@@ -29,7 +29,7 @@ use crate::{
     quantization::{Fieldizer, TensorFielder},
     tensor::{Number, Shape},
 };
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, bail, ensure};
 use ff_ext::{ExtensionField, FieldFrom, SmallField};
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
@@ -350,7 +350,7 @@ impl Evaluate<Element> for Mha<Element> {
             proving_data,
         } = soft_out;
         let ProvingData::Softmax(softmax_data) = proving_data else {
-            Err(anyhow!("Softmax data not found while evaluating MhaLayer"))?
+            bail!("Softmax data not found while evaluating MhaLayer");
         };
         let data = MhaData {
             pre_reshaping_out: final_mul_out.outputs()[0].to_fields(),

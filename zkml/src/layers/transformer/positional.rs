@@ -164,22 +164,21 @@ where
             "positional embeddings only support 2d tensors"
         );
 
-        let outputs = inputs
-            .iter()
-            .map(|x| match self {
-                Self::Learned(pos) => {
+        let outputs = match self {
+            Positional::Learned(pos) => inputs
+                .iter()
+                .map(|x| {
                     let sub_pos = pos.positional.slice_2d(0, x.get_shape()[0]);
                     pos.add_layer
                         .evaluate::<E>(&[x, &sub_pos], vec![pos.unpadded_shape.clone(); 2])?
                         .outputs
                         .pop()
                         .context("Expected at least 1 output from add in positional encoding layer")
-                }
-                Self::Rope => {
-                    anyhow::bail!("Rope not implemented");
-                }
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            Positional::Rope => anyhow::bail!("Rope not implemented"),
+        };
+
         Ok(LayerOut::from_vec(outputs))
     }
 }

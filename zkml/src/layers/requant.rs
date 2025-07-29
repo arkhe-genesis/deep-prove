@@ -128,12 +128,42 @@ impl Evaluate<Element> for Requant {
         inputs: &[&Tensor<Element>],
         _unpadded_input_shapes: Vec<Shape>,
     ) -> Result<LayerOut<Element, E>> {
-        Ok(LayerOut::from_vec(
-            inputs
-                .iter()
-                .map(|input| self.op(input))
-                .collect::<Result<Vec<_>>>()?,
-        ))
+        let result = inputs
+            .iter()
+            .map(|input| {
+                // We use this value to determine if any of the inputs are too large to be requantised (i.e. they fall outside the clamping table)
+                let max_abs_val: Element = 1 << self.intermediate_bit_size;
+                let res = input
+                    .get_data()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, elem)| {
+                        ensure!(
+                            elem.abs() <= max_abs_val,
+                            "Could not apply requantisation, tensor element {} had absolute value too large, given value: {}, max value: {}",
+                            i, elem, max_abs_val
+                        );
+
+                        let rounding: Element = 1 << (self.shift() - 1);
+                        let unclamped = (rounding + elem * self.fixed_point_multiplier) >> self.shift();
+                        let sign: Element = if unclamped.is_positive() || unclamped == 0 {
+                            1
+                        } else {
+                            -1
+                        };
+
+                        if unclamped.abs() >= *quantization::MAX {
+                            Ok(*quantization::MAX * sign)
+                        } else {
+                            Ok(unclamped)
+                        }
+                    })
+                    .collect::<Result<Vec<Element>, anyhow::Error>>()?;
+
+                Ok(Tensor::<Element>::new(input.get_shape(), res))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(LayerOut::from_vec(result))
     }
 }
 
@@ -449,36 +479,6 @@ impl Requant {
     /// This returns the shift (including the part that depends on `S1 * S2/ S3`)
     pub(crate) fn shift(&self) -> usize {
         self.fp_scale + self.right_shift
-    }
-
-    /// Internal method that applies this op to an [`Element`]
-    fn apply(&self, elem: &Element) -> Element {
-        let rounding: Element = 1 << (self.shift() - 1);
-        let unclamped = (rounding + elem * self.fixed_point_multiplier) >> self.shift();
-        let sign: Element = if unclamped.is_positive() || unclamped == 0 {
-            1
-        } else {
-            -1
-        };
-
-        if unclamped.abs() >= *quantization::MAX {
-            *quantization::MAX * sign
-        } else {
-            unclamped
-        }
-    }
-
-    /// API for performing this op on a quantised tensor.
-    pub fn op(&self, input: &Tensor<Element>) -> Result<Tensor<Element>> {
-        // We use this value to determine if any of the inputs are too large to be requantised (i.e. they fall outside the clamping table)
-        let max_abs_val: Element = 1 << self.intermediate_bit_size;
-        let res = input
-            .get_data()
-            .iter().enumerate()
-            .map(|(i,e)| {if e.abs() <= max_abs_val {Ok(self.apply(e))} else {Err(anyhow!("Could not apply requantisation, tensor element {} had absoloute value too large, given value: {}, max value: {}", i, e, max_abs_val))}})
-            .collect::<Result<Vec<Element>, anyhow::Error>>()?;
-
-        Ok(Tensor::<Element>::new(input.get_shape(), res))
     }
 
     /// Function that tells us how large to make the clamping table

@@ -168,9 +168,10 @@ impl<N: Number> Evaluate<N> for Dense<N> {
             "Found more than 1 input when evaluating dense layer"
         );
         let input = inputs[0];
-        Ok(LayerOut::from_vec(vec![if input.get_shape().len() != 1 {
+
+        let out = if input.get_shape().len() != 1 {
             let flat_input = input.flatten();
-            assert!(
+            ensure!(
                 flat_input.get_data().len() == self.matrix.ncols_2d(),
                 "flat input length {} (from shape {:?}) vs matrix ncols {}",
                 flat_input.get_data().len(),
@@ -181,7 +182,9 @@ impl<N: Number> Evaluate<N> for Dense<N> {
             matvec.add(&self.bias)
         } else {
             self.matrix.matvec(input).add(&self.bias)
-        }]))
+        };
+
+        Ok(LayerOut::from_vec(vec![out]))
     }
 }
 

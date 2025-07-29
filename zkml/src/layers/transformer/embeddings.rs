@@ -200,10 +200,7 @@ impl<N: Number> Evaluate<N> for Embeddings<N> {
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
-            inputs.iter().all(|x| {
-                let shape: Shape = x.get_shape();
-                shape.rank() == 1
-            }),
+            inputs.iter().all(|x| { x.get_shape().rank() == 1 }),
             "embeddings only support 1d tensors: {:?}",
             inputs.iter().map(|x| x.get_shape()).collect::<Vec<_>>()
         );
