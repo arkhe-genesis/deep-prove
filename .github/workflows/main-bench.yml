@@ -26,6 +26,7 @@ jobs:
     if: ${{ needs.changes.outputs.should_run == 'true' }}
     permissions:
       checks: write
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +45,7 @@ jobs:
         run: |
           cd zkml && \
           bencher run \
-          --project deep-prove-f264508-ok338l62t85v1 \
+          --project deep-prove-private-70c58ed-ejzl400nndqc0 \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --branch main \
           --threshold-measure latency \
