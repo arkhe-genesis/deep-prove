@@ -29,6 +29,7 @@
     enable = true;
     venv.enable = true;
     venv.requirements = ''
+    gguf[gui]
     matplotlib
     numpy
     onnx
