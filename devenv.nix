@@ -5,7 +5,7 @@
 
   packages = [
     # General dev.
-    pkgs.git pkgs.openssl
+    pkgs.git pkgs.openssl pkgs.cmake
     # Rust
     pkgs.rustup pkgs.protobuf pkgs.openssl
   ];

@@ -194,15 +194,21 @@ impl<N: Number> Mha<N> {
     // The id is ephemeral in the sense that it will not correspond to an actual node in the
     // model
     fn compute_ephemeral_node_id(node_id: NodeId, domain_separator: &str) -> NodeId {
-        let payload = once(Goldilocks::from_canonical_u64(node_id as u64))
-            .chain(
-                domain_separator
-                    .as_bytes()
-                    .iter()
-                    .map(|b| Goldilocks::from_canonical_u8(*b)),
-            )
-            .collect_vec();
-        PoseidonHash::hash_or_noop(&payload).0[0].to_canonical_u64() as usize
+        let payload = once(Goldilocks::from_canonical_u64(
+            (*node_id)
+                .try_into()
+                .expect("can not convert NodeId to u64"),
+        ))
+        .chain(
+            domain_separator
+                .as_bytes()
+                .iter()
+                .map(|b| Goldilocks::from_canonical_u8(*b)),
+        )
+        .collect_vec();
+        usize::try_from(PoseidonHash::hash_or_noop(&payload).0[0].to_canonical_u64())
+            .expect("can not convert u64 to usize")
+            .into()
     }
 
     fn qk_node_id(node_id: NodeId) -> NodeId {

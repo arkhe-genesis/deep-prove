@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow, bail, ensure};
+use derive_more::{From, Into};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
@@ -31,7 +32,25 @@ use super::{
     transformer::{layernorm::LayerNormData, softmax::SoftmaxData},
 };
 
-pub(crate) type NodeId = usize;
+#[derive(
+    Copy,
+    Clone,
+    From,
+    Into,
+    Hash,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    PartialOrd,
+    Ord,
+    derive_more::Debug,
+    derive_more::Display,
+    derive_more::Deref,
+)]
+#[debug("node #{_0}")]
+#[display("#{_0}")]
+pub struct NodeId(usize);
 
 /// Represents a link between an input/output wire of a node with an input/output wire of
 /// another node.
@@ -138,7 +157,7 @@ pub enum ProvingData<E: ExtensionField> {
     Mha(MhaData<E>),
     /// Variant used for extra data used to prove [LayerNorm][`crate::layers::transformer::layernorm::LayerNorm`]
     LayerNorm(LayerNormData),
-    /// Varient used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
+    /// Variant used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
     ArgMax(ArgmaxData<E>),
     /// Variant used when no extra data is returned.
     None,

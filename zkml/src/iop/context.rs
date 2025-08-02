@@ -220,7 +220,7 @@ fn compute_node_shape<E: ExtensionField>(
     step_infos: &mut BTreeMap<NodeId, NodeCtx<E>>,
     shapes: &mut HashMap<NodeId, Vec<Shape>>,
     input_shapes: &[Shape],
-    id: usize,
+    id: NodeId,
     node: &Node<Element>,
 ) -> anyhow::Result<ContextAux> {
     trace!(
@@ -244,7 +244,7 @@ fn compute_node_shape<E: ExtensionField>(
                 ))?;
                 ensure!(
                     edge.index < node_shapes.len(),
-                    "Input for node {} is coming from output {} of node {}, 
+                    "Input for node {} is coming from output {} of node {},
                         but this node has only {} outputs",
                     id,
                     edge.index,
@@ -256,7 +256,7 @@ fn compute_node_shape<E: ExtensionField>(
                 // input node
                 ensure!(
                     edge.index < input_shapes.len(),
-                    "Input for node {} is the input {} of the model, 
+                    "Input for node {} is the input {} of the model,
                         but the model has only {} inputs",
                     id,
                     edge.index,

@@ -105,17 +105,17 @@ fn from_inference_model(model: InferenceModel) -> Result<Model<f32>> {
             .add_node_with_id(id, zkml_node)
             .context(format!("adding node {desc}:"))?;
         first_node = false;
-        last_node_id = id;
+        last_node_id = id.into();
     }
     let outputs = onnx_model
         .output_outlets()?
         .iter()
-        .map(|outlet| Edge::new(outlet.node, outlet.slot))
+        .map(|outlet| Edge::new(outlet.node.into(), outlet.slot))
         .collect::<Vec<_>>();
     assert!(
         outputs
             .iter()
-            .any(|edge| edge.node.unwrap() == last_node_id)
+            .any(|edge| *edge.node.unwrap() == last_node_id)
     );
     pmodel.route_output(Some(outputs))?;
     Ok(pmodel)
@@ -179,8 +179,8 @@ impl<'a, I: Iterator<Item = &'a usize> + Sized> ParserFactory<'a, I> {
             debug!("current node {:?}", curr_node.op);
             let parser = self.0.get(layer_name).unwrap();
 
-            Some(
-                parser(model, *curr_node_id, curr_node, iter).map(|(node_id, mut node)| {
+            Some(parser(model, (*curr_node_id).into(), curr_node, iter).map(
+                |(node_id, mut node)| {
                     if first_node {
                         // if the node is the first one, we need to add the
                         // input edge as an input to the node
@@ -197,8 +197,8 @@ impl<'a, I: Iterator<Item = &'a usize> + Sized> ParserFactory<'a, I> {
                         node.inputs
                     );
                     (node_id, node)
-                }),
-            )
+                },
+            ))
         } else {
             Some(err(format!("Unknown node type: {op_name}: {curr_node:?}")))
         }
@@ -244,7 +244,7 @@ fn load_reshape<'a, I: Iterator<Item = &'a usize> + Sized>(
         node.name
     );
     let provable_node = ProvableNode::new(
-        vec![Edge::new(node.inputs[0].node, node.inputs[0].slot)],
+        vec![Edge::new(node.inputs[0].node.into(), node.inputs[0].slot)],
         Layer::Flatten(crate::layers::flatten::Flatten),
     );
     Ok((node_id, provable_node))
@@ -262,7 +262,7 @@ fn load_flatten<'a, I: Iterator<Item = &'a usize> + Sized>(
         node.name
     );
     let node = ProvableNode::new(
-        vec![Edge::new(node.inputs[0].node, node.inputs[0].slot)],
+        vec![Edge::new(node.inputs[0].node.into(), node.inputs[0].slot)],
         Layer::Flatten(crate::layers::flatten::Flatten),
     );
     Ok((node_id, node))
@@ -323,7 +323,7 @@ fn load_maxpool<'a, I: Iterator<Item = &'a usize> + Sized>(
     }
     let zkml_maxpool = Layer::Pooling(Pooling::Maxpool2D(Maxpool2D::default()));
     let node = ProvableNode::new(
-        vec![Edge::new(node.inputs[0].node, node.inputs[0].slot)],
+        vec![Edge::new(node.inputs[0].node.into(), node.inputs[0].slot)],
         zkml_maxpool,
     );
     Ok((node_id, node))
@@ -356,7 +356,7 @@ fn load_relu<'a, I: Iterator<Item = &'a usize> + Sized>(
         }
     };
     let provable_node = crate::layers::provable::Node::new(
-        vec![Edge::new(real_input_id.node, real_input_id.slot)],
+        vec![Edge::new(real_input_id.node.into(), real_input_id.slot)],
         Layer::Activation(Activation::Relu(relu)),
     );
     Ok((node_id, provable_node))
@@ -519,7 +519,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
                         .inputs
                         .iter()
                         .enumerate()
-                        .find(|(_i, &x)| x.node == node_id)
+                        .find(|(_i, &x)| x.node == *node_id)
                     {
                         Some((idx, ..)) => {
                             // Now we need to find the bias node, which is the other input to the Add node
@@ -530,7 +530,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
                             // in that case, we move on the iterator, since we already saw the bias node and the Add is part of the dense layer
                             // unwrap is safe here since we peeked already
                             iter.next().unwrap();
-                            (next_node_id, Some(bias_input.node))
+                            (next_node_id.into(), Some(bias_input.node))
                         }
                         None => {
                             // no bias, just return the matrix node
@@ -572,7 +572,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     );
     let dense = crate::layers::dense::Dense::new(weight, bias_tensor);
     let provable_node = crate::layers::provable::Node::new(
-        vec![Edge::new(input_link.node, input_link.slot)],
+        vec![Edge::new(input_link.node.into(), input_link.slot)],
         Layer::Dense(dense),
     );
     // here since the bias addition is the _last_ operation, the next layers are gonna refer
@@ -610,7 +610,7 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
         Convolution::new(filter_const, bias_const)
     };
     let provable_node = crate::layers::provable::Node::new(
-        vec![Edge::new(input_link.node, input_link.slot)],
+        vec![Edge::new(input_link.node.into(), input_link.slot)],
         Layer::Convolution(conv),
     );
     Ok((node_id, provable_node))

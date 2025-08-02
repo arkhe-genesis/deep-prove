@@ -298,9 +298,10 @@ where
     /// Add the node provided as input to the model. The id of the added node is
     /// computed inside this method and returned as output
     pub fn add_node(&mut self, node: Node<N>) -> anyhow::Result<NodeId> {
-        let node_id = (0..self.nodes.len() + 1)
-            .find(|i| !self.nodes.contains_key(i))
-            .ok_or(anyhow!("No valid node id found for new node"))?;
+        let node_id: NodeId = (0..self.nodes.len() + 1)
+            .find(|i| !self.nodes.contains_key(&NodeId::from(*i)))
+            .ok_or(anyhow!("No valid node id found for new node"))?
+            .into();
         self.add_node_with_id(node_id, node)?;
         Ok(node_id)
     }
@@ -458,7 +459,7 @@ impl<N: Number> Model<N> {
                 .output_shapes(&shapes, PaddingMode::NoPadding);
             let output = node
                 .run(inputs.as_slice(), shapes)
-                .context(format!("Error occured at node ID: {node_id}"))?;
+                .context(format!("Error occurred at node ID: {node_id}"))?;
             // add output tensors to tracker, if any
             if let Some(tracker) = &mut tracker {
                 for (i, out) in output.outputs().into_iter().enumerate() {
@@ -1322,7 +1323,7 @@ pub(crate) mod test {
     ///       A
     ///     /  \\
     ///    R1  R2  <-- distinct requant layers !
-    ///    /    \\   
+    ///    /    \\
     ///   B      C
     #[test]
     fn test_model_insert_requant() {

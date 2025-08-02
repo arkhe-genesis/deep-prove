@@ -111,7 +111,7 @@ impl ScalingStrategy for InferenceObserver {
                 .enumerate()
                 .map(|(i, (inp, shape))| {
                     let input_tensor = Tensor::new(shape, inp);
-                    tracker.track(INPUT_TRACKING_ID as NodeId, i, input_tensor.clone());
+                    tracker.track(INPUT_TRACKING_ID.into(), i, input_tensor.clone());
                     input_tensor
                 })
                 .collect_vec();
@@ -123,8 +123,7 @@ impl ScalingStrategy for InferenceObserver {
         let num_model_inputs = input_not_padded_shapes.len();
         let input_scaling = (0..num_model_inputs)
             .map(|i| {
-                let (input_min, input_max) =
-                    tracker.distribution_info(INPUT_TRACKING_ID as NodeId, i);
+                let (input_min, input_max) = tracker.distribution_info(INPUT_TRACKING_ID.into(), i);
                 ScalingFactor::from_absolute_max(input_min.abs().max(input_max.abs()), None)
             })
             .collect_vec();
