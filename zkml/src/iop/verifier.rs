@@ -167,7 +167,7 @@ where
                         );
                         Ok((
                             ctx.unpadded_input_shapes[edge.index].clone(),
-                            self.io.input[edge.index].get_shape(),
+                            self.io.input[edge.index].shape(),
                         ))
                     }
                 }))?;

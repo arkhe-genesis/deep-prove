@@ -147,12 +147,12 @@ impl InputMatrixDimensions {
                 self.mat_mul_dimension,
                 self.output_dimension,
             ];
-            let mut mle = input.permute3d(&permute).data.into_mle();
+            let mut mle = input.permute3d(&permute).into_mle();
             mle.fix_variables_in_place_parallel(partial_point);
             mle
         } else {
             // no permutation needed, just compute the MLE
-            let mut mle = input.data.clone().into_mle();
+            let mut mle = input.as_mle();
             if self.output_dimension == 0 {
                 // We need to fix the variables related to the first dimension, which are
                 // the most significant ones
@@ -478,13 +478,13 @@ impl ConcatMatMul {
     ) -> Result<(Vec<crate::Claim<E>>, ConcatMatMulProof<E>)> {
         let input_shapes = inputs
             .iter()
-            .map(|input| input.as_ref().get_shape())
+            .map(|input| input.as_ref().shape())
             .collect_vec();
         self.ensure_shape_consistency(&input_shapes)?;
 
         let (point_for_concat, point_for_row, point_for_col) = self
             .permutations
-            .split_output_claim_point(output.get_shape(), &last_claims[0].point)?;
+            .split_output_claim_point(output.shape(), &last_claims[0].point)?;
 
         // determine if we need to permute the left matrix for sum-check
         let left = self
@@ -507,10 +507,8 @@ impl ConcatMatMul {
 
         let sum_check_num_vars = left.num_vars();
 
-        let num_columns_left =
-            inputs[0].as_ref().get_shape()[self.permutations.left.mat_mul_dimension];
-        let num_rows_right =
-            inputs[1].as_ref().get_shape()[self.permutations.right.mat_mul_dimension];
+        let num_columns_left = inputs[0].as_ref().shape()[self.permutations.left.mat_mul_dimension];
+        let num_rows_right = inputs[1].as_ref().shape()[self.permutations.right.mat_mul_dimension];
         ensure!(
             num_columns_left == num_rows_right,
             "ConcatMatMul: found different mat mul dimensions in left and right input matrix {} vs {}",
@@ -586,8 +584,8 @@ impl<N: Number> Evaluate<N> for ConcatMatMul {
         ensure!(inputs.len() == 2, "ConcatMatMul expects 2 inputs");
         let a = inputs[0];
         let b = inputs[1];
-        let a_shape = a.get_shape();
-        let b_shape = b.get_shape();
+        let a_shape = a.shape();
+        let b_shape = b.shape();
         self.ensure_shape_consistency(&[&a_shape, &b_shape])?;
         let permuted_a = self
             .permutations
@@ -599,8 +597,8 @@ impl<N: Number> Evaluate<N> for ConcatMatMul {
             .map(|p| b.permute3d(&p.0));
         let a = permuted_a.as_ref().unwrap_or(a);
         let b = permuted_b.as_ref().unwrap_or(b);
-        let a_shape = a.get_shape();
-        let b_shape = b.get_shape();
+        let a_shape = a.shape();
+        let b_shape = b.shape();
         ensure!(
             a_shape.dim(0) == b_shape.dim(0),
             "ConcatMatMul expects inputs with same batch size: {} vs {}",
@@ -925,8 +923,8 @@ mod test {
             .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
             .unwrap();
         assert_eq!(
-            result.outputs[0].data,
-            vec![7.0, 10.0, 15.0, 22.0, 67.0, 78.0, 91.0, 106.0]
+            result.outputs[0].data(),
+            &[7.0, 10.0, 15.0, 22.0, 67.0, 78.0, 91.0, 106.0]
         );
     }
 
@@ -953,10 +951,10 @@ mod test {
             vec![7.0, 10.0, 15.0, 22.0, 67.0, 78.0, 91.0, 106.0],
         );
         let expected = expected.permute3d(&vec![1, 0, 2]);
-        assert_eq!(result.outputs[0].data, expected.data);
+        assert_eq!(result.outputs[0].data(), expected.data());
         let expected_shape =
-            concat_matmul.output_shapes(&[a.get_shape(), b.get_shape()], PaddingMode::NoPadding);
-        assert_eq!(result.outputs[0].get_shape(), expected_shape[0]);
+            concat_matmul.output_shapes(&[a.shape(), b.shape()], PaddingMode::NoPadding);
+        assert_eq!(result.outputs[0].shape(), expected_shape[0]);
     }
 
     #[test]
@@ -988,10 +986,10 @@ mod test {
                 143.0, 173.0, 173.0, 219.0, 265.0,
             ],
         );
-        assert_eq!(result.outputs[0].data, expected.data);
+        assert_eq!(result.outputs[0].data(), expected.data());
         let expected_shape =
-            concat_matmul.output_shapes(&[a.get_shape(), b.get_shape()], PaddingMode::NoPadding);
-        assert_eq!(result.outputs[0].get_shape(), expected_shape[0]);
+            concat_matmul.output_shapes(&[a.shape(), b.shape()], PaddingMode::NoPadding);
+        assert_eq!(result.outputs[0].shape(), expected_shape[0]);
     }
 
     #[test]
@@ -1017,7 +1015,7 @@ mod test {
 
         // check output shape
         assert_eq!(
-            outputs[0].get_shape(),
+            outputs[0].shape(),
             Shape::new(vec![5, 14, 18]).next_power_of_two()
         );
     }
@@ -1045,7 +1043,7 @@ mod test {
         model.describe();
         let outputs = prove_model(model).unwrap();
         assert_eq!(
-            outputs[0].get_shape(),
+            outputs[0].shape(),
             Shape::new(vec![5, 14, 18]).next_power_of_two()
         );
     }
@@ -1097,7 +1095,7 @@ mod test {
 
         let outputs = prove_model(model).unwrap();
         assert_eq!(
-            outputs[0].get_shape(),
+            outputs[0].shape(),
             Shape::new(vec![21, 7, 17]).next_power_of_two()
         );
     }

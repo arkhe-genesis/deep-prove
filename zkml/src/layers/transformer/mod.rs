@@ -126,7 +126,7 @@ pub(crate) mod test {
             }
             let out = self.add.evaluate::<GoldilocksExt2>(
                 &vec![input, &down.outputs()[0]],
-                vec![input.get_shape(), down.outputs()[0].get_shape()],
+                vec![input.shape(), down.outputs()[0].shape()],
             )?;
             Ok(out.outputs()[0].clone())
         }
@@ -221,7 +221,7 @@ pub(crate) mod test {
             input: &Tensor<f32>,
             gpt2_output: Option<&GPT2LayerOutput>,
         ) -> anyhow::Result<Tensor<f32>> {
-            ensure!(input.get_shape().len() == 2);
+            ensure!(input.shape().len() == 2);
 
             let normed = self
                 .layernorm
@@ -269,7 +269,7 @@ pub(crate) mod test {
             // and then residual connection, [1, hidden_size]
             let out = self.add.evaluate::<GoldilocksExt2>(
                 &vec![input, &projected.outputs()[0]],
-                vec![input.get_shape(), projected.outputs()[0].get_shape()],
+                vec![input.shape(), projected.outputs()[0].shape()],
             )?;
 
             if let Some(gpt2_output) = gpt2_output {
@@ -321,7 +321,7 @@ pub(crate) mod test {
         let mut att = FlatAttention::random(emb_size, num_heads).unwrap();
         let input = Tensor::<f32>::random(&vec![1, emb_size].into());
         let output = att.forward(&input, None).unwrap();
-        println!("output shape: {:?}", output.get_shape());
+        println!("output shape: {:?}", output.shape());
     }
 
     #[test]
@@ -335,7 +335,7 @@ pub(crate) mod test {
             let input = Tensor::<f32>::random(&vec![seq_len, config.embedding_size].into());
             let mut att = FlatAttention::new_from_parser(&config, model.blocks.remove(0)).unwrap();
             let flat_output = att.forward(&input, None).unwrap();
-            println!("output shape: {:?}", flat_output.get_shape());
+            println!("output shape: {:?}", flat_output.shape());
         }
         Ok(())
     }
@@ -481,18 +481,17 @@ pub(crate) mod test {
         let mut att = FlatAttention::new_from_parser(&config, first_attention.clone()).unwrap();
         let first_layer_output = gpt2_output.layers.get(0).expect("no layers in output");
         let output = att.forward(&input, Some(first_layer_output))?;
-        println!("flat output: {:?}", output.get_shape());
+        println!("flat output: {:?}", output.shape());
         let expected_output = &first_layer_output.manual_output;
         assert!(is_close(expected_output, &output.get_data()));
         // Now try to run with the graph implementation
-        let mut model =
-            Model::new_from_input_shapes(vec![input.get_shape()], PaddingMode::NoPadding);
+        let mut model = Model::new_from_input_shapes(vec![input.shape()], PaddingMode::NoPadding);
         let _last_node_id = first_attention.write_to_model(&mut model, None, &config)?;
         model.route_output(None)?;
         let output1 = model.run::<GoldilocksExt2>(&[input.clone()])?;
         let output = model.run_float(&[input.clone()])?;
         assert_eq!(output1.outputs()?[0].get_data(), output[0].get_data());
-        println!("graph output: {:?}", output[0].get_shape());
+        println!("graph output: {:?}", output[0].shape());
         assert!(
             is_close(expected_output, &output[0].get_data()),
             "graph output differs"
@@ -529,11 +528,11 @@ pub(crate) mod test {
         let single_input = Tensor::new(vec![1].into(), vec![max_token as f32]);
         let model = llm_model
             .clone()
-            .into_provable_model(&config, Shape::from(single_input.get_shape()))?;
+            .into_provable_model(&config, Shape::from(single_input.shape()))?;
         model.describe();
         model.run_float(&[single_input.clone()])?;
 
-        let model = llm_model.into_provable_model(&config, Shape::from(input.get_shape()))?;
+        let model = llm_model.into_provable_model(&config, Shape::from(input.shape()))?;
         model.describe();
         let output = model.run_float(&[input.clone()])?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,

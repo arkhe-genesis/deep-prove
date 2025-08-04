@@ -123,7 +123,7 @@ where
             .into_iter()
             .zip(input_shapes)
             .map(|(mut input, shape)| {
-                if input.get_shape().clone() == shape {
+                if input.shape().clone() == shape {
                     // no need to pad, simply return the input
                     input
                 } else {
@@ -740,16 +740,16 @@ pub(crate) mod test {
         real_tensor: Tensor<E>,
         padded_tensor: Tensor<E>,
     ) {
-        let n_x = padded_tensor.shape[1];
-        for i in 0..real_tensor.shape[0] {
-            for j in 0..real_tensor.shape[1] {
-                for k in 0..real_tensor.shape[1] {
+        let n_x = padded_tensor.shape()[1];
+        for i in 0..real_tensor.shape()[0] {
+            for j in 0..real_tensor.shape()[1] {
+                for k in 0..real_tensor.shape()[1] {
                     // if(real_tensor.data[i*real_tensor.shape[1]*real_tensor.shape[1]+j*real_tensor.shape[1]+k] > 0){
                     assert!(
-                        real_tensor.data[i * real_tensor.shape[1] * real_tensor.shape[1]
-                            + j * real_tensor.shape[1]
+                        real_tensor[i * real_tensor.shape()[1] * real_tensor.shape()[1]
+                            + j * real_tensor.shape()[1]
                             + k]
-                            == padded_tensor.data[i * n_x * n_x + j * n_x + k],
+                            == padded_tensor[i * n_x * n_x + j * n_x + k],
                         "Error in tensor consistency"
                     );
                     //}else{

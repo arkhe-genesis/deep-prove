@@ -272,11 +272,11 @@ impl Softmax<Element> {
 
         // We need a mask
         let final_dim = *input
-            .shape
+            .shape()
             .last()
             .ok_or(anyhow!("Input tensor had no shape in quantised Softmax"))?;
         // We also need the second to last dim
-        let second_dim = input.shape[input.shape.len() - 2];
+        let second_dim = input.shape()[input.shape().len() - 2];
         let shift_data = input
             .get_data()
             .chunks(final_dim)
@@ -304,14 +304,14 @@ impl Softmax<Element> {
             .collect::<Vec<Element>>();
         // Make a tensor for the shift data
         let shift_shape = input
-            .shape
+            .shape()
             .iter()
             .take(unpadded_input_shape.len() - 1)
             .copied()
             .chain(std::iter::once(1usize))
             .collect::<Vec<usize>>();
         let shift_tensor = Tensor::<Element>::new(shift_shape.into(), shift_data);
-        let mask = AttentionMask::<Element>::new(input.shape.as_slice(), negative_infinity)?;
+        let mask = AttentionMask::<Element>::new(input.shape().as_slice(), negative_infinity)?;
 
         Ok((shift_tensor, mask))
     }
@@ -356,11 +356,11 @@ impl Evaluate<f32> for Softmax<f32> {
         );
         let input = inputs[0];
         // Make the attention mask
-        let mask = AttentionMask::<f32>::new(&input.shape, f32::NEG_INFINITY)?;
+        let mask = AttentionMask::<f32>::new(&input.shape(), f32::NEG_INFINITY)?;
         let masked_input = mask.apply(input)?;
 
         let chunk_size = *input
-            .shape
+            .shape()
             .last()
             .ok_or(anyhow!("Input shape was empty for float Softmax"))?;
         let output = masked_input
@@ -386,7 +386,7 @@ impl Evaluate<f32> for Softmax<f32> {
                 scaled.iter().map(|x| x / sum).collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let output_tensor = Tensor::new(input.get_shape(), output);
+        let output_tensor = Tensor::new(input.shape(), output);
         Ok(LayerOut::from_vec(vec![output_tensor]))
     }
 }
@@ -482,7 +482,7 @@ impl Evaluate<Element> for Softmax<Element> {
         let input = inputs[0];
         let (shift_tensor, mask) = self.calculate_shift_data(input, &unpadded_input_shapes[0])?;
 
-        let dim = *input.shape.last().ok_or(anyhow!(
+        let dim = *input.shape().last().ok_or(anyhow!(
             "Softmax input had no shape in quantised evaluation"
         ))?;
         let shifted_input_data = input
@@ -497,7 +497,7 @@ impl Evaluate<Element> for Softmax<Element> {
             })
             .collect::<Vec<Element>>();
 
-        let shifted_input = Tensor::<Element>::new(input.get_shape(), shifted_input_data);
+        let shifted_input = Tensor::<Element>::new(input.shape(), shifted_input_data);
         // Apply the mask to the shifted input
         let masked_input = mask.apply(&shifted_input)?;
 
@@ -557,7 +557,7 @@ impl Evaluate<Element> for Softmax<Element> {
         });
 
         // Make the output tensor
-        let output = Tensor::<Element>::new(input.get_shape(), softmax_outputs);
+        let output = Tensor::<Element>::new(input.shape(), softmax_outputs);
 
         Ok(LayerOut {
             outputs: vec![output],
@@ -920,7 +920,7 @@ impl Softmax<Element> {
         // Now we construct the polynomials used in the lookups
         // To do this we need the size of the last dimension
         let final_dim_size = *output
-            .get_shape()
+            .shape()
             .last()
             .ok_or(anyhow!("Softmax output tensor did not have a shape"))?;
         let normalisation_lookup = output
@@ -1655,9 +1655,9 @@ impl<N: Number> AttentionMask<N> {
         // First check that the bias and tril shapes agree
         let shapes_equal = self
             .tril
-            .shape
+            .shape()
             .iter()
-            .zip(self.bias.shape.iter())
+            .zip(self.bias.shape().iter())
             .all(|(t, b)| *t == *b);
         ensure!(
             shapes_equal,
@@ -1665,7 +1665,7 @@ impl<N: Number> AttentionMask<N> {
         );
 
         // Now we check to see if everything is already a power of two
-        if self.tril.shape.iter().all(|s| s.is_power_of_two()) {
+        if self.tril.shape().iter().all(|s| s.is_power_of_two()) {
             return Ok(());
         }
 
@@ -1673,7 +1673,7 @@ impl<N: Number> AttentionMask<N> {
         // For tril and bias we just expand to a larger lower/upper triangular matrix
         let padded_shape = self
             .bias
-            .get_shape()
+            .shape()
             .iter()
             .map(|dim| dim.next_power_of_two())
             .collect::<Vec<usize>>();
@@ -1693,7 +1693,7 @@ impl<N: Number> AttentionMask<N> {
     /// It elementwise multiplies by `self.tril` and then adds `self.bias`.
     fn apply(&self, input: &Tensor<N>) -> Result<Tensor<N>> {
         // Check the the input has 2 or 3 dims
-        let num_input_dims = input.shape.len();
+        let num_input_dims = input.shape().len();
         ensure!(
             num_input_dims == 2 || num_input_dims == 3,
             "To apply Attention Mask input need to have 2 or 3 dims, got: {}",
@@ -1702,9 +1702,9 @@ impl<N: Number> AttentionMask<N> {
         // If the input only has 2 dims reshape to have 3
         if num_input_dims == 3 {
             if !input
-                .shape
+                .shape()
                 .iter()
-                .zip(self.tril.shape.iter())
+                .zip(self.tril.shape().iter())
                 .all(|(a, b)| *a == *b)
             {
                 return Err(anyhow!(
@@ -1714,13 +1714,13 @@ impl<N: Number> AttentionMask<N> {
 
             Ok(input.mul(&self.tril).add(&self.bias))
         } else {
-            let new_shape = input.get_shape().insert(0, 1);
+            let new_shape = input.shape().insert(0, 1);
             let new_input = input.clone().reshape(new_shape);
 
             if !new_input
-                .shape
+                .shape()
                 .iter()
-                .zip(self.tril.shape.iter())
+                .zip(self.tril.shape().iter())
                 .all(|(a, b)| *a == *b)
             {
                 return Err(anyhow!(
@@ -1729,7 +1729,7 @@ impl<N: Number> AttentionMask<N> {
             }
 
             let output = new_input.mul(&self.tril).add(&self.bias);
-            Ok(output.reshape(input.get_shape()))
+            Ok(output.reshape(input.shape()))
         }
     }
 }
@@ -1758,7 +1758,7 @@ mod tests {
         let output = softmax
             .evaluate::<GoldilocksExt2>(&[&input], vec![vec![1, 3, 3].into()])
             .unwrap();
-        assert_eq!(output.outputs[0].get_shape(), vec![1, 3, 3].into());
+        assert_eq!(output.outputs[0].shape(), vec![1, 3, 3].into());
 
         output.outputs[0].get_data().chunks(3).for_each(|chunk| {
             assert_eq!(chunk.iter().sum::<f32>(), 1.0);

@@ -214,12 +214,12 @@ pub(crate) fn pad_conv(
         "More than 1 input shape found when padding convolution layer"
     );
     let sd = si.shapes.first_mut().unwrap();
-    sd.input_shape_og = safe_conv2d_shape(&sd.input_shape_og, &c.filter.get_shape())?;
-    let weight_shape = c.filter.get_shape();
+    sd.input_shape_og = safe_conv2d_shape(&sd.input_shape_og, &c.filter.shape())?;
+    let weight_shape = c.filter.shape();
     // Perform basic sanity checks on the tensor dimensions
     check_filter(&weight_shape).context("filter shape test failed:")?;
     ensure!(
-        weight_shape[0] == c.bias.get_shape()[0],
+        weight_shape[0] == c.bias.shape()[0],
         "Bias length doesn't match filter shape"
     );
     // Make sure that input shape is already padded and is well formed
@@ -233,7 +233,7 @@ pub(crate) fn pad_conv(
     );
     let new_conv_good = c.clone();
     // Since we are doing an FFT based conv, we need to pad the last two dimensions of the filter to match the input.
-    let weight_shape = c.filter.pad_next_power_of_two().get_shape();
+    let weight_shape = c.filter.pad_next_power_of_two().shape();
     let (filter_height, filter_width) = (weight_shape[2], weight_shape[3]);
     let (input_height, input_width) = (sd.input_shape_padded.dim(1), sd.input_shape_padded.dim(2));
 
@@ -255,7 +255,7 @@ pub(crate) fn pad_dense(mut d: Dense<Element>, si: &mut ShapeInfo) -> Result<Den
         "More than 1 input shape found when padding dense layer"
     );
     let sd = si.shapes.first_mut().unwrap();
-    let matrix_shape: Shape = d.matrix.get_shape();
+    let matrix_shape: Shape = d.matrix.shape();
     let nrows = matrix_shape.nrows();
     sd.input_shape_og = vec![nrows].into();
     ensure!(
@@ -338,7 +338,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
             m.tensor
                 .reshape_to_fit_inplace_2d(vec![nrows, ncols].into());
             (
-                m.tensor.get_shape(),
+                m.tensor.shape(),
                 padded_input_shapes.pop().unwrap(), /* safe to unwrap since we checked the number of inputs at the beginning */
             )
         }
@@ -354,7 +354,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
             } else {
                 m.tensor.reshape_to_fit_inplace_2d(padded_matrix_shape)
             };
-            (padded_input_shapes.pop().unwrap(), m.tensor.get_shape())
+            (padded_input_shapes.pop().unwrap(), m.tensor.shape())
         }
         (OperandMatrix::Input, OperandMatrix::Input) => {
             let right_shape = padded_input_shapes.pop().unwrap();

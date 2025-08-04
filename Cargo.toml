@@ -28,9 +28,9 @@ version = "0.1.0"
 aes = "0.8"
 anyhow = { version = "1.0", default-features = false }
 ark-std = "0.5"
-axum = { version = "0.8" }
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-marketplacemetering = "1.78"
+axum = { version = "0.8" }
 bitvec = "1.0"
 blake3 = { version = "1.4", features = ["serde"] }
 cfg-if = "1.0"
@@ -100,7 +100,8 @@ opt-level = 3
 [profile.release]
 debug = 1
 debug-assertions = true
-lto = "thin"
+# LTO, even thin, is **very slow** to compile for marginal gains at best
+lto = "off"
 
 [profile.fast]
 inherits = "release"

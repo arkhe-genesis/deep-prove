@@ -40,6 +40,7 @@
     torch
     torchvision
     tqdm
+    transformers
     '';
   };
 

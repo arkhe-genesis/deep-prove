@@ -135,13 +135,13 @@ pub enum Positional<N> {
 impl<N: Number> Positional<N> {
     pub fn get_shape(&self) -> Shape {
         match self {
-            Self::Learned(pos) => pos.positional.get_shape(),
+            Self::Learned(pos) => pos.positional.shape(),
             Self::Rope => unimplemented!("Rope not implemented"),
         }
     }
 
     pub fn new_learned(matrix: Tensor<N>) -> Self {
-        let unpadded_shape = matrix.get_shape();
+        let unpadded_shape = matrix.shape();
         Self::Learned(Learned {
             positional: matrix,
             unpadded_shape,
@@ -160,7 +160,7 @@ where
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
-            inputs.iter().all(|x| x.get_shape().len() == 2),
+            inputs.iter().all(|x| x.shape().len() == 2),
             "positional embeddings only support 2d tensors"
         );
 
@@ -168,7 +168,7 @@ where
             Positional::Learned(pos) => inputs
                 .iter()
                 .map(|x| {
-                    let sub_pos = pos.positional.slice_2d(0, x.get_shape()[0]);
+                    let sub_pos = pos.positional.slice_2d(0, x.shape()[0]);
                     pos.add_layer
                         .evaluate::<E>(&[x, &sub_pos], vec![pos.unpadded_shape.clone(); 2])?
                         .outputs
@@ -245,7 +245,7 @@ impl<E: ExtensionField> ProveInfo<E> for Positional<Element> {
                 .into_iter()
                 .chain(once((
                     POSITIONAL_POLY_ID.to_string(),
-                    pos.positional.pad_next_power_of_two().data,
+                    pos.positional.pad_next_power_of_two().into_data(),
                 )))
                 .collect(),
         );
@@ -350,7 +350,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
                 // derive sub-matrix to be added to input. ToDo: place it in proving data
                 let matrix_slice = TensorSlice::from(&pos.positional);
                 let sub_pos = matrix_slice
-                    .slice_over_first_dim(0, input.get_shape()[0])
+                    .slice_over_first_dim(0, input.shape()[0])
                     .to_fields();
 
                 let (mut claims, add_proof) = pos.add_layer.prove_step(
@@ -398,7 +398,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
                     .chain(extra_coordinates)
                     .collect_vec();
 
-                let mut slice_start = input.get_shape()[0];
+                let mut slice_start = input.shape()[0];
                 let sub_matrices = (0..diff_vars)
                     .map(|_| {
                         let sub_matrix =
@@ -409,7 +409,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
                     .collect_vec();
 
                 // check that all the slices of `positional_matrix` have been computed
-                ensure!(slice_start == pos.positional.get_shape()[0]);
+                ensure!(slice_start == pos.positional.shape()[0]);
 
                 // now, evaluate the MLE of each sub-matrix
                 let sub_matrix_evals = (0..diff_vars)
@@ -606,12 +606,9 @@ mod tests {
             unreachable!()
         };
 
-        let padded_shape = padded_pos.positional.get_shape();
-        assert_eq!(padded_pos.unpadded_shape, positional_matrix.get_shape());
-        assert_eq!(
-            padded_shape,
-            positional_matrix.get_shape().next_power_of_two()
-        );
+        let padded_shape = padded_pos.positional.shape();
+        assert_eq!(padded_pos.unpadded_shape, positional_matrix.shape());
+        assert_eq!(padded_shape, positional_matrix.shape().next_power_of_two());
 
         // check that padded positional matrix has the same data of original matrix
         for i in 0..padded_shape[0] {

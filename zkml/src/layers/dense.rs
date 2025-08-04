@@ -78,8 +78,8 @@ fn output_shape(input_shape: &Shape, matrix_shape: &Shape) -> Shape {
 
 impl<T: Number> Dense<T> {
     pub fn new(matrix: Tensor<T>, bias: Tensor<T>) -> Self {
-        assert_eq!(matrix.nrows_2d(), bias.get_shape()[0]);
-        let unpadded_matrix_shape = matrix.get_shape();
+        assert_eq!(matrix.nrows_2d(), bias.shape()[0]);
+        let unpadded_matrix_shape = matrix.shape();
         Self {
             matrix,
             bias,
@@ -169,13 +169,13 @@ impl<N: Number> Evaluate<N> for Dense<N> {
         );
         let input = inputs[0];
 
-        let out = if input.get_shape().len() != 1 {
+        let out = if input.shape().len() != 1 {
             let flat_input = input.flatten();
             ensure!(
                 flat_input.get_data().len() == self.matrix.ncols_2d(),
                 "flat input length {} (from shape {:?}) vs matrix ncols {}",
                 flat_input.get_data().len(),
-                input.get_shape(),
+                input.shape(),
                 self.matrix.ncols_2d()
             );
             let matvec = self.matrix.matvec(&flat_input);
@@ -216,11 +216,11 @@ where
                 vector_num_vars,
             ]]),
             unpadded_matrix_shape: self.unpadded_matrix_shape.clone(),
-            padded_matrix_shape: self.matrix.get_shape(),
+            padded_matrix_shape: self.matrix.shape(),
         });
 
-        let weights_evals = self.matrix.pad_next_power_of_two().get_data().to_vec();
-        let bias_evals = self.bias.pad_next_power_of_two().get_data().to_vec();
+        let weights_evals = self.matrix.pad_next_power_of_two().into_data();
+        let bias_evals = self.bias.pad_next_power_of_two().into_data();
 
         aux.model_polys = {
             let mut model_polys = HashMap::new();
@@ -379,7 +379,7 @@ impl Dense<f32> {
     }
 
     pub fn new_from_weights(weights: Tensor<f32>, bias: Tensor<f32>) -> Self {
-        let unpadded_matrix_shape = weights.get_shape();
+        let unpadded_matrix_shape = weights.shape();
         Self {
             matrix: weights,
             bias,
@@ -693,12 +693,12 @@ mod test {
         let padded = dense.pad_next_power_of_two();
 
         // Check padded dimensions are powers of two
-        let padded_dims = padded.matrix.get_shape();
+        let padded_dims = padded.matrix.shape();
         assert_eq!(padded_dims[0], 4); // Next power of 2 after 3
         assert_eq!(padded_dims[1], 4); // Next power of 2 after 3
 
         // Check bias is padded
-        let bias_dims = padded.bias.get_shape();
+        let bias_dims = padded.bias.shape();
         assert_eq!(bias_dims[0], 4); // Next power of 2 after 3
 
         // Check original values are preserved
@@ -739,12 +739,12 @@ mod test {
         let padded = dense.clone().pad_next_power_of_two();
 
         // Check dimensions remain the same
-        let padded_dims = padded.matrix.get_shape();
+        let padded_dims = padded.matrix.shape();
         assert_eq!(padded_dims[0], 4);
         assert_eq!(padded_dims[1], 4);
 
         // Check bias dimensions remain the same
-        let bias_dims = padded.bias.get_shape();
+        let bias_dims = padded.bias.shape();
         assert_eq!(bias_dims[0], 4);
 
         // Check values are preserved
@@ -775,12 +775,12 @@ mod test {
         let padded = dense.pad_next_power_of_two();
 
         // Check dimensions are padded correctly
-        let padded_dims = padded.matrix.get_shape();
+        let padded_dims = padded.matrix.shape();
         assert_eq!(padded_dims[0], 4); // Next power of 2 after 3
         assert_eq!(padded_dims[1], 4); // Already a power of 2
 
         // Check bias is padded
-        let bias_dims = padded.bias.get_shape();
+        let bias_dims = padded.bias.shape();
         assert_eq!(bias_dims[0], 4); // Next power of 2 after 3
 
         // Check original values are preserved and padding is zeros

@@ -540,7 +540,7 @@ impl Relu {
 
     pub fn op<T: Number>(&self, input: &Tensor<T>) -> Tensor<T> {
         Tensor::new(
-            input.get_shape(),
+            input.shape(),
             input
                 .get_data()
                 .par_iter()
@@ -613,7 +613,7 @@ impl Evaluate<f32> for GELU<f32> {
             .map(|t| {
                 let d = t.get_data();
                 let gelued = d.iter().map(gelu_float).collect::<Vec<_>>();
-                Tensor::new(t.get_shape(), gelued)
+                Tensor::new(t.shape(), gelued)
             })
             .collect();
         Ok(LayerOut::from_vec(output_tensors))
@@ -746,7 +746,7 @@ mod test {
         assert_eq!(layer_out.outputs().len(), 1);
         let output_tensor = &layer_out.outputs()[0];
 
-        assert_eq!(output_tensor.get_shape(), vec![1, input_data.len()].into());
+        assert_eq!(output_tensor.shape(), vec![1, input_data.len()].into());
         let actual_output_data = output_tensor.get_data();
 
         actual_output_data

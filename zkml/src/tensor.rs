@@ -9,8 +9,11 @@ use ark_std::rand::Rng;
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use itertools::Itertools;
 use mpcs::util::plonky2_util::log2_ceil;
-use multilinear_extensions::{mle::DenseMultilinearExtension, util::ceil_log2};
-use p3_field::{FieldAlgebra, TwoAdicField};
+use multilinear_extensions::{
+    mle::{DenseMultilinearExtension, IntoMLE},
+    util::ceil_log2,
+};
+use p3_field::{Field, FieldAlgebra, TwoAdicField};
 use p3_goldilocks::Goldilocks;
 use rayon::{
     iter::{
@@ -51,6 +54,7 @@ pub trait Number:
     const MIN: Self;
     const MAX: Self;
     fn unit() -> Self;
+    fn zero() -> Self;
     fn random<R: Rng>(rng: &mut R) -> Self;
     /// reason abs is necessary is because f32 doesn't implement Ord trait, so to have uniform code for f32 and Element,
     /// we implement abs here.
@@ -82,6 +86,9 @@ impl Number for Element {
     const MAX: Element = Element::MAX;
     fn unit() -> Self {
         1
+    }
+    fn zero() -> Self {
+        0
     }
     fn random<R: Rng>(rng: &mut R) -> Self {
         rng.gen_range(*quantization::MIN..=*quantization::MAX)
@@ -122,6 +129,9 @@ impl Number for f32 {
     fn unit() -> Self {
         1.0
     }
+    fn zero() -> Self {
+        0.0
+    }
     fn random<R: Rng>(rng: &mut R) -> Self {
         rng.gen_range(MIN_FLOAT..=MAX_FLOAT)
     }
@@ -159,6 +169,9 @@ impl Number for GoldilocksExt2 {
     const MAX: GoldilocksExt2 = GoldilocksExt2::ZERO;
     fn unit() -> Self {
         GoldilocksExt2::ONE
+    }
+    fn zero() -> Self {
+        GoldilocksExt2::ZERO
     }
     fn random<R: Rng>(rng: &mut R) -> Self {
         Element::random(rng).to_field()
@@ -370,11 +383,31 @@ where
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, derive_more::Index, derive_more::IndexMut)]
 pub struct Tensor<T> {
-    pub data: Vec<T>,
-    pub shape: Shape,
+    // Indexing the `Tensor` indexes the underlying storage.
+    #[index]
+    #[index_mut]
+    data: Vec<T>,
+    shape: Shape,
     og_shape: Shape,
+}
+impl<T> Tensor<T> {
+    /// Return an immutable reference to this tensor data.
+    pub fn data(&self) -> &[T] {
+        &self.data
+    }
+
+    /// Consume this tensore, returning its backing.
+    pub fn into_data(self) -> Vec<T> {
+        self.data
+    }
+
+    /// Return the number of elements contained in this tensor, independently of
+    /// its shape.
+    pub fn data_size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 impl<T> AsRef<Tensor<T>> for Tensor<T> {
@@ -602,6 +635,22 @@ impl Tensor<Element> {
     }
 }
 
+impl<F: ExtensionField> Tensor<F> {
+    pub fn to_mle_2d(&self) -> DenseMultilinearExtension<F> {
+        tensor_to_mle_2d(self, self.data.clone())
+    }
+}
+
+impl<F: Field> Tensor<F> {
+    pub fn into_mle<E: ExtensionField>(self) -> DenseMultilinearExtension<E> {
+        self.data.into_mle()
+    }
+
+    pub fn as_mle<E: ExtensionField>(&self) -> DenseMultilinearExtension<E> {
+        self.data.clone().into_mle()
+    }
+}
+
 impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
     fn from(value: &Tensor<Element>) -> Self {
         Self {
@@ -609,12 +658,6 @@ impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
             shape: value.shape.clone(),
             og_shape: value.og_shape.clone(),
         }
-    }
-}
-
-impl<F: ExtensionField> Tensor<F> {
-    pub fn to_mle_2d(&self) -> DenseMultilinearExtension<F> {
-        tensor_to_mle_2d(self, self.data.clone())
     }
 }
 
@@ -646,6 +689,16 @@ impl Tensor<f32> {
             .map(|x| s.quantize(&x))
             .collect::<Vec<_>>();
         Tensor::new(self.shape, data)
+    }
+}
+
+impl<T: Number> Tensor<T> {
+    pub fn allocate(shape: Shape) -> Self {
+        Tensor {
+            data: vec![T::zero(); shape.numel()],
+            og_shape: shape.clone(),
+            shape,
+        }
     }
 }
 
@@ -682,21 +735,21 @@ impl<T> Tensor<T> {
 
     /// Is vector
     pub fn is_vector(&self) -> bool {
-        self.get_shape().len() == 1 || (self.get_shape().len() == 2 && self.get_shape()[0] == 1)
+        self.shape().len() == 1 || (self.shape().len() == 2 && self.shape()[0] == 1)
     }
     /// Is matrix
     pub fn is_matrix(&self) -> bool {
-        self.get_shape().len() == 2
+        self.shape().len() == 2
     }
 
     pub fn is_convolution(&self) -> bool {
-        self.get_shape().len() == 4
+        self.shape().len() == 4
     }
 
     /// Get the number of rows from the matrix
     pub fn nrows_2d(&self) -> usize {
         let mut cols = 0;
-        let dims = self.get_shape();
+        let dims = self.shape();
         if self.is_matrix() {
             cols = dims[0];
         } else if self.is_convolution() {
@@ -709,7 +762,7 @@ impl<T> Tensor<T> {
     /// Get the number of cols from the matrix
     pub fn ncols_2d(&self) -> usize {
         let mut cols = 0;
-        let dims = self.get_shape();
+        let dims = self.shape();
         if self.is_matrix() {
             cols = dims[1];
         } else if self.is_convolution() {
@@ -732,9 +785,21 @@ impl<T> Tensor<T> {
     }
 
     /// Get the dimensions of the tensor
-    pub fn get_shape(&self) -> Shape {
+    pub fn shape(&self) -> Shape {
         assert!(!self.is_empty(), "Empty tensor");
         self.shape.clone()
+    }
+
+    /// Get the dimensions of the tensor
+    pub fn shape_mut(&mut self) -> &mut Shape {
+        &mut self.shape
+    }
+
+    /// Force-set the tensor shape
+    pub fn set_shape(&mut self, new_shape: Shape) {
+        assert!(!self.is_empty(), "Empty tensor");
+        assert!(self.shape.numel() == new_shape.numel());
+        self.shape = new_shape;
     }
 
     /// Returns the number of dimensions the [`Tensor`] has
@@ -999,7 +1064,7 @@ where
 
     /// Recursively pads the tensor so its ready to be viewed as an MLE, the `padding_value` is the element that is used to pad
     pub fn generic_pad_next_power_of_two(&self, padding_value: T) -> Self {
-        let shape = self.get_shape();
+        let shape = self.shape();
 
         if shape.iter().all(|dim| dim.is_power_of_two()) {
             return self.clone();
@@ -1333,7 +1398,7 @@ where
         *self = Tensor::new(new_shape, new_data);
     }
     pub fn maxpool2d(&self, kernel_size: usize, stride: usize) -> Tensor<T> {
-        let dims = self.get_shape().len();
+        let dims = self.shape().len();
         assert!(dims >= 2, "Input tensor must have at least 2 dimensions.");
 
         let (h, w) = (self.shape[dims - 2], self.shape[dims - 1]);
@@ -1389,7 +1454,7 @@ where
 
         let maxpool_result = self.maxpool2d(kernel_size, stride);
 
-        let dims: usize = self.get_shape().len();
+        let dims: usize = self.shape().len();
         assert!(dims >= 2, "Input tensor must have at least 2 dimensions.");
 
         let (h, w) = (self.shape[dims - 2], self.shape[dims - 1]);
@@ -1424,7 +1489,7 @@ where
 
         let padded_maxpool_tensor = Tensor {
             data: padded_maxpool_data,
-            shape: self.get_shape(),
+            shape: self.shape(),
             og_shape: vec![0].into(),
         };
 
@@ -1435,12 +1500,9 @@ where
         let (n_size, c_size, h_size, w_size) = self.get4d();
         let (k_n, k_c, k_h, k_w) = kernels.get4d();
 
+        assert!(self.shape().len() <= 4, "Supports only at most 4D input.");
         assert!(
-            self.get_shape().len() <= 4,
-            "Supports only at most 4D input."
-        );
-        assert!(
-            kernels.get_shape().len() <= 4,
+            kernels.shape().len() <= 4,
             "Supports only at most 4D filters."
         );
         // Validate shapes
@@ -1448,8 +1510,8 @@ where
             c_size,
             k_c,
             "Input {c_size} and kernel {k_c} channels must match! {:?} vs kernel {:?}",
-            self.get_shape(),
-            kernels.get_shape()
+            self.shape(),
+            kernels.shape()
         );
         assert_eq!(
             bias.shape.as_ref(),
@@ -1642,7 +1704,7 @@ where
             mat_shp_pad.len(),
             self.shape.len()
         );
-        let mat_shp_og = self.get_shape();
+        let mat_shp_og = self.shape();
 
         let new_data: Vec<T> = (0..mat_shp_pad[0] * mat_shp_pad[1])
             .into_par_iter()
@@ -1821,7 +1883,7 @@ impl<T: Default + Clone + Copy> Tensor<T> {
             .chain(self.shape.iter().copied())
             .collect::<Vec<usize>>();
         expansion_shape.iter().zip(padded_shape.iter()).try_for_each(|(&new_dim, &dim)|{
-            // Check new_dim isn't zero 
+            // Check new_dim isn't zero
             if new_dim == 0 {
                 Err(anyhow!("Cannot expand to new shape, new shape dim: {new_dim} was zero"))
             } else if dim != 1 {
@@ -2474,7 +2536,7 @@ mod test {
         let new_shape = vec![shape[0].next_power_of_two(), shape[1].next_power_of_two()];
         let new_mat = mat.pad_next_power_of_two();
         assert_eq!(
-            new_mat.get_shape(),
+            new_mat.shape(),
             new_shape.into(),
             "Matrix padding to next power of two failed."
         );
@@ -2483,7 +2545,7 @@ mod test {
     impl Tensor<Element> {
         pub fn get_2d(&self, i: usize, j: usize) -> Element {
             assert!(self.is_matrix() == true);
-            self.data[i * self.get_shape()[1] + j]
+            self.data[i * self.shape()[1] + j]
         }
 
         pub fn random_eval_point(&self) -> Vec<E> {
@@ -2497,7 +2559,7 @@ mod test {
     #[test]
     fn test_tensor_mle() {
         let mat = Tensor::random(&vec![3, 5].into());
-        let shape = mat.get_shape();
+        let shape = mat.shape();
         let mat = mat.pad_next_power_of_two();
         println!("matrix {}", mat);
         let mut mle = mat.to_2d_mle::<E>();
@@ -2658,9 +2720,9 @@ mod test {
         let padded = input.pad_next_power_of_two();
 
         padded
-            .get_shape()
+            .shape()
             .iter()
-            .zip(input.get_shape().iter())
+            .zip(input.shape().iter())
             .for_each(|(padded_dim, input_dim)| {
                 assert_eq!(*padded_dim, input_dim.next_power_of_two())
             });
@@ -2873,7 +2935,7 @@ mod test {
         // minimal bias shape is k_n
         let bias = Tensor::<Element>::random(&vec![2].into());
         let output = input.conv2d(&conv, &bias, 1);
-        assert_eq!(output.get_shape(), vec![1, 2, 1, 1].into());
+        assert_eq!(output.shape(), vec![1, 2, 1, 1].into());
     }
 
     #[test]
@@ -2911,10 +2973,10 @@ mod test {
     fn test_tensor_slice_2d() {
         let tensor = Tensor::<Element>::new(vec![3, 3].into(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let sliced = tensor.slice_2d(0, 2);
-        assert_eq!(sliced.get_shape(), vec![2, 3].into());
+        assert_eq!(sliced.shape(), vec![2, 3].into());
         assert_eq!(sliced.get_data(), vec![1, 2, 3, 4, 5, 6]);
         let sliced = tensor.slice_2d(2, 3);
-        assert_eq!(sliced.get_shape(), vec![1, 3].into());
+        assert_eq!(sliced.shape(), vec![1, 3].into());
         assert_eq!(sliced.get_data(), vec![7, 8, 9]);
     }
 
@@ -2923,7 +2985,7 @@ mod test {
         let tensor = Tensor::<Element>::new(vec![2, 3].into(), vec![1, 2, 3, 4, 5, 6]);
         let vector = Tensor::<Element>::new(vec![3].into(), vec![10, 20, 30]);
         let result = tensor.add_dim2(&vector);
-        assert_eq!(result.get_shape(), vec![2, 3].into());
+        assert_eq!(result.shape(), vec![2, 3].into());
         assert_eq!(result.get_data(), vec![11, 22, 33, 14, 25, 36]);
     }
 
@@ -2933,12 +2995,12 @@ mod test {
         let vector = Tensor::<Element>::new(vec![3].into(), vec![10, 20, 30]);
         tensor.concat(vector);
 
-        assert_eq!(tensor.get_shape(), vec![3, 3].into());
+        assert_eq!(tensor.shape(), vec![3, 3].into());
         assert_eq!(tensor.get_data(), vec![1, 2, 3, 4, 5, 6, 10, 20, 30]);
 
         let vector = Tensor::<Element>::new(vec![1, 3].into(), vec![66, 77, 88]);
         tensor.concat(vector);
-        assert_eq!(tensor.get_shape(), vec![4, 3].into());
+        assert_eq!(tensor.shape(), vec![4, 3].into());
         assert_eq!(
             tensor.get_data(),
             vec![1, 2, 3, 4, 5, 6, 10, 20, 30, 66, 77, 88]
@@ -2967,7 +3029,7 @@ mod test {
         );
         // i,j,k --> j,i,k -> new shape = 3,2,3
         let permuted = tensor.permute3d(&[1, 0, 2]);
-        assert_eq!(permuted.get_shape(), vec![3, 2, 3].into());
+        assert_eq!(permuted.shape(), vec![3, 2, 3].into());
         for i in 0..2 {
             for j in 0..3 {
                 for k in 0..3 {
@@ -2981,7 +3043,7 @@ mod test {
 
         let tensor = Tensor::<Element>::random(&vec![18, 5, 27].into());
         let permuted = tensor.permute3d(&vec![1, 2, 0]);
-        assert_eq!(permuted.get_shape(), vec![5, 27, 18].into())
+        assert_eq!(permuted.shape(), vec![5, 27, 18].into())
     }
 
     #[test]
@@ -2992,7 +3054,7 @@ mod test {
         );
         let sliced = tensor.slice_3d(1, 3);
         assert_eq!(sliced.get_data(), vec![5, 6, 7, 8, 9, 10, 11, 12]);
-        assert_eq!(sliced.get_shape(), vec![2, 2, 2].into());
+        assert_eq!(sliced.shape(), vec![2, 2, 2].into());
     }
 
     #[test]
@@ -3050,7 +3112,7 @@ mod test {
         assert_eq!(slices.next(), None);
 
         let (slices, shape) = tensor.slice_on_dim(2);
-        assert_eq!(shape, tensor.get_shape());
+        assert_eq!(shape, tensor.shape());
         let data = slices.flatten().cloned().collect::<Vec<_>>();
         assert_eq!(
             data,
@@ -3081,7 +3143,7 @@ mod test {
             Tensor::<Element>::new(vec![2, 3].into(), vec![7, 8, 9, 10, 11, 12]),
         ];
         let stacked = Tensor::<Element>::stack_all(tensors.clone()).unwrap();
-        assert_eq!(stacked.get_shape(), vec![4, 3].into());
+        assert_eq!(stacked.shape(), vec![4, 3].into());
         assert_eq!(
             stacked.get_data(),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
@@ -3089,7 +3151,7 @@ mod test {
 
         let stacked =
             Tensor::<Element>::stack_all(tensors.into_iter().map(|t| t.unsqueeze(0))).unwrap();
-        assert_eq!(stacked.get_shape(), vec![2, 2, 3].into());
+        assert_eq!(stacked.shape(), vec![2, 2, 3].into());
         assert_eq!(
             stacked.get_data(),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
@@ -3242,23 +3304,23 @@ mod test {
         let data = vec![
             1.0, 2.0,
 
-            3.0, 4.0, 
-                                  
+            3.0, 4.0,
+
             5.0, 6.0];
 
         let expansion_shape: Shape = vec![3, 3, 2].into();
         #[rustfmt::skip]
         let expansion_data = vec![
-            1.0, 2.0, 
-            1.0, 2.0, 
-            1.0, 2.0, 
-            
-            3.0, 4.0, 
-            3.0, 4.0, 
-            3.0, 4.0, 
-            
-            5.0, 6.0, 
-            5.0, 6.0, 
+            1.0, 2.0,
+            1.0, 2.0,
+            1.0, 2.0,
+
+            3.0, 4.0,
+            3.0, 4.0,
+            3.0, 4.0,
+
+            5.0, 6.0,
+            5.0, 6.0,
             5.0, 6.0,
         ];
 

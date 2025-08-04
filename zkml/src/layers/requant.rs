@@ -160,7 +160,7 @@ impl Evaluate<Element> for Requant {
                     })
                     .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-                Ok(Tensor::<Element>::new(input.get_shape(), res))
+                Ok(Tensor::<Element>::new(input.shape(), res))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(LayerOut::from_vec(result))

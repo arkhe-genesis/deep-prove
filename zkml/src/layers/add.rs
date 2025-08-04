@@ -155,10 +155,10 @@ impl Evaluate<f32> for Add<f32> {
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let result = if inputs.len() == 2 {
             ensure!(
-                inputs[0].get_shape().product() == inputs[1].get_shape().product(),
+                inputs[0].shape().product() == inputs[1].shape().product(),
                 "Add layer expects inputs to have the same shape: {:?} vs {:?}",
-                inputs[0].get_shape(),
-                inputs[1].get_shape()
+                inputs[0].shape(),
+                inputs[1].shape()
             );
             inputs[0].add(inputs[1])
         } else if inputs.len() == 1 {
@@ -167,11 +167,10 @@ impl Evaluate<f32> for Add<f32> {
                 "Add operand can't be None if there is only one input"
             );
             ensure!(
-                inputs[0].get_shape().product()
-                    == self.operand.as_ref().unwrap().0.get_shape().product(),
+                inputs[0].shape().product() == self.operand.as_ref().unwrap().0.shape().product(),
                 "Add layer expects input and operand to have the same shape: {:?} vs {:?}",
-                inputs[0].get_shape(),
-                self.operand.as_ref().unwrap().0.get_shape()
+                inputs[0].shape(),
+                self.operand.as_ref().unwrap().0.shape()
             );
             inputs[0].add(&self.operand.as_ref().unwrap().0)
         } else {
@@ -301,12 +300,12 @@ impl QuantInfo {
         output_scaling: &ScalingFactor,
     ) -> Self {
         // The common scale factor needs to be worked out here from `left_scaling`, `right_scaling` and `output_scaling`
-        // To do this we take the absoloute value of the base 2 logarithm of each (they should all be values in the interval [0,1), thus having negative base 2 logarithm)
+        // To do this we take the absolute value of the base 2 logarithm of each (they should all be values in the interval [0,1), thus having negative base 2 logarithm)
         let left_log = left_scaling.scale().log2().abs();
         let right_log = right_scaling.scale().log2().abs();
         let output_log = output_scaling.scale().log2().abs();
 
-        // We make a closure that we can use once we work out whic of the left and right inputs has higher precision. This closure takes both (once it knows which is high precision and which is low)
+        // We make a closure that we can use once we work out which of the left and right inputs has higher precision. This closure takes both (once it knows which is high precision and which is low)
         // and calculates what we have to multiply the left input by, the right input by, the common scale factor after multiplying by both of these and also whether a requant step is required after the addition.
         let minimum_precision_diff = *crate::quantization::BIT_LEN as f32;
         let scale_comparison = |h_precision: ScalingFactor,
@@ -417,7 +416,7 @@ impl QuantInfo {
     pub fn common_scale(&self) -> f32 {
         self.common_scale
     }
-    /// The absoloute value of intermedaite size before addition is bounded above by `self.common_scale.log2().abs().ceil()`, so we add 2 extra to this.
+    /// The absolute value of intermedaite size before addition is bounded above by `self.common_scale.log2().abs().ceil()`, so we add 2 extra to this.
     /// The first because we need an additional bit for the sign and the second because of the actual addition.
     pub fn intermediate_bit_size(&self) -> usize {
         self.common_scale.log2().abs().ceil() as usize + 2
@@ -533,7 +532,7 @@ impl PadOp for Add<Element> {
         if let Some((op, og_shape)) = self.operand {
             ensure!(si.shapes.len() == 1, "Add layer expects 1 input shape");
             let op = op.pad_next_power_of_two();
-            let padded_shape = op.get_shape();
+            let padded_shape = op.shape();
             self.operand = Some((op, og_shape.clone()));
             ShapeData::new(og_shape.clone());
             let sd = si.shapes.first_mut().unwrap();
@@ -656,7 +655,7 @@ mod test {
 
         let scale = qadd.quant_info.as_ref().unwrap().common_scale() / s3.scale();
         let result_scaled = Tensor::<Element>::new(
-            qadd_result.outputs()[0].get_shape(),
+            qadd_result.outputs()[0].shape(),
             qadd_result.outputs()[0]
                 .get_data()
                 .iter()

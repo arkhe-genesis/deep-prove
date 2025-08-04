@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, anyhow, ensure};
-
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
@@ -9,6 +6,7 @@ use multilinear_extensions::{
     virtual_poly::{VPAuxInfo, VirtualPolynomial},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
 use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
 use tracing::debug;
 use transcript::Transcript;
@@ -56,7 +54,7 @@ pub enum OperandMatrix<T> {
 
 impl<T> OperandMatrix<T> {
     pub fn new_weight_matrix(matrix: Tensor<T>) -> Self {
-        let unpadded_shape = matrix.get_shape();
+        let unpadded_shape = matrix.shape();
         OperandMatrix::Weight(WeightMatrix {
             tensor: matrix,
             unpadded_shape,
@@ -76,7 +74,7 @@ impl<T> OperandMatrix<T> {
                 PaddingMode::NoPadding => Some(mat.unpadded_shape.clone()),
                 PaddingMode::Padding => Some(
                     mat.tensor
-                        .get_shape()
+                        .shape()
                         .into_vec()
                         .into_iter()
                         .map(|dim| dim.next_power_of_two())
@@ -89,7 +87,7 @@ impl<T> OperandMatrix<T> {
 
     pub(crate) fn get_actual_shape(&self) -> Option<Shape> {
         match self {
-            OperandMatrix::Weight(mat) => Some(mat.tensor.get_shape()),
+            OperandMatrix::Weight(mat) => Some(mat.tensor.shape()),
             OperandMatrix::Input => None,
         }
     }
@@ -202,18 +200,18 @@ impl<T> MatMul<T> {
         // check that we don't have 2 weight matrix being multiplied
         if let (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) = (&left_matrix, &right_matrix)
         {
-            Err(anyhow!("Pointless to have a layer with 2 constant matrices, just use the product as a parameter in 
+            Err(anyhow!("Pointless to have a layer with 2 constant matrices, just use the product as a parameter in
                 another layer"))?
         }
         if let Some(bt) = bias.as_ref() {
-            ensure!(bt.get_shape().len() == 1, "Bias must be a 1D tensor");
+            ensure!(bt.shape().len() == 1, "Bias must be a 1D tensor");
             match right_matrix {
                 OperandMatrix::Weight(ref mat) => {
                     ensure!(
-                        mat.tensor.get_shape()[1] == bt.get_shape()[0],
+                        mat.tensor.shape()[1] == bt.shape()[0],
                         "bias shape {:?} is incompatible with right matrix shape {:?}",
-                        bt.get_shape(),
-                        mat.tensor.get_shape(),
+                        bt.shape(),
+                        mat.tensor.shape(),
                     );
                 }
                 OperandMatrix::Input => (),
@@ -233,7 +231,7 @@ impl<T> MatMul<T> {
     {
         let matmul = match (&self.left_matrix, &self.right_matrix) {
             (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => panic!(
-                "Found layer with 2 constant matrices, which is useless as the 
+                "Found layer with 2 constant matrices, which is useless as the
                 product can be directly used instead"
             ),
             (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
@@ -299,10 +297,10 @@ impl<T> MatMul<T> {
         };
         if let Some(bias) = self.bias.as_ref() {
             ensure!(
-                matmul.shape[1] == bias.shape[0],
+                matmul.shape()[1] == bias.shape()[0],
                 "Bias shape {:?} is incompatible with matmul shape {:?}",
-                bias.shape,
-                matmul.shape
+                bias.shape(),
+                matmul.shape()
             );
             Ok(matmul.add_dim2(bias))
         } else {
@@ -469,7 +467,7 @@ impl<N: Number> OpInfo for MatMul<N> {
                 } else {
                     shape.clone()
                 }),
-            self.bias.as_ref().map(|bias| bias.shape.clone()),
+            self.bias.as_ref().map(|bias| bias.shape().clone()),
         )
     }
 
@@ -681,17 +679,19 @@ impl MatMul<Element> {
 
     // Return evaluations for the constant matrix employed in the layer.
     // If there is no constant matrix in the layer, `None` is returned
+    // TODO: a reshaped tensor should be created as a tensor view without
+    // duplicating storage
     pub(crate) fn eval_constant_matrix(&self) -> Option<Vec<Element>> {
         match (&self.left_matrix, &self.right_matrix) {
             (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => panic!(
-                "Found layer with 2 constant matrices, which is useless as the 
+                "Found layer with 2 constant matrices, which is useless as the
                 product can be directly used instead"
             ),
             (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
-                Some(mat.tensor.pad_next_power_of_two().data)
+                Some(mat.tensor.pad_next_power_of_two().into_data())
             }
             (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-                Some(mat.tensor.pad_next_power_of_two().data)
+                Some(mat.tensor.pad_next_power_of_two().into_data())
             }
             (OperandMatrix::Input, OperandMatrix::Input) => None,
         }
@@ -789,7 +789,7 @@ impl MatMul<Element> {
         let mut left_mat_mle = left_matrix.to_mle_2d();
         // For a repeating matrix M like [v,v,v,...], where v is a column vector, then
         // the trick is that M(r1,r2) = v(r1) - here we take the right split that corresponds to
-        // the number of variables that the bias has and substract its eval from the last claim.
+        // the number of variables that the bias has and subtract its eval from the last claim.
         // since output(r1,r2) = M1 * M2 + bias(r2)
         let init_split = last_claim.clone();
         let (point_for_left, point_for_right) = Self::split_claim(&init_split, num_vars_2d);
@@ -884,10 +884,10 @@ impl MatMul<Element> {
     {
         let (left_shape, right_shape) = match (&self.left_matrix, &self.right_matrix) {
             (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
-                (mat.tensor.get_shape(), ctx_aux.last_output_shape[0].clone())
+                (mat.tensor.shape(), ctx_aux.last_output_shape[0].clone())
             }
             (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-                (ctx_aux.last_output_shape[0].clone(), mat.tensor.get_shape())
+                (ctx_aux.last_output_shape[0].clone(), mat.tensor.shape())
             }
             (OperandMatrix::Input, OperandMatrix::Input) => (
                 ctx_aux.last_output_shape[0].clone(),
@@ -1252,7 +1252,7 @@ mod tests {
 
         // Check dimensions remain the same
         assert_eq!(
-            matrix.get_shape(),
+            matrix.shape(),
             padded.left_matrix.get_actual_shape().unwrap()
         );
 
@@ -1372,10 +1372,10 @@ mod tests {
             .unwrap();
 
         // Check that the result is correct
-        let out_shape = output.get_shape();
+        let out_shape = output.shape();
         let out_cols = out_shape[1];
-        let padded_out_shape = padded_output.get_shape();
-        let padded_out_cols = padded_output.get_shape()[1];
+        let padded_out_shape = padded_output.shape();
+        let padded_out_cols = padded_output.shape()[1];
         for i in 0..padded_out_shape[0] {
             for j in 0..padded_out_cols {
                 if i < out_shape[0] && j < out_cols {
@@ -1400,7 +1400,7 @@ mod tests {
         let result = matmul
             .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
             .unwrap();
-        assert_eq!(result.outputs[0].data, vec![22.0, 28.0, 49.0, 64.0]);
+        assert_eq!(result.outputs[0].data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
     #[test]
@@ -1417,7 +1417,7 @@ mod tests {
         let result = matmul
             .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
             .unwrap();
-        assert_eq!(result.outputs[0].data, vec![22.0, 28.0, 49.0, 64.0]);
+        assert_eq!(result.outputs[0].data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
     #[test]

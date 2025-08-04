@@ -270,9 +270,6 @@ pub mod file_cache {
     use anyhow::{Context as _, anyhow, bail};
     use hex;
     use sha2::{Digest, Sha256};
-    use tokio::runtime::Runtime;
-    use wreq::{Client, redirect};
-    use wreq_util::Emulation;
     use std::{
         fs::{self, File},
         io::{ErrorKind, Write},
@@ -281,6 +278,9 @@ pub mod file_cache {
         thread,
         time::Duration,
     };
+    use tokio::runtime::Runtime;
+    use wreq::{Client, redirect};
+    use wreq_util::Emulation;
 
     // Directory to store cached files.
     static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -355,7 +355,6 @@ pub mod file_cache {
         const RETRY_DELAY_MS: u64 = 1000;
 
         for attempt in 0..MAX_RETRIES {
-            
             // Check 1: File exists and no lock. This is the ideal fast path.
             if local_file_path.exists() && !lock_file_path.exists() {
                 return Ok(local_file_path);
@@ -410,20 +409,24 @@ pub mod file_cache {
                     // Perform the download. Lock_guard ensures lock removal on success or panic/error.
                     match (|| -> anyhow::Result<()> {
                         // Create tokio runtime to handle async wreq operations
-                        let rt = Runtime::new()
-                            .context("Download: Failed to create tokio runtime")?;
-                        
+                        let rt =
+                            Runtime::new().context("Download: Failed to create tokio runtime")?;
+
                         let content = rt.block_on(async {
                             // Build wreq client with browser emulation and redirect following
                             let client = Client::builder()
                                 .emulation(Emulation::Firefox136)
                                 .redirect(redirect::Policy::limited(10))
                                 .build()
-                                .map_err(|e| anyhow!("Download: Failed to build wreq client: {}", e))?;
+                                .map_err(|e| {
+                                    anyhow!("Download: Failed to build wreq client: {}", e)
+                                })?;
 
                             // Make the request
-                            let response = client.get(url).send().await
-                                .with_context(|| format!("Download: Failed to GET URL: {}", url))?;
+                            let response =
+                                client.get(url).send().await.with_context(|| {
+                                    format!("Download: Failed to GET URL: {}", url)
+                                })?;
 
                             if !response.status().is_success() {
                                 bail!(

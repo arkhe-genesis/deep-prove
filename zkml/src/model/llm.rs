@@ -135,7 +135,7 @@ where
             // We simply need to take the _last_ inference trace that would contain _everything_
             seq_len += 1;
             tensor.concat(Tensor::new(vec![1, 1].into(), vec![last_token]));
-            debug_assert_eq!(tensor.get_shape()[0], seq_len);
+            debug_assert_eq!(tensor.shape()[0], seq_len);
             observer.observe(seq_len - user_len, &trace);
         }
         Ok(trace)

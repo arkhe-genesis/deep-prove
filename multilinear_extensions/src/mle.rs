@@ -110,6 +110,7 @@ impl<F: Field, E: ExtensionField> IntoMLE<DenseMultilinearExtension<E>> for Vec<
     }
 }
 
+// TODO: invert implementations for &[F] and Vec<F> to avoid the `to_vec`
 impl<F: Field, E: ExtensionField> IntoMLE<DenseMultilinearExtension<E>> for &[F] {
     fn into_mle(self) -> DenseMultilinearExtension<E> {
         self.to_vec().into_mle()

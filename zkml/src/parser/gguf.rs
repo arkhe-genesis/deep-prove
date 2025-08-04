@@ -138,15 +138,15 @@ impl FeedForward<f32> {
         let down = loader.get_tensor("ffn_down.weight")?.transpose();
         let down_bias = loader.get_tensor("ffn_down.bias")?;
         ensure!(
-            up.get_shape()[0] == c.hidden_size,
+            up.shape()[0] == c.hidden_size,
             "up have shape {:?} but in features should be equal to hidden_size: {}",
-            up.get_shape(),
+            up.shape(),
             c.hidden_size
         );
         ensure!(
-            down.get_shape()[1] == c.embedding_size,
+            down.shape()[1] == c.embedding_size,
             "down have shape {:?} but out features should be equal to embedding_size: {}",
-            down.get_shape(),
+            down.shape(),
             c.embedding_size
         );
         Ok(Self {
@@ -209,11 +209,11 @@ impl Attention<f32> {
         let out = loader.get_tensor("attn_output.weight")?.transpose();
         let out_bias = loader.get_tensor("attn_output.bias")?;
         ensure!(
-            out.get_shape().as_ref() == &[embedding_size, embedding_size],
+            out.shape().as_ref() == &[embedding_size, embedding_size],
             "out must have shape [hidden_size, hidden_size]"
         );
         ensure!(
-            out_bias.get_shape().as_ref() == &[embedding_size],
+            out_bias.shape().as_ref() == &[embedding_size],
             "out_bias must have shape [hidden_size]"
         );
 
@@ -240,18 +240,18 @@ impl Positional<f32> {
         match c.specific_config {
             LLMVariant::GPT2 => {
                 let position_embd = loader.get_tensor("position_embd.weight")?;
-                let shape = position_embd.get_shape();
+                let shape = position_embd.shape();
                 ensure!(
                     shape[0] == c.context_length,
                     "position_embd must have shape [{}] vs given {:?}",
                     c.context_length,
-                    position_embd.get_shape()
+                    position_embd.shape()
                 );
                 ensure!(
                     shape[1] == c.embedding_size,
                     "position_embd must have shape [{}] vs given {:?}",
                     c.embedding_size,
-                    position_embd.get_shape()
+                    position_embd.shape()
                 );
                 Ok(Self::new_learned(position_embd))
             }
@@ -657,7 +657,7 @@ pub mod tests {
         let embedding_tensor = loader.get_tensor("token_embd.weight")?;
         // Expected shape for gpt2 token_embd.weight: [vocab_size, embedding_length] = [50257, 768]
         assert_eq!(
-            embedding_tensor.get_shape(),
+            embedding_tensor.shape(),
             vec![50257usize, 768usize].into(),
             "Shape mismatch for token_embd.weight"
         );
@@ -667,7 +667,7 @@ pub mod tests {
         let attn_norm_weight = blk0_loader.get_tensor("attn_norm.weight")?;
         // Expected shape for blk.0.attn_norm.weight: [embedding_length] = [768]
         assert_eq!(
-            attn_norm_weight.get_shape(),
+            attn_norm_weight.shape(),
             vec![768usize].into(),
             "Shape mismatch for blk.0.attn_norm.weight"
         );
@@ -675,7 +675,7 @@ pub mod tests {
         let qkv_weight = blk0_loader.get_tensor("attn_qkv.weight")?;
         // Expected shape for blk.0.attn_qkv.weight: [3 * embedding_length, embedding_length] = [2304, 768]
         assert_eq!(
-            qkv_weight.get_shape(),
+            qkv_weight.shape(),
             vec![2304usize, 768usize].into(),
             "Shape mismatch for blk.0.attn_qkv.weight"
         );
@@ -685,7 +685,7 @@ pub mod tests {
         let blk0_attn_loader = blk0_loader.pp("attn_"); // New prefix: "blk.0.attn_"
         let attn_norm_weight_v2 = blk0_attn_loader.get_tensor("norm.weight")?; // Full name: "blk.0.attn_norm.weight"
         assert_eq!(
-            attn_norm_weight_v2.get_shape(),
+            attn_norm_weight_v2.shape(),
             vec![768usize].into(),
             "Shape mismatch for blk.0.attn_norm.weight via custom subscope"
         );
@@ -694,7 +694,7 @@ pub mod tests {
         let ffn_norm_weight = blk0_ffn_loader.get_tensor("norm.weight")?; // Full name: "blk.0.ffn_norm.weight"
         // Expected shape for blk.0.ffn_norm.weight: [embedding_length] = [768]
         assert_eq!(
-            ffn_norm_weight.get_shape(),
+            ffn_norm_weight.shape(),
             vec![768usize].into(),
             "Shape mismatch for blk.0.ffn_norm.weight via custom subscope"
         );

@@ -85,15 +85,15 @@ impl FeedForward<f32> {
         let down = l.get_tensor("ffn_down.weight")?;
         let down_bias = l.get_tensor("ffn_down.bias")?;
         ensure!(
-            up.get_shape()[0] == c.hidden_size,
+            up.shape()[0] == c.hidden_size,
             "up have shape {:?} but in features should be equal to hidden_size: {}",
-            up.get_shape(),
+            up.shape(),
             c.hidden_size
         );
         ensure!(
-            down.get_shape()[1] == c.embedding_size,
+            down.shape()[1] == c.embedding_size,
             "down have shape {:?} but out features should be equal to embedding_size: {}",
-            down.get_shape(),
+            down.shape(),
             c.embedding_size
         );
         Ok(Self {
@@ -174,17 +174,17 @@ impl Attention<f32> {
         // Python script exports it as [out_features, in_features]
         // For c_proj (attn_output), out_features = hidden_size, in_features = hidden_size
         ensure!(
-            out.get_shape().as_ref() == &[hidden_size, hidden_size],
+            out.shape().as_ref() == &[hidden_size, hidden_size],
             "Attention output weight tensor shape mismatch in from_json. Expected [{}, {}], got {:?}",
             hidden_size,
             hidden_size,
-            out.get_shape()
+            out.shape()
         );
         ensure!(
-            out_bias.get_shape().as_ref() == &[hidden_size],
+            out_bias.shape().as_ref() == &[hidden_size],
             "Attention output bias tensor shape mismatch in from_json. Expected [{}], got {:?}",
             hidden_size,
-            out_bias.get_shape()
+            out_bias.shape()
         );
 
         let feedforward =
@@ -234,7 +234,7 @@ fn unfuse_crate_tensors(
         num_chunks,
         expected_chunk_len_elements,
         expected_total_elements,
-        fused_tensor.get_shape()
+        fused_tensor.shape()
     );
 
     let tensors_data: Vec<Vec<f32>> = data
@@ -255,21 +255,18 @@ fn unfuse_crate_tensors(
 impl Positional<f32> {
     pub fn from_json(l: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         let position_embd = l.get_tensor("position_embd.weight")?;
+        ensure!(position_embd.shape().len() == 2, "position_embd must be 2d");
         ensure!(
-            position_embd.get_shape().len() == 2,
-            "position_embd must be 2d"
-        );
-        ensure!(
-            position_embd.get_shape()[0] == c.context_length,
+            position_embd.shape()[0] == c.context_length,
             "position_embd must have shape [0] [{}] vs given {:?}",
             c.context_length,
-            position_embd.get_shape()
+            position_embd.shape()
         );
         ensure!(
-            position_embd.get_shape()[1] == c.embedding_size,
+            position_embd.shape()[1] == c.embedding_size,
             "position_embd must have shape [1] [{}] vs given {:?}",
             c.embedding_size,
-            position_embd.get_shape()
+            position_embd.shape()
         );
         Ok(Self::new_learned(position_embd))
     }

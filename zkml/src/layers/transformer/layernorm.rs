@@ -113,7 +113,7 @@ pub struct LayerNormData {
 
 impl<N: Number> LayerNorm<N> {
     pub fn new(gamma: Tensor<N>, beta: Tensor<N>, eps: f32) -> Self {
-        assert_eq!(gamma.get_shape(), beta.get_shape());
+        assert_eq!(gamma.shape(), beta.shape());
         Self {
             gamma,
             beta,
@@ -124,7 +124,7 @@ impl<N: Number> LayerNorm<N> {
 
     /// Returns the size of the dimension normalisation occurs over.
     pub fn normalisation_dim_size(&self) -> usize {
-        self.gamma.shape[0]
+        self.gamma.shape()[0]
     }
 
     /// Returns the [`QuantisedLayerNormData`] if there is any.
@@ -154,7 +154,7 @@ impl<N: Number> LayerNorm<N> {
         let input_scale = input_scaling.scale();
         // Get the dim size (N)
         let dim_size = self.normalisation_dim_size();
-        // We work out what we have to mutliply by so that everything is scaled to `LAYERNORM_SCALE_FACTOR` in quantised world
+        // We work out what we have to multiply by so that everything is scaled to `LAYERNORM_SCALE_FACTOR` in quantised world
         let multiplier =
             (LAYERNORM_SCALE_FACTOR as f32 * input_scale * input_scale).round() as Element;
         // Work out the number of variables the table requires, this is likely to be far too large to actually materialise as a table
@@ -162,7 +162,7 @@ impl<N: Number> LayerNorm<N> {
             + ceil_log2(multiplier as usize)
             + 1;
         // To get around this we use the fact that we should only have roughly `2*(*quantization::BIT_LEN -1)` bits of precision i.e. only the most significant `2*(*quantization::BIT_LEN -1)`
-        // can actually be "trusted" the rest are essentially junk because they don't come from the actual inputs and are just guesses at the part that we have alread "rounded away" in quantisation.
+        // can actually be "trusted" the rest are essentially junk because they don't come from the actual inputs and are just guesses at the part that we have already "rounded away" in quantisation.
         // So the actual part we perform inverse square root on is size `2*(*quantization::BIT_LEN -1)` and then we just need the discarded part to be range checked (which we do via a separate lookup).
         let range_checked_bits = full_table_bit_size - 2 * (*quantization::BIT_LEN - 1);
 
@@ -207,7 +207,7 @@ impl<N: Number> LayerNorm<N> {
             })
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-        let quant_gamma = Tensor::<Element>::new(self.gamma.get_shape(), quant_gamma_data);
+        let quant_gamma = Tensor::<Element>::new(self.gamma.shape(), quant_gamma_data);
         // Work out how to quantise the bias, it needs to have the same scale factor as the end product.
         // This will be `input_scaling.scale() * model_scaling.scale() * 1.0f32 / LAYERNORM_OUTPUT_SCALE_FACTOR as f32`
         let bias_scale = input_scale * model_scaling.scale() / LAYERNORM_OUTPUT_SCALE_FACTOR as f32;
@@ -233,7 +233,7 @@ impl<N: Number> LayerNorm<N> {
             })
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-        let quant_beta = Tensor::<Element>::new(self.beta.get_shape(), quant_bias_data);
+        let quant_beta = Tensor::<Element>::new(self.beta.shape(), quant_bias_data);
 
         // To calculate the intermediate bit size we have that the output is `self.gamma * (N * input - SUM input) * lookup_output + self.beta`
         // So lets work out the left hand bit size
@@ -270,16 +270,16 @@ impl LayerNorm<f32> {
         let gamma = loader.get_tensor("norm.weight")?;
         let beta = loader.get_tensor("norm.bias")?;
         ensure!(
-            gamma.get_shape().as_ref() == &[c.embedding_size],
+            gamma.shape().as_ref() == &[c.embedding_size],
             "norm_gamma must have shape [{}] vs given {:?}",
             c.embedding_size,
-            gamma.get_shape()
+            gamma.shape()
         );
         ensure!(
-            beta.get_shape().as_ref() == &[c.embedding_size],
+            beta.shape().as_ref() == &[c.embedding_size],
             "norm_beta must have shape [{}] vs given {:?}",
             c.embedding_size,
-            beta.get_shape()
+            beta.shape()
         );
         let eps = loader.metadata::<f32>(c.specific_config.norm_epsilon_key());
         Ok(Self::new(gamma, beta, eps))
@@ -334,7 +334,7 @@ impl<N: Number> OpInfo for LayerNorm<N> {
     }
 
     fn describe(&self) -> String {
-        format!("LayerNorm(dimension size: {:?})", self.gamma.get_shape(),)
+        format!("LayerNorm(dimension size: {:?})", self.gamma.shape(),)
     }
 
     fn is_provable(&self) -> bool {
@@ -354,25 +354,25 @@ impl Evaluate<f32> for LayerNorm<f32> {
         assert!(inputs.len() == 1);
         let input = inputs[0];
         ensure!(
-            input.get_shape().len() == 2,
+            input.shape().len() == 2,
             "layernorm input must have shape [seq_len, embedding_size]: found {:?}",
-            input.get_shape()
+            input.shape()
         );
-        let embedding_size = input.get_shape()[1];
+        let embedding_size = input.shape()[1];
         let device = Default::default();
         // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
         // instead of re-implementing everything ourselves.
         // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/layer.rs.html#67
         let input = BTensor::<Backend, 2>::from_data(
-            TensorData::new(input.get_data().to_vec(), input.get_shape()),
+            TensorData::new(input.get_data().to_vec(), input.shape()),
             &device,
         );
         let gamma = BTensor::<Backend, 1>::from_data(
-            TensorData::new(self.gamma.get_data().to_vec(), self.gamma.get_shape()),
+            TensorData::new(self.gamma.get_data().to_vec(), self.gamma.shape()),
             &device,
         );
         let beta = BTensor::<Backend, 1>::from_data(
-            TensorData::new(self.beta.get_data().to_vec(), self.beta.get_shape()),
+            TensorData::new(self.beta.get_data().to_vec(), self.beta.shape()),
             &device,
         );
         let config = BLayerNormConfig::new(embedding_size).with_epsilon(self.eps as f64);
@@ -419,7 +419,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
         } = self.quant_info.as_ref().unwrap();
 
         // So we need to take the input data and calculate `N * multiplier * SUM (xi * xi) - multiplier * (SUM xi) * (SUM xi)`
-        let final_dim = *input.get_shape().last().ok_or(anyhow!(
+        let final_dim = *input.shape().last().ok_or(anyhow!(
             "Cannot evaluate LayerNorm, input didn't have a shape"
         ))?;
 
@@ -464,7 +464,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
             range_check,
         };
 
-        let output_tensor = Tensor::<Element>::new(input.get_shape(), output_data);
+        let output_tensor = Tensor::<Element>::new(input.shape(), output_data);
         Ok(LayerOut::from_tensor(output_tensor)
             .with_proving_data(ProvingData::LayerNorm(layernorm_data)))
     }
@@ -600,8 +600,8 @@ where
             aux.tables.insert(TableType::InverseSQRT(*lut));
 
             // Add the Gamma and Beta commitments
-            let gamma_evals = self.gamma.pad_next_power_of_two().get_data().to_vec();
-            let beta_evals = self.beta.pad_next_power_of_two().get_data().to_vec();
+            let gamma_evals = self.gamma.pad_next_power_of_two().into_data();
+            let beta_evals = self.beta.pad_next_power_of_two().into_data();
 
             aux.model_polys = {
                 let mut model_polys = HashMap::new();
@@ -744,7 +744,7 @@ where
             step_data.inputs[0].get_data().to_vec().into_mle().into();
         // We also make the MLE for the sum of each dim we perform layernorm on
         let last_dim = *step_data.inputs[0]
-            .shape
+            .shape()
             .last()
             .ok_or(anyhow!("Step data input tensor had no shape in LayerNorm"))?;
         let mean_mle = step_data.inputs[0]
@@ -1195,7 +1195,7 @@ impl LayerNorm<Element> {
             .collect::<Vec<(PCS::CommitmentWithWitness, DenseMultilinearExtension<E>)>>();
         let inv_sqrt_evals = evals.drain(..2).collect::<Vec<Vec<E::BaseField>>>();
 
-        // Add the merged columsn to the lookups lists
+        // Add the merged columns to the lookups lists
         gen.element_count
             .insert(TableType::Range, range_elements_count);
 
@@ -1315,7 +1315,7 @@ where
             .collect::<Vec<E>>();
         let rlc_terms = compute_betas_eval(&batching_challenge);
         // Build the initial evaluation for the accumulatio n sumcheck
-        let accumulation_inital_eval = inv_sqrt_claims
+        let accumulation_initial_eval = inv_sqrt_claims
             .iter()
             .chain(range_claims.iter())
             .zip(rlc_terms.iter())
@@ -1323,7 +1323,7 @@ where
         let aux_info =
             VPAuxInfo::<E>::from_mle_list_dimensions(&[vec![inv_sqrt_claims[0].point.len(); 2]]);
         let accumulation_subclaim = IOPVerifierState::verify(
-            accumulation_inital_eval,
+            accumulation_initial_eval,
             accumulation_proof,
             &aux_info,
             verifier.transcript,
@@ -1343,11 +1343,11 @@ where
 
         ensure!(
             calculated_claim == accumulation_subclaim.expected_evaluation,
-            "LayerNorm verifiaction failed calculated claim for accumulation proof: {:?}, did not equal the expected claim: {:?}",
+            "LayerNorm verification failed calculated claim for accumulation proof: {:?}, did not equal the expected claim: {:?}",
             calculated_claim,
             accumulation_subclaim.expected_evaluation
         );
-        // Now we build the inital evaluation for the io_sumcheck
+        // Now we build the initial evaluation for the io_sumcheck
         let challenge = verifier
             .transcript
             .get_and_append_challenge(b"batching")
@@ -1424,7 +1424,7 @@ where
         let calculated_io_claim = first_part + second_part + third_part;
         ensure!(
             calculated_io_claim == io_subclaim.expected_evaluation,
-            "Calculated IO subclaim: {:?} did not equal expected: {:?} in LayerNorm verifiaction",
+            "Calculated IO subclaim: {:?} did not equal expected: {:?} in LayerNorm verification",
             calculated_io_claim,
             io_subclaim.expected_evaluation
         );
@@ -1547,7 +1547,7 @@ mod tests {
         };
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
         let output = layernorm.evaluate::<E>(&[&input], vec![]).unwrap();
-        assert_eq!(output.outputs[0].get_shape(), vec![1, 1024].into());
+        assert_eq!(output.outputs[0].shape(), vec![1, 1024].into());
         assert_eq!(output.outputs[0].get_data(), vec![0.0; 1024]);
     }
 

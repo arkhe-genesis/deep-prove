@@ -241,7 +241,7 @@ impl<N: Number> Mha<N> {
     {
         let unpadded_input_shapes = if unpadded_input_shapes.is_empty() {
             // take input shapes from inputs
-            inputs.iter().map(|input| input.get_shape()).collect()
+            inputs.iter().map(|input| input.shape()).collect()
         } else {
             unpadded_input_shapes
         };
@@ -540,7 +540,7 @@ where
     let nrows = padded_shape[0].max(padded_num_heads * padded_head_dim);
     let ncols = padded_shape[1];
 
-    let unpadded_shape = matrix.get_shape();
+    let unpadded_shape = matrix.shape();
 
     ensure!(
         unpadded_shape.is_matrix(),
@@ -661,7 +661,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         // apply reshaping to input and output tensors before employing them in proving logic
         let reshaped_inputs = self.inputs_reshape.evaluate_layer::<E, E>(
             &inputs.iter().collect_vec(),
-            inputs.iter().map(|input| input.get_shape()).collect(),
+            inputs.iter().map(|input| input.shape()).collect(),
         )?;
 
         let reshaped_inputs = reshaped_inputs.outputs();
@@ -988,10 +988,10 @@ mod test {
             assert_eq!(output.outputs.len(), 1);
             let qk = output.outputs.remove(0);
             // normally [1,seq_len] per head, so with all heads [num_heads, 1, seq_len]
-            assert_eq!(qk.get_shape(), vec![num_heads, q_len, seq_len].into());
+            assert_eq!(qk.shape(), vec![num_heads, q_len, seq_len].into());
             let output_shapes =
-                mha_qk.output_shapes(&[q.get_shape(), k.get_shape()], PaddingMode::NoPadding);
-            assert_eq!(output_shapes, vec![qk.get_shape()]);
+                mha_qk.output_shapes(&[q.shape(), k.shape()], PaddingMode::NoPadding);
+            assert_eq!(output_shapes, vec![qk.shape()]);
         }
     }
 
@@ -1021,14 +1021,14 @@ mod test {
                 .unwrap()
                 .final_mul;
             let mut output = mha_mul
-                .evaluate::<GoldilocksExt2>(&[&qk, &v], vec![qk.get_shape(), v.get_shape()])
+                .evaluate::<GoldilocksExt2>(&[&qk, &v], vec![qk.shape(), v.shape()])
                 .expect("mha_final_mul should not fail");
             assert_eq!(output.outputs.len(), 1);
             let out = output.outputs.remove(0);
-            assert_eq!(out.get_shape(), vec![q_len, num_heads, head_dim].into());
+            assert_eq!(out.shape(), vec![q_len, num_heads, head_dim].into());
             let output_shapes =
-                mha_mul.output_shapes(&[qk.get_shape(), v.get_shape()], PaddingMode::NoPadding);
-            assert_eq!(output_shapes, vec![out.get_shape()]);
+                mha_mul.output_shapes(&[qk.shape(), v.shape()], PaddingMode::NoPadding);
+            assert_eq!(output_shapes, vec![out.shape()]);
         }
     }
 
@@ -1042,8 +1042,8 @@ mod test {
         let minus_infinity = infinitizer(num_heads, q_len, seq_len, Element::MIN);
         let zeroified = input.mul(&zeros);
         let infinitized = zeroified.add(&minus_infinity);
-        assert_eq!(zeroified.get_shape(), input.get_shape());
-        assert_eq!(infinitized.get_shape(), input.get_shape());
+        assert_eq!(zeroified.shape(), input.shape());
+        assert_eq!(infinitized.shape(), input.shape());
         let (slice_it, _) = infinitized.slice_on_dim(0);
         slice_it.enumerate().all(|(head_idx, head)| {
             head.chunks(q_len).enumerate().all(|(q_idx, q)| {
@@ -1348,7 +1348,7 @@ mod test {
 
         let output = &outputs[0];
 
-        let padded_output_shape = output.get_shape();
+        let padded_output_shape = output.shape();
 
         for i in 0..padded_output_shape[0] {
             for j in 0..padded_output_shape[1] {
@@ -1412,7 +1412,7 @@ mod test {
 
         let mut padded_input_data = vec![Element::default(); padded_input_shape.product()];
 
-        input.data.iter().enumerate().for_each(|(i, value)| {
+        input.data().iter().enumerate().for_each(|(i, value)| {
             let col = i % input_shape[1];
             let row = i / input_shape[1];
             let padded_col = col / head_dim * padded_head_dim + col % head_dim;
@@ -1423,7 +1423,7 @@ mod test {
 
         let padded_output = padded_input.matmul(&padded_matrix);
 
-        let padded_out_shape = padded_output.get_shape();
+        let padded_out_shape = padded_output.shape();
 
         for i in 0..padded_out_shape[0] {
             for j in 0..padded_out_shape[1] {
@@ -1473,7 +1473,7 @@ mod test {
             .positional
             .evaluate::<GoldilocksExt2>(&vec![embedded.outputs()[0]], vec![])?;
 
-        let input_shape = positioned.outputs()[0].get_shape();
+        let input_shape = positioned.outputs()[0].shape();
 
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
@@ -1583,7 +1583,7 @@ mod test {
 
         // check that non-garbabe entries in padded output are the same as corresponding entries
         // in unpadded_out, i.e., the padding didn't affect the results of MHA
-        let padded_out_shape = padded_out.get_shape();
+        let padded_out_shape = padded_out.shape();
 
         let padded_head_dim = head_dim.next_power_of_two();
         for i in 0..padded_out_shape[0] {

@@ -24,7 +24,7 @@ impl<N: Number> Evaluate<N> for Permute {
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
-            inputs.iter().all(|t| t.get_shape().len() == 3),
+            inputs.iter().all(|t| t.shape().len() == 3),
             "Permute expects 3D tensors"
         );
         let output = inputs
@@ -51,6 +51,6 @@ mod test {
         let output = permute
             .evaluate::<GoldilocksExt2>(&[&input], vec![])
             .unwrap();
-        assert_eq!(output.outputs()[0].get_shape(), vec![3, 2, 4].into());
+        assert_eq!(output.outputs()[0].shape(), vec![3, 2, 4].into());
     }
 }

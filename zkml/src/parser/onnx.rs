@@ -386,20 +386,19 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         return err(format!("Gemm {} has no constant input", node.name));
     };
     let mut weight = extract_const_tensor(model.node(weight_link.node))?;
-    let mut weight_shape = weight.get_shape();
+    let weight_shape = weight.shape();
     if weight_shape.len() > 2 {
         let input_flattened = weight_shape[1..].iter().product::<usize>();
-        weight_shape = Shape::new(vec![weight_shape[0], input_flattened]);
-        weight.shape = weight_shape.clone();
+        weight.set_shape(Shape::new(vec![weight_shape[0], input_flattened]));
     } else if weight_shape.len() == 1 {
         // A Gemm is always a matrix - so if there's only one dimension, we need to add 1 to
         // to the output features
-        weight.shape = weight.shape.insert(0, 1);
-    }
+        weight.set_shape(weight_shape.insert(0, 1));
+    };
     ensure_onnx!(
         weight.is_matrix(),
         "Weight for Gemm must be a matrix: {:?}",
-        weight.get_shape()
+        weight.shape()
     );
     // find the input node
     let Some(input_link) = node.inputs.iter().find(|&x| x.node != weight_link.node) else {
@@ -425,7 +424,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         if *weight_shape.last().unwrap() == out_features {
             // Layout is likely [...in_features, out_features].
             let in_features = weight_size_flattened / out_features;
-            weight.shape = Shape::new(vec![in_features, out_features]);
+            weight.set_shape(Shape::new(vec![in_features, out_features]));
             // Transpose to get [out_features, in_features] for subsequent logic.
             weight = weight.transpose();
         } else if weight_shape[0] == out_features {
@@ -437,7 +436,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
                 in_features,
                 input_size_flattened
             );
-            weight.shape = Shape::new(vec![out_features, in_features]);
+            weight.set_shape(Shape::new(vec![out_features, in_features]));
         } else {
             return err(format!(
                 "Could not determine layout of weights for Gemm. Shape: {weight_shape:?}, expecting output dim of size {out_features}"
@@ -447,7 +446,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     ensure_onnx!(
         weight.is_matrix(),
         "Weight for Gemm must be a matrix 2: {:?}",
-        weight.get_shape()
+        weight.shape()
     );
 
     if input_shape.len() != 1 {
@@ -463,10 +462,10 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         input_shape
     );
 
-    let mut weight_shape = weight.get_shape();
+    let mut weight_shape = weight.shape();
     if weight_shape[1] != input_shape[0] {
         weight = weight.transpose();
-        weight_shape = weight.get_shape();
+        weight_shape = weight.shape();
     }
     ensure_onnx!(
         weight_shape[1] == input_shape[0],
@@ -474,7 +473,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         input_shape,
         weight_shape,
     );
-    let mut weight_shape = weight.get_shape();
+    let mut weight_shape = weight.shape();
     // If the weights are a 1D vector we insert a 1 in the shape after checking everything lines up
     if weight_shape.len() == 1 {
         ensure_onnx!(
@@ -483,11 +482,11 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
             input_shape,
             weight_shape,
         );
-        weight.shape.insert(0, 1);
+        weight.shape_mut().insert(0, 1);
     } else {
         if weight_shape[1] != input_shape[0] {
             weight = weight.transpose();
-            weight_shape = weight.get_shape();
+            weight_shape = weight.shape();
         }
         ensure_onnx!(
             *weight_shape.last().unwrap() == input_shape[0],
@@ -551,23 +550,23 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
             extract_const_tensor(bias_node)?
         }
         // we always require a bias tensor in current proving logic
-        None => crate::Tensor::zeros(vec![weight.shape[0]].into()),
+        None => crate::Tensor::zeros(vec![weight.shape()[0]].into()),
     };
     ensure_onnx!(
-        bias_tensor.shape.len() == 1 || bias_tensor.shape.len() == 2,
+        bias_tensor.shape().len() == 1 || bias_tensor.shape().len() == 2,
         "Bias tensor must be 1D or 2D with batch: {:?}",
-        bias_tensor.shape
+        bias_tensor.shape()
     );
-    if bias_tensor.shape.len() == 2 {
+    if bias_tensor.shape().len() == 2 {
         ensure_onnx!(
-            bias_tensor.shape[0] == 1,
+            bias_tensor.shape()[0] == 1,
             "Bias tensor must be 1D with batch: {:?}",
-            bias_tensor.shape
+            bias_tensor.shape()
         );
-        bias_tensor.shape = bias_tensor.shape.slice(1..);
+        bias_tensor.set_shape(bias_tensor.shape().slice(1..));
     }
     ensure_onnx!(
-        bias_tensor.shape[0] == weight.shape[0],
+        bias_tensor.shape()[0] == weight.shape()[0],
         "Bias tensor must have same size as filter's rows"
     );
     let dense = crate::layers::dense::Dense::new(weight, bias_tensor);

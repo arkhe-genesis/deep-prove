@@ -68,8 +68,8 @@ pub struct EmbeddingsProof<E: ExtensionField> {
 
 impl<N: Number> Embeddings<N> {
     pub fn new(emb: Tensor<N>) -> anyhow::Result<Self> {
-        let emb_size = emb.get_shape()[1];
-        let vocab_size = emb.get_shape()[0];
+        let emb_size = emb.shape()[1];
+        let vocab_size = emb.shape()[0];
         // left side is one hot input tensor, and right side
         // is the embedding matrix
         let left = OperandMatrix::Input;
@@ -200,9 +200,9 @@ impl<N: Number> Evaluate<N> for Embeddings<N> {
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
-            inputs.iter().all(|x| { x.get_shape().rank() == 1 }),
+            inputs.iter().all(|x| { x.shape().rank() == 1 }),
             "embeddings only support 1d tensors: {:?}",
-            inputs.iter().map(|x| x.get_shape()).collect::<Vec<_>>()
+            inputs.iter().map(|x| x.shape()).collect::<Vec<_>>()
         );
         ensure!(inputs.len() == 1, "embeddings only support 1 input tensor");
         // we still uses this evaluation for inference as it's quicker
@@ -213,9 +213,9 @@ impl<N: Number> Evaluate<N> for Embeddings<N> {
         };
         let emb = &w.tensor;
         let x = inputs[0];
-        let seq_len = x.get_shape()[0];
-        let vocab_size = emb.get_shape()[0];
-        let emb_size = emb.get_shape()[1];
+        let seq_len = x.shape()[0];
+        let vocab_size = emb.shape()[0];
+        let emb_size = emb.shape()[1];
         let emb_data = emb.get_data();
         let emb = x
             .get_data()
@@ -282,7 +282,10 @@ where
         aux.model_polys = Some(
             once((
                 EMBEDDING_POLY_ID.to_string(),
-                self.embedding_matrix().pad_next_power_of_two().data,
+                self.embedding_matrix()
+                    .pad_next_power_of_two()
+                    .data()
+                    .to_vec(),
             ))
             .collect(),
         );
@@ -541,7 +544,7 @@ where
         let input = inputs[0].as_ref();
         let one_hot_claim = &claims[0];
         let vocab_nv = self.vocab_size.next_power_of_two().ilog2();
-        let seq_len_nv = input.get_shape().dim(0).next_power_of_two().ilog2();
+        let seq_len_nv = input.shape().dim(0).next_power_of_two().ilog2();
         ensure!(
             vocab_nv + seq_len_nv == one_hot_claim.point.len() as u32,
             "vocab_nv: {vocab_nv}, seq_len_nv: {seq_len_nv}, one_hot_claim.point.len(): {}",
@@ -653,8 +656,8 @@ mod tests {
         let vocab_size = 6;
         let emb_size = 10;
         let one_hot = one_hot_encoding(&indices.get_data(), vocab_size);
-        let expected_shape: Shape = vec![indices.get_shape().numel(), vocab_size].into();
-        assert_eq!(one_hot.get_shape(), expected_shape);
+        let expected_shape: Shape = vec![indices.shape().numel(), vocab_size].into();
+        assert_eq!(one_hot.shape(), expected_shape);
         assert_eq!(
             one_hot.get_data(),
             vec![
@@ -697,7 +700,7 @@ mod tests {
         let out = embeddings
             .evaluate::<GoldilocksExt2>(&[&input], vec![vec![indices_elem.len(), 1].into()])?;
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
-        assert_eq!(out.outputs()[0].get_shape(), expected_shape);
+        assert_eq!(out.outputs()[0].shape(), expected_shape);
         let onehot_result = one_hot.matmul(&emb.to_fields());
         assert_eq!(
             onehot_result.get_data(),
@@ -729,7 +732,7 @@ mod tests {
             .collect::<Vec<_>>();
         let x = Tensor::new(vec![seq_len].into(), input_data.clone());
         let out = embeddings.evaluate::<GoldilocksExt2>(&[&x], vec![vec![seq_len].into()])?;
-        assert_eq!(out.outputs()[0].get_shape(), vec![seq_len, emb_size].into());
+        assert_eq!(out.outputs()[0].shape(), vec![seq_len, emb_size].into());
         // for each input index, check that the embedding vector is the correct one
         for (idx, table_idx) in input_data.iter().enumerate() {
             let emb = emb_vector(*table_idx as usize);

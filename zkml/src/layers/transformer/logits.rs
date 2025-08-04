@@ -93,7 +93,7 @@ impl Logits {
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<(LayerOut<N, E>, ArgmaxData<N>)> {
         ensure!(
-            inputs.iter().all(|i| i.get_shape().len() >= 2),
+            inputs.iter().all(|i| i.shape().len() >= 2),
             "Argmax is for tensors of rank >= 2"
         );
 
@@ -394,7 +394,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         // build the reduced MLE of the matrix `M`, which has the same shape of `input`, from `max_values` and `output`.
         // More specifically, `M[i][j] = max_values[i] if j == output[i], 0 otherwise`. The MLE has the row variables
         // already fixed to `row_point`, to be later employed in the sum-check
-        let input_shape = input.get_shape();
+        let input_shape = input.shape();
 
         let beta_vec = compute_betas_eval(row_point);
         let mut reduced_m = vec![E::ZERO; input_shape.dim(input_shape.rank() - 1)];
@@ -502,12 +502,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
 
         let max_values = &argmax_data.max_values[0];
 
-        let input_shape = input.get_shape();
+        let input_shape = input.shape();
         ensure!(
-            max_values.get_shape().dim(0) == input.get_shape().dim(0),
+            max_values.shape().dim(0) == input.shape().dim(0),
             "Incompatible shapes between max values tensor and input tensor: {:?} vs {:?}",
-            max_values.get_shape(),
-            input.get_shape(),
+            max_values.shape(),
+            input.shape(),
         );
 
         let (merged_diff, diff_values): (Vec<Element>, Vec<E::BaseField>) = input
@@ -696,15 +696,15 @@ impl<E: ExtensionField> LogitsCtx<E> {
     ) -> anyhow::Result<()> {
         ensure!(
             verifier.io.output.len() == 1,
-            "Expected 1 output tensor when veryfing logits layer output claim, found {}",
+            "Expected 1 output tensor when verifying logits layer output claim, found {}",
             verifier.io.output.len(),
         );
         let output = &verifier.io.output[0];
         ensure!(
-            output.get_shape().is_power_of_two(),
+            output.shape().is_power_of_two(),
             "Output shape in Logits layer is not a power of 2"
         );
-        let num_row_vars = output.get_shape().dim(0).ilog2() as usize;
+        let num_row_vars = output.shape().dim(0).ilog2() as usize;
         let (column_point, row_point) =
             Logits::split_claim_point(&output_claim.point, num_row_vars)?;
         let beta = compute_betas_eval(row_point);
