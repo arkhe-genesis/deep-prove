@@ -51,11 +51,7 @@ use crate::{
     tensor::{Number, Shape},
 };
 
-use burn::{
-    module::Param,
-    nn::LayerNormConfig as BLayerNormConfig,
-    tensor::{Tensor as BTensor, TensorData},
-};
+use burn::{module::Param, nn::LayerNormConfig as BLayerNormConfig};
 
 /// The base 2 logarithm of the scale factor used in the inverse square root lookup tables
 pub(crate) const LOG_LAYERNORM_SCALE_FACTOR: usize = 24;
@@ -342,9 +338,6 @@ impl<N: Number> OpInfo for LayerNorm<N> {
     }
 }
 
-// Type alias for the backend to use.
-type Backend = burn::backend::NdArray;
-
 impl Evaluate<f32> for LayerNorm<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
@@ -363,18 +356,9 @@ impl Evaluate<f32> for LayerNorm<f32> {
         // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
         // instead of re-implementing everything ourselves.
         // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/layer.rs.html#67
-        let input = BTensor::<Backend, 2>::from_data(
-            TensorData::new(input.get_data().to_vec(), input.shape()),
-            &device,
-        );
-        let gamma = BTensor::<Backend, 1>::from_data(
-            TensorData::new(self.gamma.get_data().to_vec(), self.gamma.shape()),
-            &device,
-        );
-        let beta = BTensor::<Backend, 1>::from_data(
-            TensorData::new(self.beta.get_data().to_vec(), self.beta.shape()),
-            &device,
-        );
+        let input = input.clone().into_btensor_2d();
+        let gamma = self.gamma.clone().into_btensor_1d();
+        let beta = self.beta.clone().into_btensor_1d();
         let config = BLayerNormConfig::new(embedding_size).with_epsilon(self.eps as f64);
         let mut norm = config.init(&device);
         norm.gamma = Param::from_tensor(gamma);

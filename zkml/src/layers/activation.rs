@@ -1,6 +1,7 @@
 use crate::{
     Claim, Context, Element, Prover, ScalingFactor,
     commit::same_poly,
+    gpu::zkml_gelu,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -19,8 +20,7 @@ use crate::{
     },
     model::StepData,
     padding::PaddingMode,
-    quantization,
-    quantization::Fieldizer,
+    quantization::{self, Fieldizer},
     tensor::{Number, Shape},
 };
 use ff_ext::ExtensionField;
@@ -610,21 +610,35 @@ impl Evaluate<f32> for GELU<f32> {
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let output_tensors: Vec<Tensor<f32>> = inputs
             .par_iter()
-            .map(|t| {
-                let d = t.get_data();
-                let gelued = d.iter().map(gelu_float).collect::<Vec<_>>();
-                Tensor::new(t.shape(), gelued)
+            .map(|tensor| {
+                let shape = tensor.shape();
+                let mut tensor = (*tensor).clone();
+                tensor.to_1d();
+                let tensor = tensor.into_btensor_1d();
+
+                let result = zkml_gelu(tensor);
+
+                let data = result.to_data().into_vec().expect("Failed to compute GELU");
+                Tensor::new(shape, data)
             })
             .collect();
         Ok(LayerOut::from_vec(output_tensors))
     }
 }
 
+/// Compute the GeLU
+///
+/// This formula is based on [1]
+///
+/// [1]: https://docs.pytorch.org/docs/stable/generated/torch.nn.GELU.html
 fn gelu_float(x: &f32) -> f32 {
+    let c = (2.0f32 / std::f32::consts::PI).sqrt();
+
     let x_cubed = x * x * x;
-    let inner_term = (2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x_cubed);
+    let inner_term = c * (x + 0.044715 * x_cubed);
     0.5 * x * (1.0 + inner_term.tanh())
 }
+
 impl GELU<f32> {
     fn quantize(&self, input_scaling: ScalingFactor) -> anyhow::Result<GELU<Element>> {
         // so we want sf * SCALING = multiplier
@@ -673,6 +687,7 @@ impl GELU<Element> {
 #[cfg(test)]
 mod test {
     use ff_ext::GoldilocksExt2;
+    use proptest::prelude::*;
 
     use crate::{
         Element,
@@ -731,16 +746,7 @@ mod test {
         let input_data = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
         let input_tensor = Tensor::new(vec![1, input_data.len()].into(), input_data.clone());
 
-        // Expected values calculated using the GELU approximation
-        // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        let expected_output_data = vec![
-            -0.045500278, // GELU(-2.0)
-            -0.15865526,  // GELU(-1.0)
-            0.0,          // GELU(0.0)
-            0.8413447,    // GELU(1.0)
-            1.9544997,    // GELU(2.0)
-            2.9963627,    // GELU(3.0)
-        ];
+        let expected_output_data = input_data.iter().map(gelu_float).collect::<Vec<_>>();
 
         let layer_out = gelu.evaluate::<GoldilocksExt2>(&[&input_tensor], vec![])?;
         assert_eq!(layer_out.outputs().len(), 1);
@@ -761,5 +767,27 @@ mod test {
                 );
             });
         Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn gelu_kernel_test(size in 1usize..1024) {
+            let shape = Shape::new(vec![size]);
+            let tensor = Tensor::<f32>::random(&shape);
+
+            let btensor = tensor.clone().into_btensor_1d();
+            let data = zkml_gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
+            let resultb = Tensor::<f32>::new(shape.clone(), data);
+
+            let data = tensor.get_data();
+            let data = data.iter().map(gelu_float).collect::<Vec<_>>();
+            let result = Tensor::new(shape, data);
+
+            let result_is_close = resultb.get_data().iter().zip(result.get_data().iter()).all(|(left, right)| {
+                (left-right).abs() < 1e-3
+            });
+
+            assert!(result_is_close, "btensor: {resultb:?} tensor: {result:?}");
+        }
     }
 }

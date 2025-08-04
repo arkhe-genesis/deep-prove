@@ -2,10 +2,12 @@
 
 use crate::{
     NextPowerOfTwo, ScalingFactor,
+    gpu::Backend,
     quantization::{self, MAX_FLOAT, MIN_FLOAT},
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use ark_std::rand::Rng;
+use burn::tensor::{Int, Tensor as BTensor, TensorData};
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use itertools::Itertools;
 use mpcs::util::plonky2_util::log2_ceil;
@@ -633,6 +635,16 @@ impl Tensor<Element> {
             self.evals_flat(),
         )
     }
+
+    pub fn into_btensor_1d(self) -> BTensor<Backend, 1, Int> {
+        let shape = self.shape();
+        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
+    }
+
+    pub fn into_btensor_2d(self) -> BTensor<Backend, 2, Int> {
+        let shape = self.shape();
+        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
+    }
 }
 
 impl<F: ExtensionField> Tensor<F> {
@@ -690,6 +702,16 @@ impl Tensor<f32> {
             .collect::<Vec<_>>();
         Tensor::new(self.shape, data)
     }
+
+    pub fn into_btensor_1d(self) -> BTensor<Backend, 1> {
+        let shape = self.shape();
+        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
+    }
+
+    pub fn into_btensor_2d(self) -> BTensor<Backend, 2> {
+        let shape = self.shape();
+        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
+    }
 }
 
 impl<T: Number> Tensor<T> {
@@ -731,6 +753,11 @@ impl<T> Tensor<T> {
     {
         let num_elements = shape.product();
         Self::new(shape, vec![T::default(); num_elements])
+    }
+
+    /// Flattens the tensor into a 1D.
+    pub fn to_1d(&mut self) {
+        self.shape = Shape::new(vec![self.shape.product()]);
     }
 
     /// Is vector
@@ -1935,7 +1962,7 @@ impl<T: Number> Tensor<T> {
     pub fn min_value(&self) -> T {
         self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
     }
-    #[cfg(test)]
+
     pub fn random(shape: &Shape) -> Self {
         Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
     }
@@ -1955,9 +1982,8 @@ impl<T: Number> Tensor<T> {
     /// Creates a random matrix with a given number of rows and cols.
     /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
     /// sync which is not true for basic rng core.
-    #[cfg(test)]
     pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(|| crate::seed_from_env_or_rng()); // Use provided seed or default
+        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
         let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
         let size = shape.product();
         let data = (0..size).map(|_| T::random(&mut rng)).collect();

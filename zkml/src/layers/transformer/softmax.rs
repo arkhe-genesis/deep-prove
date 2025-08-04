@@ -581,7 +581,7 @@ impl Softmax<Element> {
         softmax_data: &SoftmaxData<E>,
         prover: &mut crate::Prover<E, T, PCS>,
     ) -> Result<(Vec<Claim<E>>, SoftmaxProof<E, PCS>)> {
-        // Check we have the correct number of claims
+        // Check number of claims
         ensure!(
             last_claims.len() == 1,
             "Softmax only produces one output claim but got: {}",
@@ -589,23 +589,24 @@ impl Softmax<Element> {
         );
         let last_claim = last_claims[0];
 
-        let logup_witnesses = prover.lookup_witness(node_id)?;
-        // Nw we need to know if we have any zero table lookups
+        // Check if there are zero table lookups
         let zero_table_lookups = self
             .quant_info()
             .map(|quant_info| !quant_info.number_zero_chunks.is_zero())
             .ok_or(anyhow!(
                 "No Quant Info available for Softmax, unable to prove"
             ))?;
+
         // Check that we have the correct number of witnesses for Softmax
         let num_witnesses = if zero_table_lookups { 4 } else { 3 };
-        if logup_witnesses.len() != num_witnesses {
-            return Err(anyhow!(
-                "There should be four lookup witnesses during Softmax proving, node: {}, number of witnesses: {}",
-                node_id,
-                logup_witnesses.len()
-            ));
-        }
+        let logup_witnesses = prover.lookup_witness(node_id)?;
+        ensure!(
+            logup_witnesses.len() == num_witnesses,
+            "There should be four lookup witnesses during Softmax proving, node: {}, number of witnesses: {}",
+            node_id,
+            logup_witnesses.len(),
+        );
+
         // Run the lookup protocol and return the lookup proof
         let (commits, logup_proofs): CommsAndProofs<PCS, E> = logup_witnesses
             .into_iter()

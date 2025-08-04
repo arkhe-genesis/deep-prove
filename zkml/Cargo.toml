@@ -18,17 +18,21 @@ path = "src/bin/bench.rs"
 
 [features]
 blake = ["mpcs/blake"]
-default = []
+default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
 capture-layers-quant = ["dep:sha2"]
 mem-track = ["utils/mem-track"]
+gpu = ["burn/wgpu", "dep:cubecl", "dep:burn-cubecl"]
+cpu = ["burn/ndarray"]
 
 [dependencies]
 anyhow.workspace = true
 ark-std.workspace = true
-burn = { version = "0.17.0", features = ["ndarray"] }
+burn = { version = "0.18.0", default-features = false }
+burn-cubecl = { version = "0.18.0", default-features = false, optional = true }
 candle-core = "0.9.1"
 clap = { workspace = true, features = ["derive", "env"] }
+cubecl = { version = "0.6.0", default-features = false, optional = true }
 derive_more = { workspace = true, features = ["full"] }
 ff_ext = { version = "0.1.0", path = "../ff_ext" }
 gguf-rs = "0.1.4"
@@ -75,6 +79,7 @@ rstest = "0.25.0"
 sha2 = "0.10.9"
 tempfile.workspace = true
 zstd = "0.13.3"
+proptest = "1.7.0"
 
 [[bench]]
 harness = false

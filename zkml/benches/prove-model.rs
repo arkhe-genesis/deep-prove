@@ -1,11 +1,13 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams, Hasher};
 use zkml::{
-    Context, Element, FloatOnnxLoader, Prover, default_transcript,
+    Context, Element, FloatOnnxLoader, Prover, Tensor, default_transcript,
     inputs::Input,
+    layers::{activation::GELU, provable::Evaluate},
     model::Model,
     quantization::{AbsoluteMax, ModelMetadata},
+    tensor::Shape,
     verify,
 };
 
@@ -72,7 +74,7 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
     }
 }
 
-fn criterion_benchmark(c: &mut Criterion) {
+fn models(c: &mut Criterion) {
     let mut group = c.benchmark_group("run-models");
     group
         .sample_size(20)
@@ -112,7 +114,25 @@ fn criterion_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+fn layers(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    for size in [1 << 5, 1 << 10, 1 << 15, 1 << 20, 1 << 22] {
+        let input = Tensor::<f32>::random(&Shape::new(vec![size]));
+
+        group.bench_with_input(BenchmarkId::new("gelu", size), &input, |b, input| {
+            let gelu = GELU::<f32>::new();
+            b.iter(|| gelu.evaluate::<GoldilocksExt2>(&[input], vec![]));
+        });
+    }
+
+    group.finish();
+}
+
 // NOTE: XXX: when running, limit RAYON_NUM_THREADS to e.g. 2 to avoid high
 // concurrency resulting in measure noise.
-criterion_group!(benches, criterion_benchmark);
+criterion_group!(benches, models, layers);
 criterion_main!(benches);
