@@ -1,8 +1,8 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 use ff_ext::ExtensionField;
 use itertools::Itertools;
-use multilinear_extensions::mle::FieldType;
+use multilinear_extensions::{mle::FieldType, smart_slice::SmartSlice};
 use rayon::{
     iter::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -20,16 +20,16 @@ use ark_std::{end_timer, start_timer};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct MerkleTree<E: ExtensionField, H: MerkleHasher<E>>
+pub struct MerkleTree<'a, E: ExtensionField, H: MerkleHasher<E>>
 where
     E::BaseField: Serialize + DeserializeOwned,
 {
     inner: Vec<Vec<H::Digest>>,
-    leaves: Vec<FieldType<E>>,
+    leaves: Vec<Arc<FieldType<'a, E>>>,
     _phantom: PhantomData<H>,
 }
 
-impl<E: ExtensionField, H: MerkleHasher<E>> MerkleTree<E, H>
+impl<'a, E: ExtensionField, H: MerkleHasher<E>> MerkleTree<'a, E, H>
 where
     E::BaseField: Serialize + DeserializeOwned,
 {
@@ -49,25 +49,25 @@ where
         inner.last().unwrap()[0].clone()
     }
 
-    pub fn from_inner_leaves(inner: Vec<Vec<H::Digest>>, leaves: FieldType<E>) -> Self {
+    pub fn from_inner_leaves(inner: Vec<Vec<H::Digest>>, leaves: FieldType<'a, E>) -> Self {
         Self {
             inner,
-            leaves: vec![leaves],
+            leaves: vec![leaves.into()],
             _phantom: PhantomData,
         }
     }
 
-    pub fn from_leaves(leaves: FieldType<E>) -> Self {
+    pub fn from_leaves(leaves: FieldType<'a, E>) -> Self {
         Self {
             inner: Self::compute_inner(&leaves),
-            leaves: vec![leaves],
+            leaves: vec![leaves.into()],
             _phantom: PhantomData,
         }
     }
 
-    pub fn from_batch_leaves(leaves: Vec<FieldType<E>>) -> Self {
+    pub fn from_batch_leaves(leaves: Vec<Arc<FieldType<'a, E>>>) -> Self {
         Self {
-            inner: merkelize::<E, H>(&leaves.iter().collect_vec()),
+            inner: merkelize::<E, H>(&leaves.iter().map(|l| l.as_ref()).collect_vec()),
             leaves,
             _phantom: PhantomData,
         }
@@ -85,7 +85,7 @@ where
         self.inner.len()
     }
 
-    pub fn leaves(&self) -> &Vec<FieldType<E>> {
+    pub fn leaves(&self) -> &Vec<Arc<FieldType<E>>> {
         &self.leaves
     }
 
@@ -107,7 +107,7 @@ where
     }
 
     pub fn get_leaf_as_base(&self, index: usize) -> Vec<E::BaseField> {
-        match &self.leaves[0] {
+        match &self.leaves[0].as_ref() {
             FieldType::Base(_) => self
                 .leaves
                 .iter()
@@ -121,7 +121,7 @@ where
     }
 
     pub fn get_leaf_as_extension(&self, index: usize) -> Vec<E> {
-        match &self.leaves[0] {
+        match &self.leaves[0].as_ref() {
             FieldType::Base(_) => self
                 .leaves
                 .iter()
@@ -202,7 +202,7 @@ where
     ) {
         authenticate_merkle_path_root::<E, H>(
             &self.inner,
-            FieldType::Ext(vec![left, right]),
+            FieldType::Ext(SmartSlice::Owned(vec![left, right])),
             index,
             root,
         )
@@ -217,7 +217,7 @@ where
     ) {
         authenticate_merkle_path_root::<E, H>(
             &self.inner,
-            FieldType::Base(vec![left, right]),
+            FieldType::Base(SmartSlice::Owned(vec![left, right])),
             index,
             root,
         )
@@ -232,8 +232,8 @@ where
     ) {
         authenticate_merkle_path_root_batch::<E, H>(
             &self.inner,
-            FieldType::Ext(left),
-            FieldType::Ext(right),
+            FieldType::Ext(SmartSlice::Owned(left)),
+            FieldType::Ext(SmartSlice::Owned(right)),
             index,
             root,
         )
@@ -248,8 +248,8 @@ where
     ) {
         authenticate_merkle_path_root_batch::<E, H>(
             &self.inner,
-            FieldType::Base(left),
-            FieldType::Base(right),
+            FieldType::Base(SmartSlice::Owned(left)),
+            FieldType::Base(SmartSlice::Owned(right)),
             index,
             root,
         )

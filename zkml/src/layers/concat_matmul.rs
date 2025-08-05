@@ -15,15 +15,21 @@ use std::collections::BTreeMap;
 use std::borrow::Borrow;
 
 use anyhow::{Result, ensure};
+use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
-    mle::{DenseMultilinearExtension, IntoMLE, MultilinearExtension},
-    virtual_poly::{VPAuxInfo, VirtualPolynomial},
+    Expression,
+    mle::{IntoMLE, MultilinearExtension},
+    virtual_poly::VPAuxInfo,
+    virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use tracing::trace;
 use transcript::Transcript;
 
@@ -133,11 +139,11 @@ impl InputMatrixDimensions {
 
     /// Compute the MLE for the input tensor, checking if the tensor needs to be permuted for the sum-check
     /// employed in proving
-    fn input_mle_for_proving<E: ExtensionField>(
+    fn input_mle_for_proving<'a, E: ExtensionField>(
         &self,
-        input: &Tensor<E>,
+        input: &'a Tensor<E>,
         partial_point: &[E],
-    ) -> DenseMultilinearExtension<E> {
+    ) -> MultilinearExtension<'a, E> {
         // determine if we need to permute the matrix for sum-check
         if self.concat_dimension > self.mat_mul_dimension || self.output_dimension == 1 {
             // we need to permute the matrix; for simplicity, we alwayes permute in order to get
@@ -532,20 +538,22 @@ impl ConcatMatMul {
             sum_check_num_vars,
             beta_mle.num_vars(),
         );
+        let num_threads = optimal_sumcheck_threads(sum_check_num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, sum_check_num_vars);
+        let expr = [&beta_mle, &left, &right]
+            .into_iter()
+            .fold(Expression::Constant(Either::Right(E::ONE)), |acc, p| {
+                acc * expr_builder.lift(Either::Left(p))
+            });
+        let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
+        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
-        let mut vp = VirtualPolynomial::new(sum_check_num_vars);
-
-        vp.add_mle_list(vec![beta_mle.into(), left.into(), right.into()], E::ONE);
-
-        #[allow(deprecated)]
-        let (proof, state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
-
-        let evals = state.get_mle_final_evaluations();
+        let evals = state.get_mle_flatten_final_evaluations();
 
         let left_eval = evals[1];
         let right_eval = evals[2];
 
-        let proof_point = &proof.point;
+        let proof_point = &state.collect_raw_challenges();
         let (point_for_concat_dim, point_for_mat_mul_dim) = self
             .permutations
             .split_sumcheck_point(proof_point, &input_shapes)?;
@@ -708,7 +716,7 @@ where
 
         let num_vars = (num_columns_left * num_chunks).ilog2() as usize;
 
-        let vp_aux = VPAuxInfo::from_mle_list_dimensions(&[vec![num_vars, num_vars, num_vars]]);
+        let vp_aux = crate::util::from_mle_list_dimensions(&[vec![num_vars, num_vars, num_vars]]);
 
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
 
@@ -834,7 +842,11 @@ where
                 &last_claims[0].point,
             )?;
 
-        let sumcheck_point = subclaim.point_flat();
+        let sumcheck_point = subclaim
+            .point
+            .iter()
+            .map(|p| p.elements)
+            .collect::<Vec<_>>();
 
         let (point_for_concat_dim, point_for_mat_mul_dim) = self
             .permutations

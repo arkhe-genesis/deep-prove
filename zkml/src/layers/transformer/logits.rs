@@ -27,17 +27,20 @@ use crate::{
     to_bit_sequence_le,
 };
 use anyhow::{anyhow, ensure};
+use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
-    mle::{IntoMLE, MultilinearExtension},
-    virtual_poly::{VPAuxInfo, VirtualPolynomial},
+    Expression, mle::IntoMLE, virtual_poly::VPAuxInfo, virtual_polys::VirtualPolynomialsBuilder,
 };
 use p3_field::FieldAlgebra;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use transcript::Transcript;
 
 use crate::{
@@ -225,7 +228,7 @@ impl<E: ExtensionField> ProveInfo<E> for Logits {
         );
 
         let input_num_vars = aux.last_output_shape[0].product().ilog2() as usize;
-        let hadamard_poly_aux = VPAuxInfo::from_mle_list_dimensions(&[vec![
+        let hadamard_poly_aux = crate::util::from_mle_list_dimensions(&[vec![
             input_num_vars,
             input_num_vars,
             input_num_vars,
@@ -236,7 +239,7 @@ impl<E: ExtensionField> ProveInfo<E> for Logits {
         let num_vars = aux.last_output_shape[0]
             .dim(aux.last_output_shape[0].rank() - 1)
             .ilog2() as usize;
-        let sumcheck_poly_aux = VPAuxInfo::from_mle_list_dimensions(&[vec![num_vars, num_vars]]);
+        let sumcheck_poly_aux = crate::util::from_mle_list_dimensions(&[vec![num_vars]]);
 
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.tables.insert(TableType::Range);
@@ -402,19 +405,22 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
             .for_each(|(beta, &out_value, &max_value)| reduced_m[out_value] += beta * max_value);
 
         let reduced_m_len = reduced_m.len();
-        let reduced_mle = Tensor::new(vec![reduced_m_len, 1].into(), reduced_m).to_mle_2d();
-        let mut vp = VirtualPolynomial::new(reduced_mle.num_vars());
-        let one_vec =
-            Tensor::new(vec![reduced_m_len, 1].into(), vec![E::ONE; reduced_m_len]).to_mle_2d();
-        vp.add_mle_list(vec![reduced_mle.into(), one_vec.into()], E::ONE);
-        #[allow(deprecated)]
-        let (sumcheck_proof, state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
 
-        let max_matrix_eval = state.get_mle_final_evaluations()[0];
+        let binding = Tensor::new(vec![reduced_m_len, 1].into(), reduced_m);
+        let reduced_mle = binding.to_mle_2d();
+        let num_vars = reduced_mle.num_vars();
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let reduced_expr = expr_builder.lift(Either::Left(&reduced_mle));
+        let virtual_poly = expr_builder.to_virtual_polys(&[reduced_expr], &[]);
+
+        let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+
+        let max_matrix_eval = state.get_mle_flatten_final_evaluations()[0];
 
         // build point for claim about matrix m
-        let claim_point = sumcheck_proof
-            .point
+        let claim_point = state
+            .collect_raw_challenges()
             .iter()
             .chain(row_point)
             .cloned()
@@ -431,30 +437,28 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
             one_hot_output[index] = E::BaseField::ONE;
         });
         let one_hot_mle = one_hot_output.into_mle();
-        let mut vp = VirtualPolynomial::new(input_mle.num_vars());
-        vp.add_mle_list(
-            vec![
-                input_mle.clone().into(),
-                one_hot_mle.into(),
-                beta_mle.into(),
-            ],
-            E::ONE,
-        );
-
-        // squeeze the challenge to include `input_claim` produced by the lookup in the hadamard product sum-check
-        let challenge = Self::squeeze_challenge(prover.transcript, &input_claim);
-
         // compute the beta evaluations over `input_claim.point`
         let input_eq_mle = compute_betas_eval(&input_claim.point).into_mle();
 
-        vp.add_mle_list(vec![input_eq_mle.into(), input_mle.into()], challenge);
+        let num_vars = input_mle.num_vars();
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let input_expr = expr_builder.lift(Either::Left(&input_mle));
+        let one_hot_expr = expr_builder.lift(Either::Left(&one_hot_mle));
+        let beta_expr = expr_builder.lift(Either::Left(&beta_mle));
+        let input_eq_expr = expr_builder.lift(Either::Left(&input_eq_mle));
 
-        #[allow(deprecated)]
-        let (hadamard_proof, state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
+        let expr = input_expr
+            * (beta_expr * one_hot_expr
+                + Expression::Challenge(0, 1, E::ONE, E::ZERO) * input_eq_expr);
+        // squeeze the challenge to include `input_claim` produced by the lookup in the hadamard product sum-check
+        let challenge = Self::squeeze_challenge(prover.transcript, &input_claim);
+        let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[challenge]);
+        let (hadamard_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
-        let input_eval = state.get_mle_final_evaluations()[0];
+        let input_eval = state.get_mle_flatten_final_evaluations()[0];
 
-        let final_input_claim = Claim::new(hadamard_proof.point.clone(), input_eval);
+        let final_input_claim = Claim::new(state.collect_raw_challenges(), input_eval);
 
         let proof = LogitsProof {
             logup_proof,
@@ -471,12 +475,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         Ok(vec![final_input_claim])
     }
 
-    fn gen_lookup_witness(
+    fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &Context<E, PCS>,
-        step_data: &StepData<Element, E>,
-    ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
+        ctx: &Context<'a, E, PCS>,
+        step_data: &'a StepData<Element, E>,
+    ) -> anyhow::Result<LookupWitnessGen<'a, E, PCS>> {
         ensure!(
             step_data.inputs.len() == 1,
             "Expected 1 input tensor for Logits witness generation, found {}",
@@ -640,8 +644,9 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         );
 
         let max_mat_claim_point = subclaim
-            .point_flat()
+            .point
             .iter()
+            .map(|p| &p.elements)
             .chain(row_point)
             .cloned()
             .collect_vec();
@@ -656,7 +661,11 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             verifier.transcript,
         );
 
-        let sumcheck_point = subclaim.point_flat();
+        let sumcheck_point = subclaim
+            .point
+            .iter()
+            .map(|p| p.elements)
+            .collect::<Vec<_>>();
         let beta_eval = identity_eval(&max_mat_claim_point, &sumcheck_point);
         let input_eq_eval = identity_eval(&input_claim.point, &sumcheck_point);
 

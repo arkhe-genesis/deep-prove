@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use derive_more::{From, Into};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
+use multilinear_extensions::mle::IntoMLE;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -484,13 +484,13 @@ where
     type Ctx: VerifiableCtx<E, PCS>;
 
     /// Produces a proof of correct execution for this operation.
-    fn prove<T: Transcript<E>>(
-        &self,
+    fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
+        &'a self,
         _node_id: NodeId,
-        _ctx: &Self::Ctx,
+        _ctx: &'b Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
-        _prover: &mut Prover<E, T, PCS>,
+        _prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
         assert!(
@@ -501,12 +501,12 @@ where
     }
 
     /// Generate witness for a node where a lookup table is employed in proving
-    fn gen_lookup_witness(
+    fn gen_lookup_witness<'a>(
         &self,
         _id: NodeId,
-        _ctx: &Context<E, PCS>,
-        _step_data: &StepData<Element, E>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+        _ctx: &'a Context<'a, E, PCS>,
+        _step_data: &'a StepData<Element, E>,
+    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
         Ok(Default::default())
     }
 }
@@ -568,7 +568,12 @@ where
             "number of input tensors and claims must be the same"
         );
         for (i, (input, claim)) in inputs.iter().zip(claims).enumerate() {
-            let computed = input.as_ref().get_data().into_mle().evaluate(&claim.point);
+            let computed = input
+                .as_ref()
+                .get_data()
+                .to_vec()
+                .into_mle()
+                .evaluate(&claim.point);
             ensure!(
                 computed == claim.eval,
                 "input claim {:?} is incorrect, computed: {:?}, given: {:?}",

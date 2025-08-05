@@ -13,9 +13,10 @@ use core::fmt::Debug;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::sync::Arc;
 use transcript::Transcript;
 
-use multilinear_extensions::mle::FieldType;
+use multilinear_extensions::{mle::FieldType, smart_slice::SmartSlice};
 
 use crate::util::plonky2_util::reverse_index_bits_in_place;
 use rayon::{
@@ -40,7 +41,7 @@ where
     let queries: Vec<_> = (0..num_verifier_queries)
         .map(|_| {
             transcript
-                .get_and_append_challenge(b"query indices")
+                .sample_and_append_challenge(b"query indices")
                 .elements
         })
         .collect();
@@ -77,7 +78,7 @@ where
     let queries: Vec<_> = (0..num_verifier_queries)
         .map(|_| {
             transcript
-                .get_and_append_challenge(b"query indices")
+                .sample_and_append_challenge(b"query indices")
                 .elements
         })
         .collect();
@@ -113,7 +114,7 @@ where
     let queries: Vec<_> = (0..num_verifier_queries)
         .map(|_| {
             transcript
-                .get_and_append_challenge(b"query indices")
+                .sample_and_append_challenge(b"query indices")
                 .elements
         })
         .collect();
@@ -162,8 +163,10 @@ pub fn verifier_query_phase<E: ExtensionField, Spec: BasefoldSpec<E>>(
     if <Spec::EncodingScheme as EncodingScheme<E>>::message_is_even_and_odd_folding() {
         reverse_index_bits_in_place(&mut message);
     }
-    let final_codeword =
-        <Spec::EncodingScheme as EncodingScheme<E>>::encode_small(vp, &FieldType::Ext(message));
+    let final_codeword = <Spec::EncodingScheme as EncodingScheme<E>>::encode_small(
+        vp,
+        &FieldType::Ext(SmartSlice::Owned(message)),
+    );
     let mut final_codeword = match final_codeword {
         FieldType::Ext(final_codeword) => final_codeword,
         _ => panic!("Final codeword must be extension field"),
@@ -237,8 +240,10 @@ pub fn batch_verifier_query_phase<E: ExtensionField, Spec: BasefoldSpec<E>>(
         reverse_index_bits_in_place(&mut message);
     }
     interpolate_over_boolean_hypercube(&mut message);
-    let final_codeword =
-        <Spec::EncodingScheme as EncodingScheme<E>>::encode_small(vp, &FieldType::Ext(message));
+    let final_codeword = <Spec::EncodingScheme as EncodingScheme<E>>::encode_small(
+        vp,
+        &FieldType::Ext(SmartSlice::Owned(message)),
+    );
     let mut final_codeword = match final_codeword {
         FieldType::Ext(final_codeword) => final_codeword,
         _ => panic!("Final codeword must be extension field"),
@@ -317,8 +322,10 @@ pub fn simple_batch_verifier_query_phase<E: ExtensionField, Spec: BasefoldSpec<E
         reverse_index_bits_in_place(&mut message);
     }
     interpolate_over_boolean_hypercube(&mut message);
-    let final_codeword =
-        <Spec::EncodingScheme as EncodingScheme<E>>::encode_small(vp, &FieldType::Ext(message));
+    let final_codeword = <Spec::EncodingScheme as EncodingScheme<E>>::encode_small(
+        vp,
+        &FieldType::Ext(SmartSlice::Owned(message)),
+    );
     let mut final_codeword = match final_codeword {
         FieldType::Ext(final_codeword) => final_codeword,
         _ => panic!("Final codeword must be extension field"),
@@ -449,7 +456,7 @@ where
             let x_index = x_index >> (log2_strict(codeword_size) - comm.codeword_size_log());
             let p1 = x_index | 1;
             let p0 = p1 - 1;
-            match &comm.get_codewords()[0] {
+            match &comm.get_codewords()[0].as_ref() {
                 FieldType::Ext(poly_codeword) => {
                     CodewordSingleQueryResult::new_ext(poly_codeword[p0], poly_codeword[p1], p0)
                 }
@@ -472,7 +479,7 @@ where
 }
 
 fn simple_batch_basefold_get_query<E: ExtensionField, H: MerkleHasher<E>>(
-    poly_codewords: &[FieldType<E>],
+    poly_codewords: &[Arc<FieldType<E>>],
     trees: &[MerkleTree<E, H>],
     x_index: usize,
 ) -> SimpleBatchSingleQueryResult<E>
@@ -483,7 +490,7 @@ where
     let p1 = index | 1;
     let p0 = p1 - 1;
 
-    let commitment_query = match poly_codewords[0] {
+    let commitment_query = match poly_codewords[0].as_ref() {
         FieldType::Ext(_) => SimpleBatchCommitmentSingleQueryResult::new_ext(
             poly_codewords
                 .iter()

@@ -1,4 +1,4 @@
-use std::{fs::File, io::BufReader};
+use std::{fs::File, io::BufReader, sync::Arc};
 use timed_core::Output;
 #[cfg(feature = "blake")]
 use transcript::blake::BlakeTranscript;
@@ -315,6 +315,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         None
     };
 
+    let ctx = Arc::new(ctx);
+
     let span = metrics.to_span();
     stream_metrics("Context creation", &span);
     info!("== Context creation metrics: {} ==", span);
@@ -392,8 +394,8 @@ fn run(args: Args) -> anyhow::Result<()> {
 
         let io = trace.to_verifier_io();
         let mut prover_transcript = new_transcript();
-        let prover = Prover::<_, _, _>::new(ctx.as_ref().unwrap(), &mut prover_transcript);
-        let proof = prover.prove(trace).expect("unable to generate proof");
+        let prover = Prover::<_, _, _>::new(ctx.as_ref().as_ref().unwrap(), &mut prover_transcript);
+        let proof = prover.prove(&trace).expect("unable to generate proof");
 
         // Serialize proof using MessagePack and calculate size in KB
         let proof_bytes = to_vec_named(&proof)?;
@@ -412,7 +414,7 @@ fn run(args: Args) -> anyhow::Result<()> {
 
         let mut verifier_transcript = new_transcript();
         verify::<_, _, _>(
-            ctx.as_ref().unwrap().clone(),
+            ctx.as_ref().clone().unwrap(),
             proof,
             io,
             &mut verifier_transcript,

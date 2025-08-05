@@ -4,8 +4,8 @@
 
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
 use ff_ext::ExtensionField;
-use gkr::structs::PointAndEval;
 use itertools::Itertools;
+use multilinear_extensions::mle::PointAndEval;
 use quantization::Fieldizer;
 use rayon::iter::ParallelIterator;
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ pub mod capture;
 
 #[cfg(test)]
 mod testing;
+pub(crate) mod util;
 
 /// We allow higher range to account for overflow. Since we do a requant after each layer, we
 /// can support with i128 with 8 bits quant:
@@ -228,7 +229,7 @@ mod test {
     use ark_std::rand::Rng;
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
     use itertools::Itertools;
-    use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
+    use multilinear_extensions::mle::IntoMLE;
     use p3_field::FieldAlgebra;
 
     use crate::{
@@ -283,7 +284,7 @@ mod test {
         let mut prover_transcript = default_transcript();
         let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
         println!("[+] Run prover");
-        let proof = prover.prove(trace).expect("unable to generate proof");
+        let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = default_transcript();
         verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript).expect("invalid proof");

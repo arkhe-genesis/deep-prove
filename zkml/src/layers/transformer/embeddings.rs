@@ -11,15 +11,16 @@ use crate::{
 };
 
 use anyhow::{anyhow, bail, ensure};
+use either::Either;
 use ff_ext::{ExtensionField, SmallField};
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    mle::MultilinearExtension,
-    virtual_poly::{VPAuxInfo, VirtualPolynomial},
-};
+use multilinear_extensions::{virtual_poly::VPAuxInfo, virtual_polys::VirtualPolynomialsBuilder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use transcript::Transcript;
 
 use crate::{
@@ -293,7 +294,9 @@ where
         Ok((
             LayerCtx::Embeddings(EmbeddingsCtx {
                 id,
-                sumcheck_poly_aux: VPAuxInfo::from_mle_list_dimensions(&[vec![num_vars, num_vars]]),
+                sumcheck_poly_aux: crate::util::from_mle_list_dimensions(&[vec![
+                    num_vars, num_vars,
+                ]]),
                 vocab_size: self.vocab_size,
                 emb_size: self.emb_size,
             }),
@@ -427,19 +430,25 @@ where
         assert_eq!(input_mle.num_vars(), embedding_mat_mle.num_vars());
 
         let num_vars = input_mle.num_vars();
-        let mut vp = VirtualPolynomial::<E>::new(num_vars);
-        vp.add_mle_list(vec![input_mle.into(), embedding_mat_mle.into()], E::ONE);
-        #[allow(deprecated)]
-        let (proof, state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let input_expr = expr_builder.lift(Either::Left(&input_mle));
+        let embedding_mat_expr = expr_builder.lift(Either::Left(&embedding_mat_mle));
+        let virtual_poly = expr_builder.to_virtual_polys(&[input_expr * embedding_mat_expr], &[]);
+        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
         // sum-check will produce claims about `reduced_one_hot` vector and the `embedding_matrix`. We need
         // to commit build a claim for the one-hot encoded input tensor from the first claim, and produce an
         // opening proof for the second claim
-        let one_hot_eval = state.get_mle_final_evaluations()[0];
-        let embedding_mat_eval = state.get_mle_final_evaluations()[1];
+        let final_evaluations = state.get_mle_flatten_final_evaluations();
+        let one_hot_eval = final_evaluations[0];
+        let embedding_mat_eval = final_evaluations[1];
 
-        let (one_hot_claim_point, embedding_mat_point) =
-            Self::build_points_for_claims(last_claim, self.emb_size, &proof.point)?;
+        let (one_hot_claim_point, embedding_mat_point) = Self::build_points_for_claims(
+            last_claim,
+            self.emb_size,
+            &state.collect_raw_challenges(),
+        )?;
 
         let output_claim = Claim::new(one_hot_claim_point, one_hot_eval);
 
@@ -454,7 +463,7 @@ where
             node_id,
             LayerProof::Embeddings(EmbeddingsProof {
                 sumcheck: proof,
-                individual_claims: state.get_mle_final_evaluations(),
+                individual_claims: final_evaluations,
             }),
         );
         Ok(vec![output_claim])
@@ -496,7 +505,11 @@ where
             Embeddings::<Element>::build_points_for_claims(
                 last_claim,
                 self.emb_size,
-                &subclaim.point_flat(),
+                &subclaim
+                    .point
+                    .iter()
+                    .map(|p| p.elements)
+                    .collect::<Vec<_>>(),
             )?;
         let one_hot_eval = proof.individual_claims[0];
         let embedding_mat_eval = proof.individual_claims[1];

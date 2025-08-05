@@ -522,13 +522,13 @@ where
 {
     type Ctx = LayerCtx<E>;
 
-    fn prove<T: Transcript<E>>(
-        &self,
+    fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
+        &'a self,
         node_id: provable::NodeId,
-        ctx: &Self::Ctx,
+        ctx: &'b Self::Ctx,
         last_claims: Vec<&crate::Claim<E>>,
         step_data: &StepData<E, E>,
-        prover: &mut crate::Prover<E, T, PCS>,
+        prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {
             (Layer::Dense(dense), LayerCtx::Dense(info)) => {
@@ -592,12 +592,12 @@ where
         }
     }
 
-    fn gen_lookup_witness(
+    fn gen_lookup_witness<'a>(
         &self,
         id: provable::NodeId,
-        ctx: &Context<E, PCS>,
-        step_data: &StepData<Element, E>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+        ctx: &'a Context<'a, E, PCS>,
+        step_data: &'a StepData<Element, E>,
+    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
         match self {
             Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data),
             Layer::Convolution(convolution) => convolution.gen_lookup_witness(id, ctx, step_data),

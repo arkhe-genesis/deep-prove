@@ -163,10 +163,10 @@ impl ConnContext {
 async fn process_job(job: v2::GwToWorker, store: &mut StoreKind) -> anyhow::Result<Vec<u8>> {
     let result = match store {
         StoreKind::S3(store) => {
-            crate::run_model_v1(job.try_into().context("parsing job")?, store).await
+            crate::run_model_v1(job.try_into().context("parsing job")?, store.clone()).await
         }
         StoreKind::Mem(store) => {
-            crate::run_model_v1(job.try_into().context("parsing job")?, store).await
+            crate::run_model_v1(job.try_into().context("parsing job")?, store.clone()).await
         }
     };
 

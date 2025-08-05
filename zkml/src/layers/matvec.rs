@@ -1,12 +1,15 @@
 use anyhow::ensure;
+use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use multilinear_extensions::{
-    mle::{IntoMLE, MultilinearExtension},
-    virtual_poly::{VPAuxInfo, VirtualPolynomial},
+    mle::IntoMLE, virtual_poly::VPAuxInfo, virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use transcript::Transcript;
 
 use crate::{Claim, Element, Tensor, quantization::TensorFielder, tensor::Number};
@@ -45,7 +48,7 @@ impl<T: Number> MatVec<T> {
     pub fn aux_info<E: ExtensionField>(&self) -> VPAuxInfo<E> {
         // we fix the rows variables during sumcheck so we only consider the columns
         let num_vars = self.matrix.ncols_2d().ilog2() as usize;
-        VPAuxInfo::<E>::from_mle_list_dimensions(&[vec![num_vars, num_vars]])
+        crate::util::from_mle_list_dimensions(&[vec![num_vars, num_vars]])
     }
 }
 
@@ -83,11 +86,13 @@ impl MatVec<Element> {
         let input_mle = input.get_data().to_vec().into_mle();
         assert_eq!(mat_mle.num_vars(), input_mle.num_vars());
         let num_vars = input_mle.num_vars();
-        let mut vp = VirtualPolynomial::<E>::new(num_vars);
-        vp.add_mle_list(vec![mat_mle.into(), input_mle.into()], E::ONE);
-        // let tmp_transcript = prover.transcript.clone();
-        #[allow(deprecated)]
-        let (proof, state) = IOPProverState::<E>::prove_parallel(vp, transcript);
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let mat_expr = expr_builder.lift(Either::Left(&mat_mle));
+        let input_expr = expr_builder.lift(Either::Left(&input_mle));
+        let virtual_poly = expr_builder.to_virtual_polys(&[mat_expr * input_expr], &[]);
+        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, transcript);
+
         debug_assert!(
             {
                 let output = self.matrix.clone().to_fields().matvec(input);
@@ -101,13 +106,13 @@ impl MatVec<Element> {
             "invalid sumcheck proof for matvec?"
         );
         let claim = Claim {
-            point: proof.point.clone(),
+            point: state.collect_raw_challenges(),
             // [mat, vec] -> we want the vector evaluation for the next layer
-            eval: state.get_mle_final_evaluations()[1],
+            eval: state.get_mle_flatten_final_evaluations()[1],
         };
         let proof = MatVecProof {
             sumcheck: proof,
-            evaluations: state.get_mle_final_evaluations(),
+            evaluations: state.get_mle_flatten_final_evaluations(),
         };
         Ok((proof, claim))
     }
@@ -134,7 +139,10 @@ where
     let subclaim =
         IOPVerifierState::<E>::verify(last_claim.eval, &proof.sumcheck, aux_info, transcript);
     let matrix_point = subclaim
-        .point_flat()
+        .point
+        .iter()
+        .map(|p| p.elements)
+        .collect_vec()
         .iter()
         .chain(last_claim.point.iter())
         .cloned()
@@ -142,7 +150,7 @@ where
     let matrix_eval = eval_matrix_at(&matrix_point);
     ensure!(proof.matrix_eval() == matrix_eval);
     Ok(Claim {
-        point: subclaim.point_flat(),
+        point: subclaim.point.iter().map(|p| p.elements).collect_vec(),
         eval: proof.vec_eval(),
     })
 }

@@ -568,16 +568,18 @@ pub(crate) mod test {
         rng_from_env_or_random,
         tensor::{Number, Shape},
         testing::{Pcs, random_bool_vector, random_vector},
+        util::from_mle_list_dimensions,
     };
     use anyhow::{Ok, Result};
     use ark_std::rand::{Rng, RngCore};
+    use either::Either;
     use ff_ext::{ExtensionField, GoldilocksExt2};
     use itertools::Itertools;
-    use multilinear_extensions::{
-        mle::{IntoMLE, MultilinearExtension},
-        virtual_poly::VirtualPolynomial,
+    use multilinear_extensions::{mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
+    use sumcheck::{
+        structs::{IOPProverState, IOPVerifierState},
+        util::optimal_sumcheck_threads,
     };
-    use sumcheck::structs::{IOPProverState, IOPVerifierState};
 
     use crate::{Element, default_transcript, quantization::TensorFielder, tensor::Tensor};
 
@@ -940,7 +942,6 @@ pub(crate) mod test {
         assert_eq!(final_output.get_data().len(), nrow);
     }
 
-    use p3_field::FieldAlgebra;
     #[test]
     fn test_model_sequential() {
         let (model, input) = Model::random(1).unwrap();
@@ -979,25 +980,25 @@ pub(crate) mod test {
         // since y = SUM M(j,i) x(i) + B(j)
         // then
         // y(r) - B(r) = SUM_i m(r,i) x(i)
-        let full_poly = vec![
-            flatten_mat1.clone().into(),
-            input_vector.get_data().to_vec().into_mle().into(),
-        ];
-        let mut vp = VirtualPolynomial::new(flatten_mat1.num_vars());
-        vp.add_mle_list(full_poly, F::ONE);
-        #[allow(deprecated)]
-        let (proof, _state) =
-            IOPProverState::<F>::prove_parallel(vp.clone(), &mut default_transcript());
-        let (p2, _s2) =
-            IOPProverState::prove_batch_polys(1, vec![vp.clone()], &mut default_transcript());
+        let input_mle = input_vector.get_data().to_vec().into_mle();
+
+        let num_vars = flatten_mat1.num_vars();
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let expr = expr_builder.lift(Either::Left(&flatten_mat1))
+            * expr_builder.lift(Either::Left(&input_mle));
+        let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
+        let (proof, _state) = IOPProverState::prove(virtual_poly, &mut default_transcript());
+
         let given_eval1 = proof.extract_sum();
-        assert_eq!(p2.extract_sum(), proof.extract_sum());
+
         assert_eq!(computed_eval1_no_bias, given_eval1);
 
+        let aux_info = from_mle_list_dimensions(&[vec![num_vars, num_vars]]);
         let _subclaim = IOPVerifierState::<F>::verify(
             computed_eval1_no_bias,
             &proof,
-            &vp.aux_info,
+            &aux_info,
             &mut default_transcript(),
         );
     }
@@ -1028,9 +1029,9 @@ pub(crate) mod test {
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
         let io = trace.to_verifier_io();
-        let prover: Prover<'_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
+        let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
-        let proof = prover.prove(trace).expect("unable to generate proof");
+        let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
         verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
@@ -1068,7 +1069,7 @@ pub(crate) mod test {
             Context::<F, Pcs<F>>::generate(&model, None, None).expect("Unable to generate context");
         let io = trace.to_verifier_io();
         let prover = Prover::new(&ctx, &mut tr);
-        let proof = prover.prove(trace).expect("unable to generate proof");
+        let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript = BasicTranscript::<F>::new(b"matmul");
         verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
     }
@@ -1105,9 +1106,9 @@ pub(crate) mod test {
             .expect("Unable to generate context");
         let io = trace.to_verifier_io();
 
-        let prover: Prover<'_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
+        let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
-        let proof = prover.prove(trace).expect("unable to generate proof");
+        let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
@@ -1156,9 +1157,14 @@ pub(crate) mod test {
                         )
                         .expect("Unable to generate context");
                         let io = trace.to_verifier_io();
-                        let prover: Prover<'_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
-                            Prover::new(&ctx, &mut tr);
-                        let proof = prover.prove(trace).expect("unable to generate proof");
+                        let prover: Prover<
+                            '_,
+                            '_,
+                            GoldilocksExt2,
+                            BasicTranscript<GoldilocksExt2>,
+                            _,
+                        > = Prover::new(&ctx, &mut tr);
+                        let proof = prover.prove(&trace).expect("unable to generate proof");
                         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
                             BasicTranscript::new(b"m2vec");
                         verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript).unwrap();
@@ -1276,9 +1282,9 @@ pub(crate) mod test {
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"model");
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
-        let prover: Prover<'_, E, T, _> = Prover::new(&ctx, &mut tr);
+        let prover: Prover<'_, '_, E, T, _> = Prover::new(&ctx, &mut tr);
         let io = trace.to_verifier_io();
-        let proof = prover.prove(trace).expect("unable to generate proof");
+        let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"model");
         println!("Verifying");

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
-    mle::{DenseMultilinearExtension, IntoMLE, MultilinearExtension},
+    mle::{IntoMLE, MultilinearExtension},
     util::ceil_log2,
 };
 use p3_field::{Field, FieldAlgebra};
@@ -33,18 +33,18 @@ use crate::{
 use rayon::prelude::*;
 pub const TABLE_POLY_ID_OFFSET: usize = 666;
 
-pub(crate) type ProverCommitment<PCS, E> = (
+pub(crate) type ProverCommitment<'a, PCS, E> = (
     <PCS as PolynomialCommitmentScheme<E>>::CommitmentWithWitness,
-    DenseMultilinearExtension<E>,
+    MultilinearExtension<'a, E>,
 );
 
-pub(crate) type CommsAndEvals<PCS, E> = (
-    Vec<ProverCommitment<PCS, E>>,
+pub(crate) type CommsAndEvals<'a, PCS, E> = (
+    Vec<ProverCommitment<'a, PCS, E>>,
     Vec<Vec<<E as ExtensionField>::BaseField>>,
 );
 
-pub(crate) type CommsAndProofs<PCS, E> = (
-    Vec<Vec<ProverCommitment<PCS, E>>>,
+pub(crate) type CommsAndProofs<'a, PCS, E> = (
+    Vec<Vec<ProverCommitment<'a, PCS, E>>>,
     Vec<crate::lookup::logup_gkr::structs::LogUpProof<E>>,
 );
 
@@ -463,17 +463,19 @@ impl TableType {
 
     pub fn generate_challenge<E: ExtensionField, T: Transcript<E>>(&self, transcript: &mut T) -> E {
         match self {
-            TableType::GELU(_) => transcript.get_and_append_challenge(b"GELU").elements,
-            TableType::Relu => transcript.get_and_append_challenge(b"Relu").elements,
+            TableType::GELU(_) => transcript.sample_and_append_challenge(b"GELU").elements,
+            TableType::Relu => transcript.sample_and_append_challenge(b"Relu").elements,
             TableType::Range | TableType::ErrorTable(..) => {
                 // Theres only one column for a range check so we don't need to generate a challenge
                 E::ONE
             }
-            TableType::Clamping(_) => transcript.get_and_append_challenge(b"Clamping").elements,
-            TableType::Softmax(..) => transcript.get_and_append_challenge(b"Softmax").elements,
-            TableType::ZeroTable(..) => transcript.get_and_append_challenge(b"Zero").elements,
+            TableType::Clamping(_) => transcript.sample_and_append_challenge(b"Clamping").elements,
+            TableType::Softmax(..) => transcript.sample_and_append_challenge(b"Softmax").elements,
+            TableType::ZeroTable(..) => transcript.sample_and_append_challenge(b"Zero").elements,
             TableType::InverseSQRT(..) => {
-                transcript.get_and_append_challenge(b"InverseSQRT").elements
+                transcript
+                    .sample_and_append_challenge(b"InverseSQRT")
+                    .elements
             }
         }
     }
@@ -492,11 +494,13 @@ impl TableType {
     }
 
     /// Function that returns any MLEs that have to be committed for this [`TableType`]
-    pub fn committed_columns<E: ExtensionField>(&self) -> Option<DenseMultilinearExtension<E>> {
+    pub fn committed_columns<'a, E: ExtensionField>(
+        &'a self,
+    ) -> Option<MultilinearExtension<'a, E>> {
         match self {
             TableType::GELU(qd) => {
                 let out_column = to_base::<E, _>(qd.table().map(|(_, elem)| elem));
-                Some(DenseMultilinearExtension::<E>::from_evaluations_vec(
+                Some(MultilinearExtension::<E>::from_evaluations_vec(
                     qd.table_size(),
                     out_column,
                 ))
@@ -506,7 +510,8 @@ impl TableType {
 
                 let out_column =
                     to_base::<E, _>((0..table_size).map(|j| table_data.table_output(j)));
-                Some(DenseMultilinearExtension::<E>::from_evaluations_vec(
+
+                Some(MultilinearExtension::<E>::from_evaluations_vec(
                     table_data.size(),
                     out_column,
                 ))
@@ -526,7 +531,7 @@ impl TableType {
                     .chain(std::iter::repeat(E::BaseField::ZERO))
                     .take(table_size)
                     .collect::<Vec<E::BaseField>>();
-                Some(DenseMultilinearExtension::<E>::from_evaluations_vec(
+                Some(MultilinearExtension::<E>::from_evaluations_vec(
                     num_vars, column,
                 ))
             }
@@ -536,7 +541,7 @@ impl TableType {
                 let column =
                     to_base::<E, _>((table_min..table_max).map(|i| table_data.table_output(i)));
                 let num_vars = 2 * (*quantization::BIT_LEN - 1) + 1;
-                Some(DenseMultilinearExtension::<E>::from_evaluations_vec(
+                Some(MultilinearExtension::<E>::from_evaluations_vec(
                     num_vars, column,
                 ))
             }
@@ -591,15 +596,15 @@ pub(crate) fn count_elements<I: IntoIterator<Item = Element>>(i: I) -> HashMap<E
 }
 
 #[derive(Default)]
-pub struct LookupWitnessGen<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+pub struct LookupWitnessGen<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// Contains the count of elements per table type.
     ///
     /// These values are later used to compute the GKR's multiplicities.
     pub(crate) element_count: BTreeMap<TableType, HashMap<Element, u64>>,
-    pub(crate) logup_witnesses: HashMap<NodeId, Vec<LogUpWitness<E, PCS>>>,
+    pub(crate) logup_witnesses: HashMap<NodeId, Vec<LogUpWitness<'a, E, PCS>>>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, PCS> {
+impl<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<'a, E, PCS> {
     /// Consume the lookups and witness of `other` into this instance.
     fn consume(&mut self, other: Self) {
         for (table_type, elements) in other.element_count.into_iter() {
@@ -622,17 +627,17 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, 
 pub(crate) const COLUMN_SEPARATOR: Element = 1 << 32;
 
 #[derive(Debug, Default)]
-pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+pub struct LookupWitness<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     pub challenge_storage: ChallengeStorage<E>,
-    pub logup_witnesses: HashMap<NodeId, Vec<LogUpWitness<E, PCS>>>,
-    pub table_witnesses: Vec<LogUpWitness<E, PCS>>,
+    pub logup_witnesses: HashMap<NodeId, Vec<LogUpWitness<'a, E, PCS>>>,
+    pub table_witnesses: Vec<LogUpWitness<'a, E, PCS>>,
 }
 
-pub fn generate_lookup_witnesses<'a, E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
-    trace: &InferenceTrace<'a, E, Element>,
-    ctx: &Context<E, PCS>,
+pub fn generate_lookup_witnesses<'a, 'b, E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    trace: &'b InferenceTrace<'a, E, Element>,
+    ctx: &'b Context<'b, E, PCS>,
     transcript: &mut T,
-) -> Result<LookupWitness<E, PCS>, LogUpError>
+) -> Result<LookupWitness<'b, E, PCS>, LogUpError>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
@@ -720,7 +725,7 @@ where
                 .collect::<Vec<E::BaseField>>();
             let num_vars = ceil_log2(multiplicities.len());
             let mle =
-                DenseMultilinearExtension::<E>::from_evaluations_slice(num_vars, &multiplicities);
+                MultilinearExtension::<E>::from_evaluations_vec(num_vars, multiplicities.to_vec());
             let commit = ctx.commitment_ctx.commit(&mle).map_err(|e| {
                 LogUpError::PolynomialError(format!(
                     "Error while committing to {} table multiplicity polynomial: {:?}",
@@ -765,7 +770,7 @@ fn initialise_from_table_set<
     transcript: &mut T,
 ) -> ChallengeStorage<E> {
     let constant_challenge = transcript
-        .get_and_append_challenge(b"table_constant")
+        .sample_and_append_challenge(b"table_constant")
         .elements;
     let challenge_map = set
         .map(|table_type| {

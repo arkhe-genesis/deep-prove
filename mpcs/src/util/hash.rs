@@ -1,11 +1,8 @@
 use ff_ext::{ExtensionField, SmallField};
-use poseidon::poseidon_hash::PoseidonHash;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 
 use transcript::Transcript;
-
-pub use poseidon::digest::Digest;
 
 /// Trait for hashing elements into a digest and doing merkle trees
 pub trait MerkleHasher<E: ExtensionField>: Debug + Clone + Send + Sync + Default {
@@ -44,16 +41,84 @@ pub trait MerkleHasher<E: ExtensionField>: Debug + Clone + Send + Sync + Default
 #[derive(Debug, Clone, Default)]
 pub struct PoseidonHasher;
 
+pub mod poseidon_zkml {
+    use ff_ext::{ExtensionField, FieldChallengerExt, PoseidonField};
+    use poseidon::{
+        DIGEST_WIDTH,
+        challenger::{CanObserve, CanSample, DefaultChallenger},
+        digest::Digest,
+    };
+
+    pub fn two_to_one<F: PoseidonField>(left: &Digest<F>, right: &Digest<F>) -> Digest<F> {
+        compress::<F>(left, right)
+    }
+
+    pub fn hash_or_noop<F: PoseidonField>(inputs: &[F]) -> Digest<F> {
+        if inputs.len() <= DIGEST_WIDTH {
+            digest_from_partial(inputs)
+        } else {
+            hash_n_to_hash_no_pad::<F>(inputs)
+        }
+    }
+    pub fn hash_n_to_m_no_pad<F: PoseidonField>(inputs: &[F], num_outputs: usize) -> Vec<F> {
+        let mut challenger = DefaultChallenger::<F>::new_poseidon_default();
+        challenger.observe_slice(inputs);
+        challenger.sample_vec(num_outputs)
+    }
+
+    #[allow(unused)]
+    pub fn hash_n_to_m_no_pad_ext<F: PoseidonField, E: ExtensionField<BaseField = F>>(
+        inputs: &[E],
+        num_outputs: usize,
+    ) -> Vec<F> {
+        let mut challenger = DefaultChallenger::<F>::new_poseidon_default();
+        challenger.observe_ext_slice(inputs);
+        challenger.sample_vec(num_outputs)
+    }
+
+    pub fn hash_n_to_hash_no_pad<F: PoseidonField>(inputs: &[F]) -> Digest<F> {
+        hash_n_to_m_no_pad(inputs, DIGEST_WIDTH).try_into().unwrap()
+    }
+
+    #[allow(unused)]
+    pub fn hash_n_to_hash_no_pad_ext<F: PoseidonField, E: ExtensionField<BaseField = F>>(
+        inputs: &[E],
+    ) -> Digest<F> {
+        hash_n_to_m_no_pad_ext(inputs, DIGEST_WIDTH)
+            .try_into()
+            .unwrap()
+    }
+
+    #[allow(unused)]
+    pub fn compress<F: PoseidonField>(x: &Digest<F>, y: &Digest<F>) -> Digest<F> {
+        let mut challenger = DefaultChallenger::<F>::new_poseidon_default();
+        challenger.observe_slice(&x.0);
+        challenger.observe_slice(&y.0);
+        Digest(challenger.sample_array::<DIGEST_WIDTH>())
+    }
+
+    pub fn digest_from_partial<F: PoseidonField>(inputs: &[F]) -> Digest<F> {
+        assert!(
+            inputs.len() <= DIGEST_WIDTH,
+            "undefine behaviours for input {}> DIGEST_WIDTH {DIGEST_WIDTH}",
+            inputs.len()
+        );
+        let mut elements = [F::ZERO; DIGEST_WIDTH];
+        elements[0..inputs.len()].copy_from_slice(inputs);
+        Digest(elements)
+    }
+}
+
 impl<E: ExtensionField> MerkleHasher<E> for PoseidonHasher
 where
     E::BaseField: Serialize + DeserializeOwned,
 {
-    type Digest = Digest<E::BaseField>;
+    type Digest = poseidon::digest::Digest<E::BaseField>;
     fn hash_bases(elems: &[E::BaseField]) -> Self::Digest {
-        PoseidonHash::hash_or_noop(elems)
+        poseidon_zkml::hash_or_noop(elems)
     }
     fn hash_two_digests(a: &Self::Digest, b: &Self::Digest) -> Self::Digest {
-        PoseidonHash::two_to_one(a, b)
+        poseidon_zkml::two_to_one(a, b)
     }
     fn digest_to_transcript(digest: &Self::Digest, transcript: &mut impl Transcript<E>) {
         digest

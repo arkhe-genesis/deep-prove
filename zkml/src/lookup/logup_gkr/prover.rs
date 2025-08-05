@@ -1,15 +1,15 @@
 //! Contains the code for batch proving a number of LogUp GKR claims.
 
-use std::sync::Arc;
-
+use either::Either;
 use ff_ext::ExtensionField;
 use p3_field::FieldAlgebra;
 
 use multilinear_extensions::{
+    Expression,
     mle::{IntoMLE, MultilinearExtension},
-    virtual_poly::{ArcMultilinearExtension, VirtualPolynomial},
+    virtual_polys::VirtualPolynomialsBuilder,
 };
-use sumcheck::structs::{IOPProof, IOPProverState};
+use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use transcript::Transcript;
 
 use crate::{Claim, commit::compute_betas_eval, lookup::logup_gkr::circuit::LogUpLayer};
@@ -53,13 +53,13 @@ pub fn batch_prove<E: ExtensionField, T: Transcript<E>>(
         .for_each(|evals| transcript.append_field_element_exts(evals));
 
     let batching_challenge = transcript
-        .get_and_append_challenge(b"initial_batching")
+        .sample_and_append_challenge(b"initial_batching")
         .elements;
     let mut alpha = transcript
-        .get_and_append_challenge(b"initial_alpha")
+        .sample_and_append_challenge(b"initial_alpha")
         .elements;
     let mut lambda = transcript
-        .get_and_append_challenge(b"initial_lambda")
+        .sample_and_append_challenge(b"initial_lambda")
         .elements;
 
     let (mut current_claim, _) =
@@ -79,7 +79,7 @@ pub fn batch_prove<E: ExtensionField, T: Transcript<E>>(
     // The initial sumcheck point is just the batching challenge
     let mut sumcheck_point: Vec<E> = vec![batching_challenge];
 
-    let mut sumcheck_proofs: Vec<IOPProof<E>> = vec![];
+    let mut sumcheck_proofs = vec![];
 
     let mut round_evaluations: Vec<Vec<E>> = vec![];
 
@@ -88,66 +88,83 @@ pub fn batch_prove<E: ExtensionField, T: Transcript<E>>(
         transcript.append_field_element_ext(&current_claim);
 
         // Compute the eq_evals
-        let eq_poly: ArcMultilinearExtension<E> =
-            Arc::new(compute_betas_eval(&sumcheck_point).into_mle());
-
+        // let eq_poly: ArcMultilinearExtension<E> =
+        //     Arc::new(compute_betas_eval(&sumcheck_point).into_mle());
+        let eq_poly = compute_betas_eval(&sumcheck_point).into_mle();
         // Then add all the terms to the sumcheck virtual polynomial
-        let mut vp = VirtualPolynomial::<E>::new(current_layer_vars);
+        let num_threads = optimal_sumcheck_threads(current_layer_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, current_layer_vars);
+        let eq_expr = expr_builder.lift(Either::Left(&eq_poly));
 
-        let mut current_alpha = E::ONE;
-        layer_iters.iter_mut().try_for_each(|iter| {
-            let layer = iter.next().ok_or(LogUpError::ProvingError(
-                "One of the circuits was not the same size as the others".to_string(),
-            ))?;
-            let mles = layer.get_mles();
-            if let LogUpLayer::Generic { .. } | LogUpLayer::InitialTable { .. } = layer {
-                vp.add_mle_list(
-                    vec![eq_poly.clone(), mles[0].clone(), mles[3].clone()],
-                    current_alpha,
-                );
-                vp.add_mle_list(
-                    vec![eq_poly.clone(), mles[1].clone(), mles[2].clone()],
-                    current_alpha,
-                );
-                vp.add_mle_list(
-                    vec![eq_poly.clone(), mles[2].clone(), mles[3].clone()],
-                    current_alpha * lambda,
-                );
-            } else {
-                // Here we are in the initial lookup case so we have no numerator polynomials (all the numerator values are -1)
-                vp.add_mle_list(vec![eq_poly.clone(), mles[1].clone()], -current_alpha);
-                vp.add_mle_list(vec![eq_poly.clone(), mles[0].clone()], -current_alpha);
-                vp.add_mle_list(
-                    vec![eq_poly.clone(), mles[0].clone(), mles[1].clone()],
-                    current_alpha * lambda,
-                );
-            }
-            current_alpha *= alpha;
-            Result::<(), LogUpError>::Ok(())
-        })?;
+        let mles = layer_iters
+            .iter_mut()
+            .map(|iter| {
+                let layer = iter.next().ok_or(LogUpError::ProvingError(
+                    "One of the circuits was not the same size as the others".to_string(),
+                ))?;
 
-        // Run the sumcheck for this round
-        #[allow(deprecated)]
-        let (proof, state) = IOPProverState::<E>::prove_parallel(vp, transcript);
+                let layer_type =
+                    if let LogUpLayer::Generic { .. } | LogUpLayer::InitialTable { .. } = layer {
+                        0
+                    } else {
+                        1
+                    };
+                Ok((layer_type, layer.new_get_mles()))
+            })
+            .collect::<Result<Vec<(usize, Vec<MultilinearExtension<E>>)>, _>>()?;
+
+        let expressions = mles
+            .iter()
+            .enumerate()
+            .map(|(i, (layer_type, step))| {
+                if *layer_type == 0 {
+                    let num_l = expr_builder.lift(Either::Left(&step[0]));
+                    let denom_r = expr_builder.lift(Either::Left(&step[3]));
+                    let num_r = expr_builder.lift(Either::Left(&step[1]));
+                    let denom_l = expr_builder.lift(Either::Left(&step[2]));
+
+                    eq_expr.clone()
+                        * (Expression::Challenge(0, i, E::ONE, E::ZERO)
+                            * ((num_l * denom_r.clone()) + (num_r * denom_l.clone()))
+                            + Expression::Challenge(0, i, lambda, E::ZERO) * denom_l * denom_r)
+                } else {
+                    let denom_1 = expr_builder.lift(Either::Left(&step[1]));
+                    let denom_2 = expr_builder.lift(Either::Left(&step[0]));
+                    eq_expr.clone()
+                        * (Expression::Challenge(0, i, -E::ONE, E::ZERO)
+                            * (denom_1.clone() + denom_2.clone())
+                            + Expression::Challenge(0, i, lambda, E::ZERO) * denom_1 * denom_2)
+                }
+            })
+            .collect::<Vec<Expression<E>>>();
+
+        let virtual_poly = expr_builder.to_virtual_polys(&expressions, &[alpha]);
+        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, transcript);
 
         // Update the sumcheck proof
-        sumcheck_point = proof.point.clone();
+        sumcheck_point = state.collect_raw_challenges();
 
         // The first one is always the eq_poly eval
-        let evals = &state.get_mle_final_evaluations()[1..];
+        let evals = &state
+            .get_mle_final_evaluations()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()[1..];
 
         // Squeeze the challenges to combine everything into a single sumcheck
         let batching_challenge = transcript
-            .get_and_append_challenge(b"logup_batching")
+            .sample_and_append_challenge(b"logup_batching")
             .elements;
-        alpha = transcript.get_and_append_challenge(b"logup_alpha").elements;
+        alpha = transcript
+            .sample_and_append_challenge(b"logup_alpha")
+            .elements;
         lambda = transcript
-            .get_and_append_challenge(b"logup_lambda")
+            .sample_and_append_challenge(b"logup_lambda")
             .elements;
         // Append the batching challenge to the proof point
         sumcheck_point.push(batching_challenge);
         // Append the sumcheck proof to the list of proofs
-        sumcheck_proofs.push(proof);
+        sumcheck_proofs.push((proof, state.collect_raw_challenges()));
 
         // This step works out the initial claim for the next round of the protocol
         current_claim = if current_layer_vars != total_layers {

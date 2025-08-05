@@ -8,7 +8,7 @@ pub mod verifier;
 mod tests {
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
     use itertools::izip;
-    use multilinear_extensions::mle::{DenseMultilinearExtension, MultilinearExtension};
+    use multilinear_extensions::mle::MultilinearExtension;
     use p3_field::FieldAlgebra;
     use p3_goldilocks::Goldilocks;
 
@@ -84,7 +84,7 @@ mod tests {
                 .iter()
                 .zip(column_evals.into_iter())
                 .for_each(|(claim, evaluations)| {
-                    let mle = DenseMultilinearExtension::<GoldilocksExt2>::from_evaluations_vec(
+                    let mle = MultilinearExtension::<GoldilocksExt2>::from_evaluations_vec(
                         n,
                         evaluations,
                     );

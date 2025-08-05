@@ -1,14 +1,20 @@
 use anyhow::{Result, ensure};
+use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
+    Expression,
     mle::{IntoMLE, MultilinearExtension},
-    virtual_poly::{VPAuxInfo, VirtualPolynomial},
+    virtual_poly::VPAuxInfo,
+    virtual_polys::VirtualPolynomialsBuilder,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use transcript::{Challenge, Transcript};
 
 use crate::{
@@ -429,7 +435,7 @@ where
         // the rows of weight matrices
         let num_vars = self.q.num_vars_2d().0;
 
-        let vp_aux = VPAuxInfo::from_mle_list_dimensions(&vec![vec![num_vars, num_vars]; 3]);
+        let vp_aux = crate::util::from_mle_list_dimensions(&vec![vec![num_vars, num_vars]; 3]);
 
         let ctx = QKVCtx {
             node_id: id,
@@ -541,30 +547,39 @@ where
 
         // Number of variables involved in the sum-check corresponds to the number of columns of the input matrix
         let num_vars = input.num_vars_2d().1;
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
 
-        let mut vp = VirtualPolynomial::new(num_vars);
-
-        last_claims
+        let terms = last_claims
             .iter()
             .zip([&self.q, &self.k, &self.v])
-            .zip(&challenges)
-            .try_for_each(|((&claim, weight_matrix), challenge)| {
+            .map(|(&claim, weight_matrix)| {
                 let mut weight_mle = weight_matrix.to_2d_mle();
                 let (point_for_row, point_for_column) =
                     Self::split_claim_point(&claim.point, output_num_vars_2d)?;
                 let fixed_input_mle = input_mle.fix_high_variables(point_for_row);
                 weight_mle.fix_variables_in_place(point_for_column);
-                let coefficient = challenge.elements;
-                vp.add_mle_list(vec![fixed_input_mle.into(), weight_mle.into()], coefficient);
-                anyhow::Ok(())
-            })?;
 
-        #[allow(deprecated)]
-        let (proof, state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
+                Ok((fixed_input_mle, weight_mle))
+            })
+            .collect::<Result<Vec<(MultilinearExtension<E>, MultilinearExtension<E>)>, anyhow::Error>>()?;
+
+        let expr = terms.iter().zip(challenges.iter()).fold(
+            Expression::Constant(Either::Right(E::ZERO)),
+            |acc, ((fi, w), c)| {
+                let fi_expr = expr_builder.lift(Either::Left(fi));
+                let w_expr = expr_builder.lift(Either::Left(w));
+                let challenge = Expression::Constant(Either::Right(c.elements));
+                acc + fi_expr * w_expr * challenge
+            },
+        );
+
+        let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
+        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
         // get claims for all the MLEs involved in sum-check
         let sumcheck_evals = state
-            .get_mle_final_evaluations()
+            .get_mle_flatten_final_evaluations()
             .chunks(2) // each chunk refers to a pair of (input, weight matrix) MLEs in the sumcheck
             .map(|evals| (evals[0], evals[1]))
             .collect_vec();
@@ -576,8 +591,11 @@ where
                 .iter()
                 .zip(&sumcheck_evals)
                 .map(|(&claim, evals)| {
-                    let (point_for_input, point_for_weight) =
-                        Self::build_points(&claim.point, &proof.point, output_num_vars_2d)?;
+                    let (point_for_input, point_for_weight) = Self::build_points(
+                        &claim.point,
+                        &state.collect_raw_challenges(),
+                        output_num_vars_2d,
+                    )?;
                     anyhow::Ok((
                         Claim::new(point_for_input, evals.0),
                         Claim::new(point_for_weight, evals.1),
@@ -615,9 +633,7 @@ where
             .into_iter()
             .try_for_each(|claim| same_poly_prover.add_claim(claim))?;
 
-        let aggregation_proof = same_poly_prover.prove(prover.transcript)?;
-
-        let aggregated_claim = aggregation_proof.extract_claim();
+        let (aggregation_proof, aggregated_claim) = same_poly_prover.prove(prover.transcript)?;
 
         let proof = QKVProof {
             sumcheck: proof,
@@ -756,7 +772,7 @@ where
                 .map(|(&claim, evals)| {
                     let (point_for_input, point_for_weight) = QKV::<Element>::build_points(
                         &claim.point,
-                        &subclaim.point_flat(),
+                        &subclaim.point.iter().map(|p| p.elements).collect::<Vec<_>>(),
                         output_num_vars,
                     )?;
                     anyhow::Ok((

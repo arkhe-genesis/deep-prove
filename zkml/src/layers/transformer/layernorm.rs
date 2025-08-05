@@ -3,18 +3,24 @@ use std::collections::HashMap;
 use crate::to_base;
 use anyhow::{Result, anyhow, ensure};
 use ark_std::Zero;
+use either::Either;
 use ff_ext::ExtensionField;
 use itertools::izip;
 use mpcs::{PolynomialCommitmentScheme, sum_check::eq_xy_eval};
 use multilinear_extensions::{
-    mle::{DenseMultilinearExtension, IntoMLE, MultilinearExtension},
+    Expression,
+    mle::{ArcMultilinearExtension, FieldType, IntoMLE, MultilinearExtension},
+    smart_slice::SmartSlice,
     util::ceil_log2,
-    virtual_poly::{ArcMultilinearExtension, VPAuxInfo, VirtualPolynomial},
+    virtual_polys::VirtualPolynomialsBuilder,
 };
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use tracing::trace;
 
 use crate::{
@@ -679,6 +685,21 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LayerNormProof<E, PC
     }
 }
 
+fn mle_to_owned<'a, E: ExtensionField>(
+    mle: MultilinearExtension<'a, E>,
+) -> MultilinearExtension<'static, E> {
+    let evaluations = match &mle.evaluations {
+        FieldType::Base(smart_slice) => FieldType::Base(SmartSlice::Owned(smart_slice.to_vec())),
+        FieldType::Ext(smart_slice) => FieldType::Ext(SmartSlice::Owned(smart_slice.to_vec())),
+        FieldType::Unreachable => unreachable!(),
+    };
+
+    MultilinearExtension {
+        evaluations,
+        num_vars: mle.num_vars,
+    }
+}
+
 impl PadOp for LayerNorm<Element> {
     fn pad_node(self, _si: &mut crate::padding::ShapeInfo) -> Result<Self>
     where
@@ -748,12 +769,12 @@ where
         Ok(claims)
     }
 
-    fn gen_lookup_witness(
+    fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &Context<E, PCS>,
+        ctx: &Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
         ensure!(
             step_data.inputs.len() == 1,
             "Found more than 1 input in inference step of LayerNorm layer"
@@ -817,48 +838,57 @@ impl LayerNorm<Element> {
         let range_claims = logup_proofs[1].output_claims();
 
         let num_vars = inv_sqrt_claims[0].point.len();
+        let num_threads = optimal_sumcheck_threads(num_vars);
         // First perform a sumcheck so that all of our claims are evaluated at the same point
         let challenges_to_squeeze = ceil_log2(inv_sqrt_claims.len() + range_claims.len());
         let batching_challenge = (0..challenges_to_squeeze)
             .map(|_| {
                 prover
                     .transcript
-                    .get_and_append_challenge(b"batching")
+                    .sample_and_append_challenge(b"batching")
                     .elements
             })
             .collect::<Vec<E>>();
         let rlc_terms = compute_betas_eval(&batching_challenge);
 
-        let sqrt_eq: ArcMultilinearExtension<E> = compute_betas_eval(&inv_sqrt_claims[0].point)
-            .into_mle()
-            .into();
-        let range_eq: ArcMultilinearExtension<E> =
-            compute_betas_eval(&range_claims[0].point).into_mle().into();
+        let sqrt_eq: MultilinearExtension<E> =
+            compute_betas_eval(&inv_sqrt_claims[0].point).into_mle();
+        let range_eq: MultilinearExtension<E> =
+            compute_betas_eval(&range_claims[0].point).into_mle();
 
-        let eq_polys = std::iter::repeat_n(sqrt_eq, 2)
-            .chain(std::iter::repeat_n(range_eq, range_claims.len()))
-            .collect::<Vec<ArcMultilinearExtension<E>>>();
-
-        let vp = izip!(commits.iter().flatten(), rlc_terms, eq_polys).fold(
-            VirtualPolynomial::<E>::new(num_vars),
-            |mut acc, ((_, poly), challenge, eq)| {
-                acc.add_mle_list(vec![poly.clone().into(), eq], challenge);
-                acc
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let polys = commits
+            .iter()
+            .flatten()
+            .map(|(_, p)| p)
+            .collect::<Vec<&MultilinearExtension<E>>>();
+        let (sqrt_polys, range_polys) = polys.split_at(2);
+        let sqrt_expr = sqrt_polys.iter().enumerate().fold(
+            Expression::Constant(Either::Right(E::ZERO)),
+            |acc, (i, p)| {
+                acc + expr_builder.lift(Either::Left(*p))
+                    * Expression::Challenge(i as u16, 1, E::ONE, E::ZERO)
+            },
+        );
+        let range_expr = range_polys.iter().enumerate().fold(
+            Expression::Constant(Either::Right(E::ZERO)),
+            |acc, (i, p)| {
+                acc + expr_builder.lift(Either::Left(*p))
+                    * Expression::Challenge(i as u16 + 2, 1, E::ONE, E::ZERO)
             },
         );
 
-        #[allow(deprecated)]
+        let sqrt_eq_expr = expr_builder.lift(Either::Left(&sqrt_eq));
+        let range_eq_expr = expr_builder.lift(Either::Left(&range_eq));
+        let expr = sqrt_expr * sqrt_eq_expr + range_expr * range_eq_expr;
+        let virtual_poly = expr_builder.to_virtual_polys(&[expr], &rlc_terms);
         let (accumulation_proof, accumulation_state) =
-            IOPProverState::prove_parallel(vp, prover.transcript);
-        let sumcheck_point = &accumulation_proof.point;
-        let accumulation_evals = accumulation_state.get_mle_final_evaluations();
-        let sqrt_in = accumulation_evals[0];
-        let sqrt_out = accumulation_evals[2];
-        let first_range = accumulation_evals[3];
-        let acc_evals = [sqrt_in, sqrt_out, first_range]
-            .into_iter()
-            .chain(accumulation_evals.into_iter().skip(5))
-            .collect::<Vec<E>>();
+            IOPProverState::prove(virtual_poly, prover.transcript);
+
+        let sumcheck_point = accumulation_state.collect_raw_challenges();
+        let mut acc_evals = accumulation_state.get_mle_flatten_final_evaluations();
+        acc_evals.truncate(polys.len());
+
         // The lookups are performed over fewer variables than there are in the `last_claim` point because they sum over the final dimension before being handed to the lookup argument.
         let sum_dim_vars = ceil_log2(self.gamma.get_data().len());
         let two_inv = E::TWO.inverse();
@@ -867,11 +897,11 @@ impl LayerNorm<Element> {
         // The input claim is multiplier * N * 2^k * eq(2^-1, ..,rk,..,rn,b) * input(b)*input(b) - 2^k * multiplier * eq(2^-1, ..,rk,..,rn,b) * input(b) * 2^k * eq(2^-1, ..,rk,..,rn,b) * input(b)
         let challenge = prover
             .transcript
-            .get_and_append_challenge(b"batching")
+            .sample_and_append_challenge(b"batching")
             .elements;
         let second_challenge = prover
             .transcript
-            .get_and_append_challenge(b"batching")
+            .sample_and_append_challenge(b"batching")
             .elements;
         let one_minus_challenge = E::ONE - challenge;
         let one_minus_second_challenge = E::ONE - second_challenge;
@@ -883,11 +913,14 @@ impl LayerNorm<Element> {
         let full_point = std::iter::repeat_n(two_inv, sum_dim_vars)
             .chain(sumcheck_point.iter().copied())
             .collect::<Vec<E>>();
-        let input_eq_poly: ArcMultilinearExtension<E> =
-            compute_betas_eval(&full_point).into_mle().into();
+        let input_eq_poly: MultilinearExtension<E> = compute_betas_eval(&full_point).into_mle();
+        let num_vars = full_point.len();
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let input_expr = expr_builder.lift(Either::Left(&input_poly));
+        let mean_expr = expr_builder.lift(Either::Left(&mean_poly));
 
         // Construct the VirtualPolynomial
-        let mut vp = VirtualPolynomial::<E>::new(full_point.len());
         let (dim_size, multiplier) = self
             .quant_info
             .as_ref()
@@ -897,24 +930,12 @@ impl LayerNorm<Element> {
             ))?;
         let dim_size_field = E::from_canonical_u64(dim_size as u64);
         let multiplier_field: E = multiplier.to_field();
-        vp.add_mle_list(
-            vec![
-                input_eq_poly.clone(),
-                input_poly.clone(),
-                input_poly.clone(),
-            ],
-            first_batch_chal * multiplier_field * dim_size_field * two_mul,
-        );
-        vp.add_mle_list(
-            vec![input_eq_poly.clone(), mean_poly.clone(), mean_poly.clone()],
-            -first_batch_chal * multiplier_field,
-        );
 
         // `last_claim.eval` should be equal to `gamma(b) * eq(r,b)*(N * input(b))*inv_sqrt_out(b) - 2^k* gamma(b) * eq(2^-1,..,rk,..,rn,b)*input(b)*inv_qrt_out(b) + beta(b)`
         let last_claim_point = &last_claim.point;
         // We need to repeat the gamma and beta evals the correct number of times, additionally we also need to construct the less than polys to multiply beta by
         let number_of_repeats = 1usize << (last_claim_point.len() - sum_dim_vars);
-        let gamma_poly: ArcMultilinearExtension<E> = std::iter::repeat_n(
+        let gamma_poly: MultilinearExtension<E> = std::iter::repeat_n(
             self.gamma
                 .get_data()
                 .iter()
@@ -924,9 +945,8 @@ impl LayerNorm<Element> {
         )
         .flatten()
         .collect::<Vec<E>>()
-        .into_mle()
-        .into();
-        let beta_poly: ArcMultilinearExtension<E> = std::iter::repeat_n(
+        .into_mle();
+        let beta_poly: MultilinearExtension<E> = std::iter::repeat_n(
             self.beta
                 .get_data()
                 .iter()
@@ -936,79 +956,85 @@ impl LayerNorm<Element> {
         )
         .flatten()
         .collect::<Vec<E>>()
-        .into_mle()
-        .into();
+        .into_mle();
 
-        let last_claim_eq: ArcMultilinearExtension<E> =
-            compute_betas_eval(last_claim_point).into_mle().into();
+        let last_claim_eq: MultilinearExtension<E> =
+            compute_betas_eval(last_claim_point).into_mle();
 
         let number_repeats_inv_sqrt = 1usize << sum_dim_vars;
 
-        let inv_sqrt_out_poly: ArcMultilinearExtension<E> = commits[0][1]
+        let inv_sqrt_out_poly: MultilinearExtension<E> = commits[0][1]
             .1
             .get_base_field_vec()
             .iter()
             .flat_map(|&eval| vec![eval; number_repeats_inv_sqrt])
             .collect::<Vec<E::BaseField>>()
-            .into_mle()
-            .into();
+            .into_mle();
 
-        vp.add_mle_list(
-            vec![
-                last_claim_eq.clone(),
-                gamma_poly.clone(),
-                input_poly.clone(),
-                inv_sqrt_out_poly.clone(),
-            ],
-            second_batch_chal * dim_size_field,
+        let inv_sqrt_out_expr = expr_builder.lift(Either::Left(&inv_sqrt_out_poly));
+        let gamma_expr = expr_builder.lift(Either::Left(&gamma_poly));
+        let beta_expr = expr_builder.lift(Either::Left(&beta_poly));
+
+        let input_eq_expr = expr_builder.lift(Either::Left(&input_eq_poly));
+        let last_claim_expr = expr_builder.lift(Either::Left(&last_claim_eq));
+
+        let first_expr = input_eq_expr
+            * (Expression::Challenge(0, 1, multiplier_field, E::ZERO)
+                * (Expression::Constant(Either::Right(dim_size_field * two_mul))
+                    * input_expr.clone()
+                    * input_expr.clone()
+                    - mean_expr.clone() * mean_expr.clone())
+                + Expression::Challenge(2, 1, E::ONE, E::ZERO) * inv_sqrt_out_expr.clone());
+        let second_expr = Expression::Challenge(1, 1, E::ONE, E::ZERO)
+            * last_claim_expr
+            * (gamma_expr
+                * inv_sqrt_out_expr
+                * (Expression::Constant(Either::Right(dim_size_field)) * input_expr - mean_expr)
+                + beta_expr);
+
+        let virtual_poly = expr_builder.to_virtual_polys(
+            &[first_expr, second_expr],
+            &[first_batch_chal, second_batch_chal, third_batch_chal],
         );
-
-        vp.add_mle_list(
-            vec![
-                last_claim_eq.clone(),
-                gamma_poly,
-                mean_poly,
-                inv_sqrt_out_poly.clone(),
-            ],
-            -second_batch_chal,
-        );
-
-        vp.add_mle_list(vec![last_claim_eq, beta_poly], second_batch_chal);
-        // This term is added to prove that we used the same `inv_sqrt_out_poly` in this sumcheck and the previous sumcheck.
-        vp.add_mle_list(vec![input_eq_poly, inv_sqrt_out_poly], third_batch_chal);
-        #[allow(deprecated)]
-        let (io_proof, io_state) = IOPProverState::prove_parallel(vp, prover.transcript);
-        let io_point = &io_proof.point;
-        let io_evaluations = io_state.get_mle_final_evaluations();
-        let input_eval = io_evaluations[1];
-        let mean_eval = io_evaluations[2];
-        let gamma_eval = io_evaluations[4];
-        let inv_sqrt_out_eval = io_evaluations[5];
-        let beta_eval = io_evaluations[6];
+        let (io_proof, io_state) = IOPProverState::prove(virtual_poly, prover.transcript);
+        let io_point = &io_state.collect_raw_challenges();
+        let io_evaluations = io_state.get_mle_flatten_final_evaluations();
+        let input_eval = io_evaluations[0];
+        let mean_eval = io_evaluations[1];
+        let inv_sqrt_out_eval = io_evaluations[2];
+        let gamma_eval = io_evaluations[3];
+        let beta_eval = io_evaluations[4];
 
         // Finally we have to prove that `mean_poly` is `input_poly` summed over the normalisation dimension
         let input_challenge = prover
             .transcript
-            .get_and_append_challenge(b"batching")
+            .sample_and_append_challenge(b"batching")
             .elements;
-        let mut vp = VirtualPolynomial::<E>::new(io_point.len());
+        let num_vars = io_point.len();
+        let num_threads = optimal_sumcheck_threads(num_vars);
+
         // We need to replace the first sum_dim_vars of `io_point` with 2^-1
         let sum_io_point = std::iter::repeat_n(two_inv, sum_dim_vars)
             .chain(io_point.iter().skip(sum_dim_vars).copied())
             .collect::<Vec<E>>();
-        let input_eq: ArcMultilinearExtension<E> = compute_betas_eval(io_point).into_mle().into();
-        let input_sum_eq: ArcMultilinearExtension<E> =
-            compute_betas_eval(&sum_io_point).into_mle().into();
-        // These terms are here to prove that `mean_poly` is `input_poly` summed along the normalisation dimension.
-        vp.add_mle_list(vec![input_poly.clone(), input_eq], E::ONE - input_challenge);
-        vp.add_mle_list(vec![input_poly, input_sum_eq], input_challenge * two_mul);
 
-        #[allow(deprecated)]
-        let (input_proof, input_state) = IOPProverState::prove_parallel(vp, prover.transcript);
+        let input_eq: MultilinearExtension<E> = compute_betas_eval(io_point).into_mle();
+        let input_sum_eq: MultilinearExtension<E> = compute_betas_eval(&sum_io_point).into_mle();
+
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let input_expr = expr_builder.lift(Either::Left(&input_poly));
+        let input_eq_expr = expr_builder.lift(Either::Left(&input_eq));
+        let input_sum_expr = expr_builder.lift(Either::Left(&input_sum_eq));
+        let expr = input_expr
+            * (Expression::Challenge(0, 1, -E::ONE, E::ONE) * input_eq_expr
+                + Expression::Challenge(0, 1, two_mul, E::ZERO) * input_sum_expr);
+        let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[input_challenge]);
+        let (input_proof, input_state) = IOPProverState::prove(virtual_poly, prover.transcript);
+
         // Construct the input_claim that will be passed to the next layer
         let input_claim = Claim::<E>::new(
-            input_proof.point.to_vec(),
-            input_state.get_mle_final_evaluations()[0],
+            input_state.collect_raw_challenges(),
+            input_state.get_mle_flatten_final_evaluations()[0],
         );
 
         // Add the witness claims to the commitment prover
@@ -1084,12 +1110,12 @@ impl LayerNorm<Element> {
     }
 
     /// Internal method for generating the [`LogUpWitness`] for a [`LayerNorm`] step.
-    fn lookup_witness<E, PCS>(
+    fn lookup_witness<'a, E, PCS>(
         &self,
         id: NodeId,
-        ctx: &Context<E, PCS>,
+        ctx: &Context<'a, E, PCS>,
         layernorm_data: &LayerNormData,
-    ) -> Result<LookupWitnessGen<E, PCS>>
+    ) -> Result<LookupWitnessGen<'a, E, PCS>>
     where
         E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E>,
@@ -1165,8 +1191,9 @@ impl LayerNorm<Element> {
             .chain(range_checks.par_iter())
             .map(|vals| {
                 let evaluations = to_base::<E, _>(vals);
-                let mle =
-                    DenseMultilinearExtension::<E>::from_evaluations_slice(num_vars, &evaluations);
+                let mle = MultilinearExtension::<E>::from_evaluations_slice(num_vars, &evaluations);
+
+                let mle = mle_to_owned(mle);
                 let commit = ctx.commitment_ctx.commit(&mle)?;
                 Ok(((commit, mle), evaluations))
             })
@@ -1176,7 +1203,7 @@ impl LayerNorm<Element> {
         // Split off the commits and evaluations for the inverse square root lookup
         let inv_sqrt_commits = commits
             .drain(..2)
-            .collect::<Vec<(PCS::CommitmentWithWitness, DenseMultilinearExtension<E>)>>();
+            .collect::<Vec<(PCS::CommitmentWithWitness, MultilinearExtension<E>)>>();
         let inv_sqrt_evals = evals.drain(..2).collect::<Vec<Vec<E::BaseField>>>();
 
         // Add the merged columns to the lookups lists
@@ -1293,7 +1320,7 @@ where
             .map(|_| {
                 verifier
                     .transcript
-                    .get_and_append_challenge(b"batching")
+                    .sample_and_append_challenge(b"batching")
                     .elements
             })
             .collect::<Vec<E>>();
@@ -1305,14 +1332,18 @@ where
             .zip(rlc_terms.iter())
             .fold(E::ZERO, |acc, (claim, &chal)| acc + claim.eval * chal);
         let aux_info =
-            VPAuxInfo::<E>::from_mle_list_dimensions(&[vec![inv_sqrt_claims[0].point.len(); 2]]);
+            crate::util::from_mle_list_dimensions(&[vec![inv_sqrt_claims[0].point.len(); 2]]);
         let accumulation_subclaim = IOPVerifierState::verify(
             accumulation_initial_eval,
             accumulation_proof,
             &aux_info,
             verifier.transcript,
         );
-        let accumulation_point = accumulation_subclaim.point_flat();
+        let accumulation_point = accumulation_subclaim
+            .point
+            .iter()
+            .map(|p| p.elements)
+            .collect::<Vec<_>>();
 
         // Make the eq poly evals
         let eq_sqrt = eq_xy_eval(&inv_sqrt_claims[0].point, &accumulation_point);
@@ -1334,11 +1365,11 @@ where
         // Now we build the initial evaluation for the io_sumcheck
         let challenge = verifier
             .transcript
-            .get_and_append_challenge(b"batching")
+            .sample_and_append_challenge(b"batching")
             .elements;
         let second_challenge = verifier
             .transcript
-            .get_and_append_challenge(b"batching")
+            .sample_and_append_challenge(b"batching")
             .elements;
         let one_minus_challenge = E::ONE - challenge;
         let one_minus_second_challenge = E::ONE - second_challenge;
@@ -1363,7 +1394,7 @@ where
         let second_term_eval = second_batch_chal * last_claim.eval;
         let third_term_eval = acc_evals[1] * third_batch_chal;
 
-        let aux_info = VPAuxInfo::<E>::from_mle_list_dimensions(&[vec![last_claim.point.len(); 4]]);
+        let aux_info = crate::util::from_mle_list_dimensions(&[vec![last_claim.point.len(); 4]]);
         let io_subclaim = IOPVerifierState::verify(
             first_term_eval + second_term_eval + third_term_eval,
             io_proof,
@@ -1372,7 +1403,11 @@ where
         );
 
         // Now we check that the io_subclaim can be reconstructed from the evaluations the prover supplied.
-        let io_point = io_subclaim.point_flat();
+        let io_point = io_subclaim
+            .point
+            .iter()
+            .map(|p| p.elements)
+            .collect::<Vec<_>>();
         let input_io_eval = proof.get_input_poly_io_eval();
         let mean_io_eval = proof.get_mean_poly_io_eval();
         let inv_eval = proof.get_lookup_output_io_eval();
@@ -1416,12 +1451,12 @@ where
         // Verify the sumcheck that links `mean_poly` and `input_poly`
         let input_challenge = verifier
             .transcript
-            .get_and_append_challenge(b"batching")
+            .sample_and_append_challenge(b"batching")
             .elements;
 
         let input_initial_eval = input_io_eval + input_challenge * (mean_io_eval - input_io_eval);
 
-        let aux_info = VPAuxInfo::<E>::from_mle_list_dimensions(&[vec![io_point.len(); 2]]);
+        let aux_info = crate::util::from_mle_list_dimensions(&[vec![io_point.len(); 2]]);
         let input_subclaim = IOPVerifierState::verify(
             input_initial_eval,
             input_proof,
@@ -1429,7 +1464,11 @@ where
             verifier.transcript,
         );
         // The subclaim eval should be equal to input_eval * ((1 - input_challenge) * eq(io_point, input_point) + input_challenge * two_mul * eq(io_sum_point, input_point))
-        let input_point = input_subclaim.point_flat();
+        let input_point = input_subclaim
+            .point
+            .iter()
+            .map(|p| p.elements)
+            .collect::<Vec<_>>();
         let io_sum_point = std::iter::repeat_n(two_inv, sum_dim_vars)
             .chain(io_point.iter().skip(sum_dim_vars).copied())
             .collect::<Vec<E>>();

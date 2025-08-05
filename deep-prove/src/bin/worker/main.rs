@@ -30,7 +30,7 @@ type Pcs<E> = Basefold<E, BasefoldRSParams<Hasher>>;
 /// From a proof request wrapped in a [`DeepProveRequestV1`] and a [`Store`]
 /// implementation (to interact with the PPs), attempt to generate proofs for a
 /// list of inputs.
-async fn run_model_v1<S: Store>(model: DeepProveRequestV1, store: &mut S) -> Result<Vec<ProofV1>> {
+async fn run_model_v1<S: Store>(model: DeepProveRequestV1, mut store: S) -> Result<Vec<ProofV1>> {
     info!("Proving inference");
     let DeepProveRequestV1 {
         model,
@@ -45,22 +45,27 @@ async fn run_model_v1<S: Store>(model: DeepProveRequestV1, store: &mut S) -> Res
     };
 
     let params_key = store::ParamsKey {
-        model_file_hash: &model_file_hash,
+        model_file_hash: model_file_hash.clone(),
     };
     let model_key = store::ModelKey {
-        model_file_hash: &model_file_hash,
+        model_file_hash,
         scaling_strategy,
-        scaling_input_hash: scaling_input_hash.as_deref(),
+        scaling_input_hash,
     };
 
-    let params = store.get_params(params_key).await.context("fetching PPs")?;
+    let params = store
+        .get_params(&params_key)
+        .await
+        .context("fetching PPs")?
+        .clone();
     let is_stored_params = params.is_some();
 
     let store::ScaledModel {
         model,
         model_metadata,
     } = store
-        .get_or_init_model_with(model_key, async move || {
+        .clone()
+        .get_or_init_model_with(&model_key, async move || {
             let (model, model_metadata) = tokio::task::spawn_blocking(move || parse_model(&model))
                 .await
                 .context("running parsing model task")?
@@ -75,24 +80,25 @@ async fn run_model_v1<S: Store>(model: DeepProveRequestV1, store: &mut S) -> Res
 
     let inputs = input.to_elements(&model_metadata);
 
-    let mut failed_inputs = vec![];
-    let (ctx, model) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let ctx = Context::<F, Pcs<F>>::generate(
-            &model,
-            None,
-            params.map(|store::Params { prover, verifier }| (prover, verifier)),
-        )
-        .context("generating model")?;
-        Ok((ctx, model))
-    })
-    .await
-    .context("running context generation task")?
-    .context("generating context")?;
+    let (ctx, model) = {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let ctx = Context::<F, Pcs<F>>::generate(
+                &model,
+                None,
+                params.map(|store::Params { prover, verifier }| (prover, verifier)),
+            )
+            .context("generating model")?;
+            Ok((ctx, model))
+        })
+        .await
+        .context("running context generation task")?
+        .context("generating context")?
+    };
 
     if !is_stored_params {
         store
             .insert_params(
-                params_key,
+                &params_key,
                 store::Params {
                     prover: ctx.commitment_ctx.prover_params().clone(),
                     verifier: ctx.commitment_ctx.verifier_params().clone(),
@@ -121,14 +127,13 @@ async fn run_model_v1<S: Store>(model: DeepProveRequestV1, store: &mut S) -> Res
                         0, // num_samples,
                         e
                     );
-                    failed_inputs.push(i);
                     continue; // Skip to the next input without writing to CSV
                 }
             };
             let mut prover_transcript = default_transcript();
             let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
             let proof = prover
-                .prove(trace)
+                .prove(&trace)
                 .with_context(|| "unable to generate proof for {i}th input")?;
 
             proofs.push(proof);

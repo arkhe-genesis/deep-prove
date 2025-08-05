@@ -1,4 +1,4 @@
-use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
+use multilinear_extensions::mle::IntoMLE;
 use serde::de::DeserializeOwned;
 use std::{cmp::Ordering, collections::HashMap};
 

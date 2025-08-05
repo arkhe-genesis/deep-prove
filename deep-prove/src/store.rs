@@ -27,16 +27,16 @@ use zkml::{
     quantization::{ModelMetadata, ScalingStrategyKind},
 };
 
-#[derive(Debug, Clone, Copy)]
-pub struct ParamsKey<'a> {
-    pub model_file_hash: &'a str,
+#[derive(Debug, Clone)]
+pub struct ParamsKey {
+    pub model_file_hash: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ModelKey<'a> {
-    pub model_file_hash: &'a str,
+#[derive(Debug, Clone)]
+pub struct ModelKey {
+    pub model_file_hash: String,
     pub scaling_strategy: ScalingStrategyKind,
-    pub scaling_input_hash: Option<&'a str>,
+    pub scaling_input_hash: Option<String>,
 }
 
 type F = GoldilocksExt2;
@@ -54,24 +54,24 @@ pub struct ScaledModel {
     pub model_metadata: ModelMetadata,
 }
 
-pub trait Store {
+pub trait Store: Clone {
     /// Try to get the params from store.
     fn get_params(
         &mut self,
-        key: ParamsKey<'_>,
+        key: &ParamsKey,
     ) -> impl Future<Output = anyhow::Result<Option<Params>>> + Send;
 
     /// Store the params.
     fn insert_params(
         &mut self,
-        key: ParamsKey<'_>,
+        key: &ParamsKey,
         params: Params,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
     /// Try to get the model from store. If not present, initialize the value with the given function, store it and return.
     fn get_or_init_model_with<F, FR>(
         &mut self,
-        key: ModelKey<'_>,
+        key: &ModelKey,
         init: F,
     ) -> impl Future<Output = anyhow::Result<ScaledModel>> + Send
     where
@@ -107,7 +107,7 @@ impl S3Store {
 impl Store for S3Store {
     fn get_params(
         &mut self,
-        key: ParamsKey<'_>,
+        key: &ParamsKey,
     ) -> impl Future<Output = anyhow::Result<Option<Params>>> + Send {
         async move {
             let key = params_key(key);
@@ -153,7 +153,7 @@ impl Store for S3Store {
 
     fn insert_params(
         &mut self,
-        key: ParamsKey<'_>,
+        key: &ParamsKey,
         params: Params,
     ) -> impl Future<Output = anyhow::Result<()>> + Send {
         async move {
@@ -200,7 +200,7 @@ impl Store for S3Store {
 
     fn get_or_init_model_with<F, FR>(
         &mut self,
-        key: ModelKey<'_>,
+        key: &ModelKey,
         init: F,
     ) -> impl Future<Output = anyhow::Result<ScaledModel>> + Send
     where
@@ -284,7 +284,7 @@ pub struct MemStoreInner {}
 impl Store for MemStore {
     fn get_params(
         &mut self,
-        key: ParamsKey<'_>,
+        key: &ParamsKey,
     ) -> impl Future<Output = anyhow::Result<Option<Params>>> + Send {
         async move {
             let key = params_key(key);
@@ -295,7 +295,7 @@ impl Store for MemStore {
 
     fn insert_params(
         &mut self,
-        key: ParamsKey<'_>,
+        key: &ParamsKey,
         params: Params,
     ) -> impl Future<Output = anyhow::Result<()>> + Send {
         async move {
@@ -308,7 +308,7 @@ impl Store for MemStore {
 
     fn get_or_init_model_with<F, FR>(
         &mut self,
-        key: ModelKey<'_>,
+        key: &ModelKey,
         init: F,
     ) -> impl Future<Output = anyhow::Result<ScaledModel>> + Send
     where
@@ -346,7 +346,7 @@ enum KeyKind {
 }
 
 /// A store key for parameters
-fn params_key(ParamsKey { model_file_hash }: ParamsKey<'_>) -> Key {
+fn params_key(ParamsKey { model_file_hash }: &ParamsKey) -> Key {
     let prefix = KeyKind::Params.to_string();
     let prefix = prefix.as_str();
     let pkg_major_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
@@ -361,7 +361,7 @@ fn model_key(
         model_file_hash,
         scaling_strategy,
         scaling_input_hash,
-    }: ModelKey<'_>,
+    }: &ModelKey,
 ) -> Key {
     let prefix = KeyKind::Model.to_string();
     let prefix = prefix.as_str();

@@ -36,7 +36,7 @@ async fn serve_health_check(addr: SocketAddr) -> anyhow::Result<()> {
 async fn process_message_from_gw(
     msg: WorkerToGwResponse,
     outbound_tx: &tokio::sync::mpsc::Sender<WorkerToGwRequest>,
-    store: &mut StoreKind,
+    store: StoreKind,
 ) -> anyhow::Result<()> {
     let task: DeepProveRequest = rmp_serde::from_slice(
         zstd::decode_all(msg.task.as_slice())
@@ -99,7 +99,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let mut store = instantiate_store(s3_args).context("instantiating PPs store")?;
+    let store = instantiate_store(s3_args).context("instantiating PPs store")?;
 
     let channel =
         tonic::transport::Channel::builder(gw_url.parse().context("parsing gateway URL")?)
@@ -166,7 +166,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
                         break;
                     }
                 };
-                process_message_from_gw(msg, &outbound_tx, &mut store).await?;
+                process_message_from_gw(msg, &outbound_tx, store.clone()).await?;
             }
             h = &mut healthcheck_handler => {
                 if let Err(e) = h {

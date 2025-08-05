@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use multilinear_extensions::mle::FieldType;
 
-use std::{marker::PhantomData, slice};
+use std::{marker::PhantomData, slice, sync::Arc};
 
 pub use super::encoding::{EncodingProverParameters, EncodingScheme, RSCode, RSCodeDefaultSpec};
 use super::{
@@ -64,8 +64,8 @@ pub struct BasefoldCommitmentWithWitness<E: ExtensionField, H: MerkleHasher<E>>
 where
     E::BaseField: Serialize + DeserializeOwned,
 {
-    pub(crate) codeword_tree: MerkleTree<E, H>,
-    pub(crate) polynomials_bh_evals: Vec<FieldType<E>>,
+    pub(crate) codeword_tree: MerkleTree<'static, E, H>,
+    pub(crate) polynomials_bh_evals: Vec<FieldType<'static, E>>,
     pub(crate) num_vars: usize,
     pub(crate) is_base: bool,
     pub(crate) num_polys: usize,
@@ -96,7 +96,7 @@ where
         self.get_root_ref().clone()
     }
 
-    pub fn get_codewords(&self) -> &Vec<FieldType<E>> {
+    pub fn get_codewords(&self) -> &Vec<Arc<FieldType<E>>> {
         self.codeword_tree.leaves()
     }
 
@@ -340,8 +340,8 @@ where
     pub(crate) roots: Vec<Digest>,
     pub(crate) final_message: Vec<E>,
     pub(crate) query_result_with_merkle_path: ProofQueriesResultWithMerklePath<E, Digest>,
-    pub(crate) sumcheck_proof: Option<SumcheckProof<E, Coefficients<E>>>,
-    pub(crate) trivial_proof: Vec<FieldType<E>>,
+    pub(crate) sumcheck_proof: Option<SumcheckProof<E, Arc<Coefficients<'static, E>>>>,
+    pub(crate) trivial_proof: Vec<Arc<FieldType<'static, E>>>,
 }
 
 impl<E: ExtensionField, Digest> BasefoldProof<E, Digest>
@@ -349,7 +349,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     Digest: Clone + Send + Sync + Serialize + DeserializeOwned,
 {
-    pub fn trivial(evals: Vec<FieldType<E>>) -> Self {
+    pub fn trivial(evals: Vec<Arc<FieldType<'static, E>>>) -> Self {
         Self {
             sumcheck_messages: vec![],
             roots: vec![],

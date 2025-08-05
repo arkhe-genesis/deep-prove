@@ -18,22 +18,19 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use deep_prove::{
-    middleware::v1::{DeepProveRequest as DeepProveRequestV1, Proof as ProofV1},
-    store::MemStore,
-};
+use deep_prove::{middleware::v1::DeepProveRequest as DeepProveRequestV1, store::MemStore};
 use tokio::sync::Mutex;
 use tracing::{error, info, trace};
+
+#[derive(Default)]
+struct AppState {
+    work_queue: Vec<DeepProveRequestV1>,
+    proofs_queue: Vec<String>,
+}
 
 /// Expose a long-lived local HTTP API, executing submitted proofs and returning
 /// ready proofs on request.
 pub async fn serve(args: RunMode) -> anyhow::Result<()> {
-    #[derive(Default)]
-    struct AppState {
-        work_queue: Vec<DeepProveRequestV1>,
-        proofs_queue: Vec<ProofV1>,
-    }
-
     let RunMode::LocalApi {
         port,
         json,
@@ -77,17 +74,21 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
     {
         let app_state = app_state.clone();
         tokio::spawn(async move {
-            let mut store = MemStore::default();
+            let store = MemStore::default();
             loop {
                 let maybe_work = { app_state.lock().await.work_queue.pop() };
                 if let Some(proof_request) = maybe_work {
                     let now = std::time::Instant::now();
                     info!("processing proof...");
-                    let result = crate::run_model_v1(proof_request, &mut store).await;
+                    let result = crate::run_model_v1(proof_request, store.clone()).await;
                     match result {
                         Ok(proofs) => {
                             info!("proof generated in {}s", now.elapsed().as_secs());
-                            app_state.lock().await.proofs_queue.extend(proofs);
+                            app_state.lock().await.proofs_queue.extend(
+                                proofs
+                                    .into_iter()
+                                    .map(|proof| serde_json::to_string_pretty(&proof).unwrap()),
+                            );
                         }
                         Err(err) => error!("failed to generate proof: {err:?}"),
                     }
@@ -119,9 +120,8 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
             get(|State(state): State<Arc<Mutex<AppState>>>| async move {
                 let mut state = state.lock().await;
                 if let Some(proof) = state.proofs_queue.pop() {
-                    let encoded = serde_json::to_string_pretty(&proof).unwrap();
-                    info!("returning a {}MB proof", encoded.len() / (1024 * 1024));
-                    (StatusCode::OK, encoded)
+                    info!("returning a {}MB proof", proof.len() / (1024 * 1024));
+                    (StatusCode::OK, proof)
                 } else {
                     info!("no proofs ready");
                     (StatusCode::NO_CONTENT, "no proof ready".to_string())

@@ -55,6 +55,8 @@ jobs:
             --skip parser::json::test::test_json_tensor_loader \
             --skip layers::transformer::mha::test::test_mha_with_real_values
           mv layers-quant ~/layers-quant-base
+        env:
+          RAYON_NUM_THREADS: 8
       - name: Checkout HEAD
         uses: actions/checkout@v4
         with:
@@ -70,6 +72,8 @@ jobs:
             --skip layers::transformer::mha::test::test_mha_with_real_values
           mv layers-quant ~/layers-quant
           cp ../scripts/ci/cmp-layers-quant.sh ~/cmp-layers-quant.sh
+        env:
+          RAYON_NUM_THREADS: 8
       - name: Compare HEAD outputs against base
         run: |
           cd ~

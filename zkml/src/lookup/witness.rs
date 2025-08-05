@@ -15,24 +15,24 @@ use super::{
 
 #[derive(Clone, Debug)]
 /// Enum used for storing witness data for LogUp GKR, it is equivalent to [`LogUpInput`] but with no challenges stored.
-pub enum LogUpWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+pub enum LogUpWitness<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// Lookup variant can have multiple instances in one [`LogUpInput::Lookup`], `columns_per_instance` is used to work out how many batches we need to prove.
     Lookup {
-        commits: Vec<ProverCommitment<PCS, E>>,
+        commits: Vec<ProverCommitment<'a, PCS, E>>,
         column_evals: Vec<Vec<E::BaseField>>,
         columns_per_instance: usize,
         table_type: TableType,
     },
     /// Input for a Table proof.
     Table {
-        multiplicity_commit: ProverCommitment<PCS, E>,
+        multiplicity_commit: ProverCommitment<'a, PCS, E>,
         multiplicity_evals: Vec<E::BaseField>,
         column_evals: Vec<Vec<E::BaseField>>,
         table_type: TableType,
     },
 }
 
-impl<E, PCS> LogUpWitness<E, PCS>
+impl<'a, E, PCS> LogUpWitness<'a, E, PCS>
 where
     E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
@@ -41,11 +41,11 @@ where
 {
     /// Creates a new lookup witness
     pub fn new_lookup(
-        commits: Vec<ProverCommitment<PCS, E>>,
+        commits: Vec<ProverCommitment<'a, PCS, E>>,
         column_evals: Vec<Vec<E::BaseField>>,
         columns_per_instance: usize,
         table_type: TableType,
-    ) -> LogUpWitness<E, PCS> {
+    ) -> LogUpWitness<'a, E, PCS> {
         LogUpWitness::Lookup {
             commits,
             column_evals,
@@ -56,11 +56,11 @@ where
 
     /// Creates a new table witness
     pub fn new_table(
-        multiplicity_commit: ProverCommitment<PCS, E>,
+        multiplicity_commit: ProverCommitment<'a, PCS, E>,
         multiplicity_evals: Vec<E::BaseField>,
         column_evals: Vec<Vec<E::BaseField>>,
         table_type: TableType,
-    ) -> LogUpWitness<E, PCS> {
+    ) -> LogUpWitness<'a, E, PCS> {
         LogUpWitness::Table {
             multiplicity_commit,
             multiplicity_evals,
@@ -144,7 +144,7 @@ where
     }
 
     /// Consumes the witness and returns its commitments.
-    pub fn into_commitments(self) -> Vec<ProverCommitment<PCS, E>> {
+    pub fn into_commitments(self) -> Vec<ProverCommitment<'a, PCS, E>> {
         match self {
             LogUpWitness::Lookup { commits, .. } => commits,
             LogUpWitness::Table {

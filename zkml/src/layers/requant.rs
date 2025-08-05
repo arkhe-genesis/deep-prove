@@ -23,20 +23,23 @@ use crate::{
     to_base,
 };
 use anyhow::{Result, anyhow, ensure};
-
+use either::Either;
 use ff_ext::ExtensionField;
-use gkr::util::ceil_log2;
+use itertools::Itertools;
+use multilinear_extensions::{
+    Expression, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
+};
 use p3_field::FieldAlgebra;
 
 use mpcs::{PolynomialCommitmentScheme, sum_check::eq_xy_eval};
-use multilinear_extensions::{
-    mle::{DenseMultilinearExtension, IntoMLE},
-    virtual_poly::{ArcMultilinearExtension, VPAuxInfo, VirtualPolynomial},
-};
+use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use transcript::Transcript;
 
 use super::{
@@ -235,12 +238,12 @@ where
         Ok(vec![self.prove_step(prover, last_claims[0], ctx, id)?])
     }
 
-    fn gen_lookup_witness(
+    fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &Context<E, PCS>,
+        ctx: &'a Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
         ensure!(
             step_data.inputs.len() == 1,
             "Found more than 1 input in inference step of requant layer"
@@ -317,14 +320,14 @@ where
 
         #[allow(clippy::type_complexity)]
         let (clamping_commits, clamping_evals): (
-            Vec<(PCS::CommitmentWithWitness, DenseMultilinearExtension<E>)>,
+            Vec<(PCS::CommitmentWithWitness, MultilinearExtension<'_, E>)>,
             Vec<Vec<E::BaseField>>,
         ) = [clamping_in, clamping_out]
             .into_par_iter()
             .map(|vals| {
                 let evaluations = to_base::<E, _>(vals);
                 let mle =
-                    DenseMultilinearExtension::<E>::from_evaluations_slice(num_vars, &evaluations);
+                    MultilinearExtension::<E>::from_evaluations_vec(num_vars, evaluations.clone());
                 let commit = ctx.commitment_ctx.commit(&mle)?;
                 Ok(((commit, mle), evaluations))
             })
@@ -334,14 +337,14 @@ where
 
         #[allow(clippy::type_complexity)]
         let (shifted_chunk_commits, shifted_chunks_evals): (
-            Vec<(PCS::CommitmentWithWitness, DenseMultilinearExtension<E>)>,
+            Vec<(PCS::CommitmentWithWitness, MultilinearExtension<'_, E>)>,
             Vec<Vec<E::BaseField>>,
         ) = shifted_chunks
             .into_par_iter()
             .map(|chunk| {
                 let evaluations = to_base::<E, _>(chunk);
                 let mle =
-                    DenseMultilinearExtension::<E>::from_evaluations_slice(num_vars, &evaluations);
+                    MultilinearExtension::<E>::from_evaluations_vec(num_vars, evaluations.clone());
                 let commit = ctx.commitment_ctx.commit(&mle)?;
                 Ok(((commit, mle), evaluations))
             })
@@ -576,65 +579,71 @@ impl Requant {
         let clamping_mles = clamping_polys
             .iter()
             .map(|evaluations| {
-                DenseMultilinearExtension::<E>::from_evaluations_slice(num_vars, evaluations).into()
+                MultilinearExtension::<E>::from_evaluations_slice(num_vars, evaluations)
             })
-            .collect::<Vec<ArcMultilinearExtension<E>>>();
+            .collect::<Vec<MultilinearExtension<E>>>();
 
         let shifted_mles = shifted_prover_info
             .column_evals()
             .iter()
             .map(|evaluations| {
-                DenseMultilinearExtension::<E>::from_evaluations_slice(num_vars, evaluations).into()
+                MultilinearExtension::<E>::from_evaluations_slice(num_vars, evaluations)
             })
-            .collect::<Vec<ArcMultilinearExtension<E>>>();
+            .collect::<Vec<MultilinearExtension<E>>>();
 
         // produce a beta poly for the claim point for the claming lookup argument
-        let clamping_beta: ArcMultilinearExtension<E> =
-            compute_betas_eval(&clamping_logup_proof.output_claims()[0].point)
-                .into_mle()
-                .into();
+        let clamping_beta: MultilinearExtension<E> =
+            compute_betas_eval(&clamping_logup_proof.output_claims()[0].point).into_mle();
         // Produce a beta poly for the last_claim point
-        let last_claim_beta: ArcMultilinearExtension<E> =
-            compute_betas_eval(&last_claim.point).into_mle().into();
+        let last_claim_beta: MultilinearExtension<E> =
+            compute_betas_eval(&last_claim.point).into_mle();
         // Produce a beta poly for the shifted polys lookup argument
-        let shifted_beta: ArcMultilinearExtension<E> =
-            compute_betas_eval(&shifted_logup_proof.output_claims()[0].point)
-                .into_mle()
-                .into();
+        let shifted_beta: MultilinearExtension<E> =
+            compute_betas_eval(&shifted_logup_proof.output_claims()[0].point).into_mle();
 
         // Squeeze a batching challenge from the transcript.
         let batching_challenge = prover
             .transcript
-            .get_and_append_challenge(b"requant_batching")
+            .sample_and_append_challenge(b"requant_batching")
             .elements;
 
         // Construct the virtual polynomial for the sumcheck
-        let mut vp = VirtualPolynomial::<E>::new(num_vars);
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let clamping_out_expr = expr_builder.lift(either::Either::Left(&clamping_mles[1]));
+        let last_claim_beta_expr = expr_builder.lift(either::Either::Left(&last_claim_beta));
+        let clamping_beta_expr = expr_builder.lift(either::Either::Left(&clamping_beta));
+        let clamping_in_expr = expr_builder.lift(Either::Left(&clamping_mles[0]));
+        let shifted_beta_expr = expr_builder.lift(Either::Left(&shifted_beta));
 
-        vp.add_mle_list(vec![clamping_mles[1].clone(), last_claim_beta], E::ONE);
-        vp.add_mle_list(
-            vec![clamping_mles[1].clone(), clamping_beta.clone()],
-            batching_challenge,
-        );
+        let shifted_exprs = shifted_mles
+            .iter()
+            .map(|mle| expr_builder.lift(Either::Left(mle)))
+            .collect::<Vec<Expression<E>>>();
+
+        let batching_expr = Expression::Constant(Either::Right(batching_challenge));
+        let expr_one =
+            clamping_out_expr * (last_claim_beta_expr + batching_expr * clamping_beta_expr.clone());
 
         let mut combiner = batching_challenge * batching_challenge;
-        vp.add_mle_list(vec![clamping_mles[0].clone(), clamping_beta], combiner);
+        let combiner_expr = Expression::Constant(Either::Right(combiner));
+        let expr_two = combiner_expr * clamping_beta_expr * clamping_in_expr;
 
-        combiner *= batching_challenge;
-        shifted_mles.iter().for_each(|mle| {
-            vp.add_mle_list(vec![shifted_beta.clone(), mle.clone()], combiner);
-            combiner *= batching_challenge;
-        });
+        let all_expr = [expr_one, expr_two]
+            .into_iter()
+            .chain(shifted_exprs.into_iter().map(|e| {
+                combiner *= batching_challenge;
+                let const_expr = Expression::Constant(Either::Right(combiner));
+                const_expr * shifted_beta_expr.clone() * e
+            }))
+            .collect::<Vec<Expression<E>>>();
 
-        // Run the sumcheck prover for the claims
-        // This sumcheck checks that the polynomial `last_claim` relates to is the clamping output while simultaneously providing us with claimns for clamping input and
-        // the shifted chunks at the same point (we need them all evaluated at the same point so we can recombine the evaluations and produce the next claim).
-        #[allow(deprecated)]
-        let (claim_acc_proof, state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
+        let virtual_poly = expr_builder.to_virtual_polys(&all_expr, &[]);
+        let (claim_acc_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
         // Split out the eq poly evals from witness poly evals
-        let final_evals = state.get_mle_final_evaluations();
-        let point = claim_acc_proof.point.clone();
+        let final_evals = state.get_mle_flatten_final_evaluations();
+        let point = state.collect_raw_challenges();
         let clamping_out_eval = final_evals[0];
         let clamping_in_eval = final_evals[3];
         let shifted_evals = &final_evals[5..];
@@ -727,7 +736,7 @@ impl RequantCtx {
         // Squeeze the batching challenge for the claim accumulation sumcheck
         let batching_challenge = verifier
             .transcript
-            .get_and_append_challenge(b"requant_batching")
+            .sample_and_append_challenge(b"requant_batching")
             .elements;
 
         // 2. Verify claim accumulation
@@ -752,7 +761,7 @@ impl RequantCtx {
                 (acc + chal * val, chal * batching_challenge)
             });
         // The verifier can work out the auxiliary information about the sumcheck on their own.
-        let aux_info = VPAuxInfo::<E>::from_mle_list_dimensions(&[vec![
+        let aux_info = crate::util::from_mle_list_dimensions(&[vec![
             clamping_point.len(),
             clamping_point.len(),
         ]]);
@@ -765,7 +774,7 @@ impl RequantCtx {
         );
 
         // Now we check that the evalautions provided by the prover do recombine to the sumcheck subclaim
-        let acc_point = subclaim.point_flat();
+        let acc_point = subclaim.point.iter().map(|p| p.elements).collect_vec();
         // Calculate all th ebeta poly evals ourselves
         let last_claim_beta = eq_xy_eval(&last_claim.point, &acc_point);
         let clamping_beta = eq_xy_eval(clamping_point, &acc_point);

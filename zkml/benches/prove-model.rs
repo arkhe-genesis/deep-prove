@@ -61,7 +61,7 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
         let mut prover_transcript = new_transcript();
         let prover = Prover::<_, _, _>::new(ctx.as_ref().unwrap(), &mut prover_transcript);
         let io = trace.to_verifier_io();
-        let proof = prover.prove(trace).expect("unable to generate proof");
+        let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = new_transcript();
         verify::<_, _, _>(

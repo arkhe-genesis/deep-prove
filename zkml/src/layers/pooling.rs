@@ -20,16 +20,21 @@ use crate::{
     to_base,
 };
 use anyhow::{Result, anyhow, ensure};
+use either::Either;
 use ff_ext::ExtensionField;
-use gkr::util::ceil_log2;
 use itertools::{Itertools, izip};
 use mpcs::{PolynomialCommitmentScheme, sum_check::eq_xy_eval};
 use multilinear_extensions::{
-    mle::{ArcDenseMultilinearExtension, DenseMultilinearExtension, IntoMLE},
-    virtual_poly::{ArcMultilinearExtension, VPAuxInfo, VirtualPolynomial},
+    Expression,
+    mle::{IntoMLE, MultilinearExtension},
+    util::ceil_log2,
+    virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::de::DeserializeOwned;
-use sumcheck::structs::{IOPProof, IOPVerifierState};
+use sumcheck::{
+    structs::{IOPProof, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use transcript::Transcript;
 
 use rayon::prelude::*;
@@ -207,12 +212,12 @@ where
         )?])
     }
 
-    fn gen_lookup_witness(
+    fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &Context<E, PCS>,
+        ctx: &'a Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
         ensure!(
             step_data.inputs.len() == 1,
             "Input for pooling layer with invalid length. expected: 1 got: {}",
@@ -242,14 +247,15 @@ where
         let output_poly = to_base::<E, _>(step_data.outputs.outputs()[0].get_data());
         let num_vars = ceil_log2(output_poly.len());
         let commit_evals = column_evals
-            .iter()
-            .chain(std::iter::once(&output_poly))
+            .clone()
+            .into_iter()
+            .chain(std::iter::once(output_poly))
             .collect::<Vec<_>>();
         let commits = commit_evals
             .into_par_iter()
             .map(|evaluations| {
                 let mle =
-                    DenseMultilinearExtension::<E>::from_evaluations_slice(num_vars, evaluations);
+                    MultilinearExtension::<'_, E>::from_evaluations_vec(num_vars, evaluations);
                 let commit = ctx.commitment_ctx.commit(&mle)?;
                 Ok((commit, mle))
             })
@@ -260,7 +266,7 @@ where
             id,
             vec![LogUpWitness::<E, PCS>::new_lookup(
                 commits,
-                column_evals,
+                column_evals.clone(),
                 1,
                 TableType::Range,
             )],
@@ -371,16 +377,15 @@ impl Pooling {
         let logup_proof = logup_batch_prove(&prover_info, prover.transcript)?;
 
         // These are the polys that get passed to the zero check make sure their product is zero at every evaluation point
-        let mut diff_polys = prover_info
+        let diff_polys = prover_info
             .column_evals()
             .iter()
-            .map(|diff| {
-                DenseMultilinearExtension::<E>::from_evaluations_slice(info.num_vars, diff).into()
-            })
-            .collect::<Vec<ArcMultilinearExtension<E>>>();
+            .map(|diff| MultilinearExtension::<'_, E>::from_evaluations_slice(info.num_vars, diff))
+            .collect::<Vec<MultilinearExtension<E>>>();
 
         // Run the Zerocheck that checks enforces that output does contain the maximum value for the kernel
-        let mut vp = VirtualPolynomial::<E>::new(info.num_vars);
+        let num_threads = optimal_sumcheck_threads(info.num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, info.num_vars);
 
         // We reuse the logup point here for the zerocheck challenge
         let lookup_point = &logup_proof.output_claims()[0].point;
@@ -388,53 +393,55 @@ impl Pooling {
         // Compute the identity poly
         let batch_challenge = prover
             .transcript
-            .get_and_append_challenge(b"batch_pooling")
+            .sample_and_append_challenge(b"batch_pooling")
             .elements;
 
         let beta_eval = compute_betas_eval(lookup_point);
-        let beta_poly: ArcDenseMultilinearExtension<E> =
-            DenseMultilinearExtension::<E>::from_evaluations_ext_vec(info.num_vars, beta_eval)
-                .into();
+        let beta_poly = MultilinearExtension::from_evaluations_ext_vec(info.num_vars, beta_eval);
+
         let last_claim_beta_eval = compute_betas_eval(&last_claim.point);
-        let last_claim_beta: ArcDenseMultilinearExtension<E> =
-            DenseMultilinearExtension::<E>::from_evaluations_ext_vec(
-                info.num_vars,
-                last_claim_beta_eval,
-            )
-            .into();
-        let mut challenge_combiner = batch_challenge;
-        let lookup_parts = diff_polys
-            .iter()
-            .map(|diff| {
-                let out = (vec![diff.clone(), beta_poly.clone()], challenge_combiner);
-                challenge_combiner *= batch_challenge;
-                out
-            })
-            .collect::<Vec<(Vec<_>, E)>>();
-
-        diff_polys.push(beta_poly);
-        vp.add_mle_list(diff_polys, E::ONE);
-
-        lookup_parts
-            .into_iter()
-            .for_each(|(prod, coeff)| vp.add_mle_list(prod, coeff));
-
-        // We also batch in the same poly proof for the output with the Zerocheck
-        let output_mle: ArcMultilinearExtension<E> = output.get_data().to_vec().into_mle().into();
-
-        vp.add_mle_list(
-            vec![output_mle.clone(), last_claim_beta],
-            challenge_combiner,
+        let last_claim_beta = MultilinearExtension::from_evaluations_ext_vec(
+            info.num_vars,
+            last_claim_beta_eval.clone(),
         );
-        #[allow(deprecated)]
-        let (proof, sumcheck_state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
+        let output_mle: MultilinearExtension<E> = output.get_data().to_vec().into_mle();
+        let diff_exprs = diff_polys
+            .iter()
+            .map(|p| expr_builder.lift(Either::Left(p)))
+            .collect::<Vec<Expression<E>>>();
+        let output_expr = expr_builder.lift(Either::Left(&output_mle));
+        let beta_expr = expr_builder.lift(Either::Left(&beta_poly));
+        let last_claim_expr = expr_builder.lift(Either::Left(&last_claim_beta));
+
+        let (prod_expr, sum_expr, final_challenge) = diff_exprs.into_iter().fold(
+            (
+                beta_expr.clone(),
+                Expression::Constant(Either::Right(E::ZERO)),
+                batch_challenge,
+            ),
+            |(prod_acc, sum_acc, chal_acc), expr| {
+                (
+                    prod_acc * expr.clone(),
+                    sum_acc + Expression::Constant(Either::Right(chal_acc)) * expr,
+                    chal_acc * batch_challenge,
+                )
+            },
+        );
+        let diffs_expr = prod_expr + (beta_expr * sum_expr);
+        let out_expr =
+            Expression::Constant(Either::Right(final_challenge)) * last_claim_expr * output_expr;
+        let virtual_poly = expr_builder.to_virtual_polys(&[diffs_expr, out_expr], &[]);
+        let (proof, sumcheck_state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
         // Extract all claims about committed witness polys
-        let zerocheck_point = &proof.point;
-        let sumcheck_evals = sumcheck_state.get_mle_final_evaluations();
+        //
+        // `collect_raw_challenges` instead of the `.point` field
+        // since https://github.com/scroll-tech/ceno/pull/959
+        let zerocheck_point = &sumcheck_state.collect_raw_challenges();
+        let sumcheck_evals = sumcheck_state.get_mle_flatten_final_evaluations();
         let kernel_size = info.poolinfo.kernel_size * info.poolinfo.kernel_size;
 
-        let output_eval = sumcheck_evals[kernel_size + 1];
+        let output_eval = sumcheck_evals[kernel_size];
 
         let commitments = sumcheck_evals[..kernel_size]
             .iter()
@@ -442,10 +449,9 @@ impl Pooling {
             .zip(commits)
             .map(|(&eval, comm_with_wit)| {
                 let commit = PCS::get_pure_commitment(&comm_with_wit.0);
-                prover.commit_prover.add_witness_claim(
-                    comm_with_wit,
-                    Claim::<E>::new(zerocheck_point.clone(), eval),
-                )?;
+                prover
+                    .commit_prover
+                    .add_witness_claim(comm_with_wit, Claim::new(zerocheck_point.clone(), eval))?;
                 Ok(commit)
             })
             .collect::<Result<Vec<PCS::Commitment>, anyhow::Error>>()?;
@@ -458,7 +464,7 @@ impl Pooling {
         // We can batch all of the claims for the input poly with 00, 10, 01, 11 fixed into one with random challenges
         let [r1, r2] = [prover
             .transcript
-            .get_and_append_challenge(b"input_batching")
+            .sample_and_append_challenge(b"input_batching")
             .elements; 2];
 
         let one_minus_r1 = E::ONE - r1;
@@ -479,6 +485,7 @@ impl Pooling {
             sumcheck_state
                 .get_mle_final_evaluations()
                 .iter()
+                .flatten()
                 .take(kernel_size),
         )
         .fold(E::ZERO, |zc_acc, (m, zc)| zc_acc + *m * (output_eval - *zc));
@@ -499,7 +506,10 @@ impl Pooling {
         // We don't need the last eval of the the sumcheck state as it is the beta poly
 
         let zerocheck_evals = [
-            &sumcheck_state.get_mle_final_evaluations()[..kernel_size],
+            &sumcheck_state
+                .get_mle_flatten_final_evaluations()
+                .into_iter()
+                .collect::<Vec<_>>()[..kernel_size],
             &[output_eval],
         ]
         .concat();
@@ -544,10 +554,10 @@ impl PoolingCtx {
         )?;
 
         // 2. Verify the sumcheck proof
-        let poly_aux = VPAuxInfo::<E>::from_mle_list_dimensions(&[vec![self.num_vars; 5]]);
+        let poly_aux = crate::util::from_mle_list_dimensions(&[vec![self.num_vars; 5]]);
         let batching_challenge = verifier
             .transcript
-            .get_and_append_challenge(b"batch_pooling")
+            .sample_and_append_challenge(b"batch_pooling")
             .elements;
         let (initial_value_no_last_claim, final_batching_challenge) = verifier_claims
             .claims()
@@ -565,7 +575,7 @@ impl PoolingCtx {
         );
 
         // Verify the sumcheck output claim and add commitment claims to the commit verifier
-        let zerocheck_point = subclaim.point_flat();
+        let zerocheck_point = subclaim.point.iter().map(|p| p.elements).collect_vec();
         let beta_eval = eq_xy_eval(verifier_claims.point(), &zerocheck_point);
 
         let last_claim_beta_eval = eq_xy_eval(&last_claim.point, &zerocheck_point);
@@ -610,7 +620,7 @@ impl PoolingCtx {
         // Challenegs used to batch input poly claims together and link them with zerocheck and lookup verification output
         let [r1, r2] = [verifier
             .transcript
-            .get_and_append_challenge(b"input_batching")
+            .sample_and_append_challenge(b"input_batching")
             .elements; 2];
         let one_minus_r1 = E::ONE - r1;
         let one_minus_r2 = E::ONE - r2;
@@ -787,17 +797,13 @@ mod tests {
     use crate::{commit::compute_betas_eval, default_transcript, rng_from_env_or_random, to_base};
 
     use super::*;
-    use crate::quantization::Fieldizer;
+    use crate::{quantization::Fieldizer, util::from_mle_list_dimensions};
     use ark_std::rand::Rng;
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
-    use gkr::util::ceil_log2;
     use itertools::Itertools;
-    use multilinear_extensions::{
-        mle::{DenseMultilinearExtension, MultilinearExtension},
-        virtual_poly::{ArcMultilinearExtension, VirtualPolynomial},
-    };
+    use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
     use p3_field::FieldAlgebra;
-    use p3_goldilocks::Goldilocks;
+
     use sumcheck::structs::{IOPProverState, IOPVerifierState};
 
     type F = GoldilocksExt2;
@@ -837,7 +843,7 @@ mod tests {
             let num_vars = padded_input.get_data().len().ilog2() as usize;
             let output_num_vars = padded_output.get_data().len().ilog2() as usize;
 
-            let mle = DenseMultilinearExtension::<F>::from_evaluations_vec(
+            let mle = MultilinearExtension::<'_, F>::from_evaluations_vec(
                 num_vars,
                 to_base::<F, _>(padded_input.get_data()),
             );
@@ -852,19 +858,19 @@ mod tests {
 
                     mle.fix_variables(&point)
                 })
-                .collect::<Vec<DenseMultilinearExtension<F>>>();
+                .collect::<Vec<MultilinearExtension<'_, F>>>();
             // f(0,x,0,..) = x * f(0,1,0,...) + (1 - x) * f(0,0,0,...)
             let even_mles = fixed_mles
                 .iter()
                 .cloned()
                 .step_by(2)
-                .collect::<Vec<DenseMultilinearExtension<F>>>();
+                .collect::<Vec<MultilinearExtension<'_, F>>>();
             let odd_mles = fixed_mles
                 .iter()
                 .cloned()
                 .skip(1)
                 .step_by(2)
-                .collect::<Vec<DenseMultilinearExtension<F>>>();
+                .collect::<Vec<MultilinearExtension<'_, F>>>();
 
             let even_merged = even_mles
                 .chunks(padded_input_shape[3] >> 1)
@@ -885,12 +891,12 @@ mod tests {
                             .collect::<Vec<Vec<F>>>();
                     }
 
-                    DenseMultilinearExtension::<F>::from_evaluations_ext_slice(
+                    MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
                         output_num_vars,
-                        &mles_vec[0],
+                        mles_vec[0].clone(),
                     )
                 })
-                .collect::<Vec<DenseMultilinearExtension<F>>>();
+                .collect::<Vec<MultilinearExtension<'_, F>>>();
 
             let odd_merged = odd_mles
                 .chunks(padded_input_shape[3] >> 1)
@@ -911,16 +917,16 @@ mod tests {
                             .collect::<Vec<Vec<F>>>();
                     }
 
-                    DenseMultilinearExtension::<F>::from_evaluations_ext_slice(
+                    MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
                         output_num_vars,
-                        &mles_vec[0],
+                        mles_vec[0].clone(),
                     )
                 })
-                .collect::<Vec<DenseMultilinearExtension<F>>>();
+                .collect::<Vec<MultilinearExtension<'_, F>>>();
 
             let merged_input_mles = [even_merged, odd_merged].concat();
 
-            let output_mle = DenseMultilinearExtension::<F>::from_evaluations_ext_vec(
+            let output_mle = MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
                 output_num_vars,
                 padded_output
                     .get_data()
@@ -932,12 +938,13 @@ mod tests {
                     .collect::<Vec<F>>(),
             );
 
-            let mut vp = VirtualPolynomial::<F>::new(output_num_vars);
-
+            let num_threads = optimal_sumcheck_threads(output_num_vars);
+            let mut expr_builder =
+                VirtualPolynomialsBuilder::<F>::new(num_threads, output_num_vars);
             let diff_mles = merged_input_mles
                 .iter()
                 .map(|in_mle| {
-                    DenseMultilinearExtension::<F>::from_evaluations_ext_vec(
+                    MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
                         output_num_vars,
                         in_mle
                             .get_ext_field_vec()
@@ -946,9 +953,13 @@ mod tests {
                             .map(|(input, output)| *output - *input)
                             .collect::<Vec<F>>(),
                     )
-                    .into()
                 })
-                .collect::<Vec<ArcMultilinearExtension<F>>>();
+                .collect::<Vec<MultilinearExtension<F>>>();
+
+            let diff_exprs = diff_mles
+                .iter()
+                .map(|diff_mle| expr_builder.lift(Either::Left(diff_mle)))
+                .collect::<Vec<Expression<F>>>();
 
             (0..1 << output_num_vars).for_each(|j| {
                 let values = diff_mles
@@ -958,28 +969,28 @@ mod tests {
                 assert_eq!(values.into_iter().product::<F>(), F::ZERO)
             });
 
-            vp.add_mle_list(diff_mles, F::ONE);
-
             let random_point = (0..output_num_vars)
                 .map(|_| <F as FromUniformBytes>::random(&mut rng))
                 .collect::<Vec<F>>();
 
             let beta_evals = compute_betas_eval(&random_point);
 
-            let beta_mle: ArcMultilinearExtension<F> =
-                DenseMultilinearExtension::<F>::from_evaluations_ext_vec(
+            let beta_mle: MultilinearExtension<F> =
+                MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
                     output_num_vars,
                     beta_evals,
-                )
-                .into();
-            vp.mul_by_mle(beta_mle.clone(), Goldilocks::ONE);
+                );
 
-            let aux_info = vp.aux_info.clone();
+            let beta_expr = expr_builder.lift(Either::Left(&beta_mle));
+            let expr = diff_exprs.into_iter().fold(beta_expr, |acc, d| acc * d);
+            let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
+
+            let aux_info = from_mle_list_dimensions(&[vec![output_num_vars; 5]]);
 
             let mut prover_transcript = default_transcript::<F>();
 
             #[allow(deprecated)]
-            let (proof, state) = IOPProverState::<F>::prove_parallel(vp, &mut prover_transcript);
+            let (proof, state) = IOPProverState::<F>::prove(virtual_poly, &mut prover_transcript);
 
             let mut verifier_transcript = default_transcript::<F>();
 
@@ -1025,7 +1036,7 @@ mod tests {
             assert_eq!(calc_eval, subclaim.expected_evaluation);
 
             // in order output - 00, output - 10, output - 01, output - 11, eq I believe
-            let final_mle_evals = state.get_mle_final_evaluations();
+            let final_mle_evals = state.get_mle_flatten_final_evaluations();
 
             // let (r1, r2) = (<F as Field>::random(&mut rng), <F as Field>::random(&mut rng));
             let [r1, r2] = [<F as FromUniformBytes>::random(&mut rng); 2];

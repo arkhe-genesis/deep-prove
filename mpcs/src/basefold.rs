@@ -27,14 +27,14 @@ pub use encoding::{
     RSCodeDefaultSpec,
 };
 use ff_ext::ExtensionField;
-use multilinear_extensions::mle::MultilinearExtension;
+use multilinear_extensions::{mle::MultilinearExtension, smart_slice::SmartSlice};
 use query_phase::{
     BatchedQueriesResultWithMerklePath, QueriesResultWithMerklePath,
     SimpleBatchQueriesResultWithMerklePath, batch_prover_query_phase, batch_verifier_query_phase,
     prover_query_phase, simple_batch_prover_query_phase, simple_batch_verifier_query_phase,
     verifier_query_phase,
 };
-use std::{borrow::BorrowMut, ops::Deref};
+use std::{borrow::BorrowMut, ops::Deref, sync::Arc};
 pub use structure::BasefoldSpec;
 use structure::{BasefoldProof, ProofQueriesResultWithMerklePath};
 use transcript::Transcript;
@@ -42,16 +42,13 @@ use transcript::Transcript;
 use itertools::Itertools;
 use serde::{Serialize, de::DeserializeOwned};
 
-use multilinear_extensions::{
-    mle::{DenseMultilinearExtension, FieldType},
-    virtual_poly::build_eq_x_r_vec,
-};
+use multilinear_extensions::{mle::FieldType, virtual_poly::build_eq_x_r_vec};
 
 use rayon::{iter::IntoParallelIterator, prelude::*};
 use std::borrow::Cow;
 pub use sumcheck::{one_level_eval_hc, one_level_interp_hc};
 
-type SumCheck<F> = ClassicSumCheck<CoefficientsProver<F>>;
+type SumCheck<'a, F> = ClassicSumCheck<CoefficientsProver<'a, F>>;
 
 mod structure;
 pub use structure::{
@@ -63,7 +60,7 @@ mod commit_phase;
 use commit_phase::{batch_commit_phase, commit_phase, simple_batch_commit_phase};
 mod encoding;
 pub use encoding::{coset_fft, fft, fft_root_table};
-use multilinear_extensions::virtual_poly::ArcMultilinearExtension;
+use multilinear_extensions::mle::ArcMultilinearExtension;
 
 mod query_phase;
 // This sumcheck module is different from the mpcs::sumcheck module, in that
@@ -71,9 +68,17 @@ mod query_phase;
 mod sumcheck;
 
 enum PolyEvalsCodeword<E: ExtensionField> {
-    Normal((FieldType<E>, FieldType<E>)),
-    TooSmall(FieldType<E>), // The polynomial is too small to apply FRI
+    Normal((FieldType<'static, E>, FieldType<'static, E>)),
+    TooSmall(FieldType<'static, E>), // The polynomial is too small to apply FRI
     TooBig(usize),
+}
+
+fn field_type_to_owned<F: ExtensionField>(ft: &FieldType<F>) -> FieldType<'static, F> {
+    match ft {
+        FieldType::Base(smart_slice) => FieldType::Base(SmartSlice::Owned(smart_slice.to_vec())),
+        FieldType::Ext(smart_slice) => FieldType::Ext(SmartSlice::Owned(smart_slice.to_vec())),
+        FieldType::Unreachable => unreachable!(),
+    }
 }
 
 impl<E: ExtensionField, Spec: BasefoldSpec<E>> Basefold<E, Spec>
@@ -85,12 +90,12 @@ where
     /// for said polynomial
     fn get_poly_bh_evals_and_codeword(
         pp: &BasefoldProverParams<E, Spec>,
-        poly: &DenseMultilinearExtension<E>,
+        poly: &MultilinearExtension<E>,
     ) -> PolyEvalsCodeword<E> {
         // bh_evals is just a copy of poly.evals().
         // Note that this function implicitly assumes that the size of poly.evals() is a
         // power of two. Otherwise, the function crashes with index out of bound.
-        let mut bh_evals = poly.evaluations.clone();
+        let mut bh_evals = field_type_to_owned(&poly.evaluations);
         let num_vars = poly.num_vars;
         if num_vars > pp.encoding_params.get_max_message_size_log() {
             return PolyEvalsCodeword::TooBig(num_vars);
@@ -154,9 +159,9 @@ where
     }
 
     /// Transpose a matrix of field elements, generic over the type of field element
-    pub fn transpose_field_type<T: Send + Sync + Copy>(
-        matrix: &[FieldType<E>],
-    ) -> Result<Vec<FieldType<E>>, Error> {
+    pub fn transpose_field_type<'a, T: Send + Sync + Copy>(
+        matrix: &[FieldType<'a, E>],
+    ) -> Result<Vec<FieldType<'a, E>>, Error> {
         let transpose_fn = match matrix[0] {
             FieldType::Ext(_) => Self::get_column_ext,
             FieldType::Base(_) => Self::get_column_base,
@@ -170,11 +175,11 @@ where
             .collect()
     }
 
-    fn get_column_base(
-        matrix: &[FieldType<E>],
+    fn get_column_base<'a>(
+        matrix: &[FieldType<'a, E>],
         column_index: usize,
-    ) -> Result<FieldType<E>, Error> {
-        Ok(FieldType::Base(
+    ) -> Result<FieldType<'a, E>, Error> {
+        Ok(FieldType::Base(SmartSlice::Owned(
             matrix
                 .par_iter()
                 .map(|row| match row {
@@ -184,11 +189,14 @@ where
                     )),
                 })
                 .collect::<Result<Vec<E::BaseField>, Error>>()?,
-        ))
+        )))
     }
 
-    fn get_column_ext(matrix: &[FieldType<E>], column_index: usize) -> Result<FieldType<E>, Error> {
-        Ok(FieldType::Ext(
+    fn get_column_ext<'a>(
+        matrix: &[FieldType<'a, E>],
+        column_index: usize,
+    ) -> Result<FieldType<'a, E>, Error> {
+        Ok(FieldType::Ext(SmartSlice::Owned(
             matrix
                 .par_iter()
                 .map(|row| match row {
@@ -198,7 +206,19 @@ where
                     )),
                 })
                 .collect::<Result<Vec<E>, Error>>()?,
-        ))
+        )))
+    }
+}
+
+fn into_owned_fieldtype<E: ExtensionField>(f: &FieldType<E>) -> Arc<FieldType<'static, E>> {
+    match f {
+        FieldType::Base(smart_slice) => {
+            FieldType::Base(SmartSlice::Owned(smart_slice.to_vec())).into()
+        }
+        FieldType::Ext(smart_slice) => {
+            FieldType::Ext(SmartSlice::Owned(smart_slice.to_vec())).into()
+        }
+        FieldType::Unreachable => unreachable!(),
     }
 }
 
@@ -262,7 +282,8 @@ where
 ///     positions are (i >> k) and (i >> k) XOR 1.
 /// (c) The verifier checks that the folding has been correctly computed
 ///     at these positions.
-impl<E: ExtensionField, Spec: BasefoldSpec<E>> PolynomialCommitmentScheme<E> for Basefold<E, Spec>
+impl<E: ExtensionField + p3_field::Field, Spec: BasefoldSpec<E>> PolynomialCommitmentScheme<E>
+    for Basefold<E, Spec>
 where
     E: Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
@@ -301,9 +322,9 @@ where
         )
     }
 
-    fn commit(
+    fn commit<'b>(
         pp: &Self::ProverParam,
-        poly: &DenseMultilinearExtension<E>,
+        poly: MultilinearExtension<E>,
     ) -> Result<Self::CommitmentWithWitness, Error> {
         let timer = start_timer!(|| "Basefold::commit");
 
@@ -318,7 +339,7 @@ where
         // 1. Encode the polynomials. Simultaneously get:
         //  (1) The evaluations over the hypercube (just a clone of the input)
         //  (2) The encoding of the coefficient vector (need an interpolation)
-        let ret = match Self::get_poly_bh_evals_and_codeword(pp, poly) {
+        let ret = match Self::get_poly_bh_evals_and_codeword(pp, &poly) {
             PolyEvalsCodeword::Normal((bh_evals, codeword)) => {
                 let codeword_tree = MerkleTree::<E, Spec::MerkleHasher>::from_leaves(codeword);
 
@@ -333,7 +354,8 @@ where
                 })
             }
             PolyEvalsCodeword::TooSmall(evals) => {
-                let codeword_tree = MerkleTree::<E, Spec::MerkleHasher>::from_leaves(evals.clone());
+                let codeword_tree =
+                    MerkleTree::<'static, E, Spec::MerkleHasher>::from_leaves(evals.clone());
 
                 // All these values are stored in the `CommitmentWithWitness` because
                 // they are useful in opening, and we don't want to recompute them.
@@ -353,9 +375,9 @@ where
         ret
     }
 
-    fn batch_commit(
+    fn batch_commit<'b>(
         pp: &Self::ProverParam,
-        polys: &[DenseMultilinearExtension<E>],
+        polys: &[MultilinearExtension<'b, E>],
     ) -> Result<Self::CommitmentWithWitness, Error> {
         // assumptions
         // 1. there must be at least one polynomial
@@ -409,8 +431,9 @@ where
                         }
                     })
                     .collect::<(Vec<_>, Vec<_>)>();
-                let codeword_tree =
-                    MerkleTree::<E, Spec::MerkleHasher>::from_batch_leaves(codewords);
+                let codeword_tree = MerkleTree::<E, Spec::MerkleHasher>::from_batch_leaves(
+                    codewords.iter().map(into_owned_fieldtype).collect(),
+                );
                 Self::CommitmentWithWitness {
                     codeword_tree,
                     polynomials_bh_evals: bh_evals,
@@ -430,8 +453,9 @@ where
                         }
                     })
                     .collect::<Vec<_>>();
-                let codeword_tree =
-                    MerkleTree::<E, Spec::MerkleHasher>::from_batch_leaves(bh_evals.clone());
+                let codeword_tree = MerkleTree::<E, Spec::MerkleHasher>::from_batch_leaves(
+                    bh_evals.iter().map(into_owned_fieldtype).collect(),
+                );
                 Self::CommitmentWithWitness {
                     codeword_tree,
                     polynomials_bh_evals: bh_evals,
@@ -463,14 +487,14 @@ where
     /// Open a single polynomial commitment at one point. If the given
     /// commitment with data contains more than one polynomial, this function
     /// will panic.
-    fn open(
+    fn open<'b>(
         pp: &Self::ProverParam,
-        poly: &DenseMultilinearExtension<E>,
+        poly: &MultilinearExtension<'b, E>,
         comm: &Self::CommitmentWithWitness,
         point: &[E],
         _eval: &E, // Opening does not need eval, except for sanity check
         transcript: &mut impl Transcript<E>,
-    ) -> Result<Self::Proof, Error> {
+    ) -> Result<BasefoldProof<E, <Spec::MerkleHasher as MerkleHasher<E>>::Digest>, Error> {
         let timer = start_timer!(|| "Basefold::open");
 
         // The encoded polynomial should at least have the number of
@@ -479,7 +503,9 @@ where
         // the protocol won't work, and saves no verifier work anyway.
         // In this case, simply return the evaluations as trivial proof.
         if comm.is_trivial::<Spec>() {
-            return Ok(Self::Proof::trivial(vec![poly.evaluations.clone()]));
+            return Ok(Self::Proof::trivial(vec![into_owned_fieldtype(
+                &poly.evaluations,
+            )]));
         }
 
         assert!(comm.num_vars >= Spec::get_basecode_msg_size_log());
@@ -543,9 +569,9 @@ where
     /// Because otherwise it is complex to match the polynomials and
     /// the commitments, and because currently this high flexibility is
     /// not very useful in ceno.
-    fn batch_open(
+    fn batch_open<'b>(
         pp: &Self::ProverParam,
-        polys: &[DenseMultilinearExtension<E>],
+        polys: &[MultilinearExtension<'b, E>],
         comms: &[Self::CommitmentWithWitness],
         points: &[Vec<E>],
         evals: &[Evaluation<E>],
@@ -566,7 +592,7 @@ where
         );
 
         comms.iter().for_each(|comm| {
-            assert!(comm.num_polys == 1);
+            assert_eq!(comm.num_polys, 1);
             assert!(!comm.is_trivial::<Spec>());
         });
 
@@ -587,7 +613,7 @@ where
         let t = (0..batch_size_log)
             .map(|_| {
                 transcript
-                    .get_and_append_challenge(b"batch coeffs")
+                    .sample_and_append_challenge(b"batch coeffs")
                     .elements
             })
             .collect::<Vec<_>>();
@@ -596,7 +622,7 @@ where
         // Note that this is a small polynomial (only batch_size) compared to the polynomials
         // to open.
         let eq_xt =
-            DenseMultilinearExtension::<E>::from_evaluations_ext_vec(t.len(), build_eq_x_r_vec(&t));
+            MultilinearExtension::<E>::from_evaluations_ext_vec(t.len(), build_eq_x_r_vec(&t));
         // When this polynomial is smaller, it will be repeatedly summed over the cosets of the hypercube
         let target_sum = inner_product_three(
             evals.iter().map(Evaluation::value),
@@ -611,7 +637,7 @@ where
         let merged_polys = evals.iter().zip(poly_iter_ext(&eq_xt)).fold(
             // This folding will generate a vector of |points| pairs of (scalar, polynomial)
             // The polynomials are initialized to zero, and the scalars are initialized to one
-            vec![(E::ONE, Cow::<DenseMultilinearExtension<E>>::default()); points.len()],
+            vec![(E::ONE, Cow::<MultilinearExtension<E>>::default()); points.len()],
             |mut merged_polys, (eval, eq_xt_i)| {
                 // For each polynomial to open, eval.point() specifies which point it is to be opened at.
                 if merged_polys[eval.point()].1.num_vars == 0 {
@@ -674,7 +700,7 @@ where
                     * scalar
             })
             .sum();
-        let sumcheck_polys: Vec<&DenseMultilinearExtension<E>> = merged_polys
+        let sumcheck_polys: Vec<&MultilinearExtension<'_, E>> = merged_polys
             .iter()
             .map(|(_, poly)| poly.deref())
             .collect_vec();
@@ -774,7 +800,7 @@ where
     /// 2. All the polynomials share the same commitment and have the same
     ///    number of variables.
     /// 3. The point is already a random point generated by a sum-check.
-    fn simple_batch_open(
+    fn simple_batch_open<'b>(
         pp: &Self::ProverParam,
         polys: &[ArcMultilinearExtension<E>],
         comm: &Self::CommitmentWithWitness,
@@ -786,7 +812,12 @@ where
         let num_vars = polys[0].num_vars();
 
         if comm.is_trivial::<Spec>() {
-            return Ok(Self::Proof::trivial(comm.polynomials_bh_evals.clone()));
+            return Ok(Self::Proof::trivial(
+                comm.polynomials_bh_evals
+                    .iter()
+                    .map(into_owned_fieldtype)
+                    .collect(),
+            ));
         }
 
         polys
@@ -807,7 +838,7 @@ where
         let t = (0..batch_size_log)
             .map(|_| {
                 transcript
-                    .get_and_append_challenge(b"batch coeffs")
+                    .sample_and_append_challenge(b"batch coeffs")
                     .elements
             })
             .collect::<Vec<_>>();
@@ -875,8 +906,8 @@ where
             let merkle_tree =
                 MerkleTree::<E, Spec::MerkleHasher>::from_batch_leaves(trivial_proof.clone());
             if comm.root() == merkle_tree.root() {
-                let computed_eval = DenseMultilinearExtension::<E> {
-                    evaluations: trivial_proof[0].clone(),
+                let computed_eval = MultilinearExtension::<'_, E> {
+                    evaluations: trivial_proof[0].as_ref().to_owned(),
                     num_vars: trivial_proof[0].len().ilog2() as usize,
                 }
                 .evaluate(point);
@@ -907,7 +938,7 @@ where
             transcript.append_field_element_exts(sumcheck_messages[i].as_slice());
             fold_challenges.push(
                 transcript
-                    .get_and_append_challenge(b"commit round")
+                    .sample_and_append_challenge(b"commit round")
                     .elements,
             );
             if i < num_rounds - 1 {
@@ -924,7 +955,7 @@ where
             .map(|_| {
                 ext_to_usize(
                     &transcript
-                        .get_and_append_challenge(b"query indices")
+                        .sample_and_append_challenge(b"query indices")
                         .elements,
                 ) % (1 << (num_vars + Spec::get_rate_log()))
             })
@@ -997,13 +1028,12 @@ where
         let t = (0..batch_size_log)
             .map(|_| {
                 transcript
-                    .get_and_append_challenge(b"batch coeffs")
+                    .sample_and_append_challenge(b"batch coeffs")
                     .elements
             })
             .collect::<Vec<_>>();
 
-        let eq_xt =
-            DenseMultilinearExtension::from_evaluations_ext_vec(t.len(), build_eq_x_r_vec(&t));
+        let eq_xt = MultilinearExtension::from_evaluations_ext_vec(t.len(), build_eq_x_r_vec(&t));
         let target_sum = inner_product_three(
             evals.iter().map(Evaluation::value),
             &evals
@@ -1042,7 +1072,7 @@ where
             transcript.append_field_element_exts(sumcheck_messages[i].as_slice());
             fold_challenges.push(
                 transcript
-                    .get_and_append_challenge(b"commit round")
+                    .sample_and_append_challenge(b"commit round")
                     .elements,
             );
             if i < num_rounds - 1 {
@@ -1058,7 +1088,7 @@ where
             .map(|_| {
                 ext_to_usize(
                     &transcript
-                        .get_and_append_challenge(b"query indices")
+                        .sample_and_append_challenge(b"query indices")
                         .elements,
                 ) % (1 << (num_vars + Spec::get_rate_log()))
             })
@@ -1134,10 +1164,11 @@ where
         let t = (0..batch_size_log)
             .map(|_| {
                 transcript
-                    .get_and_append_challenge(b"batch coeffs")
+                    .sample_and_append_challenge(b"batch coeffs")
                     .elements
             })
             .collect::<Vec<_>>();
+
         let eq_xt = build_eq_x_r_vec(&t)[..evals.len()].to_vec();
 
         let mut fold_challenges: Vec<E> = Vec::with_capacity(num_vars);
@@ -1147,7 +1178,7 @@ where
             transcript.append_field_element_exts(sumcheck_messages[i].as_slice());
             fold_challenges.push(
                 transcript
-                    .get_and_append_challenge(b"commit round")
+                    .sample_and_append_challenge(b"commit round")
                     .elements,
             );
             if i < num_rounds - 1 {
@@ -1163,7 +1194,7 @@ where
             .map(|_| {
                 ext_to_usize(
                     &transcript
-                        .get_and_append_challenge(b"query indices")
+                        .sample_and_append_challenge(b"query indices")
                         .elements,
                 ) % (1 << (num_vars + Spec::get_rate_log()))
             })
