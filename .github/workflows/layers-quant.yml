@@ -2,6 +2,10 @@ name: "Layer quantization regression tests"
 on:
   pull_request:
 
+concurrency:
+  group: quant-tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ['hostname:hetzner-dedicated-7']

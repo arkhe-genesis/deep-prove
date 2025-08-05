@@ -10,6 +10,10 @@ on:
       - master
   pull_request:
 
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   changes:
     name: Check for changes in zkML sources
