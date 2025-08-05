@@ -65,16 +65,13 @@ jobs:
         run: |
           cd zkml && \
           bencher run \
-          --project deep-prove-f264508-ok338l62t85v1 \
+          --project deep-prove-private-70c58ed-ejzl400nndqc0 \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --branch "$GITHUB_HEAD_REF" \
-          --start-point "$GITHUB_BASE_REF" \
+          --start-point master \
           --start-point-hash '${{ github.event.pull_request.base.sha }}' \
           --start-point-clone-thresholds \
           --start-point-reset \
-          --threshold-measure latency \
-          --threshold-test percentage \
-          --threshold-upper-boundary 0.20 \
           --testbed ci-runner \
           --err \
           --adapter rust_criterion \

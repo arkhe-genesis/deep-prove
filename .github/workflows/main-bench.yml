@@ -47,7 +47,7 @@ jobs:
           bencher run \
           --project deep-prove-private-70c58ed-ejzl400nndqc0 \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
-          --branch main \
+          --branch master \
           --threshold-measure latency \
           --threshold-test percentage \
           --threshold-upper-boundary 0.20 \
