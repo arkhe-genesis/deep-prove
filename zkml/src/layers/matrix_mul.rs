@@ -211,7 +211,7 @@ impl<T> MatMul<T> {
                 another layer"))?
         }
         if let Some(bt) = bias.as_ref() {
-            ensure!(bt.shape().len() == 1, "Bias must be a 1D tensor");
+            ensure!(bt.rank() == 1, "Bias must be a 1D tensor");
             match right_matrix {
                 OperandMatrix::Weight(ref mat) => {
                     ensure!(

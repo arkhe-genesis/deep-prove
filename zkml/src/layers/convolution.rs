@@ -133,7 +133,7 @@ pub struct ConvProof<E: ExtensionField> {
 impl<T: Number> Convolution<T> {
     pub fn new(filter: Tensor<T>, bias: Tensor<T>) -> Self {
         assert_eq!(filter.kw(), bias.shape()[0]);
-        assert_eq!(filter.shape().len(), 4);
+        assert_eq!(filter.rank(), 4);
         let filter_shape = filter.shape();
         Self::new_padded(filter, bias, &filter_shape)
     }
@@ -173,7 +173,7 @@ impl<T: Number> Convolution<T> {
 
     /// Retrieves an element using (N, C, H, W) indexing
     pub fn get(&self, n: usize, c: usize, h: usize, w: usize) -> T {
-        assert!(self.filter.shape().len() <= 4);
+        assert!(self.filter.rank() <= 4);
 
         let (n_size, c_size, h_size, w_size) = self.filter.get4d();
 

@@ -361,7 +361,7 @@ impl Pooling {
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
     {
-        assert_eq!(input.shape().len(), 3, "Maxpool needs 3D inputs.");
+        assert_eq!(input.rank(), 3, "Maxpool needs 3D inputs.");
         // Should only be one prover_info for this step
         let mut logup_witnesses = prover.lookup_witness(id)?;
         ensure!(

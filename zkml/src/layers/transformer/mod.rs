@@ -221,7 +221,7 @@ pub(crate) mod test {
             input: &Tensor<f32>,
             gpt2_output: Option<&GPT2LayerOutput>,
         ) -> anyhow::Result<Tensor<f32>> {
-            ensure!(input.shape().len() == 2);
+            ensure!(input.rank() == 2);
 
             let normed = self
                 .layernorm

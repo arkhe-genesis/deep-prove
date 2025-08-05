@@ -24,7 +24,7 @@ impl<N: Number> Evaluate<N> for Permute {
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
-            inputs.iter().all(|t| t.shape().len() == 3),
+            inputs.iter().all(|t| t.rank() == 3),
             "Permute expects 3D tensors"
         );
         let output = inputs

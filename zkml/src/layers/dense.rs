@@ -13,6 +13,7 @@ use crate::{
     tensor::{Number, Shape},
 };
 use anyhow::{Result, ensure};
+use burn::tensor::module::linear;
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -162,32 +163,55 @@ impl<N: Number> OpInfo for Dense<N> {
     }
 }
 
-impl<N: Number> Evaluate<N> for Dense<N> {
+impl Evaluate<Element> for Dense<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&Tensor<Element>],
         _unpadded_input_shapes: Vec<Shape>,
-    ) -> Result<LayerOut<N, E>> {
+    ) -> Result<LayerOut<Element, E>> {
+        ensure!(
+            inputs.len() == 1,
+            "Found more than 1 input when evaluating dense layer"
+        );
+
+        let matrix = self.matrix.clone().into_btensor_2d();
+        let input = inputs[0].flatten().into_btensor_1d();
+        let bias = self.bias.flatten().into_btensor_1d();
+
+        // NOTE: Can not use the [burn::tensor::module::linear] because it
+        // is defined only for floats
+        let input = input.unsqueeze_dim(1);
+        let matmul = matrix.matmul(input);
+        let matmul = matmul.squeeze(1);
+        let res = matmul.add(bias);
+
+        let data = res.to_data().into_vec().expect("Failed to compute Dense");
+        let shape = Shape::new(vec![data.len()]);
+        let out = Tensor::<Element>::new(shape, data);
+        Ok(LayerOut::from_vec(vec![out]))
+    }
+}
+
+impl Evaluate<f32> for Dense<f32> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&Tensor<f32>],
+        _unpadded_input_shapes: Vec<Shape>,
+    ) -> Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating dense layer"
         );
         let input = inputs[0];
 
-        let out = if input.shape().len() != 1 {
-            let flat_input = input.flatten();
-            ensure!(
-                flat_input.get_data().len() == self.matrix.ncols_2d(),
-                "flat input length {} (from shape {:?}) vs matrix ncols {}",
-                flat_input.get_data().len(),
-                input.shape(),
-                self.matrix.ncols_2d()
-            );
-            let matvec = self.matrix.matvec(&flat_input);
-            matvec.add(&self.bias)
-        } else {
-            self.matrix.matvec(input).add(&self.bias)
-        };
+        let matrix = self.matrix.clone().into_btensor_2d();
+        let input = input.flatten().into_btensor_1d();
+        let bias = self.bias.flatten().into_btensor_1d();
+        let res = linear(input, matrix.transpose(), Some(bias));
+
+        let data = res.to_data().into_vec().expect("Failed to compute Dense");
+        let shape = Shape::new(vec![data.len()]);
+        let out = Tensor::<f32>::new(shape, data);
 
         Ok(LayerOut::from_vec(vec![out]))
     }
@@ -632,6 +656,7 @@ impl<E: ExtensionField> DenseProof<E> {
 #[cfg(test)]
 mod test {
     use ff_ext::GoldilocksExt2;
+    use proptest::prelude::*;
 
     use crate::{
         layers::{Layer, provable::evaluate_layer},
@@ -832,5 +857,42 @@ mod test {
         model.route_output(None).unwrap();
         model.describe();
         prove_model(model).unwrap();
+    }
+
+    proptest! {
+        #[test]
+        fn test_dense_with_element(dim in 1usize..256) {
+            let matrix = Tensor::<Element>::random(&Shape::new(vec![dim, dim]));
+            let bias = Tensor::<Element>::random(&Shape::new(vec![dim]));
+            let input = Tensor::<Element>::random(&Shape::new(vec![dim]));
+
+            let expected = matrix.matvec(&input).add(&bias);
+
+            let dense = Dense::<Element>::new(matrix.clone(), bias.clone());
+            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], vec![]).expect("Dense evaluation must be successful");
+
+            assert_eq!(expected, computed.outputs[0]);
+        }
+
+        #[test]
+        fn test_dense_with_f32(dim in 1usize..256) {
+            let matrix = Tensor::<f32>::random(&Shape::new(vec![dim, dim]));
+            let bias = Tensor::<f32>::random(&Shape::new(vec![dim]));
+            let input = Tensor::<f32>::random(&Shape::new(vec![dim]));
+
+            let expected = matrix.matvec(&input).add(&bias);
+
+            let dense = Dense::<f32>::new(matrix.clone(), bias.clone());
+            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], vec![]).expect("Dense evaluation must be successful");
+
+            expected.get_data().iter().zip(computed.outputs[0].get_data().iter()).for_each(|(left, right)| {
+                assert!(
+                    (left - right).abs() < 1e-3,
+                    "Actual: {}, Expected: {}",
+                    left,
+                    right
+                );
+            });
+        }
     }
 }

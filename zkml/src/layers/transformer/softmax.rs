@@ -281,7 +281,7 @@ impl Softmax<Element> {
             .last()
             .ok_or(anyhow!("Input tensor had no shape in quantised Softmax"))?;
         // We also need the second to last dim
-        let second_dim = input.shape()[input.shape().len() - 2];
+        let second_dim = input.shape()[input.rank() - 2];
         let shift_data = input
             .get_data()
             .chunks(final_dim)
@@ -1746,7 +1746,7 @@ impl<N: Number> AttentionMask<N> {
     /// It elementwise multiplies by `self.tril` and then adds `self.bias`.
     fn apply(&self, input: &Tensor<N>) -> Result<Tensor<N>> {
         // Check the the input has 2 or 3 dims
-        let num_input_dims = input.shape().len();
+        let num_input_dims = input.rank();
         ensure!(
             num_input_dims == 2 || num_input_dims == 3,
             "To apply Attention Mask input need to have 2 or 3 dims, got: {}",

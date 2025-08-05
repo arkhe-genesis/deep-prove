@@ -763,15 +763,15 @@ impl<T> Tensor<T> {
 
     /// Is vector
     pub fn is_vector(&self) -> bool {
-        self.shape().len() == 1 || (self.shape().len() == 2 && self.shape()[0] == 1)
+        self.rank() == 1 || (self.rank() == 2 && self.shape()[0] == 1)
     }
     /// Is matrix
     pub fn is_matrix(&self) -> bool {
-        self.shape().len() == 2
+        self.rank() == 2
     }
 
     pub fn is_convolution(&self) -> bool {
-        self.shape().len() == 4
+        self.rank() == 4
     }
 
     /// Get the number of rows from the matrix
@@ -1426,7 +1426,7 @@ where
         *self = Tensor::new(new_shape, new_data);
     }
     pub fn maxpool2d(&self, kernel_size: usize, stride: usize) -> Tensor<T> {
-        let dims = self.shape().len();
+        let dims = self.rank();
         assert!(dims >= 2, "Input tensor must have at least 2 dimensions.");
 
         let (h, w) = (self.shape[dims - 2], self.shape[dims - 1]);
@@ -1482,7 +1482,7 @@ where
 
         let maxpool_result = self.maxpool2d(kernel_size, stride);
 
-        let dims: usize = self.shape().len();
+        let dims: usize = self.rank();
         assert!(dims >= 2, "Input tensor must have at least 2 dimensions.");
 
         let (h, w) = (self.shape[dims - 2], self.shape[dims - 1]);
@@ -1528,11 +1528,8 @@ where
         let (n_size, c_size, h_size, w_size) = self.get4d();
         let (k_n, k_c, k_h, k_w) = kernels.get4d();
 
-        assert!(self.shape().len() <= 4, "Supports only at most 4D input.");
-        assert!(
-            kernels.shape().len() <= 4,
-            "Supports only at most 4D filters."
-        );
+        assert!(self.rank() <= 4, "Supports only at most 4D input.");
+        assert!(kernels.rank() <= 4, "Supports only at most 4D filters.");
         // Validate shapes
         assert_eq!(
             c_size,

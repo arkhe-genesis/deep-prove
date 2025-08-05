@@ -353,9 +353,9 @@ impl Evaluate<f32> for LayerNorm<f32> {
         assert!(inputs.len() == 1);
         let input = inputs[0];
         ensure!(
-            input.shape().len() == 2,
+            input.rank() == 2,
             "layernorm input must have shape [seq_len, embedding_size]: found {:?}",
-            input.shape()
+            input.shape(),
         );
         let embedding_size = input.shape()[1];
         let device = Default::default();

@@ -96,8 +96,8 @@ impl Logits {
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<(LayerOut<N, E>, ArgmaxData<N>)> {
         ensure!(
-            inputs.iter().all(|i| i.shape().len() >= 2),
-            "Argmax is for tensors of rank >= 2"
+            inputs.iter().all(|i| i.rank() >= 2),
+            "Argmax is for tensors of rank >= 2",
         );
 
         match self {

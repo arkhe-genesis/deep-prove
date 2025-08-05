@@ -553,11 +553,11 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         None => crate::Tensor::zeros(vec![weight.shape()[0]].into()),
     };
     ensure_onnx!(
-        bias_tensor.shape().len() == 1 || bias_tensor.shape().len() == 2,
+        bias_tensor.rank() == 1 || bias_tensor.rank() == 2,
         "Bias tensor must be 1D or 2D with batch: {:?}",
         bias_tensor.shape()
     );
-    if bias_tensor.shape().len() == 2 {
+    if bias_tensor.rank() == 2 {
         ensure_onnx!(
             bias_tensor.shape()[0] == 1,
             "Bias tensor must be 1D with batch: {:?}",

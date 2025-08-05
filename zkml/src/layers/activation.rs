@@ -785,11 +785,14 @@ mod test {
             let data = data.iter().map(gelu_float).collect::<Vec<_>>();
             let result = Tensor::new(shape, data);
 
-            let result_is_close = resultb.get_data().iter().zip(result.get_data().iter()).all(|(left, right)| {
-                (left-right).abs() < 1e-3
+            resultb.get_data().iter().zip(result.get_data().iter()).for_each(|(left, right)| {
+                assert!(
+                    (left - right).abs() < 1e-3,
+                    "Actual: {}, Expected: {}",
+                    left,
+                    right
+                );
             });
-
-            assert!(result_is_close, "btensor: {resultb:?} tensor: {result:?}");
         }
     }
 }

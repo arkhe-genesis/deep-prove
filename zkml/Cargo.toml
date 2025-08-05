@@ -32,7 +32,7 @@ burn = { version = "0.18.0", default-features = false }
 burn-cubecl = { version = "0.18.0", default-features = false, optional = true }
 candle-core = "0.9.1"
 clap = { workspace = true, features = ["derive", "env"] }
-cubecl = { version = "0.6.0", default-features = false, optional = true }
+cubecl = { version = "0.6.0", default-features = false, features = ["wgpu-msl"], optional = true }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }
@@ -82,6 +82,10 @@ proptest = "1.7.0"
 [[bench]]
 harness = false
 name = "prove-model"
+
+[[bench]]
+harness = false
+name = "gpu"
 
 [lints.clippy]
 dbg_macro = "deny"

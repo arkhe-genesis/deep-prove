@@ -1,5 +1,7 @@
 use burn::tensor::{ElementConversion, Tensor as BTensor, TensorPrimitive, ops::FloatTensor};
 
+use crate::Element;
+
 #[cfg(feature = "gpu")]
 mod cubecl;
 
@@ -10,23 +12,23 @@ mod kernels;
 mod ndarray;
 
 #[cfg(all(feature = "cpu", not(feature = "gpu")))]
-pub type Backend = burn::backend::NdArray<f32, i32>;
+pub type Backend = burn::backend::NdArray<f32, Element>;
 
 #[cfg(feature = "gpu")]
-pub type Backend = burn::backend::Wgpu<f32, i32>;
+pub type Backend = burn::backend::Wgpu<f32, Element>;
 
 pub(crate) trait ZKMLBackend: burn::tensor::backend::Backend {
     fn zkml_gelu(tensor: FloatTensor<Self>) -> FloatTensor<Self> {
         // compute: tensor * tensor * tensor
-        let squared = Self::float_mul(tensor.clone(), tensor.clone());
-        let cubed = Self::float_mul(squared, tensor.clone());
+        let c0 = Self::IntElem::from_elem(3);
+        let cubed = Self::float_powi_scalar(tensor.clone(), c0);
 
         // compute: sqrt(2 / PI) * (tensor + 0.044715 * cubed)
-        let c0 = Self::FloatElem::from_elem(0.044715);
-        let inner0 = Self::float_mul_scalar(cubed, c0);
+        let c1 = Self::FloatElem::from_elem(0.044715);
+        let inner0 = Self::float_mul_scalar(cubed, c1);
         let inner1 = Self::float_add(tensor.clone(), inner0);
-        let c1 = Self::FloatElem::from_elem((2.0_f32 / std::f32::consts::PI).sqrt());
-        let inner2 = Self::float_mul_scalar(inner1, c1);
+        let c2 = Self::FloatElem::from_elem((2.0_f32 / std::f32::consts::PI).sqrt());
+        let inner2 = Self::float_mul_scalar(inner1, c2);
 
         // compute: 1.0 + tanh(inner2)
         let inner3 = Self::float_tanh(inner2);

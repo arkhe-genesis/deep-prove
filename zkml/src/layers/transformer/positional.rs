@@ -159,8 +159,8 @@ where
         _unpadded_input_shapes: Vec<Shape>,
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
-            inputs.iter().all(|x| x.shape().len() == 2),
-            "positional embeddings only support 2d tensors"
+            inputs.iter().all(|x| x.rank() == 2),
+            "positional embeddings only support 2d tensors",
         );
 
         let outputs = match self {

@@ -128,10 +128,7 @@ impl<N: Number> QKV<N> {
             q.shape(),
             v.shape(),
         );
-        ensure!(
-            q_bias.shape().len() == 1,
-            "Bias in QKV layer is not a 1d tensor"
-        );
+        ensure!(q_bias.rank() == 1, "Bias in QKV layer is not a 1d tensor");
         ensure!(
             q_bias.shape() == k_bias.shape(),
             "Incompatible shapes of q and k bias in QKV layer: q = {:?}, k = {:?}",
