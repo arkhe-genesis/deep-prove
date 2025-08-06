@@ -65,7 +65,7 @@ mod test {
         // FAILING WITH THIS POINT
         let n = 4;
         let r1 = random_bool_vector::<F>(n);
-        println!("r1: {:?}", r1);
+        println!("r1: {r1:?}");
 
         // When vectors are identical, should return 1
         let r2 = r1.clone();
@@ -74,7 +74,7 @@ mod test {
 
         // When vectors are different, should return 0
         let r2 = random_bool_vector::<F>(n);
-        println!("r2: {:?}", r2);
+        println!("r2: {r2:?}");
         let result = identity_eval(&r1, &r2);
         assert!(r1 == r2 || result == F::ZERO);
     }

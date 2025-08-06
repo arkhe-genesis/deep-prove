@@ -1,3 +1,24 @@
-allowed-duplicate-crates = ["getrandom", "rand", "rand_core", "rand_chacha", "syn", "wasi"]
-allow-print-in-tests = true
 allow-dbg-in-tests = true
+allow-print-in-tests = true
+allowed-duplicate-crates = [
+  "getrandom",
+  "rand",
+  "rand_core",
+  "rand_chacha",
+  "syn",
+  "wasi",
+  "windows-targets",
+  "windows_aarch64_gnullvm",
+  "windows_aarch64_msvc",
+  "windows_i686_gnu",
+  "windows_i686_gnullvm",
+  "windows_i686_msvc",
+  "windows_x86_64_gnu",
+  "windows_x86_64_gnullvm",
+  "windows_x86_64_msvc",
+]
+disallowed-methods = [
+  # NOTE `thread_rng` is deprecated in 0.9 and replaced by `rng`
+  { path = "rand::thread_rng", reason = "use seeded rng from `zkml::rng_from_env_or_random`" },
+  { path = "ark_std::rand::thread_rng", reason = "use seeded rng from `zkml::rng_from_env_or_random`" },
+]

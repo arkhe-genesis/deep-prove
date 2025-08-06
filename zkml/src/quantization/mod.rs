@@ -335,7 +335,7 @@ mod test {
             res: Element,
         }
 
-        let cases = vec![
+        let cases = [
             TestCase {
                 a: -53,
                 b: 10,
@@ -353,7 +353,7 @@ mod test {
             let bp: F = case.b.to_field();
             let res = ap * bp;
             let expected = case.res.to_field();
-            assert_eq!(res, expected, "test case {}: {:?}", i, case);
+            assert_eq!(res, expected, "test case {i}: {case:?}");
         }
     }
 
@@ -367,18 +367,17 @@ mod test {
 
             assert_eq!(
                 val, roundtrip,
-                "Element {} did not roundtrip correctly (got {})",
-                val, roundtrip
+                "Element {val} did not roundtrip correctly (got {roundtrip})"
             );
         }
     }
 
     #[test]
     fn test_split_scale_into_multiplier() {
-        for s in vec![0.125, 0.075] {
+        for s in [0.125, 0.075] {
             let (shift, m) = split_scale_into_multiplier(s);
 
-            assert!((m * (2f32.powf(-shift as f32) as f32) - s).abs() <= f32::EPSILON);
+            assert!((m * 2f32.powf(-shift as f32) - s).abs() <= f32::EPSILON);
         }
     }
 }

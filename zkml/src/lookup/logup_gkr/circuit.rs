@@ -327,6 +327,7 @@ mod tests {
     use ff_ext::GoldilocksExt2;
     use p3_field::{Field, FieldAlgebra};
     use p3_goldilocks::Goldilocks;
+    use std::slice;
 
     use super::*;
 
@@ -335,7 +336,7 @@ mod tests {
         let column = random_field_vector::<Goldilocks>(1 << 10);
 
         let circuit = LogUpCircuit::<GoldilocksExt2>::new_lookup_circuit(
-            &[column.clone()],
+            slice::from_ref(&column),
             GoldilocksExt2::ZERO,
             GoldilocksExt2::ONE,
         );

@@ -580,7 +580,7 @@ pub mod tests {
         let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let config = LLMConfig::from_content(&loader)?;
-        println!("config: {:?}", config);
+        println!("config: {config:?}");
         Ok(())
     }
 
@@ -633,7 +633,7 @@ pub mod tests {
                     CpuStorage::F32(d) => d.to_vec(),
                     CpuStorage::F16(d) => d.iter().map(|x| x.to_f32()).collect(),
                     _ => {
-                        panic!("unsupported type of tensor: {:?}", s);
+                        panic!("unsupported type of tensor: {s:?}");
                     }
                 },
                 _ => {

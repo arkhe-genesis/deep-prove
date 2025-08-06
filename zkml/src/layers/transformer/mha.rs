@@ -959,7 +959,7 @@ mod test {
             seq_len: usize,
             q_len: usize,
         }
-        for params in vec![
+        for params in [
             Params {
                 seq_len: 2,
                 q_len: 1,
@@ -1001,7 +1001,7 @@ mod test {
             seq_len: usize,
             q_len: usize,
         }
-        for params in vec![
+        for params in [
             Params {
                 seq_len: 2,
                 q_len: 1,
@@ -1066,11 +1066,9 @@ mod test {
     // should correspond to the MLE of the zeroifier matrix
     fn eval_lteq_poly(x_i: &[Element], y_i: &[Element]) -> Element {
         assert_eq!(x_i.len(), y_i.len());
-        x_i.into_iter()
-            .zip(y_i.into_iter())
-            .fold(Element::from(1), |acc, (x, y)| {
-                acc * (1 - x - y + 2 * x * y) + (1 - x) * y
-            })
+        x_i.iter().zip(y_i).fold(Element::from(1), |acc, (x, y)| {
+            acc * (1 - x - y + 2 * x * y) + (1 - x) * y
+        })
     }
 
     fn test_zeroifier_evaluation_for_num_heads<const NUM_HEADS_BITS: usize>() {
@@ -1100,7 +1098,7 @@ mod test {
 
         for i in 0..num_columns {
             for j in 0..num_columns {
-                for h in 0..num_heads {
+                for (h, zeroifier_head) in zeroifier_heads.iter().enumerate().take(num_heads) {
                     let x_i = to_bit_sequence_le(i, NUM_BITS)
                         .map(|x| x as Element)
                         .collect_vec();
@@ -1111,11 +1109,9 @@ mod test {
                     // check that the zeroifier matrix is equivalent to the lteq function
                     let cmp = eval_lteq_poly(&y_i, &x_i);
                     assert_eq!(
-                        zeroifier_heads[h].get_2d(i, j),
+                        zeroifier_head.get_2d(i, j),
                         cmp,
-                        "Zeroifier evaluation failed for ({}, {})",
-                        i,
-                        j
+                        "Zeroifier evaluation failed for ({i}, {j})"
                     );
                     // build point for MLE: first column bits in little-endian order, then rows bits in little-endian order,
                     // then head bits in little-endian order
@@ -1198,7 +1194,7 @@ mod test {
 
         for i in 0..num_columns {
             for j in 0..num_columns {
-                for h in 0..num_heads {
+                for (h, infinitizer_head) in infinitizer_heads.iter().enumerate().take(num_heads) {
                     let x_i = to_bit_sequence_le(i, NUM_BITS)
                         .map(|x| x as Element)
                         .collect_vec();
@@ -1209,11 +1205,9 @@ mod test {
                     // check that the zeroifier matrix is equivalent to the gt function with output being minus_infinity
                     let cmp = eval_gt_poly(&y_i, &x_i, minus_infinity);
                     assert_eq!(
-                        infinitizer_heads[h].get_2d(i, j),
+                        infinitizer_head.get_2d(i, j),
                         cmp,
-                        "Zeroifier evaluation failed for ({}, {})",
-                        i,
-                        j
+                        "Zeroifier evaluation failed for ({i}, {j})"
                     );
                     // build point for MLE: first column bits in little-endian order, then rows bits in little-endian order,
                     // then head bits in little-endian order
@@ -1468,10 +1462,10 @@ mod test {
         );
         let embedded = llm_model
             .embeddings
-            .evaluate::<GoldilocksExt2>(&vec![&input], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[&input], vec![])?;
         let positioned = llm_model
             .positional
-            .evaluate::<GoldilocksExt2>(&vec![embedded.outputs()[0]], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], vec![])?;
 
         let input_shape = positioned.outputs()[0].shape();
 

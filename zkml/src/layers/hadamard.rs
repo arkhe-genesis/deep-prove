@@ -191,7 +191,7 @@ mod test {
         // NOTE: find closed formula to evaluate it efficiently OR use PCS
         let v2_eval = v2
             .to_mle_flat::<GoldilocksExt2>()
-            .evaluate(&proof.random_point());
+            .evaluate(proof.random_point());
         // NOTE: this has to be done by the component integrating the hadamard logic
         // normally by verifying this input claim via another sumcheck.
         let input_claim = verify(

@@ -763,9 +763,7 @@ mod test {
             .for_each(|(actual, expected)| {
                 assert!(
                     (actual - expected).abs() < 1e-3,
-                    "Actual: {}, Expected: {}",
-                    actual,
-                    expected
+                    "Actual: {actual}, Expected: {expected}"
                 );
             });
         Ok(())
@@ -788,9 +786,7 @@ mod test {
             resultb.get_data().iter().zip(result.get_data().iter()).for_each(|(left, right)| {
                 assert!(
                     (left - right).abs() < 1e-3,
-                    "Actual: {}, Expected: {}",
-                    left,
-                    right
+                    "Actual: {left}, Expected: {right}",
                 );
             });
         }

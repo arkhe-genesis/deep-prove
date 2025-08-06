@@ -54,7 +54,7 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
 
         let trace = model
             .run(&input_tensor)
-            .expect(&format!("input #{i} failed"));
+            .unwrap_or_else(|_| panic!("input #{i} failed"));
 
         let mut prover_transcript = new_transcript();
         let prover = Prover::<_, _, _>::new(ctx.as_ref().unwrap(), &mut prover_transcript);

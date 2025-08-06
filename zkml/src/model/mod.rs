@@ -576,6 +576,7 @@ pub(crate) mod test {
     use ff_ext::{ExtensionField, GoldilocksExt2};
     use itertools::Itertools;
     use multilinear_extensions::{mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
+    use std::slice;
     use sumcheck::{
         structs::{IOPProverState, IOPVerifierState},
         util::optimal_sumcheck_threads,
@@ -660,11 +661,7 @@ pub(crate) mod test {
                 }
             }
             model.route_output(None).unwrap();
-            let inputs = model
-                .input_shapes()
-                .iter()
-                .map(|shape| Tensor::random(shape))
-                .collect();
+            let inputs = model.input_shapes().iter().map(Tensor::random).collect();
             Ok((model, inputs))
         }
 
@@ -697,11 +694,7 @@ pub(crate) mod test {
             let mut model =
                 Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
 
-            let inputs = model
-                .input_shapes()
-                .iter()
-                .map(|shape| Tensor::random(shape))
-                .collect();
+            let inputs = model.input_shapes().iter().map(Tensor::random).collect();
 
             let info = Maxpool2D::default();
             let mut last_node_id = None;
@@ -830,7 +823,7 @@ pub(crate) mod test {
         model.route_output(None).unwrap();
 
         // END TEST
-        let trace = model.run::<F>(&vec![input.clone()]).unwrap();
+        let trace = model.run::<F>(slice::from_ref(&input)).unwrap();
 
         let mut model2 =
             Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
@@ -853,7 +846,7 @@ pub(crate) mod test {
             )
             .unwrap();
         model2.route_output(None).unwrap();
-        let trace2 = model.run::<F>(&vec![input]).unwrap();
+        let trace2 = model.run::<F>(&[input]).unwrap();
 
         check_tensor_consistency_field::<GoldilocksExt2>(
             trace2.outputs().unwrap()[0].to_fields(),
@@ -909,11 +902,11 @@ pub(crate) mod test {
         );
         let input_shape = vec![dense1.ncols()].into();
         let input = Tensor::<Element>::random(&input_shape);
-        let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &vec![&input], None)
+        let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &[&input], None)
             .unwrap()
             .outputs()[0]
             .clone();
-        let final_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense2, &vec![&output1], None)
+        let final_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense2, &[&output1], None)
             .unwrap()
             .outputs()[0]
             .clone();
@@ -928,7 +921,7 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
 
-        let trace = model.run::<F>(&vec![input]).unwrap();
+        let trace = model.run::<F>(&[input]).unwrap();
         assert_eq!(trace.steps.len(), 2);
         // Verify first step
         assert_eq!(*trace.get_step(&first_id).unwrap().outputs()[0], output1);
@@ -962,7 +955,7 @@ pub(crate) mod test {
         let point1 = random_bool_vector(dense_layers[0].1.matrix.nrows_2d().ilog2() as usize);
         let computed_eval1 = trace
             .get_step(&dense_layers[0].0)
-            .expect(format!("Node with id {} not found", dense_layers[0].0).as_str())
+            .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
             .outputs()[0]
             .get_data()
             .to_vec()
@@ -1024,7 +1017,7 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let trace = model.run::<F>(&vec![input]).unwrap();
+        let trace = model.run::<F>(&[input]).unwrap();
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
@@ -1100,7 +1093,7 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let trace = model.run::<F>(&vec![input]).unwrap();
+        let trace = model.run::<F>(&[input]).unwrap();
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
@@ -1149,7 +1142,7 @@ pub(crate) mod test {
                             .unwrap();
                         model.route_output(None).unwrap();
                         model.describe();
-                        let trace = model.run::<F>(&vec![input]).unwrap();
+                        let trace = model.run::<F>(&[input]).unwrap();
                         let mut tr: BasicTranscript<GoldilocksExt2> =
                             BasicTranscript::new(b"m2vec");
                         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(
@@ -1406,7 +1399,7 @@ pub(crate) mod test {
         let nrows = 42;
         let dense = Dense::random(vec![nrows, ncols].into());
         let first_dense_out_shape = &dense.output_shapes(
-            &vec![model.unpadded_input_shapes()[0].clone()],
+            &[model.unpadded_input_shapes()[0].clone()],
             PaddingMode::NoPadding,
         )[0];
         let first_input_dense = model
@@ -1423,7 +1416,7 @@ pub(crate) mod test {
         let nrows = 47;
         let dense = Dense::random(vec![nrows, ncols].into());
         let second_dense_out_shape = &dense.output_shapes(
-            &vec![model.unpadded_input_shapes()[1].clone()],
+            &[model.unpadded_input_shapes()[1].clone()],
             PaddingMode::NoPadding,
         )[0];
         let second_input_dense = model

@@ -21,7 +21,7 @@ fn bench_eval_hc(c: &mut Criterion) {
         let poly: Vec<_> = (0..1 << num_vars).map(|_| E::random(&mut OsRng)).collect();
         let challenge = E::random(&mut OsRng);
 
-        group.bench_function(BenchmarkId::new("eval_hc", format!("{}", num_vars)), |b| {
+        group.bench_function(BenchmarkId::new("eval_hc", format!("{num_vars}")), |b| {
             b.iter_batched(
                 || poly.clone(),
                 |mut coeffs| {
@@ -41,19 +41,16 @@ fn bench_interp_hc(c: &mut Criterion) {
     for num_vars in NUM_VARS_START..=NUM_VARS_END {
         let poly: Vec<_> = (0..1 << num_vars).map(|_| E::random(&mut OsRng)).collect();
 
-        group.bench_function(
-            BenchmarkId::new("interp_hc", format!("{}", num_vars)),
-            |b| {
-                b.iter_batched(
-                    || poly.clone(),
-                    |mut coeffs| {
-                        // Switch to coefficient form
-                        one_level_interp_hc(&mut coeffs);
-                    },
-                    BatchSize::SmallInput,
-                )
-            },
-        );
+        group.bench_function(BenchmarkId::new("interp_hc", format!("{num_vars}")), |b| {
+            b.iter_batched(
+                || poly.clone(),
+                |mut coeffs| {
+                    // Switch to coefficient form
+                    one_level_interp_hc(&mut coeffs);
+                },
+                BatchSize::SmallInput,
+            )
+        });
     }
 }
 

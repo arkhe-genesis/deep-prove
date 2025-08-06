@@ -349,7 +349,7 @@ pub mod file_cache {
     pub fn ensure_downloaded(url: &str) -> anyhow::Result<PathBuf> {
         let base_filename = generate_filename_from_url(url); // e.g., hash.gguf
         let local_file_path = CACHE_DIR.join(&base_filename);
-        let lock_file_path = CACHE_DIR.join(format!("{}.lock", base_filename));
+        let lock_file_path = CACHE_DIR.join(format!("{base_filename}.lock"));
 
         const MAX_RETRIES: u32 = 60; // Approx 60 seconds total timeout
         const RETRY_DELAY_MS: u64 = 1000;
@@ -404,7 +404,7 @@ pub mod file_cache {
                     );
 
                     let temp_download_path =
-                        CACHE_DIR.join(format!("{}.tmp_download", base_filename));
+                        CACHE_DIR.join(format!("{base_filename}.tmp_download"));
 
                     // Perform the download. Lock_guard ensures lock removal on success or panic/error.
                     match (|| -> anyhow::Result<()> {
@@ -425,7 +425,7 @@ pub mod file_cache {
                             // Make the request
                             let response =
                                 client.get(url).send().await.with_context(|| {
-                                    format!("Download: Failed to GET URL: {}", url)
+                                    format!("Download: Failed to GET URL: {url}")
                                 })?;
 
                             if !response.status().is_success() {
@@ -438,7 +438,7 @@ pub mod file_cache {
 
                             // Get response bytes
                             response.bytes().await.with_context(|| {
-                                format!("Download: Failed to read response bytes from URL: {}", url)
+                                format!("Download: Failed to read response bytes from URL: {url}")
                             })
                         })?;
 
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn test_load_mlp() {
         let filepath = "assets/scripts/MLP/mlp-iris-01.onnx";
-        let result = FloatOnnxLoader::new(&filepath)
+        let result = FloatOnnxLoader::new(filepath)
             .with_model_type(ModelType::MLP)
             .build();
 
@@ -544,7 +544,7 @@ mod tests {
     fn test_mlp_model_run() {
         init_test_logging_default();
         let filepath = "assets/scripts/MLP/mlp-iris-01.onnx";
-        let (model, md) = FloatOnnxLoader::new(&filepath)
+        let (model, md) = FloatOnnxLoader::new(filepath)
             .with_model_type(ModelType::MLP)
             .build()
             .unwrap();
@@ -575,7 +575,7 @@ mod tests {
             .expect("Failed to set global subscriber");
 
         let filepath = "assets/scripts/covid/cnn-covid.onnx";
-        let result = FloatOnnxLoader::new(&filepath)
+        let result = FloatOnnxLoader::new(filepath)
             .with_model_type(ModelType::CNN)
             .build();
 
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn test_is_cnn() {
         let filepath = "assets/scripts/CNN/cnn-cifar-01.onnx";
-        let result = is_cnn(&load_proto_from_path(&filepath).unwrap());
+        let result = is_cnn(&load_proto_from_path(filepath).unwrap());
 
         assert!(result.is_ok(), "Failed: {:?}", result.unwrap_err());
     }
@@ -624,10 +624,9 @@ mod tests {
         init_test_logging_default();
         let filepath = "assets/scripts/CNN/cnn-cifar-01.onnx";
         ModelType::CNN.validate_file(filepath).unwrap();
-        let result =
-            FloatOnnxLoader::new_with_scaling_strategy(&filepath, InferenceObserver::new())
-                .with_model_type(ModelType::CNN)
-                .build();
+        let result = FloatOnnxLoader::new_with_scaling_strategy(filepath, InferenceObserver::new())
+            .with_model_type(ModelType::CNN)
+            .build();
 
         assert!(result.is_ok(), "Failed: {:?}", result.unwrap_err());
 
@@ -661,10 +660,10 @@ mod tests {
         let filepath = "assets/scripts/CNN/cnn-cifar-01.onnx";
         let model = tract_onnx::onnx()
             .model_for_path(filepath)
-            .map_err(|e| Error::msg(format!("Failed to load model: {:?}", e)))
+            .map_err(|e| Error::msg(format!("Failed to load model: {e:?}")))
             .unwrap();
         for symbol in model.symbols.all_symbols().iter() {
-            println!("symbol: {:?}", symbol);
+            println!("symbol: {symbol:?}");
         }
         let opt = model.into_typed().unwrap();
 

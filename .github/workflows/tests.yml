@@ -109,7 +109,7 @@ jobs:
           RAYON_NUM_THREADS: 8
 
       - name: Run Clippy
-        run: cargo clippy --all -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
 
   formatting:

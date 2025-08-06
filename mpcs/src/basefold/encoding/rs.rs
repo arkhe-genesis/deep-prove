@@ -660,9 +660,7 @@ mod tests {
                 assert_eq!(
                     (v_x0, v_x1, v_w, p_x0, p_x1, p_w),
                     (naive_x0, naive_x1, naive_w, naive_x0, naive_x1, naive_w),
-                    "failed for level = {}, index = {}",
-                    level,
-                    index
+                    "failed for level = {level}, index = {index}"
                 );
             }
         }
@@ -709,8 +707,7 @@ mod tests {
             assert_eq!(
                 (x0 - challenge) * (b[1] - *a),
                 (x1 - challenge) * (b[0] - *a),
-                "failed for i = {}",
-                i
+                "failed for i = {i}"
             );
         }
     }
@@ -857,7 +854,7 @@ mod tests {
             .zip(left_right_diff.iter().zip(left_right_sum.iter()))
             .enumerate()
         {
-            assert_eq!(*c + *c, *sum + b * *diff, "failed for i = {}", i);
+            assert_eq!(*c + *c, *sum + b * *diff, "failed for i = {i}");
         }
 
         check_low_degree(&folded_codeword, "low degree check for folded");
@@ -873,9 +870,7 @@ mod tests {
             assert_eq!(
                 field_type_index_ext(&codeword, i),
                 E::ZERO,
-                "{}: zero check failed for i = {}",
-                message,
-                i
+                "{message}: zero check failed for i = {i}"
             )
         }
         fft(&mut codeword, 0, &root_table);
@@ -892,7 +887,7 @@ mod tests {
             .zip(codeword.iter())
             .enumerate()
             .for_each(|(i, (a, b))| {
-                assert_eq!(a, b, "{}: failed for i = {}", message, i);
+                assert_eq!(a, b, "{message}: failed for i = {i}");
             });
     }
 }

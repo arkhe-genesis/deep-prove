@@ -731,7 +731,7 @@ mod tests {
 
         let input_tensor = crate::tensor::Tensor::random(&input_shape);
         let trace = model.run::<GoldilocksExt2>(&[input_tensor]).unwrap();
-        assert!(trace.steps.len() >= 1);
+        assert!(!trace.steps.is_empty());
     }
 
     #[test]
@@ -743,9 +743,8 @@ mod tests {
         // let path = "assets/scripts/llms/gpt2_onnxcommunity.onnx";
         let path = "assets/scripts/llms/gpt2_decoder.onnx";
         let model = {
-            let pmodel = tract_onnx::onnx().model_for_path(path)?.into_typed()?;
             //.into_decluttered()?;
-            pmodel
+            tract_onnx::onnx().model_for_path(path)?.into_typed()?
             // so far we dont support batching
             // let mut values = SymbolValues::default();
             // let symbol = pmodel.sym("batch_size");

@@ -29,10 +29,10 @@ pub fn causal_mask(num_heads: usize, q_len: usize, seq_len: usize) -> Tensor<f32
 
 #[cfg(test)]
 pub(crate) mod test {
-    use std::fs::File;
+    use std::{fs::File, slice};
 
     use anyhow::{Context, ensure};
-    use ark_std::rand::{Rng, thread_rng};
+    use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use serde::Deserialize;
 
@@ -52,7 +52,8 @@ pub(crate) mod test {
             json::test::{TINY_GPT2_DEBUG_NAME, TINY_GPT2_NAME},
             llm::{Attention, FeedForward, LLMConfig, LLMModel},
         },
-        tensor::{Number, Shape, is_close},
+        rng_from_env_or_random,
+        tensor::{Number, is_close},
     };
 
     use super::{layernorm, mha, qkv};
@@ -102,7 +103,7 @@ pub(crate) mod test {
         ) -> anyhow::Result<Tensor<f32>> {
             let normed = self
                 .layernorm
-                .evaluate::<GoldilocksExt2>(&vec![input], vec![])?;
+                .evaluate::<GoldilocksExt2>(&[input], vec![])?;
             if let Some(gpt2_output) = output {
                 gpt2_output.is_prefnn_layernorm_close(normed.outputs());
             }
@@ -125,7 +126,7 @@ pub(crate) mod test {
                 assert!(gpt2_output.is_ffn_after_down_close(down.outputs()));
             }
             let out = self.add.evaluate::<GoldilocksExt2>(
-                &vec![input, &down.outputs()[0]],
+                &[input, down.outputs()[0]],
                 vec![input.shape(), down.outputs()[0].shape()],
             )?;
             Ok(out.outputs()[0].clone())
@@ -225,7 +226,7 @@ pub(crate) mod test {
 
             let normed = self
                 .layernorm
-                .evaluate::<GoldilocksExt2>(&vec![input], vec![])?;
+                .evaluate::<GoldilocksExt2>(&[input], vec![])?;
 
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_layernorm_close(normed.outputs()));
@@ -243,7 +244,7 @@ pub(crate) mod test {
 
             if let Some(gpt2_output) = gpt2_output {
                 assert!(
-                    gpt2_output.is_attention_weights_close(&softmax_out.outputs()[0]),
+                    gpt2_output.is_attention_weights_close(softmax_out.outputs()[0]),
                     "attention_weights_close given {:?} vs computed {:?}",
                     gpt2_output.attn_weights,
                     softmax_out.outputs()[0].get_data()
@@ -268,7 +269,7 @@ pub(crate) mod test {
 
             // and then residual connection, [1, hidden_size]
             let out = self.add.evaluate::<GoldilocksExt2>(
-                &vec![input, &projected.outputs()[0]],
+                &[input, projected.outputs()[0]],
                 vec![input.shape(), projected.outputs()[0].shape()],
             )?;
 
@@ -276,7 +277,7 @@ pub(crate) mod test {
                 ensure!(gpt2_output.is_residual_attn_close(out.outputs()));
             }
             // and then FFN
-            let ffn_out = self.ffn.evaluate(&out.outputs()[0], gpt2_output)?;
+            let ffn_out = self.ffn.evaluate(out.outputs()[0], gpt2_output)?;
             Ok(ffn_out)
         }
     }
@@ -445,12 +446,12 @@ pub(crate) mod test {
         );
         let embedded = llm_model
             .embeddings
-            .evaluate::<GoldilocksExt2>(&vec![&input], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[&input], vec![])?;
         let positioned = llm_model
             .positional
-            .evaluate::<GoldilocksExt2>(&vec![embedded.outputs()[0]], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], vec![])?;
         assert!(is_close(
-            &positioned.outputs()[0].get_data(),
+            positioned.outputs()[0].get_data(),
             &gpt2_output.inputs_embeds
         ));
         Ok(())
@@ -464,7 +465,7 @@ pub(crate) mod test {
 
         let loader = json::FileTensorLoader::new_from_path(model_weights_path)?;
         let config = LLMConfig::from_json(&loader)?;
-        println!("config: {:?}", config);
+        println!("config: {config:?}");
 
         let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
             File::open(debug_output_path.clone())
@@ -479,21 +480,21 @@ pub(crate) mod test {
         // Try to run with the flat attention implementation
         let first_attention = model.blocks.remove(0);
         let mut att = FlatAttention::new_from_parser(&config, first_attention.clone()).unwrap();
-        let first_layer_output = gpt2_output.layers.get(0).expect("no layers in output");
+        let first_layer_output = gpt2_output.layers.first().expect("no layers in output");
         let output = att.forward(&input, Some(first_layer_output))?;
         println!("flat output: {:?}", output.shape());
         let expected_output = &first_layer_output.manual_output;
-        assert!(is_close(expected_output, &output.get_data()));
+        assert!(is_close(expected_output, output.get_data()));
         // Now try to run with the graph implementation
         let mut model = Model::new_from_input_shapes(vec![input.shape()], PaddingMode::NoPadding);
         let _last_node_id = first_attention.write_to_model(&mut model, None, &config)?;
         model.route_output(None)?;
-        let output1 = model.run::<GoldilocksExt2>(&[input.clone()])?;
-        let output = model.run_float(&[input.clone()])?;
+        let output1 = model.run::<GoldilocksExt2>(slice::from_ref(&input))?;
+        let output = model.run_float(slice::from_ref(&input))?;
         assert_eq!(output1.outputs()?[0].get_data(), output[0].get_data());
         println!("graph output: {:?}", output[0].shape());
         assert!(
-            is_close(expected_output, &output[0].get_data()),
+            is_close(expected_output, output[0].get_data()),
             "graph output differs"
         );
         Ok(())
@@ -524,22 +525,22 @@ pub(crate) mod test {
             gpt2_output.input_ids.iter().map(|x| *x as f32).collect(),
         );
         // also test on a single random token
-        let max_token = thread_rng().gen_range(0..llm_model.embeddings.vocab_size);
+        let max_token = rng_from_env_or_random().gen_range(0..llm_model.embeddings.vocab_size);
         let single_input = Tensor::new(vec![1].into(), vec![max_token as f32]);
         let model = llm_model
             .clone()
-            .into_provable_model(&config, Shape::from(single_input.shape()))?;
+            .into_provable_model(&config, single_input.shape())?;
         model.describe();
-        model.run_float(&[single_input.clone()])?;
+        model.run_float(slice::from_ref(&single_input))?;
 
-        let model = llm_model.into_provable_model(&config, Shape::from(input.shape()))?;
+        let model = llm_model.into_provable_model(&config, input.shape())?;
         model.describe();
-        let output = model.run_float(&[input.clone()])?[0].clone();
+        let output = model.run_float(slice::from_ref(&input))?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,
         // we take the last element of the model output
         let output = output.slice_last_dim().last().unwrap();
         assert!(
-            is_close(expected_output, &output),
+            is_close(expected_output, output),
             "graph output differs: {:?} vs {:?}: LOGITS {:?}",
             expected_output,
             output,

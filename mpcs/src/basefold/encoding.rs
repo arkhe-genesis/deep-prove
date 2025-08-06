@@ -209,7 +209,7 @@ pub(crate) mod test_util {
             .zip(encoded_folded_message.iter())
             .enumerate()
         {
-            assert_eq!(a, b, "Failed at index {}", i);
+            assert_eq!(a, b, "Failed at index {i}");
         }
 
         let mut folded_codeword = FieldType::Ext(SmartSlice::Owned(folded_codeword));
@@ -238,7 +238,7 @@ pub(crate) mod test_util {
                 .zip(encoded_folded_message.iter())
                 .enumerate()
             {
-                assert_eq!(a, b, "Failed at index {} in round {}", i, round);
+                assert_eq!(a, b, "Failed at index {i} in round {round}");
             }
             folded_codeword = FieldType::Ext(SmartSlice::Owned(folded_codeword_vec));
         }

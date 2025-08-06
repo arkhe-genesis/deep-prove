@@ -893,6 +893,7 @@ impl<N: Number> CacheQKV<N> {
 #[cfg(test)]
 mod tests {
     use ff_ext::GoldilocksExt2;
+    use std::slice;
 
     use crate::{
         layers::{Layer, provable::evaluate_layer},
@@ -1042,17 +1043,21 @@ mod tests {
         let padded_weight_shape = weight_shape.next_power_of_two();
         let padded_bias_shape = bias_shape.next_power_of_two();
 
-        let unpadded_output_shapes =
-            layer.output_shapes(&vec![unpadded_input_shape.clone()], PaddingMode::NoPadding);
+        let unpadded_output_shapes = layer.output_shapes(
+            slice::from_ref(&unpadded_input_shape),
+            PaddingMode::NoPadding,
+        );
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check unpadded output shapes for padded layer
-        let unpadded_output_shapes =
-            padded_layer.output_shapes(&vec![unpadded_input_shape.clone()], PaddingMode::NoPadding);
+        let unpadded_output_shapes = padded_layer.output_shapes(
+            slice::from_ref(&unpadded_input_shape),
+            PaddingMode::NoPadding,
+        );
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check padded output shapes
         let padded_input_shape = unpadded_input_shape.next_power_of_two();
         let padded_output_shapes =
-            padded_layer.output_shapes(&vec![padded_input_shape.clone()], PaddingMode::Padding);
+            padded_layer.output_shapes(slice::from_ref(&padded_input_shape), PaddingMode::Padding);
         assert_eq!(padded_output_shapes, si.padded_input_shapes(),);
 
         assert_eq!(padded_layer.q.shape(), padded_weight_shape);
@@ -1094,7 +1099,7 @@ mod tests {
         let mut input = Tensor::<Element>::random(&unpadded_input_shape);
         let output = evaluate_layer::<GoldilocksExt2, _, _>(
             &layer,
-            &vec![&input],
+            &[&input],
             Some(vec![unpadded_input_shape.clone()]),
         )
         .unwrap();
@@ -1110,7 +1115,7 @@ mod tests {
         input.pad_to_shape(padded_input_shape);
         let padded_output = evaluate_layer::<GoldilocksExt2, _, _>(
             &padded_layer,
-            &vec![&input],
+            &[&input],
             Some(vec![unpadded_input_shape]),
         )
         .unwrap();
@@ -1174,16 +1179,20 @@ mod tests {
             .into();
         let padded_layer = layer.clone().pad_node(&mut si).unwrap();
 
-        let unpadded_output_shapes =
-            layer.output_shapes(&vec![unpadded_input_shape.clone()], PaddingMode::NoPadding);
+        let unpadded_output_shapes = layer.output_shapes(
+            slice::from_ref(&unpadded_input_shape),
+            PaddingMode::NoPadding,
+        );
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check unpadded output shapes for padded layer
-        let unpadded_output_shapes =
-            padded_layer.output_shapes(&vec![unpadded_input_shape.clone()], PaddingMode::NoPadding);
+        let unpadded_output_shapes = padded_layer.output_shapes(
+            slice::from_ref(&unpadded_input_shape),
+            PaddingMode::NoPadding,
+        );
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check padded output shapes
-        let padded_output_shapes =
-            padded_layer.output_shapes(&vec![unpadded_input_shape], PaddingMode::Padding);
+        let padded_output_shapes = padded_layer
+            .output_shapes(slice::from_ref(&unpadded_input_shape), PaddingMode::Padding);
         assert_eq!(padded_output_shapes, si.padded_input_shapes(),);
 
         assert_eq!(padded_layer.q.shape(), weight_shape);

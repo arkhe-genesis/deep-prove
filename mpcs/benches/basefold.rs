@@ -14,10 +14,7 @@ use mpcs::{
     util::plonky2_util::log2_ceil,
 };
 
-use multilinear_extensions::{
-    mle::{DenseMultilinearExtension, MultilinearExtension},
-    virtual_poly::ArcMultilinearExtension,
-};
+use multilinear_extensions::mle::{ArcMultilinearExtension, MultilinearExtension};
 use transcript::{BasicTranscript, Transcript};
 
 // For now given transcript doesn't impact perf so much, we can keep it simple
@@ -35,7 +32,7 @@ const BATCH_SIZE_LOG_END: usize = 6;
 
 struct Switch<'a, E: ExtensionField> {
     name: &'a str,
-    gen_rand_poly: fn(usize) -> DenseMultilinearExtension<E>,
+    gen_rand_poly: fn(usize) -> MultilinearExtension<'a, E>,
 }
 
 fn bench_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentScheme<E>>(
@@ -54,7 +51,7 @@ fn bench_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentScheme<E>>(
             let poly_size = 1 << num_vars;
             let param = Pcs::setup(poly_size).unwrap();
 
-            group.bench_function(BenchmarkId::new("setup", format!("{}", num_vars)), |b| {
+            group.bench_function(BenchmarkId::new("setup", format!("{num_vars}")), |b| {
                 b.iter(|| {
                     Pcs::setup(poly_size).unwrap();
                 })
@@ -66,9 +63,9 @@ fn bench_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentScheme<E>>(
         let poly = (switch.gen_rand_poly)(num_vars);
         let comm = Pcs::commit_and_write(&pp, &poly, &mut transcript).unwrap();
 
-        group.bench_function(BenchmarkId::new("commit", format!("{}", num_vars)), |b| {
+        group.bench_function(BenchmarkId::new("commit", format!("{num_vars}")), |b| {
             b.iter(|| {
-                Pcs::commit(&pp, &poly).unwrap();
+                Pcs::commit(&pp, poly.clone()).unwrap();
             })
         });
 
@@ -78,7 +75,7 @@ fn bench_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentScheme<E>>(
         let transcript_for_bench = transcript.clone();
         let proof = Pcs::open(&pp, &poly, &comm, &point, &eval, &mut transcript).unwrap();
 
-        group.bench_function(BenchmarkId::new("open", format!("{}", num_vars)), |b| {
+        group.bench_function(BenchmarkId::new("open", format!("{num_vars}")), |b| {
             b.iter_batched(
                 || transcript_for_bench.clone(),
                 |mut transcript| {
@@ -95,7 +92,7 @@ fn bench_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentScheme<E>>(
         transcript.append_field_element_ext(&eval);
         let transcript_for_bench = transcript.clone();
         Pcs::verify(&vp, &comm, &point, &eval, &proof, &mut transcript).unwrap();
-        group.bench_function(BenchmarkId::new("verify", format!("{}", num_vars)), |b| {
+        group.bench_function(BenchmarkId::new("verify", format!("{num_vars}")), |b| {
             b.iter_batched(
                 || transcript_for_bench.clone(),
                 |mut transcript| {
@@ -170,7 +167,7 @@ fn bench_batch_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentScheme<E>>
                 Pcs::batch_open(&pp, &polys, &comms, &points, &evals, &mut transcript).unwrap();
 
             group.bench_function(
-                BenchmarkId::new("batch_open", format!("{}-{}", num_vars, batch_size)),
+                BenchmarkId::new("batch_open", format!("{num_vars}-{batch_size}")),
                 |b| {
                     b.iter_batched(
                         || transcript_for_bench.clone(),
@@ -210,7 +207,7 @@ fn bench_batch_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentScheme<E>>
             Pcs::batch_verify(&vp, &comms, &points, &evals, &proof, &mut transcript).unwrap();
 
             group.bench_function(
-                BenchmarkId::new("batch_verify", format!("{}-{}", num_vars, batch_size)),
+                BenchmarkId::new("batch_verify", format!("{num_vars}-{batch_size}")),
                 |b| {
                     b.iter_batched(
                         || backup_transcript.clone(),
@@ -253,7 +250,7 @@ fn bench_simple_batch_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentSch
             let comm = Pcs::batch_commit_and_write(&pp, &polys, &mut transcript).unwrap();
 
             group.bench_function(
-                BenchmarkId::new("batch_commit", format!("{}-{}", num_vars, batch_size)),
+                BenchmarkId::new("batch_commit", format!("{num_vars}-{batch_size}")),
                 |b| {
                     b.iter(|| {
                         Pcs::batch_commit(&pp, &polys).unwrap();
@@ -272,7 +269,7 @@ fn bench_simple_batch_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentSch
                 .unwrap();
 
             group.bench_function(
-                BenchmarkId::new("batch_open", format!("{}-{}", num_vars, batch_size)),
+                BenchmarkId::new("batch_open", format!("{num_vars}-{batch_size}")),
                 |b| {
                     b.iter_batched(
                         || transcript_for_bench.clone(),
@@ -304,7 +301,7 @@ fn bench_simple_batch_commit_open_verify_goldilocks<Pcs: PolynomialCommitmentSch
             Pcs::simple_batch_verify(&vp, &comm, &point, &evals, &proof, &mut transcript).unwrap();
 
             group.bench_function(
-                BenchmarkId::new("batch_verify", format!("{}-{}", num_vars, batch_size)),
+                BenchmarkId::new("batch_verify", format!("{num_vars}-{batch_size}")),
                 |b| {
                     b.iter_batched(
                         || backup_transcript.clone(),

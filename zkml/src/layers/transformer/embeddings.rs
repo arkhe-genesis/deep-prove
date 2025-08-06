@@ -594,7 +594,7 @@ fn one_hot_shape(input_shape: &Shape, vocab_size: usize, mode: PaddingMode) -> S
 
 #[cfg(test)]
 mod tests {
-    use ark_std::rand::{Rng, thread_rng};
+    use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use p3_field::FieldAlgebra;
 
@@ -603,15 +603,17 @@ mod tests {
         layers::Layer,
         model::{Model, test::prove_model_with},
         quantization::TensorFielder,
+        rng_from_env_or_random,
     };
 
     use super::*;
 
     fn generate_unique_random_indices(seq_len: usize, vocab_size: usize) -> Vec<usize> {
         let mut ctr = 0;
+        let mut rng = rng_from_env_or_random();
         while ctr < 10 {
             let d = (0..seq_len)
-                .map(|_| thread_rng().gen_range(0..vocab_size))
+                .map(|_| rng.gen_range(0..vocab_size))
                 .collect::<Vec<_>>();
             let mut dd = d.clone();
             dd.sort();
@@ -630,14 +632,14 @@ mod tests {
         let vocab_size: usize = 200;
         let emb_size: usize = 10;
         let indices = (0..seq_len)
-            .map(|_| thread_rng().gen_range(0..vocab_size) as f32)
+            .map(|_| rng_from_env_or_random().gen_range(0..vocab_size) as f32)
             .collect::<Vec<_>>();
         let input_shape = Shape::from(vec![seq_len]);
         let input = Tensor::new(input_shape.clone(), indices.clone());
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
 
-        let embeddings_value = Tensor::random(&Shape::new(vec![vocab_size, emb_size].into()));
+        let embeddings_value = Tensor::random(&Shape::new(vec![vocab_size, emb_size]));
         let embeddings = Embeddings::new(embeddings_value.clone())?;
         let _ = model
             .add_consecutive_layer(Layer::Embeddings(embeddings), None)
@@ -668,7 +670,7 @@ mod tests {
             Tensor::<Element>::new(vec![5].into(), indices_elem.clone()).to_fields();
         let vocab_size = 6;
         let emb_size = 10;
-        let one_hot = one_hot_encoding(&indices.get_data(), vocab_size);
+        let one_hot = one_hot_encoding(indices.get_data(), vocab_size);
         let expected_shape: Shape = vec![indices.shape().numel(), vocab_size].into();
         assert_eq!(one_hot.shape(), expected_shape);
         assert_eq!(

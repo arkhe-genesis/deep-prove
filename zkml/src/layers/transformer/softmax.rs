@@ -1879,8 +1879,7 @@ mod tests {
                     // Make sure we are always within 1/100 th of the actual value
                     assert!(
                         quant_dequant_diff < 0.01,
-                        "quant dequant diff was too large got: {}",
-                        quant_dequant_diff
+                        "quant dequant diff was too large got: {quant_dequant_diff}"
                     );
                 }
             }

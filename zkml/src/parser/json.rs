@@ -393,7 +393,7 @@ pub mod test {
         let path = get_json_file(TINY_GPT2_NAME)?;
         let loader = FileTensorLoader::new_from_path(path)?;
         let config = LLMConfig::from_json(&loader)?;
-        println!("tiny gpt2 config: {:?}", config);
+        println!("tiny gpt2 config: {config:?}");
         config.model_json(&loader)?;
         Ok(())
     }

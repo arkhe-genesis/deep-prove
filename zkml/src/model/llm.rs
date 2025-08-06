@@ -197,7 +197,7 @@ mod test {
         let user_tokens = tokenizer.tokenize(sentence);
         let detokenized = tokenizer.detokenize(&user_tokens);
         assert_eq!(detokenized, sentence);
-        println!("user input in tokens: {:?}", user_tokens);
+        println!("user input in tokens: {user_tokens:?}");
         let trace = driver.run_inference::<GoldilocksExt2>(
             user_tokens,
             LLMTokenizerObserver {

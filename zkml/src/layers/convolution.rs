@@ -1654,7 +1654,7 @@ mod test {
         (valid, garbage)
     }
     fn subtest_clearing_methods(padded_tensor: &Tensor<Element>, unpadded_shape: &Shape) {
-        let clearing_tensor = new_clearing_tensor(&unpadded_shape, &padded_tensor.shape());
+        let clearing_tensor = new_clearing_tensor(unpadded_shape, &padded_tensor.shape());
         let cleared_tensor = padded_tensor.flatten().mul(&clearing_tensor);
         let auto_cleared_tensor = clear_garbage(padded_tensor, unpadded_shape);
         assert_eq!(cleared_tensor.get_data(), auto_cleared_tensor.get_data());
@@ -1725,10 +1725,7 @@ mod test {
             .map(|x| x.next_power_of_two())
             .collect::<Shape>();
         println!("INSIDE TEST: fft_output.shape() : {:?}", fft_output.shape());
-        println!(
-            "INSIDE TEST: fft_output_shape conv2d_shape(): {:?}",
-            fft_output_shape
-        );
+        println!("INSIDE TEST: fft_output_shape conv2d_shape(): {fft_output_shape:?}");
         println!(
             "INSIDE TEST: padded_input shape: {:?}",
             padded_input.shape()
@@ -1808,19 +1805,19 @@ mod test {
         let padded_nrows = padded_dense.nrows();
         padded_dense.bias = padded_dense.bias.pad_1d(padded_nrows);
         let no_garbage_fft_output =
-            evaluate_layer::<GoldilocksExt2, _, _>(&padded_dense, &vec![&flat_fft_output], None)
+            evaluate_layer::<GoldilocksExt2, _, _>(&padded_dense, &[&flat_fft_output], None)
                 .unwrap()
                 .outputs()[0]
                 .clone();
         let no_garbage_normal_output =
-            evaluate_layer::<GoldilocksExt2, _, _>(&dense, &vec![&flat_normal_output], None)
+            evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&flat_normal_output], None)
                 .unwrap()
                 .outputs()[0]
                 .clone();
         let max_rows = dense.nrows();
         assert_eq!(
             &no_garbage_fft_output.get_data()[..max_rows],
-            &no_garbage_normal_output.get_data()[..]
+            no_garbage_normal_output.get_data()
         );
         assert!(
             no_garbage_fft_output.get_data()[max_rows..]
@@ -1841,7 +1838,7 @@ mod test {
         let k_x = 1 << 0;
 
         let mut input_shape_og: Shape = vec![k_x, 256, 256].into();
-        let mut input_shape_padded: Shape = input_shape_og.next_power_of_two().into();
+        let mut input_shape_padded: Shape = input_shape_og.next_power_of_two();
         let filter = Tensor::random(&vec![k_w, k_x, n_w, n_w].into());
         let bias = Tensor::random(&vec![k_w].into());
         let input = Tensor::random(&input_shape_og);
@@ -1860,11 +1857,11 @@ mod test {
 
         // add a RELU layer
         let relu = Activation::Relu(Relu::new());
-        let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &vec![&output], None)
+        let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output], None)
             .unwrap()
             .outputs()[0]
             .clone();
-        let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &vec![&fft_output], None)
+        let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output], None)
             .unwrap()
             .outputs()[0]
             .clone();
@@ -1896,11 +1893,11 @@ mod test {
 
         // Add another RELU
         let relu = Activation::Relu(Relu::new());
-        let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &vec![&output], None)
+        let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output], None)
             .unwrap()
             .outputs()[0]
             .clone();
-        let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &vec![&fft_output], None)
+        let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output], None)
             .unwrap()
             .outputs()[0]
             .clone();
@@ -1930,7 +1927,7 @@ mod test {
         let conv_shape_og = ignore_garbage_pad.0.clone();
         let conv_shape_pad = ignore_garbage_pad.1.clone();
         let dense = Dense::new(weight.clone(), bias.clone());
-        let dense_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &vec![&output], None)
+        let dense_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&output], None)
             .unwrap()
             .outputs()[0]
             .clone();
@@ -1942,7 +1939,7 @@ mod test {
         );
         let fft_bias = bias.clone().pad_1d(new_rows);
         let fft_dense = Dense::new(fft_weight.clone(), fft_bias.clone());
-        println!("-- new_rows : {}, new_cols : {}", new_rows, new_cols);
+        println!("-- new_rows : {new_rows}, new_cols : {new_cols}");
         println!("weight.get_shape() : {:?}", weight.shape());
         println!("bias.get_shape() : {:?}", bias.shape());
         println!("fft_input.get_shape() : {:?}", fft_output.shape());
@@ -1954,7 +1951,7 @@ mod test {
             output.shape().iter().product::<usize>()
         );
         let fft_dense_output =
-            evaluate_layer::<GoldilocksExt2, _, _>(&fft_dense, &vec![&fft_output], None)
+            evaluate_layer::<GoldilocksExt2, _, _>(&fft_dense, &[&fft_output], None)
                 .unwrap()
                 .outputs()[0]
                 .clone();

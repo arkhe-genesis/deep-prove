@@ -206,7 +206,7 @@ mod test {
     #[test]
     fn test_same_poly_proof() -> anyhow::Result<()> {
         // number of vars
-        let num_vars = 10 as usize;
+        let num_vars = 10_usize;
         let poly_len = 1 << num_vars;
         let poly = random_field_vector::<F>(poly_len);
         let poly_mle = poly.clone().into_mle();

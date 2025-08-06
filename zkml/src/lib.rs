@@ -224,6 +224,46 @@ impl NextPowerOfTwo for Vec<usize> {
     }
 }
 
+use crate::tensor::Number;
+use std::cmp::Ordering;
+
+#[cfg(test)]
+static INIT: std::sync::Once = std::sync::Once::new();
+
+#[cfg(test)]
+pub fn init_test_logging_default() {
+    use tracing_subscriber::EnvFilter;
+
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    });
+}
+
+#[cfg(test)]
+pub fn init_test_logging(default_level: &str) {
+    use tracing_subscriber::EnvFilter;
+
+    INIT.call_once(|| {
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    });
+}
+
+/// Get a rng generator from a seed from env var or generate a random one
+pub fn rng_from_env_or_random() -> StdRng {
+    let seed = seed_from_env_or_rng();
+    StdRng::seed_from_u64(seed)
+}
+
+/// Get a seed from env var or generate a random one
+pub fn seed_from_env_or_rng() -> u64 {
+    env::var("RNG_SEED")
+        .map(|val| u64::from_str(&val).expect("RNG_SEED must be a u64"))
+        .unwrap_or_else(|_| rand::random::<u64>())
+}
+
 #[cfg(test)]
 mod test {
     use ark_std::rand::Rng;
@@ -278,7 +318,7 @@ mod test {
 
         let trace = model.run(&input).unwrap();
         let output = trace.outputs()?[0];
-        println!("[+] Run inference. Result: {:?}", output);
+        println!("[+] Run inference. Result: {output:?}");
 
         let io = trace.to_verifier_io();
         let mut prover_transcript = default_transcript();
@@ -296,7 +336,7 @@ mod test {
 
     #[test]
     fn test_vector_mle() {
-        let n = (10 as usize).next_power_of_two();
+        let n = 10_usize.next_power_of_two();
         let v = (0..n)
             .map(|_| <E as FromUniformBytes>::random(&mut rng_from_env_or_random()))
             .collect_vec();
@@ -308,44 +348,4 @@ mod test {
         let output = mle.evaluate(&eval);
         assert_eq!(output, v[random_index]);
     }
-}
-
-use crate::tensor::Number;
-use std::cmp::Ordering;
-
-#[cfg(test)]
-static INIT: std::sync::Once = std::sync::Once::new();
-
-#[cfg(test)]
-pub fn init_test_logging_default() {
-    use tracing_subscriber::EnvFilter;
-
-    INIT.call_once(|| {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    });
-}
-
-#[cfg(test)]
-pub fn init_test_logging(default_level: &str) {
-    use tracing_subscriber::EnvFilter;
-
-    INIT.call_once(|| {
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    });
-}
-
-/// Get a rng generator from a seed from env var or generate a random one
-pub fn rng_from_env_or_random() -> StdRng {
-    let seed = seed_from_env_or_rng();
-    StdRng::seed_from_u64(seed)
-}
-
-/// Get a seed from env var or generate a random one
-pub fn seed_from_env_or_rng() -> u64 {
-    env::var("RNG_SEED")
-        .map(|val| u64::from_str(&val).expect("RNG_SEED must be a u64"))
-        .unwrap_or_else(|_| rand::random::<u64>())
 }

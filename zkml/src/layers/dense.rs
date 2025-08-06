@@ -800,7 +800,7 @@ mod test {
     #[test]
     fn test_quantization_with_padded_dense() {
         // Create input data that needs quantization
-        let input_data = vec![0.5f32, -0.3f32, 0.1f32];
+        let input_data = [0.5f32, -0.3f32, 0.1f32];
 
         // Quantize the input
         let quantized_input: Vec<Element> = input_data
@@ -823,12 +823,12 @@ mod test {
         let input_tensor = Tensor::<Element>::new(vec![3].into(), quantized_input);
 
         // Apply the dense operation on both original and padded
-        let output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &vec![&input_tensor], None)
+        let output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&input_tensor], None)
             .unwrap()
             .outputs()[0]
             .clone();
         let padded_output =
-            evaluate_layer::<GoldilocksExt2, _, _>(&padded, &vec![&input_tensor.pad_1d(4)], None)
+            evaluate_layer::<GoldilocksExt2, _, _>(&padded, &[&input_tensor.pad_1d(4)], None)
                 .unwrap()
                 .outputs()[0]
                 .clone();
@@ -888,9 +888,7 @@ mod test {
             expected.get_data().iter().zip(computed.outputs[0].get_data().iter()).for_each(|(left, right)| {
                 assert!(
                     (left - right).abs() < 1e-3,
-                    "Actual: {}, Expected: {}",
-                    left,
-                    right
+                    "Actual: {left}, Expected: {right}",
                 );
             });
         }

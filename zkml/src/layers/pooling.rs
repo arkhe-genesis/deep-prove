@@ -867,8 +867,8 @@ mod tests {
                 .collect::<Vec<MultilinearExtension<'_, F>>>();
             let odd_mles = fixed_mles
                 .iter()
-                .cloned()
                 .skip(1)
+                .cloned()
                 .step_by(2)
                 .collect::<Vec<MultilinearExtension<'_, F>>>();
 

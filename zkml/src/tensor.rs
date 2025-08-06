@@ -2568,7 +2568,7 @@ mod test {
 
     impl Tensor<Element> {
         pub fn get_2d(&self, i: usize, j: usize) -> Element {
-            assert!(self.is_matrix() == true);
+            assert!(self.is_matrix());
             self.data[i * self.shape()[1] + j]
         }
 
@@ -2585,13 +2585,13 @@ mod test {
         let mat = Tensor::random(&vec![3, 5].into());
         let shape = mat.shape();
         let mat = mat.pad_next_power_of_two();
-        println!("matrix {}", mat);
+        println!("matrix {mat}");
         let mut mle = mat.to_2d_mle::<E>();
         let mut rng = rng_from_env_or_random();
         let (chosen_row, chosen_col) = (rng.gen_range(0..shape[0]), rng.gen_range(0..shape[1]));
         let elem = mat.get_2d(chosen_row, chosen_col);
         let elem_field: E = elem.to_field();
-        println!("(x,y) = ({},{}) ==> {:?}", chosen_row, chosen_col, elem);
+        println!("(x,y) = ({chosen_row},{chosen_col}) ==> {elem:?}");
         let inputs = mat.position_to_boolean_2d(chosen_row, chosen_col);
         let output = mle.evaluate(&inputs);
         assert_eq!(elem_field, output);
@@ -2650,11 +2650,11 @@ mod test {
 
     #[test]
     fn test_tensor_ext_ops() {
-        let matrix_a_data = vec![1 as Element, 2, 3, 4, 5, 6, 7, 8, 9];
-        let matrix_b_data = vec![10 as Element, 20, 30, 40, 50, 60, 70, 80, 90];
-        let matrix_c_data = vec![300 as Element, 360, 420, 660, 810, 960, 1020, 1260, 1500];
-        let vector_a_data = vec![10 as Element, 20, 30];
-        let vector_b_data = vec![140 as Element, 320, 500];
+        let matrix_a_data = [1 as Element, 2, 3, 4, 5, 6, 7, 8, 9];
+        let matrix_b_data = [10 as Element, 20, 30, 40, 50, 60, 70, 80, 90];
+        let matrix_c_data = [300 as Element, 360, 420, 660, 810, 960, 1020, 1260, 1500];
+        let vector_a_data = [10 as Element, 20, 30];
+        let vector_b_data = [140 as Element, 320, 500];
 
         let matrix_a_data: Vec<E> = matrix_a_data.iter().map(|x| x.to_field()).collect_vec();
         let matrix_b_data: Vec<E> = matrix_b_data.iter().map(|x| x.to_field()).collect_vec();
@@ -2976,7 +2976,7 @@ mod test {
         let og_flat_t = og_t.flatten(); // This is equivalent to conv2d output (flattened)
 
         let mut pad_t = og_t.clone();
-        pad_t.pad_to_shape(new_shape.clone().into());
+        pad_t.pad_to_shape(new_shape.clone());
         let pad_flat_t = pad_t.flatten();
 
         let og_mat = Tensor::random(&vec![orows, ocols].into()); // This is equivalent to the first dense matrix
@@ -3066,7 +3066,7 @@ mod test {
         }
 
         let tensor = Tensor::<Element>::random(&vec![18, 5, 27].into());
-        let permuted = tensor.permute3d(&vec![1, 2, 0]);
+        let permuted = tensor.permute3d(&[1, 2, 0]);
         assert_eq!(permuted.shape(), vec![5, 27, 18].into())
     }
 
@@ -3184,9 +3184,9 @@ mod test {
 
     fn eval_lteq_poly(x_i: &[Element], y_i: &[Element]) -> Element {
         assert_eq!(x_i.len(), y_i.len());
-        x_i.into_iter()
+        x_i.iter()
             .rev()
-            .zip(y_i.into_iter().rev())
+            .zip(y_i.iter().rev())
             .fold(Element::from(1), |acc, (x, y)| {
                 acc * (1 - x - y + 2 * x * y) + (1 - x) * y
             })
@@ -3195,11 +3195,9 @@ mod test {
     fn eval_mle<F: ExtensionField + FieldFrom<u64>>(point: &[F]) -> F {
         let x_i = &point[..point.len() / 2];
         let y_i = &point[point.len() / 2..];
-        x_i.into_iter()
-            .zip(y_i.into_iter())
-            .fold(F::from_v(1), |acc, (&x, &y)| {
-                acc * (F::from_v(1) - x - y + F::from_v(2) * x * y) + (F::from_v(1) - x) * y
-            })
+        x_i.iter().zip(y_i).fold(F::from_v(1), |acc, (&x, &y)| {
+            acc * (F::from_v(1) - x - y + F::from_v(2) * x * y) + (F::from_v(1) - x) * y
+        })
     }
 
     fn to_be_bits<const NUM_BITS: usize>(x: Element) -> [Element; NUM_BITS] {
@@ -3207,8 +3205,8 @@ mod test {
             .rev()
             .map(|i| {
                 let mask = 1 << i;
-                let bit = (x & Element::from(mask)) >> i;
-                bit
+
+                (x & Element::from(mask)) >> i
             })
             .collect::<Vec<_>>()
             .try_into()
@@ -3252,9 +3250,7 @@ mod test {
                 assert_eq!(
                     zeroifier.get_2d(i, j),
                     cmp,
-                    "Zeroifier evaluation failed for ({}, {})",
-                    i,
-                    j
+                    "Zeroifier evaluation failed for ({i}, {j})"
                 );
                 // build point for MLE: first column bits in little-endiian order, then rows bits in little-endian order
                 let point = y_i
@@ -3310,8 +3306,7 @@ mod test {
             // Check the result is OK
             assert!(
                 expanded_tensor_res.is_ok(),
-                "error: {:?}",
-                expanded_tensor_res
+                "error: {expanded_tensor_res:?}"
             );
 
             // Now check that the data is correct

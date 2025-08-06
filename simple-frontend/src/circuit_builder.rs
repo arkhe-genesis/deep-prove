@@ -194,8 +194,7 @@ mod tests {
             assert_eq!(
                 circuit_builder.cells[cell_id].layer,
                 Some(layer),
-                "cell_id: {}",
-                cell_id
+                "cell_id: {cell_id}"
             );
         }
     }

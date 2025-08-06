@@ -6,7 +6,7 @@ use ff_ext::{FromUniformBytes, GoldilocksExt2};
 use itertools::Itertools;
 use mpcs::{coset_fft, fft_root_table};
 
-use multilinear_extensions::mle::DenseMultilinearExtension;
+use multilinear_extensions::mle::MultilinearExtension;
 use p3_field::Field;
 use p3_goldilocks::Goldilocks;
 use rand::{SeedableRng, rngs::OsRng};
@@ -35,9 +35,9 @@ fn bench_fft(c: &mut Criterion, is_base: bool) {
             let mut polys = (0..batch_size)
                 .map(|_| {
                     if is_base {
-                        DenseMultilinearExtension::random(num_vars, &mut rng.clone())
+                        MultilinearExtension::random(num_vars, &mut rng.clone())
                     } else {
-                        DenseMultilinearExtension::from_evaluations_ext_vec(
+                        MultilinearExtension::from_evaluations_ext_vec(
                             num_vars,
                             (0..1 << num_vars).map(|_| E::random(&mut OsRng)).collect(),
                         )
@@ -46,7 +46,7 @@ fn bench_fft(c: &mut Criterion, is_base: bool) {
                 .collect_vec();
 
             group.bench_function(
-                BenchmarkId::new("batch_encode", format!("{}-{}", num_vars, batch_size)),
+                BenchmarkId::new("batch_encode", format!("{num_vars}-{batch_size}")),
                 |b| {
                     b.iter(|| {
                         polys.par_iter_mut().for_each(|poly| {

@@ -1163,7 +1163,7 @@ impl<E: ExtensionField> MatMulProof<E> {
 
 #[cfg(test)]
 mod tests {
-    use ark_std::rand::{Rng, thread_rng};
+    use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use itertools::Itertools;
 
@@ -1176,6 +1176,7 @@ mod tests {
         },
         model::{Model, test::prove_model},
         padding::PaddingMode,
+        rng_from_env_or_random,
         tensor::{Shape, Tensor},
     };
 
@@ -1349,12 +1350,10 @@ mod tests {
         let input_shape = vec![matrix.ncols_2d(), 5];
 
         // Create input data that needs quantization
-        let rng = &mut thread_rng();
+        let mut rng = rng_from_env_or_random();
         let input_data = (0..input_shape[0])
-            .into_iter()
             .map(|_| {
                 (0..input_shape[1])
-                    .into_iter()
                     .map(|_| rng.gen_range(-1.0f32..1.0f32))
                     .collect_vec()
             })
