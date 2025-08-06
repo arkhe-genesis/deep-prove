@@ -9,7 +9,6 @@ report.json
 table_cache_dev_*
 .DS_Store
 .env
-proptest-regressions/
 *.json
 zkml/bench
 zkml/data

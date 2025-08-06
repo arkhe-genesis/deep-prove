@@ -81,6 +81,9 @@ pub trait Number:
     fn from_f32(f: f32) -> anyhow::Result<Self>;
     fn to_usize(&self) -> usize;
     fn from_usize(u: usize) -> Self;
+
+    #[cfg(test)]
+    fn any() -> impl proptest::prelude::Strategy<Value = Self>;
 }
 
 impl Number for Element {
@@ -124,6 +127,11 @@ impl Number for Element {
     fn from_usize(u: usize) -> Self {
         u as Element
     }
+
+    #[cfg(test)]
+    fn any() -> impl proptest::prelude::Strategy<Value = Self> {
+        *quantization::MIN..=*quantization::MAX
+    }
 }
 impl Number for f32 {
     const MIN: f32 = f32::MIN;
@@ -165,6 +173,11 @@ impl Number for f32 {
     fn from_usize(u: usize) -> Self {
         u as f32
     }
+
+    #[cfg(test)]
+    fn any() -> impl proptest::prelude::Strategy<Value = Self> {
+        MIN_FLOAT..=MAX_FLOAT
+    }
 }
 impl Number for GoldilocksExt2 {
     const MIN: GoldilocksExt2 = GoldilocksExt2::ZERO;
@@ -200,6 +213,12 @@ impl Number for GoldilocksExt2 {
     }
     fn from_usize(_: usize) -> Self {
         unreachable!("Called from_usize for Goldilocks")
+    }
+
+    #[cfg(test)]
+    fn any() -> impl proptest::prelude::Strategy<Value = Self> {
+        use proptest::prelude::Strategy;
+        Element::any().prop_map(|el| el.to_field())
     }
 }
 
@@ -1990,6 +2009,18 @@ impl<T: Number> Tensor<T> {
             shape: shape.clone(),
             og_shape: vec![0].into(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn any(shape: Shape) -> impl proptest::prelude::Strategy<Value = Self> {
+        use proptest::prelude::*;
+        let size = shape.product();
+        let data = proptest::collection::vec(T::any(), size);
+        data.prop_map(move |data| Self {
+            data,
+            shape: shape.clone(),
+            og_shape: vec![0].into(),
+        })
     }
 
     // slice on the third dimension.

@@ -655,6 +655,8 @@ impl<E: ExtensionField> DenseProof<E> {
 
 #[cfg(test)]
 mod test {
+    use std::{fmt::Debug, ops::Range};
+
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
 
@@ -861,36 +863,57 @@ mod test {
 
     proptest! {
         #[test]
-        fn test_dense_with_element(dim in 1usize..256) {
-            let matrix = Tensor::<Element>::random(&Shape::new(vec![dim, dim]));
-            let bias = Tensor::<Element>::random(&Shape::new(vec![dim]));
-            let input = Tensor::<Element>::random(&Shape::new(vec![dim]));
+        fn test_dense_with_element(input in any_input::<Element>(1..256)) {
+            let Input {matrix, bias, input} = input;
 
             let expected = matrix.matvec(&input).add(&bias);
 
             let dense = Dense::<Element>::new(matrix.clone(), bias.clone());
             let computed = dense.evaluate::<GoldilocksExt2>(&[&input], vec![]).expect("Dense evaluation must be successful");
 
-            assert_eq!(expected, computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0]);
         }
 
         #[test]
-        fn test_dense_with_f32(dim in 1usize..256) {
-            let matrix = Tensor::<f32>::random(&Shape::new(vec![dim, dim]));
-            let bias = Tensor::<f32>::random(&Shape::new(vec![dim]));
-            let input = Tensor::<f32>::random(&Shape::new(vec![dim]));
+        fn test_dense_with_f32(input in any_input::<f32>(1usize..256)) {
+            let Input {matrix, bias, input} = input;
 
             let expected = matrix.matvec(&input).add(&bias);
 
             let dense = Dense::<f32>::new(matrix.clone(), bias.clone());
             let computed = dense.evaluate::<GoldilocksExt2>(&[&input], vec![]).expect("Dense evaluation must be successful");
 
-            expected.get_data().iter().zip(computed.outputs[0].get_data().iter()).for_each(|(left, right)| {
-                assert!(
+            for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
+                prop_assert!(
                     (left - right).abs() < 1e-3,
                     "Actual: {left}, Expected: {right}",
                 );
-            });
+            }
         }
+    }
+
+    struct Input<T> {
+        matrix: Tensor<T>,
+        bias: Tensor<T>,
+        input: Tensor<T>,
+    }
+
+    impl<T> Debug for Input<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Input").finish_non_exhaustive()
+        }
+    }
+
+    fn any_input<T: Number>(dim: Range<usize>) -> impl Strategy<Value = Input<T>> {
+        dim.prop_flat_map(|dim| {
+            let matrix = Tensor::<T>::any(Shape::new(vec![dim, dim]));
+            let bias = Tensor::<T>::any(Shape::new(vec![dim]));
+            let input = Tensor::<T>::any(Shape::new(vec![dim]));
+            (matrix, bias, input).prop_map(|(matrix, bias, input)| Input {
+                matrix,
+                bias,
+                input,
+            })
+        })
     }
 }
