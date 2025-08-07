@@ -106,7 +106,6 @@ jobs:
         run: cargo test -- --test-threads=1
         env:
           RUSTFLAGS: "-W warnings"
-          RAYON_NUM_THREADS: 8
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

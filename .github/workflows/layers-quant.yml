@@ -53,10 +53,9 @@ jobs:
             --skip layers::transformer::test::test_read_gpt2_pytorch_embeddings \
             --skip layers::transformer::test::test_read_gpt2_pytorch_output_first \
             --skip parser::json::test::test_json_tensor_loader \
-            --skip layers::transformer::mha::test::test_mha_with_real_values
+            --skip layers::transformer::mha::test::test_mha_with_real_values \
+            --test-threads=1
           mv layers-quant ~/layers-quant-base
-        env:
-          RAYON_NUM_THREADS: 8
       - name: Checkout HEAD
         uses: actions/checkout@v4
         with:
@@ -69,11 +68,10 @@ jobs:
             --skip layers::transformer::test::test_read_gpt2_pytorch_embeddings \
             --skip layers::transformer::test::test_read_gpt2_pytorch_output_first \
             --skip parser::json::test::test_json_tensor_loader \
-            --skip layers::transformer::mha::test::test_mha_with_real_values
+            --skip layers::transformer::mha::test::test_mha_with_real_values \
+            --test-threads=1
           mv layers-quant ~/layers-quant
           cp ../scripts/ci/cmp-layers-quant.sh ~/cmp-layers-quant.sh
-        env:
-          RAYON_NUM_THREADS: 8
       - name: Compare HEAD outputs against base
         run: |
           cd ~

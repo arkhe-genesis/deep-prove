@@ -484,8 +484,9 @@ where
         self.prove_tables()?;
 
         // now provide opening proofs for all claims accumulated during the proving steps
-        let mut prover = self.commit_prover.clone();
-        let commit_proof = prover.prove(&self.ctx.commitment_ctx, self.transcript)?;
+        let commit_proof = self
+            .commit_prover
+            .prove(&self.ctx.commitment_ctx, self.transcript)?;
         let output_proof = Proof {
             steps: self.proofs,
             table_proofs: self.table_proofs,
