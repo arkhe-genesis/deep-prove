@@ -56,6 +56,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 
 /// The base 2 logarithm of the scale factor used in exponential lookup tables
 pub(crate) const LOG_SCALE_FACTOR: usize = 24;
@@ -353,7 +354,7 @@ impl Evaluate<f32> for Softmax<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
@@ -461,7 +462,7 @@ impl Evaluate<Element> for Softmax<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we heck that we have some quantisation info.
         ensure!(
@@ -1033,18 +1034,20 @@ impl Softmax<Element> {
         );
         let shift_commit = ctx.commitment_ctx.commit(&shift_mle)?;
 
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
+        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
 
         // Add the looked up values to the generator so we can make multiplicity polys later
-        gen.element_count
+        gen_w
+            .element_count
             .insert(TableType::Range, range_elements_count);
 
         // Need to recreate the parameters for the Softmax table
-        gen.element_count
+        gen_w
+            .element_count
             .insert(TableType::Softmax(*lut), softman_elements_count);
 
         let quant_one = OUTPUT_SCALE_FACTOR as Element;
-        gen.element_count.insert(
+        gen_w.element_count.insert(
             TableType::ErrorTable(quant_one, allowable_error),
             count_elements(normalisation_lookup),
         );
@@ -1094,7 +1097,7 @@ impl Softmax<Element> {
                     .map(|(input, output)| input + output * COLUMN_SEPARATOR),
             );
 
-            gen.element_count.insert(
+            gen_w.element_count.insert(
                 TableType::ZeroTable(*zero_table_vars),
                 zero_table_elements_count,
             );
@@ -1106,8 +1109,8 @@ impl Softmax<Element> {
             ));
         }
 
-        gen.logup_witnesses.insert(id, lookup_witnesses);
-        Ok(gen)
+        gen_w.logup_witnesses.insert(id, lookup_witnesses);
+        Ok(gen_w)
     }
 }
 
@@ -1126,8 +1129,9 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut crate::Prover<E, T, PCS>,
+        _store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let softmax_data = step_data.outputs.try_softmax_data().ok_or(anyhow!(
+        let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
             "Softmax LayerOut didn't have any ProvingData::Softmax"
         ))?;
 
@@ -1144,19 +1148,21 @@ where
         id: NodeId,
         ctx: &'a Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
+        store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+        let output_tensors = step_data.output_tensors(store)?;
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "Found more than 1 input in inference step of Softmax layer"
         );
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            output_tensors.len() == 1,
             "Found more than 1 output in inference step of Softmax layer"
         );
-        let softmax_data = step_data.outputs.try_softmax_data().ok_or(anyhow!(
+        let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
             "Softmax data not found in inference step for Sopftmax layer"
         ))?;
-        self.lookup_witness(id, ctx, step_data.outputs.outputs()[0], softmax_data)
+        self.lookup_witness(id, ctx, &output_tensors[0], softmax_data)
     }
 }
 
@@ -1809,7 +1815,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
         let output = softmax
-            .evaluate::<GoldilocksExt2>(&[&input], vec![vec![1, 3, 3].into()])
+            .evaluate::<GoldilocksExt2>(&[&input], &[vec![1, 3, 3].into()])
             .unwrap();
         assert_eq!(output.outputs[0].shape(), vec![1, 3, 3].into());
 
@@ -1855,14 +1861,14 @@ mod tests {
             let quant_output = quant_softmax
                 .evaluate::<GoldilocksExt2>(
                     &[&test_qk_quant],
-                    vec![vec![num_tokens, num_tokens].into()],
+                    &[vec![num_tokens, num_tokens].into()],
                 )
                 .unwrap();
             // The result of running the quantised input as floats
             let dequant_output = softmax
                 .evaluate::<GoldilocksExt2>(
                     &[&test_qk_dequant],
-                    vec![vec![num_tokens, num_tokens].into()],
+                    &[vec![num_tokens, num_tokens].into()],
                 )
                 .unwrap();
 
@@ -1908,7 +1914,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
         let output = softmax
-            .evaluate::<GoldilocksExt2>(&[&input], vec![vec![3, 3].into()])
+            .evaluate::<GoldilocksExt2>(&[&input], &[vec![3, 3].into()])
             .unwrap();
         // Since this is a masked evaluation, each row should sum to 1 and the first row should have 1 non-zero value, the second two non-zero
         // and so on.
@@ -1943,6 +1949,6 @@ mod tests {
 
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut TenStore::default()).unwrap();
     }
 }

@@ -21,7 +21,7 @@ impl<N: Number> Evaluate<N> for Permute {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
             inputs.iter().all(|t| t.rank() == 3),
@@ -48,9 +48,7 @@ mod test {
     fn test_permute() {
         let input = Tensor::<Element>::random(&vec![2, 3, 4].into());
         let permute = Permute::new(vec![1, 0, 2]);
-        let output = permute
-            .evaluate::<GoldilocksExt2>(&[&input], vec![])
-            .unwrap();
+        let output = permute.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
         assert_eq!(output.outputs()[0].shape(), vec![3, 2, 4].into());
     }
 }

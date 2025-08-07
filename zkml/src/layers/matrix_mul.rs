@@ -15,6 +15,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use tracing::debug;
 use transcript::Transcript;
 
@@ -487,7 +488,7 @@ impl<N: Number> Evaluate<N> for MatMul<N> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<N, E>> {
         let output = self.op(inputs.to_vec())?;
         Ok(LayerOut::from_vec(vec![output]))
@@ -642,13 +643,17 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
+        let input_tensors = step_data.input_tensors(store)?;
+        let output_tensor = step_data.output_tensor_at(0, store)?;
+
         let (claims, proof) = self.prove_step(
             node_id,
             prover,
             last_claims[0],
-            step_data.inputs.iter().collect(),
-            step_data.outputs.outputs()[0],
+            input_tensors,
+            &output_tensor,
         )?;
         prover.push_proof(node_id, LayerProof::MatMul(proof));
         Ok(claims)
@@ -710,7 +715,7 @@ impl MatMul<Element> {
         node_id: NodeId,
         prover: &mut Prover<E, T, PCS>,
         last_claim: &Claim<E>,
-        mut inputs: Vec<&Tensor<E>>,
+        mut inputs: Vec<Tensor<E>>,
         output: &Tensor<E>,
     ) -> Result<(Vec<Claim<E>>, MatMulProof<E>)>
     where
@@ -724,7 +729,7 @@ impl MatMul<Element> {
 
         let num_inputs = inputs.len();
         let (right_matrix, is_right_constant) = match &self.right_matrix {
-            OperandMatrix::Weight(mat) => (&Tensor::<E>::from(&mat.tensor), true),
+            OperandMatrix::Weight(mat) => (Tensor::<E>::from(&mat.tensor), true),
             OperandMatrix::Input => {
                 let matrix = inputs
                     .pop()
@@ -734,7 +739,7 @@ impl MatMul<Element> {
         };
         let transposed = self.is_right_transposed();
         let (left_matrix, is_left_constant) = match &self.left_matrix {
-            OperandMatrix::Weight(mat) => (&Tensor::<E>::from(&mat.tensor), true),
+            OperandMatrix::Weight(mat) => (Tensor::<E>::from(&mat.tensor), true),
             OperandMatrix::Input => {
                 let matrix = inputs
                     .pop()
@@ -782,7 +787,7 @@ impl MatMul<Element> {
             ncols_right,
             ncols_out,
         );
-        let num_vars_2d = output.num_vars_2d();
+        let num_vars_2d = output.shape().num_vars_2d();
         let num_vars_out = num_vars_2d.0 + num_vars_2d.1;
         ensure!(
             num_vars_out == last_claim.point.len(),
@@ -924,19 +929,13 @@ impl MatMul<Element> {
 
         // number of variables of the MLE polynomials is the number of row
         // variables in in layer matrix
-        let num_vars = Tensor::<Element>::new_from_shape(
-            transposed_right_shape.unwrap_or(right_shape.clone()),
-        )
-        .num_vars_2d()
-        .0;
+        let num_vars = transposed_right_shape
+            .unwrap_or(right_shape.clone())
+            .num_vars_2d()
+            .0;
         // check that the number of variables is the same as the number of
         // column variables for left matrix
-        ensure!(
-            num_vars
-                == Tensor::<Element>::new_from_shape(left_shape.clone())
-                    .num_vars_2d()
-                    .1
-        );
+        ensure!(num_vars == left_shape.num_vars_2d().1);
 
         let left_matrix_shapes = self
             .left_matrix
@@ -1409,9 +1408,7 @@ mod tests {
         let matmul = MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap();
         let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let result = matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
-            .unwrap();
+        let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b], &[]).unwrap();
         assert_eq!(result.outputs[0].data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
@@ -1426,9 +1423,7 @@ mod tests {
         .unwrap();
         let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose();
-        let result = matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
-            .unwrap();
+        let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b], &[]).unwrap();
         assert_eq!(result.outputs[0].data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
@@ -1456,7 +1451,7 @@ mod tests {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
     }
 
     #[test]
@@ -1491,7 +1486,7 @@ mod tests {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
     }
 
     #[test]
@@ -1510,7 +1505,7 @@ mod tests {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
     }
 
     #[test]
@@ -1536,6 +1531,6 @@ mod tests {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
     }
 }

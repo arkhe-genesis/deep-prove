@@ -10,7 +10,7 @@ use super::{Model, ModelCtx};
 pub trait ToIterator<E: NodeEdges> {
     /// Produces an iterator over a set of nodes in a model, starting from the inputs
     /// and yielding nodes in order according to whether their inputs all come from
-    /// nodes already visited by the iterator  
+    /// nodes already visited by the iterator
     fn to_forward_iterator<'a>(&'a self) -> NodeIterator<'a, E, true>;
 
     /// Produces an iterator over a set of nodes in a model, starting from the outputs

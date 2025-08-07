@@ -1,5 +1,4 @@
 #![allow(clippy::needless_range_loop)]
-
 use crate::{
     NextPowerOfTwo, ScalingFactor,
     gpu::Backend,
@@ -29,8 +28,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::{Ordering, PartialEq},
     fmt::{self, Debug},
+    marker::PhantomData,
     ops::{Bound, RangeBounds},
 };
+use tenstore::{TenStore, TensorKey, TensorStore, TenstoreError};
 
 use crate::{
     Element,
@@ -404,6 +405,74 @@ where
     }
 }
 
+/// A dry tensor only contain the meta-information required to build a tensor
+/// from a store.
+#[derive(Clone, Debug)]
+pub struct DryTensor<T> {
+    /// A marker to conserve the tensor element type.
+    _t: PhantomData<T>,
+    /// A key pointing to the tensor data in a [`TenStore`]
+    k: TensorKey<T>,
+    /// The shape of the tensor.
+    shape: Shape,
+}
+impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
+    pub(crate) fn new(k: TensorKey<T>, shape: Shape) -> Self {
+        Self {
+            _t: PhantomData,
+            k,
+            shape,
+        }
+    }
+
+    /// Return a reference to this dry tensor key.
+    pub(crate) fn key(&self) -> &TensorKey<T> {
+        &self.k
+    }
+
+    /// Return a reference to this dry tensor shape.
+    pub(crate) fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    /// Hydrate this dry tensor from `store`, generating a [`Tensor`] from it.
+    pub(crate) fn hydrate(&self, mut store: TenStore) -> Result<Tensor<T>, TenstoreError> {
+        store
+            .fetch(&self.k)
+            .map(|data| Tensor::new(self.shape.clone(), data))
+    }
+
+    /// Ensure that the tensor under the key `l(self.key)` exist. If it does
+    /// not, allocate it, fill it by applying `f` over `self`, then return its
+    /// dried version.
+    pub(crate) fn dry_cast<S>(
+        &self,
+        mut store: TenStore,
+        f: impl Fn(&T) -> S,
+    ) -> Result<DryTensor<S>, TenstoreError>
+    where
+        S: Serialize + for<'a> Deserialize<'a>,
+    {
+        let new_k = store.cast(&self.k, f)?;
+        Ok(DryTensor::<S>::new(new_k, self.shape.clone()))
+    }
+
+    /// Fetch the tensor under the key `l(self.key)`. If it does not exist,
+    /// build it by mapping `f` over `self`, store it, then return its data.
+    pub(crate) fn hydrated_cast<S>(
+        &self,
+        mut store: TenStore,
+        f: impl Fn(&T) -> S,
+    ) -> Result<Tensor<S>, TenstoreError>
+    where
+        S: Serialize + for<'a> Deserialize<'a>,
+    {
+        store
+            .cast_and_fetch(&self.k, f)
+            .map(|bytes| Tensor::new(self.shape.clone(), bytes.1))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, derive_more::Index, derive_more::IndexMut)]
 pub struct Tensor<T> {
     // Indexing the `Tensor` indexes the underlying storage.
@@ -414,6 +483,22 @@ pub struct Tensor<T> {
     og_shape: Shape,
 }
 impl<T> Tensor<T> {
+    /// Create a new tensor with given shape and data
+    pub fn new(shape: Shape, data: Vec<T>) -> Self {
+        assert!(
+            shape.product() == data.len(),
+            "Shape does not match data length: shape {:?}->{} vs data.len() {}",
+            shape,
+            shape.product(),
+            data.len(),
+        );
+        Self {
+            data,
+            shape,
+            og_shape: vec![0].into(),
+        }
+    }
+
     /// Return an immutable reference to this tensor data.
     pub fn data(&self) -> &[T] {
         &self.data
@@ -428,6 +513,205 @@ impl<T> Tensor<T> {
     /// its shape.
     pub fn data_size(&self) -> usize {
         self.data.len()
+    }
+
+    /// Returns an iterator that yields slices of the last dimension.
+    /// For a tensor of shape [2,3,3], it will yield 6 slices (2*3) of 3 elements each.
+    pub fn slice_last_dim(&self) -> impl Iterator<Item = &[T]> {
+        let (it, _) = self.slice_on_dim(self.shape.len() - 2);
+        it
+    }
+
+    /// Returns an iterator of slices whose length corresponds to the subspace
+    /// the dimension represents. Note dim is the dimension _index_ (0-based indexing).
+    /// Example: if dimension is [2,3,4], and we call `slice_on_dim(1)`,
+    /// it will yield 2x3 slices of 4 elements each. If we call `slice_on_dim(0)`,
+    /// it will yield 2 slices of 3x4=12 element each.
+    /// If dim is the last dimension, it will simply yield a slice of the whole tensor.
+    /// The shape returned is the shape of each slice. The shape is the same as the shape of the tensor
+    /// if the dim is the last dimension or more
+    pub fn slice_on_dim(&self, dim: usize) -> (impl Iterator<Item = &[T]>, Shape) {
+        assert!(
+            dim < self.shape.len(),
+            "can't slice on dim {:?} if shape is {:?}",
+            dim,
+            self.shape
+        );
+        let (stride, shape) = if dim < self.shape.len() - 1 {
+            let slice = self.shape.slice(dim + 1..);
+            (slice.product(), slice)
+        } else {
+            (self.shape.product(), self.shape.clone())
+        };
+        (self.data.chunks(stride), shape)
+    }
+
+    // Concatenate the other tensor to the first one.
+    // RESTRICTIOn: self shape is [a1,a2...,an] we
+    // expect other shape to be [a2...,an] OR [1, a2...,an]
+    // The new shape of self will be [a1+1,...an]
+    // In other words, we only concatenate another vector if it's exactly size of the highest dimension
+    // If it's 2d, then we expect other to be a vector
+    pub fn concat(&mut self, other: Self) {
+        // make sure that the all dimension but the highest one are the same
+        let common_shape = self.shape.len().min(other.shape.len());
+        let added_higher = if common_shape < self.shape.len() {
+            assert!(
+                self.shape
+                    .iter()
+                    .rev()
+                    .zip(other.shape.iter().rev())
+                    .take(common_shape)
+                    .all(|(a, b)| a == b)
+            );
+            assert_eq!(common_shape + 1, self.shape.len());
+            1
+        } else {
+            assert_eq!(common_shape, self.shape.len());
+            *other.shape.first().unwrap()
+        };
+        // then the new shape has this higher dimension + 1 simply
+        // common_shape since 0-based indexing
+        *self.shape.get_mut(0).unwrap() += added_higher;
+        self.data.extend(other.data);
+    }
+    /// Stack all the tensors in the iterator into a single tensor using `concat()`
+    /// Note this naively increase the highest dimension. If you wish to stack along a new higher dimension,
+    /// call `unsqueeze(0)` on the first or all tensors first.
+    /// e.g. [2,3] and [2,3] will be stacked into [4,3] naively. Calling `unsqueeze(0)` on both
+    /// will stack into [2,2,3].
+    pub fn stack_all<I: IntoIterator<Item = Self>>(tensors: I) -> anyhow::Result<Self> {
+        let mut it = tensors.into_iter();
+        let mut first = it
+            .next()
+            .ok_or(anyhow::anyhow!("Can't concat an empty list of tensors"))?;
+        for tensor in it {
+            first.concat(tensor);
+        }
+        Ok(first)
+    }
+
+    pub fn unsqueeze(self, index: usize) -> Self {
+        let new_shape = self.shape.insert(index, 1);
+        Self {
+            data: self.data,
+            shape: new_shape,
+            og_shape: self.og_shape.clone(),
+        }
+    }
+
+    /// Is an empty tensor
+    pub fn is_empty(&self) -> bool {
+        self.shape.len() == 0
+    }
+
+    /// Is vector
+    pub fn is_vector(&self) -> bool {
+        self.shape().len() == 1 || (self.shape().len() == 2 && self.shape()[0] == 1)
+    }
+    /// Is matrix
+    pub fn is_matrix(&self) -> bool {
+        self.shape().len() == 2
+    }
+
+    pub fn is_convolution(&self) -> bool {
+        self.shape().len() == 4
+    }
+
+    /// Get the number of rows from the matrix
+    pub fn nrows_2d(&self) -> usize {
+        let mut cols = 0;
+        let dims = self.shape();
+        if self.is_matrix() {
+            cols = dims[0];
+        } else if self.is_convolution() {
+            cols = dims[0] * dims[2] * dims[2];
+        }
+        assert!(cols != 0, "Tensor is not a matrix or convolution");
+        cols
+    }
+
+    /// Get the number of cols from the matrix
+    pub fn ncols_2d(&self) -> usize {
+        let mut cols = 0;
+        let dims = self.shape();
+        if self.is_matrix() {
+            cols = dims[1];
+        } else if self.is_convolution() {
+            cols = dims[1] * dims[2] * dims[2];
+        }
+        assert!(cols != 0, "Tensor is not a matrix or convolution");
+        // assert!(self.is_matrix(), "Tensor is not a matrix");
+        // let dims = self.dims();
+
+        cols
+    }
+
+    /// Get the dimensions of the tensor
+    pub fn shape(&self) -> Shape {
+        assert!(!self.is_empty(), "Empty tensor");
+        self.shape.clone()
+    }
+
+    /// Get the dimensions of the tensor
+    pub fn shape_mut(&mut self) -> &mut Shape {
+        &mut self.shape
+    }
+
+    /// Force-set the tensor shape
+    pub fn set_shape(&mut self, new_shape: Shape) {
+        assert!(!self.is_empty(), "Empty tensor");
+        assert!(self.shape.numel() == new_shape.numel());
+        self.shape = new_shape;
+    }
+
+    /// Returns the number of dimensions the [`Tensor`] has
+    pub fn rank(&self) -> usize {
+        self.shape.len()
+    }
+
+    /// Get the input shape of the tensor
+    /// TODO: Remove it
+    pub fn get_input_shape(&self) -> Shape {
+        assert!(!self.is_empty(), "Empty tensor");
+        self.og_shape.clone()
+    }
+    pub fn get_data(&self) -> &[T] {
+        &self.data
+    }
+
+    pub fn get_data_into(self) -> Vec<T> {
+        self.data
+    }
+    pub fn kx(&self) -> usize {
+        self.shape[1]
+    }
+    pub fn kw(&self) -> usize {
+        self.shape[0]
+    }
+    pub fn nw(&self) -> usize {
+        self.shape[2]
+    }
+    pub fn real_nw(&self) -> usize {
+        self.og_shape[2]
+    }
+    pub fn real_shape(&self) -> Shape {
+        self.og_shape.clone()
+    }
+    // Returns the size of an individual filter
+    pub fn filter_size(&self) -> usize {
+        self.shape[2] * self.shape[2]
+    }
+
+    pub fn get_conv_weights<F: ExtensionField>(&self) -> Vec<F>
+    where
+        T: Fieldizer<F>,
+    {
+        let mut data = vec![F::ZERO; self.data.len()];
+        for i in 0..data.len() {
+            data[i] = self.data[i].to_field();
+        }
+        data
     }
 }
 
@@ -735,7 +1019,7 @@ impl Tensor<f32> {
 }
 
 impl<T: Number> Tensor<T> {
-    pub fn allocate(shape: Shape) -> Self {
+    pub fn zero(shape: Shape) -> Self {
         Tensor {
             data: vec![T::zero(); shape.numel()],
             og_shape: shape.clone(),
@@ -744,165 +1028,7 @@ impl<T: Number> Tensor<T> {
     }
 }
 
-impl<T> Tensor<T> {
-    /// Create a new tensor with given shape and data
-    pub fn new(shape: Shape, data: Vec<T>) -> Self {
-        assert!(
-            shape.product() == data.len(),
-            "Shape does not match data length: shape {:?}->{} vs data.len() {}",
-            shape,
-            shape.product(),
-            data.len()
-        );
-        Self {
-            data,
-            shape,
-            og_shape: vec![0].into(),
-        }
-    }
-
-    /// Is an empty tensor
-    pub fn is_empty(&self) -> bool {
-        self.shape.len() == 0
-    }
-
-    /// Create a new tensor with default values
-    pub fn new_from_shape(shape: Shape) -> Self
-    where
-        T: Clone + Default,
-    {
-        let num_elements = shape.product();
-        Self::new(shape, vec![T::default(); num_elements])
-    }
-
-    /// Flattens the tensor into a 1D.
-    pub fn to_1d(&mut self) {
-        self.shape = Shape::new(vec![self.shape.product()]);
-    }
-
-    /// Is vector
-    pub fn is_vector(&self) -> bool {
-        self.rank() == 1 || (self.rank() == 2 && self.shape()[0] == 1)
-    }
-    /// Is matrix
-    pub fn is_matrix(&self) -> bool {
-        self.rank() == 2
-    }
-
-    pub fn is_convolution(&self) -> bool {
-        self.rank() == 4
-    }
-
-    /// Get the number of rows from the matrix
-    pub fn nrows_2d(&self) -> usize {
-        let mut cols = 0;
-        let dims = self.shape();
-        if self.is_matrix() {
-            cols = dims[0];
-        } else if self.is_convolution() {
-            cols = dims[0] * dims[2] * dims[2];
-        }
-        assert!(cols != 0, "Tensor is not a matrix or convolution");
-        cols
-    }
-
-    /// Get the number of cols from the matrix
-    pub fn ncols_2d(&self) -> usize {
-        let mut cols = 0;
-        let dims = self.shape();
-        if self.is_matrix() {
-            cols = dims[1];
-        } else if self.is_convolution() {
-            cols = dims[1] * dims[2] * dims[2];
-        }
-        assert!(cols != 0, "Tensor is not a matrix or convolution");
-        // assert!(self.is_matrix(), "Tensor is not a matrix");
-        // let dims = self.dims();
-
-        cols
-    }
-
-    /// Returns the number of boolean variables needed to address any row, and any columns
-    pub fn num_vars_2d(&self) -> (usize, usize) {
-        assert!(self.is_matrix(), "Tensor is not a matrix");
-        (
-            self.nrows_2d().ilog2() as usize,
-            self.ncols_2d().ilog2() as usize,
-        )
-    }
-
-    /// Get the dimensions of the tensor
-    pub fn shape(&self) -> Shape {
-        assert!(!self.is_empty(), "Empty tensor");
-        self.shape.clone()
-    }
-
-    /// Get the dimensions of the tensor
-    pub fn shape_mut(&mut self) -> &mut Shape {
-        &mut self.shape
-    }
-
-    /// Force-set the tensor shape
-    pub fn set_shape(&mut self, new_shape: Shape) {
-        assert!(!self.is_empty(), "Empty tensor");
-        assert!(self.shape.numel() == new_shape.numel());
-        self.shape = new_shape;
-    }
-
-    /// Returns the number of dimensions the [`Tensor`] has
-    pub fn rank(&self) -> usize {
-        self.shape.len()
-    }
-
-    /// Get the input shape of the tensor
-    /// TODO: Remove it
-    pub fn get_input_shape(&self) -> Shape {
-        assert!(!self.is_empty(), "Empty tensor");
-        self.og_shape.clone()
-    }
-    pub fn get_data(&self) -> &[T] {
-        &self.data
-    }
-
-    pub fn get_data_into(self) -> Vec<T> {
-        self.data
-    }
-    pub fn kx(&self) -> usize {
-        self.shape[1]
-    }
-    pub fn kw(&self) -> usize {
-        self.shape[0]
-    }
-    pub fn nw(&self) -> usize {
-        self.shape[2]
-    }
-    pub fn real_nw(&self) -> usize {
-        self.og_shape[2]
-    }
-    pub fn real_shape(&self) -> Shape {
-        self.og_shape.clone()
-    }
-    // Returns the size of an individual filter
-    pub fn filter_size(&self) -> usize {
-        self.shape[2] * self.shape[2]
-    }
-
-    pub fn get_conv_weights<F: ExtensionField>(&self) -> Vec<F>
-    where
-        T: Fieldizer<F>,
-    {
-        let mut data = vec![F::ZERO; self.data.len()];
-        for i in 0..data.len() {
-            data[i] = self.data[i].to_field();
-        }
-        data
-    }
-}
-
-impl<T> Tensor<T>
-where
-    T: Clone,
-{
+impl<T: Clone> Tensor<T> {
     pub fn flatten(&self) -> Self {
         let new_data = self.get_data().to_vec();
         let new_shape = vec![new_data.len()];
@@ -932,14 +1058,14 @@ where
     /// evaluated by an MLE
     pub fn row_to_boolean_2d<F: ExtensionField>(&self, row: usize) -> impl Iterator<Item = F> {
         assert!(self.is_matrix(), "Tensor is not a matrix");
-        let (nvars_rows, _) = self.num_vars_2d();
+        let (nvars_rows, _) = self.shape().num_vars_2d();
         to_bit_sequence_le(row, nvars_rows).map(|b| F::from_canonical_u64(b as u64))
     }
     /// Returns the boolean iterator indicating the given row in the right endianness to be
     /// evaluated by an MLE
     pub fn col_to_boolean_2d<F: ExtensionField>(&self, col: usize) -> impl Iterator<Item = F> {
         assert!(self.is_matrix(), "Tensor is not a matrix");
-        let (_, nvars_col) = self.num_vars_2d();
+        let (_, nvars_col) = self.shape().num_vars_2d();
         to_bit_sequence_le(col, nvars_col).map(|b| F::from_canonical_u64(b as u64))
     }
     /// From a given row and a given column, return the vector of field elements in the right
@@ -966,10 +1092,7 @@ where
     }
 }
 
-impl<T> Tensor<T>
-where
-    T: Number,
-{
+impl<T: Number> Tensor<T> {
     pub fn argmax(&self) -> usize {
         self.data
             .iter()
@@ -986,6 +1109,7 @@ where
             .iter()
             .fold(T::default(), |max, x| max.cmp_max(&x.absolute_value()))
     }
+
     /// Create a tensor filled with zeros
     pub fn zeros(shape: Shape) -> Self {
         let size = shape.product();
@@ -1016,6 +1140,7 @@ where
             data,
         }
     }
+
     /// Add a vector to each sub-tensor of the second dimension of the tensor
     /// If self is 2d, then add a vector to each row of self.
     pub fn add_dim2(&self, other: &Tensor<T>) -> Tensor<T> {
@@ -1038,6 +1163,7 @@ where
             data,
         }
     }
+
     /// Element-wise subtraction
     pub fn sub(&self, other: &Tensor<T>) -> Tensor<T> {
         assert!(self.shape == other.shape, "Shape mismatch for subtraction.");
@@ -1052,6 +1178,7 @@ where
             data,
         }
     }
+
     /// Element-wise multiplication
     pub fn mul(&self, other: &Tensor<T>) -> Tensor<T> {
         assert!(
@@ -1102,6 +1229,11 @@ where
         self.data.resize(new_len, Default::default());
         self.shape[0] = new_len;
         self
+    }
+
+    /// Flattens the tensor into a 1D.
+    pub fn to_1d(&mut self) {
+        self.shape = Shape::new(vec![self.shape.product()]);
     }
 
     /// Recursively pads the tensor so its ready to be viewed as an MLE
@@ -1442,7 +1574,8 @@ where
             })
             .collect();
 
-        *self = Tensor::new(new_shape, new_data);
+        self.shape = new_shape;
+        self.data = new_data;
     }
     pub fn maxpool2d(&self, kernel_size: usize, stride: usize) -> Tensor<T> {
         let dims = self.rank();
@@ -1653,6 +1786,87 @@ where
             .collect::<Vec<T>>();
 
         Tensor::<T>::new(vec![num_matrices, matrix_dim, matrix_dim].into(), data)
+    }
+
+    pub fn max_value(&self) -> T {
+        self.data.iter().fold(T::MIN, |max, x| max.cmp_max(x))
+    }
+    pub fn min_value(&self) -> T {
+        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
+    }
+
+    pub fn random(shape: &Shape) -> Self {
+        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
+    }
+
+    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
+        Ok(Self {
+            data: self
+                .data
+                .iter()
+                .map(f)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            shape: self.shape.clone(),
+            og_shape: self.og_shape.clone(),
+        })
+    }
+
+    /// Creates a random matrix with a given number of rows and cols.
+    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
+    /// sync which is not true for basic rng core.
+    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
+        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
+        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
+        let size = shape.product();
+        let data = (0..size).map(|_| T::random(&mut rng)).collect();
+        Self {
+            data,
+            shape: shape.clone(),
+            og_shape: vec![0].into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn any(shape: Shape) -> impl proptest::prelude::Strategy<Value = Self> {
+        use proptest::prelude::*;
+        let size = shape.product();
+        let data = proptest::collection::vec(T::any(), size);
+        data.prop_map(move |data| Self {
+            data,
+            shape: shape.clone(),
+            og_shape: vec![0].into(),
+        })
+    }
+
+    // slice on the third dimension.
+    // start inclusive, end exclusive
+    pub fn slice_3d(&self, start: usize, end: usize) -> Self {
+        assert!(self.shape.len() == 3);
+        assert!(start < self.shape[0]);
+        assert!(end <= self.shape[0]);
+        let blocks = self.shape[1] * self.shape[2];
+        let sliced = self.data[blocks * start..blocks * end].to_vec();
+        Self {
+            data: sliced,
+            shape: vec![end - start, self.shape[1], self.shape[2]].into(),
+            og_shape: vec![0].into(),
+        }
+    }
+
+    // slice the tensor on the second dimension
+    // dim2_start inclusive
+    // dim2_end exclusive
+    // TODO: refactor to take generic shape dimensions where to slice ... or just use burn API tensor
+    pub fn slice_2d(&self, dim2_start: usize, dim2_end: usize) -> Self {
+        assert!(self.shape.len() == 2);
+        let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
+        let data = self.data[range].to_vec();
+        let new_shape = vec![dim2_end - dim2_start, self.shape[1]];
+        Self {
+            data,
+            shape: new_shape.into(),
+            og_shape: vec![0].into(),
+        }
     }
 }
 
@@ -1972,176 +2186,6 @@ impl<T: Default + Clone + Copy> Tensor<T> {
     }
 }
 
-impl<T: Number> Tensor<T> {
-    pub fn max_value(&self) -> T {
-        self.data.iter().fold(T::MIN, |max, x| max.cmp_max(x))
-    }
-    pub fn min_value(&self) -> T {
-        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
-    }
-
-    pub fn random(shape: &Shape) -> Self {
-        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
-    }
-
-    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
-        Ok(Self {
-            data: self
-                .data
-                .iter()
-                .map(f)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            shape: self.shape.clone(),
-            og_shape: self.og_shape.clone(),
-        })
-    }
-
-    /// Creates a random matrix with a given number of rows and cols.
-    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
-    /// sync which is not true for basic rng core.
-    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
-        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
-        let size = shape.product();
-        let data = (0..size).map(|_| T::random(&mut rng)).collect();
-        Self {
-            data,
-            shape: shape.clone(),
-            og_shape: vec![0].into(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn any(shape: Shape) -> impl proptest::prelude::Strategy<Value = Self> {
-        use proptest::prelude::*;
-        let size = shape.product();
-        let data = proptest::collection::vec(T::any(), size);
-        data.prop_map(move |data| Self {
-            data,
-            shape: shape.clone(),
-            og_shape: vec![0].into(),
-        })
-    }
-
-    // slice on the third dimension.
-    // start inclusive, end exclusive
-    pub fn slice_3d(&self, start: usize, end: usize) -> Self {
-        assert!(self.shape.len() == 3);
-        assert!(start < self.shape[0]);
-        assert!(end <= self.shape[0]);
-        let blocks = self.shape[1] * self.shape[2];
-        let sliced = self.data[blocks * start..blocks * end].to_vec();
-        Self {
-            data: sliced,
-            shape: vec![end - start, self.shape[1], self.shape[2]].into(),
-            og_shape: vec![0].into(),
-        }
-    }
-
-    // slice the tensor on the second dimension
-    // dim2_start inclusive
-    // dim2_end exclusive
-    // TODO: refactor to take generic shape dimensions where to slice ... or just use burn API tensor
-    pub fn slice_2d(&self, dim2_start: usize, dim2_end: usize) -> Self {
-        assert!(self.shape.len() == 2);
-        let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
-        let data = self.data[range].to_vec();
-        let new_shape = vec![dim2_end - dim2_start, self.shape[1]];
-        Self {
-            data,
-            shape: new_shape.into(),
-            og_shape: vec![0].into(),
-        }
-    }
-}
-
-impl<T> Tensor<T> {
-    /// Returns an iterator that yields slices of the last dimension.
-    /// For a tensor of shape [2,3,3], it will yield 6 slices (2*3) of 3 elements each.
-    pub fn slice_last_dim(&self) -> impl Iterator<Item = &[T]> {
-        let (it, _) = self.slice_on_dim(self.shape.len() - 2);
-        it
-    }
-
-    /// Returns an iterator of slices whose length corresponds to the subspace
-    /// the dimension represents. Note dim is the dimension _index_ (0-based indexing).
-    /// Example: if dimension is [2,3,4], and we call `slice_on_dim(1)`,
-    /// it will yield 2x3 slices of 4 elements each. If we call `slice_on_dim(0)`,
-    /// it will yield 2 slices of 3x4=12 element each.
-    /// If dim is the last dimension, it will simply yield a slice of the whole tensor.
-    /// The shape returned is the shape of each slice. The shape is the same as the shape of the tensor
-    /// if the dim is the last dimension or more
-    pub fn slice_on_dim(&self, dim: usize) -> (impl Iterator<Item = &[T]>, Shape) {
-        assert!(
-            dim < self.shape.len(),
-            "can't slice on dim {:?} if shape is {:?}",
-            dim,
-            self.shape
-        );
-        let (stride, shape) = if dim < self.shape.len() - 1 {
-            let slice = self.shape.slice(dim + 1..);
-            (slice.product(), slice)
-        } else {
-            (self.shape.product(), self.shape.clone())
-        };
-        (self.data.chunks(stride), shape)
-    }
-
-    // Concatenate the other tensor to the first one.
-    // RESTRICTIOn: self shape is [a1,a2...,an] we
-    // expect other shape to be [a2...,an] OR [1, a2...,an]
-    // The new shape of self will be [a1+1,...an]
-    // In other words, we only concatenate another vector if it's exactly size of the highest dimension
-    // If it's 2d, then we expect other to be a vector
-    pub fn concat(&mut self, other: Self) {
-        // make sure that the all dimension but the highest one are the same
-        let common_shape = self.shape.len().min(other.shape.len());
-        let added_higher = if common_shape < self.shape.len() {
-            assert!(
-                self.shape
-                    .iter()
-                    .rev()
-                    .zip(other.shape.iter().rev())
-                    .take(common_shape)
-                    .all(|(a, b)| a == b)
-            );
-            assert_eq!(common_shape + 1, self.shape.len());
-            1
-        } else {
-            assert_eq!(common_shape, self.shape.len());
-            *other.shape.first().unwrap()
-        };
-        // then the new shape has this higher dimension + 1 simply
-        // common_shape since 0-based indexing
-        *self.shape.get_mut(0).unwrap() += added_higher;
-        self.data.extend(other.data);
-    }
-    /// Stack all the tensors in the iterator into a single tensor using `concat()`
-    /// Note this naively increase the highest dimension. If you wish to stack along a new higher dimension,
-    /// call `unsqueeze(0)` on the first or all tensors first.
-    /// e.g. [2,3] and [2,3] will be stacked into [4,3] naively. Calling `unsqueeze(0)` on both
-    /// will stack into [2,2,3].
-    pub fn stack_all<I: IntoIterator<Item = Self>>(tensors: I) -> anyhow::Result<Self> {
-        let mut it = tensors.into_iter();
-        let mut first = it
-            .next()
-            .ok_or(anyhow::anyhow!("Can't concat an empty list of tensors"))?;
-        for tensor in it {
-            first.concat(tensor);
-        }
-        Ok(first)
-    }
-
-    pub fn unsqueeze(self, index: usize) -> Self {
-        let new_shape = self.shape.insert(index, 1);
-        Self {
-            data: self.data,
-            shape: new_shape,
-            og_shape: self.og_shape.clone(),
-        }
-    }
-}
-
 /// Structure that holds a shape of a tensor.
 /// NOTE: it is currently being phased in incrementally the codebase currently. There will be places where we still use Vec<usize>
 #[derive(
@@ -2294,6 +2338,9 @@ impl Shape {
     pub fn is_matrix(&self) -> bool {
         self.0.len() == 2
     }
+    pub fn is_convolution(&self) -> bool {
+        self.0.len() == 4
+    }
     pub fn ncols(&self) -> usize {
         assert!(self.is_matrix(), "Tensor is not a matrix");
         self.0[1]
@@ -2331,6 +2378,41 @@ impl Shape {
     }
     pub fn numel(&self) -> usize {
         self.product()
+    }
+
+    /// Get the number of rows from the matrix
+    pub fn nrows_2d(&self) -> usize {
+        let mut cols = 0;
+        let dims = &self.0;
+        if self.is_matrix() {
+            cols = dims[0];
+        } else if self.is_convolution() {
+            cols = dims[0] * dims[2] * dims[2];
+        }
+        assert!(cols != 0, "Shape is not a matrix or convolution");
+        cols
+    }
+
+    /// Get the number of cols from the matrix
+    pub fn ncols_2d(&self) -> usize {
+        let mut cols = 0;
+        let dims = &self.0;
+        if self.is_matrix() {
+            cols = dims[1];
+        } else if self.is_convolution() {
+            cols = dims[1] * dims[2] * dims[2];
+        }
+        assert!(cols != 0, "Shape is not a matrix or convolution");
+
+        cols
+    }
+
+    pub fn num_vars_2d(&self) -> (usize, usize) {
+        assert!(self.is_matrix(), "Shape is not a matrix");
+        (
+            self.nrows_2d().ilog2() as usize,
+            self.ncols_2d().ilog2() as usize,
+        )
     }
 }
 

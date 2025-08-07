@@ -15,6 +15,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use transcript::{Challenge, Transcript};
 
 use crate::{
@@ -281,7 +282,7 @@ impl<N: Number> Evaluate<N> for QKV<N> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(inputs.len() == 1, "QKV expects 1 input");
         let shape = inputs[0].shape();
@@ -430,7 +431,7 @@ where
 
         // number of variables in the sum-check is equal to the number of variables corresponding to
         // the rows of weight matrices
-        let num_vars = self.q.num_vars_2d().0;
+        let num_vars = self.q.shape().num_vars_2d().0;
 
         let vp_aux = crate::util::from_mle_list_dimensions(&vec![vec![num_vars, num_vars]; 3]);
 
@@ -469,7 +470,11 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
+        let input_tensors = step_data.input_tensors(store)?;
+        let output_tensors = step_data.output_tensors(store)?;
+
         let expected_num_outputs = self.num_outputs(1);
         ensure!(
             last_claims.len() == expected_num_outputs,
@@ -477,11 +482,11 @@ where
             last_claims.len()
         );
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "Expected 1 input tenstor in inference data for QKV layer, found {}",
-            step_data.inputs.len()
+            step_data.node_inputs.len()
         );
-        let input = &step_data.inputs[0];
+        let input = &input_tensors[0];
         ensure!(
             input.is_matrix(),
             "Input tensor for QKV layer is not a matrix"
@@ -492,20 +497,20 @@ where
             ncols == nrows,
             "Number of columns in input matrix ({ncols}) different from number of rows in Q weight matrix of QKV layer ({nrows})"
         );
-        let expected_output_shape = vec![input.nrows_2d(), self.q.ncols_2d()].into();
+        let expected_output_shape: Shape = vec![input.nrows_2d(), self.q.ncols_2d()].into();
         ensure!(
-            step_data.outputs.outputs().len() == expected_num_outputs,
+            output_tensors.len() == expected_num_outputs,
             "Expected {expected_num_outputs} output tensors in inference data for QKV layer, found {}",
-            step_data.outputs.outputs().len()
+            output_tensors.len()
         );
-        step_data.outputs.outputs().into_iter().try_for_each(|out| {
+        output_tensors.iter().try_for_each(|out| {
                 ensure!(out.shape() == expected_output_shape,
                     "Expected shape {expected_output_shape:?} for output of QKV layer, found shape {:?}", out.shape(),
                 );
                 Ok(())
             }
         )?;
-        let output_num_vars_2d = step_data.outputs.outputs()[0].num_vars_2d(); // we can use the first one since we checked all outputs
+        let output_num_vars_2d = output_tensors[0].shape().num_vars_2d(); // we can use the first one since we checked all outputs
         // have the same shape
         let output_num_vars = output_num_vars_2d.0 + output_num_vars_2d.1; // overall number of variables for the MLEs of outputs
         last_claims.iter().try_for_each(|claim| {
@@ -543,7 +548,7 @@ where
         let input_mle = input.to_mle_2d();
 
         // Number of variables involved in the sum-check corresponds to the number of columns of the input matrix
-        let num_vars = input.num_vars_2d().1;
+        let num_vars = input.shape().num_vars_2d().1;
         let num_threads = optimal_sumcheck_threads(num_vars);
         let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
 
@@ -882,12 +887,6 @@ impl<N: Number> CacheQKV<N> {
     pub fn v_shape(&self) -> Shape {
         self.cache_v.shape()
     }
-    pub fn k(&self) -> Tensor<N> {
-        self.cache_k.clone()
-    }
-    pub fn v(&self) -> Tensor<N> {
-        self.cache_v.clone()
-    }
 }
 
 #[cfg(test)]
@@ -993,7 +992,7 @@ mod tests {
         .unwrap();
         let mut input = Tensor::<f32>::random(&vec![seq_len, emb_size].into());
         let output = qkv
-            .evaluate::<GoldilocksExt2>(&[&input], vec![])
+            .evaluate::<GoldilocksExt2>(&[&input], &[])
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
@@ -1009,7 +1008,7 @@ mod tests {
         let new_token_emb = Tensor::<f32>::random(&vec![1, emb_size].into());
         input.concat(new_token_emb.clone());
         let output = qkv
-            .evaluate::<GoldilocksExt2>(&[&input], vec![])
+            .evaluate::<GoldilocksExt2>(&[&input], &[])
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
@@ -1100,7 +1099,7 @@ mod tests {
         let output = evaluate_layer::<GoldilocksExt2, _, _>(
             &layer,
             &[&input],
-            Some(vec![unpadded_input_shape.clone()]),
+            Some(std::slice::from_ref(&unpadded_input_shape)),
         )
         .unwrap();
 
@@ -1116,7 +1115,7 @@ mod tests {
         let padded_output = evaluate_layer::<GoldilocksExt2, _, _>(
             &padded_layer,
             &[&input],
-            Some(vec![unpadded_input_shape]),
+            Some(&[unpadded_input_shape]),
         )
         .unwrap();
 
@@ -1231,6 +1230,6 @@ mod tests {
 
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut TenStore::default()).unwrap();
     }
 }

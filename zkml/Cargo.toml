@@ -21,9 +21,9 @@ blake = ["mpcs/blake"]
 default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
 capture-layers-quant = ["dep:sha2"]
-mem-track = ["utils/mem-track"]
-gpu = ["burn/wgpu", "dep:cubecl", "dep:burn-cubecl"]
 cpu = ["burn/ndarray"]
+gpu = ["burn/wgpu", "dep:cubecl", "dep:burn-cubecl"]
+mem-track = ["utils/mem-track"]
 
 [dependencies]
 anyhow.workspace = true
@@ -52,14 +52,15 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = { version = "0.10.9", optional = true }
 statrs = { workspace = true }
-sumcheck = { workspace = true }
+sumcheck.workspace = true
+tenstore = { path = "../tenstore" }
 timed = { workspace = true }
 timed-core = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = [
-    "env-filter",
-    "fmt",
-    "json",
+  "env-filter",
+  "fmt",
+  "json",
 ] }
 tract-onnx = { workspace = true }
 transcript = { workspace = true }
@@ -69,14 +70,14 @@ utils = { path = "../utils" }
 [dev-dependencies]
 criterion = { "version" = "0.6", features = ["html_reports"] }
 ndarray = "0.16.1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-wreq = "5"
-wreq-util = "2"
+proptest = "1.7.0"
 rstest = "0.25.0"
 sha2 = "0.10.9"
 tempfile.workspace = true
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+wreq = "5"
+wreq-util = "2"
 zstd = "0.13.3"
-proptest = "1.7.0"
 
 [[bench]]
 harness = false

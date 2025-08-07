@@ -9,6 +9,7 @@ use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
+use tenstore::TenStore;
 use transcript::Transcript;
 
 use crate::{
@@ -68,7 +69,7 @@ pub struct Learned<N> {
 
 impl<N> Learned<N> {
     fn num_vars(&self) -> usize {
-        let num_vars = self.positional.num_vars_2d();
+        let num_vars = self.positional.shape().num_vars_2d();
         num_vars.0 + num_vars.1
     }
 
@@ -156,7 +157,7 @@ where
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
             inputs.iter().all(|x| x.rank() == 2),
@@ -169,7 +170,7 @@ where
                 .map(|x| {
                     let sub_pos = pos.positional.slice_2d(0, x.shape()[0]);
                     pos.add_layer
-                        .evaluate::<E>(&[x, &sub_pos], vec![pos.unpadded_shape.clone(); 2])?
+                        .evaluate::<E>(&[x, &sub_pos], &vec![pos.unpadded_shape.clone(); 2])?
                         .outputs
                         .pop()
                         .context("Expected at least 1 output from add in positional encoding layer")
@@ -329,11 +330,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
-            last_claims.len() == step_data.inputs.len(),
+            last_claims.len() == step_data.node_inputs.len(),
             "Found different number of inputs and outputs when proving positional layer: {} inputs, {} outputs",
-            step_data.inputs.len(),
+            step_data.node_inputs.len(),
             last_claims.len(),
         );
         let Self::Learned(pos) = self else {
@@ -344,10 +346,11 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
         let mut common_claims = HashMap::new();
         let proofs = last_claims
             .into_iter()
-            .zip(&step_data.inputs)
+            .zip(&step_data.node_inputs)
             .map(|(output_claim, input)| {
                 // derive sub-matrix to be added to input. ToDo: place it in proving data
                 let matrix_slice = TensorSlice::from(&pos.positional);
+                let input = input.hydrate(store.clone())?;
                 let sub_pos = matrix_slice
                     .slice_over_first_dim(0, input.shape()[0])
                     .to_fields();
@@ -355,7 +358,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
                 let (mut claims, add_proof) = pos.add_layer.prove_step(
                     node_id,
                     vec![output_claim],
-                    &[input, &sub_pos],
+                    &[&input, &sub_pos],
                     prover,
                 )?;
 
@@ -632,6 +635,8 @@ mod tests {
         #[case] embedding_size: usize,
         #[case] context_length: usize,
     ) {
+        use tenstore::TenStore;
+
         let input_shape = vec![seq_len, embedding_size];
 
         let mut model =
@@ -650,6 +655,6 @@ mod tests {
 
         model.route_output(None).unwrap();
 
-        let _ = prove_model(model).unwrap();
+        let _ = prove_model(model, &mut TenStore::default()).unwrap();
     }
 }

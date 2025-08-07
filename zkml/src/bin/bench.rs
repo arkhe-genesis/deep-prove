@@ -1,4 +1,5 @@
 use std::{fs::File, io::BufReader, sync::Arc};
+use tenstore::TenStore;
 use timed_core::Output;
 #[cfg(feature = "blake")]
 use transcript::blake::BlakeTranscript;
@@ -218,7 +219,7 @@ fn run_float_model(raw_inputs: &InputJSON, model: &Model<f32>) -> Result<f32> {
     {
         // Run the model in float mode
         let input = model.load_input_flat(vec![input.clone()])?;
-        let output = &model.run_float(&input)?[0];
+        let output = &model.run_float(&input, &mut TenStore::default())?[0];
         let accuracy = argmax_compare(expected, output.get_data());
         accuracies.push(accuracy);
         debug!(
@@ -330,7 +331,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         let metrics = Metrics::new();
         let input_tensor = model.load_input_flat(vec![input])?;
 
-        let trace_result = model.run(&input_tensor);
+        let trace_result = model.run(&input_tensor, &mut TenStore::default());
 
         let span = metrics.to_span();
         stream_metrics(format!("Inference {i}"), &span);
@@ -369,7 +370,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         //    }
         //}
 
-        let output = trace.outputs()?[0];
+        let output = trace.output_at(0)?;
         let accuracy = argmax_compare(&given_output, output.get_data());
         accuracies.push(accuracy);
 
@@ -392,7 +393,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         info!("== Proving ==");
         let metrics = Metrics::new();
 
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io()?;
         let mut prover_transcript = new_transcript();
         let prover = Prover::<_, _, _>::new(ctx.as_ref().as_ref().unwrap(), &mut prover_transcript);
         let proof = prover.prove(&trace).expect("unable to generate proof");

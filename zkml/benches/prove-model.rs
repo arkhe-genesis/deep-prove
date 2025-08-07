@@ -1,6 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams, Hasher};
+use tenstore::TenStore;
 use zkml::{
     Context, Element, FloatOnnxLoader, Prover, default_transcript,
     inputs::Input,
@@ -53,12 +54,12 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
             .expect("failed to call load_input_flat on the model");
 
         let trace = model
-            .run(&input_tensor)
+            .run(&input_tensor, &mut TenStore::default())
             .unwrap_or_else(|_| panic!("input #{i} failed"));
 
         let mut prover_transcript = new_transcript();
         let prover = Prover::<_, _, _>::new(ctx.as_ref().unwrap(), &mut prover_transcript);
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io().unwrap();
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = new_transcript();

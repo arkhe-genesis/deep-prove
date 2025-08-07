@@ -37,6 +37,7 @@ use p3_field::FieldAlgebra;
 use p3_goldilocks::Goldilocks;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tenstore::TenStore;
 use transcript::Transcript;
 
 use crate::{Tensor, layers::provable::LayerOut};
@@ -230,7 +231,7 @@ impl<N: Number> Mha<N> {
     pub(crate) fn evaluate_with_intermediate_outputs<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<(
         LayerOut<N, E>,
         LayerOut<N, E>,
@@ -242,9 +243,9 @@ impl<N: Number> Mha<N> {
     {
         let unpadded_input_shapes = if unpadded_input_shapes.is_empty() {
             // take input shapes from inputs
-            inputs.iter().map(|input| input.shape()).collect()
+            inputs.iter().map(|input| input.shape()).collect::<Vec<_>>()
         } else {
-            unpadded_input_shapes
+            unpadded_input_shapes.to_vec()
         };
 
         ensure!(
@@ -259,16 +260,15 @@ impl<N: Number> Mha<N> {
 
         let reshaped_inputs = self
             .inputs_reshape
-            .evaluate::<E>(inputs, unpadded_input_shapes)?;
+            .evaluate::<E>(inputs, &unpadded_input_shapes)?;
 
         let qk_out_shapes = self
             .qk
             .output_shapes(&reshaped_input_shapes, PaddingMode::NoPadding);
 
-        let qk_out = self.qk.evaluate::<E>(
-            &reshaped_inputs.outputs()[..2],
-            reshaped_input_shapes[..2].to_vec(),
-        )?;
+        let qk_out = self
+            .qk
+            .evaluate::<E>(&reshaped_inputs.outputs()[..2], &reshaped_input_shapes[..2])?;
 
         // apply softmax
         let soft_out_shapes = self
@@ -277,7 +277,7 @@ impl<N: Number> Mha<N> {
 
         let soft_out = self
             .softmax
-            .evaluate::<E>(&qk_out.outputs(), qk_out_shapes)?;
+            .evaluate::<E>(&qk_out.outputs(), &qk_out_shapes)?;
 
         ensure!(
             soft_out.outputs().len() == 1,
@@ -293,12 +293,12 @@ impl<N: Number> Mha<N> {
 
         let final_mul_out = self.final_mul.evaluate::<E>(
             &[soft_out.outputs()[0], reshaped_inputs.outputs()[2]],
-            final_mul_input_shapes,
+            &final_mul_input_shapes,
         )?;
 
         let out = self
             .final_reshape
-            .evaluate(&final_mul_out.outputs(), out_shapes)?;
+            .evaluate(&final_mul_out.outputs(), &out_shapes)?;
 
         Ok((out, final_mul_out, soft_out, qk_out))
     }
@@ -334,7 +334,7 @@ impl Evaluate<f32> for Mha<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let (out, _, _, _) =
             self.evaluate_with_intermediate_outputs(inputs, unpadded_input_shapes)?;
@@ -347,7 +347,7 @@ impl Evaluate<Element> for Mha<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         let (out, final_mul_out, soft_out, qk_out) =
             self.evaluate_with_intermediate_outputs(inputs, unpadded_input_shapes)?;
@@ -644,31 +644,37 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
-        let inputs = &step_data.inputs;
+        let input_tensors = step_data.input_tensors(store)?;
+        let output_tensors = step_data.output_tensors(store)?;
 
         ensure!(
-            inputs.len() == 3,
+            input_tensors.len() == 3,
             "Expected 3 inputs when proving MHA layer, found {}",
-            inputs.len()
+            input_tensors.len()
         );
 
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            output_tensors.len() == 1,
             "Expected 1 one output when proving MHA layer, found {}",
-            step_data.outputs.outputs().len()
+            output_tensors.len()
         );
 
         // apply reshaping to input and output tensors before employing them in proving logic
         let reshaped_inputs = self.inputs_reshape.evaluate_layer::<E, E>(
-            &inputs.iter().collect_vec(),
-            inputs.iter().map(|input| input.shape()).collect(),
+            &input_tensors.iter().collect_vec(),
+            input_tensors
+                .iter()
+                .map(|input| input.shape())
+                .collect::<Vec<_>>()
+                .as_slice(),
         )?;
 
         let reshaped_inputs = reshaped_inputs.outputs();
 
         let mha_data = step_data
-            .outputs
+            .node_outputs
             .try_mha_data()
             .ok_or(anyhow!("MhaData not found when proving Mha layer"))?;
 
@@ -734,9 +740,10 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         id: NodeId,
         ctx: &'a crate::Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
+        _store: &mut TenStore,
     ) -> anyhow::Result<LookupWitnessGen<'a, E, PCS>> {
         let mha_data = step_data
-            .outputs
+            .node_outputs
             .try_mha_data()
             .ok_or(anyhow!("MhaData not found when proving Mha layer"))?;
         self.softmax
@@ -982,9 +989,7 @@ mod test {
                 .qk;
             let q = Tensor::<Element>::random(&vec![q_len, num_heads, head_dim].into());
             let k = Tensor::<Element>::random(&vec![seq_len, num_heads, head_dim].into());
-            let mut output = mha_qk
-                .evaluate::<GoldilocksExt2>(&[&q, &k], vec![])
-                .unwrap();
+            let mut output = mha_qk.evaluate::<GoldilocksExt2>(&[&q, &k], &[]).unwrap();
             assert_eq!(output.outputs.len(), 1);
             let qk = output.outputs.remove(0);
             // normally [1,seq_len] per head, so with all heads [num_heads, 1, seq_len]
@@ -1021,7 +1026,7 @@ mod test {
                 .unwrap()
                 .final_mul;
             let mut output = mha_mul
-                .evaluate::<GoldilocksExt2>(&[&qk, &v], vec![qk.shape(), v.shape()])
+                .evaluate::<GoldilocksExt2>(&[&qk, &v], &[qk.shape(), v.shape()])
                 .expect("mha_final_mul should not fail");
             assert_eq!(output.outputs.len(), 1);
             let out = output.outputs.remove(0);
@@ -1272,7 +1277,7 @@ mod test {
         _ = model.add_consecutive_layer(Layer::Mha(mha), None).unwrap();
         model.route_output(None).unwrap();
 
-        _ = prove_model(model).unwrap();
+        _ = prove_model(model, &mut TenStore::default()).unwrap();
     }
 
     #[test]
@@ -1325,10 +1330,10 @@ mod test {
         let input = vec![Tensor::random(&input_shape)];
 
         let (quantized_model, quantized_input) =
-            quantize_model(model.clone(), input, None).unwrap();
+            quantize_model(model.clone(), input, None, &mut TenStore::default()).unwrap();
 
         let trace = quantized_model
-            .run::<GoldilocksExt2>(&quantized_input)
+            .run::<GoldilocksExt2>(&quantized_input, &mut TenStore::default())
             .unwrap();
         let outputs = trace.outputs().unwrap();
 
@@ -1336,7 +1341,12 @@ mod test {
 
         let expected_output = outputs[0].clone();
 
-        let outputs = prove_quantized_model(quantized_model.clone(), quantized_input).unwrap();
+        let outputs = prove_quantized_model(
+            quantized_model.clone(),
+            quantized_input,
+            &mut TenStore::default(),
+        )
+        .unwrap();
 
         assert_eq!(outputs.len(), 1);
 
@@ -1462,10 +1472,10 @@ mod test {
         );
         let embedded = llm_model
             .embeddings
-            .evaluate::<GoldilocksExt2>(&[&input], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[&input], &[])?;
         let positioned = llm_model
             .positional
-            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], &[])?;
 
         let input_shape = positioned.outputs()[0].shape();
 
@@ -1496,10 +1506,15 @@ mod test {
         model.route_output(None).unwrap();
 
         let inputs = vec![positioned.outputs()[0].clone()];
-        let (quantized_model, inputs) =
-            quantize_model(model, inputs.clone(), Some(inputs)).unwrap();
+        let (quantized_model, inputs) = quantize_model(
+            model,
+            inputs.clone(),
+            Some(inputs),
+            &mut TenStore::default(),
+        )
+        .unwrap();
 
-        prove_quantized_model(quantized_model, inputs)?;
+        prove_quantized_model(quantized_model, inputs, &mut TenStore::default())?;
 
         Ok(())
     }
@@ -1535,7 +1550,8 @@ mod test {
 
         let inputs = vec![Tensor::random(&input_shape)];
 
-        let (quantized_model, inputs) = quantize_model(model, inputs, None).unwrap();
+        let (quantized_model, inputs) =
+            quantize_model(model, inputs, None, &mut TenStore::default()).unwrap();
         quantized_model
             .to_forward_iterator()
             .for_each(|(node_id, node)| {
@@ -1543,13 +1559,10 @@ mod test {
             });
         // run to get unpadded output
         let mut outputs = quantized_model
-            .run::<GoldilocksExt2>(&inputs)
+            .run::<GoldilocksExt2>(&inputs, &mut TenStore::default())
             .unwrap()
             .outputs()
-            .unwrap()
-            .into_iter()
-            .cloned()
-            .collect_vec();
+            .unwrap();
 
         assert_eq!(outputs.len(), 1);
 
@@ -1563,13 +1576,10 @@ mod test {
 
         // compute padded evaluation, with garbage removal in matmul
         let mut outputs = padded_model
-            .run::<GoldilocksExt2>(&padded_inputs)
+            .run::<GoldilocksExt2>(&padded_inputs, &mut TenStore::default())
             .unwrap()
             .outputs()
-            .unwrap()
-            .into_iter()
-            .cloned()
-            .collect_vec();
+            .unwrap();
 
         assert_eq!(outputs.len(), 1);
 

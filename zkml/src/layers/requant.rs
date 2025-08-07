@@ -40,6 +40,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use transcript::Transcript;
 
 use super::{
@@ -129,7 +130,7 @@ impl Evaluate<Element> for Requant {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         let result = inputs
             .iter()
@@ -234,6 +235,7 @@ where
         last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        _store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
         Ok(vec![self.prove_step(prover, last_claims[0], ctx, id)?])
     }
@@ -243,13 +245,16 @@ where
         id: NodeId,
         ctx: &'a Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
+        store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+        let inputs = step_data.input_tensors(store)?;
+        let outputs = step_data.output_tensors(store)?;
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "Found more than 1 input in inference step of requant layer"
         );
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            outputs.len() == 1,
             "Found more than 1 output in inference step of requant layer"
         );
 
@@ -258,7 +263,7 @@ where
         let shift = self.shift();
         let rounding_constant: Element = 1 << (shift - 1);
         let mask: Element = (1 << shift) - 1;
-        let (clamping, shifted): (Vec<Element>, Vec<Element>) = step_data.inputs[0]
+        let (clamping, shifted): (Vec<Element>, Vec<Element>) = inputs[0]
             .get_data()
             .iter()
             .map(|&val| {

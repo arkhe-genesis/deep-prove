@@ -13,6 +13,7 @@ use ff_ext::GoldilocksExt2;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use statrs::statistics::{Data, Max, Min};
+use tenstore::TenStore;
 use tracing::{debug, info, warn};
 
 use super::ScalingFactor;
@@ -23,7 +24,11 @@ use super::ScalingFactor;
 pub trait ScalingStrategy: std::fmt::Debug {
     type AuxData: Sized;
 
-    fn quantize(&self, model: Model<f32>) -> Result<(Model<Element>, ModelMetadata)>;
+    fn quantize(
+        &self,
+        model: Model<f32>,
+        store: &mut TenStore,
+    ) -> Result<(Model<Element>, ModelMetadata)>;
 
     /// Returns the scaling factors for the outputs of the node with the given ID. The number of
     /// outputs is given by the `num_outputs` parameter. The scaling factors are computed based on
@@ -76,7 +81,11 @@ impl ScalingStrategy for InferenceObserver {
         format!("inference [{},{}]", *quantization::MIN, *quantization::MAX)
     }
 
-    fn quantize(&self, model: Model<f32>) -> Result<(Model<Element>, ModelMetadata)> {
+    fn quantize(
+        &self,
+        model: Model<f32>,
+        store: &mut TenStore,
+    ) -> Result<(Model<Element>, ModelMetadata)> {
         let mut tracker = InferenceTracker::new();
         let input_shapes = model.input_shapes();
         let input_not_padded_shapes = model.unpadded_input_shapes();
@@ -115,7 +124,7 @@ impl ScalingStrategy for InferenceObserver {
                     input_tensor
                 })
                 .collect_vec();
-            model.run_with_tracker::<GoldilocksExt2>(&input_tensors, Some(&mut tracker))?;
+            model.run_with_tracker::<GoldilocksExt2>(&input_tensors, Some(&mut tracker), store)?;
             nsamples += 1;
         }
         info!("InferenceObserver: {} samples observed", nsamples);
@@ -210,7 +219,11 @@ impl ScalingStrategy for AbsoluteMax {
         "absolute_max".to_string()
     }
 
-    fn quantize(&self, model: Model<f32>) -> Result<(Model<Element>, ModelMetadata)> {
+    fn quantize(
+        &self,
+        model: Model<f32>,
+        _store: &mut TenStore,
+    ) -> Result<(Model<Element>, ModelMetadata)> {
         let input_scaling_factor = if let Some(ref input) = self.0 {
             let input_tensor = model.load_input_flat(input.clone())?;
             model

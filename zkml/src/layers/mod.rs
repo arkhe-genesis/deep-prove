@@ -15,19 +15,23 @@ pub mod requant;
 pub mod reshape;
 pub mod transformer;
 
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use ff_ext::ExtensionField;
 use flatten::Flatten;
 use mpcs::PolynomialCommitmentScheme;
 use pooling::{PoolingCtx, PoolingProof};
 use provable::{
-    Evaluate, LayerOut, Node, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp,
-    QuantizeOutput,
+    Evaluate, LayerOut, Node, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData,
+    QuantizeOp, QuantizeOutput,
 };
 use requant::RequantCtx;
+use tenstore::{TenStore, TensorKey, TensorStore, TenstoreError};
 use transcript::Transcript;
+use transformer::{
+    layernorm::LayerNormData, logits::ArgmaxData, mha::MhaData, softmax::SoftmaxData,
+};
 
 use crate::{
     Context, Element, ScalingStrategy,
@@ -54,8 +58,8 @@ use crate::{
     lookup::context::LookupWitnessGen,
     model::StepData,
     padding::{PaddingMode, ShapeInfo},
-    quantization::ScalingFactor,
-    tensor::{Number, Shape, Tensor},
+    quantization::{Fieldizer, InferenceTracker, ModelMetadata, ScalingFactor},
+    tensor::{ConvData, DryTensor, Number, Shape, Tensor},
 };
 use activation::ActivationCtx;
 use convolution::{ConvCtx, ConvProof, SchoolBookConv, SchoolBookConvCtx};
@@ -89,6 +93,32 @@ pub enum Layer<T> {
     Embeddings(Embeddings<T>),
     Positional(Positional<T>),
     Logits(Logits),
+}
+impl<T> Layer<T> {
+    pub fn short_name(&self) -> &str {
+        let r = match self {
+            Layer::Dense(_) => "DENS",
+            Layer::MatMul(_) => "MMUL",
+            Layer::Convolution(_) => "CONV",
+            Layer::SchoolBookConvolution(_) => "SBCN",
+            Layer::Activation(_) => "ACTI",
+            Layer::Requant(_) => "REQU",
+            Layer::Pooling(_) => "POOL",
+            Layer::Flatten(_) => "FLTT",
+            Layer::QKV(_) => "_QKV",
+            Layer::Mha(_) => "MHDA",
+            Layer::ConcatMatMul(_) => "CMML",
+            Layer::LayerNorm(_) => "LNRM",
+            Layer::Softmax(_) => "SFTM",
+            Layer::Add(_) => "_ADD",
+            Layer::Reshape(_) => "RSHP",
+            Layer::Embeddings(_) => "EMBD",
+            Layer::Positional(_) => "POSI",
+            Layer::Logits(_) => "LGIT",
+        };
+        assert_eq!(r.len(), 4, "layer short name must be 4 chars long: {r}");
+        r
+    }
 }
 
 /// Describes a steps wrt the polynomial to be proven/looked at. Verifier needs to know
@@ -218,6 +248,7 @@ where
             self.output_shapes(&last_step.padded_output_shape, PaddingMode::Padding);
         ShapeStep::next_step(last_step, unpadded_output, padded_output)
     }
+
     pub fn shape_step(&self, unpadded_input: &[Shape], padded_input: &[Shape]) -> ShapeStep {
         let unpadded_output = self.output_shapes(unpadded_input, PaddingMode::NoPadding);
         let padded_output = self.output_shapes(padded_input, PaddingMode::Padding);
@@ -230,9 +261,91 @@ where
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct NodeOut<T, E: ExtensionField> {
+    _t: PhantomData<T>,
+    pub(crate) outputs: Vec<DryTensor<T>>,
+    pub(crate) proving_data: ProvingData<E>,
+}
+impl<T, E: ExtensionField> NodeOut<T, E> {
+    pub(crate) fn into_fields<U>(self, store: TenStore) -> Result<NodeOut<U, E>, TenstoreError>
+    where
+        T: Serialize + for<'a> Deserialize<'a>,
+        U: Serialize + for<'a> Deserialize<'a>,
+        T: Fieldizer<U>,
+    {
+        Ok(NodeOut::<U, E> {
+            _t: PhantomData::<U>,
+            outputs: self
+                .outputs
+                .into_iter()
+                .map(|dry| dry.dry_cast(store.clone(), |x| x.to_field()))
+                .collect::<Result<Vec<DryTensor<U>>, TenstoreError>>()?,
+            proving_data: self.proving_data,
+        })
+    }
+
+    pub fn try_convdata(&self) -> Option<&ConvData<E>> {
+        match self.proving_data {
+            ProvingData::Convolution(ref conv_data) => Some(conv_data),
+            _ => None,
+        }
+    }
+
+    pub fn try_softmax_data(&self) -> Option<&SoftmaxData<E>> {
+        match self.proving_data {
+            ProvingData::Softmax(ref softmax_data) => Some(softmax_data),
+            _ => None,
+        }
+    }
+
+    pub fn try_mha_data(&self) -> Option<&MhaData<E>> {
+        match self.proving_data {
+            ProvingData::Mha(ref mha_data) => Some(mha_data),
+            _ => None,
+        }
+    }
+
+    pub fn try_argmax_data(&self) -> Option<&ArgmaxData<E>> {
+        match self.proving_data {
+            ProvingData::ArgMax(ref argmax_data) => Some(argmax_data),
+            _ => None,
+        }
+    }
+
+    pub fn try_layernorm_data(&self) -> Option<&LayerNormData> {
+        match self.proving_data {
+            ProvingData::LayerNorm(ref layernorm_data) => Some(layernorm_data),
+            _ => None,
+        }
+    }
+}
+
+impl<E: ExtensionField> NodeOut<Element, E> {
+    pub(crate) fn to_dequantize(
+        &self,
+        md: &ModelMetadata,
+        store: TenStore,
+        node_id: NodeId,
+    ) -> Result<NodeOut<f32, E>, TenstoreError> {
+        Ok(NodeOut {
+            _t: PhantomData,
+            outputs: self
+                .outputs
+                .iter()
+                .zip(md.layer_output_scaling_factor(node_id))
+                .map(|(dry, scale_factor)| {
+                    dry.dry_cast(store.clone(), |x| scale_factor.dequantize(x))
+                })
+                .collect::<Result<Vec<_>, TenstoreError>>()?,
+            proving_data: self.proving_data.clone(),
+        })
+    }
+}
+
 impl<N> Node<N>
 where
-    N: Number,
+    N: Number + Serialize + for<'a> Deserialize<'a>,
 {
     pub fn describe(&self) -> String {
         self.operation.describe()
@@ -244,14 +357,64 @@ where
 
     pub(crate) fn run<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
-        unpadded_input_shapes: Vec<Shape>,
-    ) -> Result<LayerOut<N, E>>
+        my_id: NodeId,
+        inputs: &[TensorKey<N>],
+        unpadded_input_shapes: &[Shape],
+        padded_input_shapes: &HashMap<TensorKey<N>, Shape>,
+        tracker: &mut Option<&mut InferenceTracker>,
+        store: &mut TenStore,
+    ) -> Result<NodeOut<N, E>>
     where
         N: Number,
         Layer<N>: Evaluate<N>,
     {
-        self.operation.evaluate(inputs, unpadded_input_shapes)
+        let input_tensors = inputs
+            .iter()
+            .map(|key| {
+                let data = store
+                    .fetch(key)
+                    .with_context(|| format!("fetching tensor data for tensor {key}"))
+                    .unwrap();
+                Ok(Tensor::new(padded_input_shapes[key].clone(), data))
+            })
+            .collect::<anyhow::Result<Vec<Tensor<N>>>>()?;
+        let input_tensors_ref = input_tensors.iter().collect::<Vec<_>>();
+        let unpadded_output_shapes = self
+            .operation
+            .output_shapes(unpadded_input_shapes, PaddingMode::NoPadding);
+        let layer_out = self
+            .operation
+            .evaluate(&input_tensors_ref, unpadded_input_shapes)?;
+        assert!(unpadded_output_shapes.len() == layer_out.outputs.len());
+
+        let outputs = layer_out
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(i, tensor)| {
+                let key = provable::Edge::tkey_for_output::<N>(Some(my_id), i);
+                store
+                    .store(&key, tensor.data())
+                    .with_context(|| format!("storing outputs for tensor {key}"))
+                    .unwrap();
+                Ok(DryTensor::new(key, tensor.shape().clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // add output tensors to tracker, if any
+        if let Some(tracker) = tracker.as_mut() {
+            for (i, out) in layer_out.outputs.iter().enumerate() {
+                tracker.track(my_id, i, out.to_f32()?);
+            }
+        }
+
+        let node_out = NodeOut {
+            _t: PhantomData,
+            outputs,
+            proving_data: layer_out.proving_data,
+        };
+
+        Ok(node_out)
     }
 
     pub(crate) fn step_info<E>(
@@ -382,7 +545,7 @@ impl Evaluate<f32> for Layer<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         match self {
             Layer::Dense(dense) => dense.evaluate(inputs, unpadded_input_shapes),
@@ -415,7 +578,7 @@ impl Evaluate<Element> for Layer<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         let output = match self {
             Layer::Dense(dense) => dense.evaluate(inputs, unpadded_input_shapes),
@@ -529,58 +692,59 @@ where
         last_claims: Vec<&crate::Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {
             (Layer::Dense(dense), LayerCtx::Dense(info)) => {
-                dense.prove(node_id, info, last_claims, step_data, prover)
+                dense.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Convolution(convolution), LayerCtx::Convolution(info)) => {
-                convolution.prove(node_id, info, last_claims, step_data, prover)
+                convolution.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::MatMul(m), LayerCtx::MatMul(info)) => {
-                m.prove(node_id, info, last_claims, step_data, prover)
+                m.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::QKV(qkv), LayerCtx::QKV(info)) => {
-                qkv.prove(node_id, info, last_claims, step_data, prover)
+                qkv.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Mha(mha), LayerCtx::Mha(info)) => {
-                mha.prove(node_id, info, last_claims, step_data, prover)
+                mha.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::ConcatMatMul(concat_matmul), LayerCtx::ConcatMatMul(info)) => {
-                concat_matmul.prove(node_id, info, last_claims, step_data, prover)
+                concat_matmul.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Embeddings(embeddings), LayerCtx::Embeddings(ctx)) => {
-                embeddings.prove(node_id, ctx, last_claims, step_data, prover)
+                embeddings.prove(node_id, ctx, last_claims, step_data, prover, store)
             }
             (Layer::Positional(positional), LayerCtx::Positional(info)) => {
-                positional.prove(node_id, info, last_claims, step_data, prover)
+                positional.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Add(add), LayerCtx::Add(info)) => {
-                add.prove(node_id, info, last_claims, step_data, prover)
+                add.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Logits(logits), LayerCtx::Logits(info)) => {
-                logits.prove(node_id, info, last_claims, step_data, prover)
+                logits.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::SchoolBookConvolution(_), LayerCtx::SchoolBookConvolution(_)) => {
                 unreachable!("prove cannot be called for school book convolution")
             }
             (Layer::Activation(activation), LayerCtx::Activation(info)) => {
-                activation.prove(node_id, info, last_claims, step_data, prover)
+                activation.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Requant(requant), LayerCtx::Requant(info)) => {
-                requant.prove(node_id, info, last_claims, step_data, prover)
+                requant.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Pooling(pooling), LayerCtx::Pooling(info)) => {
-                pooling.prove(node_id, info, last_claims, step_data, prover)
+                pooling.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::Flatten(_), LayerCtx::Flatten) => {
                 unreachable!("prove cannot be called for reshape")
             }
             (Layer::Softmax(softmax), LayerCtx::Softmax(info)) => {
-                softmax.prove(node_id, info, last_claims, step_data, prover)
+                softmax.prove(node_id, info, last_claims, step_data, prover, store)
             }
             (Layer::LayerNorm(layernorm), LayerCtx::LayerNorm(info)) => {
-                layernorm.prove(node_id, info, last_claims, step_data, prover)
+                layernorm.prove(node_id, info, last_claims, step_data, prover, store)
             }
 
             _ => bail!(
@@ -597,30 +761,39 @@ where
         id: provable::NodeId,
         ctx: &'a Context<'a, E, PCS>,
         step_data: &'a StepData<Element, E>,
+        store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
         match self {
-            Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data),
-            Layer::Convolution(convolution) => convolution.gen_lookup_witness(id, ctx, step_data),
-            Layer::MatMul(m) => m.gen_lookup_witness(id, ctx, step_data),
-            Layer::QKV(qkv) => qkv.gen_lookup_witness(id, ctx, step_data),
-            Layer::Mha(mha) => mha.gen_lookup_witness(id, ctx, step_data),
-            Layer::ConcatMatMul(concat_matmul) => {
-                concat_matmul.gen_lookup_witness(id, ctx, step_data)
+            Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Convolution(convolution) => {
+                convolution.gen_lookup_witness(id, ctx, step_data, store)
             }
-            Layer::Add(add) => add.gen_lookup_witness(id, ctx, step_data),
-            Layer::Softmax(softmax) => softmax.gen_lookup_witness(id, ctx, step_data),
-            Layer::Logits(logits) => logits.gen_lookup_witness(id, ctx, step_data),
-            Layer::LayerNorm(layernorm) => layernorm.gen_lookup_witness(id, ctx, step_data),
-            Layer::Positional(positional) => positional.gen_lookup_witness(id, ctx, step_data),
-            Layer::Embeddings(embeddings) => embeddings.gen_lookup_witness(id, ctx, step_data),
+            Layer::MatMul(m) => m.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::QKV(qkv) => qkv.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Mha(mha) => mha.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::ConcatMatMul(concat_matmul) => {
+                concat_matmul.gen_lookup_witness(id, ctx, step_data, store)
+            }
+            Layer::Add(add) => add.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Softmax(softmax) => softmax.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Logits(logits) => logits.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::LayerNorm(layernorm) => layernorm.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Positional(positional) => {
+                positional.gen_lookup_witness(id, ctx, step_data, store)
+            }
+            Layer::Embeddings(embeddings) => {
+                embeddings.gen_lookup_witness(id, ctx, step_data, store)
+            }
             Layer::SchoolBookConvolution(school_book_conv) => {
                 // check that the layer is not provable, so we don't need to call the method
                 assert!(!school_book_conv.is_provable());
                 Ok(Default::default())
             }
-            Layer::Activation(activation) => activation.gen_lookup_witness(id, ctx, step_data),
-            Layer::Requant(requant) => requant.gen_lookup_witness(id, ctx, step_data),
-            Layer::Pooling(pooling) => pooling.gen_lookup_witness(id, ctx, step_data),
+            Layer::Activation(activation) => {
+                activation.gen_lookup_witness(id, ctx, step_data, store)
+            }
+            Layer::Requant(requant) => requant.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Pooling(pooling) => pooling.gen_lookup_witness(id, ctx, step_data, store),
             Layer::Reshape(r) => {
                 assert!(!r.is_provable());
                 Ok(Default::default())

@@ -41,6 +41,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use transcript::Transcript;
 
 use crate::{
@@ -93,7 +94,7 @@ impl Logits {
     fn evaluate_with_argmax_data<N: Number, E: ff_ext::ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<(LayerOut<N, E>, ArgmaxData<N>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
@@ -163,7 +164,7 @@ impl Evaluate<f32> for Logits {
     fn evaluate<E: ff_ext::ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let (output, _) = self.evaluate_with_argmax_data(inputs, unpadded_input_shapes)?;
 
@@ -175,7 +176,7 @@ impl Evaluate<Element> for Logits {
     fn evaluate<E: ff_ext::ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         let (output, argmax_data) =
             self.evaluate_with_argmax_data(inputs, unpadded_input_shapes)?;
@@ -313,28 +314,30 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         _last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "Expected 1 input tensor for Logits layer, found {}",
-            step_data.inputs.len()
+            step_data.node_inputs.len()
         );
-        let input = &step_data.inputs[0];
+        let input = step_data.input_tensor_at(0, store)?;
+        let outputs = step_data.output_tensors(store)?;
 
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            outputs.len() == 1,
             "Expected 1 output tensor for Logits layer, found {}",
-            step_data.outputs.outputs().len()
+            outputs.len()
         );
 
-        let output = step_data.outputs.outputs()[0]
+        let output = outputs[0]
             .get_data()
             .iter()
             .map(|out| out.to_element() as usize)
             .collect_vec();
 
         let argmax_data = step_data
-            .outputs
+            .node_outputs
             .try_argmax_data()
             .ok_or(anyhow!("Argmax data not found when proving Logits layer"))?;
 
@@ -480,21 +483,23 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         id: NodeId,
         ctx: &Context<'a, E, PCS>,
         step_data: &'a StepData<Element, E>,
+        store: &mut TenStore,
     ) -> anyhow::Result<LookupWitnessGen<'a, E, PCS>> {
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "Expected 1 input tensor for Logits witness generation, found {}",
-            step_data.inputs.len()
+            step_data.node_inputs.len()
         );
 
-        let input = &step_data.inputs[0];
+        let inputs = step_data.input_tensors(store)?;
+        let input = &inputs[0];
 
         ensure!(
             matches!(self, Logits::Argmax),
             "Only Argmax is currently supported in Logits layer"
         );
 
-        let argmax_data = step_data.outputs.try_argmax_data().ok_or(anyhow!(
+        let argmax_data = step_data.node_outputs.try_argmax_data().ok_or(anyhow!(
             "Argmax data not found when generating witness for Logits layer"
         ))?;
 
@@ -540,8 +545,8 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
             let max_mle = max_values.to_mle_2d();
             (ctx.commitment_ctx.commit(&max_mle)?, max_mle)
         };
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.logup_witnesses.insert(
+        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
+        gen_w.logup_witnesses.insert(
             id,
             vec![LogUpWitness::new_lookup(
                 vec![commits],
@@ -550,9 +555,9 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
                 TableType::Range,
             )],
         );
-        gen.element_count.insert(TableType::Range, element_count);
+        gen_w.element_count.insert(TableType::Range, element_count);
 
-        Ok(gen)
+        Ok(gen_w)
     }
 }
 
@@ -754,7 +759,7 @@ mod test {
     fn test_logits_argmax() -> anyhow::Result<()> {
         let input = Tensor::new(vec![3, 2].into(), vec![0.0, 1.0, 3.0, 2.0, 4.0, 5.0]);
         let logits = Logits::Argmax;
-        let out = logits.evaluate::<GoldilocksExt2>(&[&input], vec![])?;
+        let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[])?;
         // first slice is [0,1] so argmax here is 1
         // second slice is [3,2] so argmax here is 0
         // the last dimension is [4,5] so argmax here is 1
@@ -775,6 +780,6 @@ mod test {
 
         model.route_output(None).unwrap();
 
-        prove_model(model).unwrap();
+        prove_model(model, &mut TenStore::default()).unwrap();
     }
 }

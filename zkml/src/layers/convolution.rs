@@ -22,6 +22,7 @@ use anyhow::{Context, Result, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
+use tenstore::TenStore;
 // use itertools::assert_equal;
 use crate::{
     Element,
@@ -160,7 +161,7 @@ impl<T: Number> Convolution<T> {
     }
 
     pub fn add_bias(&self, conv_out: &Tensor<T>) -> Tensor<T> {
-        let mut arr = Tensor::allocate(conv_out.shape().clone());
+        let mut arr = Tensor::zero(conv_out.shape().clone());
         assert_eq!(conv_out.data_size(), conv_out.kw() * conv_out.filter_size());
         for i in 0..conv_out.kw() {
             for j in 0..conv_out.filter_size() {
@@ -249,7 +250,7 @@ impl Evaluate<f32> for Convolution<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
@@ -296,7 +297,7 @@ impl Evaluate<Element> for Convolution<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         ensure!(
             inputs.len() == 1,
@@ -638,13 +639,16 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
+        let output_tensor = step_data.output_tensor_at(0, store)?;
+
         Ok(vec![self.prove_convolution_step(
             prover,
             last_claims[0],
-            step_data.outputs.outputs()[0],
+            &output_tensor,
             &step_data.unpadded_output_shapes[0],
-            step_data.outputs.try_convdata().unwrap(),
+            step_data.node_outputs.try_convdata().unwrap(),
             ctx,
             id,
         )?])
@@ -1424,7 +1428,7 @@ impl<T: Number> Evaluate<T> for SchoolBookConv<T> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<T>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<T, E>> {
         ensure!(
             inputs.len() == 1,

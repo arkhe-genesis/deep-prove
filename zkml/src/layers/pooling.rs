@@ -35,6 +35,7 @@ use sumcheck::{
     structs::{IOPProof, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use transcript::Transcript;
 
 use rayon::prelude::*;
@@ -113,7 +114,7 @@ impl<N: Number> Evaluate<N> for Pooling {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<N, E>> {
         ensure!(
             inputs.len() == 1,
@@ -201,12 +202,16 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
+        let input_tensors = step_data.input_tensors(store)?;
+        let output_tensors = step_data.output_tensors(store)?;
+
         Ok(vec![self.prove_pooling(
             prover,
             last_claims[0],
-            &step_data.inputs[0],
-            step_data.outputs.outputs()[0],
+            &input_tensors[0],
+            &output_tensors[0],
             ctx,
             id,
         )?])
@@ -217,23 +222,26 @@ where
         id: NodeId,
         ctx: &'a Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
+        store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+        let input_tensors = step_data.input_tensors(store)?;
+        let output_tensors = step_data.output_tensors(store)?;
+
         ensure!(
-            step_data.inputs.len() == 1,
+            input_tensors.len() == 1,
             "Input for pooling layer with invalid length. expected: 1 got: {}",
-            step_data.inputs.len(),
+            input_tensors.len(),
         );
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            output_tensors.len() == 1,
             "Output for pooling layer with invalid length. expected: 1 got: {}",
-            step_data.outputs.outputs().len(),
+            output_tensors.len(),
         );
 
         let mut element_count = HashMap::<Element, u64>::new();
-        let inputs = &step_data.inputs[0];
         let column_evals = match self {
             Pooling::Maxpool2D(maxpool2d) => {
-                let field_vecs = maxpool2d.compute_polys::<E>(inputs);
+                let field_vecs = maxpool2d.compute_polys::<E>(&input_tensors[0]);
 
                 for value in field_vecs.iter().flat_map(|v| v.iter()) {
                     let el = E::from(*value).to_element();
@@ -244,7 +252,7 @@ where
             }
         };
         // Commit to the witnes polys
-        let output_poly = to_base::<E, _>(step_data.outputs.outputs()[0].get_data());
+        let output_poly = to_base::<E, _>(output_tensors[0].get_data());
         let num_vars = ceil_log2(output_poly.len());
         let commit_evals = column_evals
             .clone()
@@ -261,8 +269,8 @@ where
             })
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.logup_witnesses.insert(
+        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
+        gen_w.logup_witnesses.insert(
             id,
             vec![LogUpWitness::<E, PCS>::new_lookup(
                 commits,
@@ -271,9 +279,9 @@ where
                 TableType::Range,
             )],
         );
-        gen.element_count.insert(TableType::Range, element_count);
+        gen_w.element_count.insert(TableType::Range, element_count);
 
-        Ok(gen)
+        Ok(gen_w)
     }
 }
 

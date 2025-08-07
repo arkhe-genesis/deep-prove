@@ -30,6 +30,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use tracing::trace;
 use transcript::Transcript;
 
@@ -587,7 +588,7 @@ impl<N: Number> Evaluate<N> for ConcatMatMul {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(inputs.len() == 2, "ConcatMatMul expects 2 inputs");
         let a = inputs[0];
@@ -753,22 +754,26 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<crate::Claim<E>>> {
+        let input_tensors = step_data.input_tensors(store)?;
+        let output_tensors = step_data.output_tensors(store)?;
+
         ensure!(
-            step_data.inputs.len() == 2,
+            input_tensors.len() == 2,
             "ConcatMatMul expects 2 inputs, got {}",
-            step_data.inputs.len()
+            input_tensors.len()
         );
 
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            output_tensors.len() == 1,
             "ConcatMatMul expects 1 output, got {}",
-            step_data.outputs.outputs().len()
+            output_tensors.len()
         );
 
-        let output = step_data.outputs.outputs()[0];
+        let output = &output_tensors[0];
 
-        let (claims, proof) = self.prove_step(last_claims, output, &step_data.inputs, prover)?;
+        let (claims, proof) = self.prove_step(last_claims, output, &input_tensors, prover)?;
 
         prover.push_proof(node_id, LayerProof::ConcatMatMul(proof));
 
@@ -932,7 +937,7 @@ mod test {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
+            .evaluate::<GoldilocksExt2>(&[&a, &b], &[])
             .unwrap();
         assert_eq!(
             result.outputs[0].data(),
@@ -956,7 +961,7 @@ mod test {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
+            .evaluate::<GoldilocksExt2>(&[&a, &b], &[])
             .unwrap();
         let expected = Tensor::new(
             vec![2, 2, 2].into(),
@@ -989,7 +994,7 @@ mod test {
         );
 
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], vec![])
+            .evaluate::<GoldilocksExt2>(&[&a, &b], &[])
             .unwrap();
         let expected = Tensor::new(
             vec![2, 3, 3].into(),
@@ -1023,7 +1028,7 @@ mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let outputs = prove_model(model).unwrap();
+        let outputs = prove_model(model, &mut TenStore::default()).unwrap();
 
         // check output shape
         assert_eq!(
@@ -1053,7 +1058,7 @@ mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let outputs = prove_model(model).unwrap();
+        let outputs = prove_model(model, &mut TenStore::default()).unwrap();
         assert_eq!(
             outputs[0].shape(),
             Shape::new(vec![5, 14, 18]).next_power_of_two()
@@ -1105,7 +1110,7 @@ mod test {
 
         model.route_output(None).unwrap();
 
-        let outputs = prove_model(model).unwrap();
+        let outputs = prove_model(model, &mut TenStore::default()).unwrap();
         assert_eq!(
             outputs[0].shape(),
             Shape::new(vec![21, 7, 17]).next_power_of_two()

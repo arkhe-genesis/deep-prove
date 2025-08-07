@@ -116,10 +116,21 @@ async fn run_model_v1<S: Store>(model: DeepProveRequestV1, mut store: S) -> Resu
                 .load_input_flat(vec![input])
                 .context("loading flat inputs")?;
 
-            let trace_result = model.run(&input_tensor);
+            let trace_result = model.run(
+                &input_tensor,
+                &mut tenstore::TenStore::new_temporary(1000 * 1024 * 1024)?,
+            );
             // If model.run fails, print the error and continue to the next input
-            let trace = match trace_result {
-                Ok(trace) => trace,
+            match trace_result {
+                Ok(trace) => {
+                    let mut prover_transcript = default_transcript();
+                    let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
+                    let proof = prover
+                        .prove(&trace)
+                        .with_context(|| "unable to generate proof for {i}th input")?;
+
+                    proofs.push(proof);
+                }
                 Err(e) => {
                     error!(
                         "[!] Error running inference for input {}/{}: {}",
@@ -130,13 +141,6 @@ async fn run_model_v1<S: Store>(model: DeepProveRequestV1, mut store: S) -> Resu
                     continue; // Skip to the next input without writing to CSV
                 }
             };
-            let mut prover_transcript = default_transcript();
-            let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
-            let proof = prover
-                .prove(&trace)
-                .with_context(|| "unable to generate proof for {i}th input")?;
-
-            proofs.push(proof);
         }
         Ok(proofs)
     })
@@ -289,7 +293,7 @@ enum RunMode {
         s3_args: S3Args,
     },
     /// Prove inference on local files
-    Local {
+    OneShot {
         /// The model to prove inference on.
         #[arg(short = 'm', long)]
         onnx: PathBuf,
@@ -319,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.run_mode {
         grpc_args @ RunMode::Grpc { .. } => lpn::grpc::run(grpc_args).await,
-        local_args @ RunMode::Local { .. } => immediate::run(local_args).await,
+        local_args @ RunMode::OneShot { .. } => immediate::run(local_args).await,
         api_args @ RunMode::LocalApi { .. } => api::serve(api_args).await,
         http_args @ RunMode::Http { .. } => lpn::http::run(http_args).await,
     }

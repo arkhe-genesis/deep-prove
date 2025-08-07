@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tenstore::{TenStore, TensorStore, TenstoreError};
 use trace::Trace;
 use tracing::{debug, info};
 
@@ -15,7 +16,7 @@ use crate::{
     },
     padding::PaddingMode,
     quantization::InferenceTracker,
-    tensor::{Number, Shape},
+    tensor::{DryTensor, Number, Shape},
     try_unzip,
 };
 
@@ -402,74 +403,103 @@ where
 }
 
 impl Model<f32> {
-    pub fn run_float(&self, input: &[Tensor<f32>]) -> anyhow::Result<Vec<Tensor<f32>>> {
-        Ok(self
-            .run::<GoldilocksExt2>(input)?
-            .outputs()?
-            .into_iter()
-            .cloned()
-            .collect())
+    pub fn run_float(
+        &self,
+        input: &[Tensor<f32>],
+        store: &mut TenStore,
+    ) -> anyhow::Result<Vec<Tensor<f32>>> {
+        self.run::<GoldilocksExt2>(input, store)?
+            .outputs()
+            .context("gathering model outputs")
     }
 }
 
-impl<N: Number> Model<N> {
+impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
     pub(crate) fn run_with_tracker<E>(
         &self,
-        input: &[Tensor<N>],
+        inputs: &[Tensor<N>],
         mut tracker: Option<&mut InferenceTracker>,
+        store: &mut TenStore,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
         Layer<N>: Evaluate<N>,
     {
+        let mut padded_input_shapes = HashMap::new();
+        // Store the inputs in the store
+        store
+            .store_many(
+                inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tensor)| {
+                        let key = crate::layers::provable::Edge::tkey_for_input::<N>(None, i);
+                        padded_input_shapes.insert(key.clone(), tensor.shape());
+                        Ok((key, tensor.data()))
+                    })
+                    .collect::<Result<Vec<_>, TenstoreError>>()?
+                    .as_slice(),
+            )
+            .context("creating root inputs")?;
+
         let mut trace = Trace {
+            store: store.clone(),
             steps: HashMap::new(),
-            input: input.to_vec(),
+            input: inputs
+                .iter()
+                .enumerate()
+                .map(|(i, tensor)| {
+                    let key = crate::layers::provable::Edge::tkey_for_input::<N>(None, i);
+                    DryTensor::new(key, tensor.shape())
+                })
+                .collect(),
             output: vec![],
         };
         let iter = self.to_forward_iterator();
+
         for (node_id, node) in iter {
-            let (inputs, shapes): (Vec<_>, Vec<_>) = try_unzip(node.inputs.iter().map(|edge| {
-                Ok(if let Some(n) = &edge.node {
-                    let step = trace.get_step(n);
-                    ensure!(step.is_some(), "Node {} not found in trace", n);
-                    let step = step.unwrap();
-                    let outputs = step.step_data.outputs.outputs();
-                    ensure!(
-                        edge.index < outputs.len(),
-                        "Node {} requested output {} for node {}, which has only {} outputs",
-                        node_id,
-                        edge.index,
-                        n,
-                        outputs.len()
-                    );
-                    // get shape of this output
-                    let out_shapes = &step.step_data.unpadded_output_shapes;
-                    (outputs[edge.index], out_shapes[edge.index].clone())
-                } else {
-                    (
-                        &input[edge.index],
-                        self.unpadded_input_shapes()[edge.index].clone(),
-                    )
-                })
-            }))?;
-            let output_shapes = node
-                .operation
-                .output_shapes(&shapes, PaddingMode::NoPadding);
-            let output = node
-                .run(inputs.as_slice(), shapes)
+            let (inputs, unpadded_input_shapes): (Vec<_>, Vec<_>) =
+                try_unzip(node.inputs.iter().map(|edge| {
+                    Ok(if let Some(n) = &edge.node {
+                        let Some(step) = trace.get_step(n) else {
+                            anyhow::bail!("Node {} not found in trace", n);
+                        };
+
+                        let out_shape = step.step_data.unpadded_output_shapes[edge.index].clone();
+                        (edge.tensor_key_as_input::<N>(), out_shape)
+                    } else {
+                        (
+                            edge.tensor_key_as_input::<N>(),
+                            self.unpadded_input_shapes()[edge.index].clone(),
+                        )
+                    })
+                }))?;
+            let node_output = node
+                .run(
+                    node_id,
+                    inputs.as_slice(),
+                    &unpadded_input_shapes,
+                    &padded_input_shapes,
+                    &mut tracker,
+                    store,
+                )
                 .context(format!("Error occurred at node ID: {node_id}"))?;
-            // add output tensors to tracker, if any
-            if let Some(tracker) = &mut tracker {
-                for (i, out) in output.outputs().into_iter().enumerate() {
-                    tracker.track(node_id, i, out.to_f32()?);
-                }
-            }
+            padded_input_shapes.extend(
+                node_output
+                    .outputs
+                    .iter()
+                    .map(|t| (t.key().to_owned(), t.shape().to_owned())),
+            );
             let new_step = StepData {
-                inputs: inputs.into_iter().cloned().collect(),
-                outputs: output,
-                unpadded_output_shapes: output_shapes,
+                node_inputs: inputs
+                    .iter()
+                    .map(|k| DryTensor::new(k.clone(), padded_input_shapes[k].clone()))
+                    .collect(),
+                node_outputs: node_output,
+                unpadded_output_shapes: node
+                    .operation
+                    .output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding),
             };
             trace.new_step(
                 node_id,
@@ -505,7 +535,7 @@ impl<N: Number> Model<N> {
                     // if this output wire is an output of the model, insert in the collection of the
                     // model outputs, paired with the index among the outputs of the model
                     ensure!(
-                        outputs.insert(out_index, node_outputs[i]).is_none(),
+                        outputs.insert(out_index, node_outputs[i].clone()).is_none(),
                         "Trying to insert twice an output value for the same index {out_index}"
                     );
                 }
@@ -521,7 +551,7 @@ impl<N: Number> Model<N> {
                 && *outputs.last_key_value().unwrap().0 == outputs.len() - 1
         );
 
-        trace.output = outputs.into_values().cloned().collect();
+        trace.output = outputs.into_values().collect();
 
         Ok(trace)
     }
@@ -529,13 +559,17 @@ impl<N: Number> Model<N> {
     /// Run the inference of the model, producing the `InferenceTrace` necessary to
     /// later prove the model. The outputs of the model can be fetched from the returned
     /// trace
-    pub fn run<E>(&self, input: &[Tensor<N>]) -> anyhow::Result<InferenceTrace<'_, E, N>>
+    pub fn run<E>(
+        &self,
+        input: &[Tensor<N>],
+        store: &mut TenStore,
+    ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
         Layer<N>: Evaluate<N>,
     {
-        self.run_with_tracker(input, None)
+        self.run_with_tracker(input, None, store)
     }
 }
 
@@ -581,6 +615,7 @@ pub(crate) mod test {
         structs::{IOPProverState, IOPVerifierState},
         util::optimal_sumcheck_threads,
     };
+    use tenstore::TenStore;
 
     use crate::{Element, default_transcript, quantization::TensorFielder, tensor::Tensor};
 
@@ -728,7 +763,7 @@ pub(crate) mod test {
     #[test]
     fn test_model_long() {
         let (model, input) = Model::random(3).unwrap();
-        model.run::<F>(&input).unwrap();
+        model.run::<F>(&input, &mut Default::default()).unwrap();
     }
 
     pub fn check_tensor_consistency_field<E: ExtensionField>(
@@ -823,7 +858,9 @@ pub(crate) mod test {
         model.route_output(None).unwrap();
 
         // END TEST
-        let trace = model.run::<F>(slice::from_ref(&input)).unwrap();
+        let trace = model
+            .run::<F>(slice::from_ref(&input), &mut Default::default())
+            .unwrap();
 
         let mut model2 =
             Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
@@ -846,7 +883,7 @@ pub(crate) mod test {
             )
             .unwrap();
         model2.route_output(None).unwrap();
-        let trace2 = model.run::<F>(&[input]).unwrap();
+        let trace2 = model.run::<F>(&[input], &mut Default::default()).unwrap();
 
         check_tensor_consistency_field::<GoldilocksExt2>(
             trace2.outputs().unwrap()[0].to_fields(),
@@ -885,7 +922,9 @@ pub(crate) mod test {
         // Here is not possible since we didnt run through the onnx loader
         let input = Tensor::random(&input_shape);
         let input_padded = model.prepare_inputs(vec![input]).unwrap();
-        let _ = model.run::<F>(&input_padded).unwrap();
+        let _ = model
+            .run::<F>(&input_padded, &mut Default::default())
+            .unwrap();
     }
 
     #[test]
@@ -921,14 +960,29 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
 
-        let trace = model.run::<F>(&[input]).unwrap();
+        let mut store = TenStore::default();
+        let trace = model.run::<F>(&[input], &mut store).unwrap();
         assert_eq!(trace.steps.len(), 2);
         // Verify first step
-        assert_eq!(*trace.get_step(&first_id).unwrap().outputs()[0], output1);
+
+        assert_eq!(
+            trace
+                .get_step(&first_id)
+                .unwrap()
+                .step_data
+                .output_tensor_at(0, &mut store)
+                .unwrap(),
+            output1
+        );
 
         // Verify second step
         assert_eq!(
-            *trace.get_step(&second_id).unwrap().outputs()[0],
+            trace
+                .get_step(&second_id)
+                .unwrap()
+                .step_data
+                .output_tensor_at(0, &mut store)
+                .unwrap(),
             final_output.clone()
         );
         let (nrow, _) = (dense2.nrows(), dense2.ncols());
@@ -939,7 +993,12 @@ pub(crate) mod test {
     fn test_model_sequential() {
         let (model, input) = Model::random(1).unwrap();
         model.describe();
-        let trace = model.run::<F>(&input).unwrap().into_fields();
+        let trace = model
+            .run::<F>(&input, &mut Default::default())
+            .unwrap()
+            .into_fields()
+            .unwrap();
+        let mut store = trace.store.clone();
         let dense_layers = model
             .to_unstable_iterator()
             .flat_map(|(id, l)| match l.operation {
@@ -956,7 +1015,9 @@ pub(crate) mod test {
         let computed_eval1 = trace
             .get_step(&dense_layers[0].0)
             .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
-            .outputs()[0]
+            .step_data
+            .output_tensor_at(0, &mut store)
+            .unwrap()
             .get_data()
             .to_vec()
             .into_mle()
@@ -969,7 +1030,7 @@ pub(crate) mod test {
             .into_mle()
             .evaluate(&point1);
         let computed_eval1_no_bias = computed_eval1 - bias_eval;
-        let input_vector = trace.input[0].clone();
+        let input_vector = trace.input_at(0).unwrap();
         // since y = SUM M(j,i) x(i) + B(j)
         // then
         // y(r) - B(r) = SUM_i m(r,i) x(i)
@@ -1004,6 +1065,7 @@ pub(crate) mod test {
     #[test]
     #[ignore = "This test should be deleted since there is no requant and it is not testing much"]
     fn test_single_matvec_prover() {
+        let mut store = TenStore::default();
         let w1 = random_vector_quant(1024 * 1024);
         let conv1 = Tensor::new(vec![1024, 1024].into(), w1.clone());
         let w2 = random_vector_quant(1024);
@@ -1017,11 +1079,11 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let trace = model.run::<F>(&[input]).unwrap();
+        let trace = model.run::<F>(&[input], &mut store).unwrap();
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io().unwrap();
         let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
         let proof = prover.prove(&trace).expect("unable to generate proof");
@@ -1056,11 +1118,12 @@ pub(crate) mod test {
             .prepare_inputs(vec![Tensor::new(input_shape, input)])
             .unwrap();
 
-        let trace = model.run::<F>(&input_tensor).unwrap();
+        let mut store = TenStore::default();
+        let trace = model.run::<F>(&input_tensor, &mut store).unwrap();
         let mut tr = BasicTranscript::<F>::new(b"matmul");
         let ctx =
             Context::<F, Pcs<F>>::generate(&model, None, None).expect("Unable to generate context");
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io().unwrap();
         let prover = Prover::new(&ctx, &mut tr);
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript = BasicTranscript::<F>::new(b"matmul");
@@ -1093,11 +1156,12 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let trace = model.run::<F>(&[input]).unwrap();
+        let mut store = TenStore::default();
+        let trace = model.run::<F>(&[input], &mut store).unwrap();
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io().unwrap();
 
         let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
@@ -1142,14 +1206,15 @@ pub(crate) mod test {
                             .unwrap();
                         model.route_output(None).unwrap();
                         model.describe();
-                        let trace = model.run::<F>(&[input]).unwrap();
+                        let mut store = TenStore::default();
+                        let trace = model.run::<F>(&[input], &mut store).unwrap();
                         let mut tr: BasicTranscript<GoldilocksExt2> =
                             BasicTranscript::new(b"m2vec");
                         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(
                             &model, None, None,
                         )
                         .expect("Unable to generate context");
-                        let io = trace.to_verifier_io();
+                        let io = trace.to_verifier_io().unwrap();
                         let prover: Prover<
                             '_,
                             '_,
@@ -1215,7 +1280,9 @@ pub(crate) mod test {
 
         let input = random_vector(input_shape.iter().product());
         let input_tensor = Tensor::new(input_shape, input);
-        let trace = model.run::<E>(&[input_tensor]).unwrap();
+        let trace = model
+            .run::<E>(&[input_tensor], &mut Default::default())
+            .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
 
@@ -1226,7 +1293,9 @@ pub(crate) mod test {
         let input_shape = model.input_shapes()[0].clone();
 
         let input_tensor = Tensor::random(&input_shape);
-        let trace = model.run::<E>(&[input_tensor]).unwrap();
+        let trace = model
+            .run::<E>(&[input_tensor], &mut Default::default())
+            .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
 
@@ -1237,6 +1306,7 @@ pub(crate) mod test {
         model: Model<f32>,
         float_inputs: Vec<Tensor<f32>>,
         representative_inputs: Option<Vec<Tensor<f32>>>,
+        store: &mut TenStore,
     ) -> anyhow::Result<(Model<Element>, Vec<Tensor<Element>>)> {
         let (quantized_model, md) = if let Some(repr_inputs) = representative_inputs {
             InferenceObserver::new_with_representative_input(vec![
@@ -1248,7 +1318,7 @@ pub(crate) mod test {
         } else {
             InferenceObserver::new()
         }
-        .quantize(model)?;
+        .quantize(model, store)?;
 
         // quantize input tensor
         let input_tensors = float_inputs
@@ -1263,6 +1333,7 @@ pub(crate) mod test {
     pub(crate) fn prove_quantized_model(
         model: Model<Element>,
         inputs: Vec<Tensor<Element>>,
+        store: &mut TenStore,
     ) -> anyhow::Result<Vec<Tensor<Element>>> {
         let model = pad_model(model)?;
 
@@ -1270,36 +1341,40 @@ pub(crate) mod test {
 
         let input_tensors = model.prepare_inputs(inputs).unwrap();
 
-        let trace = model.run(&input_tensors)?;
-        let outputs = trace.outputs()?.into_iter().cloned().collect();
+        let trace = model.run(&input_tensors, store)?;
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"model");
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
         let prover: Prover<'_, '_, E, T, _> = Prover::new(&ctx, &mut tr);
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io().unwrap();
+        let outputs = trace.outputs();
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"model");
         println!("Verifying");
         verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript)?;
-        Ok(outputs)
+        outputs
     }
 
     pub(crate) fn prove_model_with(
         model: Model<f32>,
         float_inputs: Vec<Tensor<f32>>,
+        store: &mut TenStore,
     ) -> anyhow::Result<Vec<Tensor<Element>>> {
-        let (quantized_model, quantized_inputs) = quantize_model(model, float_inputs, None)?;
-        prove_quantized_model(quantized_model, quantized_inputs)
+        let (quantized_model, quantized_inputs) = quantize_model(model, float_inputs, None, store)?;
+        prove_quantized_model(quantized_model, quantized_inputs, store)
     }
 
-    pub(crate) fn prove_model(model: Model<f32>) -> anyhow::Result<Vec<Tensor<Element>>> {
+    pub(crate) fn prove_model(
+        model: Model<f32>,
+        store: &mut TenStore,
+    ) -> anyhow::Result<Vec<Tensor<Element>>> {
         let float_inputs = model
             .input_shapes()
             .into_iter()
             .map(|shape| Tensor::random(&shape))
             .collect_vec();
-        prove_model_with(model, float_inputs)
+        prove_model_with(model, float_inputs, store)
     }
 
     #[test]
@@ -1307,7 +1382,7 @@ pub(crate) mod test {
         init_test_logging_default();
         const INPUT_SIZE: usize = 57;
         let model = build_test_model::<f32, INPUT_SIZE>();
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
     }
 
     /// 2 relus connected. First relu receives two inputs and pass that to the second relu
@@ -1380,7 +1455,9 @@ pub(crate) mod test {
                 },
             ]))
             .unwrap();
-        model.run::<GoldilocksExt2>(&input_tensor).unwrap();
+        model
+            .run::<GoldilocksExt2>(&input_tensor, &mut Default::default())
+            .unwrap();
     }
 
     #[test]
@@ -1475,7 +1552,7 @@ pub(crate) mod test {
 
         model.describe();
 
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
     }
 
     #[test]
@@ -1521,6 +1598,6 @@ pub(crate) mod test {
 
         model.route_output(None).unwrap();
 
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
     }
 }

@@ -103,7 +103,7 @@ jobs:
           cache-workspace-crates: true
 
       - name: Run cargo test
-        run: cargo test -- --test-threads=1
+        run: cargo test --release -p zkml -- --test-threads=1
         env:
           RUSTFLAGS: "-W warnings"
 

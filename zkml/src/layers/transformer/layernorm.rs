@@ -21,6 +21,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use tracing::trace;
 
 use crate::{
@@ -348,7 +349,7 @@ impl Evaluate<f32> for LayerNorm<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         assert!(inputs.len() == 1);
         let input = inputs[0];
@@ -385,7 +386,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we check to see if there is any quant_info, if not error
         ensure!(
@@ -738,21 +739,23 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
+        let input_tensors = step_data.input_tensors(store)?;
         // Check there is a single input
         ensure!(
-            step_data.inputs.len() == 1,
+            input_tensors.len() == 1,
             "LayerNorm step should only have one input, received {}",
-            step_data.inputs.len()
+            input_tensors.len()
         );
         let input_mle: ArcMultilinearExtension<E> =
-            step_data.inputs[0].get_data().to_vec().into_mle().into();
+            input_tensors[0].get_data().to_vec().into_mle().into();
         // We also make the MLE for the sum of each dim we perform layernorm on
-        let last_dim = *step_data.inputs[0]
+        let last_dim = *input_tensors[0]
             .shape()
             .last()
             .ok_or(anyhow!("Step data input tensor had no shape in LayerNorm"))?;
-        let mean_mle = step_data.inputs[0]
+        let mean_mle = input_tensors[0]
             .get_data()
             .chunks(last_dim)
             .flat_map(|chunk| {
@@ -774,16 +777,18 @@ where
         id: NodeId,
         ctx: &Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
+        store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+        let output_tensors = step_data.output_tensors(store)?;
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "Found more than 1 input in inference step of LayerNorm layer"
         );
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            output_tensors.len() == 1,
             "Found more than 1 output in inference step of LayerNorm layer"
         );
-        let layernorm_data = step_data.outputs.try_layernorm_data().ok_or(anyhow!(
+        let layernorm_data = step_data.node_outputs.try_layernorm_data().ok_or(anyhow!(
             "LayerNorm data not found in inference step for LayerNorm layer"
         ))?;
         self.lookup_witness(id, ctx, layernorm_data)
@@ -1120,7 +1125,7 @@ impl LayerNorm<Element> {
         E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E>,
     {
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
+        let mut wit_gen = LookupWitnessGen::<E, PCS>::default();
         // Get the data generated during quantised evaluation
         let LayerNormData {
             lookup_input,
@@ -1207,14 +1212,16 @@ impl LayerNorm<Element> {
         let inv_sqrt_evals = evals.drain(..2).collect::<Vec<Vec<E::BaseField>>>();
 
         // Add the merged columns to the lookups lists
-        gen.element_count
+        wit_gen
+            .element_count
             .insert(TableType::Range, range_elements_count);
 
-        gen.element_count
+        wit_gen
+            .element_count
             .insert(TableType::InverseSQRT(*lut), inv_sqrt_element_count);
 
         // Insert the LogUpWitnesses
-        gen.logup_witnesses.insert(
+        wit_gen.logup_witnesses.insert(
             id,
             vec![
                 LogUpWitness::<E, PCS>::new_lookup(
@@ -1226,7 +1233,7 @@ impl LayerNorm<Element> {
                 LogUpWitness::<E, PCS>::new_lookup(commits, evals, 1, TableType::Range),
             ],
         );
-        Ok(gen)
+        Ok(wit_gen)
     }
 }
 
@@ -1569,7 +1576,7 @@ mod tests {
             quant_info: None,
         };
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
-        let output = layernorm.evaluate::<E>(&[&input], vec![]).unwrap();
+        let output = layernorm.evaluate::<E>(&[&input], &[]).unwrap();
         assert_eq!(output.outputs[0].shape(), vec![1, 1024].into());
         assert_eq!(output.outputs[0].get_data(), vec![0.0; 1024]);
     }
@@ -1597,13 +1604,13 @@ mod tests {
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = layernorm
-            .evaluate::<E>(&[&dequant_input], vec![vec![2, 100].into()])
+            .evaluate::<E>(&[&dequant_input], &[vec![2, 100].into()])
             .unwrap()
             .outputs[0]
             .clone();
 
         let quant_output = quant_layernorm
-            .evaluate::<E>(&[&quant_tensor], vec![vec![2, 100].into()])
+            .evaluate::<E>(&[&quant_tensor], &[vec![2, 100].into()])
             .unwrap()
             .outputs[0]
             .clone();
@@ -1638,6 +1645,6 @@ mod tests {
 
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut TenStore::default()).unwrap();
     }
 }

@@ -32,6 +32,7 @@ use multilinear_extensions::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, marker::PhantomData};
+use tenstore::TenStore;
 use transcript::Transcript;
 
 use crate::{quantization::BIT_LEN, tensor::Tensor};
@@ -98,7 +99,7 @@ impl Evaluate<f32> for Activation<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         match self {
             Activation::Relu(relu) => Ok(LayerOut::from_vec(
@@ -139,7 +140,7 @@ impl Evaluate<Element> for Activation<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         let outputs = match self {
             Activation::Relu(relu) => inputs
@@ -227,11 +228,12 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
         Ok(vec![self.prove_step(
             prover,
             last_claims[0],
-            step_data.outputs.outputs()[0].get_data(),
+            step_data.output_tensor_at(0, store)?.get_data(),
             ctx,
             id,
         )?])
@@ -242,18 +244,21 @@ where
         id: NodeId,
         ctx: &'a Context<'a, E, PCS>,
         step_data: &StepData<Element, E>,
+        store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+        let outputs = step_data.output_tensors(store)?;
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "Found more than 1 input tensor in inference step of activation layer"
         );
         ensure!(
-            step_data.outputs.outputs().len() == 1,
+            outputs.len() == 1,
             "Found more than 1 output tensor in inference step of activation layer"
         );
 
-        let inputs = step_data.inputs[0].get_data();
-        let outputs = step_data.outputs.outputs()[0].get_data();
+        let input_tensors = step_data.input_tensors(store)?;
+        let inputs = input_tensors[0].get_data();
+        let outputs = outputs[0].get_data();
         debug_assert_eq!(
             inputs.len(),
             outputs.len(),
@@ -305,8 +310,8 @@ where
             .into_iter()
             .unzip();
 
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.logup_witnesses.insert(
+        let mut wit_gen = LookupWitnessGen::<E, PCS>::default();
+        wit_gen.logup_witnesses.insert(
             id,
             vec![LogUpWitness::<E, PCS>::new_lookup(
                 commits,
@@ -315,9 +320,11 @@ where
                 self.table_type(),
             )],
         );
-        gen.element_count.insert(self.table_type(), element_count);
+        wit_gen
+            .element_count
+            .insert(self.table_type(), element_count);
 
-        Ok(gen)
+        Ok(wit_gen)
     }
 }
 
@@ -608,7 +615,7 @@ impl Evaluate<f32> for GELU<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let output_tensors: Vec<Tensor<f32>> = inputs
             .par_iter()
@@ -708,7 +715,7 @@ mod test {
             None,
         )?;
         model.route_output(None)?;
-        prove_model(model).unwrap();
+        prove_model(model, &mut Default::default()).unwrap();
         Ok(())
     }
 
@@ -750,7 +757,7 @@ mod test {
 
         let expected_output_data = input_data.iter().map(gelu_float).collect::<Vec<_>>();
 
-        let layer_out = gelu.evaluate::<GoldilocksExt2>(&[&input_tensor], vec![])?;
+        let layer_out = gelu.evaluate::<GoldilocksExt2>(&[&input_tensor], &[])?;
         assert_eq!(layer_out.outputs().len(), 1);
         let output_tensor = &layer_out.outputs()[0];
 

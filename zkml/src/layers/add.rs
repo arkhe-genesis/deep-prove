@@ -1,6 +1,7 @@
 use multilinear_extensions::mle::IntoMLE;
 use serde::de::DeserializeOwned;
 use std::{cmp::Ordering, collections::HashMap};
+use tenstore::TenStore;
 
 use anyhow::{bail, ensure};
 use ff_ext::ExtensionField;
@@ -151,7 +152,7 @@ impl Evaluate<f32> for Add<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let result = if inputs.len() == 2 {
             ensure!(
@@ -184,7 +185,7 @@ impl Evaluate<Element> for Add<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         let Some(ref quant_info) = self.quant_info else {
             bail!("Add layer is not quantized");
@@ -561,12 +562,17 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
         T: Transcript<E>,
     {
-        let (output_claims, proof) =
-            self.prove_step(node_id, last_claims, &step_data.inputs, prover)?;
+        let (output_claims, proof) = self.prove_step(
+            node_id,
+            last_claims,
+            &step_data.input_tensors(store)?,
+            prover,
+        )?;
 
         prover.push_proof(node_id, LayerProof::Add(proof));
         Ok(output_claims)
@@ -650,7 +656,7 @@ mod test {
         let qt2 = t2.quantize(&s2);
         let qadd = add.quantize(&[s1, s2], s3).unwrap().quantized_op;
         let qadd_result = qadd
-            .evaluate::<GoldilocksExt2>(&[&qt1, &qt2], vec![vec![2, 2].into(), vec![2, 2].into()])
+            .evaluate::<GoldilocksExt2>(&[&qt1, &qt2], &[vec![2, 2].into(), vec![2, 2].into()])
             .unwrap();
 
         let scale = qadd.quant_info.as_ref().unwrap().common_scale() / s3.scale();
@@ -694,7 +700,7 @@ mod test {
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
             model.route_output(None).unwrap();
             model.describe();
-            prove_model(model).unwrap();
+            prove_model(model, &mut TenStore::default()).unwrap();
         }
     }
 
@@ -709,7 +715,7 @@ mod test {
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
             model.route_output(None).unwrap();
             model.describe();
-            prove_model(model).unwrap();
+            prove_model(model, &mut TenStore::default()).unwrap();
         }
     }
 

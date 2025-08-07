@@ -22,7 +22,7 @@
 
   # https://devenv.sh/tests/
   enterTest = ''
-  cargo test
+  cargo test --release -p zkml -- --test-threads 1
   '';
 
   languages.python = {

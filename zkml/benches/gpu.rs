@@ -17,7 +17,7 @@ fn layers(c: &mut Criterion) {
         let gelu = GELU::<f32>::new();
 
         group.bench_with_input(BenchmarkId::new("gelu", size), &input, |b, input| {
-            b.iter(|| gelu.evaluate::<GoldilocksExt2>(&[input], vec![]));
+            b.iter(|| gelu.evaluate::<GoldilocksExt2>(&[input], &[]));
         });
     }
 
@@ -33,7 +33,7 @@ fn layers(c: &mut Criterion) {
             BenchmarkId::new("dense/Element", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], vec![]));
+                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], &[]));
             },
         );
     }
@@ -50,7 +50,7 @@ fn layers(c: &mut Criterion) {
             BenchmarkId::new("dense/f32", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], vec![]));
+                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], &[]));
             },
         );
     }

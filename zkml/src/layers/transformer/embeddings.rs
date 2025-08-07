@@ -21,6 +21,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use transcript::Transcript;
 
 use crate::{
@@ -198,7 +199,7 @@ impl<N: Number> Evaluate<N> for Embeddings<N> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
             inputs.iter().all(|x| { x.shape().rank() == 1 }),
@@ -366,19 +367,21 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         // we first construct the one hot encoding from the input indices and then we run
         // the matmul protocol.
         ensure!(
-            step_data.inputs.len() == 1,
+            step_data.node_inputs.len() == 1,
             "embeddings only support 1 input tensor"
         );
         ensure!(
             last_claims.len() == 1,
             "embeddings only support 1 last claim"
         );
-        let input = &step_data.inputs[0];
         let last_claim = last_claims[0];
+        let input_tensors = step_data.input_tensors(store)?;
+        let input = &input_tensors[0];
 
         let (row_point, column_point) = Self::split_output_point(last_claim, self.emb_size)?;
 
@@ -646,7 +649,7 @@ mod tests {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model_with(model, vec![input])?;
+        prove_model_with(model, vec![input], &mut TenStore::default())?;
 
         Ok(())
     }
@@ -713,7 +716,7 @@ mod tests {
         let embeddings = Embeddings::new(emb.clone())?;
         let input = Tensor::new(vec![seq_len].into(), indices_elem.clone());
         let out = embeddings
-            .evaluate::<GoldilocksExt2>(&[&input], vec![vec![indices_elem.len(), 1].into()])?;
+            .evaluate::<GoldilocksExt2>(&[&input], &[vec![indices_elem.len(), 1].into()])?;
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
         assert_eq!(out.outputs()[0].shape(), expected_shape);
         let onehot_result = one_hot.matmul(&emb.to_fields());
@@ -746,7 +749,7 @@ mod tests {
             .map(|x| Element::from(x as Element))
             .collect::<Vec<_>>();
         let x = Tensor::new(vec![seq_len].into(), input_data.clone());
-        let out = embeddings.evaluate::<GoldilocksExt2>(&[&x], vec![vec![seq_len].into()])?;
+        let out = embeddings.evaluate::<GoldilocksExt2>(&[&x], &[vec![seq_len].into()])?;
         assert_eq!(out.outputs()[0].shape(), vec![seq_len, emb_size].into());
         // for each input index, check that the embedding vector is the correct one
         for (idx, table_idx) in input_data.iter().enumerate() {

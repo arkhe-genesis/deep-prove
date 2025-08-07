@@ -1,10 +1,11 @@
 //! This module implements a prover instance that generates proofs completely
 //! locally, in a one-shot manner. After a successful proof generation, they are
 //! written to a local file.
+use std::io::BufWriter;
+
 use anyhow::Context;
 use deep_prove::store::MemStore;
 use memmap2::Mmap;
-use std::io::Write;
 use tracing::info;
 use zkml::{ModelType, inputs::Input, quantization::ScalingStrategyKind};
 
@@ -13,7 +14,7 @@ use crate::RunMode;
 /// Run the prover once, directly feeding it the required inputs. The proofs are
 /// written to a file.
 pub async fn run(args: RunMode) -> anyhow::Result<()> {
-    let RunMode::Local { onnx, inputs } = args else {
+    let RunMode::OneShot { onnx, inputs } = args else {
         unreachable!()
     };
 
@@ -53,13 +54,15 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
     let proofs = crate::run_model_v1(request, store).await?;
 
     // create a file to write the proofs to
-    let mut file = tempfile::Builder::new()
+    let file = tempfile::Builder::new()
         .prefix("proof-")
         .suffix(".json")
         .rand_bytes(10)
         .disable_cleanup(true)
         .tempfile_in(std::env::current_dir().unwrap_or("./".into()))?;
-    file.write_all(serde_json::to_string_pretty(&proofs)?.as_bytes())?;
+
+    serde_json::to_writer_pretty(BufWriter::new(file), &proofs)
+        .context("writing proofs to file")?;
 
     info!("Successfully generated {} proofs", proofs.len());
 

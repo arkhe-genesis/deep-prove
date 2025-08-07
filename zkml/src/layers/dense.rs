@@ -29,6 +29,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::TenStore;
 use tracing::warn;
 use transcript::Transcript;
 
@@ -167,7 +168,7 @@ impl Evaluate<Element> for Dense<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         ensure!(
             inputs.len() == 1,
@@ -196,7 +197,7 @@ impl Evaluate<f32> for Dense<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
@@ -333,12 +334,16 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
+        store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
+        let input_tensor = step_data.input_tensor_at(0, store)?;
+        let output_tensor = step_data.output_tensor_at(0, store)?;
+
         Ok(vec![self.prove_step(
             prover,
             last_claims[0],
-            &step_data.inputs[0],
-            step_data.outputs.outputs()[0],
+            &input_tensor,
+            &output_tensor,
             ctx,
             id,
         )?])
@@ -858,7 +863,7 @@ mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model).unwrap();
+        prove_model(model, &mut TenStore::default()).unwrap();
     }
 
     proptest! {
@@ -869,7 +874,7 @@ mod test {
             let expected = matrix.matvec(&input).add(&bias);
 
             let dense = Dense::<Element>::new(matrix.clone(), bias.clone());
-            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], vec![]).expect("Dense evaluation must be successful");
+            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("Dense evaluation must be successful");
 
             prop_assert_eq!(&expected, &computed.outputs[0]);
         }
@@ -881,7 +886,7 @@ mod test {
             let expected = matrix.matvec(&input).add(&bias);
 
             let dense = Dense::<f32>::new(matrix.clone(), bias.clone());
-            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], vec![]).expect("Dense evaluation must be successful");
+            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("Dense evaluation must be successful");
 
             for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
                 prop_assert!(

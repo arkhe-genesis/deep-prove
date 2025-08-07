@@ -271,6 +271,7 @@ mod test {
     use itertools::Itertools;
     use multilinear_extensions::mle::IntoMLE;
     use p3_field::FieldAlgebra;
+    use tenstore::TenStore;
 
     use crate::{
         FloatOnnxLoader, default_transcript,
@@ -316,11 +317,11 @@ mod test {
         println!("input: {:?}", input.get_data());
         let input = model.prepare_inputs(vec![input])?;
 
-        let trace = model.run(&input).unwrap();
-        let output = trace.outputs()?[0];
+        let trace = model.run(&input, &mut TenStore::default()).unwrap();
+        let output = trace.output_at(0)?;
         println!("[+] Run inference. Result: {output:?}");
 
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io()?;
         let mut prover_transcript = default_transcript();
         let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
         println!("[+] Run prover");

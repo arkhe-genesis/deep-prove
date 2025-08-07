@@ -35,6 +35,7 @@ pub(crate) mod test {
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use serde::Deserialize;
+    use tenstore::TenStore;
 
     use crate::{
         Tensor, init_test_logging,
@@ -101,33 +102,27 @@ pub(crate) mod test {
             input: &Tensor<f32>,
             output: Option<&GPT2LayerOutput>,
         ) -> anyhow::Result<Tensor<f32>> {
-            let normed = self
-                .layernorm
-                .evaluate::<GoldilocksExt2>(&[input], vec![])?;
+            let normed = self.layernorm.evaluate::<GoldilocksExt2>(&[input], &[])?;
             if let Some(gpt2_output) = output {
                 gpt2_output.is_prefnn_layernorm_close(normed.outputs());
             }
-            let up = self
-                .up
-                .evaluate::<GoldilocksExt2>(&normed.outputs(), vec![])?;
+            let up = self.up.evaluate::<GoldilocksExt2>(&normed.outputs(), &[])?;
             if let Some(gpt2_output) = output {
                 assert!(gpt2_output.is_ffn_up_close(up.outputs()));
             }
             let act = self
                 .activation
-                .evaluate::<GoldilocksExt2>(&up.outputs(), vec![])?;
+                .evaluate::<GoldilocksExt2>(&up.outputs(), &[])?;
             if let Some(gpt2_output) = output {
                 assert!(gpt2_output.is_ffn_after_gelu_close(act.outputs()));
             }
-            let down = self
-                .down
-                .evaluate::<GoldilocksExt2>(&act.outputs(), vec![])?;
+            let down = self.down.evaluate::<GoldilocksExt2>(&act.outputs(), &[])?;
             if let Some(gpt2_output) = output {
                 assert!(gpt2_output.is_ffn_after_down_close(down.outputs()));
             }
             let out = self.add.evaluate::<GoldilocksExt2>(
                 &[input, down.outputs()[0]],
-                vec![input.shape(), down.outputs()[0].shape()],
+                &[input.shape(), down.outputs()[0].shape()],
             )?;
             Ok(out.outputs()[0].clone())
         }
@@ -224,23 +219,21 @@ pub(crate) mod test {
         ) -> anyhow::Result<Tensor<f32>> {
             ensure!(input.rank() == 2);
 
-            let normed = self
-                .layernorm
-                .evaluate::<GoldilocksExt2>(&[input], vec![])?;
+            let normed = self.layernorm.evaluate::<GoldilocksExt2>(&[input], &[])?;
 
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_layernorm_close(normed.outputs()));
             }
             let qkv = self
                 .qkv
-                .evaluate::<GoldilocksExt2>(&normed.outputs(), vec![])?;
+                .evaluate::<GoldilocksExt2>(&normed.outputs(), &[])?;
 
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_qkv_close(qkv.outputs()));
             }
             let (mha, _, softmax_out, _) = self
                 .mha
-                .evaluate_with_intermediate_outputs::<GoldilocksExt2>(&qkv.outputs(), vec![])?;
+                .evaluate_with_intermediate_outputs::<GoldilocksExt2>(&qkv.outputs(), &[])?;
 
             if let Some(gpt2_output) = gpt2_output {
                 assert!(
@@ -260,9 +253,7 @@ pub(crate) mod test {
                 );
             }
             // now we do the final projection - still [seq_len,hidden_size]
-            let projected = self
-                .out
-                .evaluate::<GoldilocksExt2>(&mha.outputs(), vec![])?;
+            let projected = self.out.evaluate::<GoldilocksExt2>(&mha.outputs(), &[])?;
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_attention_output_proj_close(projected.outputs()));
             }
@@ -270,7 +261,7 @@ pub(crate) mod test {
             // and then residual connection, [1, hidden_size]
             let out = self.add.evaluate::<GoldilocksExt2>(
                 &[input, projected.outputs()[0]],
-                vec![input.shape(), projected.outputs()[0].shape()],
+                &[input.shape(), projected.outputs()[0].shape()],
             )?;
 
             if let Some(gpt2_output) = gpt2_output {
@@ -446,10 +437,10 @@ pub(crate) mod test {
         );
         let embedded = llm_model
             .embeddings
-            .evaluate::<GoldilocksExt2>(&[&input], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[&input], &[])?;
         let positioned = llm_model
             .positional
-            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], vec![])?;
+            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], &[])?;
         assert!(is_close(
             positioned.outputs()[0].get_data(),
             &gpt2_output.inputs_embeds
@@ -489,8 +480,9 @@ pub(crate) mod test {
         let mut model = Model::new_from_input_shapes(vec![input.shape()], PaddingMode::NoPadding);
         let _last_node_id = first_attention.write_to_model(&mut model, None, &config)?;
         model.route_output(None)?;
-        let output1 = model.run::<GoldilocksExt2>(slice::from_ref(&input))?;
-        let output = model.run_float(slice::from_ref(&input))?;
+        let output1 =
+            model.run::<GoldilocksExt2>(slice::from_ref(&input), &mut TenStore::default())?;
+        let output = model.run_float(slice::from_ref(&input), &mut TenStore::default())?;
         assert_eq!(output1.outputs()?[0].get_data(), output[0].get_data());
         println!("graph output: {:?}", output[0].shape());
         assert!(
@@ -531,11 +523,11 @@ pub(crate) mod test {
             .clone()
             .into_provable_model(&config, single_input.shape())?;
         model.describe();
-        model.run_float(slice::from_ref(&single_input))?;
+        model.run_float(slice::from_ref(&single_input), &mut TenStore::default())?;
 
         let model = llm_model.into_provable_model(&config, input.shape())?;
         model.describe();
-        let output = model.run_float(slice::from_ref(&input))?[0].clone();
+        let output = model.run_float(slice::from_ref(&input), &mut TenStore::default())?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,
         // we take the last element of the model output
         let output = output.slice_last_dim().last().unwrap();

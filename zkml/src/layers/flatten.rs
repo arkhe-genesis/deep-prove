@@ -43,7 +43,7 @@ impl<N: Number> Evaluate<N> for Flatten {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: Vec<Shape>,
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<N, E>> {
         ensure!(
             inputs.len() == 1,

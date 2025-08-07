@@ -652,6 +652,7 @@ where
     debug!("== Witness poly fields generation ==");
     let metrics = Metrics::new();
     let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
+    let mut store = trace.store.clone();
 
     for (node_id, _) in ctx.steps_info.to_forward_iterator() {
         let step = trace
@@ -659,15 +660,15 @@ where
             .ok_or(LogUpError::ProvingError(format!(
                 "Node {node_id} not found in trace"
             )))?;
-        let gen = step
+        let gen_w = step
             .op
-            .gen_lookup_witness(node_id, ctx, &step.step_data)
+            .gen_lookup_witness(node_id, ctx, &step.step_data, &mut store)
             .map_err(|e| {
                 LogUpError::ParameterError(format!(
                     "Error generating lookup witness for node {node_id} with error: {e}"
                 ))
             })?;
-        witness_gen.consume(gen);
+        witness_gen.consume(gen_w);
     }
     debug!(
         "== Witness poly fields generation metrics {} ==",

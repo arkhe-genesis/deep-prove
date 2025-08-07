@@ -111,8 +111,8 @@ mod test {
         init_test_logging_default();
         let (model, input) = Model::random(4).unwrap();
         model.describe();
-        let trace = model.run(&input).unwrap();
-        let io = trace.to_verifier_io();
+        let trace = model.run(&input, &mut Default::default()).unwrap();
+        let io = trace.to_verifier_io().unwrap();
         let ctx =
             Context::<F, Pcs<F>>::generate(&model, None, None).expect("unable to generate context");
         let mut prover_transcript = default_transcript();
@@ -127,8 +127,8 @@ mod test {
         init_test_logging_default();
         let (model, input) = Model::random_pooling(4).unwrap();
         model.describe();
-        let trace = model.run(&input).unwrap();
-        let io = trace.to_verifier_io();
+        let trace = model.run(&input, &mut Default::default()).unwrap();
+        let io = trace.to_verifier_io().unwrap();
         let ctx =
             Context::<F, Pcs<F>>::generate(&model, None, None).expect("unable to generate context");
         let mut prover_transcript = default_transcript();

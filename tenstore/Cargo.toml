@@ -1,0 +1,18 @@
+[package]
+name = "tenstore"
+description = "a facade to store & retrieve tensor backings"
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+compact_str.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+weight-lru = "0.0.3"

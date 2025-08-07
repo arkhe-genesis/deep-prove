@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt::Debug,
 };
+use tenstore::{TenStore, TensorKey};
 use transcript::Transcript;
 
 use crate::{
@@ -52,21 +53,42 @@ use super::{
 #[display("#{_0}")]
 pub struct NodeId(usize);
 
-/// Represents a link between an input/output wire of a node with an input/output wire of
-/// another node.
+/// Represents a link between an input/output wire of a node with an
+/// input/output wire of another node.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Edge {
-    // Reference to the node linked to this wire, will be `None` if the wire is an input or
-    // output of the model
+    // Reference to the node linked to this wire, will be `None` if the wire is
+    // an input or output of the model
     pub(crate) node: Option<NodeId>,
     // The index of the wire of `node` which is linked to this wire
     pub(crate) index: usize,
 }
+impl Edge {
+    pub(crate) fn tensor_key_as_input<T>(&self) -> TensorKey<T> {
+        Self::tkey_for_input::<T>(self.node, self.index)
+    }
+
+    pub fn tkey_for_input<T>(n: Option<NodeId>, idx: usize) -> TensorKey<T> {
+        TensorKey::from_str(format!(
+            "{}-{}",
+            n.map(|x| x.to_string()).unwrap_or("INPUT".into()),
+            idx
+        ))
+    }
+
+    pub fn tkey_for_output<T>(n: Option<NodeId>, idx: usize) -> TensorKey<T> {
+        TensorKey::from_str(format!(
+            "{}-{}",
+            n.map(|x| x.to_string()).unwrap_or("OUTPUT".into()),
+            idx
+        ))
+    }
+}
 
 impl Edge {
-    pub fn new(node: NodeId, index: usize) -> Self {
+    pub fn new(source: NodeId, index: usize) -> Self {
         Self {
-            node: Some(node),
+            node: Some(source),
             index,
         }
     }
@@ -228,6 +250,7 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
         }
     }
 }
+
 /// Represents the proving context for a given node, altogether with the input
 /// and output edges of the node
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -383,7 +406,7 @@ pub trait Evaluate<T: Number> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<T>],
-        unpadded_input_shapes: Vec<Shape>,
+        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<T, E>>;
 }
 
@@ -392,7 +415,7 @@ pub trait Evaluate<T: Number> {
 pub fn evaluate_layer<E: ExtensionField, T: Number, O: Evaluate<T>>(
     layer: &O,
     inputs: &[&Tensor<T>],
-    unpadded_input_shapes: Option<Vec<Shape>>,
+    unpadded_input_shapes: Option<&[Shape]>,
 ) -> Result<LayerOut<T, E>> {
     layer.evaluate(inputs, unpadded_input_shapes.unwrap_or_default())
 }
@@ -491,6 +514,7 @@ where
         _last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
         _prover: &mut Prover<'c, 'd, E, T, PCS>,
+        _store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
         assert!(
@@ -506,6 +530,7 @@ where
         _id: NodeId,
         _ctx: &'a Context<'a, E, PCS>,
         _step_data: &'a StepData<Element, E>,
+        _store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
         Ok(Default::default())
     }

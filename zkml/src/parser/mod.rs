@@ -13,6 +13,7 @@ use crate::{
 };
 use anyhow::{Context, Error, Result, bail, ensure};
 use itertools::Either;
+use tenstore::TenStore;
 use tracing::debug;
 use tract_onnx::{pb::ModelProto, prelude::*};
 
@@ -86,7 +87,12 @@ impl<'a, S: ScalingStrategy> FloatOnnxLoader<'a, S> {
         if self.keep_float {
             kept_float = Some(float_model.clone());
         }
-        let (quantized_model, mut md) = self.scaling_strategy.quantize(float_model)?;
+
+        // NOTE: this is running with the default store, which is reasonable for the current use.
+        // We may wish to change the store type depending on the workload in the future.
+        let (quantized_model, mut md) = self
+            .scaling_strategy
+            .quantize(float_model, &mut TenStore::default())?;
         let padded_model = pad_model(quantized_model)?;
         md.float_model = kept_float;
         Ok((padded_model, md))
@@ -515,14 +521,13 @@ pub mod file_cache {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-
     use crate::{
         Context, Prover, ScalingFactor, init_test_logging_default, quantization::InferenceObserver,
         testing::Pcs, verify,
     };
     use ff_ext::GoldilocksExt2;
+    use tenstore::TenStore;
     use tracing::info;
     use transcript::BasicTranscript;
 
@@ -551,7 +556,7 @@ mod tests {
         let input =
             crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0]).quantize(&md.input[0]);
         let input = model.prepare_inputs(vec![input]).unwrap();
-        let trace = model.run::<F>(&input).unwrap();
+        let trace = model.run::<F>(&input, &mut TenStore::default()).unwrap();
         println!("Result: {:?}", trace.outputs());
     }
 
@@ -591,7 +596,7 @@ mod tests {
             .collect();
         let input = model.prepare_inputs(inputs).unwrap();
         info!("RUNNING MODEL...");
-        let trace = model.run::<F>(&input).unwrap();
+        let trace = model.run::<F>(&input, &mut TenStore::default()).unwrap();
         info!("RUNNING MODEL DONE...");
         println!("Result: {:?}", trace.outputs());
 
@@ -600,7 +605,7 @@ mod tests {
         let ctx = Context::<GoldilocksExt2, Pcs<GoldilocksExt2>>::generate(&model, None, None)
             .expect("Unable to generate context");
         info!("GENERATING CONTEXT DONE...");
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io().unwrap();
         info!("GENERATING Proof...");
         let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
@@ -639,7 +644,7 @@ mod tests {
             .map(|(shape, s)| crate::tensor::Tensor::<f32>::random(&shape).quantize(s))
             .collect();
         let input = model.prepare_inputs(native_input).unwrap();
-        let trace = model.run::<F>(&input).unwrap();
+        let trace = model.run::<F>(&input, &mut TenStore::default()).unwrap();
         println!("Result: {:?}", trace.outputs());
 
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
@@ -648,7 +653,7 @@ mod tests {
 
         let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
             Prover::new(&ctx, &mut tr);
-        let io = trace.to_verifier_io();
+        let io = trace.to_verifier_io().unwrap();
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");

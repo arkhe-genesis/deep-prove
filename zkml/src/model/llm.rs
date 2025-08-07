@@ -6,8 +6,9 @@
 
 use anyhow::{Context, ensure};
 use ff_ext::ExtensionField;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::Path;
+use tenstore::TenStore;
 use tracing::trace;
 
 use crate::{
@@ -76,7 +77,7 @@ impl Driver<f32> {
     }
 }
 
-impl<N: Number> Driver<N>
+impl<N: Number + Serialize + for<'a> Deserialize<'a>> Driver<N>
 where
     Layer<N>: Evaluate<N>,
 {
@@ -121,9 +122,9 @@ where
         while seq_len < max_window {
             trace = self
                 .model
-                .run::<E>(&[tensor.clone()])
+                .run::<E>(&[tensor.clone()], &mut TenStore::default())
                 .context(format!("running the {} iteration loop", seq_len - user_len))?;
-            let output = trace.output.last().unwrap();
+            let output = trace.output_at(trace.output.len() - 1).unwrap();
             let last_token = output.slice_last_dim().last().unwrap();
             ensure!(last_token.len() == 1, "Last token must be a single token");
             let last_token = last_token[0];
@@ -147,13 +148,16 @@ pub struct LLMTokenizerObserver<T: LLMTokenizer> {
     tokenizer: T,
 }
 
-impl<N: Number, T: LLMTokenizer> Observer<N> for LLMTokenizerObserver<T> {
+impl<N: Number + Serialize + for<'a> Deserialize<'a>, T: LLMTokenizer> Observer<N>
+    for LLMTokenizerObserver<T>
+{
     fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>) {
-        let tensor = trace.output.last().unwrap();
-        let new_token = tensor.get_data().last().unwrap();
+        let output_tensors = trace.outputs().unwrap();
+        let output = output_tensors.last().unwrap();
+        let new_token = output.get_data().last().unwrap();
         let new_token = Token::from(new_token.to_usize());
         let new_text = self.tokenizer.detokenize(
-            tensor
+            output
                 .get_data()
                 .iter()
                 .map(|t| Token::from(t.to_usize()))
@@ -206,7 +210,8 @@ mod test {
             },
         )?;
         let _output = trace
-            .output
+            .outputs()
+            .unwrap()
             .last()
             .unwrap()
             .get_data()
