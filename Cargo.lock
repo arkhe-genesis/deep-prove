@@ -3576,7 +3576,6 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
 dependencies = [
- "bitvec",
  "rand_core 0.6.4",
  "subtle",
 ]
@@ -5552,22 +5551,15 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "ark-std 0.5.0",
- "auto_impl",
- "bitvec",
  "blake3",
  "criterion 0.6.0",
  "ctr",
- "ff",
  "ff_ext",
  "itertools 0.13.0",
  "multilinear_extensions",
- "num-bigint",
  "num-integer",
- "p3",
  "p3-field",
  "p3-goldilocks",
- "p3-poseidon2",
- "p3-symmetric",
  "plonky2",
  "poseidon",
  "rand 0.8.5",
@@ -9458,7 +9450,6 @@ dependencies = [
  "anyhow",
  "bytesize",
  "csv",
- "flate2",
  "mem-track",
  "memory-stats",
  "thiserror 2.0.12",
@@ -10582,7 +10573,6 @@ dependencies = [
  "ndarray",
  "p3-field",
  "p3-goldilocks",
- "poseidon",
  "proptest",
  "prost 0.11.9",
  "prost 0.13.5",

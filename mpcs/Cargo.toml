@@ -12,18 +12,13 @@ version.workspace = true
 [dependencies]
 aes = { workspace = true }
 ark-std.workspace = true
-auto_impl = { workspace = true }
-bitvec = { workspace = true }
 ctr = { workspace = true }
 blake3.workspace = true
-ff.workspace = true
 ff_ext = { workspace = true }
 itertools.workspace = true
 multilinear_extensions = { workspace = true }
-num-bigint = { workspace = true }
 num-integer = { workspace = true }
 plonky2.workspace = true
-p3.workspace = true
 poseidon.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
@@ -33,8 +28,6 @@ thiserror = { workspace = true }
 transcript = { workspace = true }
 p3-field = { workspace = true }
 p3-goldilocks = { workspace = true }
-p3-poseidon2 = { workspace = true }
-p3-symmetric = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true

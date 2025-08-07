@@ -43,7 +43,6 @@ mpcs = { workspace = true }
 multilinear_extensions = { workspace = true, features = ["parallel"] }
 p3-field = { workspace = true }
 p3-goldilocks = { workspace = true }
-poseidon = { workspace = true }
 prost = { version = "0.13.3" }
 prost-tract-compat = { package = "prost", version = "0.11.9" }
 rayon.workspace = true
