@@ -1,0 +1,33 @@
+name: Create Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    if: startsWith( github.event.head_commit.message, 'release:' )
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Get package version from Cargo.toml
+        id: version
+        uses: nicolaiunrein/cargo-get@master
+        with:
+          subcommand: workspace.package.version
+
+      - name: Set version as tag
+        id: set-tag
+        run: echo "tag=${{ steps.version.outputs.metadata }}" >> $GITHUB_OUTPUT
+
+      - uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          omitBody: true
+          commit: "master"
+          tag: ${{ steps.set-tag.outputs.tag }}
+

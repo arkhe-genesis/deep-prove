@@ -75,10 +75,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Try to get the git version for image build as it won't be available inside it.
+      # This will be picked up and used by `get_version` macro if not empty.
+      - name: Get git version
+        id: git-version
+        run: (echo version=`git describe --dirty 2> /dev/null` || echo "version=''") >> $GITHUB_OUTPUT
+
       - name: Build Docker image
         run: |
           IMAGE_NAME="${{ matrix.image }}"
           docker build \
+            --build-arg GIT_DESC_VER="${{ steps.git-version.outputs.version }}" \
             -t $IMAGE_NAME:${{ github.sha }} \
             -f docker/${{ matrix.image }}.dockerfile \
             .

@@ -199,6 +199,7 @@ fn setup_logging(json: bool) {
 }
 
 #[derive(Parser)]
+#[command(version = deep_prove::get_version!(), about)]
 struct Args {
     #[command(subcommand)]
     run_mode: RunMode,

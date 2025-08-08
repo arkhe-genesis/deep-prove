@@ -5,7 +5,7 @@ use protox::prost::Message;
 
 fn main() -> miette::Result<()> {
     println!("cargo:rerun-if-changed=../.git");
-    // common_build::export_version_from_git();
+    export_version_from_git();
 
     println!("cargo:rerun-if-changed=../lagrange-protobuf/");
     let file_descriptors = protox::compile(["proto/lagrange.proto"], ["../lagrange-protobuf/"])?;
@@ -24,3 +24,26 @@ fn main() -> miette::Result<()> {
 
     Ok(())
 }
+
+/// If git is available, exports compile-time env var `GIT_DESC_VER` with version based on git tag,
+/// commits and uncommitted changes on top of tag.
+///
+/// This is used in conjunction with `deep_prove::get_version!()`.
+///
+/// # Example
+///
+/// ```
+/// println!("cargo:rerun-if-changed=../.git");
+/// let version = common_build::export_version_from_git();
+/// ```
+pub fn export_version_from_git() {
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["describe", "--dirty"])
+        .output()
+    {
+        let version =
+            String::from_utf8(output.stdout).expect("git describe output must be UTF8 string");
+        println!("cargo:rustc-env=GIT_DESC_VER={version}");
+    }
+}
+

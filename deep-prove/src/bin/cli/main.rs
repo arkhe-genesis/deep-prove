@@ -10,7 +10,7 @@ mod local;
 mod lpn;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = deep_prove::get_version!(), about)]
 struct Args {
     #[command(subcommand)]
     executor: Executor,
