@@ -53,11 +53,9 @@ async fn process_message_from_gw(
     };
 
     let reply = match result {
-        Ok(result) => lagrange::worker_done::Reply::TaskOutput(
-            rmp_serde::to_vec(&DeepProveResponse::V1(DeepProveResponseV1 {
-                proofs: result,
-            }))
-            .unwrap(),
+        Ok(outputs) => lagrange::worker_done::Reply::TaskOutput(
+            rmp_serde::to_vec(&DeepProveResponse::V1(DeepProveResponseV1 { outputs }))
+                .context("serializing outputs")?,
         ),
         Err(err) => {
             error!("failed to run model: {err:?}");

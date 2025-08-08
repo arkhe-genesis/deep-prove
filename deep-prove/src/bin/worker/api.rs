@@ -82,12 +82,12 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
                     info!("processing proof...");
                     let result = crate::run_model_v1(proof_request, store.clone()).await;
                     match result {
-                        Ok(proofs) => {
+                        Ok(output) => {
                             info!("proof generated in {}s", now.elapsed().as_secs());
                             app_state.lock().await.proofs_queue.extend(
-                                proofs
+                                output
                                     .into_iter()
-                                    .map(|proof| serde_json::to_string_pretty(&proof).unwrap()),
+                                    .map(|output| serde_json::to_string_pretty(&output).unwrap()),
                             );
                         }
                         Err(err) => error!("failed to generate proof: {err:?}"),

@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use deep_prove::{
-    middleware::v1::{DeepProveRequest as DeepProveRequestV1, Proof as ProofV1},
+    middleware::v1::{self, DeepProveRequest as DeepProveRequestV1},
     store::{self, MemStore, S3Store, Store},
 };
 use ff_ext::GoldilocksExt2;
@@ -30,7 +30,10 @@ type Pcs<E> = Basefold<E, BasefoldRSParams<Hasher>>;
 /// From a proof request wrapped in a [`DeepProveRequestV1`] and a [`Store`]
 /// implementation (to interact with the PPs), attempt to generate proofs for a
 /// list of inputs.
-async fn run_model_v1<S: Store>(model: DeepProveRequestV1, mut store: S) -> Result<Vec<ProofV1>> {
+async fn run_model_v1<S: Store>(
+    model: DeepProveRequestV1,
+    mut store: S,
+) -> Result<Vec<v1::Output>> {
     info!("Proving inference");
     let DeepProveRequestV1 {
         model,
@@ -128,8 +131,9 @@ async fn run_model_v1<S: Store>(model: DeepProveRequestV1, mut store: S) -> Resu
                     let proof = prover
                         .prove(&trace)
                         .with_context(|| "unable to generate proof for {i}th input")?;
+                    let outputs = trace.outputs()?;
 
-                    proofs.push(proof);
+                    proofs.push(v1::Output { outputs, proof});
                 }
                 Err(e) => {
                     error!(

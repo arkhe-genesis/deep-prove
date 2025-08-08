@@ -153,10 +153,10 @@ pub async fn connect(gw_config: Executor) -> anyhow::Result<()> {
                 let task_id = task_id.unwrap();
                 let task_output: DeepProveResponse = rmp_serde::from_slice(&task_output)?;
                 match task_output {
-                    DeepProveResponse::V1(v1::DeepProveResponse { proofs }) => {
+                    DeepProveResponse::V1(v1::DeepProveResponse { outputs }) => {
                         let uuid = uuid::Uuid::from_slice(&task_id.id).unwrap_or_default();
                         info!("Received proof for task {uuid}",);
-                        for (i, proof) in proofs.iter().enumerate() {
+                        for (i, output) in outputs.iter().enumerate() {
                             std::fs::File::create(
                                 filename
                                     .as_ref()
@@ -164,7 +164,7 @@ pub async fn connect(gw_config: Executor) -> anyhow::Result<()> {
                                     .unwrap_or_else(|| format!("{uuid}-{i}.bin")),
                             )
                             .context("failed to create proof file")?
-                            .write_all(serde_json::to_string(proof).unwrap().as_bytes())
+                            .write_all(serde_json::to_string(output).unwrap().as_bytes())
                             .context("failed to write proof")?;
                         }
                     }
