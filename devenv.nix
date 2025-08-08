@@ -6,12 +6,14 @@
   packages = [
     # General dev.
     pkgs.git pkgs.openssl pkgs.cmake
-    # Rust
-    pkgs.rustup pkgs.protobuf pkgs.openssl
+    # Rust crates build deps
+    pkgs.protobuf pkgs.openssl
+    pkgs.llvmPackages.libclang.lib
   ];
 
   env = {
     OPENSSL_DEV = pkgs.openssl.dev;
+    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
   };
 
   # https://devenv.sh/tasks/
@@ -25,6 +27,11 @@
   cargo test --release -p zkml -- --test-threads 1
   '';
 
+  languages.rust = {
+    enable = true;
+    channel = "nightly";
+    version = "2025-05-22";
+  };
   languages.python = {
     enable = true;
     venv.enable = true;
