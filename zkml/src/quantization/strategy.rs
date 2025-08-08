@@ -9,10 +9,10 @@ use std::collections::HashMap;
 
 use crate::{Element, Tensor, quantization};
 use anyhow::{Result, anyhow, ensure};
+use average::{Estimate, Max, Min, Quantile, Variance};
 use ff_ext::GoldilocksExt2;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use statrs::statistics::{Data, Max, Min};
 use tenstore::TenStore;
 use tracing::{debug, info, warn};
 
@@ -86,7 +86,11 @@ impl ScalingStrategy for InferenceObserver {
         model: Model<f32>,
         store: &mut TenStore,
     ) -> Result<(Model<Element>, ModelMetadata)> {
-        let mut tracker = InferenceTracker::new();
+        let tracking_mode = InferenceTrackingMode::MinMax;
+        // Alternatively:
+        // let tracking_mode = InferenceTrackingMode::Quantiles(0.05, 0.95);
+        // let tracking_mode = InferenceTrackingMode::NSigmas(3);
+        let mut tracker = InferenceTracker::new(tracking_mode);
         let input_shapes = model.input_shapes();
         let input_not_padded_shapes = model.unpadded_input_shapes();
         let inputs = if self.inputs.is_empty() {
@@ -132,7 +136,7 @@ impl ScalingStrategy for InferenceObserver {
         let num_model_inputs = input_not_padded_shapes.len();
         let input_scaling = (0..num_model_inputs)
             .map(|i| {
-                let (input_min, input_max) = tracker.distribution_info(INPUT_TRACKING_ID.into(), i);
+                let (input_min, input_max) = tracker.scaling_range(INPUT_TRACKING_ID.into(), i);
                 ScalingFactor::from_absolute_max(input_min.abs().max(input_max.abs()), None)
             })
             .collect_vec();
@@ -146,51 +150,109 @@ impl ScalingStrategy for InferenceObserver {
     ) -> Vec<ScalingFactor> {
         (0..num_outputs)
             .map(|i| {
-                let (min, max) = tracker.distribution_info(node_id, i);
+                let (min, max) = tracker.scaling_range(node_id, i);
                 ScalingFactor::from_absolute_max(min.abs().max(max.abs()), None)
             })
             .collect()
     }
 }
 
+/// The inference tracker observes the execution of a model over a given set of
+/// inputs to determine adequate scaling factors for each node.
 pub struct InferenceTracker {
-    /// For each output of each node in the model of interest, we track all the values of the tensor
-    data: HashMap<(NodeId, usize), Vec<f64>>,
+    /// What statistics to estimate.
+    mode: InferenceTrackingMode,
+    /// Streaming estimator of the selected statistics for each output of each
+    /// node.
+    accumulators: HashMap<(NodeId, usize), InferenceTrackingAccumulator>,
 }
+/// Selects the statistic to use to generate the scaling range.
+enum InferenceTrackingMode {
+    /// Register the min. and max. values encountered for each node.
+    MinMax,
+    /// Estimate the p- and q-quantiles from the encountered distribution of values.
+    #[allow(dead_code)]
+    Quantiles(f32, f32),
+    /// Assume the distribution is gaussian and return the mean +/- n std. dev.
+    #[allow(dead_code)]
+    NSigmas(i32),
+}
+impl InferenceTrackingMode {
+    /// Return a new accumulator adequate for this tracking mode.
+    fn new_accumulator(&self) -> InferenceTrackingAccumulator {
+        match self {
+            InferenceTrackingMode::MinMax => {
+                InferenceTrackingAccumulator::MinMax(Min::new(), Max::new())
+            }
+            InferenceTrackingMode::Quantiles(p, q) => InferenceTrackingAccumulator::Quantiles(
+                Box::new(Quantile::new(*p as f64)),
+                Box::new(Quantile::new(*q as f64)),
+            ),
+            InferenceTrackingMode::NSigmas(n) => {
+                InferenceTrackingAccumulator::NSigmas(*n as f32, Variance::new())
+            }
+        }
+    }
+}
+/// Aggregate, in a streaming fashion, statistics for the encountered values in
+/// the given output of a node.
+enum InferenceTrackingAccumulator {
+    MinMax(Min, Max),
+    Quantiles(Box<Quantile>, Box<Quantile>),
+    NSigmas(f32, Variance),
+}
+impl InferenceTrackingAccumulator {
+    fn scaling_range(&self) -> (f32, f32) {
+        match self {
+            InferenceTrackingAccumulator::MinMax(min, max) => (min.min() as f32, max.max() as f32),
+            InferenceTrackingAccumulator::Quantiles(p, q) => {
+                (p.quantile() as f32, q.quantile() as f32)
+            }
+            InferenceTrackingAccumulator::NSigmas(n, variance) => (
+                variance.mean() as f32 - n * variance.sample_variance() as f32,
+                variance.mean() as f32 + n * variance.sample_variance() as f32,
+            ),
+        }
+    }
 
+    fn add(&mut self, x: f64) {
+        match self {
+            InferenceTrackingAccumulator::MinMax(min, max) => {
+                min.add(x);
+                max.add(x);
+            }
+            InferenceTrackingAccumulator::Quantiles(p, q) => {
+                p.add(x);
+                q.add(x);
+            }
+            InferenceTrackingAccumulator::NSigmas(_, variance) => {
+                variance.add(x);
+            }
+        }
+    }
+}
 impl InferenceTracker {
-    fn new() -> Self {
+    fn new(mode: InferenceTrackingMode) -> Self {
         Self {
-            data: HashMap::new(),
+            mode,
+            accumulators: HashMap::new(),
         }
     }
     pub(crate) fn track(&mut self, node_id: NodeId, output_index: usize, output: Tensor<f32>) {
-        self.data
+        let accumulator = self
+            .accumulators
             .entry((node_id, output_index))
-            .or_default()
-            .extend(output.get_data().iter().map(|x| *x as f64));
+            .or_insert_with(|| self.mode.new_accumulator());
+        for x in output.get_data() {
+            accumulator.add(*x as f64);
+        }
     }
 
-    /// Returns the 0.05 and 0.95 quantiles of the distribution of the output values of the layer.
-    pub(crate) fn distribution_info(&self, node_id: NodeId, output_index: usize) -> (f32, f32) {
-        let d: Data<Vec<f64>> = Data::new(
-            self.data
-                .get(&(node_id, output_index))
-                .unwrap_or_else(|| {
-                    panic!("No data for output tensor {output_index} of node {node_id}")
-                })
-                .clone(),
-        );
-        // let min = d.percentile(5) as f32;
-        // let max = d.percentile(95) as f32;
-        // assert!(min <= max);
-        //(min, max)
-        (d.min() as f32, d.max() as f32)
-        // let mean = d.mean().unwrap();
-        // let std_dev = d.std_dev().unwrap();
-        // let upper_bound = mean + 3.0 * std_dev;
-        // let lower_bound = mean - 3.0 * std_dev;
-        //(lower_bound as f32, upper_bound as f32)
+    pub(crate) fn scaling_range(&self, node_id: NodeId, output_index: usize) -> (f32, f32) {
+        self.accumulators
+            .get(&(node_id, output_index))
+            .unwrap()
+            .scaling_range()
     }
 }
 

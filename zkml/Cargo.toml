@@ -28,11 +28,14 @@ mem-track = ["utils/mem-track"]
 [dependencies]
 anyhow.workspace = true
 ark-std.workspace = true
+average = { version = "0.16.0", features = ["std"] }
 burn = { version = "0.18.0", default-features = false }
 burn-cubecl = { version = "0.18.0", default-features = false, optional = true }
 candle-core = "0.9.1"
 clap = { workspace = true, features = ["derive", "env"] }
-cubecl = { version = "0.6.0", default-features = false, features = ["wgpu-msl"], optional = true }
+cubecl = { version = "0.6.0", default-features = false, features = [
+  "wgpu-msl",
+], optional = true }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }
@@ -51,7 +54,6 @@ rust_tokenizers = "8.1.1"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = { version = "0.10.9", optional = true }
-statrs = { workspace = true }
 sumcheck.workspace = true
 tenstore = { path = "../tenstore" }
 timed = { workspace = true }
