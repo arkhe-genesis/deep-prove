@@ -70,7 +70,6 @@ jobs:
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --branch "$GITHUB_HEAD_REF" \
           --start-point master \
-          --start-point-hash '${{ github.event.pull_request.base.sha }}' \
           --start-point-clone-thresholds \
           --start-point-reset \
           --testbed ci-runner \
