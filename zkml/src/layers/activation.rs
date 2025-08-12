@@ -1,5 +1,5 @@
 use crate::{
-    Claim, Context, Element, Prover, ScalingFactor,
+    Claim, Element, Prover, ProverContext, ScalingFactor,
     commit::same_poly,
     gpu::zkml_gelu,
     iop::{
@@ -242,7 +242,7 @@ where
     fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &'a Context<'a, E, PCS>,
+        ctx: &'a ProverContext<'a, E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
@@ -423,16 +423,8 @@ impl<N> Activation<N> {
         let mut same_poly_prover = same_poly::Prover::<E>::new(output.to_vec().into_mle());
         same_poly_prover.add_claim(last_claim.clone())?;
         // Activation proofs have two columns, input and output
-        let input_claim = logup_proof.output_claims()[0].clone();
-        let input_claim = match &self {
-            Activation::Gelu(g) => {
-                let m: E = g.quant_data.as_ref().unwrap().multiplier.to_field();
-                let mi = m.inverse();
-                let eval = input_claim.eval * mi;
-                Claim::new(input_claim.point.clone(), eval)
-            }
-            _ => input_claim,
-        };
+        let mut input_claim = logup_proof.output_claims()[0].clone();
+
         let output_claim = logup_proof.output_claims()[1].clone();
 
         same_poly_prover.add_claim(output_claim)?;
@@ -460,6 +452,13 @@ impl<N> Activation<N> {
                 commits,
             }),
         );
+
+        if let Activation::Gelu(g) = self {
+            let m: E = g.quant_data.as_ref().unwrap().multiplier.to_field();
+            let mi = m.inverse();
+            input_claim.eval *= mi;
+        }
+
         Ok(input_claim)
     }
 }
@@ -660,12 +659,16 @@ impl GELU<f32> {
         // During lookup, we basically scale down back to the original
         // float value, apply GELU and multiply by 128 which is right now the output maximum range.
         let multiplier = (GELU_SCALE_FACTOR as f32 * input_scaling.scale()).round() as Element;
+        assert!(
+            multiplier > 0,
+            "multiplier GELU is 0 -> change the scale factor"
+        );
         let table_min = -2i32.pow(7 + ceil_log2(multiplier as usize) as u32);
         let table_max = 2i32.pow(7 + ceil_log2(multiplier as usize) as u32);
         let table_size = table_max - table_min;
         assert!((table_size as usize).is_power_of_two());
         assert!(
-            table_size <= 1 << 20,
+            table_size <= 1 << 25,
             "Table size for GELU is too bigggg: {:?}",
             table_size.ilog2()
         );
@@ -708,7 +711,7 @@ mod test {
 
     #[test]
     fn test_activation_gelu_proving() -> anyhow::Result<()> {
-        let input_shape = vec![3, 5].into();
+        let input_shape = vec![3, 100].into();
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
         model.add_consecutive_layer(
             Layer::Activation(Activation::Gelu(GELU::<f32>::new())),

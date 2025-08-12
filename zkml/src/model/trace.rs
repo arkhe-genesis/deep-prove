@@ -98,6 +98,7 @@ where
                                 .into_fields(store.clone())
                                 .expect("should not fail"),
                             unpadded_output_shapes: step.step_data.unpadded_output_shapes,
+                            unpadded_input_shapes: step.step_data.unpadded_input_shapes,
                         },
                     },
                 ))
@@ -115,6 +116,15 @@ where
     pub fn outputs(&self) -> anyhow::Result<Vec<Tensor<D>>> {
         Ok(self
             .output
+            .iter()
+            .map(|dry| dry.hydrate(self.store.clone()))
+            .collect::<Result<Vec<_>, TenstoreError>>()?)
+    }
+
+    /// Get the inputs tensors of the inference represented by this trace
+    pub fn inputs(&self) -> anyhow::Result<Vec<Tensor<D>>> {
+        Ok(self
+            .input
             .iter()
             .map(|dry| dry.hydrate(self.store.clone()))
             .collect::<Result<Vec<_>, TenstoreError>>()?)
@@ -224,6 +234,7 @@ pub struct StepData<D, E: ExtensionField> {
     pub(crate) node_inputs: Vec<DryTensor<D>>,
     pub(crate) node_outputs: NodeOut<D, E>,
     pub(crate) unpadded_output_shapes: Vec<Shape>,
+    pub(crate) unpadded_input_shapes: Vec<Shape>,
 }
 impl<D: Serialize + for<'a> Deserialize<'a>, E: ExtensionField> StepData<D, E> {
     /// Hydrate all the input tensors of the node corresponding to this step.
@@ -286,6 +297,7 @@ impl<E: ExtensionField> StepData<Element, E> {
                 .collect::<Result<Vec<_>, TenstoreError>>()?,
             node_outputs: self.node_outputs.to_dequantize(md, store, node_id)?,
             unpadded_output_shapes: self.unpadded_output_shapes.clone(),
+            unpadded_input_shapes: self.unpadded_input_shapes.clone(),
         })
     }
 }

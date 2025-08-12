@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     iter::once,
 };
@@ -64,13 +65,52 @@ pub struct PositionalProof<E> {
 pub struct Learned<N> {
     positional: Tensor<N>,
     unpadded_shape: Shape,
+    past_length: RefCell<LearnedCache>,
     add_layer: Add<N>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LearnedCache {
+    seq_len: usize,
+    initialized: bool,
+}
+
+impl LearnedCache {
+    fn new() -> Self {
+        Self {
+            seq_len: 0,
+            initialized: false,
+        }
+    }
+    fn set_seq_len(&mut self, seq_len: usize) -> anyhow::Result<()> {
+        if !self.initialized {
+            self.seq_len = seq_len;
+            self.initialized = true;
+        } else {
+            ensure!(
+                self.seq_len + 1 == seq_len,
+                "with caching, new seq_len should be old one + 1 = {} + 1 vs given {}",
+                self.seq_len,
+                seq_len
+            );
+            self.seq_len = seq_len;
+        }
+        Ok(())
+    }
+    fn reset(&mut self) {
+        self.seq_len = 0;
+        self.initialized = false;
+    }
 }
 
 impl<N> Learned<N> {
     fn num_vars(&self) -> usize {
         let num_vars = self.positional.shape().num_vars_2d();
         num_vars.0 + num_vars.1
+    }
+
+    pub(crate) fn reset_cache(&self) {
+        self.past_length.borrow_mut().reset();
     }
 
     // Sample from the transcript `t` `num_coordinates` random coordinates to be employed
@@ -133,7 +173,7 @@ pub enum Positional<N> {
 }
 
 impl<N: Number> Positional<N> {
-    pub fn get_shape(&self) -> Shape {
+    pub fn shape(&self) -> Shape {
         match self {
             Self::Learned(pos) => pos.positional.shape(),
             Self::Rope => unimplemented!("Rope not implemented"),
@@ -145,6 +185,7 @@ impl<N: Number> Positional<N> {
         Self::Learned(Learned {
             positional: matrix,
             unpadded_shape,
+            past_length: RefCell::new(LearnedCache::new()),
             add_layer: Add::new(),
         })
     }
@@ -157,28 +198,45 @@ where
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: &[Shape],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
-            inputs.iter().all(|x| x.rank() == 2),
-            "positional embeddings only support 2d tensors",
+            inputs.len() == 1,
+            "Positional layer expects 1 input, got {}",
+            inputs.len()
+        );
+        ensure!(
+            inputs.iter().all(|x| x.shape().len() == 2),
+            "positional embeddings only support 2d tensors"
         );
 
-        let outputs = match self {
-            Positional::Learned(pos) => inputs
-                .iter()
-                .map(|x| {
-                    let sub_pos = pos.positional.slice_2d(0, x.shape()[0]);
+        let outputs = inputs
+            .iter()
+            .map(|x| match self {
+                Self::Learned(pos) => {
+                    let past_length = pos.past_length.borrow().seq_len;
+                    let sub_pos = pos
+                        .positional
+                        .slice_2d(past_length, past_length + x.shape()[0]);
+                    pos.past_length
+                        .borrow_mut()
+                        .set_seq_len(past_length + unpadded_input_shapes[0][0])?;
                     pos.add_layer
                         .evaluate::<E>(&[x, &sub_pos], &vec![pos.unpadded_shape.clone(); 2])?
                         .outputs
                         .pop()
                         .context("Expected at least 1 output from add in positional encoding layer")
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            Positional::Rope => anyhow::bail!("Rope not implemented"),
-        };
-
+                }
+                Self::Rope => {
+                    anyhow::bail!("Rope not implemented");
+                }
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(
+            outputs.len() == 1,
+            "Expected 1 output from positional layer, got {}",
+            outputs.len()
+        );
         Ok(LayerOut::from_vec(outputs))
     }
 }
@@ -213,11 +271,7 @@ impl<N: Number> OpInfo for Positional<N> {
     }
 
     fn describe(&self) -> String {
-        format!(
-            "Positional({:?}x{:?})",
-            self.get_shape()[0],
-            self.get_shape()[1]
-        )
+        format!("Positional({:?}x{:?})", self.shape()[0], self.shape()[1])
     }
 
     fn is_provable(&self) -> bool {
@@ -291,6 +345,7 @@ impl QuantizeOp for Positional<f32> {
         let quantized_pos = Learned {
             positional: pos.positional.quantize(&pos_scaling),
             unpadded_shape: pos.unpadded_shape,
+            past_length: RefCell::new(LearnedCache::new()),
             add_layer: quantized_add.quantized_op,
         };
 

@@ -28,7 +28,7 @@ pub fn causal_mask(num_heads: usize, q_len: usize, seq_len: usize) -> Tensor<f32
 }
 
 #[cfg(test)]
-pub(crate) mod test {
+pub(crate) mod manual_attention {
     use std::{fs::File, slice};
 
     use anyhow::{Context, ensure};
@@ -49,7 +49,7 @@ pub(crate) mod test {
         padding::PaddingMode,
         parser::{
             file_cache,
-            gguf::{FileTensorLoader, tests::GPT2_Q8_0_URL},
+            gguf::{FileTensorLoader, tests::GPT2_Q8_0},
             json::test::{TINY_GPT2_DEBUG_NAME, TINY_GPT2_NAME},
             llm::{Attention, FeedForward, LLMConfig, LLMModel},
         },
@@ -226,7 +226,7 @@ pub(crate) mod test {
             }
             let qkv = self
                 .qkv
-                .evaluate::<GoldilocksExt2>(&normed.outputs(), &[])?;
+                .evaluate::<GoldilocksExt2>(&normed.outputs(), &[normed.outputs()[0].shape()])?;
 
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_qkv_close(qkv.outputs()));
@@ -318,12 +318,13 @@ pub(crate) mod test {
 
     #[test]
     fn test_flat_attention_from_gguf() -> anyhow::Result<()> {
-        let path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(path)?;
         let config = LLMConfig::from_content(&loader)?;
         let LLMModel::GPT2(mut model) = config.model(&loader)?;
         println!("model: {:?}", config.specific_config);
-        for seq_len in [1, 10] {
+        // 10 for first seq_len, then 1 for subsequent token since we use caching
+        for seq_len in [10, 1] {
             let input = Tensor::<f32>::random(&vec![seq_len, config.embedding_size].into());
             let mut att = FlatAttention::new_from_parser(&config, model.blocks.remove(0)).unwrap();
             let flat_output = att.forward(&input, None).unwrap();
@@ -438,9 +439,10 @@ pub(crate) mod test {
         let embedded = llm_model
             .embeddings
             .evaluate::<GoldilocksExt2>(&[&input], &[])?;
-        let positioned = llm_model
-            .positional
-            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], &[])?;
+        let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
+            &[embedded.outputs()[0]],
+            &[embedded.outputs()[0].shape()],
+        )?;
         assert!(is_close(
             positioned.outputs()[0].get_data(),
             &gpt2_output.inputs_embeds
@@ -481,8 +483,8 @@ pub(crate) mod test {
         let _last_node_id = first_attention.write_to_model(&mut model, None, &config)?;
         model.route_output(None)?;
         let output1 =
-            model.run::<GoldilocksExt2>(slice::from_ref(&input), &mut TenStore::default())?;
-        let output = model.run_float(slice::from_ref(&input), &mut TenStore::default())?;
+            model.run::<GoldilocksExt2>(slice::from_ref(&input), None, &mut TenStore::default())?;
+        let output = model.run_float(slice::from_ref(&input))?;
         assert_eq!(output1.outputs()?[0].get_data(), output[0].get_data());
         println!("graph output: {:?}", output[0].shape());
         assert!(
@@ -523,11 +525,11 @@ pub(crate) mod test {
             .clone()
             .into_provable_model(&config, single_input.shape())?;
         model.describe();
-        model.run_float(slice::from_ref(&single_input), &mut TenStore::default())?;
+        model.run_float(slice::from_ref(&single_input))?;
 
         let model = llm_model.into_provable_model(&config, input.shape())?;
         model.describe();
-        let output = model.run_float(slice::from_ref(&input), &mut TenStore::default())?[0].clone();
+        let output = model.run_float(slice::from_ref(&input))?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,
         // we take the last element of the model output
         let output = output.slice_last_dim().last().unwrap();

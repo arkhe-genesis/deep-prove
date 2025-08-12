@@ -4,17 +4,30 @@
 //! The main usage of a driver for now is to run the LLM forward loop until a specific token or
 //! the maximum context length is reached. It will also be used to prepend a system model correctly.
 
-use anyhow::{Context, ensure};
+use crate::{
+    IO, Proof, Prover, ProverContext,
+    iop::context::{ContextIterator, VerifierContext},
+    layers::transformer::positional::Positional,
+    padding::PaddingMode,
+    quantization::{InferenceObserver, IntoElement, ScalingStrategy},
+    verify,
+};
+use anyhow::{Context as CC, ensure};
+use ark_std::rand::Rng;
 use ff_ext::ExtensionField;
+use itertools::Itertools;
+use mpcs::PolynomialCommitmentScheme;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::Path;
 use tenstore::TenStore;
-use tracing::trace;
+use tracing::{debug, info};
+use transcript::BasicTranscript;
 
 use crate::{
-    Tensor,
+    Element, Tensor,
     layers::{Layer, provable::Evaluate},
     model::{InferenceTrace, Model},
+    padding::pad_model,
     parser::{
         gguf, json,
         llm::{LLMConfig, Token},
@@ -26,15 +39,96 @@ pub trait Observer<N: Number> {
     fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>);
 }
 
-#[derive(Debug, Clone)]
+/// The main struct responsible for generating the trace and the proof related
+/// to LLM proving. This requires a wrapper on top of the model to drive the
+/// auto regressive loop correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Driver<N: Number> {
     model: Model<N>,
     config: LLMConfig,
     max_context: Option<usize>,
+    padding_mode: PaddingMode,
+}
+
+/// The main struct responsible for verifying the proof related to the LLM proving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct LLMContext<'a, E, PCS>
+where
+    E: ExtensionField + Serialize + DeserializeOwned,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    pub prover_ctx: ProverContext<'a, E, PCS>,
+    pub verifier_ctx: VerifierContext<E, PCS>,
+    pub config: LLMConfig,
+    pub max_context: Option<usize>,
+}
+
+pub struct LLMContextIterator<'a, E, PCS>
+where
+    E: ExtensionField + Serialize + DeserializeOwned,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    context_iterator: ContextIterator<'a, E, PCS>,
+    config: LLMConfig,
+    max_context: Option<usize>,
+}
+
+impl<'a, E, PCS> Iterator for LLMContextIterator<'a, E, PCS>
+where
+    E: ExtensionField + Serialize + DeserializeOwned,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    type Item = anyhow::Result<(usize, LLMContext<'a, E, PCS>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.context_iterator.next().map(|item| {
+            item.map(|(poly_size, (prover_ctx, verifier_ctx))| {
+                (
+                    poly_size,
+                    LLMContext {
+                        prover_ctx,
+                        verifier_ctx,
+                        config: self.config.clone(),
+                        max_context: self.max_context,
+                    },
+                )
+            })
+        })
+    }
+}
+
+impl<'a, E, PCS> LLMContext<'a, E, PCS>
+where
+    E: ExtensionField + Serialize + DeserializeOwned,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    pub fn with_max_context(mut self, max_context: usize) -> Self {
+        self.max_context = Some(max_context);
+        self
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct LLMProof<E, PCS>
+where
+    E: ExtensionField + Serialize + DeserializeOwned,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    pub proof: Proof<E, PCS>,
+    /// Note the IO contains the _full_ input, e.g. the user input + the generated tokens
+    pub io: IO<E>,
 }
 
 impl Driver<f32> {
-    pub fn load_model<S: AsRef<Path>>(path: S) -> anyhow::Result<Self> {
+    /// Loads a model from a gguf or json external file. It returns the raw model in float precision.
+    pub fn load_external_model<S: AsRef<Path>>(path: S) -> anyhow::Result<Self> {
         // detect the type of the model info, either json or gguf depending on the file extension
         let (config, llm_model) = match path
             .as_ref()
@@ -68,12 +162,56 @@ impl Driver<f32> {
         // even though the llm runtime doesn't care about the model input shape, which is designed for "static" input shapes, we still
         // need to provide one.
         let init_user_shape = Shape::from(vec![1]);
-        let model = llm_model.into_provable_model(&config, init_user_shape)?;
+        let model = llm_model.into_runnable_model(&config, init_user_shape)?;
         Ok(Self {
             model,
             config,
             max_context: None,
+            padding_mode: PaddingMode::NoPadding,
         })
+    }
+
+    pub fn into_runnable_llm(mut self) -> anyhow::Result<Driver<Element>> {
+        let numel = self.max_context.unwrap_or(self.config.context_length);
+        let n_inputs = 1;
+        let representative_inputs = (0..n_inputs)
+            .map(|_| {
+                self.random_sequence(numel)
+                    .into_iter()
+                    .map(|t| t.as_number())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        self.model.unpadded_input_shapes = vec![Shape::from(vec![numel])];
+        self.model.input_shapes = vec![Shape::from(vec![numel, 1])];
+        let (quantized_model, _md) =
+            InferenceObserver::new_with_representative_input(vec![representative_inputs])
+                .quantize(self.model, &mut TenStore::default())?;
+        Ok(Driver {
+            model: quantized_model,
+            config: self.config,
+            max_context: self.max_context,
+            padding_mode: PaddingMode::NoPadding,
+        })
+    }
+
+    /// Transform the model into a provable llm model with quantization and padding done.
+    /// The result can be serialized and deserialized at will to serve inference+proving for this model.
+    pub fn into_provable_llm(self) -> anyhow::Result<Driver<Element>> {
+        let quantized_llm = self.into_runnable_llm()?;
+        quantized_llm.pad_model()
+    }
+
+    pub fn run<E>(
+        &self,
+        input: Vec<Token>,
+        observer: Option<impl Observer<f32>>,
+    ) -> anyhow::Result<InferenceTrace<'_, E, f32>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+    {
+        self.run_internal::<E>(input, observer)
     }
 }
 
@@ -81,11 +219,17 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Driver<N>
 where
     Layer<N>: Evaluate<N>,
 {
-    pub fn new(model: Model<N>, config: LLMConfig, max_context: Option<usize>) -> Self {
+    pub fn new(
+        model: Model<N>,
+        config: LLMConfig,
+        max_context: Option<usize>,
+        padding_mode: PaddingMode,
+    ) -> Self {
         Self {
             model,
             config,
             max_context,
+            padding_mode,
         }
     }
     pub fn with_max_context(mut self, max_context: usize) -> Self {
@@ -93,78 +237,345 @@ where
         self
     }
 
+    pub fn random_sequence(&self, len: usize) -> Vec<Token> {
+        let mut rng = crate::rng_from_env_or_random();
+        (0..len)
+            .map(|_| Token::from(rng.gen_range(0..self.config.vocab_size)))
+            .collect()
+    }
+
     /// Runs take the _already_ tokenized input and run the model until the maximum sequence length is reached OR until a eos token is generated.
     /// The returned trace contains the _whole_ sequence.
-    pub fn run_inference<E>(
-        &mut self,
+    fn run_internal<E>(
+        &self,
         input: Vec<Token>,
-        observer: impl Observer<N>,
+        observer: Option<impl Observer<N>>,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
     {
         let eos_token: N = self.config.specific_config.eos_token().as_number();
-        let mut seq_len = input.len();
-        let user_len = seq_len;
+        let user_len = input.len();
         // -1 because we at least want to generate ONE token
         ensure!(
-            seq_len < self.config.context_length - 1,
+            user_len < self.config.context_length - 1,
             "Input sequence length must be less than the context length"
         );
-        let mut trace = InferenceTrace::default();
-        // convert the input to the correct number type and add a dimension to make it 2d, because the embeddings layer expects a 2d tensor
-        let mut tensor = Tensor::new(
-            vec![input.len()].into(),
-            input.into_iter().map(|t| t.as_number()).collect::<Vec<_>>(),
-        );
+        let input_tokens = input
+            .into_iter()
+            .map(|t| t.as_number::<N>())
+            .collect::<Vec<_>>();
+
+        let mut tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone());
         let max_window = self.max_context.unwrap_or(self.config.context_length);
-        while seq_len < max_window {
-            trace = self
-                .model
-                .run::<E>(&[tensor.clone()], &mut TenStore::default())
-                .context(format!("running the {} iteration loop", seq_len - user_len))?;
-            let output = trace.output_at(trace.output.len() - 1).unwrap();
-            let last_token = output.slice_last_dim().last().unwrap();
-            ensure!(last_token.len() == 1, "Last token must be a single token");
-            let last_token = last_token[0];
+
+        ensure!(
+            tensor
+                .get_data()
+                .iter()
+                .all(|t| t.to_usize() < self.config.vocab_size),
+            "Input tokens must be less than the vocabulary size"
+        );
+        let mut full_tokens = tensor.get_data().to_vec();
+        let mut unpadded_seq_len = user_len;
+        // convert the input to the correct number type and add a dimension to make it 2d, because the embeddings layer expects a 2d tensor
+        // This means we're padding the input to the right size (e.g. next power of two)
+        while unpadded_seq_len <= max_window {
+            info!(
+                "Running iteration {} with input tensor {:?}",
+                unpadded_seq_len,
+                tensor.shape()
+            );
+            let mut store = TenStore::default();
+            let trace = if let PaddingMode::NoPadding = self.padding_mode {
+                self.model
+                    // TODO: make it re-usable at least for the static weights
+                    .run::<E>(&[tensor.clone()], Some(vec![tensor.shape()]), &mut store)
+            } else {
+                let unpadded_shape = tensor.shape();
+                let padded = tensor.pad_next_power_of_two();
+                info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
+                self.model
+                    .run::<E>(&[padded], Some(vec![unpadded_shape]), &mut store)
+            }
+            .context(format!(
+                "runng the {} iteration loop",
+                unpadded_seq_len - user_len
+            ))?;
+            ensure!(
+                trace.output.len() == 1,
+                "expected 1 output, got {}",
+                trace.output.len()
+            );
+            let output = trace.outputs().unwrap().into_iter().last().unwrap();
+            // We take the last token before the padding
+            let output_tokens_len = output.get_data().len();
+            let last_token = if output_tokens_len == 1 {
+                *output.get_data().last().expect("last token must exist")
+            } else {
+                output.get_data()[unpadded_seq_len - 1]
+            };
+            tensor = Tensor::new(Shape::new(vec![1]), vec![last_token]);
+            full_tokens.push(last_token);
             if last_token == eos_token {
                 break;
             }
-            // NOTE: For now, since we are NOT using any caching for the inference, we DON'T need to concat the inferences on top of each other
-            // input = input.concat(last_token);
-            // We simply need to take the _last_ inference trace that would contain _everything_
-            seq_len += 1;
-            tensor.concat(Tensor::new(vec![1, 1].into(), vec![last_token]));
-            debug_assert_eq!(tensor.shape()[0], seq_len);
-            observer.observe(seq_len - user_len, &trace);
+            if let Some(ref obs) = observer {
+                obs.observe(unpadded_seq_len - user_len, &trace);
+            }
+            unpadded_seq_len += 1;
+        }
+        // 1. input construction: we remove the last token since it's either the eos token or the max token
+        // we need to regenerate a full trace with the correct padding
+        full_tokens.pop();
+        // and we take only the part that corresponds to the _generated_ tokens
+        full_tokens.splice(..user_len, input_tokens);
+        let input_len = full_tokens.len();
+        tensor = Tensor::new(Shape::new(vec![input_len]), full_tokens.clone());
+        // 2. padding: we pad the input to the expected shape of the model
+        let target_padded_shape = vec![max_window.next_power_of_two()].into();
+        if let PaddingMode::Padding = self.padding_mode {
+            tensor.pad_to_shape(target_padded_shape)
+        };
+        // 3. model resetting: we need to _reset_ the cache of every QKV layer in the model - that's because we only
+        // expect 1 token to be generated at a time after the first inference.
+        for (node_id, node) in self.model.nodes.iter() {
+            if let Layer::QKV(qkv) = &node.operation {
+                debug!(" RESETTING THE CACHE OF QKV LAYER {node_id}");
+                qkv.reset_cache();
+            } else if let Layer::Positional(Positional::Learned(pos)) = &node.operation {
+                debug!(" RESETTING THE CACHE OF POSITIONAL LAYER {node_id}");
+                pos.reset_cache();
+            }
+        }
+        // 4. rerun to have a "clean" trace
+        info!("Running last iteration (heavy) with {input_len} tokens");
+
+        let mut store = TenStore::default();
+        let trace = self.model.run::<E>(
+            &[tensor],
+            Some(vec![Shape::new(vec![input_len])]),
+            &mut store,
+        )?;
+        for i in user_len..input_len {
+            assert_eq!(
+                trace.outputs().unwrap()[0].get_data()[i - 1],
+                trace.inputs().unwrap()[0].get_data()[i],
+                "Failed for {i}"
+            );
         }
         Ok(trace)
     }
 }
 
-pub struct LLMTokenizerObserver<T: LLMTokenizer> {
-    input: String,
-    tokenizer: T,
+impl Driver<Element> {
+    pub fn run<E>(
+        &self,
+        input: Vec<Token>,
+        observer: Option<impl Observer<Element>>,
+    ) -> anyhow::Result<InferenceTrace<'_, E, Element>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+    {
+        self.run_internal::<E>(input, observer)
+    }
+
+    pub fn pad_model(mut self) -> anyhow::Result<Self> {
+        let numel = self.max_context.unwrap_or(self.config.context_length);
+        self.model.input_shapes = vec![Shape::from(vec![numel, 1]).next_power_of_two()];
+        let model = pad_model(self.model)?;
+        Ok(Self {
+            model,
+            config: self.config,
+            max_context: self.max_context,
+            padding_mode: PaddingMode::Padding,
+        })
+    }
+
+    /// Get the size of the maximum polynomial employed when proving the LLM inference for the given `input_len`.
+    /// This size determines which context to be used to run the proving among all the possible proving contexts
+    /// for the given model
+    pub fn get_max_poly_size_for_input<E: ExtensionField>(
+        &self,
+        input_len: usize,
+    ) -> anyhow::Result<usize> {
+        self.model
+            .compute_max_poly_size::<E>(&[vec![input_len.next_power_of_two()].into()])
+    }
+
+    /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
+    /// It returns a `HashMap` which associates a given context to the maximum polynomial size supported
+    /// by that context. The proper context to be used for a given input size `input_len` is found in the
+    /// entry `HashMap` returned by this method identified by the key `self.get_max_poly_size_for_input(input_len)`
+    pub fn compute_all_contexts<E, PCS>(&self) -> anyhow::Result<LLMContextIterator<E, PCS>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E>,
+    {
+        // compute shapes for all possible input sequence lengths
+        let max_input_shapes = [Shape::new(vec![
+            self.config.context_length.next_power_of_two(),
+        ])];
+        ensure!(
+            max_input_shapes.len() == 1,
+            "Expected 1 input shape in LLM model, found {}",
+            max_input_shapes.len()
+        );
+        let max_input_length = max_input_shapes[0].numel();
+        ensure!(max_input_length.is_power_of_two());
+        let num_possible_inputs = max_input_length.ilog2() + 1;
+        let possible_input_shapes = (0..num_possible_inputs)
+            .map(|i| vec![vec![1usize << i].into()]) // ToDo: revisit if we want to generate
+            // a context for every power of 2 up to the maximum sequence length
+            .collect();
+        let contexts = self
+            .model
+            .generate_contexts_for_input_shapes(possible_input_shapes)?;
+        Ok(LLMContextIterator {
+            context_iterator: contexts,
+            config: self.config.clone(),
+            max_context: self.max_context,
+        })
+    }
+
+    pub fn context<E, PCS>(&self) -> anyhow::Result<LLMContext<E, PCS>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E>,
+    {
+        debug!(
+            "Generating context for model with {} layers",
+            self.model.nodes.len()
+        );
+        let (prover_ctx, verifier_ctx) = self.model.generate_contexts()?;
+        Ok(LLMContext {
+            prover_ctx,
+            verifier_ctx,
+            config: self.config.clone(),
+            // The verifier should put itself the max context here
+            max_context: None,
+        })
+    }
+    pub fn prove<'a, E, PCS>(
+        &self,
+        ctx: &LLMContext<'a, E, PCS>,
+        trace: InferenceTrace<'_, E, Element>,
+    ) -> anyhow::Result<LLMProof<E, PCS>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E>,
+    {
+        let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
+        let prover: Prover<'_, '_, E, _, _> = Prover::new(&ctx.prover_ctx, &mut tr);
+        let io = trace.to_verifier_io()?;
+        info!("Proving the trace");
+        let proof = prover.prove(&trace).expect("unable to generate proof");
+        info!("Proof generated");
+        Ok(LLMProof { proof, io })
+    }
 }
 
-impl<N: Number + Serialize + for<'a> Deserialize<'a>, T: LLMTokenizer> Observer<N>
-    for LLMTokenizerObserver<T>
+impl<'a, E, PCS> LLMContext<'a, E, PCS>
+where
+    E: ExtensionField + Serialize + DeserializeOwned,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    pub fn verify(&self, proof: LLMProof<E, PCS>, user_input: Vec<Token>) -> anyhow::Result<()>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned + Number,
+        E::BaseField: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E>,
+    {
+        // 0. check the size of the output
+        let output = proof.io.output[0].clone();
+        let padded_max_len = output.shape().numel();
+        let max_window = self.max_context.unwrap_or(self.config.context_length);
+
+        // in any case, the output needs to be less than the max context length
+        ensure!(
+            padded_max_len <= max_window.next_power_of_two(),
+            "output length is greater than the padded maximum context length"
+        );
+        // get the actual output length: could be either `max_window`, or when an eos token is found
+        let eos_token = self.config.specific_config.eos_token().0;
+        let eos_token_found = output
+            .get_data()
+            .iter()
+            .take(max_window) // consider only the first max_window tokens
+            .skip(user_input.len() - 1) // the first user_input.len() - 1 are not meaningful
+            .find_position(|token| token.to_element() as usize == eos_token);
+        let unpadded_output_len = if let Some(pos) = &eos_token_found {
+            pos.0
+        } else {
+            max_window
+        };
+
+        // 1. verify the proof it self
+        let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
+        let prover_input = proof.io.input[0].clone();
+        let prover_output = proof.io.output[0].clone();
+        verify::<_, _, _>(self.verifier_ctx.clone(), proof.proof, proof.io, &mut tr)?;
+        // 2. verify the sequentiality of the output: from the first newly generated token to the last
+        // but without including the padding.
+        // output is [seq_len] where []
+        let seq_len = user_input.len();
+        ensure!(
+            prover_input.get_data()[..seq_len]
+                .iter()
+                .zip(user_input[..seq_len].iter())
+                .all(|(a, b)| a.to_element().to_usize() == b.0),
+            "user input not the same"
+        );
+
+        #[allow(clippy::needless_range_loop)]
+        for i in seq_len - 1..unpadded_output_len - 1 {
+            // we check the next input token is the one generated by this "row" of the input
+            ensure!(
+                prover_input.get_data()[i + 1] == prover_output.get_data()[i],
+                "next input token is not the one generated by this row pos i {}: {:?} != {:?}",
+                i,
+                prover_input.get_data(),
+                prover_output.get_data()
+            );
+        }
+        Ok(())
+    }
+}
+
+pub struct LLMTokenizerObserver<'a, T: LLMTokenizer> {
+    pub input: String,
+    pub tokenizer: &'a T,
+}
+
+impl<'a, N, T: LLMTokenizer> Observer<N> for LLMTokenizerObserver<'a, T>
+where
+    N: Number + Serialize + for<'b> Deserialize<'b>,
 {
     fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>) {
-        let output_tensors = trace.outputs().unwrap();
-        let output = output_tensors.last().unwrap();
-        let new_token = output.get_data().last().unwrap();
+        let tensor = trace
+            .output
+            .last()
+            .unwrap()
+            .hydrate(trace.store.clone())
+            .expect("hydration failed");
+        let output_tokens_len = tensor.get_data().len();
+        let input_tokens = self.tokenizer.tokenize(&self.input);
+        let new_token = if output_tokens_len == 1 {
+            *tensor.get_data().last().expect("last token must exist")
+        } else {
+            tensor.get_data()[input_tokens.len() + step - 1]
+        };
+
+        // let new_token = tensor.get_data().last().unwrap();
         let new_token = Token::from(new_token.to_usize());
-        let new_text = self.tokenizer.detokenize(
-            output
-                .get_data()
-                .iter()
-                .map(|t| Token::from(t.to_usize()))
-                .collect::<Vec<_>>()
-                .as_slice(),
-        );
-        trace!(
+        let new_text = self.tokenizer.detokenize(&[new_token]);
+        debug!(
             "seq_len {}: new token: {:?}\n\t-{}", //\n\t-{:?}",
             step,
             &new_token,
@@ -181,19 +592,73 @@ pub trait LLMTokenizer {
 
 #[cfg(test)]
 mod test {
-    use crate::parser::{
-        file_cache,
-        gguf::tests::GPT2_Q8_0_URL,
-        llm::{Token, TokenizerData},
+    use crate::{
+        init_test_logging,
+        parser::{
+            file_cache,
+            gguf::tests::GPT2_Q8_0,
+            llm::{Token, TokenizerData},
+        },
+        testing::Pcs,
     };
 
     use super::*;
     use ff_ext::GoldilocksExt2;
 
     #[test]
-    fn test_llm_driver() -> anyhow::Result<()> {
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
-        let mut driver = Driver::load_model(&model_path)?.with_max_context(10);
+    fn test_llm_driver_prove() -> anyhow::Result<()> {
+        init_test_logging("debug");
+        let max_context = 10;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
+        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
+        let driver = Driver::load_external_model(&model_path)?.with_max_context(max_context);
+        let sentence = "The sky is";
+        let tokenizer = TokenizerData::load_tokenizer_from_gguf(&model_path)?;
+        let user_tokens = tokenizer.tokenize(sentence);
+        let driver = driver.into_provable_llm()?;
+        let trace = driver.run::<GoldilocksExt2>(
+            user_tokens.clone(),
+            Some(LLMTokenizerObserver {
+                input: sentence.to_string(),
+                tokenizer: &tokenizer,
+            }),
+        )?;
+        let ctx = driver
+            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+            .with_max_context(max_context);
+        let proof = driver.prove(&ctx, trace)?;
+        let proof_bytes =
+            bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
+        info!("Proof size: {}", proof_bytes.len());
+        ctx.verify(proof, user_tokens)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_gpt2_needs_one_context() -> anyhow::Result<()> {
+        init_test_logging("debug");
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
+        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
+        let driver = Driver::load_external_model(&model_path)?;
+        let driver = driver.into_provable_llm()?;
+        debug!("model built");
+        let mut contexts = driver.compute_all_contexts::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?;
+        // check that there is only one context generated for the GPT2 model
+        ensure!(contexts.next().is_some());
+        ensure!(contexts.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_llm_driver_inference() -> anyhow::Result<()> {
+        init_test_logging("debug");
+        const PRUNED_GPT2: &str = "gpt2.Q2_K.gguf";
+        let model_path = file_cache::from_cache(PRUNED_GPT2)?;
+        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
+        let driver = Driver::load_external_model(&model_path)?
+            .with_max_context(6)
+            .into_runnable_llm()?;
         let sentence = "The sky is";
 
         // Best to load the tokenizer from the gguf file if it's available.
@@ -202,12 +667,12 @@ mod test {
         let detokenized = tokenizer.detokenize(&user_tokens);
         assert_eq!(detokenized, sentence);
         println!("user input in tokens: {user_tokens:?}");
-        let trace = driver.run_inference::<GoldilocksExt2>(
+        let trace = driver.run::<GoldilocksExt2>(
             user_tokens,
-            LLMTokenizerObserver {
+            Some(LLMTokenizerObserver {
                 input: sentence.to_string(),
-                tokenizer,
-            },
+                tokenizer: &tokenizer,
+            }),
         )?;
         let _output = trace
             .outputs()

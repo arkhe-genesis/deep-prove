@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    Claim, Context, Element, Prover,
+    Claim, Element, Prover, ProverContext,
     commit::compute_betas_eval,
     iop::{context::ShapeStep, verifier::Verifier},
     layers::{ContextAux, LayerProof},
@@ -220,7 +220,7 @@ where
     fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &'a Context<'a, E, PCS>,
+        ctx: &'a ProverContext<'a, E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {

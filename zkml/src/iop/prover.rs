@@ -1,10 +1,12 @@
-use super::{ChallengeStorage, Context, Proof, TableProof};
+use super::{ChallengeStorage, Proof, TableProof};
 use crate::{
-    Claim, Element, VectorTranscript,
+    Claim, Element, Tensor, VectorTranscript,
     commit::{
         compute_betas_eval,
         context::{self, PolyId},
+        same_poly,
     },
+    iop::context::ProverContext,
     layers::{
         LayerProof,
         provable::{NodeId, OpInfo, ProvableOp},
@@ -30,7 +32,7 @@ use multilinear_extensions::{
     mle::{IntoMLE, MultilinearExtension},
     virtual_polys::VirtualPolynomialsBuilder,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use timed::timed_instrument;
@@ -44,10 +46,11 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
 {
-    ctx: &'a Context<'a, E, PCS>,
+    ctx: &'a ProverContext<'a, E, PCS>,
     // proofs for each layer being filled
     proofs: HashMap<NodeId, LayerProof<E, PCS>>,
     table_proofs: Vec<TableProof<E, PCS>>,
+    merge_claim_proofs: HashMap<NodeId, MergeClaimsProof<E>>,
     pub(crate) transcript: &'b mut T,
     /// Proves commitment openings
     pub(crate) commit_prover: context::CommitmentProver<'a, E, PCS>,
@@ -67,6 +70,68 @@ pub struct BatchFFTProof<E: ExtensionField> {
     pub delegation_points: Vec<Vec<E>>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub(crate) struct MergeClaimsProof<E: ExtensionField> {
+    // Map an output index for a given to a node to the proof for merging the claims
+    // related to this output
+    proofs: HashMap<usize, MergeClaimNodeProof<E>>,
+}
+
+impl<E: ExtensionField> MergeClaimsProof<E> {
+    pub(crate) fn get_proof(&self, index: usize) -> Option<&MergeClaimNodeProof<E>> {
+        self.proofs.get(&index)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub(crate) struct MergeClaimNodeProof<E: ExtensionField> {
+    proof: same_poly::Proof<E>,
+    agg_claim: Claim<E>,
+    num_vars: usize,
+}
+
+impl<E: ExtensionField> MergeClaimNodeProof<E> {
+    pub(crate) fn generate_proof<T: Transcript<E>>(
+        t: &mut T,
+        claims: &[&Claim<E>],
+        output: &Tensor<E>,
+    ) -> anyhow::Result<MergeClaimNodeProof<E>> {
+        let output_mle = output.clone().into_mle();
+        let num_vars = output_mle.num_vars();
+        let mut same_poly_prover = same_poly::Prover::new(output_mle);
+
+        claims
+            .iter()
+            .try_for_each(|&claim| same_poly_prover.add_claim(claim.clone()))?;
+
+        let (proof, claim) = same_poly_prover.prove(t)?;
+
+        Ok(Self {
+            proof,
+            num_vars,
+            agg_claim: claim,
+        })
+    }
+
+    pub(crate) fn verify_proof<T: Transcript<E>>(
+        &self,
+        t: &mut T,
+        claims: &[&Claim<E>],
+    ) -> anyhow::Result<Claim<E>> {
+        let ctx = same_poly::Context::new(self.num_vars);
+
+        let mut verifier = same_poly::Verifier::new(&ctx);
+
+        claims
+            .iter()
+            .try_for_each(|&claim| verifier.add_claim(claim.clone()))?;
+
+        verifier.verify(&self.proof, t)
+    }
+}
+
 impl<'a, 'b, E, T, PCS> Prover<'a, 'b, E, T, PCS>
 where
     T: Transcript<E>,
@@ -75,12 +140,13 @@ where
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    pub fn new(ctx: &'a Context<'a, E, PCS>, transcript: &'b mut T) -> Self {
+    pub fn new(ctx: &'a ProverContext<'a, E, PCS>, transcript: &'b mut T) -> Self {
         Self {
             ctx,
             transcript,
             proofs: Default::default(),
             table_proofs: Vec::default(),
+            merge_claim_proofs: Default::default(),
             commit_prover: context::CommitmentProver::<E, PCS>::new(),
             lookup_witness: HashMap::default(),
             table_witness: Vec::default(),
@@ -421,6 +487,7 @@ where
 
         let metrics = Metrics::new();
         self.ctx.write_to_transcript(self.transcript)?;
+
         self.instantiate_witness_ctx(full_trace)?;
 
         let span = metrics.to_span();
@@ -467,12 +534,22 @@ where
                 "Proving node with id {node_id}: {:?}",
                 node_operation.describe()
             );
-            let claims_for_prove = ctx.claims_for_node(&claims_by_layer, &out_claims)?;
+            let tensors = step_data
+                .node_outputs
+                .outputs
+                .iter()
+                .map(|t| t.hydrate(store.clone()).context("hydrating tensor"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let claims_for_prove = self.claims_for_prove(
+                ctx.claims_for_node(&claims_by_layer, &out_claims)?,
+                &tensors.iter().collect::<Vec<_>>(),
+                node_id,
+            )?;
             let claims = if node_operation.is_provable() {
                 node_operation.prove(
                     node_id,
                     &ctx.ctx,
-                    claims_for_prove,
+                    claims_for_prove.iter().collect::<Vec<_>>(),
                     step_data,
                     &mut self,
                     &mut store,
@@ -480,7 +557,7 @@ where
             } else {
                 // we only propagate the claims, without changing them, as a non-provable layer
                 // shouldn't change the input values
-                claims_for_prove.into_iter().cloned().collect()
+                claims_for_prove
             };
             claims_by_layer.insert(node_id, claims);
         }
@@ -501,6 +578,7 @@ where
             .prove(&self.ctx.commitment_ctx, self.transcript)?;
         let output_proof = Proof {
             steps: self.proofs,
+            merge_claim_proofs: self.merge_claim_proofs,
             table_proofs: self.table_proofs,
             commit: commit_proof,
         };
@@ -510,6 +588,49 @@ where
         debug!("== Generate proof metrics {} ==", span);
 
         Ok(output_proof)
+    }
+
+    fn claims_for_prove(
+        &mut self,
+        claims: Vec<Vec<&Claim<E>>>,
+        outputs: &[&Tensor<E>],
+        node_id: NodeId,
+    ) -> anyhow::Result<Vec<Claim<E>>> {
+        let mut merge_claim_proofs = HashMap::new();
+        let claims = claims
+            .into_iter()
+            .zip(outputs)
+            .enumerate()
+            .map(|(i, (mut claims, output))| {
+                anyhow::Ok(if claims.len() == 1 {
+                    // there is already only one claim, so we return it
+                    claims.pop().unwrap().clone()
+                } else {
+                    // we have to merge the claims
+                    let (merged_claim, proof) = self.merge_claims(&claims, output)?;
+                    merge_claim_proofs.insert(i, proof);
+                    merged_claim
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        self.merge_claim_proofs.insert(
+            node_id,
+            MergeClaimsProof {
+                proofs: merge_claim_proofs,
+            },
+        );
+
+        Ok(claims)
+    }
+
+    fn merge_claims(
+        &mut self,
+        claims: &[&Claim<E>],
+        output: &Tensor<E>,
+    ) -> anyhow::Result<(Claim<E>, MergeClaimNodeProof<E>)> {
+        let proof = MergeClaimNodeProof::generate_proof(self.transcript, claims, output)?;
+        Ok((proof.agg_claim.clone(), proof))
     }
 
     /// Looks at all the individual polys to accumulate from the witnesses and create the context from that.

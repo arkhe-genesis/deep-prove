@@ -3,7 +3,7 @@
 
 use anyhow::{Context, bail};
 use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams, Hasher, PolynomialCommitmentScheme};
+use mpcs::{Basefold, BasefoldRSParams, Hasher};
 #[doc(inline)]
 pub use object_store::{
     ClientOptions,
@@ -22,9 +22,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::fs;
 use zkml::{
-    Element,
-    model::Model,
-    quantization::{ModelMetadata, ScalingStrategyKind},
+    iop::context::VerifierContext, model::Model, quantization::{ModelMetadata, ScalingStrategyKind}, Element, ProverContext
 };
 
 #[derive(Debug, Clone)]
@@ -44,8 +42,8 @@ type Pcs = Basefold<F, BasefoldRSParams<Hasher>>;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Params {
-    pub prover: <Pcs as PolynomialCommitmentScheme<F>>::ProverParam,
-    pub verifier: <Pcs as PolynomialCommitmentScheme<F>>::VerifierParam,
+    pub prover: ProverContext<'static, F, Pcs>,
+    pub verifier: VerifierContext<F, Pcs>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -281,7 +279,7 @@ pub struct MemStore {
 #[derive(Clone, Default)]
 pub struct MemStoreInner {}
 
-impl Store for MemStore {
+impl Store for MemStore{
     fn get_params(
         &mut self,
         key: &ParamsKey,

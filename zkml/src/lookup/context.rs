@@ -4,10 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map};
 
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    mle::{IntoMLE, MultilinearExtension},
-    util::ceil_log2,
-};
+use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
 use p3_field::{Field, FieldAlgebra};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
@@ -16,14 +13,14 @@ use utils::Metrics;
 
 use super::{logup_gkr::error::LogUpError, witness::LogUpWitness};
 use crate::{
-    Claim, Context, Element,
-    iop::ChallengeStorage,
+    Claim, Element,
+    iop::{ChallengeStorage, context::ProverContext},
     layers::{
         activation::{GELUQuantData, Relu},
         provable::{NodeId, ProvableOp},
         transformer::{
             layernorm::{LAYERNORM_OUTPUT_SCALE_FACTOR, LAYERNORM_SCALE_FACTOR},
-            softmax::{LOG_SCALE_FACTOR, OUTPUT_SCALE_FACTOR, SCALE_FACTOR},
+            softmax::{OUTPUT_SCALE_FACTOR, SCALE_FACTOR},
         },
     },
     model::{InferenceTrace, ToIterator},
@@ -59,14 +56,14 @@ pub enum TableType {
     GELU(GELUQuantData),
     /// Table used for range checking (its size is determined by the quantisation bit size)
     Range,
-    /// Table used for clamping values, the inner [`usize`] denotes the maximum bit length a value can be before clamping to use this table
-    Clamping(usize),
     /// Table type used for computing Softmax, see the [`SoftmaxTableData`] struct for more info.
     Softmax(SoftmaxTableData),
     /// Table used for checking the normalisation error in Softmax operations, the first inner [`Element`] is `1` quantised by the scale factor, the second inner [`Element`] is the absolute value of the allowable error
     ErrorTable(Element, Element),
     /// Table use to check if a value is zero or not, returns 1 if the value is zero and zero otherwise, the [`usize`] indicates how many variables the table has.
     ZeroTable(usize),
+    /// Table used in requantisation
+    RequantZeroTable,
     /// Table used to calculate inverse square root, see the [`InverseSQRTTableData`] struct for more info.
     InverseSQRT(InverseSQRTTableData),
 }
@@ -109,7 +106,7 @@ impl SoftmaxTableData {
 
     pub(crate) fn table_output(&self, j: Element) -> Element {
         let float_temperature = self.float_temperature();
-        let base: Element = 1 << (LOG_SCALE_FACTOR - 8);
+        let base: Element = 1 << 16;
         let bkm = self.bkm();
         let prod = base * j;
         if prod >= bkm {
@@ -184,7 +181,7 @@ impl TableType {
                 let (comb, (col_one, col_two)): (
                     Vec<Element>,
                     (Vec<E::BaseField>, Vec<E::BaseField>),
-                ) = (*quantization::MIN - 1..=*quantization::MAX)
+                ) = (*quantization::MIN..=*quantization::MAX)
                     .map(|i| {
                         let out = Relu::apply(i);
                         let i_field: E = i.to_field();
@@ -206,28 +203,6 @@ impl TableType {
                     })
                     .unzip();
                 (element_out, vec![field])
-            }
-            TableType::Clamping(size) => {
-                let max: Element = 1 << (size - 1);
-                let min: Element = -max;
-                let (comb, (col_one, col_two)): LookupAndColumns<E::BaseField> = (min..max)
-                    .map(|i| {
-                        let out = if i < *quantization::MIN {
-                            *quantization::MIN
-                        } else if i > *quantization::MAX {
-                            *quantization::MAX
-                        } else {
-                            i
-                        };
-                        let i_field: E = i.to_field();
-                        let out_field: E = out.to_field();
-                        (
-                            i + out * column_separator,
-                            (i_field.as_bases()[0], out_field.as_bases()[0]),
-                        )
-                    })
-                    .unzip();
-                (comb, vec![col_one, col_two])
             }
             TableType::Softmax(table_data) => {
                 let table_size = table_data.full_table_size();
@@ -292,6 +267,21 @@ impl TableType {
                         .unzip();
                 (merged_lookup, vec![in_column, out_column])
             }
+            TableType::RequantZeroTable => {
+                let (comb, (col_one, col_two)): LookupAndColumns<E::BaseField> =
+                    (*quantization::MIN..=*quantization::MAX)
+                        .map(|i| {
+                            let out = if i != 0 { 0 } else { 1 };
+                            let i_field: E = i.to_field();
+                            let out_field: E = out.to_field();
+                            (
+                                i + out * column_separator,
+                                (i_field.as_bases()[0], out_field.as_bases()[0]),
+                            )
+                        })
+                        .unzip();
+                (comb, vec![col_one, col_two])
+            }
         }
     }
 
@@ -300,7 +290,6 @@ impl TableType {
             TableType::Relu => "Relu".to_string(),
             TableType::GELU(_) => "GELU".to_string(),
             TableType::Range => "Range".to_string(),
-            TableType::Clamping(size) => format!("Clamping: {size}"),
             TableType::Softmax(table_data) => {
                 format!("Softmax - temperature: {}", table_data.float_temperature())
             }
@@ -315,6 +304,7 @@ impl TableType {
                 table_data.float_epsilon(),
                 table_data.range_check_bits
             ),
+            TableType::RequantZeroTable => "Requant Zero Table".to_string(),
         }
     }
 
@@ -375,36 +365,6 @@ impl TableType {
                 }) - E::from_canonical_u64(1u64 << (size - 1));
                 Ok(vec![first_column])
             }
-            TableType::Clamping(size) => {
-                if point.len() != *size {
-                    return Err(LogUpError::VerifierError(format!(
-                        "Point was not the correct size to produce a clamping table evaluation, point size: {}, expected: {}",
-                        point.len(),
-                        size
-                    )));
-                }
-
-                let first_column = point.iter().enumerate().fold(E::ZERO, |acc, (index, p)| {
-                    acc + *p * E::from_canonical_u64(1u64 << index)
-                }) - E::from_canonical_u64(1u64 << (size - 1));
-
-                let max: Element = 1 << (size - 1);
-                let min: Element = -max;
-
-                let second_col_eval = to_base::<E, _>((min..max).map(|i| {
-                    if i < *quantization::MIN {
-                        *quantization::MIN
-                    } else if i > *quantization::MAX {
-                        *quantization::MAX
-                    } else {
-                        i
-                    }
-                }))
-                .into_mle()
-                .evaluate(point);
-
-                Ok(vec![first_column, second_col_eval])
-            }
             TableType::Softmax(table_data) => {
                 let size = table_data.size();
                 if point.len() != size {
@@ -458,6 +418,37 @@ impl TableType {
 
                 Ok(vec![first_column])
             }
+            TableType::RequantZeroTable => {
+                if point.len() != *quantization::BIT_LEN {
+                    return Err(LogUpError::VerifierError(format!(
+                        "Point was not the correct size to produce a requant zero check table evaluation, point size: {}, expected: {}",
+                        point.len(),
+                        *quantization::BIT_LEN
+                    )));
+                }
+
+                let (in_column_eval, out_column_eval) = point.iter().enumerate().fold(
+                    (
+                        -E::from_canonical_u64(1u64 << (*quantization::BIT_LEN - 1)),
+                        E::ONE,
+                    ),
+                    |(in_acc, out_acc), (index, p)| {
+                        if index != *quantization::BIT_LEN - 1 {
+                            (
+                                in_acc + *p * E::from_canonical_u64(1u64 << index),
+                                out_acc * (E::ONE - *p),
+                            )
+                        } else {
+                            (
+                                in_acc + *p * E::from_canonical_u64(1u64 << index),
+                                out_acc * *p,
+                            )
+                        }
+                    },
+                );
+
+                Ok(vec![in_column_eval, out_column_eval])
+            }
         }
     }
 
@@ -469,12 +460,16 @@ impl TableType {
                 // Theres only one column for a range check so we don't need to generate a challenge
                 E::ONE
             }
-            TableType::Clamping(_) => transcript.sample_and_append_challenge(b"Clamping").elements,
             TableType::Softmax(..) => transcript.sample_and_append_challenge(b"Softmax").elements,
             TableType::ZeroTable(..) => transcript.sample_and_append_challenge(b"Zero").elements,
             TableType::InverseSQRT(..) => {
                 transcript
                     .sample_and_append_challenge(b"InverseSQRT")
+                    .elements
+            }
+            TableType::RequantZeroTable => {
+                transcript
+                    .sample_and_append_challenge(b"RequantZero")
                     .elements
             }
         }
@@ -484,8 +479,9 @@ impl TableType {
     pub fn multiplicity_poly_vars(&self) -> usize {
         match self {
             TableType::GELU(qd) => qd.table_size(),
-            TableType::Range | TableType::Relu => *quantization::BIT_LEN,
-            TableType::Clamping(bits) => *bits,
+            TableType::Range | TableType::Relu | TableType::RequantZeroTable => {
+                *quantization::BIT_LEN
+            }
             TableType::Softmax(table_data) => table_data.size(),
             TableType::ErrorTable(_, allowable_error) => ceil_log2(2 * *allowable_error as usize),
             TableType::ZeroTable(bits) => *bits,
@@ -635,7 +631,7 @@ pub struct LookupWitness<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<
 
 pub fn generate_lookup_witnesses<'a, 'b, E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
     trace: &'b InferenceTrace<'a, E, Element>,
-    ctx: &'b Context<'b, E, PCS>,
+    ctx: &'b ProverContext<'b, E, PCS>,
     transcript: &mut T,
 ) -> Result<LookupWitness<'b, E, PCS>, LogUpError>
 where

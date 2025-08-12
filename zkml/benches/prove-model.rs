@@ -3,7 +3,7 @@ use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams, Hasher};
 use tenstore::TenStore;
 use zkml::{
-    Context, Element, FloatOnnxLoader, Prover, default_transcript,
+    Element, FloatOnnxLoader, Prover, default_transcript,
     inputs::Input,
     model::Model,
     quantization::{AbsoluteMax, ModelMetadata},
@@ -44,9 +44,9 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
     let (model, md) = parse_model(model_data).expect("failed to parse model");
     let inputs = run_inputs.to_elements(&md);
 
-    let ctx = Some(
-        Context::<F, Pcs<F>>::generate(&model, None, None).expect("unable to generate context"),
-    );
+    let (prover_ctx, verifier_ctx) = model
+        .generate_contexts::<F, Pcs<F>>()
+        .expect("unable to generate context");
 
     for (i, input) in inputs.into_iter().enumerate() {
         let input_tensor = model
@@ -54,22 +54,17 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
             .expect("failed to call load_input_flat on the model");
 
         let trace = model
-            .run(&input_tensor, &mut TenStore::default())
+            .run(&input_tensor, None, &mut TenStore::default())
             .unwrap_or_else(|_| panic!("input #{i} failed"));
 
         let mut prover_transcript = new_transcript();
-        let prover = Prover::<_, _, _>::new(ctx.as_ref().unwrap(), &mut prover_transcript);
+        let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
         let io = trace.to_verifier_io().unwrap();
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = new_transcript();
-        verify::<_, _, _>(
-            ctx.as_ref().unwrap().clone(),
-            proof,
-            io,
-            &mut verifier_transcript,
-        )
-        .expect("invalid proof");
+        verify::<_, _, _>(verifier_ctx.clone(), proof, io, &mut verifier_transcript)
+            .expect("invalid proof");
     }
 }
 

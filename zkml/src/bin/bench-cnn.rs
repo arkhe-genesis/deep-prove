@@ -18,7 +18,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use zkml::FloatOnnxLoader;
 
 use serde::{Deserialize, Serialize};
-use zkml::{Context, Element, Prover, argmax, default_transcript, verify};
+use zkml::{Element, Prover, argmax, default_transcript, verify};
 
 use rmp_serde::encode::to_vec_named;
 
@@ -219,7 +219,7 @@ fn run_float_model(raw_inputs: &InputJSON, model: &Model<f32>) -> Result<f32> {
     {
         // Run the model in float mode
         let input = model.load_input_flat(vec![input.clone()])?;
-        let output = &model.run_float(&input, &mut TenStore::default())?[0];
+        let output = &model.run_float(&input)?[0];
         let accuracy = argmax_compare(expected, output.get_data());
         accuracies.push(accuracy);
         debug!(
@@ -310,7 +310,9 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     let ctx = if !args.skip_proving {
         Some(
-            Context::<F, Pcs<F>>::generate(&model, None, None).expect("unable to generate context"),
+            model
+                .generate_contexts::<F, Pcs<F>>()
+                .expect("unable to generate context"),
         )
     } else {
         None
@@ -331,7 +333,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         let metrics = Metrics::new();
         let input_tensor = model.load_input_flat(vec![input])?;
 
-        let trace_result = model.run(&input_tensor, &mut TenStore::default());
+        let trace_result = model.run(&input_tensor, None, &mut TenStore::default());
 
         let span = metrics.to_span();
         stream_metrics(format!("Inference {i}"), &span);
@@ -395,7 +397,8 @@ fn run(args: Args) -> anyhow::Result<()> {
 
         let io = trace.to_verifier_io()?;
         let mut prover_transcript = new_transcript();
-        let prover = Prover::<_, _, _>::new(ctx.as_ref().as_ref().unwrap(), &mut prover_transcript);
+        let prover =
+            Prover::<_, _, _>::new(&ctx.as_ref().as_ref().unwrap().0, &mut prover_transcript);
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         // Serialize proof using MessagePack and calculate size in KB
@@ -415,7 +418,7 @@ fn run(args: Args) -> anyhow::Result<()> {
 
         let mut verifier_transcript = new_transcript();
         verify::<_, _, _>(
-            ctx.as_ref().clone().unwrap(),
+            ctx.as_ref().as_ref().unwrap().1.clone(),
             proof,
             io,
             &mut verifier_transcript,

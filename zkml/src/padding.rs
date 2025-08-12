@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::{
     Element, Tensor,
@@ -142,6 +143,7 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
     };
     let mut shape_infos: HashMap<NodeId, ShapeInfo> = HashMap::new();
     let unpadded_input_shapes = model.unpadded_input_shapes();
+    debug!("Padding model with {} inputs", unpadded_input_shapes.len());
     let nodes = model
         .into_forward_iterator()
         .map(|(node_id, node)| -> Result<(NodeId, Node<Element>)> {
@@ -178,6 +180,7 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
         })
         .collect::<Result<_>>()?;
     model = Model::<Element>::new(unpadded_input_shapes, PaddingMode::Padding, nodes);
+    debug!("Padded model with {} layers", model.nodes.len());
     Ok(model)
 }
 
@@ -391,6 +394,8 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
 }
 
 pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<Element>> {
+    // reset QKV cache, as it might contain data from a previos inference
+    qkv.reset_cache();
     // qkv layer currently expects 1 input, so we check there is only 1 input shape
     ensure!(
         si.shapes.len() == 1,
@@ -484,6 +489,8 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
             input_shape_og: unpadded_shape,
         })
         .collect();
+
+    qkv.cache.borrow_mut().padding_mode = PaddingMode::Padding;
 
     Ok(qkv)
 }

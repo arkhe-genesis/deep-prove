@@ -10,7 +10,7 @@ jobs:
     outputs:
       should_run: ${{ steps.filter.outputs.watches }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -29,7 +29,7 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: "recursive"
       - name: Install protoc via apt

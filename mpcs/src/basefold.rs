@@ -911,7 +911,6 @@ where
                     num_vars: trivial_proof[0].len().ilog2() as usize,
                 }
                 .evaluate(point);
-
                 if *eval == computed_eval {
                     return Ok(());
                 } else {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    Claim, Context, Element, Prover, ScalingFactor, ScalingStrategy,
+    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
@@ -481,7 +481,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
     fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &Context<'a, E, PCS>,
+        ctx: &ProverContext<'a, E, PCS>,
         step_data: &'a StepData<Element, E>,
         store: &mut TenStore,
     ) -> anyhow::Result<LookupWitnessGen<'a, E, PCS>> {

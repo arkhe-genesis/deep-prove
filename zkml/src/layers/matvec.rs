@@ -175,12 +175,12 @@ mod test {
         let output_point = random_field_vector(output.get_data().len().ilog2() as usize);
         let output_claim = Claim::new(
             output_point.clone(),
-            output.to_mle_flat().evaluate(&output_point),
+            output.to_field_mle().evaluate(&output_point),
         );
         let (proof, claim) = matvec
             .prove(&mut transcript, &output_claim, &input.clone().to_fields())
             .expect("proving should work");
-        let input_eval = input.to_mle_flat().evaluate(&claim.point);
+        let input_eval = input.to_field_mle().evaluate(&claim.point);
         assert_eq!(input_eval, claim.eval);
         let input_claim = verify(
             &mut default_transcript(),

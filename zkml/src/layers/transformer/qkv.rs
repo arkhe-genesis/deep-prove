@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use anyhow::{Result, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
@@ -53,8 +55,11 @@ pub struct QKV<N> {
     pub(crate) k_bias: Tensor<N>,
     pub(crate) v: Tensor<N>,
     pub(crate) v_bias: Tensor<N>,
-    unpadded_shape: Shape,       /* same shape for Q, K and V
-                                  * pub cache: Option<CacheQKV<N>>, */
+    weights_unpadded_shape: Shape, // same shape for Q, K and V
+    /// The cache that gets updated at each pass.
+    /// interior mutability for the cache to avoid borrowing issues.
+    /// Given only the QKV layer needs to update itself, it's a reasonable trade-off.
+    pub cache: RefCell<CacheQKV<N>>,
     pub(crate) num_heads: usize, // Needed to properly pad matrices for sub-sequent MHA layer
     pub(crate) head_dim: usize,  // Needed to properly pad matrices for sub-sequent MHA layer
 }
@@ -148,7 +153,7 @@ impl<N: Number> QKV<N> {
         assert_eq!(
             hidden_size,
             q_bias.shape()[0],
-            "q.get_shape() {:?} != q_bias.get_shape() {:?}",
+            "q.shape() {:?} != q_bias.shape() {:?}",
             q.shape(),
             q_bias.shape()
         );
@@ -165,11 +170,17 @@ impl<N: Number> QKV<N> {
             k_bias,
             v,
             v_bias,
-            unpadded_shape,
+            weights_unpadded_shape: unpadded_shape,
             num_heads,
             head_dim,
-            // cache: None,
+            cache: RefCell::new(CacheQKV::new()),
         })
+    }
+
+    /// Resets the cache to its default empty state. This is useful
+    /// when we want to start a new sequence as QKV is the only stateful layer.
+    pub(crate) fn reset_cache(&self) {
+        *self.cache.borrow_mut() = CacheQKV::new();
     }
 
     // Given the point of a claim referring to a 2d output tensor with `output_num_vars` variables,
@@ -241,20 +252,45 @@ impl<N: Number> OpInfo for QKV<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         assert_eq!(input_shapes.len(), 1, "Expected one input for QKV layer");
         let input_shape = input_shapes[0].clone();
+        let full_seq_len = if self.cache.borrow().is_initialized() {
+            self.cache.borrow().full_seq_len() // this assumes the `evaluate` method has already been called for the
+        // current input, and so the cache is already updated with the size of the output
+        } else {
+            input_shape[0]
+        };
+
         match padding_mode {
             PaddingMode::NoPadding => {
-                vec![vec![input_shape[0], self.unpadded_shape[1]].into(); self.num_outputs(1)]
+                // [q_len, emb_size], [seq_len, emb_size], [seq_len, emb_size]
+                vec![
+                    vec![input_shape[0], self.weights_unpadded_shape[1]].into(),
+                    vec![full_seq_len, self.weights_unpadded_shape[1]].into(),
+                    vec![full_seq_len, self.weights_unpadded_shape[1]].into(),
+                ]
             }
             PaddingMode::Padding => {
                 // compute head_dim from hidden_size and num_heads
-                let padded_weight =
-                    padded_weight_shape(&self.unpadded_shape, self.num_heads, self.head_dim);
+                let padded_weight = padded_weight_shape(
+                    &self.weights_unpadded_shape,
+                    self.num_heads,
+                    self.head_dim,
+                );
                 vec![
-                    Shape::new(vec![
+                    vec![
                         input_shape[0].next_power_of_two(),
-                        padded_weight[1].next_power_of_two()
-                    ]);
-                    3
+                        padded_weight[1].next_power_of_two(),
+                    ]
+                    .into(),
+                    vec![
+                        full_seq_len.next_power_of_two(),
+                        padded_weight[1].next_power_of_two(),
+                    ]
+                    .into(),
+                    vec![
+                        full_seq_len.next_power_of_two(),
+                        padded_weight[1].next_power_of_two(),
+                    ]
+                    .into(),
                 ]
             }
         }
@@ -277,12 +313,12 @@ impl<N: Number> OpInfo for QKV<N> {
     }
 }
 
-impl<N: Number> Evaluate<N> for QKV<N> {
+impl<N: Number> QKV<N> {
     /// Returns x[-1,..] * Q, X * K, X * V
-    fn evaluate<E: ExtensionField>(
+    fn evaluate_internal<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: &[Shape],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(inputs.len() == 1, "QKV expects 1 input");
         let shape = inputs[0].shape();
@@ -296,27 +332,21 @@ impl<N: Number> Evaluate<N> for QKV<N> {
             shape,
             self.q.shape()
         );
-        // if let Some(cache) = &self.cache {
-        //    // make sure the size of the input match the size of the cache + 1
-        //    // as we only want to do the the matmul for the new token, not for the previously generated ones
-        //    ensure!(
-        //        seq_len == cache.k_shape()[0] + 1,
-        //        "QKV: seq_len != cache.k_shape()[0] + 1"
-        //    );
-        //}
+
+        // NOTE: we take the _whole_ input and not just the last row / token.
+        // The reason is because the _first_ time we infere via this layer, this is on the user input which is X token long.
+        // The subsequent times, it's just to run with the newly generated token, so there is only one here.
         let input = inputs[0];
-        // if self.cache.is_some() {
-        //    &inputs[0].slice_2d(seq_len - 1, seq_len)
-        //} else {
-        // add row by row
+        let unpadded_seq_len = unpadded_input_shapes[0].dim(0);
         let q = input.matmul(&self.q).add_dim2(&self.q_bias);
         let k = input.matmul(&self.k).add_dim2(&self.k_bias);
         let v = input.matmul(&self.v).add_dim2(&self.v_bias);
-        // if let Some(cache) = &mut self.cache {
-        //    cache.stack(k, v);
-        //    // vector Q, full K, full V
-        //    Ok(LayerOut::from_vec(vec![q, cache.k(), cache.v()]))
-        //} else {
+        self.cache.borrow_mut().stack(k, v, unpadded_seq_len)?;
+        // vector Q, full K, full V
+        let cache = self.cache.borrow();
+        let k = cache.k();
+        let v = cache.v();
+
         Ok(LayerOut::from_vec(vec![q, k, v]))
     }
 }
@@ -389,6 +419,39 @@ impl QKV<f32> {
     }
 }
 
+impl Evaluate<f32> for QKV<f32> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&Tensor<f32>],
+        unpadded_input_shapes: &[Shape],
+    ) -> anyhow::Result<LayerOut<f32, E>> {
+        // f32 inference is only used for quantization parameter computation so we don't want
+        // to make it stateful since it would have to make the quantization strategy be aware that
+        // we're using caching and it's LLM. It's currently not in scope.
+        self.cache.borrow_mut().reset();
+        self.evaluate_internal(inputs, unpadded_input_shapes)
+    }
+}
+
+impl Evaluate<Element> for QKV<Element> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&Tensor<Element>],
+        unpadded_input_shapes: &[Shape],
+    ) -> anyhow::Result<LayerOut<Element, E>> {
+        // as we only want to do the the matmul for the new token, not for the previously generated ones
+        // This check is only true if the cache is not empty, i.e. if we've already used the cache before.
+        // in case it's the first time we use it, then we accept to get any first user input to put in the cache.
+        // NOTE: we dont enforce this check during float inference since this is used only to compute quantization factors
+        // and this would force the quantization strategy to be aware of the specificities of the LLM logic.
+        if self.cache.borrow().is_initialized() {
+            ensure!(inputs[0].shape()[0] == 1, "QKV: seq_len != 1");
+        }
+
+        self.evaluate_internal(inputs, unpadded_input_shapes)
+    }
+}
+
 const WEIGHT_Q_POLY_ID: &str = "WeightQ";
 const WEIGHT_K_POLY_ID: &str = "WeightK";
 const WEIGHT_V_POLY_ID: &str = "WeightV";
@@ -411,6 +474,8 @@ where
             aux.last_output_shape[0][1],
             self.q.shape()[0],
         );
+        // reset the cache of QKV as it might be filled with data from a previous inference
+        self.reset_cache();
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.model_polys = Some(
             [
@@ -438,7 +503,7 @@ where
         let ctx = QKVCtx {
             node_id: id,
             sumcheck_poly_aux: vp_aux,
-            unpadded_shape: self.unpadded_shape.clone(),
+            unpadded_shape: self.weights_unpadded_shape.clone(),
             num_heads: self.num_heads,
             head_dim: self.head_dim,
         };
@@ -572,6 +637,7 @@ where
                 let fi_expr = expr_builder.lift(Either::Left(fi));
                 let w_expr = expr_builder.lift(Either::Left(w));
                 let challenge = Expression::Constant(Either::Right(c.elements));
+                // vp.add_mle_list(vec![fixed_input_mle.into(), weight_mle.into()], coefficient);
                 acc + fi_expr * w_expr * challenge
             },
         );
@@ -835,11 +901,13 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheQKV<N> {
     cache_k: Tensor<N>,
     cache_v: Tensor<N>,
+    seq_len: usize,
     initialized: bool,
+    pub(crate) padding_mode: PaddingMode,
 }
 
 impl<N: Number> Default for CacheQKV<N> {
@@ -853,11 +921,21 @@ impl<N: Number> CacheQKV<N> {
         Self {
             cache_k: Tensor::new(vec![0].into(), vec![]),
             cache_v: Tensor::new(vec![0].into(), vec![]),
+            seq_len: 0,
             initialized: false,
+            padding_mode: PaddingMode::NoPadding,
         }
     }
-    pub fn stack(&mut self, k: Tensor<N>, v: Tensor<N>) {
-        assert!(k.is_vector(), "k is not a vector {:?}", k.shape());
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+    pub fn full_seq_len(&self) -> usize {
+        self.seq_len
+    }
+    pub fn stack(&mut self, k: Tensor<N>, v: Tensor<N>, seq_len: usize) -> anyhow::Result<()> {
         assert_eq!(
             k.shape(),
             v.shape(),
@@ -866,6 +944,7 @@ impl<N: Number> CacheQKV<N> {
             v.shape()
         );
         if self.initialized {
+            assert!(k.is_vector(), "k is not a vector {:?}", k.shape());
             assert_eq!(
                 self.cache_k.shape()[1],
                 k.shape()[1],
@@ -873,19 +952,55 @@ impl<N: Number> CacheQKV<N> {
                 self.cache_k.shape(),
                 k.shape()
             );
-            self.cache_k.concat(k);
-            self.cache_v.concat(v);
+            assert_eq!(
+                seq_len, 1,
+                "subsequent forward pass after the initial one must have seq_len = 1"
+            );
+
+            self.cache_k.concat_from_unpadded(self.seq_len, k, 1)?;
+            self.cache_v.concat_from_unpadded(self.seq_len, v, 1)?;
+            let expected_first_dim = if let PaddingMode::Padding = self.padding_mode {
+                self.cache_k = self.cache_k.pad_next_power_of_two();
+                self.cache_v = self.cache_v.pad_next_power_of_two();
+                (self.seq_len + 1).next_power_of_two()
+            } else {
+                self.seq_len + 1
+            };
+            // we can only check the padded version since the unpadded version is "hidden" inside the shape of the tensor
+            assert_eq!(
+                self.cache_k.shape()[0],
+                expected_first_dim,
+                "cache_k shape is not correct {:?} != {:?}",
+                self.cache_k.shape()[0],
+                expected_first_dim,
+            );
+            assert_eq!(
+                self.cache_v.shape()[0],
+                expected_first_dim,
+                "cache_v shape is not correct {:?} != {:?}",
+                self.cache_v.shape()[0],
+                expected_first_dim,
+            );
+            self.seq_len += 1;
         } else {
             self.cache_k = k;
             self.cache_v = v;
+            self.seq_len = seq_len;
             self.initialized = true;
         }
+        Ok(())
     }
     pub fn k_shape(&self) -> Shape {
         self.cache_k.shape()
     }
     pub fn v_shape(&self) -> Shape {
         self.cache_v.shape()
+    }
+    pub fn k(&self) -> Tensor<N> {
+        self.cache_k.clone()
+    }
+    pub fn v(&self) -> Tensor<N> {
+        self.cache_v.clone()
     }
 }
 
@@ -919,67 +1034,19 @@ mod tests {
         }
     }
 
-    //#[test]
-    // fn test_qkv_cache() {
-    //    // first token
-    //    let seq_len = 1;
-    //    let emb_size = 2;
-    //    let hidden_size = 3;
-    //    let q = Tensor::<f32>::random(&[emb_size, hidden_size]);
-    //    let q_bias = Tensor::<f32>::random(&[hidden_size]);
-    //    let k = Tensor::<f32>::random(&[emb_size, hidden_size]);
-    //    let k_bias = Tensor::<f32>::random(&[hidden_size]);
-    //    let v = Tensor::<f32>::random(&[emb_size, hidden_size]);
-    //    let v_bias = Tensor::<f32>::random(&[hidden_size]);
-    //    let mut qkv = QKV::new(
-    //        q.clone(),
-    //        q_bias.clone(),
-    //        k.clone(),
-    //        k_bias.clone(),
-    //        v.clone(),
-    //        v_bias.clone(),
-    //    )
-    //    .with_cache();
-    //    let mut input = Tensor::<f32>::random(&[1, emb_size]);
-    //    let output = qkv.evaluate::<GoldilocksExt2>(&[&input]).unwrap().outputs;
-    //    assert_eq!(output.len(), 3);
-    //    assert_eq!(output[0].get_shape(), vec![1, hidden_size]);
-    //    assert_eq!(output[1].get_shape(), vec![seq_len, hidden_size]);
-    //    let mut out_k = input.matmul(&k).add_dim2(&k_bias);
-    //    assert_eq!(output[1].get_data(), out_k.get_data());
-    //    let mut out_v = input.matmul(&v).add_dim2(&v_bias);
-    //    assert_eq!(output[2].get_shape(), vec![seq_len, hidden_size]);
-    //    assert_eq!(output[2].get_data(), out_v.get_data());
-    //    // second token
-    //    let seq_len = 2;
-    //    let new_token_emb = Tensor::<f32>::random(&[1, emb_size]);
-    //    input.concat(new_token_emb.clone());
-    //    let output = qkv.evaluate::<GoldilocksExt2>(&[&input]).unwrap().outputs;
-    //    assert_eq!(output.len(), 3);
-    //    assert_eq!(output[0].get_shape(), vec![1, hidden_size]);
-    //    assert_eq!(output[1].get_shape(), vec![seq_len, hidden_size]);
-    //    assert_eq!(output[2].get_shape(), vec![seq_len, hidden_size]);
-    //    let out_q = new_token_emb.matmul(&q).add_dim2(&q_bias);
-    //    assert_eq!(output[0].get_data(), out_q.get_data());
-    //    out_k.concat(new_token_emb.matmul(&k).add_dim2(&k_bias));
-    //    assert_eq!(output[1].get_data(), out_k.get_data());
-    //    out_v.concat(new_token_emb.matmul(&v).add_dim2(&v_bias));
-    //    assert_eq!(output[2].get_data(), out_v.get_data());
-    //}
-
     #[test]
-    fn test_qkv_no_cache() {
+    fn test_qkv_cache() {
         // first token
-        let seq_len = 3;
+        let seq_len = 1;
         let emb_size = 2;
-        let hidden_size = 3;
-        let num_heads = 1;
-        let q = Tensor::<f32>::random(&vec![emb_size, hidden_size].into());
-        let q_bias = Tensor::<f32>::random(&vec![hidden_size].into());
-        let k = Tensor::<f32>::random(&vec![emb_size, hidden_size].into());
-        let k_bias = Tensor::<f32>::random(&vec![hidden_size].into());
-        let v = Tensor::<f32>::random(&vec![emb_size, hidden_size].into());
-        let v_bias = Tensor::<f32>::random(&vec![hidden_size].into());
+        let hidden_size = 4;
+        let num_heads = 2;
+        let q = Tensor::<Element>::random(&vec![emb_size, hidden_size].into());
+        let q_bias = Tensor::random(&vec![hidden_size].into());
+        let k = Tensor::random(&vec![emb_size, hidden_size].into());
+        let k_bias = Tensor::random(&vec![hidden_size].into());
+        let v = Tensor::random(&vec![emb_size, hidden_size].into());
+        let v_bias = Tensor::random(&vec![hidden_size].into());
         let qkv = QKV::new(
             q.clone(),
             q_bias.clone(),
@@ -990,38 +1057,95 @@ mod tests {
             num_heads,
         )
         .unwrap();
-        let mut input = Tensor::<f32>::random(&vec![seq_len, emb_size].into());
+        let input = Tensor::<Element>::random(&vec![1, emb_size].into());
         let output = qkv
-            .evaluate::<GoldilocksExt2>(&[&input], &[])
+            .evaluate::<GoldilocksExt2>(&[&input], &[vec![1, emb_size].into()])
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
-        assert_eq!(output[0].shape(), vec![seq_len, hidden_size].into());
-        assert_eq!(output[1].shape(), vec![seq_len, hidden_size].into());
+        assert_eq!(output[0].shape(), Shape::from(vec![1, hidden_size]));
+        assert_eq!(output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
         let mut out_k = input.matmul(&k).add_dim2(&k_bias);
         assert_eq!(output[1].get_data(), out_k.get_data());
         let mut out_v = input.matmul(&v).add_dim2(&v_bias);
-        assert_eq!(output[2].shape(), vec![seq_len, hidden_size].into());
+        assert_eq!(output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
         assert_eq!(output[2].get_data(), out_v.get_data());
         // second token
-        let seq_len = seq_len + 1;
-        let new_token_emb = Tensor::<f32>::random(&vec![1, emb_size].into());
-        input.concat(new_token_emb.clone());
+        let seq_len = 2;
+        let new_token_emb = Tensor::<Element>::random(&vec![1, emb_size].into());
+        // we dont concat here because we should only send the last token each time
+        // input.concat(new_token_emb.clone());
         let output = qkv
-            .evaluate::<GoldilocksExt2>(&[&input], &[])
+            .evaluate::<GoldilocksExt2>(&[&new_token_emb], &[vec![1, emb_size].into()])
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
-        assert_eq!(output[0].shape(), vec![seq_len, hidden_size].into());
-        assert_eq!(output[1].shape(), vec![seq_len, hidden_size].into());
-        assert_eq!(output[2].shape(), vec![seq_len, hidden_size].into());
-        let out_q = input.matmul(&q).add_dim2(&q_bias);
+        assert_eq!(output[0].shape(), Shape::from(vec![1, hidden_size]));
+        assert_eq!(output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
+        assert_eq!(output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
+        let out_q = new_token_emb.matmul(&q).add_dim2(&q_bias);
         assert_eq!(output[0].get_data(), out_q.get_data());
         out_k.concat(new_token_emb.matmul(&k).add_dim2(&k_bias));
         assert_eq!(output[1].get_data(), out_k.get_data());
         out_v.concat(new_token_emb.matmul(&v).add_dim2(&v_bias));
         assert_eq!(output[2].get_data(), out_v.get_data());
     }
+
+    //#[test]
+    // fn test_qkv_no_cache() {
+    //    // first token
+    //    let seq_len = 3;
+    //    let emb_size = 2;
+    //    let hidden_size = 3;
+    //    let num_heads = 1;
+    //    let q = Tensor::<f32>::random(&vec![emb_size, hidden_size].into());
+    //    let q_bias = Tensor::<f32>::random(&vec![hidden_size].into());
+    //    let k = Tensor::<f32>::random(&vec![emb_size, hidden_size].into());
+    //    let k_bias = Tensor::<f32>::random(&vec![hidden_size].into());
+    //    let v = Tensor::<f32>::random(&vec![emb_size, hidden_size].into());
+    //    let v_bias = Tensor::<f32>::random(&vec![hidden_size].into());
+    //    let qkv = QKV::new(
+    //        q.clone(),
+    //        q_bias.clone(),
+    //        k.clone(),
+    //        k_bias.clone(),
+    //        v.clone(),
+    //        v_bias.clone(),
+    //        num_heads,
+    //    )
+    //    .unwrap();
+    //    let mut input = Tensor::<f32>::random(&vec![seq_len, emb_size].into());
+    //    let output = qkv
+    //        .evaluate::<GoldilocksExt2>(&[&input], vec![])
+    //        .unwrap()
+    //        .outputs;
+    //    assert_eq!(output.len(), 3);
+    //    assert_eq!(output[0].shape(), vec![seq_len, hidden_size].into());
+    //    assert_eq!(output[1].shape(), vec![seq_len, hidden_size].into());
+    //    let mut out_k = input.matmul(&k).add_dim2(&k_bias);
+    //    assert_eq!(output[1].get_data(), out_k.get_data());
+    //    let mut out_v = input.matmul(&v).add_dim2(&v_bias);
+    //    assert_eq!(output[2].shape(), vec![seq_len, hidden_size].into());
+    //    assert_eq!(output[2].get_data(), out_v.get_data());
+    //    // second token
+    //    let seq_len = seq_len + 1;
+    //    let new_token_emb = Tensor::<f32>::random(&vec![1, emb_size].into());
+    //    input.concat(new_token_emb.clone());
+    //    let output = qkv
+    //        .evaluate::<GoldilocksExt2>(&[&input], vec![])
+    //        .unwrap()
+    //        .outputs;
+    //    assert_eq!(output.len(), 3);
+    //    assert_eq!(output[0].shape(), vec![seq_len, hidden_size].into());
+    //    assert_eq!(output[1].shape(), vec![seq_len, hidden_size].into());
+    //    assert_eq!(output[2].shape(), vec![seq_len, hidden_size].into());
+    //    let out_q = input.matmul(&q).add_dim2(&q_bias);
+    //    assert_eq!(output[0].get_data(), out_q.get_data());
+    //    out_k.concat(new_token_emb.matmul(&k).add_dim2(&k_bias));
+    //    assert_eq!(output[1].get_data(), out_k.get_data());
+    //    out_v.concat(new_token_emb.matmul(&v).add_dim2(&v_bias));
+    //    assert_eq!(output[2].get_data(), out_v.get_data());
+    //}
 
     #[test]
     fn test_qkv_padding() {
@@ -1103,6 +1227,23 @@ mod tests {
         )
         .unwrap();
 
+        println!("unpadded input shape: {unpadded_input_shape:?}");
+        println!("padded input shape: {padded_input_shape:?}");
+        println!("hidden size: {hidden_size}");
+        println!("num heads: {num_heads}");
+        println!("head dim: {}", hidden_size / num_heads);
+        println!("padded head dim: {padded_head_dim}");
+        println!("embedding size: {embedding_size}");
+        println!("num inputs: {num_inputs}");
+        println!(
+            "output shapes: {:?}",
+            output
+                .outputs()
+                .iter()
+                .map(|o| o.shape())
+                .collect::<Vec<_>>()
+        );
+        println!("unpadded output shapes: {unpadded_output_shapes:?}");
         assert!(
             output
                 .outputs()

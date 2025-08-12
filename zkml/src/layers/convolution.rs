@@ -1204,7 +1204,7 @@ where
         // now we need to verify the hadamard proof for the sumcheck part.
         let hctx = hadamard::HadamardCtx::from_len(real_output_shape.product());
         let expected_v2_eval = clearing_tensor
-            .to_mle_flat()
+            .to_field_mle()
             .evaluate(proof.clearing_proof.random_point());
         // also set the claim to be the non-cleared output of conv. The rest of the logic is about proving the bias + fft claims.
         let last_claim = hadamard::verify(
@@ -1880,9 +1880,9 @@ mod test {
         // again another conv
         let filter = Tensor::random(&vec![k_w, k_x, n_w, n_w].into());
         let bias = Tensor::random(&vec![k_w].into());
-        println!("2AND CONV: filter.get_shape() : {:?}", filter.shape());
-        println!("2AND CONV: bias.get_shape() : {:?}", bias.shape());
-        println!("2AND CONV: input.get_shape() : {:?}", output.shape());
+        println!("2AND CONV: filter.shape() : {:?}", filter.shape());
+        println!("2AND CONV: bias.shape() : {:?}", bias.shape());
+        println!("2AND CONV: input.shape() : {:?}", output.shape());
         let output = output.conv2d(&filter, &bias, 1);
         let dims = filter.shape();
         let fft_conv =
@@ -1944,11 +1944,11 @@ mod test {
         let fft_bias = bias.clone().pad_1d(new_rows);
         let fft_dense = Dense::new(fft_weight.clone(), fft_bias.clone());
         println!("-- new_rows : {new_rows}, new_cols : {new_cols}");
-        println!("weight.get_shape() : {:?}", weight.shape());
-        println!("bias.get_shape() : {:?}", bias.shape());
-        println!("fft_input.get_shape() : {:?}", fft_output.shape());
-        println!("fft_weight.get_shape() : {:?}", fft_weight.shape());
-        println!("fft_bias.get_shape() : {:?}", fft_bias.shape());
+        println!("weight.shape() : {:?}", weight.shape());
+        println!("bias.shape() : {:?}", bias.shape());
+        println!("fft_input.shape() : {:?}", fft_output.shape());
+        println!("fft_weight.shape() : {:?}", fft_weight.shape());
+        println!("fft_bias.shape() : {:?}", fft_bias.shape());
         println!(
             "output shape : {:?} - product {}",
             output.shape(),

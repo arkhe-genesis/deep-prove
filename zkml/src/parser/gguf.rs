@@ -41,6 +41,7 @@ impl LLMConfig {
         let context_length = l.content.metadata[variant.context_length_key()].to_u32()? as usize;
         let norm_epsilon = l.content.metadata[variant.norm_epsilon_key()].to_f32()?;
         let num_block = l.content.metadata[variant.num_block_key()].to_u32()? as usize;
+        let vocab_size = variant.vocab_size();
         Ok(Self {
             hidden_size,
             embedding_size,
@@ -48,6 +49,7 @@ impl LLMConfig {
             context_length,
             norm_epsilon,
             num_block,
+            vocab_size,
             specific_config: variant,
         })
     }
@@ -551,12 +553,11 @@ pub mod tests {
     // download at https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF
     // pub const GPT2_Q8_0_PATH: &str = "assets/scripts/llms/gpt2.q8_0.gguf";
     // const GPT2_Q8_0_URL: &str = "https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF/resolve/main/gpt2.q8_0.gguf";
-    pub const GPT2_Q8_0_URL: &str =
-        "https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF/resolve/main/gpt2.Q8_0.gguf?download=true";
+    pub const GPT2_Q8_0: &str = "gpt2.Q8_0.gguf";
 
     #[test]
     fn test_gguf_load_model() -> anyhow::Result<()> {
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let config = LLMConfig::from_content(&loader)?;
         let _model = config.model(&loader)?;
@@ -566,7 +567,7 @@ pub mod tests {
 
     #[test]
     fn test_gguf_load_attention() -> anyhow::Result<()> {
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let config = LLMConfig::from_content(&loader)?;
         let block0_loader = loader.pp("blk.0.");
@@ -577,7 +578,7 @@ pub mod tests {
 
     #[test]
     fn test_gguf_load_config() -> anyhow::Result<()> {
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let config = LLMConfig::from_content(&loader)?;
         println!("config: {config:?}");
@@ -586,7 +587,7 @@ pub mod tests {
 
     #[test]
     fn test_gguf_load_embedding() -> anyhow::Result<()> {
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let _embedding = Embeddings::from_loader(&loader)?;
         Ok(())
@@ -596,7 +597,7 @@ pub mod tests {
     #[test]
     //#[ignore = "just a test to explore gguf internal structure"]
     fn test_load_and_inspect_gpt2_gguf() -> anyhow::Result<()> {
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
 
         let model_path_str = model_path
             .to_str()
@@ -648,7 +649,7 @@ pub mod tests {
     #[test]
     fn test_tensor_loader_subscoping_and_lazy_load() -> anyhow::Result<()> {
         // let gguf_path = GPT2_Q8_0_PATH;
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
 
         // Create TensorLoader using the type alias
         let loader = FileTensorLoader::from_path(model_path)?;
@@ -712,7 +713,7 @@ pub mod tests {
 
     #[test]
     fn test_gguf_load_tokenizer() -> anyhow::Result<()> {
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let tokenizer = TokenizerData::from_loader(&loader)?.into_tokenizer();
         let s = "do or don't. there is no try.";

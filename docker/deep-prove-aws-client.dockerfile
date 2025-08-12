@@ -1,5 +1,5 @@
 FROM rustlang/rust:nightly-slim AS builder
-RUN apt-get update && apt-get install -y git protobuf-compiler libssl-dev pkg-config
+RUN apt-get update && apt-get install -y git protobuf-compiler libssl-dev pkg-config cmake build-essential g++ libclang-dev
 
 WORKDIR /deep-prove-client
 COPY . .

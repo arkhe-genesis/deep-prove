@@ -34,7 +34,7 @@ use transformer::{
 };
 
 use crate::{
-    Context, Element, ScalingStrategy,
+    Element, ProverContext, ScalingStrategy,
     iop::context::{ContextAux, ShapeStep, TableCtx},
     layers::{
         activation::{Activation, ActivationProof},
@@ -68,6 +68,7 @@ use matrix_mul::{MatMul, MatMulCtx, MatMulProof};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum Layer<T> {
     Dense(Dense<T>),
     MatMul(MatMul<T>),
@@ -759,7 +760,7 @@ where
     fn gen_lookup_witness<'a>(
         &self,
         id: provable::NodeId,
-        ctx: &'a Context<'a, E, PCS>,
+        ctx: &'a ProverContext<'a, E, PCS>,
         step_data: &'a StepData<Element, E>,
         store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
@@ -966,17 +967,10 @@ where
             LayerProof::Dummy => None,
             LayerProof::Activation(ActivationProof { lookup, .. })
             | LayerProof::Pooling(PoolingProof { lookup, .. }) => Some(lookup.fractional_outputs()),
-            LayerProof::Requant(RequantProof {
-                clamping_lookup,
-                shifted_lookup,
-                ..
-            }) => {
-                let (clamp_nums, clamp_denoms) = clamping_lookup.fractional_outputs();
-                let (shift_nums, shift_denoms) = shifted_lookup.fractional_outputs();
-                Some((
-                    [clamp_nums, shift_nums].concat(),
-                    [clamp_denoms, shift_denoms].concat(),
-                ))
+            LayerProof::Requant(RequantProof { lookup_proofs, .. }) => {
+                let (nums, denoms): (Vec<Vec<E>>, Vec<Vec<E>>) =
+                    lookup_proofs.iter().map(|p| p.fractional_outputs()).unzip();
+                Some((nums.concat(), denoms.concat()))
             }
         }
     }

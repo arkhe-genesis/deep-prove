@@ -25,7 +25,7 @@ use tenstore::TenStore;
 use tracing::trace;
 
 use crate::{
-    Claim, Context, Element, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Tensor,
     commit::compute_betas_eval,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -243,7 +243,11 @@ impl<N: Number> LayerNorm<N> {
         let lhs_bit_size =
             2 * (*quantization::BIT_LEN - 1) + ceil_log2(dim_size) + 1 + max_lut_value_bits;
 
-        let intermediate_bit_size = lhs_bit_size.max(ceil_log2(quant_bias_max as usize)) + 1;
+        let intermediate_bit_size = if quant_bias_max > 0 {
+            lhs_bit_size.max(ceil_log2(quant_bias_max as usize)) + 1
+        } else {
+            lhs_bit_size + 1
+        };
 
         Ok((
             LayerNorm::<Element> {
@@ -477,9 +481,9 @@ impl Requant {
         let int_part = m_log.trunc().abs();
         // We allow for a possible floating point error that results in an imperfect division
         ensure!(
-            (input_fract - output_fract).abs() < 1e-5,
+            (input_fract - output_fract).fract().abs() < 1e-5,
             "Cannot perform shift only Requant as the fractional part of the exponent was too large, fractional part: {}",
-            (input_fract - output_fract).abs()
+            (input_fract - output_fract).fract().abs()
         );
 
         // We want the part that gets shifted away to be a multiple of the quantisation bit length (that way we can use the same range table for each chunk)
@@ -775,7 +779,7 @@ where
     fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &Context<'a, E, PCS>,
+        ctx: &ProverContext<'a, E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
@@ -1118,7 +1122,7 @@ impl LayerNorm<Element> {
     fn lookup_witness<'a, E, PCS>(
         &self,
         id: NodeId,
-        ctx: &Context<'a, E, PCS>,
+        ctx: &ProverContext<'a, E, PCS>,
         layernorm_data: &LayerNormData,
     ) -> Result<LookupWitnessGen<'a, E, PCS>>
     where

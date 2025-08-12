@@ -14,13 +14,17 @@ ignored = ["prost"]
 
 [[bin]]
 name = "bench"
-path = "src/bin/bench.rs"
+path = "src/bin/bench-cnn.rs"
+
+[[bin]]
+name = "bench-llm"
+path = "src/bin/bench-llm.rs"
 
 [features]
 blake = ["mpcs/blake"]
 default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
-capture-layers-quant = ["dep:sha2"]
+capture-layers-quant = []
 cpu = ["burn/ndarray"]
 gpu = ["burn/wgpu", "dep:cubecl", "dep:burn-cubecl"]
 mem-track = ["utils/mem-track"]
@@ -33,6 +37,7 @@ burn = { version = "0.18.0", default-features = false }
 burn-cubecl = { version = "0.18.0", default-features = false, optional = true }
 candle-core = "0.9.1"
 clap = { workspace = true, features = ["derive", "env"] }
+csv.workspace = true
 cubecl = { version = "0.6.0", default-features = false, features = [
   "wgpu-msl",
 ], optional = true }
@@ -53,11 +58,13 @@ rmp-serde = { workspace = true }
 rust_tokenizers = "8.1.1"
 serde.workspace = true
 serde_json.workspace = true
-sha2 = { version = "0.10.9", optional = true }
+sha2 = "0.10.9"
 sumcheck.workspace = true
+tempfile.workspace = true
 tenstore = { path = "../tenstore" }
 timed = { workspace = true }
 timed-core = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = [
   "env-filter",
@@ -70,15 +77,12 @@ utils = { path = "../utils" }
 
 
 [dev-dependencies]
+bincode = "2.0.1"
 criterion = { "version" = "0.6", features = ["html_reports"] }
 ndarray = "0.16.1"
 proptest = "1.7.0"
 rstest = "0.25.0"
-sha2 = "0.10.9"
 tempfile.workspace = true
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-wreq = "5"
-wreq-util = "2"
 zstd = "0.13.3"
 
 [[bench]]

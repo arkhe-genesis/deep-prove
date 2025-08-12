@@ -25,7 +25,7 @@ pub static BIT_LEN: LazyLock<usize> = LazyLock::new(|| {
 });
 
 /// symmetric quantization range
-pub static MIN: LazyLock<Element> = LazyLock::new(|| -(1 << (*BIT_LEN - 1)) + 1);
+pub static MIN: LazyLock<Element> = LazyLock::new(|| -(1 << (*BIT_LEN - 1)));
 pub static MAX: LazyLock<Element> = LazyLock::new(|| (1 << (*BIT_LEN - 1)) - 1);
 pub static RANGE: LazyLock<Element> = LazyLock::new(|| *MAX - *MIN);
 pub static ZERO: LazyLock<Element> = LazyLock::new(|| 0);

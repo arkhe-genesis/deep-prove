@@ -101,8 +101,8 @@ pub fn prove<F: ExtensionField, T: Transcript<F>>(
     assert!(v1.shape().into_vec().iter().all(|x| x.is_power_of_two()));
     assert!(v2.shape().into_vec().iter().all(|x| x.is_power_of_two()));
     let beta_poly = compute_betas_eval(&output_claim.point).into_mle();
-    let v1_mle = v1.to_mle_flat::<F>();
-    let v2_mle = v2.to_mle_flat::<F>();
+    let v1_mle = v1.to_field_mle::<F>();
+    let v2_mle = v2.to_field_mle::<F>();
     let num_vars = beta_poly.num_vars();
     let num_threads = optimal_sumcheck_threads(num_vars);
     let mut expr_builder = VirtualPolynomialsBuilder::<F>::new(num_threads, num_vars);
@@ -177,7 +177,7 @@ mod test {
         let v2 = Tensor::random(&vec![n].into()).pad_next_power_of_two();
         let r = random_field_vector(n.next_power_of_two().ilog2() as usize);
         let expected_output = v1.mul(&v2);
-        let output_mle = expected_output.to_mle_flat::<GoldilocksExt2>();
+        let output_mle = expected_output.to_field_mle::<GoldilocksExt2>();
         let output_eval = output_mle.evaluate(&r);
         let output_claim = Claim::new(r, output_eval);
         let proof = prove(
@@ -190,7 +190,7 @@ mod test {
         let ctx = HadamardCtx::new(&v1, &v2);
         // NOTE: find closed formula to evaluate it efficiently OR use PCS
         let v2_eval = v2
-            .to_mle_flat::<GoldilocksExt2>()
+            .to_field_mle::<GoldilocksExt2>()
             .evaluate(proof.random_point());
         // NOTE: this has to be done by the component integrating the hadamard logic
         // normally by verifying this input claim via another sumcheck.
@@ -203,7 +203,7 @@ mod test {
         )
         .unwrap();
         let expected_v1_eval = v1
-            .to_mle_flat::<GoldilocksExt2>()
+            .to_field_mle::<GoldilocksExt2>()
             .evaluate(&input_claim.point);
         assert_eq!(expected_v1_eval, input_claim.eval);
     }

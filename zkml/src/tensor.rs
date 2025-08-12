@@ -932,12 +932,8 @@ impl Tensor<Element> {
         let t = Tensor::<F>::from(self);
         t.to_mle_2d()
     }
-
-    pub fn to_mle_flat<F: ExtensionField>(&self) -> MultilinearExtension<'_, F> {
-        MultilinearExtension::from_evaluations_ext_vec(
-            self.data.len().ilog2() as usize,
-            self.evals_flat(),
-        )
+    pub fn to_field_mle<F: ExtensionField>(&self) -> MultilinearExtension<'static, F> {
+        Tensor::<F>::from(self).into_mle()
     }
 
     pub fn into_btensor_1d(self) -> BTensor<Backend, 1, Int> {
@@ -1788,44 +1784,6 @@ impl<T: Number> Tensor<T> {
         Tensor::<T>::new(vec![num_matrices, matrix_dim, matrix_dim].into(), data)
     }
 
-    pub fn max_value(&self) -> T {
-        self.data.iter().fold(T::MIN, |max, x| max.cmp_max(x))
-    }
-    pub fn min_value(&self) -> T {
-        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
-    }
-
-    pub fn random(shape: &Shape) -> Self {
-        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
-    }
-
-    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
-        Ok(Self {
-            data: self
-                .data
-                .iter()
-                .map(f)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            shape: self.shape.clone(),
-            og_shape: self.og_shape.clone(),
-        })
-    }
-
-    /// Creates a random matrix with a given number of rows and cols.
-    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
-    /// sync which is not true for basic rng core.
-    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
-        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
-        let size = shape.product();
-        let data = (0..size).map(|_| T::random(&mut rng)).collect();
-        Self {
-            data,
-            shape: shape.clone(),
-            og_shape: vec![0].into(),
-        }
-    }
-
     #[cfg(test)]
     pub fn any(shape: Shape) -> impl proptest::prelude::Strategy<Value = Self> {
         use proptest::prelude::*;
@@ -1836,37 +1794,6 @@ impl<T: Number> Tensor<T> {
             shape: shape.clone(),
             og_shape: vec![0].into(),
         })
-    }
-
-    // slice on the third dimension.
-    // start inclusive, end exclusive
-    pub fn slice_3d(&self, start: usize, end: usize) -> Self {
-        assert!(self.shape.len() == 3);
-        assert!(start < self.shape[0]);
-        assert!(end <= self.shape[0]);
-        let blocks = self.shape[1] * self.shape[2];
-        let sliced = self.data[blocks * start..blocks * end].to_vec();
-        Self {
-            data: sliced,
-            shape: vec![end - start, self.shape[1], self.shape[2]].into(),
-            og_shape: vec![0].into(),
-        }
-    }
-
-    // slice the tensor on the second dimension
-    // dim2_start inclusive
-    // dim2_end exclusive
-    // TODO: refactor to take generic shape dimensions where to slice ... or just use burn API tensor
-    pub fn slice_2d(&self, dim2_start: usize, dim2_end: usize) -> Self {
-        assert!(self.shape.len() == 2);
-        let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
-        let data = self.data[range].to_vec();
-        let new_shape = vec![dim2_end - dim2_start, self.shape[1]];
-        Self {
-            data,
-            shape: new_shape.into(),
-            og_shape: vec![0].into(),
-        }
     }
 }
 
@@ -1900,26 +1827,6 @@ where
         assert!(n < n_size);
         let flat_index = n * (c_size * h_size * w_size) + c * (h_size * w_size) + h * w_size + w;
         self.data[flat_index]
-    }
-
-    fn get_idx(&self, accessors: Vec<usize>) -> usize {
-        assert!(self.shape.len() == accessors.len());
-        let mut flat_index = *accessors.last().unwrap();
-        let mut multiplier = *self.shape.last().unwrap();
-        for (a, s) in accessors
-            .iter()
-            .rev()
-            .skip(1)
-            .zip(self.shape.iter().rev().skip(1))
-        {
-            assert!(
-                *a < *s,
-                "Index out of bounds: {a} >= {s} - 0-based indexing forbids"
-            );
-            flat_index += *a * multiplier;
-            multiplier *= *s;
-        }
-        flat_index
     }
 
     // 0-based indexing for compatibility with other libraries
@@ -2186,6 +2093,184 @@ impl<T: Default + Clone + Copy> Tensor<T> {
     }
 }
 
+impl<T: Number> Tensor<T> {
+    pub fn max_value(&self) -> T {
+        self.data.iter().fold(T::MIN, |max, x| max.cmp_max(x))
+    }
+    pub fn min_value(&self) -> T {
+        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
+    }
+
+    pub fn random(shape: &Shape) -> Self {
+        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
+    }
+
+    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
+        Ok(Self {
+            data: self
+                .data
+                .iter()
+                .map(f)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            shape: self.shape.clone(),
+            og_shape: self.og_shape.clone(),
+        })
+    }
+
+    /// Creates a random matrix with a given number of rows and cols.
+    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
+    /// sync which is not true for basic rng core.
+    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
+        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
+        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
+        let size = shape.product();
+        let data = (0..size).map(|_| T::random(&mut rng)).collect();
+        Self {
+            data,
+            shape: shape.clone(),
+            og_shape: vec![0].into(),
+        }
+    }
+
+    // slice on the third dimension.
+    // start inclusive, end exclusive
+    pub fn slice_3d(&self, start: usize, end: usize) -> Self {
+        assert!(self.shape.len() == 3);
+        assert!(start < self.shape[0]);
+        assert!(end <= self.shape[0]);
+        let blocks = self.shape[1] * self.shape[2];
+        let sliced = self.data[blocks * start..blocks * end].to_vec();
+        Self {
+            data: sliced,
+            shape: vec![end - start, self.shape[1], self.shape[2]].into(),
+            og_shape: vec![0].into(),
+        }
+    }
+
+    // slice the tensor on the second dimension
+    // dim2_start inclusive
+    // dim2_end exclusive
+    // TODO: refactor to take generic shape dimensions where to slice ... or just use burn API tensor
+    pub fn slice_2d(&self, dim2_start: usize, dim2_end: usize) -> Self {
+        assert!(self.shape.len() == 2);
+        let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
+        let data = self.data[range].to_vec();
+        let new_shape = vec![dim2_end - dim2_start, self.shape[1]];
+        Self {
+            data,
+            shape: new_shape.into(),
+            og_shape: vec![0].into(),
+        }
+    }
+}
+
+impl<T: Default> Tensor<T> {
+    fn get_idx(&self, accessors: Vec<usize>) -> usize {
+        assert!(self.shape.len() == accessors.len());
+        let mut flat_index = *accessors.last().unwrap();
+        let mut multiplier = *self.shape.last().unwrap();
+        for (a, s) in accessors
+            .iter()
+            .rev()
+            .skip(1)
+            .zip(self.shape.iter().rev().skip(1))
+        {
+            assert!(
+                *a < *s,
+                "Index out of bounds: {a} >= {s} - 0-based indexing forbids"
+            );
+            flat_index += *a * multiplier;
+            multiplier *= *s;
+        }
+        flat_index
+    }
+    pub fn map_data<O, F: Fn(&T) -> O>(&self, f: F) -> Tensor<O> {
+        Tensor {
+            data: self.data.iter().map(f).collect(),
+            shape: self.shape.clone(),
+            og_shape: self.og_shape.clone(),
+        }
+    }
+
+    pub fn insert_at_dim(mut self, dim: usize, index: usize, value: T) -> Self {
+        if self.data.len() == index {
+            self.data.push(value);
+            *self.shape.get_mut(dim).unwrap() += 1;
+        } else if self.data.len() > index {
+            self.data[index] = value;
+        } else {
+            panic!(
+                "Cannot insert at index {index} in tensor with data length {}",
+                self.data.len()
+            );
+        }
+        self
+    }
+
+    /// The new shape of self will be [S1_1+S2_1,S1,...Sn]
+    /// In other words, we only concatenate another vector if it's exactly size of the highest dimension
+    pub fn concat_from_unpadded(
+        &mut self,
+        self_unpadded_first_dim: usize,
+        other: Self,
+        other_unpadded_first_dim: usize,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.shape().rank() == other.shape().rank(),
+            "self and other shapes must have the same length"
+        );
+        ensure!(
+            self.shape()
+                .iter()
+                .zip(other.shape().iter())
+                .skip(1)
+                .all(|(a, b)| a == b),
+            "self and other shapes must have the same dimensions"
+        );
+        ensure!(
+            other.shape().numel() == other.get_data().len(),
+            "The other tensor data length is not equal to the other shape product"
+        );
+
+        // 0-based indexing
+        let max_stride: usize = self.shape().iter().skip(1).product();
+        let init_pos = self_unpadded_first_dim * max_stride;
+        let mut pos = init_pos;
+        let end_of_slice = self.get_data().len();
+        // only take the non-padded part of the other tensor
+        for new_v in other
+            .data
+            .into_iter()
+            .take(other_unpadded_first_dim * max_stride)
+        {
+            if pos >= end_of_slice {
+                self.data.push(new_v);
+            } else {
+                self.data[pos] = new_v;
+            }
+            pos += 1;
+        }
+        ensure!(
+            pos % max_stride == 0,
+            "The part going beyond must be a multiple of the stride"
+        );
+        // how many times have we added a "big" chunk to the recipient, and therefore by how much to increase the new shape
+        let new_dim = self_unpadded_first_dim + (pos - init_pos) / max_stride;
+        // we only update the shape for the part that goes beyond the existing padding
+        if new_dim > self.shape.dim(0) {
+            self.shape.set_dim(0, new_dim);
+            self.data.resize_with(self.shape.numel(), Default::default);
+        }
+        ensure!(
+            self.get_data().len() == self.shape().product(),
+            "The new data length {} is not equal to the new shape product {}",
+            self.get_data().len(),
+            self.shape().product()
+        );
+        Ok(())
+    }
+}
+
 /// Structure that holds a shape of a tensor.
 /// NOTE: it is currently being phased in incrementally the codebase currently. There will be places where we still use Vec<usize>
 #[derive(
@@ -2246,6 +2331,23 @@ impl Shape {
     /// ```
     pub fn dim(&self, index: usize) -> usize {
         self.0[index]
+    }
+
+    /// Sets the value of a given dimension.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is larger than this shape size.
+    ///
+    /// ```
+    /// # use zkml::tensor::Shape;
+    /// let mut shape = Shape::new(vec![3, 5]);
+    /// shape.set_dim(1, 10);
+    /// assert_eq!(shape.dim(1), 10);
+    /// ```
+    pub fn set_dim(&mut self, index: usize, value: usize) {
+        assert!(index < self.0.len(), "Index out of bounds");
+        self.0[index] = value;
     }
 
     /// Adds an extra dimension with size `1` to [Shape].
@@ -2324,9 +2426,25 @@ impl Shape {
     pub fn next_power_of_two(&self) -> Self {
         Self(self.0.next_power_of_two())
     }
-    pub fn concat(&self, other: &Self) -> Self {
+    pub fn extend(&self, other: &Self) -> Self {
         let mut new_shape = self.0.clone();
         new_shape.extend(other.0.clone());
+        Self(new_shape)
+    }
+    pub fn concat(&self, other: &Self) -> Self {
+        assert!(
+            self.rank() == other.rank(),
+            "Shapes must have the same rank"
+        );
+        assert!(
+            self.0
+                .iter()
+                .zip(other.0.iter())
+                .skip(1)
+                .all(|(a, b)| a == b)
+        );
+        let mut new_shape = self.0.clone();
+        new_shape[0] += other.0[0];
         Self(new_shape)
     }
     pub fn into_vec(self) -> Vec<usize> {
@@ -2548,6 +2666,8 @@ pub fn get_broadcasted_shape(shape_a: &Shape, shape_b: &Shape) -> anyhow::Result
 
 #[cfg(test)]
 mod test {
+    use std::panic::catch_unwind;
+
     use ark_std::rand::Rng;
     use ff_ext::{FieldFrom, GoldilocksExt2};
     use ndarray::{Array, Ix2, Order};
@@ -2669,7 +2789,6 @@ mod test {
     fn test_tensor_next_pow_of_two() {
         let shape = vec![3usize, 3].into();
         let mat = Tensor::<Element>::random_seed(&shape, Some(213));
-        // println!("{}", mat);
         let new_shape = vec![shape[0].next_power_of_two(), shape[1].next_power_of_two()];
         let new_mat = mat.pad_next_power_of_two();
         assert_eq!(
@@ -2698,7 +2817,6 @@ mod test {
         let mat = Tensor::random(&vec![3, 5].into());
         let shape = mat.shape();
         let mat = mat.pad_next_power_of_two();
-        println!("matrix {mat}");
         let mut mle = mat.to_2d_mle::<E>();
         let mut rng = rng_from_env_or_random();
         let (chosen_row, chosen_col) = (rng.gen_range(0..shape[0]), rng.gen_range(0..shape[1]));
@@ -3460,5 +3578,35 @@ mod test {
             .expand(&expansion_shape)
             .unwrap();
         assert_eq!(expanded_tensor.data, expansion_data);
+    }
+
+    #[test]
+    fn test_shape_concat() {
+        let shape1 = Shape(vec![2, 3, 4]);
+        let shape2 = Shape(vec![3, 4, 5]);
+        assert!(catch_unwind(|| { shape1.concat(&shape2) }).is_err());
+        let shape3 = Shape(vec![3, 3, 4]);
+        println!("YOLO");
+        let new = shape1.concat(&shape3);
+        assert_eq!(new, vec![5, 3, 4].into());
+    }
+
+    #[test]
+    fn test_concat_from() {
+        let t1_shape: Shape = vec![5, 3, 3].into();
+        let mut t1 = Tensor::<Element>::random(&t1_shape).pad_next_power_of_two();
+        let t2_shape: Shape = vec![1, 3, 3].into();
+        let t2 = Tensor::<Element>::random(&t2_shape).pad_next_power_of_two();
+        t1.concat_from_unpadded(t1_shape.dim(0), t2, t2_shape.dim(0))
+            .unwrap();
+        // 8 since 5 padded next power of two is 8, and 5+1=6 so we don't go over the dimension
+        let expected_shape = Shape(vec![8, 4, 4]);
+        assert_eq!(t1.shape(), expected_shape);
+        // 6 + 3 = 9  so resulting
+        let t3_shape: Shape = vec![3, 3, 3].into();
+        let t3 = Tensor::<Element>::random(&t3_shape).pad_next_power_of_two();
+        t1.concat_from_unpadded(6, t3, t3_shape.dim(0)).unwrap();
+        let expected_shape = Shape(vec![9, 4, 4]);
+        assert_eq!(t1.shape(), expected_shape);
     }
 }

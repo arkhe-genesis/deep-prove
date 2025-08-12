@@ -15,7 +15,7 @@ mod commit;
 pub mod iop;
 pub mod quantization;
 pub use iop::{
-    Context, Proof,
+    Proof, ProverContext,
     prover::Prover,
     verifier::{IO, verify},
 };
@@ -24,7 +24,7 @@ pub mod layers;
 pub mod lookup;
 pub mod model;
 pub mod padding;
-mod parser;
+pub mod parser;
 pub use parser::{FloatOnnxLoader, ModelType};
 pub mod tensor;
 pub use tensor::Tensor;
@@ -275,7 +275,7 @@ mod test {
 
     use crate::{
         FloatOnnxLoader, default_transcript,
-        iop::{Context, prover::Prover, verifier::verify},
+        iop::{prover::Prover, verifier::verify},
         parser::ModelType,
         rng_from_env_or_random,
         tensor::Tensor,
@@ -305,8 +305,9 @@ mod test {
             .build()?;
 
         println!("[+] Loaded onnx file");
-        let ctx =
-            Context::<E, Pcs<E>>::generate(&model, None, None).expect("unable to generate context");
+        let (prover_ctx, verifier_ctx) = model
+            .generate_contexts::<GoldilocksExt2, Pcs<GoldilocksExt2>>()
+            .expect("Unable to generate contexts");
         println!("[+] Setup parameters");
 
         let shapes = model.input_shapes();
@@ -317,18 +318,19 @@ mod test {
         println!("input: {:?}", input.get_data());
         let input = model.prepare_inputs(vec![input])?;
 
-        let trace = model.run(&input, &mut TenStore::default()).unwrap();
+        let trace = model.run(&input, None, &mut TenStore::default()).unwrap();
         let output = trace.output_at(0)?;
         println!("[+] Run inference. Result: {output:?}");
 
         let io = trace.to_verifier_io()?;
         let mut prover_transcript = default_transcript();
-        let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
+        let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
         println!("[+] Run prover");
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = default_transcript();
-        verify::<_, _, _>(ctx, proof, io, &mut verifier_transcript).expect("invalid proof");
+        verify::<_, _, _>(verifier_ctx, proof, io, &mut verifier_transcript)
+            .expect("invalid proof");
         println!("[+] Verify proof: valid");
         Ok(())
     }

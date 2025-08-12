@@ -732,7 +732,7 @@ mod tests {
 
         let input_tensor = crate::tensor::Tensor::random(&input_shape);
         let trace = model
-            .run::<GoldilocksExt2>(&[input_tensor], &mut TenStore::default())
+            .run::<GoldilocksExt2>(&[input_tensor], None, &mut TenStore::default())
             .unwrap();
         assert!(!trace.steps.is_empty());
     }

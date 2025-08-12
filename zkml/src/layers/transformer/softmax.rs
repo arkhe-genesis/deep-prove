@@ -6,7 +6,7 @@ use crate::{
     Claim, Element, ScalingStrategy, Tensor,
     commit::compute_betas_eval,
     iop::{
-        context::{Context, ContextAux, ShapeStep},
+        context::{ContextAux, ProverContext, ShapeStep},
         verifier::Verifier,
     },
     layers::{
@@ -187,7 +187,7 @@ impl<N: Number> Softmax<N> {
         // by the exponential. We will have K total tables, L of which are used for values that are so insignificant they get mapped to 1 and M of which
         // contain values that are all greater than bkm. We aim to make K - M - L = 1 because results from testing tell us that this allows
         // us to make an exp table with 17 variables which isn't too large (as it gets reused across every softmax in something like Multiheaded attention).
-        let base: Element = 1 << (LOG_SCALE_FACTOR - 8);
+        let base: Element = 1 << 16;
         let (float_error, bkm_float) = calc_softmax_error(
             base,
             self.max_size as f32,
@@ -282,21 +282,20 @@ impl Softmax<Element> {
             .last()
             .ok_or(anyhow!("Input tensor had no shape in quantised Softmax"))?;
         // We also need the second to last dim
-        let second_dim = input.shape()[input.rank() - 2];
-        let shift_data = input
-            .get_data()
-            .chunks(final_dim)
-            .enumerate()
-            .map(|(i, chunk)| {
-                // We add the check here to see if we are in the first row of a new channel, the first row has to be calculated
-                // differently so as to avoid getting rounding errors that lead to values we can't lookup.
-                if i % second_dim == 0 {
-                    -chunk[0] * self.scalar
-                } else {
-                    let max = *chunk.iter().take(i % second_dim + 1).max().unwrap();
+        let second_dim = input.shape()[input.shape().len() - 2];
+        let shift_data = if second_dim == 1 && second_dim != final_dim {
+            input
+                .get_data()
+                .chunks(final_dim)
+                .map(|chunk| {
+                    let max = *chunk
+                        .iter()
+                        .take(*unpadded_input_shape.last().unwrap())
+                        .max()
+                        .unwrap();
                     let sum = chunk
                         .iter()
-                        .take(i % second_dim + 1)
+                        .take(*unpadded_input_shape.last().unwrap())
                         .map(|x| {
                             (input_scale_factor.dequantize(&(x - max)) / inv_float_temperature)
                                 .exp()
@@ -305,9 +304,35 @@ impl Softmax<Element> {
                     let log_sum = sum.ln();
                     -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round() as Element
                         - max * self.scalar
-                }
-            })
-            .collect::<Vec<Element>>();
+                })
+                .collect::<Vec<Element>>()
+        } else {
+            input
+                .get_data()
+                .chunks(final_dim)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    // We add the check here to see if we are in the first row of a new channel, the first row has to be calculated
+                    // differently so as to avoid getting rounding errors that lead to values we can't lookup.
+                    if i % second_dim == 0 {
+                        -chunk[0] * self.scalar
+                    } else {
+                        let max = *chunk.iter().take(i % second_dim + 1).max().unwrap();
+                        let sum = chunk
+                            .iter()
+                            .take(i % second_dim + 1)
+                            .map(|x| {
+                                (input_scale_factor.dequantize(&(x - max)) / inv_float_temperature)
+                                    .exp()
+                            })
+                            .sum::<f32>();
+                        let log_sum = sum.ln();
+                        -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round() as Element
+                            - max * self.scalar
+                    }
+                })
+                .collect::<Vec<Element>>()
+        };
         // Make a tensor for the shift data
         let shift_shape = input
             .shape()
@@ -317,7 +342,11 @@ impl Softmax<Element> {
             .chain(std::iter::once(1usize))
             .collect::<Vec<usize>>();
         let shift_tensor = Tensor::<Element>::new(shift_shape.into(), shift_data);
-        let mask = AttentionMask::<Element>::new(input.shape().as_slice(), negative_infinity)?;
+        let mask = AttentionMask::<Element>::new(
+            input.shape().as_slice(),
+            unpadded_input_shape,
+            negative_infinity,
+        )?;
 
         Ok((shift_tensor, mask))
     }
@@ -354,7 +383,7 @@ impl Evaluate<f32> for Softmax<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: &[Shape],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
@@ -362,7 +391,11 @@ impl Evaluate<f32> for Softmax<f32> {
         );
         let input = inputs[0];
         // Make the attention mask
-        let mask = AttentionMask::<f32>::new(&input.shape(), f32::NEG_INFINITY)?;
+        let mask = AttentionMask::<f32>::new(
+            &input.shape(),
+            &unpadded_input_shapes[0],
+            f32::NEG_INFINITY,
+        )?;
         let masked_input = mask.apply(input)?;
 
         let chunk_size = *input
@@ -936,7 +969,7 @@ impl Softmax<Element> {
     pub(crate) fn lookup_witness<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         id: NodeId,
-        ctx: &'a Context<'a, E, PCS>,
+        ctx: &'a ProverContext<'a, E, PCS>,
         output: &Tensor<Element>,
         softmax_data: &SoftmaxData<E>,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
@@ -969,10 +1002,23 @@ impl Softmax<Element> {
             .shape()
             .last()
             .ok_or(anyhow!("Softmax output tensor did not have a shape"))?;
+        let mut error_chunks = vec![];
         let normalisation_lookup = output
             .get_data()
             .chunks(final_dim_size)
-            .map(|chunk| chunk.iter().sum::<Element>())
+            .enumerate()
+            .map(|(i, chunk)| {
+                let sum = chunk.iter().sum::<Element>();
+                let quant_one = OUTPUT_SCALE_FACTOR as Element;
+                if (sum < quant_one - allowable_error || sum > quant_one + allowable_error)
+                    && sum != 0
+                {
+                    error_chunks.push(i);
+                    // println!("Sum was {sum} on chunk {i}");
+                    // chunk.iter().for_each(|v| println!("chunk value {v}"));
+                }
+                sum
+            })
             .collect::<Vec<Element>>();
 
         let range_elements_count = count_elements(
@@ -1146,7 +1192,7 @@ where
     fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &'a Context<'a, E, PCS>,
+        ctx: &'a ProverContext<'a, E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {
@@ -1667,7 +1713,11 @@ impl<N: Number> Default for AttentionMask<N> {
 
 impl<N: Number> AttentionMask<N> {
     /// Creates a new mask given the unpadded input shape and the value to use for `-inf`
-    pub fn new(unpadded_shape: &[usize], negative_inf: N) -> Result<AttentionMask<N>> {
+    pub fn new(
+        shape: &[usize],
+        unpadded_shape: &[usize],
+        negative_inf: N,
+    ) -> Result<AttentionMask<N>> {
         // The input shape should have length either 2 or 3 and the final 2 dimensions should be equal
         let num_dims = unpadded_shape.len();
 
@@ -1680,9 +1730,10 @@ impl<N: Number> AttentionMask<N> {
 
         // Now check that either the final two dimensions are the same or the second to last dimension is 1
         let dims_equal = unpadded_shape[num_dims - 2] == unpadded_shape[num_dims - 1];
+        let single_token = unpadded_shape[num_dims - 2] == 1;
 
         ensure!(
-            dims_equal,
+            dims_equal || single_token,
             "Final two dimensions should be equal, got: second to last: {}, last: {}",
             unpadded_shape[num_dims - 2],
             unpadded_shape[num_dims - 1]
@@ -1690,23 +1741,47 @@ impl<N: Number> AttentionMask<N> {
 
         // Now that we know all the dimensions line up make the lower triangular tensor
         let shape = if num_dims == 2 {
-            let mut shape = unpadded_shape.to_vec();
+            let mut shape = shape.to_vec();
             shape.insert(0, 1);
             shape
         } else {
-            unpadded_shape.to_vec()
+            shape.to_vec()
         };
 
-        // Make the tril and bias tensor
-        let tril = Tensor::<N>::tril(shape[2], shape[0], 0);
+        // If we only have a single token we only need to mask the padding (if there is any)
+        if single_token {
+            let tril_single_row = std::iter::repeat_n(N::unit(), *unpadded_shape.last().unwrap())
+                .chain(std::iter::repeat(N::default()))
+                .take(*shape.last().unwrap())
+                .collect::<Vec<N>>();
+            let tril_data = vec![tril_single_row.clone(); shape[0]].concat();
+            let bias_single_row =
+                std::iter::repeat_n(N::default(), *unpadded_shape.last().unwrap())
+                    .chain(std::iter::repeat(negative_inf))
+                    .take(*shape.last().unwrap())
+                    .collect::<Vec<N>>();
+            let bias_data = vec![bias_single_row; shape[0]].concat();
+            let tril = Tensor::<N>::new(shape.clone().into(), tril_data);
 
-        let bias = Tensor::<N>::tri(shape[2], shape[0], 0, N::default(), negative_inf);
+            let bias = Tensor::<N>::new(shape.into(), bias_data);
 
-        Ok(AttentionMask {
-            tril,
-            bias,
-            negative_infinity: negative_inf,
-        })
+            Ok(AttentionMask {
+                tril,
+                bias,
+                negative_infinity: negative_inf,
+            })
+        } else {
+            // Make the tril and bias tensor
+            let tril = Tensor::<N>::tril(shape[2], shape[0], 0);
+
+            let bias = Tensor::<N>::tri(shape[2], shape[0], 0, N::default(), negative_inf);
+
+            Ok(AttentionMask {
+                tril,
+                bias,
+                negative_infinity: negative_inf,
+            })
+        }
     }
 
     /// Pads the [`AttentionMask`] for proving purposes

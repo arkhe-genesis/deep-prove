@@ -1,12 +1,17 @@
 //! This module contains logic to prove the correct opening of several claims from several independent
 //! polynomials.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::{Claim, default_transcript, layers::provable::NodeId, lookup::context::TableType};
+use crate::{
+    Claim, default_transcript,
+    layers::provable::NodeId,
+    lookup::context::{LookupContext, TableType},
+};
 use ff_ext::ExtensionField;
 
 use anyhow::{Context, Result, anyhow, ensure};
+use itertools::Itertools;
 use mpcs::{Evaluation, PolynomialCommitmentScheme};
 use multilinear_extensions::{
     mle::{FieldType, MultilinearExtension},
@@ -15,6 +20,7 @@ use multilinear_extensions::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use tracing::debug;
 use transcript::Transcript;
 
 pub type PolyId = String;
@@ -29,108 +35,141 @@ type ModelCommitmentsMap<'a, PCS, E> = BTreeMap<
         ),
     >,
 >;
+
+/// Data structure representing the context data that is necessary to properly derive
+/// a pair of `CommitmentProverCtx`, `CommitmentVerifierCtx` for a given size of the
+/// biggest polynomial to be committed to. This structure allows to derive a pair
+/// of prover/verifier contexts as long as the size of the biggest polynomial to be
+/// committed is at most `self.max_poly_size`
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-/// Struct that stores general information about commitments used for proving inference
-/// in a [`Model`].
-pub struct CommitmentContext<'a, E, PCS>
+pub(crate) struct GlobalCommitmentCtx<'a, E, PCS>
 where
     PCS: PolynomialCommitmentScheme<E>,
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
 {
-    /// Prover parameters for the [`PolynomialCommitmentScheme`]
-    prover_params: PCS::ProverParam,
-    /// Verifier parameters for the [`PolynomialCommitmentScheme`]
-    verifier_params: PCS::VerifierParam,
-    /// This field contains a [`BTreeMap`] where the key is a [`NodeId`] and the value is a
-    /// vector of tuples of [`PolynomialCommitmentScheme::CommitmentWithWitness`]
-    /// and [`DenseMultilinearExtension<E>`] corresponding to that ID.
-    model_comms_map: ModelCommitmentsMap<'a, PCS, E>,
-    /// This field contains a [`BTreeMap`] relating to lookup tables used by the model
-    table_comms_map: HashMap<TableType, (PCS::CommitmentWithWitness, MultilinearExtension<'a, E>)>,
+    /// Parameters for the [`PolynomialCommitmentScheme`]
+    params: PCS::Param,
+    /// Size of the maximum polynomial suppoted by `params`
+    max_poly_size: usize,
+    /// Size of the maximum constant polynomial found in the model
+    constant_polys_max_size: usize,
+    /// This field contains the constant polynomials associated to each node in the model, identifier by their [`PolyId`].
+    model_polys: Vec<(NodeId, HashMap<PolyId, MultilinearExtension<'a, E>>)>,
+    /// This field contains the polynomials associated to each lookup table employed in the model
+    table_polys: HashMap<TableType, MultilinearExtension<'a, E>>,
 }
 
-impl<'a, E, PCS> CommitmentContext<'a, E, PCS>
+pub(crate) struct ContextGenerator<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+    poly_sizes: Box<dyn Iterator<Item = usize>>,
+    ctx: GlobalCommitmentCtx<'a, E, PCS>,
+}
+
+impl<'a, E, PCS> Iterator for ContextGenerator<'a, E, PCS>
+where
+    E: ExtensionField,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    type Item = Result<(
+        usize,
+        (
+            CommitmentProverCtx<'a, E, PCS>,
+            CommitmentVerifierCtx<E, PCS>,
+        ),
+    )>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.poly_sizes.as_mut().next().map(|poly_size| {
+            self.ctx
+                .clone()
+                .generate_contexts(Some(poly_size))
+                .map(|(prover_ctx, verifier_ctx)| (poly_size, (prover_ctx, verifier_ctx)))
+        })
+    }
+}
+
+impl<'a, E, PCS> GlobalCommitmentCtx<'a, E, PCS>
 where
     PCS: PolynomialCommitmentScheme<E>,
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
 {
-    /// Make a new [`CommitmentContext`]
-    pub fn new(
+    /// Instantiate a new instance of `Self`. `witness_poly_size` must be the size of the
+    /// biggest witness polynomial to be committed that is found in the model,
+    /// while `polys` is the set of constant polynomials employed across all the layers
+    /// of the model that needs to be committed
+    pub(crate) fn new(
         witness_poly_size: usize,
         polys: Vec<(NodeId, HashMap<PolyId, MultilinearExtension<'a, E>>)>,
-        lookup_ctx: Vec<TableType>,
-    ) -> Result<CommitmentContext<'a, E, PCS>> {
-        // Find the maximum size so we can generate params
-        let max_poly_size = polys
+        lookup_ctx: &LookupContext,
+    ) -> Result<GlobalCommitmentCtx<'a, E, PCS>> {
+        let table_polys: HashMap<_, _> = lookup_ctx
             .iter()
-            .fold(witness_poly_size, |mut acc, (_, poly_vec)| {
-                poly_vec
-                    .iter()
-                    .for_each(|(_, poly)| acc = acc.max(1 << poly.num_vars()));
-                acc
+            .filter_map(|table_type| {
+                table_type
+                    .committed_columns()
+                    .map(|poly| (table_type.clone(), mle_to_owned(poly)))
             })
+            .collect();
+        // Find the maximum size so we can generate params
+        let constant_polys_max_size = polys
+            .iter()
+            .flat_map(|(node_id, poly_vec)| {
+                debug!(
+                    "Context Commitment: node {node_id} has {} polynomials of sizes {:?}",
+                    poly_vec.len(),
+                    poly_vec
+                        .values()
+                        .map(|poly| poly.num_vars())
+                        .collect::<Vec<_>>()
+                );
+                poly_vec.values().collect_vec()
+            })
+            .chain(table_polys.values())
+            .fold(0usize, |acc, poly| acc.max(1 << poly.num_vars()))
             .next_power_of_two();
 
-        let param = PCS::setup(max_poly_size).context("setting up params")?;
-        let (prover_params, verifier_params) =
-            PCS::trim(param, max_poly_size).context("trimming params")?;
+        let max_poly_size = constant_polys_max_size.max(witness_poly_size.next_power_of_two());
+        debug!("Setting up PCS params for max size {} poly", max_poly_size);
+        let params = PCS::setup(max_poly_size).context("setting up params")?;
 
-        let model_comms_map = polys
-            .into_par_iter()
-            .map(|(node_id, polys_vec)| {
-                let model_comms = polys_vec
-                    .into_iter()
-                    .map(|(id, poly)| {
-                        let commit = PCS::commit(&prover_params, poly.clone())
-                            .with_context(|| format!("committing to polynomial {id}"))?;
-                        Result::<(_, _), anyhow::Error>::Ok((id, (commit, poly)))
-                    })
-                    .collect::<Result<
-                        BTreeMap<PolyId, (PCS::CommitmentWithWitness, MultilinearExtension<'_, E>)>,
-                        _,
-                    >>()
-                    .with_context(|| format!("collecting node {node_id} commitments"))?;
-                Result::<(NodeId, BTreeMap<PolyId, (_, _)>), anyhow::Error>::Ok((
-                    node_id,
-                    model_comms,
-                ))
-            })
-            .collect::<Result<BTreeMap<NodeId, _>, _>>()
-            .context("collecting model commitments")?;
-
-        let mut table_comms_map = HashMap::new();
-
-        for table_type in lookup_ctx {
-            if let Some(poly) = table_type
-                .committed_columns()
-                .map(|mle| mle_to_owned(mle.clone()))
-            {
-                let Some(commit) = PCS::commit(&prover_params, poly.clone()).ok() else {
-                    continue;
-                };
-                table_comms_map.insert(table_type, (commit, poly));
-            }
-        }
-
-        Ok(CommitmentContext {
-            prover_params,
-            verifier_params,
-            model_comms_map,
-            table_comms_map,
+        Ok(Self {
+            params,
+            max_poly_size,
+            constant_polys_max_size,
+            model_polys: polys,
+            table_polys,
         })
     }
 
-    /// Make a new [`CommitmentContext`] from known params
-    pub fn new_with_params(
-        polys: Vec<(NodeId, HashMap<PolyId, MultilinearExtension<'a, E>>)>,
-        lookup_ctx: Vec<TableType>,
-        prover_params: PCS::ProverParam,
-        verifier_params: PCS::VerifierParam,
-    ) -> Result<CommitmentContext<'a, E, PCS>> {
-        let model_comms_map = polys
+    /// Generate a prover/verifier context for the `witness_poly_size` specified as input;
+    /// `witness_poly_size` represents the size of the biggest witness polynomial to be
+    /// committed to. If no `witness_poly_size` is provided as input, this method generates
+    /// the prover/verifier context for `self.max_poly_size()`
+    pub(crate) fn generate_contexts(
+        self,
+        witness_poly_size: Option<usize>,
+    ) -> Result<(
+        CommitmentProverCtx<'a, E, PCS>,
+        CommitmentVerifierCtx<E, PCS>,
+    )> {
+        let trimmed_poly_size = if let Some(poly_size) = witness_poly_size {
+            ensure!(
+                self.max_poly_size >= poly_size,
+                "Witness polynomial size {poly_size} is larger than the maximum polynomial size supported by Global Context {}",
+                self.max_poly_size
+            );
+            self.constant_polys_max_size
+                .max(poly_size.next_power_of_two())
+        } else {
+            self.max_poly_size
+        };
+
+        let (prover_params, verifier_params) = PCS::trim(self.params, trimmed_poly_size)?;
+
+        let model_comms_map = self
+            .model_polys
             .into_par_iter()
             .map(|(node_id, polys_vec)| {
                 let model_comms = polys_vec
@@ -144,41 +183,105 @@ where
                     .with_context(|| format!("collecting node {node_id} commitments"))?;
                 Result::<_, anyhow::Error>::Ok((node_id, model_comms))
             })
-            .collect::<Result<_, _>>()
-            .context("collecting model commitments")?;
+            .collect::<Result<BTreeMap<NodeId, _>, _>>()
+            .context(format!(
+                "collecting model commitments for size {trimmed_poly_size}"
+            ))?;
 
-        let mut table_comms_map = HashMap::new();
+        let table_comms_map =
+            self.table_polys
+                .into_par_iter()
+                .map(|(table_type, poly)| {
+                    let commit = PCS::commit(&prover_params, poly.clone())?;
+                    Ok((table_type, (commit, poly)))
+                })
+                .collect::<Result<
+                    BTreeMap<TableType, (PCS::CommitmentWithWitness, MultilinearExtension<E>)>,
+                >>()?;
 
-        for table_type in lookup_ctx {
-            if let Some(poly) = table_type
-                .committed_columns()
-                .map(|mle| mle_to_owned(mle.clone()))
-            {
-                let Some(commit) = PCS::commit(&prover_params, poly.clone()).ok() else {
-                    continue;
-                };
-                table_comms_map.insert(table_type, (commit, poly));
-            }
-        }
-
-        Ok(CommitmentContext {
-            prover_params,
+        let verifier_ctx = CommitmentVerifierCtx {
             verifier_params,
+            model_comms_map: model_comms_map
+                .iter()
+                .map(|(&node_id, comms_vec)| {
+                    (
+                        node_id,
+                        comms_vec
+                            .iter()
+                            .map(|(id, (comm, _))| (id.clone(), PCS::get_pure_commitment(comm)))
+                            .collect::<BTreeMap<PolyId, PCS::Commitment>>(),
+                    )
+                })
+                .collect(),
+            table_comms_map: table_comms_map
+                .iter()
+                .map(|(table_type, (comm, _))| (table_type.clone(), PCS::get_pure_commitment(comm)))
+                .collect(),
+        };
+
+        let prover_ctx = CommitmentProverCtx {
+            prover_params,
             model_comms_map,
             table_comms_map,
-        })
+        };
+
+        Ok((prover_ctx, verifier_ctx))
     }
 
-    /// Getter for the PCS prover params
-    pub fn prover_params(&self) -> &PCS::ProverParam {
-        &self.prover_params
-    }
+    /// Generate a set of prover/verifier contexts for the `witness_poly_sizes` specified as input;
+    /// Each `witness_poly_size` represents the size of the biggest witness polynomial to be
+    /// committed to
+    pub(crate) fn generate_all_contexts(
+        self,
+        witness_poly_sizes: Vec<usize>,
+    ) -> Result<ContextGenerator<'a, E, PCS>> {
+        // first, build the set of different poly size for which we need to build a context. Note that multiple
+        // `witness_poly_sizes` might be mapped to the same poly size for the context, so the returned set might
+        // have less entries than `witness_poly_sizes`
+        let actual_poly_sizes: HashSet<usize> = witness_poly_sizes
+            .into_iter()
+            .map(|witness_poly_size| {
+                self.constant_polys_max_size
+                    .max(witness_poly_size.next_power_of_two())
+            })
+            .collect();
 
-    /// Getter for the PCS verifier params
-    pub fn verifier_params(&self) -> &PCS::VerifierParam {
-        &self.verifier_params
-    }
+        let iterator = ContextGenerator {
+            poly_sizes: Box::new(actual_poly_sizes.into_iter()),
+            ctx: self,
+        };
 
+        Ok(iterator)
+    }
+}
+
+/// Context data for the commitment prover
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct CommitmentProverCtx<'a, E, PCS>
+where
+    PCS: PolynomialCommitmentScheme<E>,
+    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField + Serialize + DeserializeOwned,
+{
+    /// Prover parameters for the [`PolynomialCommitmentScheme`]
+    prover_params: PCS::ProverParam,
+    /// This field contains a [`BTreeMap`] where the key is a [`NodeId`] and the value is a vector of tuples of [`PolynomialCommitmentScheme::CommitmentWithWitness`]  and [`DenseMultilinearExtension<E>`] corresponding to that ID.
+    /// A [`BTreeMap`] is used to ensure that the commitments are written in a deterministic order
+    /// to the transcript
+    model_comms_map: ModelCommitmentsMap<'a, PCS, E>,
+    /// This field contains a [`BTreeMap`] relating to lookup tables used by the model.
+    /// A [`BTreeMap`] is used to ensure that the commitments are written in a deterministic order
+    /// to the transcript
+    table_comms_map: BTreeMap<TableType, (PCS::CommitmentWithWitness, MultilinearExtension<'a, E>)>,
+}
+
+impl<'a, E, PCS> CommitmentProverCtx<'a, E, PCS>
+where
+    PCS: PolynomialCommitmentScheme<E>,
+    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField + Serialize + DeserializeOwned,
+{
     /// Helper method to commit to polynomial.
     pub fn commit(&self, mle: &MultilinearExtension<'a, E>) -> Result<PCS::CommitmentWithWitness> {
         PCS::commit(&self.prover_params, mle.clone()).map_err(|e| e.into())
@@ -195,6 +298,63 @@ where
                         "Could not write commitment for polynomial {id} of node {node_id}"
                     ))
                 })
+            })?;
+        self.table_comms_map
+            .iter()
+            .try_for_each(|(table_type, (comm, _))| {
+                let v_comm = PCS::get_pure_commitment(comm);
+                PCS::write_commitment(&v_comm, transcript).context(format!(
+                    "Could not write commitment for polynomial of table {}",
+                    table_type.name()
+                ))
+            })
+    }
+}
+
+/// Context data for the commitment verifier
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct CommitmentVerifierCtx<E, PCS>
+where
+    PCS: PolynomialCommitmentScheme<E>,
+    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField + Serialize + DeserializeOwned,
+{
+    /// Verifier parameters for the [`PolynomialCommitmentScheme`]
+    verifier_params: PCS::VerifierParam,
+    /// This field contains a [`BTreeMap`] where the key is a [`NodeId`] and the value is a vector of tuples of [`PolynomialCommitmentScheme::Commitment`] corresponding to that ID.
+    /// A [`BTreeMap`] is used to ensure that the commitments are written in a deterministic order
+    /// to the transcript
+    model_comms_map: BTreeMap<NodeId, BTreeMap<PolyId, PCS::Commitment>>,
+    /// This field contains a [`BTreeMap`] relating to lookup tables used by the model
+    /// A [`BTreeMap`] is used to ensure that the commitments are written in a deterministic order
+    /// to the transcript
+    table_comms_map: BTreeMap<TableType, PCS::Commitment>,
+}
+
+impl<E, PCS> CommitmentVerifierCtx<E, PCS>
+where
+    PCS: PolynomialCommitmentScheme<E>,
+    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField + Serialize + DeserializeOwned,
+{
+    pub fn write_to_transcript<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
+        self.model_comms_map
+            .iter()
+            .try_for_each(|(node_id, comms_vec)| {
+                comms_vec.iter().try_for_each(|(id, comm)| {
+                    PCS::write_commitment(comm, transcript).context(format!(
+                        "Could not write commitment for polynomial {id} of node {node_id}"
+                    ))
+                })
+            })?;
+        self.table_comms_map
+            .iter()
+            .try_for_each(|(table_type, comm)| {
+                PCS::write_commitment(comm, transcript).context(format!(
+                    "Could not write commitment for polynomial of table {}",
+                    table_type.name()
+                ))
             })
     }
 }
@@ -332,7 +492,7 @@ where
     /// Add claims about model weights and biases for a certain node
     pub fn add_common_claims(
         &mut self,
-        ctx: &CommitmentContext<'a, E, PCS>,
+        ctx: &CommitmentProverCtx<'a, E, PCS>,
         node_id: NodeId,
         mut claims: HashMap<PolyId, Claim<E>>,
     ) -> Result<()> {
@@ -357,7 +517,7 @@ where
     /// Adds a claim about a table polynomial
     pub fn add_table_claim(
         &mut self,
-        ctx: &CommitmentContext<'a, E, PCS>,
+        ctx: &CommitmentProverCtx<'a, E, PCS>,
         table_type: TableType,
         claim: Claim<E>,
     ) -> Result<()> {
@@ -376,7 +536,7 @@ where
     /// Produce the [`ModelOpeningProof`] for this inference trace.
     pub fn prove<T: Transcript<E>>(
         &mut self,
-        commitment_context: &CommitmentContext<E, PCS>,
+        commitment_context: &CommitmentProverCtx<E, PCS>,
         transcript: &mut T,
     ) -> Result<ModelOpeningProof<E, PCS>> {
         // Prepare the parts that go into the batch proof
@@ -415,7 +575,7 @@ where
                 } = claim;
                 let Claim { point, eval } = inner_claim;
                 PCS::open(
-                    commitment_context.prover_params(),
+                    &commitment_context.prover_params,
                     poly,
                     commitment,
                     point,
@@ -428,7 +588,7 @@ where
 
         // Make the batch proof
         let batch_proof = PCS::batch_open(
-            commitment_context.prover_params(),
+            &commitment_context.prover_params,
             &polys,
             &comms,
             &points,
@@ -449,8 +609,8 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField,
 {
-    model_comms_map: HashMap<NodeId, BTreeMap<PolyId, PCS::Commitment>>,
-    table_comms_map: HashMap<TableType, PCS::Commitment>,
+    model_comms_map: BTreeMap<NodeId, BTreeMap<PolyId, PCS::Commitment>>,
+    table_comms_map: BTreeMap<TableType, PCS::Commitment>,
     claims: Vec<VerifierClaim<E, PCS>>,
     trivial_claims: Vec<VerifierClaim<E, PCS>>,
 }
@@ -462,30 +622,10 @@ where
     E: ExtensionField + Serialize + DeserializeOwned,
 {
     /// Create a new [`CommitmentVerifier`] from the models [`CommitmentContext`].
-    pub fn new(ctx: &CommitmentContext<E, PCS>) -> CommitmentVerifier<E, PCS> {
-        let model_comms_map = ctx
-            .model_comms_map
-            .iter()
-            .map(|(node_id, comms_vec)| {
-                (
-                    *node_id,
-                    comms_vec
-                        .iter()
-                        .map(|(id, (comm, _))| (id.clone(), PCS::get_pure_commitment(comm)))
-                        .collect::<BTreeMap<PolyId, PCS::Commitment>>(),
-                )
-            })
-            .collect::<HashMap<NodeId, _>>();
-
-        let table_comms_map = ctx
-            .table_comms_map
-            .iter()
-            .map(|(table_type, (comm, _))| (table_type.clone(), PCS::get_pure_commitment(comm)))
-            .collect::<HashMap<TableType, PCS::Commitment>>();
-
+    pub fn new(ctx: &CommitmentVerifierCtx<E, PCS>) -> CommitmentVerifier<E, PCS> {
         CommitmentVerifier {
-            model_comms_map,
-            table_comms_map,
+            model_comms_map: ctx.model_comms_map.clone(),
+            table_comms_map: ctx.table_comms_map.clone(),
             claims: vec![],
             trivial_claims: vec![],
         }
@@ -543,7 +683,7 @@ where
     /// Verify the [`ModelOpeningProof`] for this inference trace.
     pub fn verify<T: Transcript<E>>(
         &mut self,
-        commitment_context: &CommitmentContext<E, PCS>,
+        commitment_context: &CommitmentVerifierCtx<E, PCS>,
         proof: &ModelOpeningProof<E, PCS>,
         transcript: &mut T,
     ) -> Result<()> {
@@ -599,7 +739,7 @@ where
                 // Check that the commitments align, we can use a default transcript because trivial openings don't require a transcript
                 let mut t = default_transcript::<E>();
                 PCS::verify(
-                    commitment_context.verifier_params(),
+                    &commitment_context.verifier_params,
                     commitment,
                     point,
                     eval,
@@ -610,7 +750,7 @@ where
             })?;
         // Verify the batch opening
         PCS::batch_verify(
-            commitment_context.verifier_params(),
+            &commitment_context.verifier_params,
             &comms,
             &points,
             &evaluations,

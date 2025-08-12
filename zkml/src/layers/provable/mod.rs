@@ -12,7 +12,8 @@ use tenstore::{TenStore, TensorKey};
 use transcript::Transcript;
 
 use crate::{
-    Claim, Context, Element, Prover, ScalingFactor, ScalingStrategy, Tensor, VectorTranscript,
+    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Tensor,
+    VectorTranscript,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -278,7 +279,7 @@ where
         &self,
         claims_by_node: &'a HashMap<NodeId, Vec<Claim<E>>>,
         output_claims: &'b [Claim<E>],
-    ) -> Result<Vec<&'a Claim<E>>>
+    ) -> Result<Vec<Vec<&'a Claim<E>>>>
     where
         'b: 'a,
     {
@@ -286,9 +287,10 @@ where
             // For now, we support in proving only one edge per output wire,
             // as if an output is used as input in different nodes, we need
             // to batch claims about the same polynomial. ToDo: batch claims
-            assert_eq!(out.edges.len(), 1);
-            let edge = &out.edges[0];
-            Ok(if let Some(id) = &edge.node {
+            // TODO : revise that assumption
+            //assert_eq!(out.edges.len(), 1);
+            out.edges.iter().map(|edge| {
+                anyhow::Ok(if let Some(id) = &edge.node {
                 let claims_for_node = claims_by_node.get(id).ok_or(
                     anyhow!("No claims found for layer {}", id)
                 )?;
@@ -308,6 +310,8 @@ where
                 );
                 &output_claims[edge.index]
             })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
         }).collect()
     }
 
@@ -528,7 +532,7 @@ where
     fn gen_lookup_witness<'a>(
         &self,
         _id: NodeId,
-        _ctx: &'a Context<'a, E, PCS>,
+        _ctx: &'a ProverContext<'a, E, PCS>,
         _step_data: &'a StepData<Element, E>,
         _store: &mut TenStore,
     ) -> Result<LookupWitnessGen<'a, E, PCS>> {

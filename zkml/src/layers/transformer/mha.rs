@@ -738,7 +738,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
     fn gen_lookup_witness<'a>(
         &self,
         id: NodeId,
-        ctx: &'a crate::Context<'a, E, PCS>,
+        ctx: &'a crate::ProverContext<'a, E, PCS>,
         step_data: &StepData<Element, E>,
         _store: &mut TenStore,
     ) -> anyhow::Result<LookupWitnessGen<'a, E, PCS>> {
@@ -940,7 +940,7 @@ mod test {
         layers::{
             Layer,
             matrix_mul::{MatMul, OperandMatrix},
-            transformer::{qkv::QKV, test::GPT2Output},
+            transformer::{manual_attention::GPT2Output, qkv::QKV},
         },
         model::{
             Model, ToIterator,
@@ -949,7 +949,7 @@ mod test {
         padding::pad_model,
         parser::{
             file_cache,
-            gguf::{FileTensorLoader, tests::GPT2_Q8_0_URL},
+            gguf::{FileTensorLoader, tests::GPT2_Q8_0},
             json::{self, test::TINY_GPT2_DEBUG_NAME},
             llm::{LLMConfig, LLMModel},
         },
@@ -1099,7 +1099,7 @@ mod test {
         assert_eq!(zeroifier_heads[0].get_2d(1, 1), Element::from(1));
         assert_eq!(zeroifier_heads[0].get_2d(1, 2), Element::from(0));
 
-        let mle = zeroifier.to_mle_flat::<GoldilocksExt2>();
+        let mle = zeroifier.to_field_mle::<GoldilocksExt2>();
 
         for i in 0..num_columns {
             for j in 0..num_columns {
@@ -1195,7 +1195,7 @@ mod test {
             Element::from(minus_infinity)
         );
 
-        let mle = infinitizer.to_mle_flat::<GoldilocksExt2>();
+        let mle = infinitizer.to_field_mle::<GoldilocksExt2>();
 
         for i in 0..num_columns {
             for j in 0..num_columns {
@@ -1332,14 +1332,21 @@ mod test {
         let (quantized_model, quantized_input) =
             quantize_model(model.clone(), input, None, &mut TenStore::default()).unwrap();
 
+        // need to clone the model as subsequent calls expect seq_len = 1 due to caching
+        // and the trace keeps an immutable reference so the cloned model lifetime still needs to be active
         let trace = quantized_model
-            .run::<GoldilocksExt2>(&quantized_input, &mut TenStore::default())
+            .run::<GoldilocksExt2>(&quantized_input, None, &mut TenStore::default())
             .unwrap();
         let outputs = trace.outputs().unwrap();
 
         assert_eq!(outputs.len(), 1);
 
         let expected_output = outputs[0].clone();
+        for node in quantized_model.nodes.values() {
+            if let Layer::QKV(ref qkv) = node.operation {
+                qkv.reset_cache();
+            }
+        }
 
         let outputs = prove_quantized_model(
             quantized_model.clone(),
@@ -1451,12 +1458,8 @@ mod test {
 
     #[test]
     fn test_mha_with_real_values() -> anyhow::Result<()> {
-        // let model_weights_path = json::test::get_json_file(TINY_GPT2_NAME)?;
         let debug_output_path = json::test::get_json_file(TINY_GPT2_DEBUG_NAME)?;
-        // let loader = json::FileTensorLoader::new_from_path(model_weights_path)?;
-        // let config = LLMConfig::from_json(&loader)?;
-        // let LLMModel::GPT2(llm_model) = config.model_json(&loader)?;
-        let model_path = file_cache::ensure_downloaded(GPT2_Q8_0_URL)?;
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let config = LLMConfig::from_content(&loader)?;
         let model = config.model(&loader)?;
@@ -1473,9 +1476,10 @@ mod test {
         let embedded = llm_model
             .embeddings
             .evaluate::<GoldilocksExt2>(&[&input], &[])?;
-        let positioned = llm_model
-            .positional
-            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]], &[])?;
+        let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
+            &[embedded.outputs()[0]],
+            &[embedded.outputs()[0].shape()],
+        )?;
 
         let input_shape = positioned.outputs()[0].shape();
 
@@ -1559,7 +1563,7 @@ mod test {
             });
         // run to get unpadded output
         let mut outputs = quantized_model
-            .run::<GoldilocksExt2>(&inputs, &mut TenStore::default())
+            .run::<GoldilocksExt2>(&inputs, None, &mut TenStore::default())
             .unwrap()
             .outputs()
             .unwrap();
@@ -1576,7 +1580,7 @@ mod test {
 
         // compute padded evaluation, with garbage removal in matmul
         let mut outputs = padded_model
-            .run::<GoldilocksExt2>(&padded_inputs, &mut TenStore::default())
+            .run::<GoldilocksExt2>(&padded_inputs, None, &mut TenStore::default())
             .unwrap()
             .outputs()
             .unwrap();

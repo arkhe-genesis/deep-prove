@@ -4,14 +4,12 @@ use deep_prove::{
     middleware::v1::{self, DeepProveRequest as DeepProveRequestV1},
     store::{self, MemStore, S3Store, Store},
 };
-use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams, Hasher};
 use std::{net::SocketAddr, path::PathBuf};
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt::format::FmtSpan};
 use url::Url;
 use zkml::{
-    Context, Element, FloatOnnxLoader, Prover, default_transcript,
+    Element, FloatOnnxLoader, Prover, default_transcript,
     model::Model,
     quantization::{AbsoluteMax, ModelMetadata},
 };
@@ -23,9 +21,6 @@ mod lpn;
 mod lagrange {
     tonic::include_proto!("lagrange");
 }
-
-type F = GoldilocksExt2;
-type Pcs<E> = Basefold<E, BasefoldRSParams<Hasher>>;
 
 /// From a proof request wrapped in a [`DeepProveRequestV1`] and a [`Store`]
 /// implementation (to interact with the PPs), attempt to generate proofs for a
@@ -83,15 +78,16 @@ async fn run_model_v1<S: Store>(
 
     let inputs = input.to_elements(&model_metadata);
 
-    let (ctx, model) = {
+    let (prover_ctx, verifier_ctx, model) = if let Some(store::Params {
+        prover,
+        verifier
+    }) = params {
+        (prover, verifier, model)
+    } else {
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let ctx = Context::<F, Pcs<F>>::generate(
-                &model,
-                None,
-                params.map(|store::Params { prover, verifier }| (prover, verifier)),
-            )
+            let (prover_ctx, verifier_ctx) = model.generate_contexts()
             .context("generating model")?;
-            Ok((ctx, model))
+            Ok((prover_ctx, verifier_ctx, model))    
         })
         .await
         .context("running context generation task")?
@@ -103,8 +99,8 @@ async fn run_model_v1<S: Store>(
             .insert_params(
                 &params_key,
                 store::Params {
-                    prover: ctx.commitment_ctx.prover_params().clone(),
-                    verifier: ctx.commitment_ctx.verifier_params().clone(),
+                    prover: prover_ctx.clone(),
+                    verifier: verifier_ctx,
                 },
             )
             .await
@@ -121,13 +117,14 @@ async fn run_model_v1<S: Store>(
 
             let trace_result = model.run(
                 &input_tensor,
+                None,
                 &mut tenstore::TenStore::new_temporary(1000 * 1024 * 1024)?,
             );
             // If model.run fails, print the error and continue to the next input
             match trace_result {
                 Ok(trace) => {
                     let mut prover_transcript = default_transcript();
-                    let prover = Prover::<_, _, _>::new(&ctx, &mut prover_transcript);
+                    let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
                     let proof = prover
                         .prove(&trace)
                         .with_context(|| "unable to generate proof for {i}th input")?;
