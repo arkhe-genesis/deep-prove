@@ -1745,7 +1745,7 @@ impl<T: Number> Tensor<T> {
         })
     }
     /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
-    /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular amtrix must be square)
+    /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular matrix must be square)
     /// - `num_matrices` specifies how many matrices to make
     /// - `diag` specifies the "offset" for the diagonal, an offset of `1` means we keep two `1`s on the first row instead of 1, and offset of `-1` means all `zeroes`
     pub fn tril(matrix_dim: usize, num_matrices: usize, diag: i32) -> Tensor<T> {
@@ -1753,7 +1753,7 @@ impl<T: Number> Tensor<T> {
     }
 
     /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
-    /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular amtrix must be square)
+    /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular matrix must be square)
     /// - `num_matrices` specifies how many matrices to make
     /// - `diag` specifies the "offset" for the diagonal, an offset of `1` means we keep two `lower_val`s on the first row instead of 1, and offset of `-1` means all `upper_val`
     /// - `lower_val` specifies the value to fill the lower triangular part with
@@ -1942,6 +1942,12 @@ where
 }
 
 impl PartialEq for Tensor<Element> {
+    fn eq(&self, other: &Self) -> bool {
+        self.shape == other.shape && self.data == other.data
+    }
+}
+
+impl PartialEq for Tensor<f32> {
     fn eq(&self, other: &Self) -> bool {
         self.shape == other.shape && self.data == other.data
     }
