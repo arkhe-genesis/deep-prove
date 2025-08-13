@@ -10,24 +10,29 @@ jobs:
   test:
     runs-on: ['hostname:hetzner-dedicated-7']
     steps:
+
       - name: Clean previous outputs
         run: |
           rm -r ~/layers-quant 2> /dev/null || true
           rm -r ~/layers-quant-base 2> /dev/null || true
+
       - name: Set RNG seed
         run: |
           seed="$(date +%s)"
           echo RNG seed: "$seed"
           echo RNG_SEED="$seed" >> "$GITHUB_ENV"
+
       - name: Checkout base
         uses: actions/checkout@v5
         with:
           lfs: 'true'
           ref: ${{ github.base_ref || 'master' }}
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly-2025-05-22
           cache: false
+
       - name: Capture layers outputs on base
         run: |
           cd zkml
@@ -38,13 +43,18 @@ jobs:
             --skip layers::transformer::test::test_read_gpt2_pytorch_output_first \
             --skip parser::json::test::test_json_tensor_loader \
             --skip layers::transformer::mha::test::test_mha_with_real_values \
+            --skip layers::transformer::manual_attention::test_gpt2_model_full_pass \
+            --skip layers::transformer::manual_attention::test_read_gpt2_pytorch_embeddings \
+            --skip layers::transformer::manual_attention::test_read_gpt2_pytorch_output_first \
             --test-threads=1
           mv layers-quant ~/layers-quant-base
+
       - name: Checkout HEAD
         uses: actions/checkout@v5
         with:
           lfs: 'true'
           ref: ${{ github.event.pull_request.head.sha }}
+
       - name: Capture layers outputs on HEAD
         run: |
           cd zkml
@@ -54,9 +64,13 @@ jobs:
             --skip layers::transformer::test::test_read_gpt2_pytorch_output_first \
             --skip parser::json::test::test_json_tensor_loader \
             --skip layers::transformer::mha::test::test_mha_with_real_values \
+            --skip layers::transformer::manual_attention::test_gpt2_model_full_pass \
+            --skip layers::transformer::manual_attention::test_read_gpt2_pytorch_embeddings \
+            --skip layers::transformer::manual_attention::test_read_gpt2_pytorch_output_first \
             --test-threads=1
           mv layers-quant ~/layers-quant
           cp ../scripts/ci/cmp-layers-quant.sh ~/cmp-layers-quant.sh
+
       - name: Compare HEAD outputs against base
         run: |
           cd ~
