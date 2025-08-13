@@ -92,7 +92,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run cargo test
-        run: cargo test --release -p zkml -- --test-threads=1
+        run: cargo test --release -p zkml
         env:
           RUSTFLAGS: "-W warnings"
 
