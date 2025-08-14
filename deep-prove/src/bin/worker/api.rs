@@ -87,7 +87,7 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
                             app_state.lock().await.proofs_queue.extend(
                                 output
                                     .into_iter()
-                                    .map(|output| serde_json::to_string_pretty(&output).unwrap()),
+                                    .map(|output| serde_json::to_string(&output).unwrap()),
                             );
                         }
                         Err(err) => error!("failed to generate proof: {err:?}"),

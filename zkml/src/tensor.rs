@@ -28,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::{Ordering, PartialEq},
     fmt::{self, Debug},
-    marker::PhantomData,
     ops::{Bound, RangeBounds},
 };
 use tenstore::{TenStore, TensorKey, TensorStore, TenstoreError};
@@ -409,8 +408,6 @@ where
 /// from a store.
 #[derive(Clone, Debug)]
 pub struct DryTensor<T> {
-    /// A marker to conserve the tensor element type.
-    _t: PhantomData<T>,
     /// A key pointing to the tensor data in a [`TenStore`]
     k: TensorKey<T>,
     /// The shape of the tensor.
@@ -418,11 +415,7 @@ pub struct DryTensor<T> {
 }
 impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
     pub(crate) fn new(k: TensorKey<T>, shape: Shape) -> Self {
-        Self {
-            _t: PhantomData,
-            k,
-            shape,
-        }
+        Self { k, shape }
     }
 
     /// Return a reference to this dry tensor key.

@@ -1,7 +1,10 @@
-use anyhow::{Context as _, Result};
+use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use deep_prove::{
-    middleware::v1::{self, DeepProveRequest as DeepProveRequestV1},
+    middleware::{
+        v1::{self, DeepProveRequest as DeepProveRequestV1},
+        v2::Provable,
+    },
     store::{self, MemStore, S3Store, Store},
 };
 use std::{net::SocketAddr, path::PathBuf};
@@ -78,16 +81,14 @@ async fn run_model_v1<S: Store>(
 
     let inputs = input.to_elements(&model_metadata);
 
-    let (prover_ctx, verifier_ctx, model) = if let Some(store::Params {
-        prover,
-        verifier
-    }) = params {
+    let (prover_ctx, verifier_ctx, model) = if let Some(store::Params { prover, verifier }) = params
+    {
         (prover, verifier, model)
     } else {
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let (prover_ctx, verifier_ctx) = model.generate_contexts()
-            .context("generating model")?;
-            Ok((prover_ctx, verifier_ctx, model))    
+            let (prover_ctx, verifier_ctx) =
+                model.generate_contexts().context("generating model")?;
+            Ok((prover_ctx, verifier_ctx, model))
         })
         .await
         .context("running context generation task")?
@@ -100,7 +101,7 @@ async fn run_model_v1<S: Store>(
                 &params_key,
                 store::Params {
                     prover: prover_ctx.clone(),
-                    verifier: verifier_ctx,
+                    verifier: verifier_ctx.clone(),
                 },
             )
             .await
@@ -130,15 +131,17 @@ async fn run_model_v1<S: Store>(
                         .with_context(|| "unable to generate proof for {i}th input")?;
                     let outputs = trace.outputs()?;
 
-                    proofs.push(v1::Output { outputs, proof});
+                    proofs.push(v1::Output {
+                        outputs,
+                        proof: Provable {
+                            proof,
+                            io: trace.to_verifier_io().context("generating verifier IOs")?,
+                            ctx: verifier_ctx.clone(),
+                        },
+                    });
                 }
                 Err(e) => {
-                    error!(
-                        "[!] Error running inference for input {}/{}: {}",
-                        i + 1,
-                        0, // num_samples,
-                        e
-                    );
+                    error!("[!] Error running inference for input {}: {}", i + 1, e);
                     continue; // Skip to the next input without writing to CSV
                 }
             };

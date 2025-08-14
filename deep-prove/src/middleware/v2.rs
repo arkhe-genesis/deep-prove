@@ -3,10 +3,26 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams, Hasher};
 use serde::{Deserialize, Serialize};
-use zkml::{Proof as ZkmlProof, inputs::Input, quantization::ScalingStrategyKind};
+use zkml::{
+    IO, Proof as ZkmlProof, default_transcript, inputs::Input, iop::context::VerifierContext,
+    quantization::ScalingStrategyKind, verify,
+};
 
-/// A type of the proof for the `v2` of the protocol
-pub type Proof = ZkmlProof<GoldilocksExt2, Basefold<GoldilocksExt2, BasefoldRSParams<Hasher>>>;
+/// The extension field the proving system is based on.
+pub type E = GoldilocksExt2;
+
+/// A wrapper for a proof and its ancillaries, required by the verifying process.
+#[derive(Serialize, Deserialize)]
+pub struct Provable {
+    pub proof: ZkmlProof<E, Basefold<E, BasefoldRSParams<Hasher>>>,
+    pub io: IO<E>,
+    pub ctx: VerifierContext<E, Basefold<E, BasefoldRSParams<Hasher>>>,
+}
+impl Provable {
+    pub fn verify(self) -> anyhow::Result<()> {
+        verify(self.ctx, self.proof, self.io, &mut default_transcript())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]

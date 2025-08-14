@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub use zkml::inputs::Input;
 use zkml::{Element, Proof as ProofG, Tensor, quantization::ScalingStrategyKind};
 
+use super::v2::Provable;
+
 /// A type of the proof for the `v1` of the protocol
 pub type Proof = ProofG<GoldilocksExt2, Basefold<GoldilocksExt2, BasefoldRSParams<Hasher>>>;
 
@@ -34,5 +36,5 @@ pub struct Output {
     /// Model run outputs
     pub outputs: Vec<Tensor<Element>>,
     /// Generated proof
-    pub proof: Proof,
+    pub proof: Provable,
 }

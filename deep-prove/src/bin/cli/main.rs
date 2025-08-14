@@ -1,8 +1,8 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use deep_prove::middleware::v1::DeepProveRequest as DeepProveRequestV1;
-use std::path::PathBuf;
-use tracing::level_filters::LevelFilter;
+use deep_prove::middleware::v1::{DeepProveRequest as DeepProveRequestV1, Output};
+use std::{io::BufReader, path::PathBuf};
+use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -62,6 +62,13 @@ enum Executor {
 
         #[command(subcommand)]
         command: Command,
+    },
+
+    /// Verify that a proof is correct.
+    Verify {
+        /// The file containing the serialized proof to verify.
+        #[arg(long, short)]
+        proof: PathBuf,
     },
 }
 
@@ -130,5 +137,15 @@ async fn main() -> anyhow::Result<()> {
         gw_config @ Executor::LpnGrpc { .. } => lpn::grpc::connect(gw_config).await,
         http_config @ Executor::LpnHttp { .. } => lpn::http::connect(http_config).await,
         local_config @ Executor::LocalApi { .. } => local::connect(local_config).await,
+        Executor::Verify { proof } => {
+            info!("verifying proof in `{}`", proof.display());
+            let output: Vec<Output> = serde_json::from_reader(BufReader::new(
+                std::fs::File::open(&proof)
+                    .with_context(|| format!("failed to open `{}`", proof.display()))?,
+            ))
+            .context("deserializing proof")?;
+
+            output.into_iter().try_fold((), |_, o| o.proof.verify())
+        }
     }
 }

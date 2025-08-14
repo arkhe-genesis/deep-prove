@@ -61,8 +61,7 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
         .disable_cleanup(true)
         .tempfile_in(std::env::current_dir().unwrap_or("./".into()))?;
 
-    serde_json::to_writer_pretty(BufWriter::new(file), &proofs)
-        .context("writing proofs to file")?;
+    serde_json::to_writer(BufWriter::new(file), &proofs).context("writing proofs to file")?;
 
     info!("Successfully generated {} proofs", proofs.len());
 
