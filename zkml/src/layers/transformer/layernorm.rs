@@ -465,6 +465,10 @@ impl Evaluate<Element> for LayerNorm<Element> {
     }
 }
 
+fn is_close_to_integer(x: f32, tol: f32) -> bool {
+    (x - x.round()).abs() < tol
+}
+
 impl Requant {
     /// We implement a special way of formulating a [`Requant`] layer here where `s1*s2/s3 = 2^-s` where
     /// s is a positive integer (so the requant layer only needs to perform a shift rather than a shift and a rescaling)
@@ -474,16 +478,16 @@ impl Requant {
         intermediate_bit_size: usize,
     ) -> Result<Requant> {
         // First we check that we can actually use this method
-        let input_fract = input_scale.log2().fract();
-        let output_fract = output_scale.log2().fract();
+        let input_log = input_scale.log2();
+        let output_log= output_scale.log2();
         let m = input_scale / output_scale;
         let m_log = m.log2();
         let int_part = m_log.trunc().abs();
         // We allow for a possible floating point error that results in an imperfect division
         ensure!(
-            (input_fract - output_fract).fract().abs() < 1e-5,
-            "Cannot perform shift only Requant as the fractional part of the exponent was too large, fractional part: {}",
-            (input_fract - output_fract).fract().abs()
+            is_close_to_integer((input_log - output_log).abs(), 1e-5),
+            "Cannot perform shift only Requant as the fractional part of the exponent was too large, input {},output {} -> diff {}",
+            input_log,output_log,is_close_to_integer((input_log - output_log).abs(), 1e-5),
         );
 
         // We want the part that gets shifted away to be a multiple of the quantisation bit length (that way we can use the same range table for each chunk)
