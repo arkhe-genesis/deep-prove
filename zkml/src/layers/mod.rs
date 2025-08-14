@@ -269,7 +269,7 @@ pub(crate) struct NodeOut<T, E: ExtensionField> {
     pub(crate) proving_data: ProvingData<E>,
 }
 impl<T, E: ExtensionField> NodeOut<T, E> {
-    pub(crate) fn into_fields<U>(self, store: TenStore) -> Result<NodeOut<U, E>, TenstoreError>
+    pub(crate) fn into_fields<U>(self, store: TenStore) -> anyhow::Result<NodeOut<U, E>>
     where
         T: Serialize + for<'a> Deserialize<'a>,
         U: Serialize + for<'a> Deserialize<'a>,
@@ -280,8 +280,11 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
             outputs: self
                 .outputs
                 .into_iter()
-                .map(|dry| dry.dry_cast(store.clone(), |x| x.to_field()))
-                .collect::<Result<Vec<DryTensor<U>>, TenstoreError>>()?,
+                .map(|dry| {
+                    dry.dry_cast(store.clone(), |x| x.to_field())
+                        .with_context(|| format!("converting {:?}", dry.key()))
+                })
+                .collect::<anyhow::Result<Vec<DryTensor<U>>>>()?,
             proving_data: self.proving_data,
         })
     }

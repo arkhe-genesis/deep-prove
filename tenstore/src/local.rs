@@ -46,6 +46,21 @@ impl<P: AsRef<Path>> LocalStore<P> {
         })
     }
 }
+impl<P: AsRef<Path>> std::fmt::Debug for LocalStore<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (k, Storage { allocated, file }) in self.storage.iter() {
+            writeln!(
+                f,
+                "{}{:10} {:12} {}",
+                if self.cache.contains(k) { "*" } else { " " },
+                k,
+                allocated,
+                file.display()
+            )?;
+        }
+        Ok(())
+    }
+}
 impl<P: AsRef<Path>> TensorStore for LocalStore<P> {
     fn clear(&mut self) {
         self.storage.clear();
@@ -61,26 +76,27 @@ impl<P: AsRef<Path>> TensorStore for LocalStore<P> {
         if let Some(Storage { allocated, file }) = backing {
             let data: Vec<T> =
                 rmp_serde::from_slice(self.cache.try_get_or_insert(k_str, || {
-                    let mut buffer = Vec::with_capacity(allocated);
+                    // This is an over-allocation, as serialization will
+                    // typically compress, even if slightly, the content.
+                    let mut buffer = Vec::with_capacity(allocated * std::mem::size_of::<T>());
                     let mut reader =
                         BufReader::new(std::fs::File::open(file).map_err(TenstoreError::from)?);
                     reader
                         .read_to_end(&mut buffer)
                         .map_err(TenstoreError::from)?;
 
-                    if buffer.len() != allocated {
-                        return Err(TenstoreError::InvalidSize {
-                            allocated,
-                            provided: buffer.len(),
-                        });
-                    }
-
-                    let buffer_len = NonZero::new(buffer.len() * std::mem::size_of::<T>())
-                        .ok_or(TenstoreError::EmptyTensor)?;
+                    let buffer_len =
+                        NonZero::new(buffer.len()).ok_or(TenstoreError::EmptyTensor)?;
 
                     Ok::<_, TenstoreError>((buffer, buffer_len))
                 })?)?;
 
+            if data.len() != allocated {
+                return Err(TenstoreError::InvalidSize {
+                    allocated,
+                    provided: data.len(),
+                });
+            }
             Ok(data)
         } else {
             Err(TenstoreError::KeyUnknown)
@@ -94,16 +110,17 @@ impl<P: AsRef<Path>> TensorStore for LocalStore<P> {
     ) -> Result<(), TenstoreError> {
         let k_str = k.to_key();
         let data = data.as_ref();
+        let provided = data.len();
+
         let Storage { allocated, file } = self.storage.entry(k_str.clone()).or_insert_with(|| {
             let mut file = self.root.as_ref().to_path_buf();
             file.push(k.to_key());
             Storage {
-                allocated: data.as_ref().len(),
+                allocated: data.len(),
                 file,
             }
         });
 
-        let provided = data.len();
         if *allocated != provided {
             return Err(TenstoreError::InvalidSize {
                 allocated: *allocated,

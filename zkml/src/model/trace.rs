@@ -61,7 +61,7 @@ where
 
     /// Convert an inference trace computed over integers to a trace over field elements, which is
     /// needed to prove the inference
-    pub(crate) fn into_fields(self) -> Result<ProvingTrace<'a, E, N>, TenstoreError>
+    pub(crate) fn into_fields(self) -> anyhow::Result<ProvingTrace<'a, E, N>>
     where
         D: Fieldizer<E> + Serialize + for<'b> Deserialize<'b>,
     {
@@ -70,12 +70,14 @@ where
             .input
             .into_iter()
             .map(|dry| dry.dry_cast(self.store.clone(), |x: &D| x.to_field()))
-            .collect::<Result<Vec<DryTensor<E>>, TenstoreError>>()?;
+            .collect::<Result<Vec<DryTensor<E>>, TenstoreError>>()
+            .context("converting input")?;
         let output = self
             .output
             .into_iter()
             .map(|dry| dry.dry_cast(self.store.clone(), |x: &D| x.to_field()))
-            .collect::<Result<Vec<DryTensor<E>>, TenstoreError>>()?;
+            .collect::<Result<Vec<DryTensor<E>>, TenstoreError>>()
+            .context("converting output")?;
         let field_steps = self
             .steps
             .into_iter()
@@ -89,21 +91,25 @@ where
                                 .step_data
                                 .node_inputs
                                 .into_iter()
-                                .map(|dry| dry.dry_cast(store.clone(), |x| x.to_field()))
-                                .collect::<Result<Vec<DryTensor<_>>, TenstoreError>>()?,
+                                .map(|dry| {
+                                    dry.dry_cast(store.clone(), |x| x.to_field())
+                                        .with_context(|| format!("converting `{:?}`", dry.key()))
+                                })
+                                .collect::<anyhow::Result<Vec<DryTensor<_>>>>()?,
 
                             node_outputs: step
                                 .step_data
                                 .node_outputs
                                 .into_fields(store.clone())
-                                .expect("should not fail"),
+                                .context("converting node_outputs")?,
                             unpadded_output_shapes: step.step_data.unpadded_output_shapes,
                             unpadded_input_shapes: step.step_data.unpadded_input_shapes,
                         },
                     },
                 ))
             })
-            .collect::<Result<HashMap<_, _>, TenstoreError>>()?;
+            .collect::<anyhow::Result<HashMap<_, _>>>()
+            .context("converting steps")?;
         Ok(Trace {
             store: self.store,
             steps: field_steps,

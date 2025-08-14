@@ -13,7 +13,7 @@ use compact_str::CompactString;
 use local::LocalStore;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 /// Used to unequivocally address a tensor backing in a [`TensorStore`].
 pub struct TensorKey<T> {
     /// An ID for this tensor, unique among tensors of a given type.
@@ -42,6 +42,11 @@ impl<T> TensorKey<T> {
 
     pub(crate) fn to_key(&self) -> CompactString {
         CompactString::new(format!("{}-{}", self.id, std::any::type_name::<T>()))
+    }
+}
+impl<T> std::fmt::Debug for TensorKey<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)
     }
 }
 // PartialEq/Eq and Hash have to be written manually, because the derive-based
@@ -105,6 +110,14 @@ pub enum TenStore {
     /// ownership of the `TempDir`, otherwise it would get dropped and erased
     /// from disk.
     TmpStore(Arc<Mutex<local::LocalStore<tempfile::TempDir>>>),
+}
+impl std::fmt::Debug for TenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TenStore::LocalStore(mutex) => write!(f, "{:?}", mutex.lock().unwrap()),
+            TenStore::TmpStore(mutex) => write!(f, "{:?}", mutex.lock().unwrap()),
+        }
+    }
 }
 impl TenStore {
     pub fn new_local<S: AsRef<Path>>(root: S, cache_size: usize) -> Result<Self, TenstoreError> {
