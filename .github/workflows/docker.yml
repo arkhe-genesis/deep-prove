@@ -9,6 +9,12 @@ on:
   pull_request:
     branches:
       - '**'
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+      - ready_for_review
   workflow_dispatch:
 
 concurrency:
@@ -22,6 +28,7 @@ permissions:
 
 jobs:
   changes:
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
