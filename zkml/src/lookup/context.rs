@@ -16,7 +16,7 @@ use crate::{
     Claim, Element,
     iop::{ChallengeStorage, context::ProverContext},
     layers::{
-        activation::{GELUQuantData, Relu},
+        activation::{GeluTableData, Relu},
         provable::{NodeId, ProvableOp},
         transformer::{
             layernorm::{LAYERNORM_OUTPUT_SCALE_FACTOR, LAYERNORM_SCALE_FACTOR},
@@ -53,7 +53,7 @@ pub enum TableType {
     /// Table used for the Relu activation function
     Relu,
     /// Table used for the GELU activation function
-    GELU(GELUQuantData),
+    GELU(GeluTableData),
     /// Table used for range checking (its size is determined by the quantisation bit size)
     Range,
     /// Table type used for computing Softmax, see the [`SoftmaxTableData`] struct for more info.

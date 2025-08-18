@@ -160,9 +160,9 @@ impl ProveInfo for Activation<Element> {
         match self {
             Activation::Relu(_) => aux.tables.insert(TableType::Relu),
             // TODO: if we want to save on memory, we can use a pointer to the vector instead
-            Activation::Gelu(gelu) => aux
-                .tables
-                .insert(TableType::GELU(gelu.quant_data.clone().unwrap())),
+            Activation::Gelu(gelu) => aux.tables.insert(TableType::GELU(
+                gelu.quant_data.as_ref().unwrap().table_data.clone(),
+            )),
         };
 
         // Set the model polys to be empty
@@ -252,8 +252,8 @@ where
                 Activation::Gelu(g) => {
                     let scaled = a * g.quant_data.as_ref().unwrap().multiplier;
                     assert!(
-                        scaled >= g.quant_data.as_ref().unwrap().min
-                            && scaled <= g.quant_data.as_ref().unwrap().max
+                        scaled >= g.quant_data.as_ref().unwrap().table_data.min
+                            && scaled <= g.quant_data.as_ref().unwrap().table_data.max
                     );
                     (scaled, scaled.to_field())
                 }
@@ -341,7 +341,9 @@ where
     ) -> Result<Vec<Claim<E>>> {
         let table_type = match &self.op {
             Activation::Relu(_) => TableType::Relu,
-            Activation::Gelu(g) => TableType::GELU(g.quant_data.clone().unwrap()),
+            Activation::Gelu(g) => {
+                TableType::GELU(g.quant_data.as_ref().unwrap().table_data.clone())
+            }
         };
         let (constant_challenge, column_separation_challenge) = verifier
             .challenge_storage
@@ -365,7 +367,9 @@ impl<N> Activation<N> {
     fn table_type(&self) -> TableType {
         match self {
             Activation::Relu(_) => TableType::Relu,
-            Activation::Gelu(g) => TableType::GELU(g.quant_data.clone().unwrap()),
+            Activation::Gelu(g) => {
+                TableType::GELU(g.quant_data.as_ref().unwrap().table_data.clone())
+            }
         }
     }
     #[timed::timed_instrument(name = "Prover::prove_activation_step")]
@@ -561,18 +565,15 @@ pub struct GELU<N> {
     quant_data: Option<GELUQuantData>,
     _n: PhantomData<N>,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GELUQuantData {
-    /// The multiplier used to scale the input
-    multiplier: Element,
+pub struct GeluTableData {
     /// The minimum value of the input
     pub(crate) min: Element,
     /// The maximum value of the input
     pub(crate) max: Element,
 }
 
-impl GELUQuantData {
+impl GeluTableData {
     pub fn table_size(&self) -> usize {
         (self.max - self.min + 1).ilog2() as usize
     }
@@ -585,6 +586,20 @@ impl GELUQuantData {
         let float_input = input as f32 / GELU_SCALE_FACTOR as f32;
         let float_output = gelu_float(&float_input);
         (float_output * *quantization::MAX as f32).round() as Element
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GELUQuantData {
+    /// The multiplier used to scale the input
+    multiplier: Element,
+    /// table data
+    table_data: GeluTableData,
+}
+
+impl GELUQuantData {
+    pub fn table_output(&self, input: Element) -> Element {
+        self.table_data.table_output(input)
     }
 }
 
@@ -667,8 +682,10 @@ impl GELU<f32> {
         );
         let qd = GELUQuantData {
             multiplier,
-            min: table_min as Element,
-            max: table_max as Element,
+            table_data: GeluTableData {
+                min: table_min as Element,
+                max: table_max as Element,
+            },
         };
         Ok(GELU {
             quant_data: Some(qd),
@@ -683,7 +700,8 @@ impl GELU<Element> {
             bail!("GELU not quantized");
         };
         let scaled = input * quant_data.multiplier;
-        let within_range = quant_data.min <= scaled && scaled <= quant_data.max;
+        let within_range =
+            quant_data.table_data.min <= scaled && scaled <= quant_data.table_data.max;
         ensure!(within_range, "Input out of range");
         Ok(self.quant_data.as_ref().unwrap().table_output(scaled))
     }
