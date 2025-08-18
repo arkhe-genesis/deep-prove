@@ -1,7 +1,7 @@
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor,
+    backend::zkml_gelu,
     commit::same_poly,
-    gpu::zkml_gelu,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,

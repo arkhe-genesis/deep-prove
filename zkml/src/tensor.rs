@@ -1,7 +1,7 @@
 #![allow(clippy::needless_range_loop)]
 use crate::{
     NextPowerOfTwo, ScalingFactor,
-    gpu::Backend,
+    backend::Backend,
     quantization::{self, MAX_FLOAT, MIN_FLOAT},
 };
 use anyhow::{Result, anyhow, bail, ensure};

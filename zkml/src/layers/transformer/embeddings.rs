@@ -2,6 +2,7 @@ use std::iter::once;
 
 use crate::{
     ScalingFactor, ScalingStrategy,
+    backend::Backend,
     commit::{compute_betas_eval, identity_eval},
     layers::{
         LayerProof,
@@ -12,6 +13,10 @@ use crate::{
 };
 
 use anyhow::{anyhow, bail, ensure};
+use burn::tensor::{
+    TensorPrimitive,
+    ops::{FloatTensorOps, IntTensorOps},
+};
 use either::Either;
 use ff_ext::{ExtensionField, SmallField};
 use itertools::Itertools;
@@ -195,12 +200,12 @@ impl<N: Number> OpInfo for Embeddings<N> {
     }
 }
 
-impl<N: Number> Evaluate<N> for Embeddings<N> {
+impl Evaluate<f32> for Embeddings<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&Tensor<f32>],
         _unpadded_input_shapes: &[Shape],
-    ) -> anyhow::Result<LayerOut<N, E>> {
+    ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(
             inputs.iter().all(|x| { x.shape().rank() == 1 }),
             "embeddings only support 1d tensors: {:?}",
@@ -213,27 +218,65 @@ impl<N: Number> Evaluate<N> for Embeddings<N> {
         let OperandMatrix::Weight(ref w) = self.mat.right_matrix else {
             bail!("right matrix is not a weight matrix");
         };
+        let input = inputs[0];
+        let input_len = input.shape()[0];
+
         let emb = &w.tensor;
-        let x = inputs[0];
-        let seq_len = x.shape()[0];
-        let vocab_size = emb.shape()[0];
         let emb_size = emb.shape()[1];
-        let emb_data = emb.get_data();
-        let emb = x
-            .get_data()
-            .iter()
-            .flat_map(|v| {
-                let idx = v.to_usize();
-                assert!(
-                    idx < vocab_size,
-                    "idx {idx} out of bounds for vocab size {vocab_size}"
-                );
-                let emd_idx = idx * emb_size;
-                emb_data[emd_idx..emd_idx + emb_size].to_vec()
-            })
-            .collect::<Vec<_>>();
-        let out_shape = Shape::new(vec![seq_len, emb_size]);
-        Ok(LayerOut::from_vec(vec![Tensor::new(out_shape, emb)]))
+
+        let weights = emb.clone().into_btensor_2d();
+        let indices = input.clone().into_btensor_1d().int();
+
+        let res = Backend::float_select(
+            weights.into_primitive().tensor(),
+            0,
+            indices.into_primitive(),
+        );
+
+        let data = burn::tensor::Tensor::<Backend, 2>::new(TensorPrimitive::Float(res))
+            .to_data()
+            .into_vec()
+            .expect("convert tensor to scalar");
+        let out_shape = Shape::new(vec![input_len, emb_size]);
+        Ok(LayerOut::from_vec(vec![Tensor::new(out_shape, data)]))
+    }
+}
+
+impl Evaluate<Element> for Embeddings<Element> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&Tensor<Element>],
+        _unpadded_input_shapes: &[Shape],
+    ) -> anyhow::Result<LayerOut<Element, E>> {
+        ensure!(
+            inputs.iter().all(|x| { x.shape().rank() == 1 }),
+            "embeddings only support 1d tensors: {:?}",
+            inputs.iter().map(|x| x.shape()).collect::<Vec<_>>()
+        );
+        ensure!(inputs.len() == 1, "embeddings only support 1 input tensor");
+        // we still uses this evaluation for inference as it's quicker
+        // than doing the matmul with one hot encoding. Proving however will generate
+        // the one hot encoding and do the matmul.
+        let OperandMatrix::Weight(ref w) = self.mat.right_matrix else {
+            bail!("right matrix is not a weight matrix");
+        };
+        let input = inputs[0];
+        let input_len = input.shape()[0];
+
+        let emb = &w.tensor;
+        let emb_size = emb.shape()[1];
+
+        let weights = emb.clone().into_btensor_2d();
+        let indices = input.clone().into_btensor_1d();
+
+        let res = Backend::int_select(weights.into_primitive(), 0, indices.into_primitive());
+
+        let data = burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res)
+            .to_data()
+            .into_vec()
+            .expect("convert tensor to scalar");
+        let out_shape = Shape::new(vec![input_len, emb_size]);
+        Ok(LayerOut::from_vec(vec![Tensor::new(out_shape, data)]))
     }
 }
 
@@ -583,6 +626,8 @@ mod tests {
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use p3_field::FieldAlgebra;
+    use proptest::prelude::*;
+    use std::{fmt::Debug, ops::Range};
 
     use crate::{
         Element,
@@ -742,5 +787,98 @@ mod tests {
             assert_eq!(emb, out_emb);
         }
         Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn test_embeddings_with_f32(input in any_input::<f32>(1..256, 1..8, 1..32)) {
+            let Input { emb, input } = input;
+            let seq_len = input.shape()[0];
+            let vocab_size = emb.shape()[0];
+            let emb_size = emb.shape()[1];
+            let emb_data = emb.get_data();
+
+            let new_emb = input
+                .get_data()
+                .iter()
+                .flat_map(|v| {
+                    let idx = v.to_usize();
+                    assert!(
+                        idx < vocab_size,
+                        "idx {idx} out of bounds for vocab size {vocab_size}"
+                    );
+                    let emd_idx = idx * emb_size;
+                    emb_data[emd_idx..emd_idx + emb_size].to_vec()
+                })
+                .collect::<Vec<_>>();
+            let out_shape = Shape::new(vec![seq_len, emb_size]);
+            let expected = Tensor::new(out_shape, new_emb);
+
+            let layer = Embeddings::<f32>::new(emb).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+
+            prop_assert_eq!(&expected, &computed.outputs[0]);
+        }
+
+        #[test]
+        fn test_embeddings_with_element(input in any_input::<Element>(1..256, 1..8, 1..32)) {
+            let Input { emb, input } = input;
+            let seq_len = input.shape()[0];
+            let vocab_size = emb.shape()[0];
+            let emb_size = emb.shape()[1];
+
+            let scaling = ScalingFactor::from_span(
+                <f32 as Number>::MIN,
+                <f32 as Number>::MAX,
+                Some((0, vocab_size as Element)),
+            );
+            let input = input.quantize(&scaling);
+
+            let emb_data = emb.get_data();
+            let new_emb = input
+                .get_data()
+                .iter()
+                .flat_map(|v| {
+                    let idx = v.to_usize();
+                    assert!(
+                        idx < vocab_size,
+                        "idx {idx} out of bounds for vocab size {vocab_size}"
+                    );
+                    let emd_idx = idx * emb_size;
+                    emb_data[emd_idx..emd_idx + emb_size].to_vec()
+                })
+                .collect::<Vec<_>>();
+            let out_shape = Shape::new(vec![seq_len, emb_size]);
+            let expected = Tensor::new(out_shape, new_emb);
+
+            let layer = Embeddings::<Element>::new(emb).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+
+            prop_assert_eq!(&expected, &computed.outputs[0]);
+        }
+    }
+
+    struct Input<T> {
+        emb: Tensor<T>,
+        input: Tensor<f32>,
+    }
+
+    impl<T> Debug for Input<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Input").finish_non_exhaustive()
+        }
+    }
+
+    fn any_input<T: Number>(
+        vocab_size: Range<usize>,
+        emb_size: Range<usize>,
+        input_size: Range<usize>,
+    ) -> impl Strategy<Value = Input<T>> {
+        (vocab_size, emb_size, input_size).prop_flat_map(|(vocab_size, emb_size, input_size)| {
+            let shape = Shape::new(vec![vocab_size, emb_size]);
+            let emb = Tensor::<T>::any(shape.clone());
+            let input = Tensor::<f32>::any(Shape::new(vec![emb_size * input_size]));
+            (emb, input).prop_map(|(emb, input)| Input { emb, input })
+        })
     }
 }

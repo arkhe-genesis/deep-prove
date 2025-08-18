@@ -28,7 +28,7 @@ pub mod parser;
 pub use parser::{FloatOnnxLoader, ModelType};
 pub mod tensor;
 pub use tensor::Tensor;
-mod gpu;
+mod backend;
 pub mod inputs;
 
 #[cfg(feature = "capture-layers-quant")]
