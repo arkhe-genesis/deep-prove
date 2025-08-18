@@ -25,15 +25,14 @@ use crate::{
     quantization::{Fieldizer, IntoElement, TensorFielder},
     tensor::Shape,
     to_bit_sequence_le,
+    util::from_mle_list_dimensions,
 };
 use anyhow::{anyhow, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    Expression, mle::IntoMLE, virtual_poly::VPAuxInfo, virtual_polys::VirtualPolynomialsBuilder,
-};
+use multilinear_extensions::{Expression, mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
 use p3_field::FieldAlgebra;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -55,11 +54,7 @@ pub struct ArgmaxData<E> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct LogitsCtx<E: ExtensionField> {
-    hadamard_poly_aux: VPAuxInfo<E>,
-    sumcheck_poly_aux: VPAuxInfo<E>,
-}
+pub struct LogitsCtx {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
@@ -216,42 +211,22 @@ impl OpInfo for Logits {
     }
 }
 
-impl<E: ExtensionField> ProveInfo<E> for Logits {
+impl ProveInfo for Logits {
     fn step_info(
         &self,
         _id: NodeId,
         mut aux: ContextAux,
-    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+    ) -> anyhow::Result<(LayerCtx, ContextAux)> {
         ensure!(
             aux.last_output_shape.len() == 1,
             "Expected 1 input shape in ContextAux for Logits layer, found {}",
             aux.last_output_shape.len(),
         );
 
-        let input_num_vars = aux.last_output_shape[0].product().ilog2() as usize;
-        let hadamard_poly_aux = crate::util::from_mle_list_dimensions(&[vec![
-            input_num_vars,
-            input_num_vars,
-            input_num_vars,
-        ]]);
-        // Number of variables in the sum-check to convert vector of maximum values to sparse matrix.
-        // The number of variables corresponds to the variables related to the last dimension of the input
-        // matrix (i.e., the number of columns of the sparse matrix)
-        let num_vars = aux.last_output_shape[0]
-            .dim(aux.last_output_shape[0].rank() - 1)
-            .ilog2() as usize;
-        let sumcheck_poly_aux = crate::util::from_mle_list_dimensions(&[vec![num_vars]]);
-
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.tables.insert(TableType::Range);
 
-        Ok((
-            LayerCtx::Logits(LogitsCtx {
-                hadamard_poly_aux,
-                sumcheck_poly_aux,
-            }),
-            aux,
-        ))
+        Ok((LayerCtx::Logits(LogitsCtx {}), aux))
     }
 }
 
@@ -305,7 +280,7 @@ impl PadOp for Logits {
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Logits {
-    type Ctx = LogitsCtx<E>;
+    type Ctx = LogitsCtx;
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
@@ -561,7 +536,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
     }
 }
 
-impl<E: ExtensionField> OpInfo for LogitsCtx<E> {
+impl OpInfo for LogitsCtx {
     fn output_shapes(
         &self,
         input_shapes: &[Shape],
@@ -583,7 +558,7 @@ impl<E: ExtensionField> OpInfo for LogitsCtx<E> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LogitsCtx<E> {
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LogitsCtx {
     type Proof = LogitsProof<E, PCS>;
 
     fn verify<T: Transcript<E>>(
@@ -621,7 +596,8 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             shape_step.padded_input_shape.len(),
         );
 
-        let num_row_vars = shape_step.padded_input_shape[0].dim(0).ilog2() as usize;
+        let num_row_vars = shape_step.padded_input_shape[0].num_vars()[0];
+        let num_col_vars = shape_step.padded_input_shape[0].num_vars()[1];
         let (_, row_point) = Logits::split_claim_point(&claim.point, num_row_vars)?;
 
         let input_claim = Claim::new(claim.point.clone(), proof.max_eval - claim.eval);
@@ -632,10 +608,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         )?;
 
         // verify the sum-check to convert the vector of maximum values to the sparse matrix
+
+        let sumcheck_poly_aux = from_mle_list_dimensions(&[vec![num_col_vars]]);
         let subclaim = IOPVerifierState::verify(
             proof.max_eval,
             &proof.sumcheck_proof,
-            &self.sumcheck_poly_aux,
+            &sumcheck_poly_aux,
             verifier.transcript,
         );
 
@@ -659,10 +637,13 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let challenge = Logits::squeeze_challenge(verifier.transcript, &input_claim);
 
         // verify hadamard product sum-check
+        let input_num_vars = shape_step.padded_input_shape[0].num_vars().iter().sum();
+        let hadamard_poly_aux =
+            from_mle_list_dimensions(&[vec![input_num_vars, input_num_vars, input_num_vars]]);
         let subclaim = IOPVerifierState::verify(
             proof.max_mat_eval + challenge * input_claim.eval,
             &proof.hadamard_proof,
-            &self.hadamard_poly_aux,
+            &hadamard_poly_aux,
             verifier.transcript,
         );
 
@@ -703,8 +684,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
     }
 }
 
-impl<E: ExtensionField> LogitsCtx<E> {
-    fn verify_output_evaluation<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+impl LogitsCtx {
+    fn verify_output_evaluation<
+        E: ExtensionField,
+        T: Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E>,
+    >(
         verifier: &mut Verifier<E, T, PCS>,
         output_claim: Claim<E>,
     ) -> anyhow::Result<()> {

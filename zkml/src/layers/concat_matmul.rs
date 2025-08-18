@@ -22,7 +22,6 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     Expression,
     mle::{IntoMLE, MultilinearExtension},
-    virtual_poly::VPAuxInfo,
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -51,6 +50,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
     tensor::{Number, Shape},
+    util::from_mle_list_dimensions,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,9 +362,8 @@ pub struct ConcatMatMul {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ConcatMatMulCtx<E> {
+pub struct ConcatMatMulCtx {
     pub(crate) node_id: NodeId,
-    pub(crate) matrix_poly_aux: VPAuxInfo<E>,
     permutations: MatrixPermutations,
 }
 
@@ -688,11 +687,8 @@ impl QuantizeOp for ConcatMatMul {
     }
 }
 
-impl<E: ExtensionField + DeserializeOwned> ProveInfo<E> for ConcatMatMul
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for ConcatMatMul {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         let num_columns_left = aux.last_output_shape[0][self.permutations.left.mat_mul_dimension];
 
         let num_rows_right = aux.last_output_shape[1][self.permutations.right.mat_mul_dimension];
@@ -704,26 +700,10 @@ where
             num_rows_right,
         );
 
-        let num_chunks = aux.last_output_shape[0][self.permutations.left.concat_dimension];
-        ensure!(
-            num_chunks == aux.last_output_shape[1][self.permutations.right.concat_dimension],
-            "ConcatMatMul: number of chunk matrices in left matrix different from number of chunks in right matrix: {} vs {}",
-            num_chunks,
-            aux.last_output_shape[1][self.permutations.right.concat_dimension]
-        );
-
-        ensure!(num_columns_left.is_power_of_two());
-        ensure!(num_chunks.is_power_of_two());
-
-        let num_vars = (num_columns_left * num_chunks).ilog2() as usize;
-
-        let vp_aux = crate::util::from_mle_list_dimensions(&[vec![num_vars, num_vars, num_vars]]);
-
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
 
         let ctx = ConcatMatMulCtx {
             node_id: id,
-            matrix_poly_aux: vp_aux,
             permutations: self.permutations.clone(),
         };
 
@@ -745,7 +725,7 @@ impl<E: ExtensionField + DeserializeOwned, PCS: PolynomialCommitmentScheme<E>> P
 where
     E::BaseField: DeserializeOwned + Serialize,
 {
-    type Ctx = ConcatMatMulCtx<E>;
+    type Ctx = ConcatMatMulCtx;
 
     fn prove<T: Transcript<E>>(
         &self,
@@ -781,7 +761,7 @@ where
     }
 }
 
-impl<E: ExtensionField> OpInfo for ConcatMatMulCtx<E> {
+impl OpInfo for ConcatMatMulCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         self.permutations.output_shapes(input_shapes, padding_mode)
     }
@@ -803,7 +783,7 @@ impl<E: ExtensionField> OpInfo for ConcatMatMulCtx<E> {
 }
 
 impl<E: ExtensionField + DeserializeOwned, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS>
-    for ConcatMatMulCtx<E>
+    for ConcatMatMulCtx
 where
     E::BaseField: DeserializeOwned,
 {
@@ -828,10 +808,24 @@ where
         self.permutations
             .ensure_shape_consistency(padded_input_shapes)?;
 
+        let num_columns_left = padded_input_shapes[0][self.permutations.left.mat_mul_dimension];
+
+        let num_chunks = padded_input_shapes[0][self.permutations.left.concat_dimension];
+        ensure!(
+            num_chunks == padded_input_shapes[1][self.permutations.right.concat_dimension],
+            "ConcatMatMul: number of chunk matrices in left matrix different from number of chunks in right matrix: {} vs {}",
+            num_chunks,
+            padded_input_shapes[1][self.permutations.right.concat_dimension]
+        );
+
+        let num_vars = (num_columns_left * num_chunks).ilog2() as usize;
+
+        let vp_aux = from_mle_list_dimensions(&[vec![num_vars, num_vars, num_vars]]);
+
         let subclaim = IOPVerifierState::<E>::verify(
             last_claim.eval,
             &proof.sumcheck_proof,
-            &self.matrix_poly_aux,
+            &vp_aux,
             verifier.transcript,
         );
 

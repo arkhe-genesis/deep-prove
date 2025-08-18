@@ -1,8 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ff_ext::ExtensionField;
-use serde::{Serialize, de::DeserializeOwned};
-
 use crate::layers::provable::{Node, NodeCtx, NodeEdges, NodeId};
 
 use super::{Model, ModelCtx};
@@ -42,18 +39,15 @@ pub type ModelForwardIterator<'a, N> = NodeIterator<'a, Node<N>, true>;
 // proving
 pub type ModelBackwardIterator<'a, N> = NodeIterator<'a, Node<N>, false>;
 
-impl<E: ExtensionField + DeserializeOwned> ToIterator<NodeCtx<E>> for ModelCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn to_forward_iterator<'a>(&'a self) -> ModelCtxForwardIterator<'a, E> {
+impl ToIterator<NodeCtx> for ModelCtx {
+    fn to_forward_iterator<'a>(&'a self) -> ModelCtxForwardIterator<'a> {
         NodeIterator {
             unvisited_nodes: self.nodes.keys().copied().collect(),
             nodes: BTreeMapNodeSet(&self.nodes).to_node_set(),
         }
     }
 
-    fn to_backward_iterator<'a>(&'a self) -> ModelCtxBackwardIterator<'a, E> {
+    fn to_backward_iterator<'a>(&'a self) -> ModelCtxBackwardIterator<'a> {
         NodeIterator {
             unvisited_nodes: self.nodes.keys().copied().collect(),
             nodes: BTreeMapNodeSet(&self.nodes).to_node_set(),
@@ -89,9 +83,9 @@ impl<N> NodeCollection<Node<N>> for Model<N> {
 }
 
 /// Forward iterator for the proving contexts of nodes in a model
-pub type ModelCtxForwardIterator<'a, E> = NodeIterator<'a, NodeCtx<E>, true>;
+pub type ModelCtxForwardIterator<'a> = NodeIterator<'a, NodeCtx, true>;
 /// Backward iterator for the proving contexts of nodes in a model
-pub type ModelCtxBackwardIterator<'a, E> = NodeIterator<'a, NodeCtx<E>, false>;
+pub type ModelCtxBackwardIterator<'a> = NodeIterator<'a, NodeCtx, false>;
 
 pub trait ToNodeSet<'a, E: NodeEdges> {
     fn to_node_set(self) -> HashMap<NodeId, &'a E>;

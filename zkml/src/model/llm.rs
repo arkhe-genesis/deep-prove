@@ -402,7 +402,7 @@ impl Driver<Element> {
         input_len: usize,
     ) -> anyhow::Result<usize> {
         self.model
-            .compute_max_poly_size::<E>(&[vec![input_len.next_power_of_two()].into()])
+            .compute_max_poly_size(&[vec![input_len.next_power_of_two()].into()])
     }
 
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.

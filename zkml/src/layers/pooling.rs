@@ -58,7 +58,6 @@ pub enum Pooling {
 pub struct PoolingCtx {
     pub poolinfo: Maxpool2D,
     pub node_id: NodeId,
-    pub num_vars: usize,
 }
 
 /// Contains proof material related to one step of the inference
@@ -128,37 +127,15 @@ impl<N: Number> Evaluate<N> for Pooling {
     }
 }
 
-impl<E> ProveInfo<E> for Pooling
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Pooling {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         let info = match self {
             Pooling::Maxpool2D(info) => {
                 aux.tables.insert(TableType::Range);
 
-                // `try_fold` would not allow returning of `Err` values
-                // from here and would short-circuit
-                // instead of looping over all values in the iterator
-                #[allow(clippy::manual_try_fold)]
-                let num_vars = aux.last_output_shape.iter_mut().fold(Ok(None), |expected_num_vars, shape| {
-                    // Pooling only affects the last two dimensions
-                    let total_number_dims = shape.len();
+                aux.last_output_shape =
+                    self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
 
-                    shape.iter_mut()
-                        .skip(total_number_dims - 2)
-                        .for_each(|dim| *dim = (*dim - info.kernel_size) / info.stride + 1);
-
-                    let num_vars = shape.iter()
-                        .map(|dim| ceil_log2(*dim))
-                        .sum::<usize>();
-                    if let Some(vars) = expected_num_vars? {
-                        ensure!(vars == num_vars,
-                        "All input shapes for convolution must have the same number of variables");
-                    }
-                    Ok(Some(num_vars))
-                })?.expect("No input shape found for convolution layer?");
                 // Set the model polys to be empty
                 aux.model_polys = None;
                 aux.max_poly_len = aux
@@ -170,7 +147,6 @@ where
                 LayerCtx::Pooling(PoolingCtx {
                     poolinfo: *info,
                     node_id: id,
-                    num_vars,
                 })
             }
         };
@@ -322,7 +298,7 @@ where
         proof: &Self::Proof,
         last_claims: &[&Claim<E>],
         verifier: &mut Verifier<E, T, PCS>,
-        _shape_step: &ShapeStep,
+        shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         let (constant_challenge, column_separation_challenge) = verifier
             .challenge_storage
@@ -337,6 +313,7 @@ where
             proof,
             constant_challenge,
             column_separation_challenge,
+            shape_step,
         )?])
     }
 }
@@ -350,6 +327,22 @@ impl Pooling {
         match self {
             Pooling::Maxpool2D(maxpool2d) => maxpool2d.op(input),
         }
+    }
+
+    fn num_vars_for_outputs(output_shapes: &[Shape]) -> Result<usize> {
+        Ok(output_shapes
+            .iter()
+            .try_fold(None, |expected_num_vars, shape| {
+                let num_vars = shape.iter().map(|dim| ceil_log2(*dim)).sum::<usize>();
+                if let Some(vars) = expected_num_vars {
+                    ensure!(
+                        vars == num_vars,
+                        "All output shapes for pooling must have the same number of variables"
+                    );
+                }
+                Ok(Some(num_vars))
+            })?
+            .expect("No output shape found for pooling layer?"))
     }
 
     #[timed::timed_instrument(name = "Prover::prove_pooling_step")]
@@ -370,6 +363,8 @@ impl Pooling {
         E: ExtensionField + Serialize + DeserializeOwned,
     {
         assert_eq!(input.rank(), 3, "Maxpool needs 3D inputs.");
+        let output_shapes = self.output_shapes(&[input.shape()], PaddingMode::Padding);
+        let num_vars = Self::num_vars_for_outputs(output_shapes.as_slice())?;
         // Should only be one prover_info for this step
         let mut logup_witnesses = prover.lookup_witness(id)?;
         ensure!(
@@ -388,12 +383,12 @@ impl Pooling {
         let diff_polys = prover_info
             .column_evals()
             .iter()
-            .map(|diff| MultilinearExtension::<'_, E>::from_evaluations_slice(info.num_vars, diff))
+            .map(|diff| MultilinearExtension::<'_, E>::from_evaluations_slice(num_vars, diff))
             .collect::<Vec<MultilinearExtension<E>>>();
 
         // Run the Zerocheck that checks enforces that output does contain the maximum value for the kernel
-        let num_threads = optimal_sumcheck_threads(info.num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, info.num_vars);
+        let num_threads = optimal_sumcheck_threads(num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
 
         // We reuse the logup point here for the zerocheck challenge
         let lookup_point = &logup_proof.output_claims()[0].point;
@@ -405,13 +400,11 @@ impl Pooling {
             .elements;
 
         let beta_eval = compute_betas_eval(lookup_point);
-        let beta_poly = MultilinearExtension::from_evaluations_ext_vec(info.num_vars, beta_eval);
+        let beta_poly = MultilinearExtension::from_evaluations_ext_vec(num_vars, beta_eval);
 
         let last_claim_beta_eval = compute_betas_eval(&last_claim.point);
-        let last_claim_beta = MultilinearExtension::from_evaluations_ext_vec(
-            info.num_vars,
-            last_claim_beta_eval.clone(),
-        );
+        let last_claim_beta =
+            MultilinearExtension::from_evaluations_ext_vec(num_vars, last_claim_beta_eval.clone());
         let output_mle: MultilinearExtension<E> = output.get_data().to_vec().into_mle();
         let diff_exprs = diff_polys
             .iter()
@@ -547,6 +540,7 @@ impl PoolingCtx {
         proof: &PoolingProof<E, PCS>,
         constant_challenge: E,
         column_separation_challenge: E,
+        shape_step: &ShapeStep,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,
@@ -562,7 +556,10 @@ impl PoolingCtx {
         )?;
 
         // 2. Verify the sumcheck proof
-        let poly_aux = crate::util::from_mle_list_dimensions(&[vec![self.num_vars; 5]]);
+        let output_shapes =
+            self.output_shapes(&shape_step.padded_input_shape, PaddingMode::Padding);
+        let num_vars = Pooling::num_vars_for_outputs(&output_shapes)?;
+        let poly_aux = crate::util::from_mle_list_dimensions(&[vec![num_vars; 5]]);
         let batching_challenge = verifier
             .transcript
             .sample_and_append_challenge(b"batch_pooling")

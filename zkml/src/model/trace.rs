@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Debug};
 
 use anyhow::Context;
 use ff_ext::ExtensionField;
@@ -63,7 +63,7 @@ where
     /// needed to prove the inference
     pub(crate) fn into_fields(self) -> anyhow::Result<ProvingTrace<'a, E, N>>
     where
-        D: Fieldizer<E> + Serialize + for<'b> Deserialize<'b>,
+        D: Fieldizer<E> + Serialize + for<'b> Deserialize<'b> + Debug,
     {
         let store = self.store.clone();
         let input = self

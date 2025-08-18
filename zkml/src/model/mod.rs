@@ -591,12 +591,8 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
 /// Collection of the proving contexts of all the nodes in the model
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ModelCtx<E: ExtensionField + DeserializeOwned>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    pub(crate) nodes: BTreeMap<NodeId, NodeCtx<E>>,
+pub struct ModelCtx {
+    pub(crate) nodes: BTreeMap<NodeId, NodeCtx>,
 }
 
 #[cfg(test)]

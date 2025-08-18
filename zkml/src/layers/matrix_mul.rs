@@ -6,7 +6,6 @@ use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     mle::{IntoMLE, MultilinearExtension},
-    virtual_poly::VPAuxInfo,
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -21,12 +20,16 @@ use transcript::Transcript;
 
 use crate::{
     Claim, Element, Prover, ScalingFactor, ScalingStrategy,
-    iop::{context::ContextAux, verifier::Verifier},
+    iop::{
+        context::{ContextAux, ShapeStep},
+        verifier::Verifier,
+    },
     layers::LayerProof,
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
     quantization::{self, bias_scaling_matmul},
     tensor::{Number, Shape, Tensor},
+    util::from_mle_list_dimensions,
 };
 
 use super::{
@@ -139,11 +142,8 @@ pub struct MatMul<T> {
 
 /// Information stored in the context (setup phase) for this layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MatMulCtx<E> {
+pub struct MatMulCtx {
     pub(crate) node_id: NodeId,
-    pub(crate) matrix_poly_aux: VPAuxInfo<E>,
-    // Number of variables of the MLE polynomial for each dimension of the output matrix
-    pub(crate) output_mle_num_vars: (usize, usize),
     /// Unpadded and padded shapes of the left matrix, if the left matrx is a constant matrix
     pub(crate) left_matrix_shapes: Option<(Shape, Shape)>,
     /// Unpadded and padded shapes of the right matrix, if the right matrx is a constant matrix
@@ -495,13 +495,8 @@ impl<N: Number> Evaluate<N> for MatMul<N> {
     }
 }
 
-impl<E> ProveInfo<E> for MatMul<Element>
-where
-    E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, ctx_aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for MatMul<Element> {
+    fn step_info(&self, id: NodeId, ctx_aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         let (info, ctx_aux) = self.ctx(id, ctx_aux)?;
 
         // there is only one product (i.e. quadratic sumcheck)
@@ -634,7 +629,7 @@ where
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    type Ctx = MatMulCtx<E>;
+    type Ctx = MatMulCtx;
 
     fn prove<T: Transcript<E>>(
         &self,
@@ -891,15 +886,11 @@ impl MatMul<Element> {
         Ok((output_claims, proof))
     }
 
-    pub(crate) fn ctx<E>(
+    pub(crate) fn ctx(
         &self,
         id: NodeId,
         mut ctx_aux: ContextAux,
-    ) -> Result<(MatMulCtx<E>, ContextAux)>
-    where
-        E: ExtensionField + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
-    {
+    ) -> Result<(MatMulCtx, ContextAux)> {
         let (left_shape, right_shape) = match (&self.left_matrix, &self.right_matrix) {
             (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
                 (mat.tensor.shape(), ctx_aux.last_output_shape[0].clone())
@@ -915,27 +906,9 @@ impl MatMul<Element> {
                 unreachable!("Found Matmul layer with 2 constant matrices, which is useless")
             }
         };
-        // construct dimension of the polynomial given to the sumcheck
-        let transposed_right_shape = if self.is_right_transposed() {
-            Some(right_shape.iter().rev().copied().collect())
-        } else {
-            None
-        };
-        let (nrows, ncols) = (
-            left_shape[0],
-            transposed_right_shape.as_ref().unwrap_or(&right_shape)[1],
-        );
-        ctx_aux.last_output_shape = vec![Shape::new(vec![nrows, ncols])];
 
-        // number of variables of the MLE polynomials is the number of row
-        // variables in in layer matrix
-        let num_vars = transposed_right_shape
-            .unwrap_or(right_shape.clone())
-            .num_vars_2d()
-            .0;
-        // check that the number of variables is the same as the number of
-        // column variables for left matrix
-        ensure!(num_vars == left_shape.num_vars_2d().1);
+        ctx_aux.last_output_shape =
+            self.output_shapes(&ctx_aux.last_output_shape, PaddingMode::Padding);
 
         let left_matrix_shapes = self
             .left_matrix
@@ -949,8 +922,6 @@ impl MatMul<Element> {
         // there is only one product (i.e. quadratic sumcheck)
         let info = MatMulCtx {
             node_id: id,
-            matrix_poly_aux: crate::util::from_mle_list_dimensions(&[vec![num_vars, num_vars]]),
-            output_mle_num_vars: (nrows.ilog2() as usize, ncols.ilog2() as usize),
             left_matrix_shapes,
             right_matrix_shapes,
             config: self.config.clone(),
@@ -977,11 +948,7 @@ impl MatMul<Element> {
     }
 }
 
-impl<E: ExtensionField> OpInfo for MatMulCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl OpInfo for MatMulCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         let left_matrix_shape = self
             .left_matrix_shapes
@@ -1028,7 +995,7 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for MatMulCtx<E>
+impl<E, PCS> VerifiableCtx<E, PCS> for MatMulCtx
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
@@ -1042,32 +1009,76 @@ where
         proof: &Self::Proof,
         last_claims: &[&Claim<E>],
         verifier: &mut Verifier<E, T, PCS>,
-        _shape_step: &crate::iop::context::ShapeStep,
+        shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
-        self.verify_matmul(verifier, last_claims[0], proof)
+        self.verify_matmul(verifier, last_claims[0], proof, shape_step)
     }
 }
 
-impl<E: ExtensionField> MatMulCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl MatMulCtx {
     fn is_right_transposed(&self) -> bool {
         matches!(self.config, Some(Config::TransposeB))
     }
 
-    pub(crate) fn verify_matmul<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn verify_matmul<
+        E: ExtensionField,
+        T: Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E>,
+    >(
         &self,
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
         proof: &MatMulProof<E>,
+        shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         let mut last_claim = last_claim.clone();
+        let input_shapes = &shape_step.padded_input_shape;
+
+        let (left_shape, right_shape) = match (&self.left_matrix_shapes, &self.right_matrix_shapes)
+        {
+            (Some((_unpadded_shape, padded_shape)), None) => {
+                ensure!(
+                    input_shapes.len() == 1,
+                    "Expected 1 input shape when verifying MatMul layer, found {}",
+                    input_shapes.len(),
+                );
+                (padded_shape, &input_shapes[0])
+            }
+            (None, Some((_unpadded_shape, padded_shape))) => {
+                ensure!(
+                    input_shapes.len() == 1,
+                    "Expected 1 input shape when verifying MatMul layer, found {}",
+                    input_shapes.len(),
+                );
+                (&input_shapes[0], padded_shape)
+            }
+            (None, None) => {
+                ensure!(
+                    input_shapes.len() == 2,
+                    "Expected 2 input shape when verifying MatMul layer, found {}",
+                    input_shapes.len(),
+                );
+                (&input_shapes[0], &input_shapes[1])
+            }
+            (Some(_), Some(_)) => {
+                unreachable!("Found Matmul layer with 2 constant matrices, which is useless")
+            }
+        };
+        // construct dimension of the polynomial given to the sumcheck
+        let transposed_right_shape = if self.is_right_transposed() {
+            Some(right_shape.iter().rev().copied().collect())
+        } else {
+            None
+        };
+        let output_shape = Shape::new(vec![
+            left_shape[0],
+            transposed_right_shape.as_ref().unwrap_or(right_shape)[1],
+        ]);
+        let output_num_vars = output_shape.num_vars();
+        let output_num_vars = (output_num_vars[0], output_num_vars[1]);
         // claims to be verified with opening proofs
         let mut common_claims = HashMap::new();
-        let (_, point_for_right) =
-            MatMul::<Element>::split_claim(&last_claim, self.output_mle_num_vars);
+        let (_, point_for_right) = MatMul::<Element>::split_claim(&last_claim, output_num_vars);
         if self.with_bias {
             let bias_eval = proof
                 .bias_eval
@@ -1080,10 +1091,25 @@ where
             last_claim.eval -= bias_eval;
         }
 
+        // number of variables of the MLE polynomials is the number of row
+        // variables in in layer matrix
+        let num_vars = transposed_right_shape
+            .as_ref()
+            .unwrap_or(right_shape)
+            .num_vars()[0];
+        // check that the number of variables is the same as the number of
+        // column variables for left matrix
+        ensure!(
+            num_vars == left_shape.num_vars()[1],
+            "Number of variables in left matrix ({}) does not match number of variables in right matrix ({})",
+            left_shape.num_vars()[1],
+            num_vars
+        );
+
         let subclaim = IOPVerifierState::<E>::verify(
             last_claim.eval,
             &proof.sumcheck,
-            &self.matrix_poly_aux,
+            &from_mle_list_dimensions(&[vec![num_vars, num_vars]]),
             verifier.transcript,
         );
         let is_left_matrix_constant = self.left_matrix_shapes.is_some();
@@ -1102,7 +1128,7 @@ where
         let (point_for_left, point_for_right) = MatMul::<Element>::full_points(
             &last_claim,
             &subclaim.point.iter().map(|p| p.elements).collect_vec(),
-            self.output_mle_num_vars,
+            output_num_vars,
             transposed,
         );
         // 0 because left matrix comes first in the product

@@ -27,8 +27,6 @@ use crate::{
 
 use super::{
     Layer, LayerCtx, LayerProof,
-    convolution::ConvCtx,
-    dense::DenseCtx,
     flatten::Flatten,
     requant::Requant,
     transformer::{layernorm::LayerNormData, softmax::SoftmaxData},
@@ -134,10 +132,7 @@ impl<N> NodeEdges for Node<N> {
     }
 }
 
-impl<E: ExtensionField + DeserializeOwned> NodeEdges for NodeCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
+impl NodeEdges for NodeCtx {
     fn inputs(&self) -> &[Edge] {
         &self.inputs
     }
@@ -255,27 +250,18 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
 /// Represents the proving context for a given node, altogether with the input
 /// and output edges of the node
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct NodeCtx<E>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
+pub struct NodeCtx {
     pub(crate) inputs: Vec<Edge>,
     pub(crate) outputs: Vec<OutputWire>,
-    pub(crate) ctx: LayerCtx<E>,
+    pub(crate) ctx: LayerCtx,
 }
 
-impl<E> NodeCtx<E>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
+impl NodeCtx {
     /// Get the claims corresponding to the output edges of a node.
     /// Requires the input claims for the nodes of the model using the
     /// outputs of the current node, and the claims of the output
     /// tensors of the model
-    pub(crate) fn claims_for_node<'a, 'b>(
+    pub(crate) fn claims_for_node<'a, 'b, E>(
         &self,
         claims_by_node: &'a HashMap<NodeId, Vec<Claim<E>>>,
         output_claims: &'b [Claim<E>],
@@ -320,7 +306,7 @@ where
     /// and the set of claims for the input tensors of all the nodes of
     /// the model
     #[allow(clippy::type_complexity)]
-    pub(crate) fn input_claims<'a, I: Iterator<Item = (NodeId, &'a Self)>>(
+    pub(crate) fn input_claims<'a, E, I: Iterator<Item = (NodeId, &'a Self)>>(
         nodes: I,
         claims_by_node: &HashMap<NodeId, Vec<Claim<E>>>,
     ) -> Result<Vec<(NodeId, Vec<(usize, &Claim<E>)>)>> {
@@ -424,13 +410,9 @@ pub fn evaluate_layer<E: ExtensionField, T: Number, O: Evaluate<T>>(
     layer.evaluate(inputs, unpadded_input_shapes.unwrap_or_default())
 }
 
-pub trait ProveInfo<E: ExtensionField>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
+pub trait ProveInfo {
     /// Compute the proving context for the operation
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)>;
+    fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)>;
 }
 
 /// Output of `QuantizeOp` method over a layer
@@ -501,7 +483,7 @@ pub trait PadOp {
     }
 }
 
-pub trait ProvableOp<E, PCS>: OpInfo + PadOp + ProveInfo<E>
+pub trait ProvableOp<E, PCS>: OpInfo + PadOp + ProveInfo
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
@@ -684,11 +666,7 @@ impl<'a, O: OpInfo + Debug, E: ExtensionField, PCS: PolynomialCommitmentScheme<E
     }
 }
 
-impl<E: ExtensionField> OpInfo for LayerCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl OpInfo for LayerCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         match self {
             LayerCtx::Dense(dense_ctx) => dense_ctx.output_shapes(input_shapes, padding_mode),
@@ -712,7 +690,7 @@ where
             LayerCtx::Flatten => {
                 <Flatten as OpInfo>::output_shapes(&Flatten, input_shapes, padding_mode)
             }
-            LayerCtx::SchoolBookConvolution(_) | LayerCtx::Table(_) => unreachable!(),
+            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 
@@ -735,7 +713,7 @@ where
             LayerCtx::Requant(requant_ctx) => requant_ctx.num_outputs(num_inputs),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.num_outputs(num_inputs),
             LayerCtx::Flatten => <Flatten as OpInfo>::num_outputs(&Flatten, num_inputs),
-            LayerCtx::SchoolBookConvolution(_) | LayerCtx::Table(_) => unreachable!(),
+            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 
@@ -758,7 +736,7 @@ where
             LayerCtx::Requant(requant_ctx) => requant_ctx.describe(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.describe(),
             LayerCtx::Flatten => Flatten.describe(),
-            LayerCtx::SchoolBookConvolution(_) | LayerCtx::Table(_) => unreachable!(),
+            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 
@@ -781,12 +759,12 @@ where
             LayerCtx::Requant(requant_ctx) => requant_ctx.is_provable(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_provable(),
             LayerCtx::Flatten => Flatten.is_provable(),
-            LayerCtx::SchoolBookConvolution(_) | LayerCtx::Table(_) => unreachable!(),
+            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx<E>
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
@@ -802,22 +780,10 @@ where
     ) -> Result<Vec<Claim<E>>> {
         match (self, proof) {
             (LayerCtx::Dense(dense_ctx), LayerProof::Dense(proof)) => {
-                <DenseCtx<E> as VerifiableCtx<E, PCS>>::verify(
-                    dense_ctx,
-                    proof,
-                    last_claims,
-                    verifier,
-                    shape_step,
-                )
+                dense_ctx.verify(proof, last_claims, verifier, shape_step)
             }
             (LayerCtx::Convolution(conv_ctx), LayerProof::Convolution(proof)) => {
-                <ConvCtx<E> as VerifiableCtx<E, PCS>>::verify(
-                    conv_ctx,
-                    proof,
-                    last_claims,
-                    verifier,
-                    shape_step,
-                )
+                conv_ctx.verify(proof, last_claims, verifier, shape_step)
             }
             (LayerCtx::MatMul(matmul_ctx), LayerProof::MatMul(proof)) => {
                 matmul_ctx.verify(proof, last_claims, verifier, shape_step)
@@ -859,7 +825,6 @@ where
                 softmax_ctx.verify(proof, last_claims, verifier, shape_step)
             }
             (LayerCtx::SchoolBookConvolution(_), _)
-            | (LayerCtx::Table(_), _)
             | (LayerCtx::Flatten, _)
             | (LayerCtx::Reshape(_), _) => {
                 unreachable!("Trying to verify a non-provable layer")
@@ -897,7 +862,6 @@ where
             LayerCtx::Pooling(pooling_ctx) => {
                 compute_model_output_claims::<_, PCS, _, _>(pooling_ctx, transcript, outputs)
             }
-            LayerCtx::Table(_) => unreachable!(),
             LayerCtx::QKV(qkvctx) => {
                 compute_model_output_claims::<_, PCS, _, _>(qkvctx, transcript, outputs)
             }
@@ -981,7 +945,7 @@ where
                 inputs,
                 claims,
             ),
-            LayerCtx::SchoolBookConvolution(_) | LayerCtx::Table(_) => unreachable!(),
+            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 }

@@ -479,7 +479,7 @@ impl Requant {
     ) -> Result<Requant> {
         // First we check that we can actually use this method
         let input_log = input_scale.log2();
-        let output_log= output_scale.log2();
+        let output_log = output_scale.log2();
         let m = input_scale / output_scale;
         let m_log = m.log2();
         let int_part = m_log.trunc().abs();
@@ -487,7 +487,9 @@ impl Requant {
         ensure!(
             is_close_to_integer((input_log - output_log).abs(), 1e-5),
             "Cannot perform shift only Requant as the fractional part of the exponent was too large, input {},output {} -> diff {}",
-            input_log,output_log,is_close_to_integer((input_log - output_log).abs(), 1e-5),
+            input_log,
+            output_log,
+            is_close_to_integer((input_log - output_log).abs(), 1e-5),
         );
 
         // We want the part that gets shifted away to be a multiple of the quantisation bit length (that way we can use the same range table for each chunk)
@@ -578,12 +580,8 @@ impl QuantizeOp for LayerNorm<f32> {
     }
 }
 
-impl<E> ProveInfo<E> for LayerNorm<Element>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for LayerNorm<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         if let Some(quant_info) = self.quant_info() {
             let QuantisedLayerNormData {
                 multiplier,
@@ -619,7 +617,7 @@ where
             // The output shape is the same as the input shape so we don't need to update it
             // return the LayerCtx and the updated ContextAux
             Ok((
-                LayerCtx::<E>::LayerNorm(LayerNormCtx {
+                LayerCtx::LayerNorm(LayerNormCtx {
                     node_id: id,
                     eps: self.eps.to_bits(),
                     range_check_bits: *range_check_bits,

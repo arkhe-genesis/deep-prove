@@ -292,7 +292,7 @@ where
                 .nodes
                 .get(&node_id)
                 .ok_or(anyhow!("Node {node_id} not found"))?;
-            <LayerCtx<E> as VerifiableCtx<E, PCS>>::verify_input_claim(
+            <LayerCtx as VerifiableCtx<E, PCS>>::verify_input_claim(
                 &node_ctx.ctx,
                 inputs.as_slice(),
                 &claims,

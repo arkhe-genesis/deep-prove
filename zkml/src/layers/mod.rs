@@ -35,7 +35,7 @@ use transformer::{
 
 use crate::{
     Element, ProverContext, ScalingStrategy,
-    iop::context::{ContextAux, ShapeStep, TableCtx},
+    iop::context::{ContextAux, ShapeStep},
     layers::{
         activation::{Activation, ActivationProof},
         add::{Add, AddCtx, AddProof},
@@ -126,32 +126,27 @@ impl<T> Layer<T> {
 /// the sequence of steps and the type of each step from the setup phase so it can make sure the prover is not
 /// cheating on this.
 /// NOTE: The context automatically appends a requant step after each dense layer.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub enum LayerCtx<E>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    Dense(DenseCtx<E>),
-    MatMul(MatMulCtx<E>),
-    Convolution(ConvCtx<E>),
+pub enum LayerCtx {
+    Dense(DenseCtx),
+    MatMul(MatMulCtx),
+    Convolution(ConvCtx),
     SchoolBookConvolution(SchoolBookConvCtx),
     Activation(ActivationCtx),
     Requant(RequantCtx),
     Pooling(PoolingCtx),
-    Table(TableCtx<E>),
-    QKV(QKVCtx<E>),
-    Mha(MhaCtx<E>),
-    ConcatMatMul(ConcatMatMulCtx<E>),
+    QKV(QKVCtx),
+    Mha(MhaCtx),
+    ConcatMatMul(ConcatMatMulCtx),
     LayerNorm(LayerNormCtx),
     Flatten,
     Add(AddCtx),
     Softmax(SoftmaxCtx),
     Reshape(ReshapeCtx),
-    Embeddings(EmbeddingsCtx<E>),
+    Embeddings(EmbeddingsCtx),
     Positional(PositionalCtx),
-    Logits(LogitsCtx<E>),
+    Logits(LogitsCtx),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -206,11 +201,7 @@ impl<T> Layer<T> {
     }
 }
 
-impl<E> LayerCtx<E>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
+impl LayerCtx {
     pub fn variant_name(&self) -> String {
         match self {
             Self::Dense(_) => "Dense".to_string(),
@@ -230,16 +221,12 @@ where
             Self::Activation(_) => "Activation".to_string(),
             Self::Requant(_) => "Requant".to_string(),
             Self::Pooling(_) => "Pooling".to_string(),
-            Self::Table(..) => "Table".to_string(),
             Self::Flatten => "Reshape".to_string(),
         }
     }
 
     pub fn has_proof(&self) -> bool {
-        !matches!(
-            self,
-            Self::Flatten | Self::Table(_) | Self::SchoolBookConvolution(_)
-        )
+        !matches!(self, Self::Flatten | Self::SchoolBookConvolution(_))
     }
 
     pub fn next_shape_step(&self, last_step: &ShapeStep) -> ShapeStep {
@@ -273,7 +260,7 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
     where
         T: Serialize + for<'a> Deserialize<'a>,
         U: Serialize + for<'a> Deserialize<'a>,
-        T: Fieldizer<U>,
+        T: Fieldizer<U> + Debug,
     {
         Ok(NodeOut::<U, E> {
             _t: PhantomData::<U>,
@@ -421,15 +408,9 @@ where
         Ok(node_out)
     }
 
-    pub(crate) fn step_info<E>(
-        &self,
-        id: NodeId,
-        aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)>
+    pub(crate) fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)>
     where
-        E: ExtensionField + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
-        Layer<N>: ProveInfo<E>,
+        Layer<N>: ProveInfo,
     {
         self.operation.step_info(id, aux)
     }
@@ -622,12 +603,8 @@ impl Evaluate<Element> for Layer<Element> {
     }
 }
 
-impl<E: ExtensionField> ProveInfo<E> for Layer<Element>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Layer<Element> {
+    fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         match self {
             Layer::Dense(dense) => dense.step_info(id, aux),
             Layer::QKV(qkv) => qkv.step_info(id, aux),
@@ -687,7 +664,7 @@ where
     E: ExtensionField + Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    type Ctx = LayerCtx<E>;
+    type Ctx = LayerCtx;
 
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,

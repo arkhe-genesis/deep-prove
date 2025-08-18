@@ -8,6 +8,7 @@ use crate::{
         provable::{QuantizeOp, QuantizeOutput},
     },
     to_bit_sequence_le,
+    util::from_mle_list_dimensions,
 };
 
 use anyhow::{anyhow, bail, ensure};
@@ -15,7 +16,7 @@ use either::Either;
 use ff_ext::{ExtensionField, SmallField};
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{virtual_poly::VPAuxInfo, virtual_polys::VirtualPolynomialsBuilder};
+use multilinear_extensions::virtual_polys::VirtualPolynomialsBuilder;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
@@ -50,11 +51,10 @@ pub struct Embeddings<N> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingsCtx<E> {
+pub struct EmbeddingsCtx {
     id: NodeId,
     vocab_size: usize,
     emb_size: usize,
-    sumcheck_poly_aux: VPAuxInfo<E>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,17 +269,8 @@ impl PadOp for Embeddings<Element> {
 
 const EMBEDDING_POLY_ID: &str = "EmbeddingMat";
 
-impl<E> ProveInfo<E> for Embeddings<Element>
-where
-    E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
-    fn step_info(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Embeddings<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.model_polys = Some(
             once((
@@ -291,13 +282,9 @@ where
             ))
             .collect(),
         );
-        let num_vars = self.vocab_size.next_power_of_two().ilog2() as usize;
         Ok((
             LayerCtx::Embeddings(EmbeddingsCtx {
                 id,
-                sumcheck_poly_aux: crate::util::from_mle_list_dimensions(&[vec![
-                    num_vars, num_vars,
-                ]]),
                 vocab_size: self.vocab_size,
                 emb_size: self.emb_size,
             }),
@@ -306,12 +293,7 @@ where
     }
 }
 
-impl<E> OpInfo for EmbeddingsCtx<E>
-where
-    E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl OpInfo for EmbeddingsCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         output_shapes(input_shapes, padding_mode, self.emb_size)
     }
@@ -358,7 +340,7 @@ where
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    type Ctx = EmbeddingsCtx<E>;
+    type Ctx = EmbeddingsCtx;
 
     fn prove<T: Transcript<E>>(
         &self,
@@ -473,7 +455,7 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for EmbeddingsCtx<E>
+impl<E, PCS> VerifiableCtx<E, PCS> for EmbeddingsCtx
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
@@ -494,10 +476,11 @@ where
             "embeddings only support 1 last claim"
         );
         let last_claim = &last_claims[0];
+        let num_vars = self.vocab_size.next_power_of_two().ilog2() as usize;
         let subclaim = IOPVerifierState::<E>::verify(
             last_claim.eval,
             &proof.sumcheck,
-            &self.sumcheck_poly_aux,
+            &from_mle_list_dimensions(&[vec![num_vars, num_vars]]),
             verifier.transcript,
         );
 

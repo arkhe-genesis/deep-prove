@@ -78,7 +78,6 @@ pub struct Requant {
 pub struct RequantCtx {
     pub requant: Requant,
     pub node_id: NodeId,
-    pub num_vars: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -144,12 +143,8 @@ impl Evaluate<Element> for Requant {
     }
 }
 
-impl<E> ProveInfo<E> for Requant
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Requant {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         aux.tables.insert(TableType::Range);
 
         // Add ZeroTable to the aux if needed
@@ -157,25 +152,6 @@ where
             aux.tables.insert(TableType::RequantZeroTable);
         }
 
-        // `try_fold` would not allow returning of `Err` values
-        // from here and would short-circuit
-        // instead of looping over all values in the iterator
-        #[allow(clippy::manual_try_fold)]
-        let num_vars = aux
-            .last_output_shape
-            .iter_mut()
-            .fold(Ok(None), |expected_num_vars, shape| {
-                let num_vars = shape.iter().map(|dim| ceil_log2(*dim)).sum::<usize>();
-                if let Some(vars) = expected_num_vars? {
-                    ensure!(
-                        vars == num_vars,
-                        "All input shapes for requant layer \
-                        must have the same number of variables"
-                    );
-                }
-                Ok(Some(num_vars))
-            })?
-            .expect("No input shape found for requant layer?");
         // Set the model polys to be empty
         aux.model_polys = None;
         aux.max_poly_len = aux
@@ -188,7 +164,6 @@ where
             LayerCtx::Requant(RequantCtx {
                 requant: *self,
                 node_id: id,
-                num_vars,
             }),
             aux,
         ))

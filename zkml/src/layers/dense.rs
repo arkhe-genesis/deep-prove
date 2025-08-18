@@ -11,6 +11,7 @@ use crate::{
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
     tensor::{Number, Shape},
+    util::from_mle_list_dimensions,
 };
 use anyhow::{Result, ensure};
 use burn::tensor::module::linear;
@@ -21,7 +22,6 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     mle::{IntoMLE, MultilinearExtension},
     util::ceil_log2,
-    virtual_poly::VPAuxInfo,
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -51,9 +51,8 @@ pub struct Dense<T> {
 
 /// Information stored in the context (setup phase) for this layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DenseCtx<E> {
+pub struct DenseCtx {
     pub node_id: NodeId,
-    pub matrix_poly_aux: VPAuxInfo<E>,
     pub unpadded_matrix_shape: Shape,
     pub padded_matrix_shape: Shape,
 }
@@ -221,30 +220,15 @@ impl Evaluate<f32> for Dense<f32> {
 const WEIGHT_POLY_ID: &str = "DenseWeight";
 const BIAS_POLY_ID: &str = "DenseBias";
 
-impl<E> ProveInfo<E> for Dense<Element>
-where
-    E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Dense<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         // construct dimension of the polynomial given to the sumcheck
-        let ncols = self.matrix.ncols_2d();
         aux.last_output_shape
             .iter_mut()
             .for_each(|shape| *shape = Shape::new(vec![self.matrix.nrows_2d()]));
-        // each poly is only two polynomial right now: matrix and vector
-        // for matrix, each time we fix the variables related to rows so we are only left
-        // with the variables related to columns
-        let matrix_num_vars = ncols.ilog2() as usize;
-        let vector_num_vars = matrix_num_vars;
-        // there is only one product (i.e. quadratic sumcheck)
+
         let dense_info = LayerCtx::Dense(DenseCtx {
             node_id: id,
-            matrix_poly_aux: crate::util::from_mle_list_dimensions(&[vec![
-                matrix_num_vars,
-                vector_num_vars,
-            ]]),
             unpadded_matrix_shape: self.unpadded_matrix_shape.clone(),
             padded_matrix_shape: self.matrix.shape(),
         });
@@ -325,7 +309,7 @@ where
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    type Ctx = DenseCtx<E>;
+    type Ctx = DenseCtx;
 
     fn prove<T: Transcript<E>>(
         &self,
@@ -350,12 +334,7 @@ where
     }
 }
 
-impl<E> OpInfo for DenseCtx<E>
-where
-    E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl OpInfo for DenseCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes
             .iter()
@@ -379,7 +358,7 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for DenseCtx<E>
+impl<E, PCS> VerifiableCtx<E, PCS> for DenseCtx
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
@@ -463,7 +442,7 @@ impl Dense<Element> {
         last_claim: &Claim<E>,
         input: &Tensor<E>,
         output: &Tensor<E>,
-        _info: &DenseCtx<E>,
+        _info: &DenseCtx,
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
@@ -562,11 +541,7 @@ impl Dense<Element> {
     }
 }
 
-impl<E: ExtensionField> DenseCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl DenseCtx {
     pub fn output_shape(&self, input_shape: &Shape, mode: PaddingMode) -> Shape {
         let mat_shape = match mode {
             PaddingMode::NoPadding => &self.unpadded_matrix_shape,
@@ -574,20 +549,25 @@ where
         };
         output_shape(input_shape, mat_shape)
     }
-    pub(crate) fn verify_dense<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn verify_dense<
+        E: ExtensionField,
+        T: Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E>,
+    >(
         &self,
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
         proof: &DenseProof<E>,
     ) -> anyhow::Result<Claim<E>> {
-        let info = self;
         // Subtract the bias evaluation from the previous claim to remove the bias
         let eval_no_bias = last_claim.eval - proof.bias_eval;
         // TODO: currently that API can panic - should remove panic for error
+        let matrix_num_vars = self.padded_matrix_shape.num_vars()[1];
+        let matrix_poly_aux = from_mle_list_dimensions(&[vec![matrix_num_vars, matrix_num_vars]]);
         let subclaim = IOPVerifierState::<E>::verify(
             eval_no_bias,
             &proof.sumcheck,
-            &info.matrix_poly_aux,
+            &matrix_poly_aux,
             verifier.transcript,
         );
 

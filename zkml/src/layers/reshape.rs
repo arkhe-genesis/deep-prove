@@ -223,12 +223,12 @@ fn range_end<R: RangeBounds<usize>>(range: &R) -> Option<usize> {
     }
 }
 
-impl<E: ExtensionField> ProveInfo<E> for Reshape {
+impl ProveInfo for Reshape {
     fn step_info(
         &self,
         _id: NodeId,
         mut aux: ContextAux,
-    ) -> anyhow::Result<(super::LayerCtx<E>, ContextAux)> {
+    ) -> anyhow::Result<(super::LayerCtx, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
 
         Ok((LayerCtx::Reshape(ReshapeCtx(self.clone())), aux))

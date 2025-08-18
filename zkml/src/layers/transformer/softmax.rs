@@ -1294,12 +1294,8 @@ impl OpInfo for SoftmaxCtx {
     }
 }
 
-impl<E> ProveInfo<E> for Softmax<Element>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Softmax<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         if let Some(quant_info) = self.quant_info() {
             let QuantisedSoftmaxData {
                 lut,
@@ -1341,7 +1337,7 @@ where
             // The output shape is the same as the input shape so we don't need to update it
             // return the LayerCtx and the updated ContextAux
             Ok((
-                LayerCtx::<E>::Softmax(SoftmaxCtx {
+                LayerCtx::Softmax(SoftmaxCtx {
                     node_id: id,
                     allowable_error,
                     bkm: *bkm,

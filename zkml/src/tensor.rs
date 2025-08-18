@@ -2497,6 +2497,13 @@ impl Shape {
         self.product()
     }
 
+    /// Returns the number of variables in each dimension of the shape.
+    /// Assumes that the shape is already a padded shape
+    pub fn num_vars(&self) -> Vec<usize> {
+        assert!(self.is_power_of_two());
+        self.0.iter().map(|s| s.ilog2() as usize).collect()
+    }
+
     /// Get the number of rows from the matrix
     pub fn nrows_2d(&self) -> usize {
         let mut cols = 0;
@@ -3561,15 +3568,15 @@ mod test {
         #[rustfmt::skip]
         let expansion_data = vec![
             1.0, 2.0,
-            1.0, 2.0,
-            1.0, 2.0,
-
-            3.0, 4.0,
-            3.0, 4.0,
-            3.0, 4.0,
-
-            5.0, 6.0,
-            5.0, 6.0,
+            1.0, 2.0, 
+            1.0, 2.0, 
+            
+            3.0, 4.0, 
+            3.0, 4.0, 
+            3.0, 4.0, 
+            
+            5.0, 6.0, 
+            5.0, 6.0, 
             5.0, 6.0,
         ];
 

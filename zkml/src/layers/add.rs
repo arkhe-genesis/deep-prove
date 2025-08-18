@@ -519,17 +519,8 @@ impl QuantizeOp for Add<f32> {
     }
 }
 
-impl<E> ProveInfo<E> for Add<Element>
-where
-    E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
-    fn step_info(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Add<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
         let Some(ref quant_info) = self.quant_info else {
             bail!("Add layer is not quantized");
         };

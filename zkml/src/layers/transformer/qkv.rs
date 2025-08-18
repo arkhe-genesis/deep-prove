@@ -8,7 +8,6 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     Expression,
     mle::{IntoMLE, MultilinearExtension},
-    virtual_poly::VPAuxInfo,
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -40,6 +39,7 @@ use crate::{
     quantization::model_scaling_factor_from_tensor_and_bias,
     tensor::{Number, Shape},
     try_unzip, try_unzip_parallel,
+    util::from_mle_list_dimensions,
 };
 
 /// A layer that evaluates the tensor X against the matrices Q, K and V.
@@ -64,9 +64,8 @@ pub struct QKV<N> {
     pub(crate) head_dim: usize,  // Needed to properly pad matrices for sub-sequent MHA layer
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct QKVCtx<E> {
+pub struct QKVCtx {
     node_id: NodeId,
-    sumcheck_poly_aux: VPAuxInfo<E>,
     unpadded_shape: Shape, // same shape for Q, K and V
     num_heads: usize,
     head_dim: usize,
@@ -459,11 +458,8 @@ const BIAS_Q_POLY_ID: &str = "BiasQ";
 const BIAS_K_POLY_ID: &str = "BiasK";
 const BIAS_V_POLY_ID: &str = "BiasV";
 
-impl<E: ExtensionField + DeserializeOwned> ProveInfo<E> for QKV<Element>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for QKV<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         ensure!(
             aux.last_output_shape.len() == 1,
             "expected one input shape for context of QKV layer"
@@ -494,15 +490,8 @@ where
             .collect(),
         );
 
-        // number of variables in the sum-check is equal to the number of variables corresponding to
-        // the rows of weight matrices
-        let num_vars = self.q.shape().num_vars_2d().0;
-
-        let vp_aux = crate::util::from_mle_list_dimensions(&vec![vec![num_vars, num_vars]; 3]);
-
         let ctx = QKVCtx {
             node_id: id,
-            sumcheck_poly_aux: vp_aux,
             unpadded_shape: self.weights_unpadded_shape.clone(),
             num_heads: self.num_heads,
             head_dim: self.head_dim,
@@ -526,7 +515,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
 {
-    type Ctx = QKVCtx<E>;
+    type Ctx = QKVCtx;
 
     fn prove<T: Transcript<E>>(
         &self,
@@ -716,7 +705,7 @@ where
     }
 }
 
-impl<E> OpInfo for QKVCtx<E> {
+impl OpInfo for QKVCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         let weight_shape = match padding_mode {
             PaddingMode::NoPadding => &self.unpadded_shape,
@@ -757,7 +746,7 @@ impl<E> OpInfo for QKVCtx<E> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for QKVCtx<E>
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for QKVCtx
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
@@ -822,10 +811,15 @@ where
             .fold(E::ZERO, |acc, (eval, chal)| acc + *eval * chal.elements);
 
         // verify batched sumcheck
+        // number of variables in the sum-check is equal to the number of variables corresponding to
+        // the columns of input matrix
+        let num_vars = padded_input_shape.num_vars()[1];
+
+        let vp_aux = from_mle_list_dimensions(&vec![vec![num_vars, num_vars]; 3]);
         let subclaim = IOPVerifierState::<E>::verify(
             batched_evals,
             &proof.sumcheck,
-            &self.sumcheck_poly_aux,
+            &vp_aux,
             verifier.transcript,
         );
 

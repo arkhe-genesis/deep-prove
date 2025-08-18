@@ -6,6 +6,7 @@ use crate::{
     padding::{PaddingMode, ShapeInfo, pad_conv},
     quantization::{BIT_LEN, TensorFielder},
     tensor::Shape,
+    util::from_mle_list_dimensions,
 };
 use core::f32;
 use std::collections::HashMap;
@@ -65,15 +66,8 @@ pub struct Convolution<T> {
 
 /// Info about the convolution layer derived during the setup phase
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ConvCtx<E> {
+pub struct ConvCtx {
     pub node_id: NodeId,
-    pub fft_aux: VPAuxInfo<E>,
-    pub fft_weights_aux: VPAuxInfo<E>,
-    pub ifft_aux: VPAuxInfo<E>,
-    pub delegation_fft: Vec<VPAuxInfo<E>>,
-    pub delegation_fft_weights: Vec<VPAuxInfo<E>>,
-    pub delegation_ifft: Vec<VPAuxInfo<E>>,
-    pub hadamard: VPAuxInfo<E>,
     pub kw: usize,
     pub kx: usize,
     pub real_nw: usize,
@@ -483,61 +477,16 @@ pub struct BatchFFTWeightsProof<E: ExtensionField> {
 const FILTER_POLY_ID: &str = "ConvFilter";
 const BIAS_POLY_ID: &str = "ConvBias";
 
-impl<E> ProveInfo<E> for Convolution<Element>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Convolution<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         let mut filter_shape = self.filter.shape();
         filter_shape.remove(1);
         aux.last_output_shape
             .iter_mut()
             .for_each(|shape| *shape = filter_shape.clone());
 
-        let mut delegation_fft: Vec<VPAuxInfo<E>> = Vec::new();
-        let mut delegation_fft_weights: Vec<VPAuxInfo<E>> = Vec::new();
-        let mut delegation_ifft: Vec<VPAuxInfo<E>> = Vec::new();
-        for i in (0..(self.filter_size().ilog2() as usize)).rev() {
-            delegation_fft.push(crate::util::from_mle_list_dimensions(&[vec![
-                i + 1,
-                i + 1,
-                i + 1,
-            ]]));
-            delegation_fft_weights.push(crate::util::from_mle_list_dimensions(&[vec![
-                i + 1,
-                i + 1,
-                i + 1,
-            ]]));
-            delegation_ifft.push(crate::util::from_mle_list_dimensions(&[vec![
-                i + 1,
-                i + 1,
-                i + 1,
-            ]]));
-        }
-
         let conv_info = LayerCtx::Convolution(ConvCtx {
             node_id: id,
-            ifft_aux: crate::util::from_mle_list_dimensions(&[vec![
-                ((self.filter_size()).ilog2() as usize) + 1,
-                ((self.filter_size()).ilog2() as usize) + 1,
-            ]]),
-            fft_aux: crate::util::from_mle_list_dimensions(&[vec![
-                ((self.filter_size()).ilog2() as usize) + 1,
-                ((self.filter_size()).ilog2() as usize) + 1,
-            ]]),
-            fft_weights_aux: crate::util::from_mle_list_dimensions(&[vec![
-                ((self.filter_size()).ilog2() as usize) + 1,
-                ((self.filter_size()).ilog2() as usize) + 1,
-            ]]),
-            hadamard: crate::util::from_mle_list_dimensions(&[vec![
-                ((self.kx() * self.filter_size()).ilog2() as usize) + 1,
-                ((self.kx() * self.filter_size()).ilog2() as usize) + 1,
-                ((self.kx() * self.filter_size()).ilog2() as usize) + 1,
-            ]]),
-            delegation_fft,
-            delegation_fft_weights,
-            delegation_ifft,
             kw: self.kw(),
             kx: self.kx(),
             nw: self.filter.nw(),
@@ -630,12 +579,12 @@ where
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    type Ctx = ConvCtx<E>;
+    type Ctx = ConvCtx;
 
     fn prove<T: Transcript<E>>(
         &self,
         id: NodeId,
-        ctx: &Self::Ctx,
+        _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
@@ -649,17 +598,12 @@ where
             &output_tensor,
             &step_data.unpadded_output_shapes[0],
             step_data.node_outputs.try_convdata().unwrap(),
-            ctx,
             id,
         )?])
     }
 }
 
-impl<E: ExtensionField> OpInfo for ConvCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl OpInfo for ConvCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes
             .iter()
@@ -683,7 +627,7 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for ConvCtx<E>
+impl<E, PCS> VerifiableCtx<E, PCS> for ConvCtx
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
@@ -724,7 +668,6 @@ impl Convolution<Element> {
         output: &Tensor<E>,
         unpadded_output_shape: &Shape,
         proving_data: &ConvData<E>,
-        info: &ConvCtx<E>,
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
@@ -832,11 +775,16 @@ impl Convolution<Element> {
             ifft_proof_point.len(),
             "Error in ifft sumceck"
         );
+
         debug_assert!({
+            let fft_aux = from_mle_list_dimensions(&[vec![
+                (self.filter_size().ilog2() as usize) + 1,
+                (self.filter_size().ilog2() as usize) + 1,
+            ]]);
             IOPVerifierState::<E>::verify(
                 last_claim.eval - bias_eval,
                 &ifft_proof.clone(),
-                &info.ifft_aux.clone(),
+                &fft_aux,
                 &mut temp_t,
             );
             info!("iFFT Sumcheck Correct");
@@ -1109,25 +1057,27 @@ impl Convolution<Element> {
     }
 }
 
-impl<E> ConvCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
-{
+impl ConvCtx {
     pub fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
         match padding_mode {
             PaddingMode::NoPadding => conv2d_shape(input_shape, &self.unpadded_filter_shape),
             PaddingMode::Padding => padded_conv2d_shape(input_shape, &self.padded_filter_shape),
         }
     }
+
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn verify_fft_delegation<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn verify_fft_delegation<
+        E: ExtensionField,
+        T: Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E>,
+    >(
         &self,
         verifier: &mut Verifier<E, T, PCS>,
         mut claim: E,
         proof: &ConvProof<E>,
         delegation_proof: &[IOPProof<E>],
         delegation_claims: &[Vec<E>],
+        delegation_poly_aux: &[VPAuxInfo<E>],
         delegation_points: &[Vec<E>],
         mut prev_r: Vec<E>,
     ) {
@@ -1138,7 +1088,7 @@ where
             IOPVerifierState::<E>::verify(
                 claim,
                 &delegation_proof[i],
-                &self.delegation_fft[i],
+                &delegation_poly_aux[i],
                 verifier.transcript,
             );
 
@@ -1171,7 +1121,11 @@ where
         );
     }
 
-    pub(crate) fn verify_convolution<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn verify_convolution<
+        E: ExtensionField,
+        T: Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E>,
+    >(
         &self,
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
@@ -1218,27 +1172,37 @@ where
 
         let conv_claim = last_claim.eval - proof.bias_claim;
 
-        IOPVerifierState::<E>::verify(
-            conv_claim,
-            &proof.ifft_proof,
-            &self.ifft_aux,
-            verifier.transcript,
-        );
+        let mut delegation_fft_aux = Vec::new();
+        for i in (0..(self.filter_size.ilog2() as usize)).rev() {
+            delegation_fft_aux.push(from_mle_list_dimensions(&[vec![i + 1, i + 1, i + 1]]));
+        }
         assert_eq!(
-            self.delegation_ifft.len(),
+            delegation_fft_aux.len(),
             proof.ifft_delegation_proof.len(),
             "Inconsistency in iFFT delegation proofs/aux size"
         );
+
+        let fft_aux = from_mle_list_dimensions(&[vec![
+            (self.filter_size.ilog2() as usize) + 1,
+            (self.filter_size.ilog2() as usize) + 1,
+        ]]);
+        let hadamard_aux = from_mle_list_dimensions(&[vec![
+            ((self.kx * self.filter_size).ilog2() as usize) + 1,
+            ((self.kx * self.filter_size).ilog2() as usize) + 1,
+            ((self.kx * self.filter_size).ilog2() as usize) + 1,
+        ]]);
+
+        IOPVerifierState::<E>::verify(conv_claim, &proof.ifft_proof, &fft_aux, verifier.transcript);
 
         let iter = proof.ifft_delegation_proof.len();
         let mut claim = proof.ifft_claims[1];
         let exponents = pow_two_omegas(iter + 1, true);
         let mut prev_r = proof.ifft_point.clone();
-        for i in 0..iter {
+        for (i, ifft_proof) in proof.ifft_delegation_proof.iter().enumerate() {
             IOPVerifierState::<E>::verify(
                 claim,
-                &proof.ifft_delegation_proof[i],
-                &self.delegation_ifft[i],
+                ifft_proof,
+                &delegation_fft_aux[i],
                 verifier.transcript,
             );
             assert_eq!(
@@ -1275,7 +1239,7 @@ where
         IOPVerifierState::<E>::verify(
             proof.ifft_claims[0],
             &proof.hadamard_proof,
-            &self.hadamard,
+            &hadamard_aux,
             verifier.transcript,
         );
         assert_eq!(
@@ -1289,13 +1253,13 @@ where
         IOPVerifierState::<E>::verify(
             proof.hadamard_clams[1],
             &proof.fft_proof,
-            &self.fft_aux,
+            &fft_aux,
             verifier.transcript,
         );
         claim = proof.fft_claims[1];
 
         assert_eq!(
-            self.delegation_fft.len(),
+            delegation_fft_aux.len(),
             proof.fft_delegation_proof.len(),
             "Inconsistency in FFT delegation proofs/aux size"
         );
@@ -1306,6 +1270,7 @@ where
             proof,
             &proof.fft_delegation_proof,
             &proof.fft_delegation_claims,
+            &delegation_fft_aux,
             &proof.fft_delegation_points,
             proof.fft_point.clone(),
         );
@@ -1313,7 +1278,7 @@ where
         IOPVerifierState::<E>::verify(
             proof.hadamard_clams[0],
             &proof.fft_proof_weights,
-            &self.fft_weights_aux,
+            &fft_aux,
             verifier.transcript,
         );
         claim = proof.fft_weight_claims[1];
@@ -1323,6 +1288,7 @@ where
             proof,
             &proof.fft_delegation_proof_weights,
             &proof.fft_delegation_weights_claims,
+            &delegation_fft_aux,
             &proof.fft_delegation_weights_points,
             proof.fft_weight_point.clone(),
         );
@@ -1469,12 +1435,8 @@ impl QuantizeOp for SchoolBookConv<f32> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchoolBookConvCtx;
 
-impl<E: ExtensionField> ProveInfo<E> for SchoolBookConv<Element>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
-{
-    fn step_info(&self, _id: NodeId, aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for SchoolBookConv<Element> {
+    fn step_info(&self, _id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         let conv_info = LayerCtx::SchoolBookConvolution(SchoolBookConvCtx);
         Ok((conv_info, aux))
     }

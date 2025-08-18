@@ -11,27 +11,12 @@ use crate::{
 };
 use anyhow::{Ok, anyhow, ensure};
 use ff_ext::ExtensionField;
-use mpcs::{BasefoldCommitment, PolynomialCommitmentScheme};
+use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{debug, trace};
 use transcript::Transcript;
-
-/// Info related to the lookup protocol tables.
-/// Here `poly_id` is the multiplicity poly for this table.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct TableCtx<E>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    pub num_vars: usize,
-    pub table_commitment: BasefoldCommitment<E>,
-}
-
-pub const RESHAPE_FS_ID: u64 = 0xdeadbeef;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
@@ -43,7 +28,7 @@ where
     /// Information about each steps of the model. That's the information that the verifier
     /// needs to know from the setup to avoid the prover being able to cheat.
     /// in REVERSED order already since proving goes from last layer to first layer.
-    pub steps_info: ModelCtx<E>,
+    pub steps_info: ModelCtx,
     /// The commitment context used to generate both model commitments and witness commitments
     pub commitment_ctx: CommitmentProverCtx<'a, E, PCS>,
     /// Context holding all the different table types we use in lookups
@@ -73,7 +58,7 @@ where
     /// Information about each steps of the model. That's the information that the verifier
     /// needs to know from the setup to avoid the prover being able to cheat.
     /// in REVERSED order already since proving goes from last layer to first layer.
-    pub steps_info: ModelCtx<E>,
+    pub steps_info: ModelCtx,
     /// The commitment context used to generate both model commitments and witness commitments
     pub commitment_ctx: CommitmentVerifierCtx<E, PCS>,
     /// Context holding all the different table types we use in lookups
@@ -95,7 +80,7 @@ where
 
 pub struct ContextIterator<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     commitment_ctx: ContextGenerator<'a, E, PCS>,
-    steps_info: ModelCtx<E>,
+    steps_info: ModelCtx,
     lookup: LookupContext,
     unpadded_input_shapes: Vec<Shape>,
 }
@@ -132,7 +117,7 @@ impl Model<Element> {
     /// Helper method employed to build the context data which is independent from the input shape.
     fn build_global_context_data<'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
-    ) -> anyhow::Result<(ModelCtx<E>, GlobalCommitmentCtx<'b, E, PCS>, LookupContext)> {
+    ) -> anyhow::Result<(ModelCtx, GlobalCommitmentCtx<'b, E, PCS>, LookupContext)> {
         let input_shapes = &self.input_shapes;
         let tables = BTreeSet::new();
         let mut max_poly_len = input_shapes
@@ -184,10 +169,7 @@ impl Model<Element> {
     }
 
     /// Compute the size of the biggest polynomial to be commited for the given `input_shape`
-    pub(crate) fn compute_max_poly_size<E: ExtensionField>(
-        &self,
-        input_shapes: &[Shape],
-    ) -> anyhow::Result<usize> {
+    pub(crate) fn compute_max_poly_size(&self, input_shapes: &[Shape]) -> anyhow::Result<usize> {
         let mut max_poly_len = input_shapes
             .iter()
             .fold(0usize, |acc, shapes| acc.max(shapes.product()));
@@ -202,7 +184,7 @@ impl Model<Element> {
         for (id, node) in self.to_forward_iterator() {
             let node_input_shapes = compute_node_input_shapes(input_shapes, &shapes, id, node)?;
             ctx_aux.last_output_shape = node_input_shapes;
-            let (_, new_aux) = node.step_info::<E>(id, ctx_aux)?;
+            let (_, new_aux) = node.step_info(id, ctx_aux)?;
             shapes.insert(id, new_aux.last_output_shape.clone());
             max_poly_len = max_poly_len.max(new_aux.max_poly_len);
             ctx_aux = new_aux;
@@ -252,7 +234,7 @@ impl Model<Element> {
         debug!("Built global context");
         let max_poly_sizes = input_shapes
             .into_iter()
-            .map(|shapes| self.compute_max_poly_size::<E>(&shapes))
+            .map(|shapes| self.compute_max_poly_size(&shapes))
             .collect::<anyhow::Result<Vec<_>>>()?;
         debug!("Building all contexts");
         let commitment_ctx_iter = commitment_ctx.generate_all_contexts(max_poly_sizes)?;
@@ -355,7 +337,7 @@ fn compute_node_input_shapes(
 fn compute_node_shape<E: ExtensionField>(
     mut ctx_aux: ContextAux,
     model_polys: &mut Vec<(NodeId, HashMap<PolyId, MultilinearExtension<E>>)>,
-    step_infos: &mut BTreeMap<NodeId, NodeCtx<E>>,
+    step_infos: &mut BTreeMap<NodeId, NodeCtx>,
     shapes: &mut HashMap<NodeId, Vec<Shape>>,
     input_shapes: &[Shape],
     id: NodeId,

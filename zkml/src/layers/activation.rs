@@ -56,7 +56,6 @@ pub enum Activation<N> {
 pub struct ActivationCtx {
     pub op: Activation<Element>,
     pub node_id: NodeId,
-    pub num_vars: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -156,12 +155,8 @@ impl Evaluate<Element> for Activation<Element> {
     }
 }
 
-impl<E> ProveInfo<E> for Activation<Element>
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Activation<Element> {
+    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         match self {
             Activation::Relu(_) => aux.tables.insert(TableType::Relu),
             // TODO: if we want to save on memory, we can use a pointer to the vector instead
@@ -170,23 +165,6 @@ where
                 .insert(TableType::GELU(gelu.quant_data.clone().unwrap())),
         };
 
-        // `try_fold` would not allow returning of `Err` values from here and would short-circuit
-        // instead of looping over all values in the iterator
-        #[allow(clippy::manual_try_fold)]
-        let num_vars = aux
-            .last_output_shape
-            .iter_mut()
-            .fold(Ok(None), |expected_num_vars, shape| {
-                let num_vars = shape.iter().map(|dim| ceil_log2(*dim)).sum::<usize>();
-                if let Some(vars) = expected_num_vars? {
-                    ensure!(
-                        vars == num_vars,
-                        "All input shapes for activation must have the same number of variables"
-                    );
-                }
-                Ok(Some(num_vars))
-            })?
-            .expect("No input shape found for activation layer?");
         // Set the model polys to be empty
         aux.model_polys = None;
         aux.max_poly_len = aux
@@ -203,7 +181,6 @@ where
             LayerCtx::Activation(ActivationCtx {
                 op: act,
                 node_id: id,
-                num_vars,
             }),
             aux,
         ))
@@ -360,7 +337,7 @@ where
         proof: &Self::Proof,
         last_claims: &[&Claim<E>],
         verifier: &mut Verifier<E, T, PCS>,
-        _shape_step: &ShapeStep,
+        shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         let table_type = match &self.op {
             Activation::Relu(_) => TableType::Relu,
@@ -379,6 +356,7 @@ where
             proof,
             constant_challenge,
             column_separation_challenge,
+            shape_step,
         )?])
     }
 }
@@ -471,6 +449,7 @@ impl ActivationCtx {
         proof: &ActivationProof<E, PCS>,
         constant_challenge: E,
         column_separation_challenge: E,
+        shape_step: &ShapeStep,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,
@@ -486,7 +465,21 @@ impl ActivationCtx {
         )?;
 
         // 2. Verify the accumulation proof from last_claim + lookup claim into the new claim
-        let sp_ctx = same_poly::Context::<E>::new(self.num_vars);
+        let num_vars = shape_step
+            .padded_input_shape
+            .iter()
+            .try_fold(None, |expected_num_vars, shape| {
+                let num_vars = shape.iter().map(|dim| ceil_log2(*dim)).sum::<usize>();
+                if let Some(vars) = expected_num_vars {
+                    ensure!(
+                        vars == num_vars,
+                        "All input shapes for activation must have the same number of variables"
+                    );
+                }
+                Ok(Some(num_vars))
+            })?
+            .expect("No input shape found for activation layer?");
+        let sp_ctx = same_poly::Context::<E>::new(num_vars);
         let mut sp_verifier = same_poly::Verifier::<E>::new(&sp_ctx);
         sp_verifier.add_claim(last_claim.clone())?;
         verifier_claims.claims()[1..]

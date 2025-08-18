@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
 use ff_ext::ExtensionField;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Tensor,
@@ -54,12 +54,8 @@ impl<N: Number> Evaluate<N> for Flatten {
     }
 }
 
-impl<E> ProveInfo<E> for Flatten
-where
-    E: ExtensionField + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-{
-    fn step_info(&self, _id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Flatten {
+    fn step_info(&self, _id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
         aux.last_output_shape
             .iter_mut()
             .for_each(|s| *s = s.next_power_of_two());

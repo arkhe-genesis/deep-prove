@@ -52,12 +52,12 @@ pub struct MhaData<E: ExtensionField> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MhaCtx<E> {
+pub struct MhaCtx {
     node_id: NodeId,
     inputs_reshape: ReshapeCtx,
-    final_mul: ConcatMatMulCtx<E>,
+    final_mul: ConcatMatMulCtx,
     softmax: SoftmaxCtx,
-    qk: ConcatMatMulCtx<E>,
+    qk: ConcatMatMulCtx,
     final_reshape: ReshapeCtx,
 }
 
@@ -81,8 +81,8 @@ impl<'a, N: Number> From<&'a Mha<N>> for MhaOutputShaper<'a> {
     }
 }
 
-impl<'a, E: ExtensionField> From<&'a MhaCtx<E>> for MhaOutputShaper<'a> {
-    fn from(value: &'a MhaCtx<E>) -> Self {
+impl<'a> From<&'a MhaCtx> for MhaOutputShaper<'a> {
+    fn from(value: &'a MhaCtx) -> Self {
         Self {
             inputs_reshape: &value.inputs_reshape,
             final_mul: &value.final_mul,
@@ -431,14 +431,14 @@ impl QuantizeOp for Mha<f32> {
     }
 }
 
-impl<E: ExtensionField> ProveInfo<E> for Mha<Element> {
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Mha<Element> {
+    fn step_info(&self, id: NodeId, aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
         let (ctx, mut reshaped_aux) = self.inputs_reshape.step_info(
             id, // No need to have an ad-hoc id
             aux,
         )?;
 
-        let LayerCtx::<E>::Reshape(inputs_reshape_ctx) = ctx else {
+        let LayerCtx::Reshape(inputs_reshape_ctx) = ctx else {
             unreachable!()
         };
 
@@ -466,7 +466,7 @@ impl<E: ExtensionField> ProveInfo<E> for Mha<Element> {
 
         let (ctx, mut aux) = self.softmax.step_info(Self::softmax_node_id(id), aux)?;
 
-        let LayerCtx::<E>::Softmax(softmax_ctx) = ctx else {
+        let LayerCtx::Softmax(softmax_ctx) = ctx else {
             unreachable!()
         };
 
@@ -489,7 +489,7 @@ impl<E: ExtensionField> ProveInfo<E> for Mha<Element> {
             aux,
         )?;
 
-        let LayerCtx::<E>::Reshape(final_reshape_ctx) = ctx else {
+        let LayerCtx::Reshape(final_reshape_ctx) = ctx else {
             unreachable!()
         };
 
@@ -635,7 +635,7 @@ impl PadOp for Mha<Element> {
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Mha<Element> {
-    type Ctx = MhaCtx<E>;
+    type Ctx = MhaCtx;
 
     fn prove<T: Transcript<E>>(
         &self,
@@ -751,7 +751,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
     }
 }
 
-impl<E: ExtensionField> OpInfo for MhaCtx<E> {
+impl OpInfo for MhaCtx {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         MhaOutputShaper::from(self).output_shapes(input_shapes, padding_mode)
     }
@@ -775,7 +775,7 @@ impl<E: ExtensionField> OpInfo for MhaCtx<E> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for MhaCtx<E> {
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for MhaCtx {
     type Proof = MhaProof<E, PCS>;
 
     fn verify<T: transcript::Transcript<E>>(
@@ -798,7 +798,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             shape_step.padded_input_shape.len()
         );
 
-        let reshaped_inputs = LayerCtx::<E>::Reshape(self.inputs_reshape.clone()).shape_step(
+        let reshaped_inputs = LayerCtx::Reshape(self.inputs_reshape.clone()).shape_step(
             &shape_step.unpadded_input_shape,
             &shape_step.padded_input_shape,
         );
@@ -808,7 +808,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             &reshaped_inputs.padded_output_shape[..2],
         );
 
-        let softmax_shapes = LayerCtx::<E>::Softmax(self.softmax.clone()).shape_step(
+        let softmax_shapes = LayerCtx::Softmax(self.softmax.clone()).shape_step(
             &qk_shapes.unpadded_output_shape,
             &qk_shapes.padded_output_shape,
         );

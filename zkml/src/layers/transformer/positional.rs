@@ -281,15 +281,15 @@ impl<N: Number> OpInfo for Positional<N> {
 
 const POSITIONAL_POLY_ID: &str = "PositionalMatrix";
 
-impl<E: ExtensionField> ProveInfo<E> for Positional<Element> {
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+impl ProveInfo for Positional<Element> {
+    fn step_info(&self, id: NodeId, aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
         let Self::Learned(pos) = self else {
             unimplemented!("ProveInfo not implemented for Positional::Rope")
         };
 
         let (ctx, mut aux) = pos.add_layer.step_info(id, aux)?;
 
-        let LayerCtx::<E>::Add(add_ctx) = ctx else {
+        let LayerCtx::Add(add_ctx) = ctx else {
             unreachable!()
         };
 
@@ -578,7 +578,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             // compute shape step for add sub-layer
             let unpadded_input_shapes = vec![shape_step.unpadded_input_shape[i].clone(); 2];
             let padded_input_shapes = vec![shape_step.padded_input_shape[i].clone(); 2];
-            let shape_step = LayerCtx::<E>::Add(self.add_ctx.clone())
+            let shape_step = LayerCtx::Add(self.add_ctx.clone())
                 .shape_step(&unpadded_input_shapes, &padded_input_shapes);
 
             let mut claims =
