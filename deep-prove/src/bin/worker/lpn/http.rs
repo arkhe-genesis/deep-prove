@@ -1,6 +1,6 @@
 use super::instantiate_store;
 use crate::{RunMode, StoreKind};
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use deep_prove::middleware::v2;
 use exponential_backoff::Backoff;
@@ -195,7 +195,11 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     let worker_name = worker_name
         .ok_or(anyhow!("no worker name set"))
         .or_else(|_| machine_uid::get())
-        .map_err(|_| anyhow!("failed to build a unique worker name"))?;
+        .map_err(|_| anyhow!("failed to generate a unique worker name"))?;
+    ensure!(
+        !worker_name.is_empty(),
+        "failed to generate a non-empty worker name"
+    );
     info!("gateway URL: {gw_url}");
     info!("operator address: {address}");
     info!("worker unique name: {worker_name}");
