@@ -224,8 +224,8 @@ impl Evaluate<f32> for Embeddings<f32> {
         let emb = &w.tensor;
         let emb_size = emb.shape()[1];
 
-        let weights = emb.clone().into_btensor_2d();
-        let indices = input.clone().into_btensor_1d().int();
+        let weights = emb.clone().into_btensor::<2>();
+        let indices = input.clone().into_btensor::<1>().int();
 
         let res = Backend::float_select(
             weights.into_primitive().tensor(),
@@ -266,8 +266,8 @@ impl Evaluate<Element> for Embeddings<Element> {
         let emb = &w.tensor;
         let emb_size = emb.shape()[1];
 
-        let weights = emb.clone().into_btensor_2d();
-        let indices = input.clone().into_btensor_1d();
+        let weights = emb.clone().into_btensor::<2>();
+        let indices = input.clone().into_btensor::<1>();
 
         let res = Backend::int_select(weights.into_primitive(), 0, indices.into_primitive());
 

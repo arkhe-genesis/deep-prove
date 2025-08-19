@@ -5,7 +5,7 @@ use ff_ext::GoldilocksExt2;
 use zkml::{
     Element, ScalingFactor, Tensor,
     layers::{
-        activation::GELU, add::Add, dense::Dense, provable::Evaluate,
+        activation::GELU, add::Add, convolution::Convolution, dense::Dense, provable::Evaluate,
         transformer::embeddings::Embeddings,
     },
     tensor::{Number, Shape},
@@ -95,6 +95,32 @@ fn dense_layer(c: &mut Criterion) {
             },
         );
     }
+}
+
+fn convolution_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    let batches = 1;
+    let channels = 3;
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+        let input = Tensor::<f32>::random(&Shape::new(vec![batches, channels, size, size]));
+        let kernels = Tensor::<f32>::random(&Shape::new(vec![batches, channels, 3, 3]));
+        let bias = Tensor::<f32>::random(&Shape::new(vec![batches]));
+
+        let dense = Convolution::<f32>::new(kernels.clone(), bias.clone());
+
+        group.bench_with_input(
+            BenchmarkId::new("convolution/f32", format!("{size}x{size}")),
+            &input,
+            |b, input| {
+                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], &[]));
+            },
+        );
+    }
 
     group.finish();
 }
@@ -167,6 +193,7 @@ criterion_group!(
     benches,
     add_layer,
     dense_layer,
+    convolution_layer,
     embeddings_layer,
     gelu_layer
 );

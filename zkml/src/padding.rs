@@ -208,46 +208,53 @@ pub(crate) fn pooling(p: Pooling, si: &mut ShapeInfo) -> Result<Pooling> {
 }
 
 pub(crate) fn pad_conv(
-    c: Convolution<Element>,
-    si: &mut ShapeInfo,
+    convolution: Convolution<Element>,
+    shape_info: &mut ShapeInfo,
 ) -> Result<Convolution<Element>> {
     // convolution layer currently expects 1 input, so we check there is only 1 input shape
     ensure!(
-        si.shapes.len() == 1,
+        shape_info.shapes.len() == 1,
         "More than 1 input shape found when padding convolution layer"
     );
-    let sd = si.shapes.first_mut().unwrap();
-    sd.input_shape_og = safe_conv2d_shape(&sd.input_shape_og, &c.filter.shape())?;
-    let weight_shape = c.filter.shape();
+    let shape_data = shape_info.shapes.first_mut().unwrap();
+    shape_data.input_shape_og =
+        safe_conv2d_shape(&shape_data.input_shape_og, &convolution.filter().shape())?;
+    let weight_shape = convolution.filter().shape();
+
     // Perform basic sanity checks on the tensor dimensions
     check_filter(&weight_shape).context("filter shape test failed:")?;
     ensure!(
-        weight_shape[0] == c.bias.shape()[0],
-        "Bias length doesn't match filter shape"
+        weight_shape[0] == convolution.bias().shape()[0],
+        "Bias length doesn't match filter shape",
     );
+
     // Make sure that input shape is already padded and is well formed
     ensure!(
-        sd.input_shape_padded.is_power_of_two(),
+        shape_data.input_shape_padded.is_power_of_two(),
         "Input shape for convolution is not padded",
     );
     ensure!(
-        sd.input_shape_padded.rank() == 3,
-        "Input shape for convolution is not 3D"
+        shape_data.input_shape_padded.rank() == 3,
+        "Input shape for convolution is not 3D",
     );
-    let new_conv_good = c.clone();
+    let new_conv_good = convolution.clone();
+
     // Since we are doing an FFT based conv, we need to pad the last two dimensions of the filter to match the input.
-    let weight_shape = c.filter.pad_next_power_of_two().shape();
+    let weight_shape = convolution.filter().pad_next_power_of_two().shape();
     let (filter_height, filter_width) = (weight_shape[2], weight_shape[3]);
-    let (input_height, input_width) = (sd.input_shape_padded.dim(1), sd.input_shape_padded.dim(2));
+    let (input_height, input_width) = (
+        shape_data.input_shape_padded.dim(1),
+        shape_data.input_shape_padded.dim(2),
+    );
 
     ensure!(
         filter_height <= input_height && filter_width <= input_width,
         "Filter dimensions in convolution have to be smaller than input dimensions",
     );
 
-    let new_conv = new_conv_good.into_padded_and_ffted(&sd.input_shape_og);
-    let output_shape: Shape = safe_conv2d_shape(&sd.input_shape_padded, &weight_shape)?;
-    sd.input_shape_padded = output_shape.next_power_of_two();
+    let new_conv = new_conv_good.into_padded_and_ffted(&shape_data.input_shape_og);
+    let output_shape: Shape = safe_conv2d_shape(&shape_data.input_shape_padded, &weight_shape)?;
+    shape_data.input_shape_padded = output_shape.next_power_of_two();
     Ok(new_conv)
 }
 

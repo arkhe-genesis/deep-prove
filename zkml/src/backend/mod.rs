@@ -18,6 +18,7 @@ pub type Backend = burn::backend::NdArray<f32, Element>;
 pub type Backend = burn::backend::Wgpu<f32, Element>;
 
 pub(crate) trait ZKMLBackend: burn::tensor::backend::Backend {
+    /// Custom GeLU implementation
     fn zkml_gelu(tensor: FloatTensor<Self>) -> FloatTensor<Self> {
         // compute: tensor * tensor * tensor
         let c0 = Self::IntElem::from_elem(3);

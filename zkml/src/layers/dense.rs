@@ -174,9 +174,9 @@ impl Evaluate<Element> for Dense<Element> {
             "Found more than 1 input when evaluating dense layer"
         );
 
-        let matrix = self.matrix.clone().into_btensor_2d();
-        let input = inputs[0].flatten().into_btensor_1d();
-        let bias = self.bias.flatten().into_btensor_1d();
+        let matrix = self.matrix.clone().into_btensor::<2>();
+        let input = inputs[0].flatten().into_btensor::<1>();
+        let bias = self.bias.flatten().into_btensor::<1>();
 
         // NOTE: Can not use the [burn::tensor::module::linear] because it
         // is defined only for floats
@@ -204,9 +204,9 @@ impl Evaluate<f32> for Dense<f32> {
         );
         let input = inputs[0];
 
-        let matrix = self.matrix.clone().into_btensor_2d();
-        let input = input.flatten().into_btensor_1d();
-        let bias = self.bias.flatten().into_btensor_1d();
+        let matrix = self.matrix.clone().into_btensor::<2>();
+        let input = input.flatten().into_btensor::<1>();
+        let bias = self.bias.flatten().into_btensor::<1>();
         let res = linear(input, matrix.transpose(), Some(bias));
 
         let data = res.to_data().into_vec().expect("Failed to compute Dense");

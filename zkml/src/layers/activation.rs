@@ -630,7 +630,7 @@ impl Evaluate<f32> for GELU<f32> {
                 let shape = tensor.shape();
                 let mut tensor = (*tensor).clone();
                 tensor.to_1d();
-                let tensor = tensor.into_btensor_1d();
+                let tensor = tensor.into_btensor::<1>();
 
                 let result = zkml_gelu(tensor);
 
@@ -796,7 +796,7 @@ mod test {
             let shape = Shape::new(vec![size]);
             let tensor = Tensor::<f32>::random(&shape);
 
-            let btensor = tensor.clone().into_btensor_1d();
+            let btensor = tensor.clone().into_btensor::<1>();
             let data = zkml_gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
             let resultb = Tensor::<f32>::new(shape.clone(), data);
 
@@ -804,12 +804,13 @@ mod test {
             let data = data.iter().map(gelu_float).collect::<Vec<_>>();
             let result = Tensor::new(shape, data);
 
-            resultb.get_data().iter().zip(result.get_data().iter()).for_each(|(left, right)| {
-                assert!(
+            resultb.get_data().iter().zip(result.get_data().iter()).try_for_each(|(left, right)| {
+                prop_assert!(
                     (left - right).abs() < 1e-3,
                     "Actual: {left}, Expected: {right}",
                 );
-            });
+                Ok(())
+            })?;
         }
     }
 }

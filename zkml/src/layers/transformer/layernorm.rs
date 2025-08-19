@@ -367,9 +367,9 @@ impl Evaluate<f32> for LayerNorm<f32> {
         // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
         // instead of re-implementing everything ourselves.
         // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/layer.rs.html#67
-        let input = input.clone().into_btensor_2d();
-        let gamma = self.gamma.clone().into_btensor_1d();
-        let beta = self.beta.clone().into_btensor_1d();
+        let input = input.clone().into_btensor::<2>();
+        let gamma = self.gamma.clone().into_btensor::<1>();
+        let beta = self.beta.clone().into_btensor::<1>();
         let config = BLayerNormConfig::new(embedding_size).with_epsilon(self.eps as f64);
         let mut norm = config.init(&device);
         norm.gamma = Param::from_tensor(gamma);

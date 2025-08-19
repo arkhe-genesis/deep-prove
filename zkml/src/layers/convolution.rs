@@ -1,7 +1,7 @@
 use crate::{
     ScalingStrategy, VectorTranscript,
     iop::{context::ShapeStep, prover::BatchFFTProof},
-    layers::{hadamard, requant::Requant},
+    layers::{hadamard, provable::ProvingData, requant::Requant},
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_conv},
     quantization::{BIT_LEN, TensorFielder},
@@ -15,11 +15,12 @@ use crate::{
     Claim, Prover,
     commit::{compute_betas_eval, identity_eval},
     iop::{context::ContextAux, verifier::Verifier},
-    layers::{LayerProof, provable::ProvingData},
+    layers::LayerProof,
     quantization::{self, ScalingFactor},
     tensor::{ConvData, Number, get_root_of_unity},
 };
 use anyhow::{Context, Result, ensure};
+use burn::tensor::{module::conv2d, ops::ConvOptions};
 use either::Either;
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
@@ -57,11 +58,11 @@ const IS_PROVABLE: bool = true;
 pub struct Convolution<T> {
     /// NOTE: in the case of f32, the weights are native
     /// In the case of Element (i128), the weights are already fft'd
-    pub filter: Tensor<T>,
+    filter: Tensor<T>,
     /// Same for bias.
-    pub bias: Tensor<T>,
+    bias: Tensor<T>,
     /// Unpadded shape of the filter. This is set to filter's shape in case of no padding.
-    pub unpadded_shape: Shape,
+    unpadded_shape: Shape,
 }
 
 /// Info about the convolution layer derived during the setup phase
@@ -125,33 +126,59 @@ pub struct ConvProof<E: ExtensionField> {
     clearing_proof: hadamard::HadamardProof<E>,
 }
 
-impl<T: Number> Convolution<T> {
+impl<T> Convolution<T> {
     pub fn new(filter: Tensor<T>, bias: Tensor<T>) -> Self {
+        assert_eq!(bias.rank(), 1);
         assert_eq!(filter.kw(), bias.shape()[0]);
         assert_eq!(filter.rank(), 4);
         let filter_shape = filter.shape();
-        Self::new_padded(filter, bias, &filter_shape)
-    }
-
-    pub(crate) fn new_without_bias(filter: Tensor<T>) -> Self {
-        let bias = Tensor::zeros(Shape::new(vec![filter.kw()]));
-        Self::new(filter, bias)
-    }
-
-    pub fn new_padded(filter: Tensor<T>, bias: Tensor<T>, unpadded_shape: &Shape) -> Self {
-        assert_eq!(filter.kw(), bias.shape()[0]);
         Self {
             filter,
             bias,
-            unpadded_shape: unpadded_shape.clone(),
+            unpadded_shape: filter_shape,
         }
     }
-    pub fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
+
+    pub(crate) fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
         match padding_mode {
             // unpadded shape is the shape found in onxx file for example
             PaddingMode::NoPadding => conv2d_shape(input_shape, &self.unpadded_shape),
             PaddingMode::Padding => padded_conv2d_shape(input_shape, &self.filter.real_shape()),
         }
+    }
+
+    /// Returns a reference to the filter data.
+    pub(crate) fn filter(&self) -> &Tensor<T> {
+        &self.filter
+    }
+
+    /// Returns a reference to the bias data.
+    pub(crate) fn bias(&self) -> &Tensor<T> {
+        &self.bias
+    }
+
+    pub(crate) fn kw(&self) -> usize {
+        self.filter.kw()
+    }
+
+    pub(crate) fn kx(&self) -> usize {
+        self.filter.kx()
+    }
+
+    pub(crate) fn filter_size(&self) -> usize {
+        self.filter.filter_size()
+    }
+
+    fn num_outputs(num_inputs: usize) -> usize {
+        assert_eq!(num_inputs, 1);
+        1
+    }
+}
+
+impl<T: Number> Convolution<T> {
+    pub(crate) fn new_without_bias(filter: Tensor<T>) -> Self {
+        let bias = Tensor::zeros(Shape::new(vec![filter.kw()]));
+        Self::new(filter, bias)
     }
 
     pub fn add_bias(&self, conv_out: &Tensor<T>) -> Tensor<T> {
@@ -164,52 +191,6 @@ impl<T: Number> Convolution<T> {
             }
         }
         arr
-    }
-
-    /// Retrieves an element using (N, C, H, W) indexing
-    pub fn get(&self, n: usize, c: usize, h: usize, w: usize) -> T {
-        assert!(self.filter.rank() <= 4);
-
-        let (n_size, c_size, h_size, w_size) = self.filter.get4d();
-
-        assert!(n < n_size);
-        assert!(c < c_size);
-        assert!(h < h_size);
-        assert!(w < w_size);
-        let flat_index = n * (c_size * h_size * w_size) + c * (h_size * w_size) + h * w_size + w;
-        self.filter.get_data()[flat_index]
-    }
-
-    pub fn get_shape(&self) -> Shape {
-        self.filter.shape()
-    }
-
-    pub fn kw(&self) -> usize {
-        self.filter.kw()
-    }
-
-    pub fn kx(&self) -> usize {
-        self.filter.kx()
-    }
-
-    pub fn nw(&self) -> usize {
-        self.filter.nw()
-    }
-
-    pub fn ncols_2d(&self) -> usize {
-        self.filter.ncols_2d()
-    }
-
-    pub fn nrows_2d(&self) -> usize {
-        self.filter.nrows_2d()
-    }
-    pub fn filter_size(&self) -> usize {
-        self.filter.filter_size()
-    }
-
-    fn num_outputs(num_inputs: usize) -> usize {
-        assert_eq!(num_inputs, 1);
-        1
     }
 }
 
@@ -248,13 +229,46 @@ impl Evaluate<f32> for Convolution<f32> {
     ) -> Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
-            "Found more than 1 input when evaluating convolution layer"
+            "Expected exactly 1 input when evaluating convolution layer, found {}",
+            inputs.len(),
         );
         let input = inputs[0];
-        Ok(LayerOut::from_vec(vec![input.conv2d(
-            &self.filter,
-            &self.bias,
-            1,
+        ensure!(
+            input.rank() == 3 || input.rank() == 4,
+            "Input must be rank 3 or 4, got {}",
+            input.rank(),
+        );
+
+        let input = if input.rank() == 3 {
+            // Single batch
+            input.clone().unsqueeze(0).into_btensor::<4>()
+        } else {
+            input.clone().into_btensor::<4>()
+        };
+
+        let weight = self.filter.clone().into_btensor::<4>();
+        let bias = self.bias.clone().into_btensor::<1>();
+
+        let res = conv2d(
+            input,
+            weight,
+            Some(bias),
+            ConvOptions {
+                stride: [1, 1],
+                padding: [0, 0],
+                dilation: [1, 1],
+                groups: 1,
+            },
+        );
+
+        let data = res
+            .to_data()
+            .into_vec()
+            .expect("Failed to compute Convolution");
+
+        Ok(LayerOut::from_vec(vec![Tensor::new(
+            res.shape().into(),
+            data,
         )]))
     }
 }
@@ -294,13 +308,20 @@ impl Evaluate<Element> for Convolution<Element> {
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         ensure!(
+            unpadded_input_shapes.len() == 1,
+            "Expected exactly 1 input shape when evaluating convolution layer, got {}",
+            unpadded_input_shapes.len(),
+        );
+        ensure!(
             inputs.len() == 1,
-            "Found more than 1 input when evaluating convolution layer"
+            "Expected exactly 1 input when evaluating convolution layer, got {}",
+            inputs.len(),
         );
         let input = inputs[0];
         ensure!(
-            unpadded_input_shapes.len() == 1,
-            "Found more than 1 input shape when evaluating convolution layer"
+            input.rank() == 3 || input.rank() == 4,
+            "Input must be rank 3 or 4, got {}",
+            input.rank(),
         );
         let (output, proving_data) = self.op(input, &unpadded_input_shapes[0]);
         Ok(LayerOut {
@@ -352,17 +373,6 @@ impl Convolution<Element> {
         (cleared_tensor, proving_data)
     }
 
-    /// Returns the min and max output range of the convolution layer for a given input range.
-    /// NOTE: it assumes the weights in float are NOT fft'd
-    pub fn output_range(&self, _min_input: Element, _max_input: Element) -> (Element, Element) {
-        // 2^{BIT_LEN + log2(k_h * k_w * k_c)}
-        let (_k_n, k_c, k_h, k_w) = self.filter.get4d();
-        let exp = 2 * *quantization::BIT_LEN + ceil_log2(k_h * k_w * k_c + 1);
-        let min = -(2u64.pow(exp as u32) as Element);
-        let max = 2u64.pow(exp as u32) as Element;
-        (min, max)
-    }
-
     /// Returns the maximum bitsize of the output of this layer
     pub fn output_bitsize(&self) -> usize {
         // 2^{BIT_LEN + log2(k_h * k_w * k_c)}
@@ -391,6 +401,7 @@ impl Convolution<Element> {
         for i in 0..r2.len() {
             r2[i] = r[i + r1.len()];
         }
+
         // compute W(r1,i)
         let mut w_red: Vec<E> = vec![E::ZERO; padded_rows];
         let mut f_middle: Vec<Vec<E>> = vec![Vec::new(); r1.len() - 1];
@@ -403,6 +414,7 @@ impl Convolution<Element> {
             padded_rows.ilog2() as usize,
             false,
         );
+
         // compute X(i,r2)
         let filter_size = self.filter.real_nw() * self.filter.real_nw();
         (0..self.filter.kw()).for_each(|i| {
@@ -414,14 +426,6 @@ impl Convolution<Element> {
                 });
             });
         });
-        // for i in 0..self.filter.kw(){
-        // for j in 0..self.filter.kx(){
-        // for k in 0..filter_size{
-        // let v: E = self.filter.data[i*filter_size*self.filter.kx() + j*filter_size + k].to_field();
-        // W1_reduced[k] += beta[i*self.filter.kx()+j]*v;
-        // }
-        // }
-        // }
 
         let partial_evals = w1_reduced.clone();
         w1_reduced = index_wf(
@@ -433,10 +437,7 @@ impl Convolution<Element> {
         .collect::<Vec<E>>();
         let f_m = w1_reduced.into_mle();
 
-        // f_m.fix_high_variables_in_place(&r2);
-
         // Construct the virtual polynomial and run the sumcheck prover
-
         let f_red = w_red.into_mle();
         let num_vars = f_red.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
@@ -1544,17 +1545,6 @@ pub fn index_wf<E: ExtensionField>(
     })
 }
 
-pub fn conv2d_shape_mode(
-    input_shape: &Shape,
-    filter_shape: &Shape,
-    padding_mode: PaddingMode,
-) -> Shape {
-    match padding_mode {
-        PaddingMode::NoPadding => conv2d_shape(input_shape, filter_shape),
-        PaddingMode::Padding => padded_conv2d_shape(input_shape, filter_shape),
-    }
-}
-
 /// Assumes stride=1, padding=0, and dilation=1
 /// https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html
 pub fn conv2d_shape(input_shape: &Shape, filter_shape: &Shape) -> Shape {
@@ -1583,6 +1573,8 @@ pub fn padded_conv2d_shape(input_shape: &Shape, filter_shape: &Shape) -> Shape {
 
 #[cfg(test)]
 mod test {
+    use std::{fmt::Debug, ops::Range};
+
     use crate::layers::{
         activation::{Activation, Relu},
         dense::Dense,
@@ -1592,6 +1584,7 @@ mod test {
 
     use super::*;
     use ff_ext::GoldilocksExt2;
+    use proptest::prelude::*;
 
     fn split_garbage(
         fft_output: &Tensor<Element>,
@@ -1926,5 +1919,92 @@ mod test {
             fft_dense_output.get_data()[..weight.nrows_2d()]
         );
         Ok(())
+    }
+
+    struct Input<T> {
+        kernels: Tensor<T>,
+        input: Tensor<T>,
+        bias: Tensor<T>,
+    }
+
+    impl<T> Debug for Input<T> {
+        fn fmt(
+            &self,
+            fmt: &mut std::fmt::Formatter<'_>,
+        ) -> std::result::Result<(), std::fmt::Error> {
+            fmt.debug_struct("Input")
+                .field("input", &format_args!("{:?}", self.input.shape()))
+                .field("kernels", &format_args!("{:?}", self.kernels.shape()))
+                .field("bias", &format_args!("{:?}", self.bias.shape()))
+                .finish()
+        }
+    }
+
+    fn any_input<T: Number>(
+        batches: Range<usize>,
+        channels: Range<usize>,
+        height: Range<usize>,
+        width: Range<usize>,
+    ) -> impl Strategy<Value = Input<T>> {
+        (batches, channels, height, width).prop_flat_map(|(batches, channels, height, width)| {
+            let kernels = Tensor::<T>::any(Shape::new(vec![1 << batches, 1 << channels, 3, 3]));
+            let input = Tensor::<T>::any(Shape::new(vec![
+                1 << batches,
+                1 << channels,
+                1 << height,
+                1 << width,
+            ]));
+            let bias = Tensor::<T>::any(Shape::new(vec![1 << batches]));
+            (kernels, input, bias).prop_map(|(kernels, input, bias)| Input {
+                kernels,
+                input,
+                bias,
+            })
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn convolution_test_single_batch_f32(input in any_input::<f32>(1..2, 1..3, 2..8, 2..8)) {
+            let stride = 1;
+            let expected = input.input.conv2d(&input.kernels, &input.bias, stride);
+
+            let conv = Convolution{
+                filter: input.kernels,
+                bias: input.bias,
+                unpadded_shape: input.input.shape().clone(),
+            };
+            let result = conv.evaluate::<GoldilocksExt2>(&[&input.input], &[]).unwrap();
+
+            result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
+                prop_assert!(
+                    (left - right).abs() < 1e-3,
+                    "Actual: {left}, Expected: {right}",
+
+                );
+                Ok(())
+            })?;
+        }
+
+        #[test]
+        fn convolution_test_multiple_batches_f32(input in any_input::<f32>(1..4, 1..3, 2..8, 2..8)) {
+            let stride = 1;
+            let expected = input.input.conv2d(&input.kernels, &input.bias, stride);
+
+            let conv = Convolution{
+                filter: input.kernels,
+                bias: input.bias,
+                unpadded_shape: input.input.shape().clone(),
+            };
+            let result = conv.evaluate::<GoldilocksExt2>(&[&input.input], &[]).unwrap();
+
+            result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
+                prop_assert!(
+                    (left - right).abs() < 1e-3,
+                    "Actual: {left}, Expected: {right}",
+                );
+                Ok(())
+            })?;
+        }
     }
 }

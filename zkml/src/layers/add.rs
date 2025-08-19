@@ -186,8 +186,8 @@ impl Evaluate<f32> for Add<f32> {
             bail!("Add layer expects 1 or 2 inputs, got {}", inputs.len());
         };
 
-        let left = left.clone().into_btensor_2d();
-        let right = right.clone().into_btensor_2d();
+        let left = left.clone().into_btensor::<2>();
+        let right = right.clone().into_btensor::<2>();
         let res = left.add(right);
         let data = res.to_data().into_vec().expect("convert tensor to scalar");
         let result = Tensor::<f32>::new(shape, data);
@@ -221,8 +221,8 @@ impl Evaluate<Element> for Add<Element> {
         let shape = left_scaled.shape();
         let right_scaled = right_tensor.scalar_mul(&(quant_info.right_scale()));
 
-        let left = left_scaled.into_btensor_2d();
-        let right = right_scaled.into_btensor_2d();
+        let left = left_scaled.into_btensor::<2>();
+        let right = right_scaled.into_btensor::<2>();
         let res = left.add(right);
         let data = res.to_data().into_vec().expect("convert tensor to scalar");
         let result = Tensor::<Element>::new(shape, data);

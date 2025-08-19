@@ -222,28 +222,6 @@ impl Number for GoldilocksExt2 {
     }
 }
 
-/// Function testing the consistency between the actual convolution implementation and
-/// the FFT one. Used for debugging purposes.
-/// real_tensor is std conv2d (kw, nx-nw+1, nx-nw+1)
-/// padded_tensor is results from fft conv (kw, nx, nx)
-pub fn check_tensor_consistency(real_tensor: Tensor<Element>, padded_tensor: Tensor<Element>) {
-    let n_x = padded_tensor.shape[1];
-    for i in 0..real_tensor.shape[0] {
-        for j in 0..real_tensor.shape[1] {
-            for k in 0..real_tensor.shape[1] {
-                // TODO: test if real_tensor.shape[2] works here
-                assert!(
-                    real_tensor.data[i * real_tensor.shape[1] * real_tensor.shape[1]
-                        + j * real_tensor.shape[1]
-                        + k]
-                        == padded_tensor.data[i * n_x * n_x + j * n_x + k],
-                    "Error in tensor consistency"
-                );
-            }
-        }
-    }
-}
-
 /// Returns an n-th root of unity by starting with a 32nd root of unity and squaring it (32-n) times.
 /// Each squaring operation halves the order of the root of unity:
 ///   - For n=16: squares it 16 times (32-16) to get a 16th root of unity
@@ -593,6 +571,15 @@ impl<T> Tensor<T> {
         }
     }
 
+    pub fn squeeze(mut self, index: usize) -> Self {
+        assert_eq!(
+            self.shape[index], 1,
+            "The dimension to be squeezed must have a value of 1"
+        );
+        self.shape.remove(index);
+        self
+    }
+
     /// Is an empty tensor
     pub fn is_empty(&self) -> bool {
         self.shape.len() == 0
@@ -738,30 +725,30 @@ impl Tensor<Element> {
     }
 
     pub fn into_fft_conv(self, input_shape: &Shape) -> Self {
-        let shape = self.shape;
-        let data = self.data;
+        let og_shape = self.shape;
         assert!(
-            shape.product() == data.len(),
+            og_shape.product() == self.data.len(),
             "Shape does not match data length."
         );
-        assert!(shape.len() == 4, "Shape does not match data length.");
         assert!(
-            shape[2].is_power_of_two(),
+            og_shape.rank() == 4,
+            "Tensor shape does not match a convolution. expected 4 got {}",
+            og_shape.rank(),
+        );
+        assert!(
+            og_shape[2].is_power_of_two(),
             "Filter dimension is not power of two"
         );
-        let real_shape = shape.clone();
-        let n_w = (input_shape[1] - shape[2] + 1).next_power_of_two();
+
+        // n_w is the padded version of the input
+        let n_w = (input_shape[1] - og_shape[2] + 1).next_power_of_two();
+        let shape = Shape::new(vec![og_shape[0], og_shape[1], n_w, n_w]);
+
         Self {
-            data, // Note that field elements are back into Element
-            shape: vec![shape[0], shape[1], n_w, n_w].into(), /* nw is the padded version of the input */
-            og_shape: real_shape,
+            data: self.data,
+            shape,
+            og_shape,
         }
-    }
-    // Create specifically a new convolution. The input shape is needed to compute the
-    // output and properly arrange the weights
-    #[deprecated]
-    pub fn new_conv(shape: Shape, input_shape: Shape, data: Vec<Element>) -> Self {
-        Tensor::new(shape, data).into_fft_conv(&input_shape)
     }
     /// Recall that weights are not plain text to the "snark". Rather it is FFT(weights).
     /// Aka there is no need to compute the FFT(input) "in-circuit".
@@ -850,73 +837,6 @@ impl Tensor<Element> {
         )
     }
 
-    /// Convolution algorithm using FFTs.
-    /// When invoking this algorithm the prover generates all witness/intermediate evaluations
-    /// needed to generate a convolution proof
-    pub fn fft_conv_old<F: ExtensionField>(
-        &self,
-        x: &Tensor<Element>,
-    ) -> (Tensor<Element>, ConvData<F>) {
-        // input to field elements
-        let n_x = x.shape[1].next_power_of_two();
-        let real_input = x.data.par_iter().map(|e| e.to_field()).collect::<Vec<_>>();
-        let w_fft: Vec<F> = self
-            .data
-            .par_iter()
-            .map(|e| e.to_field())
-            .collect::<Vec<_>>();
-        let new_n = 2 * n_x * n_x;
-        let (x_vec, input): (Vec<Vec<F>>, Vec<Vec<F>>) = real_input
-            .par_iter()
-            .chunks(n_x * n_x)
-            .map(|chunk| {
-                let xx_input = chunk.into_iter().cloned().rev().collect::<Vec<_>>();
-                let mut xx_fft = xx_input
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::repeat(F::ZERO))
-                    .take(new_n)
-                    .collect::<Vec<_>>();
-                fft(&mut xx_fft, false);
-                (xx_fft, xx_input)
-            })
-            .unzip();
-        let dim1 = x_vec.len();
-        let dim2 = x_vec[0].len();
-        let (out, prod): (Vec<_>, Vec<_>) = (0..self.shape[0])
-            .into_par_iter()
-            .map(|i| {
-                let mut outi = (0..dim2)
-                    .map(|k| {
-                        (0..dim1)
-                            .map(|j| x_vec[j][k] * w_fft[i * new_n * x_vec.len() + j * new_n + k])
-                            .sum::<F>()
-                    })
-                    .collect::<Vec<_>>();
-                // TODO: remove requirement to keep the product value intact
-                let prodi = outi.clone();
-                fft(&mut outi, true);
-                (outi, prodi)
-            })
-            .unzip();
-        // TODO: remove the requirement to keep the output value intact
-        let output = out.clone();
-        let conv_data = ConvData::new(real_input, input, x_vec, prod, output, n_x);
-        (
-            Tensor::new(
-                vec![self.shape[0], n_x, n_x].into(),
-                conv_data.output_as_element.clone(),
-            ),
-            conv_data,
-        )
-    }
-
-    /// Returns the evaluation point, in order for (row,col) addressing
-    pub fn evals_2d<F: ExtensionField>(&self) -> Vec<F> {
-        assert!(self.is_matrix(), "Tensor is not a matrix");
-        self.evals_flat()
-    }
-
     pub fn evals_flat<F: ExtensionField>(&self) -> Vec<F> {
         self.data.par_iter().map(|e| e.to_field()).collect()
     }
@@ -929,12 +849,8 @@ impl Tensor<Element> {
         Tensor::<F>::from(self).into_mle()
     }
 
-    pub fn into_btensor_1d(self) -> BTensor<Backend, 1, Int> {
-        let shape = self.shape();
-        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
-    }
-
-    pub fn into_btensor_2d(self) -> BTensor<Backend, 2, Int> {
+    /// Consumes this tensor and creates a [burn::tensor::Tensor].
+    pub fn into_btensor<const D: usize>(self) -> BTensor<Backend, D, Int> {
         let shape = self.shape();
         BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
     }
@@ -942,7 +858,20 @@ impl Tensor<Element> {
 
 impl<F: ExtensionField> Tensor<F> {
     pub fn to_mle_2d(&self) -> MultilinearExtension<'static, F> {
-        tensor_to_mle_2d(self, self.data.clone())
+        assert!(self.is_matrix(), "Tensor is not a matrix");
+        assert!(
+            self.nrows_2d().is_power_of_two(),
+            "number of rows {} is not a power of two",
+            self.nrows_2d()
+        );
+        assert!(
+            self.ncols_2d().is_power_of_two(),
+            "number of columns {} is not a power of two",
+            self.ncols_2d()
+        );
+        // N variable to address 2^N rows and M variables to address 2^M columns
+        let num_vars = self.nrows_2d().ilog2() + self.ncols_2d().ilog2();
+        MultilinearExtension::from_evaluations_ext_vec(num_vars as usize, self.data.clone())
     }
 }
 
@@ -966,26 +895,6 @@ impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
     }
 }
 
-fn tensor_to_mle_2d<T, F: ExtensionField>(
-    tensor: &Tensor<T>,
-    evals: Vec<F>,
-) -> MultilinearExtension<'static, F> {
-    assert!(tensor.is_matrix(), "Tensor is not a matrix");
-    assert!(
-        tensor.nrows_2d().is_power_of_two(),
-        "number of rows {} is not a power of two",
-        tensor.nrows_2d()
-    );
-    assert!(
-        tensor.ncols_2d().is_power_of_two(),
-        "number of columns {} is not a power of two",
-        tensor.ncols_2d()
-    );
-    // N variable to address 2^N rows and M variables to address 2^M columns
-    let num_vars = tensor.nrows_2d().ilog2() + tensor.ncols_2d().ilog2();
-    MultilinearExtension::from_evaluations_ext_vec(num_vars as usize, evals)
-}
-
 impl Tensor<f32> {
     pub fn quantize(self, s: &ScalingFactor) -> Tensor<Element> {
         let data = self
@@ -996,24 +905,10 @@ impl Tensor<f32> {
         Tensor::new(self.shape, data)
     }
 
-    pub fn into_btensor_1d(self) -> BTensor<Backend, 1> {
+    /// Consumes this tensor and creates a [burn::tensor::Tensor].
+    pub fn into_btensor<const D: usize>(self) -> BTensor<Backend, D> {
         let shape = self.shape();
         BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
-    }
-
-    pub fn into_btensor_2d(self) -> BTensor<Backend, 2> {
-        let shape = self.shape();
-        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
-    }
-}
-
-impl<T: Number> Tensor<T> {
-    pub fn zero(shape: Shape) -> Self {
-        Tensor {
-            data: vec![T::zero(); shape.numel()],
-            og_shape: shape.clone(),
-            shape,
-        }
     }
 }
 
@@ -1082,6 +977,14 @@ impl<T: Clone> Tensor<T> {
 }
 
 impl<T: Number> Tensor<T> {
+    pub fn zero(shape: Shape) -> Self {
+        Tensor {
+            data: vec![T::zero(); shape.numel()],
+            og_shape: shape.clone(),
+            shape,
+        }
+    }
+
     pub fn argmax(&self) -> usize {
         self.data
             .iter()
@@ -1227,18 +1130,13 @@ impl<T: Number> Tensor<T> {
 
     /// Recursively pads the tensor so its ready to be viewed as an MLE
     pub fn pad_next_power_of_two(&self) -> Self {
-        self.generic_pad_next_power_of_two(T::default())
-    }
-
-    /// Recursively pads the tensor so its ready to be viewed as an MLE, the `padding_value` is the element that is used to pad
-    pub fn generic_pad_next_power_of_two(&self, padding_value: T) -> Self {
         let shape = self.shape();
 
         if shape.iter().all(|dim| dim.is_power_of_two()) {
             return self.clone();
         }
 
-        let padded_data = Self::recursive_pad(self.get_data(), &shape, padding_value);
+        let padded_data = Self::recursive_pad(self.get_data(), &shape, T::default());
 
         let padded_shape = shape
             .iter()
@@ -1247,6 +1145,7 @@ impl<T: Number> Tensor<T> {
 
         Tensor::<T>::new(padded_shape.into(), padded_data)
     }
+
     fn recursive_pad(data: &[T], remaining_dims: &[usize], padding_value: T) -> Vec<T> {
         match remaining_dims.len() {
             // If the remaining dims show we are a vector simply pad
@@ -1403,88 +1302,6 @@ impl<T: Number> Tensor<T> {
         });
 
         result
-    }
-    pub fn conv_prod(&self, x: &[Vec<T>], w: &[Vec<T>], ii: usize, jj: usize) -> T {
-        w.par_iter()
-            .enumerate()
-            .map(|(i, w_row)| {
-                w_row
-                    .par_iter()
-                    .enumerate()
-                    .map(|(j, &w_val)| w_val * x[i + ii][j + jj])
-                    .sum()
-            })
-            .sum()
-    }
-    pub fn single_naive_conv(&self, w: &[Vec<T>], x: &[Vec<T>]) -> Vec<Vec<T>> {
-        let mut out: Vec<Vec<T>> =
-            vec![vec![Default::default(); x[0].len() - w[0].len() + 1]; x.len() - w.len() + 1];
-        out.par_iter_mut().enumerate().for_each(|(i, out_row)| {
-            out_row.par_iter_mut().enumerate().for_each(|(j, out_val)| {
-                *out_val = self.conv_prod(x, w, i, j);
-            });
-        });
-        out
-    }
-    pub fn add_matrix(&self, m1: &mut [Vec<T>], m2: Vec<Vec<T>>) -> Vec<Vec<T>> {
-        let mut m = vec![vec![Default::default(); m1[0].len()]; m1.len()];
-        m.par_iter_mut().enumerate().for_each(|(i, row)| {
-            row.par_iter_mut().enumerate().for_each(|(j, val)| {
-                *val = m1[i][j] + m2[i][j];
-            });
-        });
-        m
-    }
-    // Implementation of the standard convolution algorithm.
-    // This is needed mostly for debugging purposes
-    pub fn cnn_naive_convolution(&self, xt: &Tensor<T>) -> Tensor<T> {
-        let k_w = self.shape[0];
-        let k_x = self.shape[1];
-        let n_w = self.shape[2];
-        let n = xt.shape[0];
-        let mut ctr = 0;
-        assert!(n == k_x, "Inconsistency on filter/input vector");
-
-        let mut w: Vec<Vec<Vec<Vec<T>>>> =
-            vec![vec![vec![vec![Default::default(); n_w]; n_w]; k_x]; k_w];
-        let mut x: Vec<Vec<Vec<T>>> =
-            vec![vec![vec![Default::default(); xt.shape[1]]; xt.shape[1]]; n];
-        for k in 0..k_w {
-            for l in 0..k_x {
-                for i in 0..n_w {
-                    for j in 0..n_w {
-                        w[k][l][i][j] = self.data[ctr];
-                        ctr += 1;
-                    }
-                }
-            }
-        }
-        ctr = 0;
-        for k in 0..n {
-            for i in 0..xt.shape[1] {
-                for j in 0..xt.shape[1] {
-                    x[k][i][j] = xt.data[ctr];
-                    ctr += 1;
-                }
-            }
-        }
-        let mut conv: Vec<Vec<Vec<T>>> =
-            vec![vec![vec![Default::default(); xt.shape[1] - n_w + 1]; xt.shape[1] - n_w + 1]; k_w];
-
-        for i in 0..k_w {
-            for j in 0..k_x {
-                let temp = self.single_naive_conv(&w[i][j], &x[j]);
-                conv[i] = self.add_matrix(&mut conv[i], temp);
-            }
-        }
-
-        Tensor::new(
-            vec![k_w, xt.shape[1] - n_w + 1, xt.shape[1] - n_w + 1].into(),
-            conv.into_iter()
-                .flat_map(|inner_vec| inner_vec.into_iter())
-                .flat_map(|inner_inner_vec| inner_inner_vec.into_iter())
-                .collect(),
-        )
     }
     /// Transpose the matrix (2D tensor)
     pub fn transpose(&self) -> Tensor<T> {
@@ -1665,63 +1482,76 @@ impl<T: Number> Tensor<T> {
         (maxpool_result, padded_maxpool_tensor)
     }
 
+    // Applies a 2dimensional convolution.
+    //
+    // [1] - https://onnx.ai/onnx/operators/onnx__Conv.html
+    // [2] - https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d
+    // [3] - https://github.com/vdumoulin/conv_arithmetic
     pub fn conv2d(&self, kernels: &Tensor<T>, bias: &Tensor<T>, stride: usize) -> Tensor<T> {
-        let (n_size, c_size, h_size, w_size) = self.get4d();
-        let (k_n, k_c, k_h, k_w) = kernels.get4d();
+        // (N x C x H x W)
+        let (batch_size, channels_in, height_in, width_in) = self.get4d();
+        // (M x C/group x kH x kW)
+        let (feature_maps, channels_out, kernel_height, kernel_width) = kernels.get4d();
 
         assert!(self.rank() <= 4, "Supports only at most 4D input.");
         assert!(kernels.rank() <= 4, "Supports only at most 4D filters.");
-        // Validate shapes
         assert_eq!(
-            c_size,
-            k_c,
-            "Input {c_size} and kernel {k_c} channels must match! {:?} vs kernel {:?}",
+            channels_in,
+            channels_out,
+            "Grouping is not supported, input channels {channels_in} and kernel {channels_out} must match! {:?} vs kernel {:?}",
             self.shape(),
             kernels.shape()
         );
         assert_eq!(
             bias.shape.as_ref(),
-            &[k_n],
-            "Bias shape must match number of kernels!"
+            &[feature_maps],
+            "Bias shape must match number of kernels!",
         );
 
-        let out_h = (h_size - k_h) / stride + 1;
-        let out_w = (w_size - k_w) / stride + 1;
-        let out_shape = vec![n_size, k_n, out_h, out_w];
+        // NOTE: neither padding nor dilation is supported
+        //
+        // The shape formula can be found at pythorch [1], the one below is
+        // simplified since padding is no supported (defaults to 0) and neither
+        // dilation is supported (defaults to 1).
+        //
+        // [1] - https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d
+        let height_out = (height_in - kernel_height) / stride + 1;
+        let width_out = (width_in - kernel_width) / stride + 1;
+        let shape_out = Shape::new(vec![batch_size, feature_maps, height_out, width_out]);
 
-        // Compute output in parallel
-        let output: Vec<T> = (0..n_size * k_n * out_h * out_w)
+        let output: Vec<T> = (0..shape_out.numel())
             .into_par_iter()
-            .map(|flat_idx| {
+            .map(|idx| {
                 // Decompose flat index into (n, o, oh, ow)
-                let n = flat_idx / (k_n * out_h * out_w);
-                let rem1 = flat_idx % (k_n * out_h * out_w);
-                let o = rem1 / (out_h * out_w);
-                let rem2 = rem1 % (out_h * out_w);
-                let oh = rem2 / out_w;
-                let ow = rem2 % out_w;
+                let batch = idx / (feature_maps * height_out * width_out);
+                let rem1 = idx % (feature_maps * height_out * width_out);
+                let o = rem1 / (height_out * width_out);
+                let rem2 = rem1 % (height_out * width_out);
+                let oh = rem2 / width_out;
+                let ow = rem2 % width_out;
 
                 let mut sum = T::default();
 
                 // Convolution
-                for c in 0..c_size {
-                    for kh in 0..k_h {
-                        for kw in 0..k_w {
+                for channel in 0..channels_out {
+                    for kh in 0..kernel_height {
+                        for kw in 0..kernel_width {
                             let h = oh * stride + kh;
                             let w = ow * stride + kw;
-                            sum += self.get_at_4d(n, c, h, w) * kernels.get_at_4d(o, c, kh, kw);
+                            let input = self.get_at_4d(batch, channel, h, w);
+                            let weight = kernels.get_at_4d(o, channel, kh, kw);
+                            sum += input * weight;
                         }
                     }
                 }
 
-                // Add bias
                 sum + bias.data[o]
             })
             .collect();
 
         Tensor {
             data: output,
-            shape: out_shape.into(),
+            shape: shape_out,
             og_shape: vec![0].into(),
         }
     }
@@ -1775,6 +1605,75 @@ impl<T: Number> Tensor<T> {
             .collect::<Vec<T>>();
 
         Tensor::<T>::new(vec![num_matrices, matrix_dim, matrix_dim].into(), data)
+    }
+
+    pub fn max_value(&self) -> T {
+        self.data.iter().fold(T::MIN, |max, x| max.cmp_max(x))
+    }
+    pub fn min_value(&self) -> T {
+        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
+    }
+
+    pub fn random(shape: &Shape) -> Self {
+        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
+    }
+
+    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
+        Ok(Self {
+            data: self
+                .data
+                .iter()
+                .map(f)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            shape: self.shape.clone(),
+            og_shape: self.og_shape.clone(),
+        })
+    }
+
+    /// Creates a random matrix with a given number of rows and cols.
+    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
+    /// sync which is not true for basic rng core.
+    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
+        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
+        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
+        let size = shape.product();
+        let data = (0..size).map(|_| T::random(&mut rng)).collect();
+        Self {
+            data,
+            shape: shape.clone(),
+            og_shape: vec![0].into(),
+        }
+    }
+
+    // slice on the third dimension.
+    // start inclusive, end exclusive
+    pub fn slice_3d(&self, start: usize, end: usize) -> Self {
+        assert!(self.shape.len() == 3);
+        assert!(start < self.shape[0]);
+        assert!(end <= self.shape[0]);
+        let blocks = self.shape[1] * self.shape[2];
+        let sliced = self.data[blocks * start..blocks * end].to_vec();
+        Self {
+            data: sliced,
+            shape: vec![end - start, self.shape[1], self.shape[2]].into(),
+            og_shape: vec![0].into(),
+        }
+    }
+
+    // slice the tensor on the second dimension
+    // dim2_start inclusive
+    // dim2_end exclusive
+    // TODO: refactor to take generic shape dimensions where to slice ... or just use burn API tensor
+    pub fn slice_2d(&self, dim2_start: usize, dim2_end: usize) -> Self {
+        assert!(self.shape.len() == 2);
+        let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
+        let data = self.data[range].to_vec();
+        let new_shape = vec![dim2_end - dim2_start, self.shape[1]];
+        Self {
+            data,
+            shape: new_shape.into(),
+            og_shape: vec![0].into(),
+        }
     }
 
     #[cfg(test)]
@@ -2089,77 +1988,6 @@ impl<T: Default + Clone + Copy> Tensor<T> {
 
         // Now that we have the expanded data make the tensor
         Ok(Tensor::<T>::new(expansion_shape.clone(), new_data))
-    }
-}
-
-impl<T: Number> Tensor<T> {
-    pub fn max_value(&self) -> T {
-        self.data.iter().fold(T::MIN, |max, x| max.cmp_max(x))
-    }
-    pub fn min_value(&self) -> T {
-        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
-    }
-
-    pub fn random(shape: &Shape) -> Self {
-        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
-    }
-
-    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
-        Ok(Self {
-            data: self
-                .data
-                .iter()
-                .map(f)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            shape: self.shape.clone(),
-            og_shape: self.og_shape.clone(),
-        })
-    }
-
-    /// Creates a random matrix with a given number of rows and cols.
-    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
-    /// sync which is not true for basic rng core.
-    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
-        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
-        let size = shape.product();
-        let data = (0..size).map(|_| T::random(&mut rng)).collect();
-        Self {
-            data,
-            shape: shape.clone(),
-            og_shape: vec![0].into(),
-        }
-    }
-
-    // slice on the third dimension.
-    // start inclusive, end exclusive
-    pub fn slice_3d(&self, start: usize, end: usize) -> Self {
-        assert!(self.shape.len() == 3);
-        assert!(start < self.shape[0]);
-        assert!(end <= self.shape[0]);
-        let blocks = self.shape[1] * self.shape[2];
-        let sliced = self.data[blocks * start..blocks * end].to_vec();
-        Self {
-            data: sliced,
-            shape: vec![end - start, self.shape[1], self.shape[2]].into(),
-            og_shape: vec![0].into(),
-        }
-    }
-
-    // slice the tensor on the second dimension
-    // dim2_start inclusive
-    // dim2_end exclusive
-    // TODO: refactor to take generic shape dimensions where to slice ... or just use burn API tensor
-    pub fn slice_2d(&self, dim2_start: usize, dim2_end: usize) -> Self {
-        assert!(self.shape.len() == 2);
-        let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
-        let data = self.data[range].to_vec();
-        let new_shape = vec![dim2_end - dim2_start, self.shape[1]];
-        Self {
-            data,
-            shape: new_shape.into(),
-            og_shape: vec![0].into(),
-        }
     }
 }
 
@@ -2546,6 +2374,18 @@ impl FromIterator<usize> for Shape {
     }
 }
 
+impl From<burn::prelude::Shape> for Shape {
+    fn from(value: burn::prelude::Shape) -> Self {
+        Self(value.dims)
+    }
+}
+
+impl From<&burn::prelude::Shape> for Shape {
+    fn from(value: &burn::prelude::Shape) -> Self {
+        Self(value.dims.to_vec())
+    }
+}
+
 // taken from https://docs.pytorch.org/docs/stable/generated/torch.isclose.html
 /// Determines whether two slices of `f32` values are element-wise close within
 /// the specified absolute (`atol`) and relative (`rtol`) tolerances.
@@ -2861,24 +2701,83 @@ mod test {
 
     type E = GoldilocksExt2;
 
+    /// Function testing the consistency between the actual convolution implementation and
+    /// the FFT one. Used for debugging purposes.
+    ///
+    /// expected is std conv2d (kw, nx-nw+1, nx-nw+1)
+    /// fft_tensor is results from fft conv (kw, nx, nx)
+    fn check_tensor_consistency(expected: Tensor<Element>, fft_tensor: Tensor<Element>) {
+        assert_eq!(
+            fft_tensor.shape().rank(),
+            3,
+            "FFT tensor should not have batching. shape {:?}",
+            fft_tensor.shape(),
+        );
+        assert_eq!(
+            fft_tensor.shape()[1],
+            fft_tensor.shape()[2],
+            "FFT tensor should have same height and width. shape {:?}",
+            fft_tensor.shape(),
+        );
+        assert!(
+            fft_tensor.shape()[2].is_power_of_two(),
+            "FFT tensor should have a power-of-two height and width. shape {:?}",
+            fft_tensor.shape(),
+        );
+
+        assert_eq!(
+            expected.shape().rank(),
+            3,
+            "Tensor should not have batching. shape {:?}",
+            expected.shape(),
+        );
+
+        let fft_strides = fft_tensor.shape().strides();
+        let strides = expected.shape().strides();
+        for channel in 0..expected.shape[0] {
+            for height in 0..expected.shape[1] {
+                for width in 0..expected.shape[2] {
+                    let expected_pos =
+                        channel * strides[0] + height * strides[1] + width * strides[2];
+                    let fft_pos =
+                        channel * fft_strides[0] + height * fft_strides[1] + width * fft_strides[2];
+
+                    assert!(
+                        expected.data[expected_pos] == fft_tensor.data[fft_pos],
+                        "Error in tensor consistency. channel {channel} height {height} width {width} got {} expected {}",
+                        fft_tensor.data[fft_pos],
+                        expected.data[expected_pos],
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_conv() {
-        for i in 0..3 {
-            for j in 2..5 {
-                for l in 0..4 {
-                    for n in 1..(j - 1) {
-                        let n_w = 1 << n;
-                        let k_w = 1 << l;
-                        let n_x = 1 << j;
-                        let k_x = 1 << i;
-                        let filter1 = Tensor::random(&vec![k_w, k_x, n_w, n_w].into());
-                        let filter2 = filter1.clone();
-                        let filter1 = filter1.into_fft_conv(&vec![k_x, n_x, n_x].into());
-                        let big_x =
-                            Tensor::new(vec![k_x, n_x, n_x].into(), vec![3; n_x * n_x * k_x]); //random_vector(n_x*n_x*k_x));
-                        let (out_2, _) = filter1.fft_conv::<GoldilocksExt2>(&big_x);
-                        let out_1 = filter2.cnn_naive_convolution(&big_x);
-                        check_tensor_consistency(out_1, out_2);
+        for channel in 0..3 {
+            for input_size in 2..5 {
+                for feature_maps in 0..4 {
+                    for kernel_size in 1..(input_size - 1) {
+                        let filter_size = 1 << kernel_size;
+                        let feature_maps = 1 << feature_maps;
+                        let input_size = 1 << input_size;
+                        let channels = 1 << channel;
+
+                        let filter_shape =
+                            Shape::new(vec![feature_maps, channels, filter_size, filter_size]);
+                        let input_shape = Shape::new(vec![channels, input_size, input_size]);
+                        let input_size = input_shape.numel();
+
+                        let filter = Tensor::random(&filter_shape);
+                        let fft_filter = filter.clone().into_fft_conv(&input_shape);
+                        let input = Tensor::new(input_shape, vec![3; input_size]);
+
+                        let (result, _) = fft_filter.fft_conv::<GoldilocksExt2>(&input);
+                        let bias = Tensor::<Element>::zero(Shape::new(vec![feature_maps]));
+                        let expected = input.conv2d(&filter, &bias, 1);
+                        let expected = expected.squeeze(0);
+                        check_tensor_consistency(expected, result);
                     }
                 }
             }
@@ -3011,12 +2910,6 @@ mod test {
         let tensor_b = Tensor::<Element>::new(shape_b.clone().into(), vec![1, 1, 1, 0]);
 
         let tensor_c = tensor_a.pad_next_power_of_two();
-        assert_eq!(tensor_b, tensor_c);
-
-        // Here we test the generic padding
-        let tensor_b = Tensor::<Element>::new(shape_b.into(), vec![1, 1, 1, 17]);
-
-        let tensor_c = tensor_a.generic_pad_next_power_of_two(17);
         assert_eq!(tensor_b, tensor_c);
     }
 
