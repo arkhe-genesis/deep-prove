@@ -10,8 +10,9 @@ RUN cargo install --locked --path deep-prove --bin deep-prove-worker
 # Create the actual final image
 FROM docker.io/library/ubuntu:24.04
 
-ARG USER_ID=1000
-ARG GROUP_ID=1000
+# USER_ID 1000 is taken by ubuntu user
+ARG USER_ID=2000
+ARG GROUP_ID=2000
 RUN groupadd -g ${GROUP_ID} lagrange && \
     useradd -m -u ${USER_ID} -g lagrange lagrange
 
