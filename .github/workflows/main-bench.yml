@@ -6,11 +6,11 @@ on:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ["nix"]
     outputs:
       should_run: ${{ steps.filter.outputs.watches }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -21,7 +21,7 @@ jobs:
               - '.github/workflows/main-bench.yml'
 
   benchmark_pr_branch:
-    name: Continuous Benchmarking PRs with Bencher
+    name: Master Benchmarking
     needs: changes
     if: ${{ needs.changes.outputs.should_run == 'true' }}
     permissions:
@@ -29,8 +29,9 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
+          clean: "false"
           submodules: "recursive"
       - name: Install protoc via apt
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -41,7 +42,7 @@ jobs:
           # Manually configure rust-cache
           cache: false
       - uses: bencherdev/bencher@main
-      - name: Track PR Benchmarks with Bencher
+        shell: devenv shell bash -- -e {0}
         run: |
           cd zkml && \
           bencher run \

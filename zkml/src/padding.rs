@@ -401,7 +401,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
 }
 
 pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<Element>> {
-    // reset QKV cache, as it might contain data from a previos inference
+    // reset QKV cache, as it might contain data from a previous inference
     qkv.reset_cache();
     // qkv layer currently expects 1 input, so we check there is only 1 input shape
     ensure!(

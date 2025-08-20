@@ -12,10 +12,12 @@ import argparse
 
 # Add argument parser similar to mlp.py
 parser = argparse.ArgumentParser(description="CIFAR10 CNN with ONNX export")
-parser.add_argument("--export",
-                    type=Path,
-                    default=Path('bench'),
-                    help="Directory to export the model to (default: bench)")
+parser.add_argument(
+    "--export",
+    type=Path,
+    default=Path("bench"),
+    help="Directory to export the model to (default: bench)",
+)
 args = parser.parse_args()
 
 # Device configuration
@@ -35,12 +37,14 @@ TRAIN_PATH = get_data_path("data/Dataset/Train")
 VAL_PATH = get_data_path("data/Dataset/Val")
 
 # Image preprocessing
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5])  # Normalize to [-1,1]
-])
+transform = transforms.Compose(
+    [
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),  # Normalize to [-1,1]
+    ]
+)
 
 # Load dataset
 train_dataset = datasets.ImageFolder(root=TRAIN_PATH, transform=transform)
@@ -56,31 +60,21 @@ class CNNModel(nn.Module):
         super(CNNModel, self).__init__()
 
         # Convolutional layers
-        self.conv1 = nn.Conv2d(in_channels=3,
-                               out_channels=32,
-                               kernel_size=3,
-                               stride=1,
-                               padding=0)
-        self.conv2 = nn.Conv2d(in_channels=32,
-                               out_channels=64,
-                               kernel_size=3,
-                               stride=1,
-                               padding=0)
-        self.conv3 = nn.Conv2d(in_channels=64,
-                               out_channels=64,
-                               kernel_size=3,
-                               stride=1,
-                               padding=0)
-        self.conv4 = nn.Conv2d(in_channels=64,
-                               out_channels=128,
-                               kernel_size=3,
-                               stride=1,
-                               padding=0)
-        self.conv5 = nn.Conv2d(in_channels=128,
-                               out_channels=128,
-                               kernel_size=3,
-                               stride=1,
-                               padding=0)
+        self.conv1 = nn.Conv2d(
+            in_channels=3, out_channels=32, kernel_size=3, stride=1, padding=0
+        )
+        self.conv2 = nn.Conv2d(
+            in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=0
+        )
+        self.conv3 = nn.Conv2d(
+            in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0
+        )
+        self.conv4 = nn.Conv2d(
+            in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=0
+        )
+        self.conv5 = nn.Conv2d(
+            in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=0
+        )
 
         # Pooling layer
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
@@ -142,8 +136,7 @@ def train(model, train_loader, criterion, optimizer, epochs=5):
     for epoch in range(epochs):
         running_loss = 0.0
         for images, labels in train_loader:
-            images, labels = images.to(device), labels.float().to(
-                device).unsqueeze(1)
+            images, labels = images.to(device), labels.float().to(device).unsqueeze(1)
 
             optimizer.zero_grad()
             outputs = model(images)
@@ -152,9 +145,7 @@ def train(model, train_loader, criterion, optimizer, epochs=5):
             optimizer.step()
 
             running_loss += loss.item()
-        print(
-            f"Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(train_loader):.4f}"
-        )
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss/len(train_loader):.4f}")
 
 
 # Train the model
@@ -174,7 +165,8 @@ torch.onnx.export(
     # do_constant_folding=True,
     opset_version=12,
     input_names=["input"],
-    output_names=["output"])
+    output_names=["output"],
+)
 
 # dynamic_axes={'input': {0: 'batch_size'},
 #       'output': {0: 'batch_size'}})
@@ -191,12 +183,13 @@ def export_test_data(model, val_loader, num_samples=5):
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
 
-            test_data["input_data"].append(images.cpu().reshape(
-                [-1]).tolist())  # Raw input
-            test_data["output_data"].append(labels.cpu().reshape(
-                [-1]).tolist())  # True labels
-            test_data["pytorch_output"].append(outputs.cpu().reshape(
-                [-1]).tolist())
+            test_data["input_data"].append(
+                images.cpu().reshape([-1]).tolist()
+            )  # Raw input
+            test_data["output_data"].append(
+                labels.cpu().reshape([-1]).tolist()
+            )  # True labels
+            test_data["pytorch_output"].append(outputs.cpu().reshape([-1]).tolist())
 
     data_path = args.export / "input.json"
     with open(data_path, "w") as f:

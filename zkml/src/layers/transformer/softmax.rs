@@ -687,7 +687,7 @@ impl Softmax<Element> {
         let logup_eq = compute_betas_eval(logup_point).into_mle();
         let last_claim_eq = compute_betas_eval(&last_claim.point).into_mle();
 
-        // Transform the polys into Either::Left so they cna be passed to the VirtualPolynomialsBuilder
+        // Transform the polys into Either::Left so they can be passed to the VirtualPolynomialsBuilder
         let either_mles = layer_polys
             .iter()
             .skip(polys_to_skip)

@@ -17,37 +17,48 @@ from pathlib import Path
 from torch.ao.quantization import QuantStub, DeQuantStub
 
 print(torch.backends.quantized.supported_engines)
-torch.backends.quantized.engine = 'qnnpack'
+torch.backends.quantized.engine = "qnnpack"
 
 parser = argparse.ArgumentParser(
-    description="mlp generator --num-dense and --layer-width")
-parser.add_argument("--num-dense", type=int, required=True,
-                    help="Number of dense layers")
-parser.add_argument("--layer-width", type=int,
-                    required=True, help="Width of each layer")
-parser.add_argument("--export", type=Path, default=Path('bench'),
-                    help="Directory to export the model to (default: bench)")
-parser.add_argument("--num-samples", type=int, default=100,
-                    help="Number of test samples to export")
-parser.add_argument("--distribution", action="store_true",
-                    help="Show distribution of model weights")
-parser.add_argument("--no-relu", action="store_true",
-                    help="Disable ReLU activation functions")
+    description="mlp generator --num-dense and --layer-width"
+)
+parser.add_argument(
+    "--num-dense", type=int, required=True, help="Number of dense layers"
+)
+parser.add_argument(
+    "--layer-width", type=int, required=True, help="Width of each layer"
+)
+parser.add_argument(
+    "--export",
+    type=Path,
+    default=Path("bench"),
+    help="Directory to export the model to (default: bench)",
+)
+parser.add_argument(
+    "--num-samples", type=int, default=100, help="Number of test samples to export"
+)
+parser.add_argument(
+    "--distribution", action="store_true", help="Show distribution of model weights"
+)
+parser.add_argument(
+    "--no-relu", action="store_true", help="Disable ReLU activation functions"
+)
 
 args = parser.parse_args()
 print(f"num_dense: {args.num_dense}, layer_width: {args.layer_width}")
 # Ensure the folder exists
 if not args.export.exists() or not args.export.is_dir():
     print(
-        f"❌ Error: export folder '{args.export}' does not exist or is not a directory.")
+        f"❌ Error: export folder '{args.export}' does not exist or is not a directory."
+    )
     exit(1)
 
 
 # Load the iris data
 iris = load_iris()
 dataset = pd.DataFrame(
-    data=np.c_[iris['data'], iris['target']],
-    columns=iris['feature_names'] + ['target'])
+    data=np.c_[iris["data"], iris["target"]], columns=iris["feature_names"] + ["target"]
+)
 print("Loaded iris data")
 
 
@@ -65,8 +76,7 @@ class MLP(nn.Module):
         layers = []
         input_size = 4  # Assuming input size is 4 for the Iris dataset
         for _ in range(num_dense):
-            layers.append(
-                nn.Linear(input_size, layer_width, bias=self.useBias))
+            layers.append(nn.Linear(input_size, layer_width, bias=self.useBias))
             if use_relu:
                 layers.append(nn.ReLU())
             input_size = layer_width
@@ -87,8 +97,9 @@ class MLP(nn.Module):
 
 
 # Modify the model creation line to enable quantization
-model = MLP(num_dense=args.num_dense, layer_width=args.layer_width,
-            quantize=True, use_relu=True)
+model = MLP(
+    num_dense=args.num_dense, layer_width=args.layer_width, quantize=True, use_relu=True
+)
 
 # Extract input features
 X = dataset[dataset.columns[0:4]].values
@@ -99,9 +110,7 @@ scaler = MinMaxScaler(feature_range=(-1, 1))
 X = scaler.fit_transform(X)
 
 # Train-test split after normalization
-train_X, test_X, train_y, test_y = train_test_split(
-    X, y, test_size=0.2
-)
+train_X, test_X, train_y, test_y = train_test_split(X, y, test_size=0.2)
 print("Divided the data into testing and training.")
 
 loss_fn = nn.CrossEntropyLoss()
@@ -133,8 +142,7 @@ for epoch in tqdm.trange(EPOCHS):
 
     with torch.no_grad():
         y_pred = model(test_X)
-        correct = (torch.argmax(y_pred, dim=1) ==
-                   test_y).type(torch.FloatTensor)
+        correct = (torch.argmax(y_pred, dim=1) == test_y).type(torch.FloatTensor)
         accuracy_list[epoch] = correct.mean()
 
 fig, (ax1, ax2) = plt.subplots(2, figsize=(12, 6), sharex=True)
@@ -160,16 +168,17 @@ data_path = args.export / "input.json"
 
 x = test_X[0].reshape(1, 4)
 model.eval()
-torch.onnx.export(model,
-                  x,
-                  model_path,
-                  export_params=True,
-                  opset_version=12,
-                  do_constant_folding=True,
-                  input_names=['input'],
-                  output_names=['output'],
-                  dynamic_axes={'input': {0: 'batch_size'},
-                                'output': {0: 'batch_size'}})
+torch.onnx.export(
+    model,
+    x,
+    model_path,
+    export_params=True,
+    opset_version=12,
+    do_constant_folding=True,
+    input_names=["input"],
+    output_names=["output"],
+    dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+)
 
 print(f"Model onnx exported to {model_path}")
 
@@ -203,9 +212,9 @@ for i in range(num_samples):
 data = {
     "input_data": input_data,
     "output_data": output_data,
-    "pytorch_output": pytorch_output
+    "pytorch_output": pytorch_output,
 }
-json.dump(data, open(data_path, 'w'), indent=2)
+json.dump(data, open(data_path, "w"), indent=2)
 print(f"Input/Output data for {num_samples} samples exported to {data_path}")
 
 
@@ -245,26 +254,30 @@ def plot_weight_distribution(model, test_X):
 
     # Create subplots: one row for inputs, then one row per layer
     num_layers = len(all_weights)
-    fig, axes = plt.subplots(
-        num_layers + 1, 2, figsize=(10, 3*(num_layers + 1)))
+    fig, axes = plt.subplots(num_layers + 1, 2, figsize=(10, 3 * (num_layers + 1)))
     if num_layers == 0:
         axes = axes.reshape(1, -1)
 
     # Plot test input distributions
-    input_names = ['sepal length', 'sepal width',
-                   'petal length', 'petal width']
+    input_names = ["sepal length", "sepal width", "petal length", "petal width"]
     for i in range(4):
         input_data = test_X[:, i].numpy()
         i_min, i_max = np.min(input_data), np.max(input_data)
         i_range_pad = (i_max - i_min) * 0.05
         i_x_min, i_x_max = i_min - i_range_pad, i_max + i_range_pad
 
-        axes[0, 0].hist(input_data, bins=50, density=False, alpha=0.7,
-                        label=input_names[i], range=(i_x_min, i_x_max))
+        axes[0, 0].hist(
+            input_data,
+            bins=50,
+            density=False,
+            alpha=0.7,
+            label=input_names[i],
+            range=(i_x_min, i_x_max),
+        )
 
-    axes[0, 0].set_title('Test Input Distribution\nAll Features')
-    axes[0, 0].set_xlabel('Input Value')
-    axes[0, 0].set_ylabel('Count')
+    axes[0, 0].set_title("Test Input Distribution\nAll Features")
+    axes[0, 0].set_xlabel("Input Value")
+    axes[0, 0].set_ylabel("Count")
     axes[0, 0].legend()
     axes[0, 0].grid(True)
 
@@ -275,28 +288,41 @@ def plot_weight_distribution(model, test_X):
         i_range_pad = (i_max - i_min) * 0.05
         i_x_min, i_x_max = i_min - i_range_pad, i_max + i_range_pad
 
-        axes[0, 1].hist(input_data, bins=50, density=False, alpha=0.7,
-                        label=input_names[i], range=(i_x_min, i_x_max))
+        axes[0, 1].hist(
+            input_data,
+            bins=50,
+            density=False,
+            alpha=0.7,
+            label=input_names[i],
+            range=(i_x_min, i_x_max),
+        )
 
-    axes[0, 1].set_title('Test Input Distribution\nIndividual Features')
-    axes[0, 1].set_xlabel('Input Value')
-    axes[0, 1].set_ylabel('Count')
+    axes[0, 1].set_title("Test Input Distribution\nIndividual Features")
+    axes[0, 1].set_xlabel("Input Value")
+    axes[0, 1].set_ylabel("Count")
     axes[0, 1].legend()
     axes[0, 1].grid(True)
 
     # Plot weights and biases for each layer
-    for ax_row, weights, biases, name in zip(axes[1:], all_weights, all_biases, layer_names):
+    for ax_row, weights, biases, name in zip(
+        axes[1:], all_weights, all_biases, layer_names
+    ):
         # Plot weights
         w_min, w_max = np.min(weights), np.max(weights)
         w_range_pad = (w_max - w_min) * 0.05
         w_x_min, w_x_max = w_min - w_range_pad, w_max + w_range_pad
 
-        ax_row[0].hist(weights, bins=50, density=False, alpha=0.7,
-                       label='Count', range=(w_x_min, w_x_max))
-        ax_row[0].set_title(
-            f'Weights - {name}\nMin: {w_min:.3f}, Max: {w_max:.3f}')
-        ax_row[0].set_xlabel('Weight Value')
-        ax_row[0].set_ylabel('Count')
+        ax_row[0].hist(
+            weights,
+            bins=50,
+            density=False,
+            alpha=0.7,
+            label="Count",
+            range=(w_x_min, w_x_max),
+        )
+        ax_row[0].set_title(f"Weights - {name}\nMin: {w_min:.3f}, Max: {w_max:.3f}")
+        ax_row[0].set_xlabel("Weight Value")
+        ax_row[0].set_ylabel("Count")
         ax_row[0].set_xlim(w_x_min, w_x_max)
         ax_row[0].grid(True)
 
@@ -305,18 +331,23 @@ def plot_weight_distribution(model, test_X):
         b_range_pad = (b_max - b_min) * 0.05
         b_x_min, b_x_max = b_min - b_range_pad, b_max + b_range_pad
 
-        ax_row[1].hist(biases, bins=50, density=False, alpha=0.7,
-                       label='Count', range=(b_x_min, b_x_max))
-        ax_row[1].set_title(
-            f'Biases - {name}\nMin: {b_min:.3f}, Max: {b_max:.3f}')
-        ax_row[1].set_xlabel('Bias Value')
-        ax_row[1].set_ylabel('Count')
+        ax_row[1].hist(
+            biases,
+            bins=50,
+            density=False,
+            alpha=0.7,
+            label="Count",
+            range=(b_x_min, b_x_max),
+        )
+        ax_row[1].set_title(f"Biases - {name}\nMin: {b_min:.3f}, Max: {b_max:.3f}")
+        ax_row[1].set_xlabel("Bias Value")
+        ax_row[1].set_ylabel("Count")
         ax_row[1].set_xlim(b_x_min, b_x_max)
         ax_row[1].grid(True)
 
     plt.tight_layout()
     # Save the figure with extra space for legend
-    plt.savefig("weight_distribution.png", bbox_inches='tight', dpi=300)
+    plt.savefig("weight_distribution.png", bbox_inches="tight", dpi=300)
     # Show the plot interactively
     plt.show()
     # Close the figure to free memory
@@ -352,7 +383,7 @@ def evaluate_accuracy(model, test_X, test_y, num_samples):
 
 # Replace the final evaluation with:
 actual_samples = min(args.num_samples, len(test_X))
-print(f"\nEvaluation accuracy on {actual_samples} samples: ", end='')
+print(f"\nEvaluation accuracy on {actual_samples} samples: ", end="")
 accuracy = evaluate_accuracy(model, test_X, test_y, actual_samples)
 print(f"{accuracy:.2f}%")
 
@@ -361,13 +392,13 @@ print(f"{accuracy:.2f}%")
 # Verify accuracy consistency with JSON output
 print("\nVerifying accuracy consistency...")
 try:
-    with open(data_path, 'r') as f:
+    with open(data_path, "r") as f:
         json_data = json.load(f)
 
     json_correct = 0
     json_total = 0
 
-    for truth, pred in zip(json_data['output_data'], json_data['pytorch_output']):
+    for truth, pred in zip(json_data["output_data"], json_data["pytorch_output"]):
         # Get predicted class from model output
         pred_class = max(range(len(pred)), key=lambda i: pred[i])
         # Get true class from one-hot encoded truth
@@ -377,7 +408,8 @@ try:
             json_correct += 1
         json_total += 1
         print(
-            f"Run {json_total}: {pred_class == true_class}\n\t truth {truth}\n\t pytorch {pred}")
+            f"Run {json_total}: {pred_class == true_class}\n\t truth {truth}\n\t pytorch {pred}"
+        )
 
     json_accuracy = 100 * json_correct / json_total
 
@@ -398,7 +430,7 @@ except Exception as e:
 class AverageMeter(object):
     """Computes and stores the average and current value"""
 
-    def __init__(self, name, fmt=':f'):
+    def __init__(self, name, fmt=":f"):
         self.name = name
         self.fmt = fmt
         self.reset()
@@ -416,13 +448,13 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
     def __str__(self):
-        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
 
 
 def evaluate(model, input, target, neval_batches):
     model.eval()
-    top1 = AverageMeter('Acc@1', ':6.2f')
+    top1 = AverageMeter("Acc@1", ":6.2f")
     cnt = 0
     num_samples = len(test_X)
     with torch.no_grad():
@@ -435,7 +467,7 @@ def evaluate(model, input, target, neval_batches):
             if predicted == true_label:
                 correct += 100
             cnt += 1
-            print('.', end='')
+            print(".", end="")
             top1.update(correct)
             if cnt >= neval_batches:
                 return top1
@@ -449,7 +481,7 @@ def print_model_io(model, sample_input):
 
     def hook_fn(layer, inp, out):
         inputs_by_layer[layer] = inp[0].detach()  # Input
-        outputs_by_layer[layer] = out.detach()    # Output
+        outputs_by_layer[layer] = out.detach()  # Output
 
     hooks = []
 
@@ -478,16 +510,18 @@ def print_model_io(model, sample_input):
             # Weights
             if hasattr(layer, "weight"):
                 try:
-                    weight = layer.weight() if callable(layer.weight) else layer.weight.data
+                    weight = (
+                        layer.weight() if callable(layer.weight) else layer.weight.data
+                    )
                 except Exception:
                     weight = layer._weight_bias()[0]
                 print("  Weights:")
 
                 if isinstance(layer, quantized_layers):
                     print(weight.int_repr())
-                    if hasattr(weight, 'q_scale'):
+                    if hasattr(weight, "q_scale"):
                         print("  Weight scale:", weight.q_scale())
-                    if hasattr(weight, 'q_zero_point'):
+                    if hasattr(weight, "q_zero_point"):
                         print("  Weight zero_point:", weight.q_zero_point())
                 else:
                     print(weight)
@@ -524,30 +558,33 @@ model.eval()
 # Start with simple min/max range estimation and per-tensor quantization of weights
 myconfig = torch.ao.quantization.qconfig.QConfig(
     activation=MinMaxObserver.with_args(
-        dtype=torch.quint8, qscheme=torch.per_tensor_symmetric),
-    weight=MinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_tensor_symmetric))
+        dtype=torch.quint8, qscheme=torch.per_tensor_symmetric
+    ),
+    weight=MinMaxObserver.with_args(
+        dtype=torch.qint8, qscheme=torch.per_tensor_symmetric
+    ),
+)
 model.qconfig = myconfig
 print(model.qconfig)
 torch.ao.quantization.prepare(model, inplace=True)
 print("model prepared", model)
 
 # Calibrate first
-print('Post Training Quantization Prepare: Inserting Observers')
+print("Post Training Quantization Prepare: Inserting Observers")
 
 # Calibrate with the training set
 # Create a subset of test data with exactly the same samples used in the JSON
-json_sample_loader = torch.utils.data.DataLoader(
-    test_X, batch_size=1, shuffle=False)
+json_sample_loader = torch.utils.data.DataLoader(test_X, batch_size=1, shuffle=False)
 num_calibration_batches = len(test_X)
 evaluate(model, test_X, test_y, neval_batches=num_calibration_batches)
-print('Post Training Quantization: Calibration done', model)
+print("Post Training Quantization: Calibration done", model)
 
 # Convert to quantized model
 torch.ao.quantization.convert(model, inplace=True)
 # You may see a user warning about needing to calibrate the model. This warning can be safely ignored.
 # This warning occurs because not all modules are run in each model runs, so some
 # modules may not be calibrated.
-print('Post Training Quantization: Convert done', model)
+print("Post Training Quantization: Convert done", model)
 
 
 # num_eval_batches = 1000
@@ -556,14 +593,16 @@ print('Post Training Quantization: Convert done', model)
 # compute_accuracy(net, testloader)
 
 print(
-    f'\nEvaluating accuracy on the same {len(test_X)} samples used in the JSON file...')
+    f"\nEvaluating accuracy on the same {len(test_X)} samples used in the JSON file..."
+)
 json_model_top1 = evaluate(model, test_X, test_y, neval_batches=len(test_X))
 print(
-    f'Model evaluation accuracy on {len(test_X)} JSON samples: {json_model_top1.avg:.2f}%')
+    f"Model evaluation accuracy on {len(test_X)} JSON samples: {json_model_top1.avg:.2f}%"
+)
 
 # 2. Compute accuracy directly from the JSON file
 input_path = args.export / "input.json"
-with open(input_path, 'r') as f:
+with open(input_path, "r") as f:
     json_data = json.load(f)
 
 # Calculate accuracy from the saved outputs in JSON
@@ -581,12 +620,11 @@ for i in range(total_json):
         correct_json += 1
 
 json_accuracy = 100 * correct_json / total_json
-print(f'JSON file accuracy on {total_json} samples: {json_accuracy:.2f}%')
+print(f"JSON file accuracy on {total_json} samples: {json_accuracy:.2f}%")
 
 # Compare the two
-print('\nComparison: Model evaluation vs JSON file accuracy')
-print(
-    f'Model evaluation: {json_model_top1.avg:.2f}% | JSON file: {json_accuracy:.2f}%')
+print("\nComparison: Model evaluation vs JSON file accuracy")
+print(f"Model evaluation: {json_model_top1.avg:.2f}% | JSON file: {json_accuracy:.2f}%")
 
 # Existing accuracy computation on full test set
 accuracy = evaluate_accuracy(model, test_X, test_y, actual_samples)

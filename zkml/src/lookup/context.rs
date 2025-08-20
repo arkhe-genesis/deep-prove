@@ -807,7 +807,7 @@ impl LookupContext {
         E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E>,
     {
-        // First we retireve the multiplicity polynomials
+        // First we retrieve the multiplicity polynomials
         let mulitplicity_polys =
             PCS::get_arc_mle_witness_from_commitment(multiplicities_commitment);
         self.iter()
@@ -944,7 +944,7 @@ where
     let metrics = Metrics::new();
     // calculate the table multiplicities
 
-    let multiplicites = witness_gen
+    let multiplicities = witness_gen
         .element_count
         .par_iter()
         .map(|(table_type, table_lookup_data)| {
@@ -1005,7 +1005,7 @@ where
         .sorted_by(|a, b| Ord::cmp(&b.0, &a.0))
         .fold((vec![], 0), |(mut acc, skip), (_, take)| {
             let transposed = transpose(
-                multiplicites
+                multiplicities
                     .iter()
                     .skip(skip)
                     .take(take)

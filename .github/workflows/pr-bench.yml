@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ['nix']
     permissions:
       pull-requests: read
     outputs:
@@ -31,7 +31,7 @@ jobs:
               - '.github/workflows/pr-bench.yml'
 
   benchmark_pr_branch:
-    name: Continuous Benchmarking PRs with Bencher
+    name: PR Benchmarking
     needs: changes
     # DO NOT REMOVE: For handling Fork PRs see Pull Requests from Forks
     if: |
@@ -42,10 +42,12 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
+          clean: "false"
           lfs: 'true'
           submodules: "recursive"
+
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -53,16 +55,9 @@ jobs:
             zkml_src:
               - 'zkml/**'
               - '.github/workflows/pr-bench.yml'
-      - name: Install protoc via apt
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy
-          # Manually configure rust-cache
-          cache: false
+
       - uses: bencherdev/bencher@main
-      - name: Track PR Benchmarks with Bencher
+        shell: devenv shell bash -- -e {0}
         run: |
           cd zkml && \
           bencher run \

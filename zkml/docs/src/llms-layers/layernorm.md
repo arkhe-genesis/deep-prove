@@ -24,7 +24,7 @@ To see why we do this consider the following example. We pick two numbers $`3.43
 
 ## Quantised Evaluation
 
-The main difficuly comes from computing the inverse square root term. For this we use a lookup table that takes as input $`\sum_{l=1}^{n}n\cdot A_{i,l}^{2} -\mu_{i}^{2}`$ and outputs $`D_{i} = (\sum_{l=1}^{n}n\cdot A_{i,l}^{2} -\mu_{i}^{2} + \epsilon)^{-1/2}`$. The final layer output is then calculated by performing the multiplication $`\gamma\cdot (n\cdot A_{i,j} - \mu_{i})\cdot D_{i} + \beta`$. 
+The main difficulty comes from computing the inverse square root term. For this we use a lookup table that takes as input $`\sum_{l=1}^{n}n\cdot A_{i,l}^{2} -\mu_{i}^{2}`$ and outputs $`D_{i} = (\sum_{l=1}^{n}n\cdot A_{i,l}^{2} -\mu_{i}^{2} + \epsilon)^{-1/2}`$. The final layer output is then calculated by performing the multiplication $`\gamma\cdot (n\cdot A_{i,j} - \mu_{i})\cdot D_{i} + \beta`$. 
 
 This output involves a degree 4 multiplication and so the bit size of the output is large, too large to apply our normal requantisation technique of applying $`m = s_{\mathrm{in}}/s_{\mathrm{out}}`$ via its normal form $`m = 2^{-t}\cdot \epsilon`$ using a fixed pointsclae factor. To still allow us to perform a requantisation we set $`s_{\mathrm{out}}`$ to be such that the requantisation requires only a right shift (i.e. we pick $`s_{\mathrm{out}}`$ such that $`\epsilon = 1`$).
 
@@ -43,7 +43,7 @@ $$ \begin{align*} \hat{\mu}(r_{1},\dots, r_{k}) = \sum_{b\in\mathcal{B}_{k}}2^{\
 
 ### Step-by-Step
 
-The prover recieves the input tensor $`A`$ and its corresponding MLE $`A(\bar{x})`$. They use this to compute the input to the lookup table $`\mathrm{LookupIn}`$ and output of the lookup table $`D`$ together with their corresponding MLEs $`\mathrm{LookupIn}(\bar{x})`$ and $`D(\bar{x})`$. 
+The prover receives the input tensor $`A`$ and its corresponding MLE $`A(\bar{x})`$. They use this to compute the input to the lookup table $`\mathrm{LookupIn}`$ and output of the lookup table $`D`$ together with their corresponding MLEs $`\mathrm{LookupIn}(\bar{x})`$ and $`D(\bar{x})`$. 
 
 To compute $`\mathrm{LookupIn}`$ the prover calculates $`\sum_{l=1}^{n}n\cdot A_{i,l}^{2} -\mu_{i}^{2}`$. The outputs of this sum have large bit size, too large for a single lookup table, so if the quantisation bit length is $`b_{q}`$ we use the fact that only the most significant $`2b_{q}`$ bits of the sum have any real precision (any bits less significant than this are calculated via terms that involve rounding error). We split the most significant $`2b_{q}`$ (see [this](./layernorm.md#precision) for more info) bits of the sum off to become $`\mathrm{LookupIn}`$ and range check the remainder.
 

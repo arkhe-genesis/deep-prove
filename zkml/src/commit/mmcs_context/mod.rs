@@ -46,7 +46,7 @@ where
     model_comms_map: BTreeMap<usize, Vec<(NodeId, PolyId)>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
-    /// This is the [`Expression`] used in the sumcheck so that everything is evalauted at the same point
+    /// This is the [`Expression`] used in the sumcheck so that everything is evaluated at the same point
     sumcheck_expression: Expression<E>,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
@@ -251,7 +251,7 @@ where
     model_comms_map: BTreeMap<usize, Vec<(NodeId, PolyId)>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
-    /// This is the [`Expression`] used in the sumcheck so that everything is evalauted at the same point
+    /// This is the [`Expression`] used in the sumcheck so that everything is evaluated at the same point
     sumcheck_expression: Expression<E>,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
@@ -323,7 +323,7 @@ where
     model_comms_map: BTreeMap<usize, Vec<(NodeId, PolyId)>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
-    /// This is the [`Expression`] used in the sumcheck so that everything is evalauted at the same point
+    /// This is the [`Expression`] used in the sumcheck so that everything is evaluated at the same point
     sumcheck_expression: Expression<E>,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,

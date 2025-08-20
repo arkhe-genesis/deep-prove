@@ -143,7 +143,7 @@ impl Model<Element> {
         Ok((ModelCtx { nodes: step_infos }, commitment_ctx, lookup))
     }
 
-    /// Compute the size of the biggest polynomial to be commited for the given `input_shape`
+    /// Compute the size of the biggest polynomial to be committed for the given `input_shape`
     pub(crate) fn compute_max_poly_size<E: ExtensionField>(
         &self,
         input_shapes: &[Shape],

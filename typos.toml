@@ -2,6 +2,6 @@
 extend-exclude = ["*.nix"]
 
 [default]
-format = "brief"
 check-filename = true
-extend-identifiers = {"Ein" = "Ein", "EinSum" = "EinSum", "NdArray" = "NdArray"}
+extend-identifiers = { "Ein" = "Ein", "EinSum" = "EinSum", "NdArray" = "NdArray" }
+format = "brief"

@@ -1,4 +1,4 @@
-//! Module containg code to verify a [`ModelOpeningProof`].
+//! Module containing code to verify a [`ModelOpeningProof`].
 
 use super::{CommitmentVerifierCtx, ModelOpeningProof, PolyId};
 use crate::{Claim, commit::identity_eval, layers::provable::NodeId, lookup::context::TableType};
@@ -138,7 +138,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
         } else {
             ensure!(
                 sumcheck_proof.proofs.is_empty() && sumcheck_evals.is_empty(),
-                "There was noe Model Commitment but the Model Sumcheck proof was not trivial"
+                "There was no Model Commitment but the Model Sumcheck proof was not trivial"
             );
         }
         // Run the PCS batch_verify protocol
@@ -242,7 +242,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
             subclaim.expected_evaluation
         );
 
-        // Now we build the VerfierClaim for the model
+        // Now we build the VerifierClaim for the model
         let (model_claim, _) = commit_ctx.model_comms_map.iter().rev().fold(
             (vec![], 0),
             |(mut claim_acc, skip), (&nv, claim_keys)| {

@@ -29,7 +29,7 @@ use super::{
 /// `transcript` - an implementor of [`Transcript`]
 ///
 /// The function works because after the different challenges have been applied to the columns all LogUp instances look the same.
-/// Hence in each round of the GKR we can prove all the sumchecks together, reducing the proof size and the verificaiton cost.
+/// Hence in each round of the GKR we can prove all the sumchecks together, reducing the proof size and the verification cost.
 ///
 /// To handle instances of differeing size we require that the values in `input` are ordered in a decreasing number of variables. Then
 /// the largest instances begin proving in the first round with smaller instances being "rolled in" at the correct point so that every instance
@@ -144,7 +144,7 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
     for current_layer_vars in 1..=total_layers {
         let remaining_layers = total_layers - (current_layer_vars - 1);
         // Here we check to see if any of the smaller instances need to be folded in this round.
-        // If so we extend the last set of `round_evaluations` by the inital evaluations of the instances that are about to start proving.
+        // If so we extend the last set of `round_evaluations` by the initial evaluations of the instances that are about to start proving.
         let wit_evals = if let Some(evals) = round_evaluations.last() {
             let new_evals = output_evals.get(&remaining_layers);
             if let Some(new_evals) = new_evals {

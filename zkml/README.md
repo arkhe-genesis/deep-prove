@@ -27,7 +27,7 @@ This is a research driven project and the codebase is improving on a fast pace. 
 
 **Accuracy**:
 - [x] Layer-wise requantization (a single scaling factor per layer)
-- [ ] Allowing BIT_LEN to grow without loosing performance (lookup related)
+- [ ] Allowing BIT_LEN to grow without losing performance (lookup related)
 - [ ] Add supports for row-wise quantization for each layer to provide better accuracy
 
 **Performance**:

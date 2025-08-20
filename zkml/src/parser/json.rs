@@ -366,7 +366,7 @@ impl FileTensorLoader {
 #[cfg(test)]
 pub mod test {
     use crate::parser::llm::LLMConfig;
-    use std::{env, path::PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -378,16 +378,11 @@ pub mod test {
     pub const DISTIL_GPT2_DEBUG_NAME: &str = "distilgpt2_debug_output.json";
 
     pub fn get_json_file(name: &str) -> anyhow::Result<String> {
-        let path = if env::var("DEEPPROVE_CI").unwrap_or_default() == "true" {
-            let ci_asset_dir = env::var("DEEPPROVE_ASSET_DIR")
-                .context("DEEPPROVE_ASSET_DIR not set in CI environment")?;
-            PathBuf::from(ci_asset_dir).join(name)
-        } else {
-            PathBuf::from("assets/scripts/llms/").join(name)
-        };
+        let path = PathBuf::from("assets/scripts/llms/").join(name);
         assert!(
             path.exists(),
-            "Missing model locally, create a venv and run `python3 gpt2_internal.py --output-dir ./assets/scripts/llms/ --export-model` to retrieve it",
+            "Missing model `{}` run `python3 gpt2_internal.py --output-dir ./assets/scripts/llms/ --export-model`",
+            path.display()
         );
         Ok(path.to_str().unwrap().to_string())
     }

@@ -69,29 +69,47 @@ import json
 import argparse
 from pathlib import Path
 from torch.utils.data import Subset
+
 print(torch.backends.quantized.supported_engines)
-torch.backends.quantized.engine = 'qnnpack'
+torch.backends.quantized.engine = "qnnpack"
 # Add argument parser similar to mlp.py
 parser = argparse.ArgumentParser(description="CIFAR10 CNN with ONNX export")
-parser.add_argument("--export", type=Path, default=Path('bench'),
-                    help="Directory to export the model to (default: bench)")
-parser.add_argument("--num-samples", type=int, default=100,
-                    help="Number of test samples to export")
-parser.add_argument("--num-params", type=int, default=None,
-                    help="Target number of parameters for the model (default: None, uses default model)")
-parser.add_argument("--distribution", action="store_true",
-                    help="Show distribution of model weights")
-parser.add_argument("--without-bias", action="store_true",
-                    help="Don't use bias in the layers of the model (optional)")
-parser.add_argument("--without-maxpool", action="store_true",
-                    help="Don't use maxpool layers in the model (optional)")
+parser.add_argument(
+    "--export",
+    type=Path,
+    default=Path("bench"),
+    help="Directory to export the model to (default: bench)",
+)
+parser.add_argument(
+    "--num-samples", type=int, default=100, help="Number of test samples to export"
+)
+parser.add_argument(
+    "--num-params",
+    type=int,
+    default=None,
+    help="Target number of parameters for the model (default: None, uses default model)",
+)
+parser.add_argument(
+    "--distribution", action="store_true", help="Show distribution of model weights"
+)
+parser.add_argument(
+    "--without-bias",
+    action="store_true",
+    help="Don't use bias in the layers of the model (optional)",
+)
+parser.add_argument(
+    "--without-maxpool",
+    action="store_true",
+    help="Don't use maxpool layers in the model (optional)",
+)
 
 args = parser.parse_args()
 
 # Ensure the export folder exists
 if not args.export.exists() or not args.export.is_dir():
     print(
-        f"❌ Error: export folder '{args.export}' does not exist or is not a directory.")
+        f"❌ Error: export folder '{args.export}' does not exist or is not a directory."
+    )
     exit(1)
 
 # Add after parser section
@@ -111,31 +129,40 @@ print(f"📊 Will export {args.num_samples} samples as input/output pairs\n")
 print("📦 Preparing data transformations...")
 
 transform = transforms.Compose(
-    [transforms.ToTensor(),
-     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+    [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+)
 
 batch_size = 4
 
 # Add before trainset
 print("🔽 Loading and preparing training dataset...")
 
-trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                        download=True, transform=transform)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
-                                          shuffle=True)
+trainset = torchvision.datasets.CIFAR10(
+    root="./data", train=True, download=True, transform=transform
+)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True)
 
-testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                       download=True, transform=transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                         shuffle=False)
+testset = torchvision.datasets.CIFAR10(
+    root="./data", train=False, download=True, transform=transform
+)
+testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False)
 
-classes = ('plane', 'car', 'bird', 'cat',
-           'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+classes = (
+    "plane",
+    "car",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
+)
 
 # Add after classes definition
 print("✅ Datasets loaded successfully")
-print(
-    f"👉 CIFAR10 has {len(trainset)} training images and {len(testset)} test images")
+print(f"👉 CIFAR10 has {len(trainset)} training images and {len(testset)} test images")
 print(f"👉 {len(classes)} classes: {', '.join(classes)}\n")
 
 ########################################################################
@@ -146,7 +173,7 @@ print(f"👉 {len(classes)} classes: {', '.join(classes)}\n")
 
 
 def imshow(img):
-    img = img / 2 + 0.5     # unnormalize
+    img = img / 2 + 0.5  # unnormalize
     npimg = img.numpy()
     plt.imshow(np.transpose(npimg, (1, 2, 0)))
     plt.show()
@@ -162,7 +189,7 @@ images, labels = next(dataiter)
 # show images
 # imshow(torchvision.utils.make_grid(images))
 # print labels
-print(' '.join(f'{classes[labels[j]]:5s}' for j in range(batch_size)))
+print(" ".join(f"{classes[labels[j]]:5s}" for j in range(batch_size)))
 
 
 ########################################################################
@@ -176,7 +203,7 @@ def estimate_params(c1, c2, fc1, fc2, fc3, use_bias=True, use_maxpool=True):
     bias_term = 1 if use_bias else 0
     conv1_params = (3 * 5 * 5 + bias_term) * c1
     conv2_params = (c1 * 5 * 5 + bias_term) * c2
-    
+
     # Calculate the size of the flattened features after conv layers
     if use_maxpool:
         # With maxpool: 32x32 -> 16x16 -> 8x8
@@ -184,7 +211,7 @@ def estimate_params(c1, c2, fc1, fc2, fc3, use_bias=True, use_maxpool=True):
     else:
         # Without maxpool: 32x32 -> 28x28 -> 24x24
         flattened_size = c2 * 24 * 24
-        
+
     fc1_params = (flattened_size + bias_term) * fc1
     fc2_params = (fc1 + bias_term) * fc2
     fc3_params = (fc2 + bias_term) * fc3
@@ -201,24 +228,35 @@ class Net(nn.Module):
 
         if target_params:
             # Adjust parameters iteratively to fit within target
-            scale = (target_params / estimate_params(c1, c2, fc1, fc2, fc3, use_bias=use_bias, use_maxpool=use_maxpool)) ** 0.5
+            scale = (
+                target_params
+                / estimate_params(
+                    c1, c2, fc1, fc2, fc3, use_bias=use_bias, use_maxpool=use_maxpool
+                )
+            ) ** 0.5
             c1, c2 = int(c1 * scale), int(c2 * scale)
             fc1, fc2 = int(fc1 * scale), int(fc2 * scale)
 
             # Recalculate to get final parameter count
-            final_params = estimate_params(c1, c2, fc1, fc2, fc3, use_bias=use_bias, use_maxpool=use_maxpool)
-            
+            final_params = estimate_params(
+                c1, c2, fc1, fc2, fc3, use_bias=use_bias, use_maxpool=use_maxpool
+            )
+
             # Print detailed parameter breakdown before assertion
             print("\n📊 Parameter Count Breakdown:")
             print(f"  Target parameters: {target_params:,}")
             print(f"  Final parameters: {final_params:,}")
             print(f"  Difference: {abs(final_params - target_params):,}")
-            print(f"  Percentage difference: {abs(final_params - target_params) / target_params * 100:.2f}%")
+            print(
+                f"  Percentage difference: {abs(final_params - target_params) / target_params * 100:.2f}%"
+            )
             print("\nLayer-wise breakdown:")
             bias_term = 1 if use_bias else 0
             conv1_params = (3 * 5 * 5 + bias_term) * c1
             conv2_params = (c1 * 5 * 5 + bias_term) * c2
-            flattened_size = c2 * (5 if use_maxpool else 24) * (5 if use_maxpool else 24)
+            flattened_size = (
+                c2 * (5 if use_maxpool else 24) * (5 if use_maxpool else 24)
+            )
             fc1_params = (flattened_size + bias_term) * fc1
             fc2_params = (fc1 + bias_term) * fc2
             fc3_params = (fc2 + bias_term) * fc3
@@ -227,16 +265,24 @@ class Net(nn.Module):
             print(f"  FC1: {fc1_params:,} parameters")
             print(f"  FC2: {fc2_params:,} parameters")
             print(f"  FC3: {fc3_params:,} parameters")
-            print(f"  Total: {conv1_params + conv2_params + fc1_params + fc2_params + fc3_params:,} parameters")
-            
-            assert abs(final_params - target_params) / target_params <= 0.05, "Final params exceed 5% tolerance"
+            print(
+                f"  Total: {conv1_params + conv2_params + fc1_params + fc2_params + fc3_params:,} parameters"
+            )
+
+            assert (
+                abs(final_params - target_params) / target_params <= 0.05
+            ), "Final params exceed 5% tolerance"
 
         # Create layers with or without bias based on use_bias parameter
         self.quant = QuantStub()
         self.conv1 = nn.Conv2d(3, c1, 5, bias=use_bias)
         self.pool = nn.MaxPool2d(2, 2) if use_maxpool else nn.Identity()
         self.conv2 = nn.Conv2d(c1, c2, 5, bias=use_bias)
-        self.fc1 = nn.Linear(c2 * (5 if use_maxpool else 24) * (5 if use_maxpool else 24), fc1, bias=use_bias)
+        self.fc1 = nn.Linear(
+            c2 * (5 if use_maxpool else 24) * (5 if use_maxpool else 24),
+            fc1,
+            bias=use_bias,
+        )
         self.fc2 = nn.Linear(fc1, fc2, bias=use_bias)
         self.fc3 = nn.Linear(fc2, fc3, bias=use_bias)
         self.dequant = DeQuantStub()
@@ -277,9 +323,13 @@ class Net(nn.Module):
 with_bias = not args.without_bias
 use_maxpool = not args.without_maxpool
 if args.num_params:
-    print(f"🏗️ Initializing neural network with target parameter count: {args.num_params:,}...")
+    print(
+        f"🏗️ Initializing neural network with target parameter count: {args.num_params:,}..."
+    )
     try:
-        net = Net(target_params=args.num_params, use_bias=with_bias, use_maxpool=use_maxpool)
+        net = Net(
+            target_params=args.num_params, use_bias=with_bias, use_maxpool=use_maxpool
+        )
         total_params = sum(p.numel() for p in net.parameters())
         print(f"✅ Model created with {total_params:,} parameters")
         print(f"   Conv1: {net.conv1.out_channels} channels")
@@ -289,7 +339,9 @@ if args.num_params:
         print(f"   Using bias: {with_bias}")
     except AssertionError as e:
         print(f"❌ Error: {e}")
-        print(f"Using default model instead with bias: {with_bias} and maxpool: {use_maxpool}.")
+        print(
+            f"Using default model instead with bias: {with_bias} and maxpool: {use_maxpool}."
+        )
         net = Net(use_bias=with_bias, use_maxpool=use_maxpool)  # Use default parameters
 else:
     print("🏗️ Initializing default neural network...")
@@ -341,11 +393,11 @@ for epoch in range(2):  # loop over the dataset multiple times
 
         # print statistics
         running_loss += loss.item()
-        if i % 500 == 499:    # print more frequently
-            print(f'    Batch {i+1:5d} - Loss: {running_loss / 500:.4f}')
+        if i % 500 == 499:  # print more frequently
+            print(f"    Batch {i+1:5d} - Loss: {running_loss / 500:.4f}")
             running_loss = 0.0
 
-print('Finished Training')
+print("Finished Training")
 
 # Add before saving model
 print("\n💾 Training complete! Saving model...")
@@ -353,7 +405,7 @@ print("\n💾 Training complete! Saving model...")
 ########################################################################
 # Let's quickly save our trained model:
 
-PATH = './cifar_net.pth'
+PATH = "./cifar_net.pth"
 torch.save(net.state_dict(), PATH)
 
 ########################################################################
@@ -361,10 +413,17 @@ torch.save(net.state_dict(), PATH)
 net.eval()
 dummy_input = torch.randn(1, 3, 32, 32)
 model_path = args.export / "model.onnx"
-torch.onnx.export(net, dummy_input, model_path, export_params=True, opset_version=12,
-                  do_constant_folding=True, input_names=['input'], output_names=['output'],
-                  dynamic_axes={'input': {0: 'batch_size'},
-                                'output': {0: 'batch_size'}})
+torch.onnx.export(
+    net,
+    dummy_input,
+    model_path,
+    export_params=True,
+    opset_version=12,
+    do_constant_folding=True,
+    input_names=["input"],
+    output_names=["output"],
+    dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+)
 
 print(f"Model onnx exported to {model_path}")
 
@@ -389,7 +448,7 @@ images, labels = next(dataiter)
 
 # print images
 # imshow(torchvision.utils.make_grid(images))
-print('GroundTruth: ', ' '.join(f'{classes[labels[j]]:5s}' for j in range(4)))
+print("GroundTruth: ", " ".join(f"{classes[labels[j]]:5s}" for j in range(4)))
 
 ########################################################################
 # Okay, now let us see what the neural network thinks these examples above are:
@@ -403,8 +462,7 @@ outputs = net(images)
 # So, let's get the index of the highest energy:
 _, predicted = torch.max(outputs, 1)
 
-print('Predicted: ', ' '.join(f'{classes[predicted[j]]:5s}'
-                              for j in range(4)))
+print("Predicted: ", " ".join(f"{classes[predicted[j]]:5s}" for j in range(4)))
 
 ########################################################################
 # The results seem pretty good.
@@ -427,7 +485,8 @@ def compute_accuracy(model, data_loader):
             correct += (predicted == labels).sum().item()
 
     print(
-        f'Accuracy of the network on the 10000 test images: {100 * correct // total} %')
+        f"Accuracy of the network on the 10000 test images: {100 * correct // total} %"
+    )
 
 
 compute_accuracy(net, testloader)
@@ -460,7 +519,7 @@ with torch.no_grad():
 # print accuracy for each class
 for classname, correct_count in correct_pred.items():
     accuracy = 100 * float(correct_count) / total_pred[classname]
-    print(f'Accuracy for class: {classname:5s} is {accuracy:.1f} %')
+    print(f"Accuracy for class: {classname:5s} is {accuracy:.1f} %")
 
 ########################################################################
 # Okay, so what next?
@@ -475,7 +534,7 @@ for classname, correct_count in correct_pred.items():
 # Let's first define our device as the first visible cuda device if we have
 # CUDA available:
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Assuming that we are on a CUDA machine, this should print a CUDA device:
 
@@ -577,11 +636,11 @@ for i in sample_indices:
 data = {
     "input_data": input_data,
     "output_data": output_data,
-    "pytorch_output": pytorch_output
+    "pytorch_output": pytorch_output,
 }
 
 input_path = args.export / "input.json"
-json.dump(data, open(input_path, 'w'), indent=2)
+json.dump(data, open(input_path, "w"), indent=2)
 print(f"Input/Output data for {num_samples} samples exported to {input_path}")
 
 
@@ -599,8 +658,7 @@ def plot_weight_distribution(model):
             layer_names.append(f"{name}")
 
     # Create subplots for each layer
-    fig, axes = plt.subplots(
-        len(all_weights), 1, figsize=(12, 4*len(all_weights)))
+    fig, axes = plt.subplots(len(all_weights), 1, figsize=(12, 4 * len(all_weights)))
     if len(all_weights) == 1:
         axes = [axes]
 
@@ -615,21 +673,28 @@ def plot_weight_distribution(model):
         x_max = w_max + range_pad
 
         # Plot histogram with dynamic range
-        ax.hist(weights, bins=50, density=False, alpha=0.7,
-                label='Count', range=(x_min, x_max))
+        ax.hist(
+            weights,
+            bins=50,
+            density=False,
+            alpha=0.7,
+            label="Count",
+            range=(x_min, x_max),
+        )
 
         ax.set_title(
-            f'Weight Distribution - {name}\nMin: {w_min:.3f}, Max: {w_max:.3f}')
-        ax.set_xlabel('Weight Value')
-        ax.set_ylabel('Count')
+            f"Weight Distribution - {name}\nMin: {w_min:.3f}, Max: {w_max:.3f}"
+        )
+        ax.set_xlabel("Weight Value")
+        ax.set_ylabel("Count")
         ax.set_xlim(x_min, x_max)  # Set dynamic x-axis limits
         # Position legend outside the plot
-        ax.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+        ax.legend(loc="upper right", bbox_to_anchor=(1.15, 1))
         ax.grid(True)
 
     plt.tight_layout()
     # Save the figure with extra space for legend
-    plt.savefig("weight_distribution.png", bbox_inches='tight', dpi=300)
+    plt.savefig("weight_distribution.png", bbox_inches="tight", dpi=300)
     # Show the plot interactively
     plt.show()
     # Close the figure to free memory
@@ -648,7 +713,7 @@ if args.distribution:
 class AverageMeter(object):
     """Computes and stores the average and current value"""
 
-    def __init__(self, name, fmt=':f'):
+    def __init__(self, name, fmt=":f"):
         self.name = name
         self.fmt = fmt
         self.reset()
@@ -666,7 +731,7 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
     def __str__(self):
-        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
 
 
@@ -696,12 +761,12 @@ def compare_accuracy(model, criterion, json_path):
     print("\nEvaluating model on JSON inputs...")
 
     try:
-        with open(json_path, 'r') as f:
+        with open(json_path, "r") as f:
             data = json.load(f)
 
-        input_data = data['input_data']
-        truth_data = data['output_data']
-        stored_outputs = data['pytorch_output']
+        input_data = data["input_data"]
+        truth_data = data["output_data"]
+        stored_outputs = data["pytorch_output"]
 
         total_samples = len(input_data)
         model_correct = 0
@@ -724,8 +789,9 @@ def compare_accuracy(model, criterion, json_path):
             true_labels = [t.index(1.0) for t in batch_truth]
 
             # Get predictions from stored outputs
-            stored_preds = [max(range(len(out)), key=lambda i: out[i])
-                            for out in batch_stored]
+            stored_preds = [
+                max(range(len(out)), key=lambda i: out[i]) for out in batch_stored
+            ]
 
             # Get live model predictions
             with torch.no_grad():
@@ -733,13 +799,15 @@ def compare_accuracy(model, criterion, json_path):
                 _, model_preds = torch.max(model_output, 1)
 
             # Update accuracy counters
-            model_correct += sum(pred.item() == true
-                                 for pred, true in zip(model_preds, true_labels))
-            stored_correct += sum(pred == true
-                                  for pred, true in zip(stored_preds, true_labels))
+            model_correct += sum(
+                pred.item() == true for pred, true in zip(model_preds, true_labels)
+            )
+            stored_correct += sum(
+                pred == true for pred, true in zip(stored_preds, true_labels)
+            )
 
             # Print progress
-            print(f"Processed {end_idx}/{total_samples} samples", end='\r')
+            print(f"Processed {end_idx}/{total_samples} samples", end="\r")
 
         # Calculate accuracies
         model_accuracy = 100 * model_correct / total_samples
@@ -752,8 +820,7 @@ def compare_accuracy(model, criterion, json_path):
         # Allow for minor floating point differences
         if abs(model_accuracy - stored_accuracy) > 0.01:
             print("\n⚠️  WARNING: Accuracy mismatch detected!")
-            print(
-                f"    Difference: {abs(model_accuracy - stored_accuracy):.2f}%")
+            print(f"    Difference: {abs(model_accuracy - stored_accuracy):.2f}%")
         else:
             print("\n✅ Model consistency verified: accuracies match")
 
@@ -773,8 +840,8 @@ if model_acc is not None:
 
 def evaluate(model, criterion, data_loader, neval_batches):
     model.eval()
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
+    top1 = AverageMeter("Acc@1", ":6.2f")
+    top5 = AverageMeter("Acc@5", ":6.2f")
     cnt = 0
     with torch.no_grad():
         for image, target in data_loader:
@@ -782,7 +849,7 @@ def evaluate(model, criterion, data_loader, neval_batches):
             _ = criterion(output, target)
             cnt += 1
             acc1, acc5 = topk_accuracy(output, target, topk=(1, 5))
-            print('.', end='')
+            print(".", end="")
             top1.update(acc1[0], image.size(0))
             top5.update(acc5[0], image.size(0))
             if cnt >= neval_batches:
@@ -797,7 +864,7 @@ def print_model_io(model, sample_input):
 
     def hook_fn(layer, inp, out):
         inputs_by_layer[layer] = inp[0].detach()  # Input
-        outputs_by_layer[layer] = out.detach()    # Output
+        outputs_by_layer[layer] = out.detach()  # Output
 
     hooks = []
 
@@ -826,16 +893,18 @@ def print_model_io(model, sample_input):
             # Weights
             if hasattr(layer, "weight"):
                 try:
-                    weight = layer.weight() if callable(layer.weight) else layer.weight.data
+                    weight = (
+                        layer.weight() if callable(layer.weight) else layer.weight.data
+                    )
                 except Exception:
                     weight = layer._weight_bias()[0]
                 print("  Weights:")
 
                 if isinstance(layer, quantized_layers):
                     print(weight.int_repr())
-                    if hasattr(weight, 'q_scale'):
+                    if hasattr(weight, "q_scale"):
                         print("  Weight scale:", weight.q_scale())
-                    if hasattr(weight, 'q_zero_point'):
+                    if hasattr(weight, "q_zero_point"):
                         print("  Weight zero_point:", weight.q_zero_point())
                 else:
                     print(weight)
@@ -873,8 +942,12 @@ net.eval()
 # Start with simple min/max range estimation and per-tensor quantization of weights
 myconfig = torch.ao.quantization.qconfig.QConfig(
     activation=MinMaxObserver.with_args(
-        dtype=torch.quint8, qscheme=torch.per_tensor_symmetric),
-    weight=MinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_tensor_symmetric))
+        dtype=torch.quint8, qscheme=torch.per_tensor_symmetric
+    ),
+    weight=MinMaxObserver.with_args(
+        dtype=torch.qint8, qscheme=torch.per_tensor_symmetric
+    ),
+)
 net.qconfig = myconfig
 print(net.qconfig)
 torch.ao.quantization.prepare(net, inplace=True)
@@ -887,20 +960,21 @@ print("model prepared", net)
 
 # Create a subset of test data with exactly the same samples used in the JSON
 json_sample_dataset = Subset(testset, sample_indices)
-json_sample_loader = torch.utils.data.DataLoader(json_sample_dataset, batch_size=batch_size, shuffle=False)
+json_sample_loader = torch.utils.data.DataLoader(
+    json_sample_dataset, batch_size=batch_size, shuffle=False
+)
 # Calibrate first
-print('Post Training Quantization Prepare: Inserting Observers')
+print("Post Training Quantization Prepare: Inserting Observers")
 num_calibration_batches = len(json_sample_loader)
-evaluate(net, criterion, json_sample_loader,
-         neval_batches=num_calibration_batches)
-print('Post Training Quantization: Calibration done', net)
+evaluate(net, criterion, json_sample_loader, neval_batches=num_calibration_batches)
+print("Post Training Quantization: Calibration done", net)
 
 # Convert to quantized model
 torch.ao.quantization.convert(net, inplace=True)
 # You may see a user warning about needing to calibrate the model. This warning can be safely ignored.
 # This warning occurs because not all modules are run in each model runs, so some
 # modules may not be calibrated.
-print('Post Training Quantization: Convert done', net)
+print("Post Training Quantization: Convert done", net)
 
 # num_eval_batches = 1000
 # top1, top5 = evaluate(net, criterion, testloader, neval_batches=num_eval_batches)
@@ -908,15 +982,18 @@ print('Post Training Quantization: Convert done', net)
 # compute_accuracy(net, testloader)
 
 print(
-    f'\nEvaluating accuracy on the same {len(sample_indices)} samples used in the JSON file...')
+    f"\nEvaluating accuracy on the same {len(sample_indices)} samples used in the JSON file..."
+)
 json_model_top1, json_model_top5 = evaluate(
-    net, criterion, json_sample_loader, neval_batches=len(json_sample_loader))
+    net, criterion, json_sample_loader, neval_batches=len(json_sample_loader)
+)
 print(
-    f'Model evaluation accuracy on {len(sample_indices)} JSON samples: {json_model_top1.avg:.2f}%')
+    f"Model evaluation accuracy on {len(sample_indices)} JSON samples: {json_model_top1.avg:.2f}%"
+)
 
 # 2. Compute accuracy directly from the JSON file
 input_path = args.export / "input.json"
-with open(input_path, 'r') as f:
+with open(input_path, "r") as f:
     json_data = json.load(f)
 
 # Calculate accuracy from the saved outputs in JSON
@@ -934,12 +1011,11 @@ for i in range(total_json):
         correct_json += 1
 
 json_accuracy = 100 * correct_json / total_json
-print(f'JSON file accuracy on {total_json} samples: {json_accuracy:.2f}%')
+print(f"JSON file accuracy on {total_json} samples: {json_accuracy:.2f}%")
 
 # Compare the two
-print('\nComparison: Model evaluation vs JSON file accuracy')
-print(
-    f'Model evaluation: {json_model_top1.avg:.2f}% | JSON file: {json_accuracy:.2f}%')
+print("\nComparison: Model evaluation vs JSON file accuracy")
+print(f"Model evaluation: {json_model_top1.avg:.2f}% | JSON file: {json_accuracy:.2f}%")
 
 # Existing accuracy computation on full test set
 # compute_accuracy(net, testloader)
@@ -951,11 +1027,11 @@ print("\n📊 Quantization Parameters:")
 print("\n🔍 Model Quantization Details:")
 for name, module in net.named_modules():
     # Check for packed parameters (common in quantized modules)
-    if hasattr(module, '_packed_params'):
+    if hasattr(module, "_packed_params"):
         print(f"\n🧰 Packed Module: {name}")
 
         # Try to extract packed parameters information
-        if hasattr(module._packed_params, 'unpack'):
+        if hasattr(module._packed_params, "unpack"):
             try:
                 # For some modules like Conv2d, we can unpack to get scales
                 unpacked = module._packed_params.unpack()
@@ -967,18 +1043,18 @@ for name, module in net.named_modules():
                 print(f"  Unable to unpack parameters for {name}: {e}")
 
     # Try to access quantization scheme and parameters
-    if hasattr(module, 'qscheme'):
+    if hasattr(module, "qscheme"):
         print(f"\n📐 Module with qscheme: {name}")
         print(f"  Quantization scheme: {module.qscheme()}")
 
 # Print state dict items that might contain quantization info
 print("\n📝 State Dict Quantization Parameters:")
 for key, value in net.state_dict().items():
-    if 'scale' in key or 'zero_point' in key:
+    if "scale" in key or "zero_point" in key:
         print(f"  {key}: {value}")
 
 # Print overall model quant config
-if hasattr(net, 'qconfig'):
+if hasattr(net, "qconfig"):
     print("\n⚙️ Model Quantization Config:")
     print(f"  {net.qconfig}")
 
@@ -987,40 +1063,39 @@ print("\n🔬 Detailed Quantization Parameters:")
 
 # Try to access quantization scales through different methods
 for name, module in net.named_modules():
-    if hasattr(module, '_packed_params'):
+    if hasattr(module, "_packed_params"):
         print(f"\n📦 Module: {name}")
 
         # Print all attribute names to help debug
         # print(f"  Available attributes: {dir(module)}")
 
         # Try to access scale directly
-        if hasattr(module, 'scale'):
+        if hasattr(module, "scale"):
             print(f"  Module scale: {module.scale}")
-        if hasattr(module, 'zero_point'):
+        if hasattr(module, "zero_point"):
             print(f"  Module zero point: {module.zero_point}")
 
         # For quantized linear/conv modules
-        if hasattr(module, 'weight'):
-            if hasattr(module.weight(), 'q_scale'):
+        if hasattr(module, "weight"):
+            if hasattr(module.weight(), "q_scale"):
                 print(f"  Weight q_scale: {module.weight().q_scale()}")
-            if hasattr(module.weight(), 'q_zero_point'):
-                print(
-                    f"  Weight q_zero_point: {module.weight().q_zero_point()}")
+            if hasattr(module.weight(), "q_zero_point"):
+                print(f"  Weight q_zero_point: {module.weight().q_zero_point()}")
 
         # Try to get the quantization parameters from state dict
         for param_name, param in module.state_dict().items():
-            if 'scale' in param_name or 'zero_point' in param_name:
+            if "scale" in param_name or "zero_point" in param_name:
                 print(f"  {param_name}: {param}")
 
 # Print input/output quantization info
 print("\n🔢 Input/Output Quantization:")
-if hasattr(net.quant, 'scale'):
+if hasattr(net.quant, "scale"):
     print(f"  Input scale: {net.quant.scale}")
-if hasattr(net.quant, 'zero_point'):
+if hasattr(net.quant, "zero_point"):
     print(f"  Input zero point: {net.quant.zero_point}")
-if hasattr(net.dequant, 'scale'):
+if hasattr(net.dequant, "scale"):
     print(f"  Output scale: {net.dequant.scale}")
-if hasattr(net.dequant, 'zero_point'):
+if hasattr(net.dequant, "zero_point"):
     print(f"  Output zero point: {net.dequant.zero_point}")
 # compute_accuracy(net, testloader)
 

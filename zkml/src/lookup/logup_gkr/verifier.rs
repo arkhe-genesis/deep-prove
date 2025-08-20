@@ -32,7 +32,7 @@ pub fn verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>>(
     // Extract the numerators and denominators
     let (numerators, denominators): (Vec<E>, Vec<E>) = proof.fractional_outputs();
 
-    // Make the maps that store inital evaluations of each circuit by the size of the circuit
+    // Make the maps that store initial evaluations of each circuit by the size of the circuit
     let output_evals = proof
         .num_vars_per_instance
         .iter()
@@ -67,7 +67,7 @@ pub fn verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>>(
 
     for (i, (sumcheck_proof, round_evaluations)) in proof.proofs_and_evals().enumerate() {
         let remaining_layers = total_layers - i;
-        // Work out if we have to include intial evaluations from one of the smaller circuits in this round.
+        // Work out if we have to include initial evaluations from one of the smaller circuits in this round.
         // If we do extend the prveious round_evaluations by these values.
         let wit_evals = if i != 0 {
             let new_evals = output_evals.get(&remaining_layers);

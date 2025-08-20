@@ -276,7 +276,7 @@ pub struct Metrics {
     /// allocator.
     allocator_metrics: Option<AllocatorMetrics>,
 
-    /// The memory stats, if available, constains the memory usage of the program as
+    /// The memory stats, if available, contains the memory usage of the program as
     /// reported by the OS.
     ///
     /// This includes memory mapped files, stack space, and memory requested by the memory
@@ -471,7 +471,7 @@ pub enum RecorderError<E> {
 
     /// User tried to write to a unknown column name.
     #[error("Unknown column during metrics streaming: {0}")]
-    UnkownName(String),
+    UnknownName(String),
 
     /// Error while writing the data..
     #[error("Failed to write data, err: {0}")]
@@ -607,7 +607,7 @@ impl<W: Write> StreamingRecorder<Writer<W>> {
                 .column_names
                 .iter()
                 .position(|column_name| name.as_ref() == column_name)
-                .ok_or_else(|| RecorderError::UnkownName(name.as_ref().to_string()))?;
+                .ok_or_else(|| RecorderError::UnknownName(name.as_ref().to_string()))?;
 
             let storage = record
                 .get_mut(pos)

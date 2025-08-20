@@ -25,7 +25,7 @@ jobs:
       zkml_src: ${{ steps.filter.outputs.zkml_src }}
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - uses: dorny/paths-filter@v3
         id: filter
@@ -38,35 +38,16 @@ jobs:
               - 'rust-toolchain.toml'
 
   test:
-    name: Run zkML Rust tests
+    name: Tests
     needs: changes
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
-    runs-on: ['hostname:hetzner-dedicated-7']
+    runs-on: ['nix']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
-          lfs: 'true'
+          lfs: "true"
           submodules: "recursive"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10.13'
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r zkml/assets/scripts/requirements.txt
-
-      - name: Create directory for Python script assets
-        run: mkdir -p ./ci_py_assets
-
-      - name: Run Python script to generate assets
-        run: python zkml/assets/scripts/llms/gpt2_internal.py --output-dir ./zkml/assets/scripts/llms/ --export-model
-
-      - name: Set Environment Variables for Rust tests
-        run: |
-          echo "DEEPPROVE_CI=true" >> "$GITHUB_ENV"
-          echo "DEEPPROVE_ASSET_DIR=${{ github.workspace }}/zkml/assets/scripts/llms/" >> "$GITHUB_ENV"
+          clean: "false"
 
       - name: Set RNG seed
         run: |
@@ -74,41 +55,30 @@ jobs:
           echo RNG seed: "$seed"
           echo RNG_SEED="$seed" >> "$GITHUB_ENV"
 
-      - name: Install protoc via apt
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy
-          cache: false
-
       - name: Run cargo check
+        shell: devenv shell bash -- -e {0}
         run: cargo check -p zkml --all --tests --benches
         env:
           RUSTFLAGS: "-W warnings"
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: Run cargo test
-        run: cargo test --release -p zkml
-        env:
-          RUSTFLAGS: "-W warnings"
+        run: devenv test
 
 
-  formatting:
-    name: Validate code formatting
+  linting:
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: ['nix']
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+          clean: "false"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: rustfmt
-          cache: false
-      - run: cargo fmt --all
+      - name: Clippy
+        shell: devenv shell bash -- -e {0}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust Format
+        shell: devenv shell bash -- -e {0}
+        run: cargo fmt --all

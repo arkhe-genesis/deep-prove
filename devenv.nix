@@ -24,6 +24,7 @@
 
   # https://devenv.sh/tests/
   enterTest = ''
+  python zkml/assets/scripts/llms/gpt2_internal.py --output-dir ./zkml/assets/scripts/llms/ --export-model
   cargo test --release -p zkml -- --test-threads 1
   '';
 
