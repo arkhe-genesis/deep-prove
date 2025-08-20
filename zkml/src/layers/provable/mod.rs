@@ -50,7 +50,7 @@ use super::{
 )]
 #[debug("node #{_0}")]
 #[display("#{_0}")]
-pub struct NodeId(usize);
+pub struct NodeId(pub(crate) usize);
 
 /// Represents a link between an input/output wire of a node with an
 /// input/output wire of another node.
@@ -132,7 +132,7 @@ impl<N> NodeEdges for Node<N> {
     }
 }
 
-impl NodeEdges for NodeCtx {
+impl<E: ExtensionField> NodeEdges for NodeCtx<E> {
     fn inputs(&self) -> &[Edge] {
         &self.inputs
     }
@@ -250,18 +250,19 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
 /// Represents the proving context for a given node, altogether with the input
 /// and output edges of the node
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NodeCtx {
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct NodeCtx<E: ExtensionField> {
     pub(crate) inputs: Vec<Edge>,
     pub(crate) outputs: Vec<OutputWire>,
-    pub(crate) ctx: LayerCtx,
+    pub(crate) ctx: LayerCtx<E>,
 }
 
-impl NodeCtx {
+impl<E: ExtensionField> NodeCtx<E> {
     /// Get the claims corresponding to the output edges of a node.
     /// Requires the input claims for the nodes of the model using the
     /// outputs of the current node, and the claims of the output
     /// tensors of the model
-    pub(crate) fn claims_for_node<'a, 'b, E>(
+    pub(crate) fn claims_for_node<'a, 'b>(
         &self,
         claims_by_node: &'a HashMap<NodeId, Vec<Claim<E>>>,
         output_claims: &'b [Claim<E>],
@@ -306,7 +307,7 @@ impl NodeCtx {
     /// and the set of claims for the input tensors of all the nodes of
     /// the model
     #[allow(clippy::type_complexity)]
-    pub(crate) fn input_claims<'a, E, I: Iterator<Item = (NodeId, &'a Self)>>(
+    pub(crate) fn input_claims<'a, I: Iterator<Item = (NodeId, &'a Self)>>(
         nodes: I,
         claims_by_node: &HashMap<NodeId, Vec<Claim<E>>>,
     ) -> Result<Vec<(NodeId, Vec<(usize, &Claim<E>)>)>> {
@@ -412,7 +413,11 @@ pub fn evaluate_layer<E: ExtensionField, T: Number, O: Evaluate<T>>(
 
 pub trait ProveInfo {
     /// Compute the proving context for the operation
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)>;
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)>;
 }
 
 /// Output of `QuantizeOp` method over a layer
@@ -489,6 +494,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx: VerifiableCtx<E, PCS>;
 
@@ -511,13 +517,13 @@ where
     }
 
     /// Generate witness for a node where a lookup table is employed in proving
-    fn gen_lookup_witness<'a>(
+    fn gen_lookup_witness(
         &self,
         _id: NodeId,
-        _ctx: &'a ProverContext<'a, E, PCS>,
-        _step_data: &'a StepData<Element, E>,
+        _ctx: &ProverContext<E, PCS>,
+        _step_data: &StepData<Element, E>,
         _store: &mut TenStore,
-    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+    ) -> Result<LookupWitnessGen<E, PCS>> {
         Ok(Default::default())
     }
 }
@@ -595,6 +601,13 @@ where
         }
         Ok(())
     }
+
+    /// Writes the associated type [`Self::Proof`] to the transcript if it contains any [`PCS::Commitment`].
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        proof: &Self::Proof,
+        transcript: &mut T,
+    ) -> anyhow::Result<()>;
 }
 
 pub(crate) fn verify_input_claim<E, PCS, V, A>(
@@ -622,6 +635,19 @@ pub(crate) fn compute_model_output_claims<
     outputs: &[&Tensor<E>],
 ) -> Vec<Claim<E>> {
     <V as VerifiableCtx<E, PCS>>::compute_model_output_claims(ctx, transcript, outputs)
+}
+
+pub(crate) fn write_proof_to_transcript<
+    E: ExtensionField,
+    PCS: PolynomialCommitmentScheme<E>,
+    T: Transcript<E>,
+    V: VerifiableCtx<E, PCS>,
+>(
+    ctx: &V,
+    proof: &<V as VerifiableCtx<E, PCS>>::Proof,
+    transcript: &mut T,
+) -> anyhow::Result<()> {
+    <V as VerifiableCtx<E, PCS>>::write_proof_to_transcript(ctx, proof, transcript)
 }
 
 #[derive(Clone, Debug)]
@@ -664,9 +690,18 @@ impl<'a, O: OpInfo + Debug, E: ExtensionField, PCS: PolynomialCommitmentScheme<E
         );
         Ok(vec![Claim::default()])
     }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
+    }
 }
 
-impl OpInfo for LayerCtx {
+impl<E: ExtensionField> OpInfo for LayerCtx<E> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         match self {
             LayerCtx::Dense(dense_ctx) => dense_ctx.output_shapes(input_shapes, padding_mode),
@@ -764,7 +799,7 @@ impl OpInfo for LayerCtx {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx<E>
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
@@ -946,6 +981,68 @@ where
                 claims,
             ),
             LayerCtx::SchoolBookConvolution(_) => unreachable!(),
+        }
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        proof: &Self::Proof,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        match (self, proof) {
+            (LayerCtx::Dense(ctx), LayerProof::Dense(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Convolution(ctx), LayerProof::Convolution(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::MatMul(ctx), LayerProof::MatMul(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::QKV(ctx), LayerProof::QKV(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Mha(ctx), LayerProof::Mha(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::ConcatMatMul(ctx), LayerProof::ConcatMatMul(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Activation(ctx), LayerProof::Activation(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::LayerNorm(ctx), LayerProof::LayerNorm(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Softmax(ctx), LayerProof::Softmax(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Logits(ctx), LayerProof::Logits(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Embeddings(ctx), LayerProof::Embeddings(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Add(ctx), LayerProof::Add(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Positional(ctx), LayerProof::Positional(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Requant(ctx), LayerProof::Requant(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Pooling(ctx), LayerProof::Pooling(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::SchoolBookConvolution(_), _) => Ok(()),
+            (LayerCtx::Flatten, _) => Ok(()),
+            (LayerCtx::Reshape(_), _) => Ok(()),
+            _ => bail!(
+                "Could not append LayerProof to transcript, Incompatible layer {} and proof {} found",
+                self.describe(),
+                proof.variant_name()
+            ),
         }
     }
 }

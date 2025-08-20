@@ -7,15 +7,16 @@ use crate::{
 use anyhow::{Result, anyhow, bail, ensure};
 use ark_std::rand::Rng;
 use burn::tensor::{Int, Tensor as BTensor, TensorData};
+use ceno_p3::{
+    field::{Field, FieldAlgebra, TwoAdicField},
+    goldilocks::Goldilocks,
+};
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use itertools::Itertools;
-use mpcs::util::plonky2_util::log2_ceil;
 use multilinear_extensions::{
     mle::{IntoMLE, MultilinearExtension},
     util::ceil_log2,
 };
-use p3_field::{Field, FieldAlgebra, TwoAdicField};
-use p3_goldilocks::Goldilocks;
 use rayon::{
     iter::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
@@ -2307,10 +2308,10 @@ impl Shape {
         let ncols = self.ncols();
         // - 1 because numbers are signed so only half of the range is used when doing multiplication
         quantized_self_input_range
-            .map(log2_ceil)
+            .map(ceil_log2)
             .unwrap_or(*quantization::BIT_LEN - 1)
             + quantized_other_input_range
-                .map(log2_ceil)
+                .map(ceil_log2)
                 .unwrap_or(*quantization::BIT_LEN - 1)
             + ceil_log2(ncols)
             + 1

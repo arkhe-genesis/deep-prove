@@ -57,8 +57,7 @@ async fn run_model_v1<S: Store>(
     let params = store
         .get_params(&params_key)
         .await
-        .context("fetching PPs")?
-        .clone();
+        .context("fetching PPs")?;
     let is_stored_params = params.is_some();
 
     let store::ScaledModel {
@@ -95,18 +94,29 @@ async fn run_model_v1<S: Store>(
         .context("generating context")?
     };
 
-    if !is_stored_params {
+    let (prover_ctx, verifier_ctx) = if !is_stored_params {
+        // Since prover_ctx is not `Clone` we store and then retrieve the params
         store
             .insert_params(
                 &params_key,
                 store::Params {
-                    prover: prover_ctx.clone(),
-                    verifier: verifier_ctx.clone(),
+                    prover: prover_ctx,
+                    verifier: verifier_ctx,
                 },
             )
             .await
             .context("storing PPs")?;
-    }
+
+        let store::Params { prover, verifier } = store
+            .get_params(&params_key)
+            .await
+            .context("fetching PPs after storing")?
+            .context("PPs not found after storing")?;
+
+        (prover, verifier)
+    } else {
+        (prover_ctx, verifier_ctx)
+    };
 
     let proofs = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let mut proofs = vec![];

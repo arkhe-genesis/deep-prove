@@ -388,6 +388,7 @@ impl Convolution<Element> {
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         let padded_rows = 2 * self.filter.nw() * self.filter.nw();
         let mut w1_reduced: Vec<E> = vec![E::ZERO; self.filter.real_nw() * self.filter.real_nw()];
@@ -479,7 +480,11 @@ const FILTER_POLY_ID: &str = "ConvFilter";
 const BIAS_POLY_ID: &str = "ConvBias";
 
 impl ProveInfo for Convolution<Element> {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         let mut filter_shape = self.filter.shape();
         filter_shape.remove(1);
         aux.last_output_shape
@@ -579,6 +584,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = ConvCtx;
 
@@ -651,6 +657,15 @@ where
             shape_step,
         )?])
     }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -658,7 +673,6 @@ impl Convolution<Element> {
     // Prove convolution of a CNN network. This is a convolution between in a 3D matrix X of dimension k_x * n_x * n_x
     // and a 4D filter matrix W of dimension k_w * k_x * n_w * n_w. The output is a 3D matrix Y of dimension k_w * n_x * n_x
     // We want to batch prove the following: Y[i] = iFFT(sum_{j \in [n_x]}(FFT(X[j]) o FFT(W[i][j])).
-    #[timed::timed_instrument(name = "Prover::prove_convolution_step")]
     pub fn prove_convolution_step<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         prover: &mut Prover<E, T, PCS>,
@@ -674,6 +688,7 @@ impl Convolution<Element> {
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         // First part is proving the clearing of the garbage has been done correctly.
         // For this, we create the clearing garbage tensor and just prove hadamard with the output.
@@ -982,7 +997,7 @@ impl Convolution<Element> {
             claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
             claims
         };
-        prover.add_common_claims(id, common_claims)?;
+        prover.add_common_claims(id, common_claims);
 
         prover.push_proof(
             id,
@@ -1350,7 +1365,7 @@ impl ConvCtx {
             claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
             claims
         };
-        verifier.add_common_claims(self.node_id, common_claims)?;
+        verifier.add_common_claims(self.node_id, common_claims);
 
         let mut input_point = proof.fft_point.clone();
         v = input_point.pop().unwrap();
@@ -1437,7 +1452,11 @@ impl QuantizeOp for SchoolBookConv<f32> {
 pub struct SchoolBookConvCtx;
 
 impl ProveInfo for SchoolBookConv<Element> {
-    fn step_info(&self, _id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        _id: NodeId,
+        aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         let conv_info = LayerCtx::SchoolBookConvolution(SchoolBookConvCtx);
         Ok((conv_info, aux))
     }

@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams, Hasher};
+use mpcs::{Basefold, BasefoldRSParams};
 use tenstore::TenStore;
 use zkml::{
     Element, FloatOnnxLoader, Prover, default_transcript,
@@ -12,25 +12,12 @@ use zkml::{
 
 type F = GoldilocksExt2;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
-type Pcs<E> = Basefold<E, BasefoldRSParams<Hasher>>;
+type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
-// Choose transcript implementation at compile time
-#[cfg(feature = "blake")]
-type Transcript = BlakeTranscript;
-
-#[cfg(not(feature = "blake"))]
 type Transcript = transcript::basic::BasicTranscript<F>;
 
 fn new_transcript() -> Transcript {
-    #[cfg(feature = "blake")]
-    {
-        use transcript::blake::BlakeTranscript;
-        BlakeTranscript::new(b"bench")
-    }
-    #[cfg(not(feature = "blake"))]
-    {
-        default_transcript()
-    }
+    default_transcript()
 }
 
 fn parse_model(model_data: &[u8]) -> anyhow::Result<(Model<Element>, ModelMetadata)> {
@@ -63,7 +50,7 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = new_transcript();
-        verify::<_, _, _>(verifier_ctx.clone(), proof, io, &mut verifier_transcript)
+        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript)
             .expect("invalid proof");
     }
 }

@@ -1,17 +1,26 @@
 //! File containing code for lookup witness generation.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, HashMap, btree_map},
+};
 
+use anyhow::{anyhow, ensure};
+use ceno_p3::field::{Field, FieldAlgebra};
 use ff_ext::ExtensionField;
+use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
-use p3_field::{Field, FieldAlgebra};
+use multilinear_extensions::{
+    mle::MultilinearExtension,
+    util::{ceil_log2, transpose},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 use transcript::Transcript;
 use utils::Metrics;
+use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
-use super::{logup_gkr::error::LogUpError, witness::LogUpWitness};
+use super::logup_gkr::error::LogUpError;
 use crate::{
     Claim, Element,
     iop::{ChallengeStorage, context::ProverContext},
@@ -23,31 +32,14 @@ use crate::{
             softmax::{OUTPUT_SCALE_FACTOR, SCALE_FACTOR},
         },
     },
+    lookup::logup_gkr::structs::{LogUpBatchVerifierClaim, LogUpInput},
     model::{InferenceTrace, ToIterator},
     quantization::{self, Fieldizer},
     to_base,
 };
 use rayon::prelude::*;
-pub const TABLE_POLY_ID_OFFSET: usize = 666;
 
-pub(crate) type ProverCommitment<'a, PCS, E> = (
-    <PCS as PolynomialCommitmentScheme<E>>::CommitmentWithWitness,
-    MultilinearExtension<'a, E>,
-);
-
-pub(crate) type CommsAndEvals<'a, PCS, E> = (
-    Vec<ProverCommitment<'a, PCS, E>>,
-    Vec<Vec<<E as ExtensionField>::BaseField>>,
-);
-
-pub(crate) type CommsAndProofs<'a, PCS, E> = (
-    Vec<Vec<ProverCommitment<'a, PCS, E>>>,
-    Vec<crate::lookup::logup_gkr::structs::LogUpProof<E>>,
-);
-
-type LookupAndColumns<BaseField> = (Vec<Element>, (Vec<BaseField>, Vec<BaseField>));
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Copy)]
 /// Enum used for establishing the different table types needed to prove non-linear functions in a model.
 pub enum TableType {
     /// Table used for the Relu activation function
@@ -60,12 +52,31 @@ pub enum TableType {
     Softmax(SoftmaxTableData),
     /// Table used for checking the normalisation error in Softmax operations, the first inner [`Element`] is `1` quantised by the scale factor, the second inner [`Element`] is the absolute value of the allowable error
     ErrorTable(Element, Element),
-    /// Table use to check if a value is zero or not, returns 1 if the value is zero and zero otherwise, the [`usize`] indicates how many variables the table has.
-    ZeroTable(usize),
     /// Table used in requantisation
     RequantZeroTable,
+    /// Table use to check if a value is zero or not, returns 1 if the value is zero and zero otherwise.
+    ZeroTable,
     /// Table used to calculate inverse square root, see the [`InverseSQRTTableData`] struct for more info.
     InverseSQRT(InverseSQRTTableData),
+}
+
+// We impl PartialOrd and Ord ourselves on TableType, that way in a BTreeMap or BtreeSet they will always be ordered by the table with the most variables first.
+impl PartialOrd for TableType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TableType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match Ord::cmp(
+            &other.multiplicity_poly_vars(),
+            &self.multiplicity_poly_vars(),
+        ) {
+            Ordering::Equal => Ord::cmp(&self.name(), &other.name()),
+            order => order,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -152,74 +163,58 @@ impl InverseSQRTTableData {
 }
 
 impl TableType {
-    pub fn get_merged_table_column<E: ExtensionField>(
-        &self,
-        column_separator: Element,
-    ) -> (Vec<Element>, Vec<Vec<E::BaseField>>) {
+    pub fn get_table_columns<E: ExtensionField>(&self) -> Vec<Vec<E::BaseField>> {
         match self {
             TableType::GELU(qd) => {
-                #[allow(clippy::type_complexity)]
-                let (comb, (col_one, col_two)): (
-                    Vec<Element>,
-                    (Vec<E::BaseField>, Vec<E::BaseField>),
-                    //) = (qd.min..=qd.max).zip(qd.lut.iter()).map(|(i, v)| {
-                ) = qd
+                let (col_one, col_two): (Vec<E::BaseField>, Vec<E::BaseField>) = qd
                     .table()
                     .map(|(i, v)| {
                         let i_field: E = (i as Element).to_field();
                         let out_field: E = v.to_field();
-                        (
-                            i as Element + v * column_separator,
-                            (i_field.as_bases()[0], out_field.as_bases()[0]),
-                        )
+
+                        (i_field.as_bases()[0], out_field.as_bases()[0])
                     })
                     .unzip();
-                (comb, vec![col_one, col_two])
+                vec![col_one, col_two]
             }
             TableType::Relu => {
                 #[allow(clippy::type_complexity)]
-                let (comb, (col_one, col_two)): (
-                    Vec<Element>,
-                    (Vec<E::BaseField>, Vec<E::BaseField>),
-                ) = (*quantization::MIN..=*quantization::MAX)
-                    .map(|i| {
-                        let out = Relu::apply(i);
-                        let i_field: E = i.to_field();
-                        let out_field: E = out.to_field();
-                        (
-                            i + out * column_separator,
-                            (i_field.as_bases()[0], out_field.as_bases()[0]),
-                        )
-                    })
-                    .unzip();
-                (comb, vec![col_one, col_two])
+                let (col_one, col_two): (Vec<E::BaseField>, Vec<E::BaseField>) =
+                    (*quantization::MIN..=*quantization::MAX)
+                        .map(|i| {
+                            let out = Relu::apply(i);
+                            let i_field: E = i.to_field();
+                            let out_field: E = out.to_field();
+
+                            (i_field.as_bases()[0], out_field.as_bases()[0])
+                        })
+                        .unzip();
+                vec![col_one, col_two]
             }
             TableType::Range => {
-                let (element_out, field): (Vec<Element>, Vec<E::BaseField>) = (0..1
-                    << *quantization::BIT_LEN)
+                let field = (0..1 << *quantization::BIT_LEN)
                     .map(|i| {
                         let i_field: E = i.to_field();
-                        (i, i_field.as_bases()[0])
+                        i_field.as_bases()[0]
                     })
-                    .unzip();
-                (element_out, vec![field])
+                    .collect::<Vec<E::BaseField>>();
+                vec![field]
             }
+
             TableType::Softmax(table_data) => {
                 let table_size = table_data.full_table_size();
 
-                let (merged_lookup, (in_column, out_column)): LookupAndColumns<E::BaseField> = (0
+                let (in_column, out_column): (Vec<E::BaseField>, Vec<E::BaseField>) = (0
                     ..table_size)
                     .map(|j| {
                         let out_elem = table_data.table_output(j);
                         let in_field: E = j.to_field();
                         let out_field: E = out_elem.to_field();
-                        (
-                            j + COLUMN_SEPARATOR * out_elem,
-                            (in_field.as_bases()[0], out_field.as_bases()[0]),
-                        )
+
+                        (in_field.as_bases()[0], out_field.as_bases()[0])
                     })
                     .unzip();
-                (merged_lookup, vec![in_column, out_column])
+                vec![in_column, out_column]
             }
             TableType::ErrorTable(quant_one, allowable_error) => {
                 // Work out the minimum and maximum elements of the table
@@ -227,68 +222,128 @@ impl TableType {
                 let table_max = *quant_one + *allowable_error;
                 // Work out the full table size
                 let table_size = 1usize << ceil_log2(2 * *allowable_error as usize);
-                let (element_out, field): (Vec<Element>, Vec<E::BaseField>) = (table_min
-                    ..=table_max)
+                let field = (table_min..=table_max)
                     .map(|elem| {
                         let f: E = elem.to_field();
-                        (elem, f.as_bases()[0])
+                        f.as_bases()[0]
                     })
-                    .chain(std::iter::repeat((0, E::BaseField::ZERO)))
+                    .chain(std::iter::repeat(E::BaseField::ZERO))
                     .take(table_size)
-                    .unzip();
-                (element_out, vec![field])
-            }
-            TableType::ZeroTable(bit_size) => {
-                let table_size: Element = 1 << bit_size;
-                let (merged_lookup, (in_column, out_column)): LookupAndColumns<E::BaseField> = (0
-                    ..table_size)
-                    .map(|i| {
-                        let out: Element = if i != 0 { 0 } else { 1 };
-                        let merged_val = i + COLUMN_SEPARATOR * out;
-                        let i_field: E = i.to_field();
-                        let out_field: E = out.to_field();
-                        (merged_val, (i_field.as_bases()[0], out_field.as_bases()[0]))
-                    })
-                    .unzip();
-                (merged_lookup, vec![in_column, out_column])
-            }
-            TableType::InverseSQRT(table_data) => {
-                let table_max: Element = 1 << (2 * (*quantization::BIT_LEN - 1));
-                let table_min = -table_max;
-                let (merged_lookup, (in_column, out_column)): LookupAndColumns<E::BaseField> =
-                    (table_min..table_max)
-                        .map(|i| {
-                            let out = table_data.table_output(i);
-                            let merged_val = i + COLUMN_SEPARATOR * out;
-                            let i_field: E = i.to_field();
-                            let out_field: E = out.to_field();
-                            (merged_val, (i_field.as_bases()[0], out_field.as_bases()[0]))
-                        })
-                        .unzip();
-                (merged_lookup, vec![in_column, out_column])
+                    .collect::<Vec<E::BaseField>>();
+                vec![field]
             }
             TableType::RequantZeroTable => {
-                let (comb, (col_one, col_two)): LookupAndColumns<E::BaseField> =
+                let (col_one, col_two): (Vec<E::BaseField>, Vec<E::BaseField>) =
                     (*quantization::MIN..=*quantization::MAX)
                         .map(|i| {
                             let out = if i != 0 { 0 } else { 1 };
                             let i_field: E = i.to_field();
                             let out_field: E = out.to_field();
-                            (
-                                i + out * column_separator,
-                                (i_field.as_bases()[0], out_field.as_bases()[0]),
-                            )
+
+                            (i_field.as_bases()[0], out_field.as_bases()[0])
                         })
                         .unzip();
-                (comb, vec![col_one, col_two])
+                vec![col_one, col_two]
             }
+            TableType::ZeroTable => {
+                let table_size: Element = 1 << *quantization::BIT_LEN;
+                let (in_column, out_column): (Vec<E::BaseField>, Vec<E::BaseField>) = (0
+                    ..table_size)
+                    .map(|i| {
+                        let out: Element = if i != 0 { 0 } else { 1 };
+                        let i_field: E = i.to_field();
+                        let out_field: E = out.to_field();
+                        (i_field.as_bases()[0], out_field.as_bases()[0])
+                    })
+                    .unzip();
+                vec![in_column, out_column]
+            }
+            TableType::InverseSQRT(table_data) => {
+                let table_max: Element = 1 << (2 * (*quantization::BIT_LEN - 1));
+                let table_min = -table_max;
+                let (in_column, out_column): (Vec<E::BaseField>, Vec<E::BaseField>) = (table_min
+                    ..table_max)
+                    .map(|i| {
+                        let out = table_data.table_output(i);
+                        let i_field: E = i.to_field();
+                        let out_field: E = out.to_field();
+                        (i_field.as_bases()[0], out_field.as_bases()[0])
+                    })
+                    .unzip();
+                vec![in_column, out_column]
+            }
+        }
+    }
+    pub fn get_merged_table_column(&self, column_separator: Element) -> Vec<Element> {
+        match self {
+            TableType::GELU(qd) => qd
+                .table()
+                .map(|(i, v)| i as Element + v * column_separator)
+                .collect(),
+            TableType::Relu => (*quantization::MIN..=*quantization::MAX)
+                .map(|i| {
+                    let out = Relu::apply(i);
+
+                    i + out * column_separator
+                })
+                .collect(),
+            TableType::Range => (0..1 << *quantization::BIT_LEN).collect(),
+            TableType::Softmax(table_data) => {
+                let table_size = table_data.full_table_size();
+
+                (0..table_size)
+                    .map(|j| {
+                        let out_elem = table_data.table_output(j);
+
+                        j + COLUMN_SEPARATOR * out_elem
+                    })
+                    .collect()
+            }
+            TableType::ErrorTable(quant_one, allowable_error) => {
+                // Work out the minimum and maximum elements of the table
+                let table_min = *quant_one - *allowable_error;
+                let table_max = *quant_one + *allowable_error;
+                // Work out the full table size
+                let table_size = 1usize << ceil_log2(2 * *allowable_error as usize);
+                (table_min..=table_max)
+                    .chain(std::iter::repeat(0))
+                    .take(table_size)
+                    .collect()
+            }
+            TableType::ZeroTable => {
+                let table_size: Element = 1 << *quantization::BIT_LEN;
+                (0..table_size)
+                    .map(|i| {
+                        let out: Element = if i != 0 { 0 } else { 1 };
+                        i + COLUMN_SEPARATOR * out
+                    })
+                    .collect()
+            }
+            TableType::InverseSQRT(table_data) => {
+                let table_max: Element = 1 << (2 * (*quantization::BIT_LEN - 1));
+                let table_min = -table_max;
+
+                (table_min..table_max)
+                    .map(|i| {
+                        let out = table_data.table_output(i);
+                        i + COLUMN_SEPARATOR * out
+                    })
+                    .collect()
+            }
+            TableType::RequantZeroTable => (*quantization::MIN..=*quantization::MAX)
+                .map(|i| {
+                    let out = if i != 0 { 0 } else { 1 };
+
+                    i + out * column_separator
+                })
+                .collect(),
         }
     }
 
     pub fn name(&self) -> String {
         match self {
             TableType::Relu => "Relu".to_string(),
-            TableType::GELU(_) => "GELU".to_string(),
+            TableType::GELU(qd) => format!("GELU: {qd:?}"),
             TableType::Range => "Range".to_string(),
             TableType::Softmax(table_data) => {
                 format!("Softmax - temperature: {}", table_data.float_temperature())
@@ -298,7 +353,7 @@ impl TableType {
                     "Error Table - quantised one: {quant_one}, allowable error: {allowable_error}",
                 )
             }
-            TableType::ZeroTable(bit_size) => format!("Zero: {bit_size}"),
+            TableType::ZeroTable => "Zero".to_string(),
             TableType::InverseSQRT(table_data) => format!(
                 "InverseSQRT - normalisation: {}, shift: {}",
                 table_data.float_epsilon(),
@@ -382,12 +437,12 @@ impl TableType {
                 ])
             }
             TableType::ErrorTable(..) => Ok(vec![]),
-            TableType::ZeroTable(bit_size) => {
-                if point.len() != *bit_size {
+            TableType::ZeroTable => {
+                if point.len() != *quantization::BIT_LEN {
                     return Err(LogUpError::VerifierError(format!(
                         "Point was not the correct size to produce a softmax table evaluation, point size: {}, expected: {}",
                         point.len(),
-                        bit_size
+                        *quantization::BIT_LEN
                     )));
                 }
 
@@ -461,7 +516,7 @@ impl TableType {
                 E::ONE
             }
             TableType::Softmax(..) => transcript.sample_and_append_challenge(b"Softmax").elements,
-            TableType::ZeroTable(..) => transcript.sample_and_append_challenge(b"Zero").elements,
+            TableType::ZeroTable => transcript.sample_and_append_challenge(b"Zero").elements,
             TableType::InverseSQRT(..) => {
                 transcript
                     .sample_and_append_challenge(b"InverseSQRT")
@@ -479,13 +534,26 @@ impl TableType {
     pub fn multiplicity_poly_vars(&self) -> usize {
         match self {
             TableType::GELU(qd) => qd.table_size(),
-            TableType::Range | TableType::Relu | TableType::RequantZeroTable => {
-                *quantization::BIT_LEN
-            }
+            TableType::Range
+            | TableType::Relu
+            | TableType::RequantZeroTable
+            | TableType::ZeroTable => *quantization::BIT_LEN,
             TableType::Softmax(table_data) => table_data.size(),
             TableType::ErrorTable(_, allowable_error) => ceil_log2(2 * *allowable_error as usize),
-            TableType::ZeroTable(bits) => *bits,
             TableType::InverseSQRT(..) => 2 * (*quantization::BIT_LEN - 1) + 1,
+        }
+    }
+
+    /// Gets the number of columns this able has
+    pub fn num_columns(&self) -> usize {
+        match self {
+            TableType::GELU(..)
+            | TableType::InverseSQRT(..)
+            | TableType::Softmax(..)
+            | TableType::ZeroTable
+            | TableType::Relu
+            | TableType::RequantZeroTable => 2,
+            TableType::Range | TableType::ErrorTable(..) => 1,
         }
     }
 
@@ -560,11 +628,159 @@ impl TableType {
             _ => vec![],
         }
     }
+
+    pub fn has_committed_claims(&self) -> bool {
+        matches!(
+            self,
+            TableType::Softmax(..)
+                | TableType::ErrorTable(..)
+                | TableType::InverseSQRT(..)
+                | TableType::GELU(..)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Struct stored in layers that use lookups that allows easy conversion of committed witness data to lookup data.
+pub struct LayerLookupContext {
+    /// These are the table types used, they are arranged in order so that the lookups with
+    /// the most variables correspond to the first [`TableType`] and so on.
+    pub(crate) tables: Vec<TableType>,
+    /// The number of instances of each lookup
+    pub(crate) instances_per_table: Vec<usize>,
+}
+
+impl LayerLookupContext {
+    pub fn new(tables: Vec<TableType>, instances_per_table: Vec<usize>) -> LayerLookupContext {
+        LayerLookupContext {
+            tables,
+            instances_per_table,
+        }
+    }
+
+    pub fn create_logup_inputs<PCS, E>(
+        &self,
+        layer_commitment: &PCS::CommitmentWithWitness,
+        challenge_storage: &ChallengeStorage<E>,
+    ) -> anyhow::Result<Vec<LogUpInput<E>>>
+    where
+        E: ExtensionField,
+        PCS: PolynomialCommitmentScheme<E>,
+    {
+        // First we extract the polynomials from the layer_commitment
+        let polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
+
+        // There should be at least as many polynomials as there are lookup columns total
+        let total_lookup_columns = self
+            .tables
+            .iter()
+            .zip(self.instances_per_table.iter())
+            .map(|(tt, &n)| tt.num_columns() * n)
+            .sum::<usize>();
+
+        ensure!(
+            polys.len() >= total_lookup_columns,
+            "Cannot create LogUp inputs because we were only provided with {} polynomials and expected {} lookup columns",
+            polys.len(),
+            total_lookup_columns
+        );
+
+        // Now we try_fold to make our output
+        let (logup_inputs, _) = self
+            .tables
+            .iter()
+            .zip(self.instances_per_table.iter())
+            .try_fold(
+                (Vec::<LogUpInput<E>>::new(), 0),
+                |(mut inputs_acc, skip), (tt, &n)| {
+                    let (constant_challenge, column_separation_challenge) = challenge_storage
+                        .get_challenges_by_name(&tt.name())
+                        .ok_or(anyhow!(
+                            "No challenges found for Table {}, cannot generate LogUp input",
+                            tt.name()
+                        ))?;
+                    let take = tt.num_columns() * n;
+                    let column_evals = polys
+                        .iter()
+                        .skip(skip)
+                        .take(take)
+                        .map(|p| p.get_base_field_vec().to_vec())
+                        .collect::<Vec<Vec<E::BaseField>>>();
+                    let logup_input = LogUpInput::<E>::new_lookup(
+                        column_evals,
+                        constant_challenge,
+                        column_separation_challenge,
+                        tt.num_columns(),
+                    )?;
+                    inputs_acc.push(logup_input);
+                    Result::<(Vec<LogUpInput<E>>, usize), anyhow::Error>::Ok((
+                        inputs_acc,
+                        skip + take,
+                    ))
+                },
+            )?;
+
+        Ok(logup_inputs)
+    }
+
+    pub fn verify_logup_batch_claim<E: ExtensionField>(
+        &self,
+        batch_claim: &LogUpBatchVerifierClaim<E>,
+        challenge_storage: &ChallengeStorage<E>,
+    ) -> anyhow::Result<()> {
+        let poly_evals = batch_claim.poly_evals();
+        let alpha = batch_claim.alpha();
+
+        let (calc_claim, _, _) = self
+            .tables
+            .iter()
+            .zip(self.instances_per_table.iter())
+            .try_fold((E::ZERO, E::ONE, 0), |(acc, chal_acc, skip), (tt, &n)| {
+                let take = tt.num_columns() * n;
+                let (constant_challenge, csc) = challenge_storage
+                    .get_challenges_by_name(&tt.name())
+                    .ok_or(anyhow!(
+                        "No challenges found for Table {}, cannot verify LogUp batch claim",
+                        tt.name()
+                    ))?;
+                let (combined_eval, chal_update) = poly_evals
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .chunks(tt.num_columns())
+                    .into_iter()
+                    .map(|chunk| {
+                        chunk
+                            .into_iter()
+                            .fold((constant_challenge, E::ONE), |(a, column_chal_acc), &e| {
+                                (a + e * column_chal_acc, column_chal_acc * csc)
+                            })
+                            .0
+                    })
+                    .fold((acc, chal_acc), |(inner_acc, inner_chal_acc), e| {
+                        (inner_acc + e * inner_chal_acc, inner_chal_acc * alpha)
+                    });
+
+                Result::<(E, E, usize), anyhow::Error>::Ok((
+                    combined_eval,
+                    chal_update,
+                    skip + take,
+                ))
+            })?;
+
+        ensure!(
+            calc_claim == batch_claim.claim(),
+            "Lookup verification failed, calculated claim {:?} did not equal LogUp claim {:?}",
+            calc_claim,
+            batch_claim.claim()
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookupContext {
-    tables: Vec<TableType>,
+    pub(crate) tables: Vec<TableType>,
 }
 
 impl LookupContext {
@@ -581,6 +797,40 @@ impl LookupContext {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+
+    pub fn create_logup_inputs<PCS, E>(
+        &self,
+        multiplicities_commitment: &PCS::CommitmentWithWitness,
+        challenge_storage: &ChallengeStorage<E>,
+    ) -> anyhow::Result<Vec<LogUpInput<E>>>
+    where
+        E: ExtensionField,
+        PCS: PolynomialCommitmentScheme<E>,
+    {
+        // First we retireve the multiplicity polynomials
+        let mulitplicity_polys =
+            PCS::get_arc_mle_witness_from_commitment(multiplicities_commitment);
+        self.iter()
+            .zip(mulitplicity_polys.iter())
+            .map(|(tt, m_poly)| {
+                let multiplicities = m_poly.get_base_field_vec().to_vec();
+                let column_evals = tt.get_table_columns::<E>();
+                let (constant_challenge, column_separation_challenge) = challenge_storage
+                    .get_challenges_by_name(&tt.name())
+                    .ok_or(anyhow!(
+                        "No challenges found for Table {}, cannot generate LogUp input",
+                        tt.name()
+                    ))?;
+                LogUpInput::<E>::new_table(
+                    column_evals,
+                    multiplicities,
+                    constant_challenge,
+                    column_separation_challenge,
+                )
+                .map_err(|e| anyhow!("{:?}", e))
+            })
+            .collect::<Result<Vec<LogUpInput<E>>, anyhow::Error>>()
+    }
 }
 
 pub(crate) fn count_elements<I: IntoIterator<Item = Element>>(i: I) -> HashMap<Element, u64> {
@@ -591,16 +841,24 @@ pub(crate) fn count_elements<I: IntoIterator<Item = Element>>(i: I) -> HashMap<E
     count
 }
 
-#[derive(Default)]
-pub struct LookupWitnessGen<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+pub struct LookupWitnessGen<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// Contains the count of elements per table type.
     ///
     /// These values are later used to compute the GKR's multiplicities.
     pub(crate) element_count: BTreeMap<TableType, HashMap<Element, u64>>,
-    pub(crate) logup_witnesses: HashMap<NodeId, Vec<LogUpWitness<'a, E, PCS>>>,
+    pub(crate) logup_witnesses: HashMap<NodeId, PCS::CommitmentWithWitness>,
 }
 
-impl<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<'a, E, PCS> {
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWitnessGen<E, PCS> {
+    fn default() -> Self {
+        LookupWitnessGen {
+            element_count: BTreeMap::default(),
+            logup_witnesses: HashMap::default(),
+        }
+    }
+}
+
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, PCS> {
     /// Consume the lookups and witness of `other` into this instance.
     fn consume(&mut self, other: Self) {
         for (table_type, elements) in other.element_count.into_iter() {
@@ -622,21 +880,32 @@ impl<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen
 
 pub(crate) const COLUMN_SEPARATOR: Element = 1 << 32;
 
-#[derive(Debug, Default)]
-pub struct LookupWitness<'a, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+#[derive(Debug)]
+pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     pub challenge_storage: ChallengeStorage<E>,
-    pub logup_witnesses: HashMap<NodeId, Vec<LogUpWitness<'a, E, PCS>>>,
-    pub table_witnesses: Vec<LogUpWitness<'a, E, PCS>>,
+    pub logup_witnesses: HashMap<NodeId, PCS::CommitmentWithWitness>,
+    pub table_witnesses: Option<PCS::CommitmentWithWitness>,
+}
+
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWitness<E, PCS> {
+    fn default() -> Self {
+        LookupWitness {
+            challenge_storage: ChallengeStorage::default(),
+            logup_witnesses: HashMap::default(),
+            table_witnesses: None,
+        }
+    }
 }
 
 pub fn generate_lookup_witnesses<'a, 'b, E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
     trace: &'b InferenceTrace<'a, E, Element>,
-    ctx: &'b ProverContext<'b, E, PCS>,
+    ctx: &ProverContext<E, PCS>,
     transcript: &mut T,
-) -> Result<LookupWitness<'b, E, PCS>, LogUpError>
+) -> Result<LookupWitness<E, PCS>, LogUpError>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     // If the lookup context is empty then there are no lookup witnesses to generate so we return default values
     if ctx.lookup.is_empty() {
@@ -674,12 +943,12 @@ where
     debug!("== Witness table multiplicities generation ==");
     let metrics = Metrics::new();
     // calculate the table multiplicities
-    let table_witnesses = witness_gen
+
+    let multiplicites = witness_gen
         .element_count
         .par_iter()
         .map(|(table_type, table_lookup_data)| {
-            let (table_column, column_evals) =
-                table_type.get_merged_table_column::<E>(COLUMN_SEPARATOR);
+            let table_column = table_type.get_merged_table_column(COLUMN_SEPARATOR);
 
             // Check to see that all the lookup values are present in the table
             #[cfg(test)]
@@ -720,40 +989,70 @@ where
                     }
                 })
                 .collect::<Vec<E::BaseField>>();
-            let num_vars = ceil_log2(multiplicities.len());
-            let mle =
-                MultilinearExtension::<E>::from_evaluations_vec(num_vars, multiplicities.to_vec());
-            let commit = ctx.commitment_ctx.commit(&mle).map_err(|e| {
-                LogUpError::PolynomialError(format!(
-                    "Error while committing to {} table multiplicity polynomial: {:?}",
-                    table_type.name(),
-                    e
-                ))
-            })?;
-            Ok(LogUpWitness::<E, PCS>::new_table(
-                (commit, mle),
-                multiplicities,
-                column_evals,
-                table_type.clone(),
-            ))
-        })
-        .collect::<Result<Vec<LogUpWitness<E, PCS>>, LogUpError>>()?;
 
+            Ok(multiplicities)
+        })
+        .collect::<Result<Vec<Vec<E::BaseField>>, LogUpError>>()?;
+
+    let grouped_by_vars = witness_gen
+        .element_count
+        .keys()
+        .map(|table_type| (table_type.multiplicity_poly_vars(), *table_type))
+        .into_group_map();
+    let rmms = grouped_by_vars
+        .into_iter()
+        .map(|(nv, list)| (nv, list.len()))
+        .sorted_by(|a, b| Ord::cmp(&b.0, &a.0))
+        .fold((vec![], 0), |(mut acc, skip), (_, take)| {
+            let transposed = transpose(
+                multiplicites
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .cloned()
+                    .collect::<Vec<Vec<E::BaseField>>>(),
+            );
+
+            let rmm = RowMajorMatrix::new_by_inner_matrix(
+                ceno_p3::matrix::dense::DenseMatrix::new(transposed.concat(), take),
+                InstancePaddingStrategy::Default,
+            );
+            acc.push(rmm);
+            (acc, skip + take)
+        })
+        .0;
+
+    let table_witness = ctx
+        .commitment_ctx
+        .batch_commit(rmms)
+        .map_err(|e| LogUpError::ParameterError(format!("{e:?}")))?;
     debug!(
         "== Witness table multiplicities metrics {} ==",
         metrics.to_span()
     );
 
+    // Write the witness commitments to the transcript
+    for (node_id, _) in ctx.steps_info.to_forward_iterator() {
+        if let Some(prover_commit) = witness_gen.logup_witnesses.get(&node_id) {
+            let comm = PCS::get_pure_commitment(prover_commit);
+            PCS::write_commitment(&comm, transcript)
+                .map_err(|e| LogUpError::ParameterError(format!("{e:?}")))?;
+        }
+    }
+
+    let table_comm = PCS::get_pure_commitment(&table_witness);
+    PCS::write_commitment(&table_comm, transcript)
+        .map_err(|e| LogUpError::ParameterError(format!("{e:?}")))?;
+
     debug!("== Challenge storage ==");
     let metrics = Metrics::new();
-    let challenge_storage =
-        initialise_from_table_set::<E, T, _>(witness_gen.element_count.keys(), transcript);
+    let challenge_storage = initialise_from_table_set::<E, T, _>(ctx.lookup.iter(), transcript);
     debug!("== Challenge storage metrics {} ==", metrics.to_span());
 
     Ok(LookupWitness {
         challenge_storage,
         logup_witnesses: witness_gen.logup_witnesses,
-        table_witnesses,
+        table_witnesses: Some(table_witness),
     })
 }
 

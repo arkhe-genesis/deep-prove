@@ -267,10 +267,10 @@ pub fn seed_from_env_or_rng() -> u64 {
 #[cfg(test)]
 mod test {
     use ark_std::rand::Rng;
+    use ceno_p3::field::FieldAlgebra;
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
     use itertools::Itertools;
     use multilinear_extensions::mle::IntoMLE;
-    use p3_field::FieldAlgebra;
     use tenstore::TenStore;
 
     use crate::{
@@ -329,7 +329,7 @@ mod test {
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = default_transcript();
-        verify::<_, _, _>(verifier_ctx, proof, io, &mut verifier_transcript)
+        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript)
             .expect("invalid proof");
         println!("[+] Verify proof: valid");
         Ok(())

@@ -1,7 +1,7 @@
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor,
     backend::zkml_gelu,
-    commit::same_poly,
+    commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -11,27 +11,37 @@ use crate::{
         provable::{QuantizeOp, QuantizeOutput},
     },
     lookup::{
-        context::{COLUMN_SEPARATOR, LookupWitnessGen, TableType},
+        context::{COLUMN_SEPARATOR, LayerLookupContext, LookupWitnessGen, TableType},
         logup_gkr::{
-            prover::batch_prove as logup_batch_prove, structs::LogUpProof,
-            verifier::verify_logup_proof,
+            prover::batch_multiple_sizes_prove, structs::LogUpBatchProof,
+            verifier::verify_logup_proof_multiple_sizes,
         },
-        witness::LogUpWitness,
     },
     model::StepData,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
     tensor::{Number, Shape},
 };
+use either::Either;
 use ff_ext::ExtensionField;
+use witness::RowMajorMatrix;
+
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
-    mle::{IntoMLE, MultilinearExtension},
-    util::ceil_log2,
+    Expression,
+    mle::IntoMLE,
+    util::{ceil_log2, transpose},
+    utils::eval_by_expr_with_instance,
+    virtual_poly::VPAuxInfo,
+    virtual_polys::VirtualPolynomialsBuilder,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, marker::PhantomData};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
 use tenstore::TenStore;
 use transcript::Transcript;
 
@@ -53,8 +63,11 @@ pub enum Activation<N> {
 
 /// Currently holds the poly info for the output polynomial of the RELU
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ActivationCtx {
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct ActivationCtx<E: ExtensionField + Serialize + DeserializeOwned> {
     pub op: Activation<Element>,
+    pub lookup_context: LayerLookupContext,
+    pub sumcheck_expression: Vec<Expression<E>>,
     pub node_id: NodeId,
 }
 
@@ -66,11 +79,23 @@ where
 {
     /// proof for the accumulation of the claim from m2v + claim from lookup for the same poly
     /// e.g. the "link" between a m2v and relu layer
-    pub(crate) io_accumulation: same_poly::Proof<E>,
+    pub(crate) io_accumulation: IOPProof<E>,
+    /// The evaluations output by the linking sumcheck
+    pub(crate) evaluations: Vec<E>,
     /// the lookup proof for the relu
-    pub(crate) lookup: LogUpProof<E>,
+    pub(crate) lookup: LogUpBatchProof<E>,
     /// The witness commitments from this function
-    pub(crate) commits: Vec<PCS::Commitment>,
+    pub(crate) commit: PCS::Commitment,
+}
+
+impl<E, PCS> ActivationProof<E, PCS>
+where
+    E: ExtensionField,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
+        PCS::write_commitment(&self.commit, transcript).map_err(|e| anyhow!("{e:?}"))
+    }
 }
 
 impl<N> OpInfo for Activation<N> {
@@ -156,12 +181,16 @@ impl Evaluate<Element> for Activation<Element> {
 }
 
 impl ProveInfo for Activation<Element> {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         match self {
             Activation::Relu(_) => aux.tables.insert(TableType::Relu),
             // TODO: if we want to save on memory, we can use a pointer to the vector instead
             Activation::Gelu(gelu) => aux.tables.insert(TableType::GELU(
-                gelu.quant_data.as_ref().unwrap().table_data.clone(),
+                gelu.quant_data.map(|q| q.table_data).unwrap(),
             )),
         };
 
@@ -173,14 +202,30 @@ impl ProveInfo for Activation<Element> {
             .fold(aux.max_poly_len, |acc, shapes| {
                 acc.max(shapes.next_power_of_two().product())
             });
-        let act = match self {
-            Activation::Relu(relu) => Activation::Relu(*relu),
-            Activation::Gelu(g) => Activation::Gelu(g.clone()),
+        let (act, lookup_context) = match self {
+            Activation::Relu(relu) => (
+                Activation::Relu(*relu),
+                LayerLookupContext::new(vec![TableType::Relu], vec![1]),
+            ),
+            Activation::Gelu(g) => (
+                Activation::Gelu(g.clone()),
+                LayerLookupContext::new(
+                    vec![TableType::GELU(g.quant_data.map(|q| q.table_data).unwrap())],
+                    vec![1],
+                ),
+            ),
         };
+        // Build the Sumcheck Expression, we presume the polynomials will be loaded in in the order: input_column, output_column, eq_polys
+        let sumcheck_expression = Expression::WitIn(0) * Expression::WitIn(2)
+            + Expression::WitIn(1)
+                * (Expression::Challenge(0, 1, E::ONE, E::ZERO) * Expression::WitIn(2)
+                    + Expression::Challenge(0, 2, E::ONE, E::ZERO) * Expression::WitIn(3));
         Ok((
             LayerCtx::Activation(ActivationCtx {
                 op: act,
+                lookup_context,
                 node_id: id,
+                sumcheck_expression: vec![sumcheck_expression],
             }),
             aux,
         ))
@@ -195,34 +240,29 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
-    type Ctx = ActivationCtx;
+    type Ctx = ActivationCtx<E>;
 
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
         id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        _step_data: &StepData<E, E>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
-        store: &mut TenStore,
+        _store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
-        Ok(vec![self.prove_step(
-            prover,
-            last_claims[0],
-            step_data.output_tensor_at(0, store)?.get_data(),
-            ctx,
-            id,
-        )?])
+        Ok(vec![self.prove_step(prover, last_claims[0], ctx, id)?])
     }
 
-    fn gen_lookup_witness<'a>(
+    fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &'a ProverContext<'a, E, PCS>,
+        ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut TenStore,
-    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+    ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors(store)?;
         ensure!(
             step_data.node_inputs.len() == 1,
@@ -267,45 +307,24 @@ where
             col_one.push(a_field.as_bases()[0]);
             col_two.push(b_field.as_bases()[0]);
         }
-
-        let num_vars = ceil_log2(col_one.len());
-
+        let transposed = transpose(vec![col_one, col_two]);
         // Add the witness polynomials that we need to commit to
-        #[allow(clippy::type_complexity)]
-        let (commits, column_evals): (
-            Vec<(PCS::CommitmentWithWitness, MultilinearExtension<'_, E>)>,
-            Vec<Vec<E::BaseField>>,
-        ) = [col_one, col_two]
-            .into_par_iter()
-            .map(|evaluations| {
-                let mle =
-                    MultilinearExtension::<E>::from_evaluations_vec(num_vars, evaluations.clone());
-                let commit = ctx.commitment_ctx.commit(&mle)?;
-                Ok(((commit, mle), evaluations))
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?
-            .into_iter()
-            .unzip();
-
-        let mut wit_gen = LookupWitnessGen::<E, PCS>::default();
-        wit_gen.logup_witnesses.insert(
-            id,
-            vec![LogUpWitness::<E, PCS>::new_lookup(
-                commits,
-                column_evals,
-                2,
-                self.table_type(),
-            )],
+        let rmm = RowMajorMatrix::new_by_inner_matrix(
+            ceno_p3::matrix::dense::DenseMatrix::new(transposed.concat(), 2),
+            witness::InstancePaddingStrategy::Default,
         );
-        wit_gen
-            .element_count
-            .insert(self.table_type(), element_count);
 
-        Ok(wit_gen)
+        let commit = ctx.commitment_ctx.batch_commit(vec![rmm])?;
+
+        let mut gen = LookupWitnessGen::<E, PCS>::default();
+        gen.logup_witnesses.insert(id, commit);
+        gen.element_count.insert(self.table_type(), element_count);
+
+        Ok(gen)
     }
 }
 
-impl OpInfo for ActivationCtx {
+impl<E: ExtensionField> OpInfo for ActivationCtx<E> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         self.op.output_shapes(input_shapes, padding_mode)
     }
@@ -323,7 +342,7 @@ impl OpInfo for ActivationCtx {
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for ActivationCtx
+impl<E, PCS> VerifiableCtx<E, PCS> for ActivationCtx<E>
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
@@ -337,29 +356,20 @@ where
         proof: &Self::Proof,
         last_claims: &[&Claim<E>],
         verifier: &mut Verifier<E, T, PCS>,
-        shape_step: &ShapeStep,
+        _shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
-        let table_type = match &self.op {
-            Activation::Relu(_) => TableType::Relu,
-            Activation::Gelu(g) => {
-                TableType::GELU(g.quant_data.as_ref().unwrap().table_data.clone())
-            }
-        };
-        let (constant_challenge, column_separation_challenge) = verifier
-            .challenge_storage
-            .get_challenges_by_name(&table_type.name())
-            .ok_or(anyhow!(
-                "Couldn't get challenges for LookupType: {}",
-                TableType::Relu.name()
-            ))?;
         Ok(vec![self.verify_activation(
             verifier,
             last_claims[0],
             proof,
-            constant_challenge,
-            column_separation_challenge,
-            shape_step,
         )?])
+    }
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        proof: &Self::Proof,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        proof.write_commitment(transcript)
     }
 }
 
@@ -367,9 +377,7 @@ impl<N> Activation<N> {
     fn table_type(&self) -> TableType {
         match self {
             Activation::Relu(_) => TableType::Relu,
-            Activation::Gelu(g) => {
-                TableType::GELU(g.quant_data.as_ref().unwrap().table_data.clone())
-            }
+            Activation::Gelu(g) => TableType::GELU(g.quant_data.map(|q| q.table_data).unwrap()),
         }
     }
     #[timed::timed_instrument(name = "Prover::prove_activation_step")]
@@ -377,145 +385,175 @@ impl<N> Activation<N> {
         &self,
         prover: &mut Prover<'a, 'b, E, T, PCS>,
         last_claim: &Claim<E>,
-        output: &[E],
-        _step: &ActivationCtx,
+        step: &ActivationCtx<E>,
         node_id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         // Should only be one prover_info for this step
-        let mut logup_witnesses = prover.lookup_witness(node_id)?;
-        ensure!(
-            logup_witnesses.len() == 1,
-            "Activation only requires a lookup into one table type, but node: {} had {} lookup witnesses",
-            node_id,
-            logup_witnesses.len()
+        let layer_commitment = prover.lookup_witness(node_id)?;
+        let logup_inputs = step
+            .lookup_context
+            .create_logup_inputs::<PCS, E>(layer_commitment, &prover.challenge_storage)?;
+        let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
+        let commit = PCS::get_pure_commitment(layer_commitment);
+        // Run the lookup protocol and return the lookup proof
+        let logup_proof = batch_multiple_sizes_prove(&logup_inputs, prover.transcript)?;
+
+        let input_claim = logup_proof.output_claims()[0].clone();
+        let logup_point = &input_claim.point;
+
+        let logup_eq_poly = compute_betas_eval(logup_point).into_mle();
+        let last_claim_eq = compute_betas_eval(&last_claim.point).into_mle();
+
+        let either_polys = layer_polys
+            .iter()
+            .map(|p| Either::Left(p.as_ref()))
+            .chain(
+                [&logup_eq_poly, &last_claim_eq]
+                    .iter()
+                    .map(|&p| Either::Left(p)),
+            )
+            .collect::<Vec<Either<_, _>>>();
+
+        let num_threads = optimal_sumcheck_threads(logup_point.len());
+        let expr_builder = VirtualPolynomialsBuilder::<E>::new_with_mles(
+            num_threads,
+            logup_point.len(),
+            either_polys,
         );
-        let logup_witness = logup_witnesses.pop().expect("Length was checked above");
-        // Run the lookup protocol and return the lookup proof
-        let prover_info = logup_witness.get_logup_input(&prover.challenge_storage)?;
-
-        let commits = logup_witness.into_commitments();
-        // Run the lookup protocol and return the lookup proof
-        let logup_proof = logup_batch_prove(&prover_info, prover.transcript)?;
-
-        // We need to prove that the output of this step is the input to following activation function
-        let mut same_poly_prover = same_poly::Prover::<E>::new(output.to_vec().into_mle());
-        same_poly_prover.add_claim(last_claim.clone())?;
-        // Activation proofs have two columns, input and output
-        let mut input_claim = logup_proof.output_claims()[0].clone();
-
-        let output_claim = logup_proof.output_claims()[1].clone();
-
-        same_poly_prover.add_claim(output_claim)?;
-        let (claim_acc_proof, acc_claim) = same_poly_prover.prove(prover.transcript)?;
+        let challenge = prover
+            .transcript
+            .sample_and_append_challenge(b"batching")
+            .elements;
+        let virtual_poly = expr_builder.to_virtual_polys(&step.sumcheck_expression, &[challenge]);
+        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let all_evals = state.get_mle_flatten_final_evaluations();
+        let point = state.collect_raw_challenges();
 
         // Add commitment claims to prover
-        let commits = [input_claim.clone(), acc_claim]
-            .into_iter()
-            .zip(commits)
-            .map(|(claim, comm_with_wit)| {
-                let comm = PCS::get_pure_commitment(&comm_with_wit.0);
-                prover
-                    .commit_prover
-                    .add_witness_claim(comm_with_wit, claim)?;
-                Ok(comm)
-            })
-            .collect::<Result<Vec<PCS::Commitment>, anyhow::Error>>()?;
+        prover.add_witness_claim(
+            node_id,
+            vec![(point.clone(), vec![all_evals[0], all_evals[1]])],
+        );
 
         // Add the proof in
         prover.push_proof(
             node_id,
             LayerProof::Activation(ActivationProof {
-                io_accumulation: claim_acc_proof,
+                io_accumulation: proof,
+                evaluations: all_evals[..2].to_vec(),
                 lookup: logup_proof,
-                commits,
+                commit,
             }),
         );
 
-        if let Activation::Gelu(g) = self {
-            let m: E = g.quant_data.as_ref().unwrap().multiplier.to_field();
-            let mi = m.inverse();
-            input_claim.eval *= mi;
-        }
+        let input_claim = match &self {
+            Activation::Gelu(g) => {
+                let m: E = g.quant_data.as_ref().unwrap().multiplier.to_field();
+                let mi = m.inverse();
+                let eval = all_evals[0] * mi;
+                Claim::new(point.clone(), eval)
+            }
+            _ => Claim::new(point.clone(), all_evals[0]),
+        };
 
         Ok(input_claim)
     }
 }
 
-impl ActivationCtx {
-    pub(crate) fn verify_activation<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+impl<E: ExtensionField> ActivationCtx<E> {
+    pub(crate) fn verify_activation<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
         proof: &ActivationProof<E, PCS>,
-        constant_challenge: E,
-        column_separation_challenge: E,
-        shape_step: &ShapeStep,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,
-        E: ExtensionField + Serialize + DeserializeOwned,
+        E: Serialize + DeserializeOwned,
     {
+        let ActivationProof {
+            io_accumulation,
+            evaluations,
+            lookup,
+            commit,
+        } = proof;
+
         // 1. Verify the lookup proof
-        let verifier_claims = verify_logup_proof(
-            &proof.lookup,
-            1,
-            constant_challenge,
-            column_separation_challenge,
-            verifier.transcript,
-        )?;
+        let batch_claim = verify_logup_proof_multiple_sizes(lookup, verifier.transcript)?;
+        self.lookup_context
+            .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
 
         // 2. Verify the accumulation proof from last_claim + lookup claim into the new claim
-        let num_vars = shape_step
-            .padded_input_shape
-            .iter()
-            .try_fold(None, |expected_num_vars, shape| {
-                let num_vars = shape.iter().map(|dim| ceil_log2(*dim)).sum::<usize>();
-                if let Some(vars) = expected_num_vars {
-                    ensure!(
-                        vars == num_vars,
-                        "All input shapes for activation must have the same number of variables"
-                    );
-                }
-                Ok(Some(num_vars))
-            })?
-            .expect("No input shape found for activation layer?");
-        let sp_ctx = same_poly::Context::<E>::new(num_vars);
-        let mut sp_verifier = same_poly::Verifier::<E>::new(&sp_ctx);
-        sp_verifier.add_claim(last_claim.clone())?;
-        verifier_claims.claims()[1..]
-            .iter()
-            .try_for_each(|claim| sp_verifier.add_claim(claim.clone()))?;
+        let challenge = verifier
+            .transcript
+            .sample_and_append_challenge(b"batching")
+            .elements;
+        let poly_evals = batch_claim.poly_evals();
+        let claimed_sum = poly_evals[0] + challenge * (poly_evals[1] + challenge * last_claim.eval);
+        let aux_info = VPAuxInfo {
+            max_degree: 2,
+            max_num_variables: last_claim.point.len(),
+            ..Default::default()
+        };
 
-        let new_output_claim = sp_verifier.verify(&proof.io_accumulation, verifier.transcript)?;
-        // 3. Accumulate the new claim into the witness commitment protocol
-        verifier_claims
-            .claims()
+        let subclaim = IOPVerifierState::<E>::verify(
+            claimed_sum,
+            io_accumulation,
+            &aux_info,
+            verifier.transcript,
+        );
+        let point = subclaim
+            .point
             .iter()
-            .take(1)
-            .cloned()
-            .chain(std::iter::once(new_output_claim))
-            .zip(proof.commits.iter())
-            .try_for_each(|(claim, commit)| {
-                verifier
-                    .commit_verifier
-                    .add_witness_claim(commit.clone(), claim)
-            })?;
+            .map(|c| c.elements)
+            .collect::<Vec<E>>();
+        let lookup_eq = identity_eval(batch_claim.point(), &point);
+        let last_claim_eq = identity_eval(&last_claim.point, &point);
+        let mut witnesses = evaluations.to_vec();
+        witnesses.push(lookup_eq);
+        witnesses.push(last_claim_eq);
 
+        let calc_claim = self
+            .sumcheck_expression
+            .iter()
+            .try_fold(E::ZERO, |acc, expr| {
+                eval_by_expr_with_instance(&[], &witnesses, &[], &[], &[challenge], expr)
+                    .right()
+                    .map(|eval| acc + eval)
+            })
+            .ok_or(anyhow!(
+                "Couldn't calculate final sumcheck evaluation in Activation"
+            ))?;
+
+        ensure!(
+            calc_claim == subclaim.expected_evaluation,
+            "Activation Verification failed: calculated claim: {:?} did not equal expected claim: {:?}",
+            calc_claim,
+            subclaim.expected_evaluation
+        );
+
+        // 3. Add the witness claim to be verified
+        verifier.commit_verifier.add_witness_claim(
+            self.node_id,
+            commit.clone(),
+            vec![(point.clone(), evaluations.clone())],
+        );
         // 4. return the input claim for to be proven at subsequent step
         let input_claim = match &self.op {
-            Activation::Relu(_) => verifier_claims.claims()[0].clone(),
+            Activation::Relu(_) => Claim::<E>::new(point, evaluations[0]),
             Activation::Gelu(g) => {
-                let claim = &verifier_claims.claims()[0];
                 let m: E = g.quant_data.as_ref().unwrap().multiplier.to_field();
                 let mi = m.inverse();
-                let eval = claim.eval * mi;
-                Claim::new(claim.point.clone(), eval)
+                let eval = evaluations[0] * mi;
+                Claim::new(point, eval)
             }
         };
+
         Ok(input_claim)
     }
 }
@@ -565,7 +603,7 @@ pub struct GELU<N> {
     quant_data: Option<GELUQuantData>,
     _n: PhantomData<N>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 pub struct GeluTableData {
     /// The minimum value of the input
     pub(crate) min: Element,
@@ -589,7 +627,7 @@ impl GeluTableData {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 pub struct GELUQuantData {
     /// The multiplier used to scale the input
     multiplier: Element,

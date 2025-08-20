@@ -4,6 +4,7 @@ use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy,
     commit::{compute_betas_eval, identity_eval},
     iop::{
+        ChallengeStorage,
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
     },
@@ -15,26 +16,29 @@ use crate::{
         },
     },
     lookup::{
-        context::{LookupWitnessGen, TableType},
-        logup_gkr::{prover::batch_prove, structs::LogUpProof, verifier::verify_logup_proof},
-        witness::LogUpWitness,
+        context::{LayerLookupContext, LookupWitnessGen, TableType},
+        logup_gkr::{
+            prover::batch_multiple_sizes_prove,
+            structs::{LogUpBatchProof, LogUpInput},
+            verifier::verify_logup_proof_multiple_sizes,
+        },
     },
     max_in_slice,
     model::StepData,
     padding::{PaddingMode, ShapeData, ShapeInfo},
-    quantization::{Fieldizer, IntoElement, TensorFielder},
+    quantization::{IntoElement, TensorFielder},
     tensor::Shape,
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
 use anyhow::{anyhow, ensure};
+use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{Expression, mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
-use p3_field::FieldAlgebra;
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
@@ -42,6 +46,7 @@ use sumcheck::{
 };
 use tenstore::TenStore;
 use transcript::Transcript;
+use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 use crate::{
     Tensor,
@@ -54,12 +59,15 @@ pub struct ArgmaxData<E> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogitsCtx {}
+pub struct LogitsCtx {
+    lookup_ctx: LayerLookupContext,
+    node_id: NodeId,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct LogitsProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
-    logup_proof: LogUpProof<E>,
+    logup_proof: LogUpBatchProof<E>,
     /// Evaluation of the vector of maximum values
     max_eval: E,
     /// Commitment to the MLE of the vector of maximum values
@@ -77,6 +85,12 @@ pub struct LogitsProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LogitsProof<E, PCS> {
     pub(crate) fn get_lookup_data(&self) -> (Vec<E>, Vec<E>) {
         self.logup_proof.fractional_outputs()
+    }
+    pub(crate) fn write_commitment<T: Transcript<E>>(
+        &self,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        PCS::write_commitment(&self.max_commitment, transcript).map_err(|e| anyhow!("{e:?}"))
     }
 }
 
@@ -212,11 +226,11 @@ impl OpInfo for Logits {
 }
 
 impl ProveInfo for Logits {
-    fn step_info(
+    fn step_info<E: ExtensionField>(
         &self,
-        _id: NodeId,
+        id: NodeId,
         mut aux: ContextAux,
-    ) -> anyhow::Result<(LayerCtx, ContextAux)> {
+    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         ensure!(
             aux.last_output_shape.len() == 1,
             "Expected 1 input shape in ContextAux for Logits layer, found {}",
@@ -226,7 +240,14 @@ impl ProveInfo for Logits {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.tables.insert(TableType::Range);
 
-        Ok((LayerCtx::Logits(LogitsCtx {}), aux))
+        let lookup_ctx = LayerLookupContext::new(vec![TableType::Range], vec![1]);
+        Ok((
+            LayerCtx::Logits(LogitsCtx {
+                lookup_ctx,
+                node_id: id,
+            }),
+            aux,
+        ))
     }
 }
 
@@ -279,13 +300,16 @@ impl PadOp for Logits {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Logits {
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Logits
+where
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+{
     type Ctx = LogitsCtx;
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
         node_id: NodeId,
-        _ctx: &Self::Ctx,
+        ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
@@ -324,32 +348,21 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
 
         let max_values = &argmax_data.max_values[0];
 
-        let mut logup_witnesses = prover.lookup_witness(node_id)?;
+        let layer_commitment = prover.lookup_witness(node_id)?;
 
-        ensure!(
-            logup_witnesses.len() == 1,
-            "Expected 1 logup witness for Logits layer, found {}",
-            logup_witnesses.len(),
-        );
+        let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
+        let commitment = PCS::get_pure_commitment(layer_commitment);
 
-        let logup_witness = logup_witnesses.pop().expect("Length is checked above");
-
-        let logup_input = logup_witness.get_logup_input(&prover.challenge_storage)?;
-
-        let mut commits = logup_witness.into_commitments();
-
-        ensure!(
-            commits.len() == 1,
-            "Expected 1 commitment in logup witness for Logits layer, found {}",
-            commits.len(),
-        );
-
-        let (max_values_commit, max_mle) = commits.remove(0);
-
-        let logup_proof = batch_prove(&logup_input, prover.transcript)?;
+        let max_mle = layer_polys[0].as_ref();
+        let logup_input = ctx.build_lookup_input(
+            max_mle.get_base_field_vec(),
+            &input,
+            &prover.challenge_storage,
+        )?;
+        let logup_batch_proof = batch_multiple_sizes_prove(&[logup_input], prover.transcript)?;
 
         // get the claim about the difference between max_values and input data
-        let output_claims = logup_proof.output_claims();
+        let output_claims = logup_batch_proof.output_claims();
         ensure!(
             output_claims.len() == 1,
             "Expected 1 claim from logup proof in Logits layer, found {}",
@@ -363,12 +376,9 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
 
         let max_eval = max_mle.evaluate(row_point);
 
-        let max_commitment = PCS::get_pure_commitment(&max_values_commit);
-
-        prover.commit_prover.add_witness_claim(
-            (max_values_commit, max_mle),
-            Claim::new(row_point.to_vec(), max_eval),
-        )?;
+        prover
+            .commit_prover
+            .add_witness_claim(node_id, vec![(row_point.to_vec(), vec![max_eval])]);
 
         let input_claim = Claim::new(diff_claim.point.clone(), max_eval - diff_claim.eval);
 
@@ -439,9 +449,9 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         let final_input_claim = Claim::new(state.collect_raw_challenges(), input_eval);
 
         let proof = LogitsProof {
-            logup_proof,
+            logup_proof: logup_batch_proof,
             max_eval,
-            max_commitment,
+            max_commitment: commitment,
             max_mat_eval: max_matrix_eval,
             sumcheck_proof,
             hadamard_proof,
@@ -453,13 +463,13 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         Ok(vec![final_input_claim])
     }
 
-    fn gen_lookup_witness<'a>(
+    fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &ProverContext<'a, E, PCS>,
-        step_data: &'a StepData<Element, E>,
+        ctx: &ProverContext<E, PCS>,
+        step_data: &StepData<Element, E>,
         store: &mut TenStore,
-    ) -> anyhow::Result<LookupWitnessGen<'a, E, PCS>> {
+    ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         ensure!(
             step_data.node_inputs.len() == 1,
             "Expected 1 input tensor for Logits witness generation, found {}",
@@ -494,45 +504,40 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
             input.shape(),
         );
 
-        let (merged_diff, diff_values): (Vec<Element>, Vec<E::BaseField>) = input
+        let merged_diff = input
             .get_data()
             .into_par_iter()
             .enumerate()
             .map(|(i, input)| {
                 let row_index = i / input_shape.dim(input_shape.len() - 1);
                 let current_max = max_values.get_data()[row_index];
-
                 let max_element = current_max.to_element();
-                let diff = max_element - input;
-                let diff_field = <Element as Fieldizer<E>>::to_field(&diff)
-                    .as_base()
-                    .expect("Diff element overflows field");
-                (diff, diff_field)
+                max_element - input
             })
-            .unzip();
+            .collect::<Vec<Element>>();
         let element_count = merged_diff.iter().fold(HashMap::new(), |mut acc, diff| {
             *acc.entry(*diff).or_default() += 1;
             acc
         });
 
         // commit to max values
-        let commits = {
-            let max_mle = max_values.to_mle_2d();
-            (ctx.commitment_ctx.commit(&max_mle)?, max_mle)
-        };
-        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
-        gen_w.logup_witnesses.insert(
-            id,
-            vec![LogUpWitness::new_lookup(
-                vec![commits],
-                vec![diff_values],
-                1,
-                TableType::Range,
-            )],
-        );
-        gen_w.element_count.insert(TableType::Range, element_count);
+        let commit_data = max_values
+            .get_data()
+            .iter()
+            .map(|v| v.as_bases()[0])
+            .collect::<Vec<E::BaseField>>();
 
-        Ok(gen_w)
+        let rmm = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
+            ceno_p3::matrix::dense::DenseMatrix::new(commit_data, 1),
+            InstancePaddingStrategy::Default,
+        );
+        let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm])?;
+
+        let mut gen = LookupWitnessGen::<E, PCS>::default();
+        gen.logup_witnesses.insert(id, layer_commitment);
+        gen.element_count.insert(TableType::Range, element_count);
+
+        Ok(gen)
     }
 }
 
@@ -568,44 +573,37 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         verifier: &mut Verifier<E, T, PCS>,
         shape_step: &ShapeStep,
     ) -> anyhow::Result<Vec<Claim<E>>> {
-        let (constant_challenge, column_separation_challenge) = verifier
-            .challenge_storage
-            .get_challenges_by_name(&TableType::Range.name())
-            .ok_or(anyhow!(
-                "Couldn't get challenges for LookupType: {}",
-                TableType::Range.name()
-            ))?;
-        let logup_claims = verify_logup_proof(
-            &proof.logup_proof,
-            1,
-            constant_challenge,
-            column_separation_challenge,
-            verifier.transcript,
-        )?;
+        let batch_claim =
+            verify_logup_proof_multiple_sizes(&proof.logup_proof, verifier.transcript)?;
+
+        self.lookup_ctx
+            .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
+
+        let poly_evals = batch_claim.poly_evals();
 
         ensure!(
-            logup_claims.claims().len() == 1,
+            poly_evals.len() == 1,
             "Expected 1 claim for logup when verifying Logis layer, found {}",
-            logup_claims.claims().len(),
+            poly_evals.len(),
         );
 
-        let claim = &logup_claims.claims()[0];
         ensure!(
             shape_step.padded_input_shape.len() == 1,
             "Expected 1 padded input shape when verifying Logits layer, found {}",
             shape_step.padded_input_shape.len(),
         );
 
-        let num_row_vars = shape_step.padded_input_shape[0].num_vars()[0];
-        let num_col_vars = shape_step.padded_input_shape[0].num_vars()[1];
-        let (_, row_point) = Logits::split_claim_point(&claim.point, num_row_vars)?;
+        let num_row_vars = shape_step.padded_input_shape[0].dim(0).ilog2() as usize;
+        let num_col_vars = shape_step.padded_input_shape[0].dim(1).ilog2() as usize;
+        let (_, row_point) = Logits::split_claim_point(batch_claim.point(), num_row_vars)?;
 
-        let input_claim = Claim::new(claim.point.clone(), proof.max_eval - claim.eval);
+        let input_claim = Claim::new(batch_claim.point().to_vec(), proof.max_eval - poly_evals[0]);
 
         verifier.commit_verifier.add_witness_claim(
+            self.node_id,
             proof.max_commitment.clone(),
-            Claim::new(row_point.to_vec(), proof.max_eval),
-        )?;
+            vec![(row_point.to_vec(), vec![proof.max_eval])],
+        );
 
         // verify the sum-check to convert the vector of maximum values to the sparse matrix
 
@@ -682,6 +680,14 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         // by the prover, and are verified directly in `LogitsCtx::verify_output_evaluation` method
         vec![Claim::default(); outputs.len()]
     }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        proof: &Self::Proof,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        proof.write_commitment(transcript)
+    }
 }
 
 impl LogitsCtx {
@@ -726,6 +732,42 @@ impl LogitsCtx {
             output_claim.eval,
         );
         Ok(())
+    }
+
+    fn build_lookup_input<E: ExtensionField>(
+        &self,
+        max_evals: &[E::BaseField],
+        input: &Tensor<E>,
+        challenge_storage: &ChallengeStorage<E>,
+    ) -> anyhow::Result<LogUpInput<E>> {
+        let input_shape = input.shape();
+        let last_dim = input_shape.dim(input_shape.len() - 1);
+
+        let column_evals = input
+            .get_data()
+            .par_chunks(last_dim)
+            .zip(max_evals.par_iter())
+            .map(|(chunk, &max)| {
+                chunk
+                    .iter()
+                    .map(|val| max - val.as_bases()[0])
+                    .collect::<Vec<E::BaseField>>()
+            })
+            .collect::<Vec<Vec<E::BaseField>>>();
+
+        let (constant_challenge, column_separation_challenge) = challenge_storage
+            .get_challenges_by_name(&self.lookup_ctx.tables[0].name())
+            .ok_or(anyhow!(
+                "No challenges found for Table Type: {}, cannot prove Logits ArgMax",
+                self.lookup_ctx.tables[0].name()
+            ))?;
+        LogUpInput::<E>::new_lookup(
+            vec![column_evals.concat()],
+            constant_challenge,
+            column_separation_challenge,
+            1,
+        )
+        .map_err(|e| anyhow!("{:?}", e))
     }
 }
 

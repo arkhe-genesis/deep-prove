@@ -496,7 +496,11 @@ impl<N: Number> Evaluate<N> for MatMul<N> {
 }
 
 impl ProveInfo for MatMul<Element> {
-    fn step_info(&self, id: NodeId, ctx_aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        ctx_aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         let (info, ctx_aux) = self.ctx(id, ctx_aux)?;
 
         // there is only one product (i.e. quadratic sumcheck)
@@ -628,6 +632,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = MatMulCtx;
 
@@ -718,6 +723,7 @@ impl MatMul<Element> {
         E::BaseField: Serialize + DeserializeOwned,
         T: Transcript<E>,
         PCS: PolynomialCommitmentScheme<E>,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         let mut last_claim = last_claim.clone();
         let mut common_claims = HashMap::new();
@@ -880,9 +886,7 @@ impl MatMul<Element> {
             bias_eval: common_claims.get(BIAS_POLY_ID).map(|c| c.eval),
         };
 
-        prover
-            .add_common_claims(node_id, common_claims)
-            .context("unable to add weight matrix claims")?;
+        prover.add_common_claims(node_id, common_claims);
         Ok((output_claims, proof))
     }
 
@@ -1012,6 +1016,15 @@ where
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         self.verify_matmul(verifier, last_claims[0], proof, shape_step)
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
     }
 }
 
@@ -1152,7 +1165,7 @@ impl MatMulCtx {
             output_claims.push(right_claim)
         }
 
-        verifier.add_common_claims(self.node_id, common_claims)?;
+        verifier.add_common_claims(self.node_id, common_claims);
 
         // SUMCHECK verification part
         // Instead of computing the polynomial at the random point requested like this

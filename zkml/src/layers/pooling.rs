@@ -2,16 +2,15 @@ use std::collections::HashMap;
 
 use crate::{
     Claim, Element, Prover, ProverContext,
-    commit::compute_betas_eval,
+    commit::{compute_betas_eval, identity_eval},
     iop::{context::ShapeStep, verifier::Verifier},
     layers::{ContextAux, LayerProof},
     lookup::{
-        context::{LookupWitnessGen, TableType},
+        context::{LayerLookupContext, LookupWitnessGen, TableType},
         logup_gkr::{
-            prover::batch_prove as logup_batch_prove, structs::LogUpProof,
-            verifier::verify_logup_proof,
+            prover::batch_multiple_sizes_prove as logup_batch_prove, structs::LogUpBatchProof,
+            verifier::verify_logup_proof_multiple_sizes,
         },
-        witness::LogUpWitness,
     },
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pooling},
@@ -19,15 +18,15 @@ use crate::{
     tensor::{Number, Shape, Tensor},
     to_base,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
-use mpcs::{PolynomialCommitmentScheme, sum_check::eq_xy_eval};
+use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     Expression,
-    mle::{IntoMLE, MultilinearExtension},
-    util::ceil_log2,
+    mle::MultilinearExtension,
+    util::{ceil_log2, transpose},
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::de::DeserializeOwned;
@@ -37,6 +36,7 @@ use sumcheck::{
 };
 use tenstore::TenStore;
 use transcript::Transcript;
+use witness::RowMajorMatrix;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,7 @@ pub enum Pooling {
 pub struct PoolingCtx {
     pub poolinfo: Maxpool2D,
     pub node_id: NodeId,
+    pub lookup_ctx: LayerLookupContext,
 }
 
 /// Contains proof material related to one step of the inference
@@ -70,13 +71,23 @@ where
     /// the actual sumcheck proof proving that the product of correct terms is always zero
     pub(crate) sumcheck: IOPProof<E>,
     /// The lookup proof showing that the diff is always in the correct range
-    pub(crate) lookup: LogUpProof<E>,
+    pub(crate) lookup: LogUpBatchProof<E>,
     /// The output evaluations of the diff polys produced by the zerocheck
     pub(crate) zerocheck_evals: Vec<E>,
     /// This tells the verifier how far apart the variables get fixed on the input MLE
     pub(crate) variable_gap: usize,
     /// Commitments that are part of the commitment opening proof for this layer
-    pub(crate) commitments: Vec<PCS::Commitment>,
+    pub(crate) commitment: PCS::Commitment,
+}
+
+impl<E, PCS> PoolingProof<E, PCS>
+where
+    E: ExtensionField,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
+        PCS::write_commitment(&self.commitment, transcript).map_err(|e| anyhow::anyhow!("{e:?}"))
+    }
 }
 
 const IS_PROVABLE: bool = true;
@@ -128,7 +139,11 @@ impl<N: Number> Evaluate<N> for Pooling {
 }
 
 impl ProveInfo for Pooling {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         let info = match self {
             Pooling::Maxpool2D(info) => {
                 aux.tables.insert(TableType::Range);
@@ -144,9 +159,12 @@ impl ProveInfo for Pooling {
                     .fold(aux.max_poly_len, |acc, shapes| {
                         acc.max(shapes.next_power_of_two().product())
                     });
+
+                let lookup_ctx = LayerLookupContext::new(vec![TableType::Range], vec![4]);
                 LayerCtx::Pooling(PoolingCtx {
                     poolinfo: *info,
                     node_id: id,
+                    lookup_ctx,
                 })
             }
         };
@@ -168,6 +186,7 @@ where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = PoolingCtx;
 
@@ -181,25 +200,23 @@ where
         store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors(store)?;
-        let output_tensors = step_data.output_tensors(store)?;
 
         Ok(vec![self.prove_pooling(
             prover,
             last_claims[0],
             &input_tensors[0],
-            &output_tensors[0],
             ctx,
             id,
         )?])
     }
 
-    fn gen_lookup_witness<'a>(
+    fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &'a ProverContext<'a, E, PCS>,
+        ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut TenStore,
-    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+    ) -> Result<LookupWitnessGen<E, PCS>> {
         let input_tensors = step_data.input_tensors(store)?;
         let output_tensors = step_data.output_tensors(store)?;
 
@@ -215,7 +232,8 @@ where
         );
 
         let mut element_count = HashMap::<Element, u64>::new();
-        let column_evals = match self {
+
+        let mut column_evals = match self {
             Pooling::Maxpool2D(maxpool2d) => {
                 let field_vecs = maxpool2d.compute_polys::<E>(&input_tensors[0]);
 
@@ -229,35 +247,21 @@ where
         };
         // Commit to the witnes polys
         let output_poly = to_base::<E, _>(output_tensors[0].get_data());
-        let num_vars = ceil_log2(output_poly.len());
-        let commit_evals = column_evals
-            .clone()
-            .into_iter()
-            .chain(std::iter::once(output_poly))
-            .collect::<Vec<_>>();
-        let commits = commit_evals
-            .into_par_iter()
-            .map(|evaluations| {
-                let mle =
-                    MultilinearExtension::<'_, E>::from_evaluations_vec(num_vars, evaluations);
-                let commit = ctx.commitment_ctx.commit(&mle)?;
-                Ok((commit, mle))
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
-
-        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
-        gen_w.logup_witnesses.insert(
-            id,
-            vec![LogUpWitness::<E, PCS>::new_lookup(
-                commits,
-                column_evals.clone(),
-                1,
-                TableType::Range,
-            )],
+        column_evals.push(output_poly);
+        let width = column_evals.len();
+        let values = transpose(column_evals);
+        let rmm = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
+            ceno_p3::matrix::dense::DenseMatrix::new(values.concat(), width),
+            witness::InstancePaddingStrategy::Default,
         );
-        gen_w.element_count.insert(TableType::Range, element_count);
 
-        Ok(gen_w)
+        let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm])?;
+
+        let mut gen = LookupWitnessGen::<E, PCS>::default();
+        gen.logup_witnesses.insert(id, layer_commitment);
+        gen.element_count.insert(TableType::Range, element_count);
+
+        Ok(gen)
     }
 }
 
@@ -300,21 +304,20 @@ where
         verifier: &mut Verifier<E, T, PCS>,
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
-        let (constant_challenge, column_separation_challenge) = verifier
-            .challenge_storage
-            .get_challenges_by_name(&TableType::Range.name())
-            .ok_or(anyhow!(
-                "Couldn't get challenges for LookupType: {}",
-                TableType::Range.name()
-            ))?;
         Ok(vec![self.verify_pooling(
             verifier,
             last_claims[0],
             proof,
-            constant_challenge,
-            column_separation_challenge,
             shape_step,
         )?])
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        proof: &Self::Proof,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        proof.write_commitment(transcript)
     }
 }
 
@@ -353,42 +356,35 @@ impl Pooling {
         last_claim: &Claim<E>,
         // input to the dense layer
         input: &Tensor<E>,
-        // output of dense layer evaluation
-        output: &Tensor<E>,
         info: &PoolingCtx,
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         assert_eq!(input.rank(), 3, "Maxpool needs 3D inputs.");
         let output_shapes = self.output_shapes(&[input.shape()], PaddingMode::Padding);
         let num_vars = Self::num_vars_for_outputs(output_shapes.as_slice())?;
         // Should only be one prover_info for this step
-        let mut logup_witnesses = prover.lookup_witness(id)?;
-        ensure!(
-            logup_witnesses.len() == 1,
-            "Pooling only requires a lookup into one table type, but node: {} had {} lookup witnesses",
-            id,
-            logup_witnesses.len(),
-        );
-        let logup_witness = logup_witnesses.pop().expect("Length is checked above");
+        let layer_commitment = prover.lookup_witness(id)?;
+        let logup_inputs = info
+            .lookup_ctx
+            .create_logup_inputs::<PCS, E>(layer_commitment, &prover.challenge_storage)?;
+        let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
+        let commitment = PCS::get_pure_commitment(layer_commitment);
 
-        let prover_info = logup_witness.get_logup_input(&prover.challenge_storage)?;
-        let commits = logup_witness.into_commitments();
-        let logup_proof = logup_batch_prove(&prover_info, prover.transcript)?;
-
-        // These are the polys that get passed to the zero check make sure their product is zero at every evaluation point
-        let diff_polys = prover_info
-            .column_evals()
-            .iter()
-            .map(|diff| MultilinearExtension::<'_, E>::from_evaluations_slice(num_vars, diff))
-            .collect::<Vec<MultilinearExtension<E>>>();
+        let logup_proof = logup_batch_prove(&logup_inputs, prover.transcript)?;
 
         // Run the Zerocheck that checks enforces that output does contain the maximum value for the kernel
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let either_mles = layer_polys
+            .iter()
+            .map(|p| Either::Left(p.as_ref()))
+            .collect::<Vec<Either<_, _>>>();
+        let mut expr_builder =
+            VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
 
         // We reuse the logup point here for the zerocheck challenge
         let lookup_point = &logup_proof.output_claims()[0].point;
@@ -405,33 +401,22 @@ impl Pooling {
         let last_claim_beta_eval = compute_betas_eval(&last_claim.point);
         let last_claim_beta =
             MultilinearExtension::from_evaluations_ext_vec(num_vars, last_claim_beta_eval.clone());
-        let output_mle: MultilinearExtension<E> = output.get_data().to_vec().into_mle();
-        let diff_exprs = diff_polys
-            .iter()
-            .map(|p| expr_builder.lift(Either::Left(p)))
-            .collect::<Vec<Expression<E>>>();
-        let output_expr = expr_builder.lift(Either::Left(&output_mle));
+
         let beta_expr = expr_builder.lift(Either::Left(&beta_poly));
         let last_claim_expr = expr_builder.lift(Either::Left(&last_claim_beta));
-
-        let (prod_expr, sum_expr, final_challenge) = diff_exprs.into_iter().fold(
-            (
-                beta_expr.clone(),
-                Expression::Constant(Either::Right(E::ZERO)),
-                batch_challenge,
-            ),
-            |(prod_acc, sum_acc, chal_acc), expr| {
-                (
-                    prod_acc * expr.clone(),
-                    sum_acc + Expression::Constant(Either::Right(chal_acc)) * expr,
-                    chal_acc * batch_challenge,
-                )
-            },
-        );
+        let prod_expr = Expression::WitIn(0)
+            * Expression::WitIn(1)
+            * Expression::WitIn(2)
+            * Expression::WitIn(3)
+            * beta_expr.clone();
+        let sum_expr = (0u16..4).fold(Expression::Constant(Either::Right(E::ZERO)), |acc, j| {
+            acc + Expression::Challenge(0, (j + 1) as usize, E::ONE, E::ZERO) * Expression::WitIn(j)
+        });
         let diffs_expr = prod_expr + (beta_expr * sum_expr);
         let out_expr =
-            Expression::Constant(Either::Right(final_challenge)) * last_claim_expr * output_expr;
-        let virtual_poly = expr_builder.to_virtual_polys(&[diffs_expr, out_expr], &[]);
+            Expression::Challenge(0, 5, E::ONE, E::ZERO) * last_claim_expr * Expression::WitIn(4);
+        let virtual_poly =
+            expr_builder.to_virtual_polys(&[diffs_expr, out_expr], &[batch_challenge]);
         let (proof, sumcheck_state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
         // Extract all claims about committed witness polys
@@ -443,19 +428,13 @@ impl Pooling {
         let kernel_size = info.poolinfo.kernel_size * info.poolinfo.kernel_size;
 
         let output_eval = sumcheck_evals[kernel_size];
-
-        let commitments = sumcheck_evals[..kernel_size]
-            .iter()
-            .chain(std::iter::once(&output_eval))
-            .zip(commits)
-            .map(|(&eval, comm_with_wit)| {
-                let commit = PCS::get_pure_commitment(&comm_with_wit.0);
-                prover
-                    .commit_prover
-                    .add_witness_claim(comm_with_wit, Claim::new(zerocheck_point.clone(), eval))?;
-                Ok(commit)
-            })
-            .collect::<Result<Vec<PCS::Commitment>, anyhow::Error>>()?;
+        let commit_evals = (
+            zerocheck_point.to_vec(),
+            sumcheck_evals[..kernel_size + 1].to_vec(),
+        );
+        prover
+            .commit_prover
+            .add_witness_claim(id, vec![commit_evals]);
 
         // Now we must do the samething accumulating evals for the input poly as we fix variables on the input poly.
         // The point length is 2 longer because for now we only support MaxPool2D.
@@ -522,7 +501,7 @@ impl Pooling {
                 lookup: logup_proof,
                 zerocheck_evals,
                 variable_gap: padded_input_row_length_log - 1,
-                commitments,
+                commitment,
             }),
         );
         Ok(next_claim)
@@ -538,8 +517,6 @@ impl PoolingCtx {
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
         proof: &PoolingProof<E, PCS>,
-        constant_challenge: E,
-        column_separation_challenge: E,
         shape_step: &ShapeStep,
     ) -> anyhow::Result<Claim<E>>
     where
@@ -547,14 +524,12 @@ impl PoolingCtx {
         E: ExtensionField + Serialize + DeserializeOwned,
     {
         // 1. Verify the lookup proof
-        let verifier_claims = verify_logup_proof(
-            &proof.lookup,
-            4,
-            constant_challenge,
-            column_separation_challenge,
-            verifier.transcript,
-        )?;
+        let batch_claim = verify_logup_proof_multiple_sizes(&proof.lookup, verifier.transcript)?;
 
+        self.lookup_ctx
+            .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
+
+        let poly_evals = batch_claim.poly_evals();
         // 2. Verify the sumcheck proof
         let output_shapes =
             self.output_shapes(&shape_step.padded_input_shape, PaddingMode::Padding);
@@ -564,11 +539,10 @@ impl PoolingCtx {
             .transcript
             .sample_and_append_challenge(b"batch_pooling")
             .elements;
-        let (initial_value_no_last_claim, final_batching_challenge) = verifier_claims
-            .claims()
+        let (initial_value_no_last_claim, final_batching_challenge) = poly_evals
             .iter()
-            .fold((E::ZERO, batching_challenge), |(acc, comb), claim| {
-                (acc + claim.eval * comb, comb * batching_challenge)
+            .fold((E::ZERO, batching_challenge), |(acc, comb), &e| {
+                (acc + e * comb, comb * batching_challenge)
             });
         let initial_value =
             initial_value_no_last_claim + final_batching_challenge * last_claim.eval;
@@ -581,9 +555,9 @@ impl PoolingCtx {
 
         // Verify the sumcheck output claim and add commitment claims to the commit verifier
         let zerocheck_point = subclaim.point.iter().map(|p| p.elements).collect_vec();
-        let beta_eval = eq_xy_eval(verifier_claims.point(), &zerocheck_point);
+        let beta_eval = identity_eval(batch_claim.point(), &zerocheck_point);
 
-        let last_claim_beta_eval = eq_xy_eval(&last_claim.point, &zerocheck_point);
+        let last_claim_beta_eval = identity_eval(&last_claim.point, &zerocheck_point);
 
         let kernel_size = proof.zerocheck_evals.len() - 1;
 
@@ -611,16 +585,12 @@ impl PoolingCtx {
             subclaim.expected_evaluation
         );
 
-        proof
-            .zerocheck_evals
-            .iter()
-            .zip(proof.commitments.iter())
-            .try_for_each(|(&eval, commit)| {
-                verifier.commit_verifier.add_witness_claim(
-                    commit.clone(),
-                    Claim::<E>::new(zerocheck_point.clone(), eval),
-                )
-            })?;
+        let commit_claim = (zerocheck_point.clone(), proof.zerocheck_evals.clone());
+        verifier.commit_verifier.add_witness_claim(
+            self.node_id,
+            proof.commitment.clone(),
+            vec![commit_claim],
+        );
 
         // Challenegs used to batch input poly claims together and link them with zerocheck and lookup verification output
         let [r1, r2] = [verifier
@@ -804,10 +774,10 @@ mod tests {
     use super::*;
     use crate::{quantization::Fieldizer, util::from_mle_list_dimensions};
     use ark_std::rand::Rng;
+    use ceno_p3::field::FieldAlgebra;
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
     use itertools::Itertools;
     use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
-    use p3_field::FieldAlgebra;
 
     use sumcheck::structs::{IOPProverState, IOPVerifierState};
 

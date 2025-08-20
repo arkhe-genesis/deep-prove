@@ -221,7 +221,11 @@ const WEIGHT_POLY_ID: &str = "DenseWeight";
 const BIAS_POLY_ID: &str = "DenseBias";
 
 impl ProveInfo for Dense<Element> {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         // construct dimension of the polynomial given to the sumcheck
         aux.last_output_shape
             .iter_mut()
@@ -308,6 +312,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = DenseCtx;
 
@@ -375,6 +380,15 @@ where
         _shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         Ok(vec![self.verify_dense(verifier, last_claims[0], proof)?])
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
     }
 }
 
@@ -450,6 +464,7 @@ impl Dense<Element> {
         E::BaseField: Serialize + DeserializeOwned,
         T: Transcript<E>,
         PCS: PolynomialCommitmentScheme<E>,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         let matrix = &self.matrix;
         let (nrows, ncols) = (matrix.nrows_2d(), matrix.ncols_2d());
@@ -521,7 +536,7 @@ impl Dense<Element> {
             claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
             claims
         };
-        prover.add_common_claims(id, common_claims)?;
+        prover.add_common_claims(id, common_claims);
 
         // the claim that this proving step outputs is the claim about not the matrix but the vector poly.
         // at next step, that claim will be proven over this vector poly (either by the next dense layer proving, or RELU etc).
@@ -598,7 +613,7 @@ impl DenseCtx {
             claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
             claims
         };
-        verifier.add_common_claims(self.node_id, common_claims)?;
+        verifier.add_common_claims(self.node_id, common_claims);
 
         // SUMCHECK verification part
         // Instead of computing the polynomial at the random point requested like this

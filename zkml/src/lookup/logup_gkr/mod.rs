@@ -6,90 +6,93 @@ pub mod verifier;
 
 #[cfg(test)]
 mod tests {
+    use ceno_p3::{field::FieldAlgebra, goldilocks::Goldilocks};
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
-    use itertools::izip;
-    use multilinear_extensions::mle::MultilinearExtension;
-    use p3_field::FieldAlgebra;
-    use p3_goldilocks::Goldilocks;
 
     use crate::{
         default_transcript,
         lookup::logup_gkr::{
-            prover::batch_prove,
-            structs::{Fraction, LogUpInput},
-            verifier::verify_logup_proof,
+            prover::batch_multiple_sizes_prove, structs::LogUpInput,
+            verifier::verify_logup_proof_multiple_sizes,
         },
         rng_from_env_or_random,
         testing::random_field_vector,
     };
 
     #[test]
-    fn test_logup_prove() {
+    fn test_logup_batch_prove() {
         let mut rng = rng_from_env_or_random();
-        for n in 5..15 {
-            let column = random_field_vector::<Goldilocks>(1 << n);
-            let column_2 = random_field_vector::<Goldilocks>(1 << n);
+        // First we make a few instances of different sizes
+        let inputs = (7..12)
+            .rev()
+            .map(|n| {
+                let column = random_field_vector::<Goldilocks>(1 << n);
+                let column_2 = random_field_vector::<Goldilocks>(1 << n);
 
-            let constant_challenge = GoldilocksExt2::random(&mut rng);
-            let column_separation_challenge = GoldilocksExt2::random(&mut rng);
+                let constant_challenge = GoldilocksExt2::random(&mut rng);
+                let column_separation_challenge = GoldilocksExt2::random(&mut rng);
 
-            let column_evals = vec![column.clone(), column_2.clone()];
-            let lookup_input = LogUpInput::<GoldilocksExt2>::new_lookup(
-                column_evals.clone(),
-                constant_challenge,
-                column_separation_challenge,
-                1,
-            )
-            .unwrap();
+                let column_evals = vec![column.clone(), column_2.clone()];
+                LogUpInput::<GoldilocksExt2>::new_lookup(
+                    column_evals.clone(),
+                    constant_challenge,
+                    column_separation_challenge,
+                    1,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<LogUpInput<GoldilocksExt2>>>();
 
-            let mut prover_transcript = default_transcript::<GoldilocksExt2>();
-            let now = std::time::Instant::now();
-            let proof = batch_prove(&lookup_input, &mut prover_transcript).unwrap();
-            println!("Elapsed time proving: {:?}", now.elapsed());
+        let mut prover_transcript = default_transcript::<GoldilocksExt2>();
+        let now = std::time::Instant::now();
+        let proof = batch_multiple_sizes_prove(&inputs, &mut prover_transcript).unwrap();
+        println!("Batch proof took: {:?}", now.elapsed());
 
-            let mut verifier_transcript = default_transcript::<GoldilocksExt2>();
-            let claims = verify_logup_proof(
-                &proof,
-                2,
-                constant_challenge,
-                column_separation_challenge,
-                &mut verifier_transcript,
-            )
-            .unwrap();
+        let mut verifier_transcript = default_transcript::<GoldilocksExt2>();
+        let logup_claim =
+            verify_logup_proof_multiple_sizes(&proof, &mut verifier_transcript).unwrap();
 
-            let fractions = column_evals
-                .iter()
-                .map(|col| {
-                    col.iter()
-                        .map(|val| {
-                            Fraction::<GoldilocksExt2>::new(
-                                -GoldilocksExt2::ONE,
-                                constant_challenge + GoldilocksExt2::from(*val),
-                            )
-                        })
-                        .sum::<Fraction<GoldilocksExt2>>()
-                })
-                .collect::<Vec<Fraction<GoldilocksExt2>>>();
-
-            izip!(claims.numerators(), claims.denominators(), fractions).for_each(
-                |(claim_num, claim_denom, frac)| {
-                    let (expected_num, expected_denom) = frac.as_tuple();
-                    assert_eq!(*claim_num, expected_num);
-                    assert_eq!(*claim_denom, expected_denom);
-                },
-            );
-
-            claims
-                .claims()
-                .iter()
-                .zip(column_evals.into_iter())
-                .for_each(|(claim, evaluations)| {
-                    let mle = MultilinearExtension::<GoldilocksExt2>::from_evaluations_vec(
-                        n,
-                        evaluations,
+        let calc = inputs
+            .iter()
+            .fold(
+                (GoldilocksExt2::ZERO, 0, GoldilocksExt2::ONE),
+                |(acc, skip, batch), l_input| {
+                    let LogUpInput::Lookup {
+                        constant_challenge,
+                        column_separation_challenge,
+                        ..
+                    } = l_input
+                    else {
+                        unreachable!()
+                    };
+                    let take = l_input.column_evals().len();
+                    let evals = proof
+                        .output_claims()
+                        .iter()
+                        .skip(skip)
+                        .take(take)
+                        .map(|c| c.eval)
+                        .collect::<Vec<GoldilocksExt2>>();
+                    let (value, new_batch) = evals.chunks(l_input.columns_per_instance()).fold(
+                        (GoldilocksExt2::ZERO, batch),
+                        |(acc, chal_acc), chunk| {
+                            let (value, _) = chunk.iter().fold(
+                                (*constant_challenge, GoldilocksExt2::ONE),
+                                |(acc, chal_acc), &val| {
+                                    (
+                                        acc + chal_acc * val,
+                                        chal_acc * *column_separation_challenge,
+                                    )
+                                },
+                            );
+                            (acc + value * chal_acc, chal_acc * logup_claim.alpha())
+                        },
                     );
-                    assert_eq!(claim.eval, mle.evaluate(&claim.point))
-                });
-        }
+                    (acc + value, skip + take, new_batch)
+                },
+            )
+            .0;
+
+        assert_eq!(logup_claim.claim(), calc);
     }
 }

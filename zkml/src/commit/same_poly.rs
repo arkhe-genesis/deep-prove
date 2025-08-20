@@ -200,7 +200,8 @@ mod test {
     fn test_pcs() {
         let num_vars = 10;
         let len = 1 << num_vars;
-        let _param = Pcs::<F>::setup(len).expect("unable to setup");
+        let _param =
+            Pcs::<F>::setup(len, mpcs::SecurityLevel::Conjecture100bits).expect("unable to setup");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use anyhow::{Context, bail};
 use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams, Hasher};
+use mpcs::{Basefold, BasefoldRSParams};
 #[doc(inline)]
 pub use object_store::{
     ClientOptions,
@@ -22,7 +22,10 @@ use std::{
 use tempfile::TempDir;
 use tokio::fs;
 use zkml::{
-    iop::context::VerifierContext, model::Model, quantization::{ModelMetadata, ScalingStrategyKind}, Element, ProverContext
+    Element, ProverContext,
+    iop::context::VerifierContext,
+    model::Model,
+    quantization::{ModelMetadata, ScalingStrategyKind},
 };
 
 #[derive(Debug, Clone)]
@@ -38,11 +41,11 @@ pub struct ModelKey {
 }
 
 type F = GoldilocksExt2;
-type Pcs = Basefold<F, BasefoldRSParams<Hasher>>;
+type Pcs = Basefold<F, BasefoldRSParams>;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Params {
-    pub prover: ProverContext<'static, F, Pcs>,
+    pub prover: ProverContext<F, Pcs>,
     pub verifier: VerifierContext<F, Pcs>,
 }
 
@@ -272,14 +275,15 @@ impl Store for S3Store {
 /// In-memory store for testing.
 #[derive(Clone, Default)]
 pub struct MemStore {
-    pps: Arc<Mutex<HashMap<Key, Params>>>,
+    /// The [`Params`] are stored serialised.
+    pps: Arc<Mutex<HashMap<Key, Vec<u8>>>>,
     models: Arc<Mutex<HashMap<Key, ScaledModel>>>,
 }
 
 #[derive(Clone, Default)]
 pub struct MemStoreInner {}
 
-impl Store for MemStore{
+impl Store for MemStore {
     fn get_params(
         &mut self,
         key: &ParamsKey,
@@ -287,7 +291,12 @@ impl Store for MemStore{
         async move {
             let key = params_key(key);
             let guard = self.pps.lock().unwrap();
-            Ok(guard.get(&key).cloned())
+            guard
+                .get(&key)
+                .map_or(Ok(None), |bytes| {
+                    serde_json::from_slice::<Params>(bytes).map(Some)
+                })
+                .map_err(anyhow::Error::from)
         }
     }
 
@@ -299,7 +308,8 @@ impl Store for MemStore{
         async move {
             let key = params_key(key);
             let mut guard = self.pps.lock().unwrap();
-            guard.insert(key, params);
+            let bytes = serde_json::to_vec(&params).context("serializing params to store")?;
+            guard.insert(key, bytes);
             Ok(())
         }
     }

@@ -6,7 +6,7 @@
 
 use crate::{
     IO, Proof, Prover, ProverContext,
-    iop::context::{ContextIterator, VerifierContext},
+    iop::context::VerifierContext,
     layers::transformer::positional::Positional,
     padding::PaddingMode,
     quantization::{InferenceObserver, IntoElement, ScalingStrategy},
@@ -51,61 +51,26 @@ pub struct Driver<N: Number> {
 }
 
 /// The main struct responsible for verifying the proof related to the LLM proving.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct LLMContext<'a, E, PCS>
+#[derive(Debug)]
+pub struct LLMContext<E, PCS>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
-    pub prover_ctx: ProverContext<'a, E, PCS>,
+    pub prover_ctx: ProverContext<E, PCS>,
     pub verifier_ctx: VerifierContext<E, PCS>,
     pub config: LLMConfig,
     pub max_context: Option<usize>,
 }
 
-pub struct LLMContextIterator<'a, E, PCS>
+impl<E, PCS> LLMContext<E, PCS>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
-{
-    context_iterator: ContextIterator<'a, E, PCS>,
-    config: LLMConfig,
-    max_context: Option<usize>,
-}
-
-impl<'a, E, PCS> Iterator for LLMContextIterator<'a, E, PCS>
-where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-{
-    type Item = anyhow::Result<(usize, LLMContext<'a, E, PCS>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.context_iterator.next().map(|item| {
-            item.map(|(poly_size, (prover_ctx, verifier_ctx))| {
-                (
-                    poly_size,
-                    LLMContext {
-                        prover_ctx,
-                        verifier_ctx,
-                        config: self.config.clone(),
-                        max_context: self.max_context,
-                    },
-                )
-            })
-        })
-    }
-}
-
-impl<'a, E, PCS> LLMContext<'a, E, PCS>
-where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub fn with_max_context(mut self, max_context: usize) -> Self {
         self.max_context = Some(max_context);
@@ -402,21 +367,22 @@ impl Driver<Element> {
         input_len: usize,
     ) -> anyhow::Result<usize> {
         self.model
-            .compute_max_poly_size(&[vec![input_len.next_power_of_two()].into()])
+            .compute_max_poly_size::<E>(&[vec![input_len.next_power_of_two()].into()])
     }
 
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
     /// It returns a `HashMap` which associates a given context to the maximum polynomial size supported
     /// by that context. The proper context to be used for a given input size `input_len` is found in the
     /// entry `HashMap` returned by this method identified by the key `self.get_max_poly_size_for_input(input_len)`
-    pub fn compute_all_contexts<E, PCS>(&self) -> anyhow::Result<LLMContextIterator<E, PCS>>
+    pub fn compute_all_contexts<E, PCS>(&self) -> anyhow::Result<LLMContext<E, PCS>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
         PCS: PolynomialCommitmentScheme<E>,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         // compute shapes for all possible input sequence lengths
-        let max_input_shapes = [Shape::new(vec![
+        let max_input_shapes = vec![Shape::new(vec![
             self.config.context_length.next_power_of_two(),
         ])];
         ensure!(
@@ -426,16 +392,13 @@ impl Driver<Element> {
         );
         let max_input_length = max_input_shapes[0].numel();
         ensure!(max_input_length.is_power_of_two());
-        let num_possible_inputs = max_input_length.ilog2() + 1;
-        let possible_input_shapes = (0..num_possible_inputs)
-            .map(|i| vec![vec![1usize << i].into()]) // ToDo: revisit if we want to generate
-            // a context for every power of 2 up to the maximum sequence length
-            .collect();
-        let contexts = self
+
+        let (prover_ctx, verifier_ctx) = self
             .model
-            .generate_contexts_for_input_shapes(possible_input_shapes)?;
-        Ok(LLMContextIterator {
-            context_iterator: contexts,
+            .generate_contexts_for_input_shapes(max_input_shapes)?;
+        Ok(LLMContext {
+            prover_ctx,
+            verifier_ctx,
             config: self.config.clone(),
             max_context: self.max_context,
         })
@@ -446,6 +409,7 @@ impl Driver<Element> {
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
         PCS: PolynomialCommitmentScheme<E>,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         debug!(
             "Generating context for model with {} layers",
@@ -460,15 +424,16 @@ impl Driver<Element> {
             max_context: None,
         })
     }
-    pub fn prove<'a, E, PCS>(
+    pub fn prove<E, PCS>(
         &self,
-        ctx: &LLMContext<'a, E, PCS>,
+        ctx: &LLMContext<E, PCS>,
         trace: InferenceTrace<'_, E, Element>,
     ) -> anyhow::Result<LLMProof<E, PCS>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
         PCS: PolynomialCommitmentScheme<E>,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
         let prover: Prover<'_, '_, E, _, _> = Prover::new(&ctx.prover_ctx, &mut tr);
@@ -480,11 +445,12 @@ impl Driver<Element> {
     }
 }
 
-impl<'a, E, PCS> LLMContext<'a, E, PCS>
+impl<E, PCS> LLMContext<E, PCS>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub fn verify(&self, proof: LLMProof<E, PCS>, user_input: Vec<Token>) -> anyhow::Result<()>
     where
@@ -520,7 +486,7 @@ where
         let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
         let prover_input = proof.io.input[0].clone();
         let prover_output = proof.io.output[0].clone();
-        verify::<_, _, _>(self.verifier_ctx.clone(), proof.proof, proof.io, &mut tr)?;
+        verify::<_, _, _>(&self.verifier_ctx, proof.proof, proof.io, &mut tr)?;
         // 2. verify the sequentiality of the output: from the first newly generated token to the last
         // but without including the padding.
         // output is [seq_len] where []
@@ -631,22 +597,6 @@ mod test {
             bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
         info!("Proof size: {}", proof_bytes.len());
         ctx.verify(proof, user_tokens)?;
-        Ok(())
-    }
-
-    #[test]
-    #[ignore]
-    fn test_gpt2_needs_one_context() -> anyhow::Result<()> {
-        init_test_logging("debug");
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
-        let driver = Driver::load_external_model(&model_path)?;
-        let driver = driver.into_provable_llm()?;
-        debug!("model built");
-        let mut contexts = driver.compute_all_contexts::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?;
-        // check that there is only one context generated for the GPT2 model
-        ensure!(contexts.next().is_some());
-        ensure!(contexts.next().is_none());
         Ok(())
     }
 

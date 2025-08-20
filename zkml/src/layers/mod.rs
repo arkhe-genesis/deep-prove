@@ -122,27 +122,29 @@ impl<T> Layer<T> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 /// Describes a steps wrt the polynomial to be proven/looked at. Verifier needs to know
 /// the sequence of steps and the type of each step from the setup phase so it can make sure the prover is not
 /// cheating on this.
 /// NOTE: The context automatically appends a requant step after each dense layer.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LayerCtx {
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub enum LayerCtx<E: ExtensionField> {
     Dense(DenseCtx),
     MatMul(MatMulCtx),
     Convolution(ConvCtx),
     SchoolBookConvolution(SchoolBookConvCtx),
-    Activation(ActivationCtx),
-    Requant(RequantCtx),
+    Activation(ActivationCtx<E>),
+    Requant(RequantCtx<E>),
     Pooling(PoolingCtx),
     QKV(QKVCtx),
-    Mha(MhaCtx),
+    Mha(MhaCtx<E>),
     ConcatMatMul(ConcatMatMulCtx),
-    LayerNorm(LayerNormCtx),
+    LayerNorm(LayerNormCtx<E>),
     Flatten,
     Add(AddCtx),
-    Softmax(SoftmaxCtx),
+    Softmax(SoftmaxCtx<E>),
     Reshape(ReshapeCtx),
     Embeddings(EmbeddingsCtx),
     Positional(PositionalCtx),
@@ -201,7 +203,7 @@ impl<T> Layer<T> {
     }
 }
 
-impl LayerCtx {
+impl<E: ExtensionField> LayerCtx<E> {
     pub fn variant_name(&self) -> String {
         match self {
             Self::Dense(_) => "Dense".to_string(),
@@ -408,11 +410,15 @@ where
         Ok(node_out)
     }
 
-    pub(crate) fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)>
+    pub(crate) fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)>
     where
         Layer<N>: ProveInfo,
     {
-        self.operation.step_info(id, aux)
+        self.operation.step_info::<E>(id, aux)
     }
 }
 
@@ -604,7 +610,11 @@ impl Evaluate<Element> for Layer<Element> {
 }
 
 impl ProveInfo for Layer<Element> {
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         match self {
             Layer::Dense(dense) => dense.step_info(id, aux),
             Layer::QKV(qkv) => qkv.step_info(id, aux),
@@ -663,8 +673,9 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
-    type Ctx = LayerCtx;
+    type Ctx = LayerCtx<E>;
 
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
@@ -737,13 +748,13 @@ where
         }
     }
 
-    fn gen_lookup_witness<'a>(
+    fn gen_lookup_witness(
         &self,
         id: provable::NodeId,
-        ctx: &'a ProverContext<'a, E, PCS>,
-        step_data: &'a StepData<Element, E>,
+        ctx: &ProverContext<E, PCS>,
+        step_data: &StepData<Element, E>,
         store: &mut TenStore,
-    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+    ) -> Result<LookupWitnessGen<E, PCS>> {
         match self {
             Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data, store),
             Layer::Convolution(convolution) => {
@@ -945,12 +956,12 @@ where
             LayerProof::Embeddings(..) => None,
             LayerProof::Convolution(..) => None,
             LayerProof::Dummy => None,
-            LayerProof::Activation(ActivationProof { lookup, .. })
-            | LayerProof::Pooling(PoolingProof { lookup, .. }) => Some(lookup.fractional_outputs()),
-            LayerProof::Requant(RequantProof { lookup_proofs, .. }) => {
-                let (nums, denoms): (Vec<Vec<E>>, Vec<Vec<E>>) =
-                    lookup_proofs.iter().map(|p| p.fractional_outputs()).unzip();
-                Some((nums.concat(), denoms.concat()))
+            LayerProof::Activation(ActivationProof { lookup, .. }) => {
+                Some(lookup.fractional_outputs())
+            }
+            LayerProof::Pooling(PoolingProof { lookup, .. }) => Some(lookup.fractional_outputs()),
+            LayerProof::Requant(RequantProof { logup_proof, .. }) => {
+                Some(logup_proof.fractional_outputs())
             }
         }
     }

@@ -55,7 +55,11 @@ impl<N: Number> Evaluate<N> for Flatten {
 }
 
 impl ProveInfo for Flatten {
-    fn step_info(&self, _id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        _id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         aux.last_output_shape
             .iter_mut()
             .for_each(|s| *s = s.next_power_of_two());

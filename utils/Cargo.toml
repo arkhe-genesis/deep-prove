@@ -13,11 +13,12 @@ version.workspace = true
 mem-track = ["dep:mem-track"]
 
 [dependencies]
-memory-stats = { version = "1.2.0" }
-tracing = { workspace = true }
-mem-track = { git = "https://github.com/hackaugusto/mem-track", branch = "main", optional = true }
-bytesize = "2.0.1"
-thousands = "0.2.0"
-csv.workspace = true
 anyhow.workspace = true
+bytesize = "2.0.1"
+csv.workspace = true
+flate2 = "1.1.2"
+mem-track = { git = "https://github.com/hackaugusto/mem-track", branch = "main", optional = true }
+memory-stats = { version = "1.2.0" }
 thiserror.workspace = true
+thousands = "0.2.0"
+tracing = { workspace = true }

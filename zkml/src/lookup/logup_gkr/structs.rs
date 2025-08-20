@@ -300,9 +300,19 @@ impl<E: ExtensionField> LogUpInput<E> {
                 .collect(),
         }
     }
+
+    pub fn columns_per_instance(&self) -> usize {
+        match self {
+            LogUpInput::Lookup {
+                columns_per_instance,
+                ..
+            } => *columns_per_instance,
+            LogUpInput::Table { column_evals, .. } => column_evals.len(),
+        }
+    }
 }
 
-#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
+#[derive(Clone, Debug, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProofType {
     Lookup,
     Table,
@@ -310,15 +320,23 @@ pub enum ProofType {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct LogUpProof<E: ExtensionField> {
-    pub sumcheck_proofs: Vec<(IOPProof<E>, Vec<E>)>,
+/// Struct used to store all information needed to verify a LogUp GKR argument.
+pub struct LogUpBatchProof<E: ExtensionField> {
+    /// Sumcheck proofs for each round
+    pub sumcheck_proofs: Vec<IOPProof<E>>,
+    /// The evaluations of the polynomials at each layer
     pub round_evaluations: Vec<Vec<E>>,
+    /// Claims about the individual column evals from the last round (so before they are meged using the column challenges)
     pub output_claims: Vec<Claim<E>>,
+    /// The outputs of the circuit
     pub circuit_outputs: Vec<Vec<E>>,
+    /// Whether this proof wa for lookups or tables
     pub proof_type: ProofType,
+    /// How many variables each instance is.
+    pub num_vars_per_instance: Vec<usize>,
 }
 
-impl<E: ExtensionField> LogUpProof<E> {
+impl<E: ExtensionField> LogUpBatchProof<E> {
     pub fn append_to_transcript<T: Transcript<E>>(&self, transcript: &mut T) {
         self.circuit_outputs
             .iter()
@@ -337,7 +355,7 @@ impl<E: ExtensionField> LogUpProof<E> {
             .unzip()
     }
 
-    pub fn proofs_and_evals(&self) -> impl Iterator<Item = (&(IOPProof<E>, Vec<E>), &Vec<E>)> {
+    pub fn proofs_and_evals(&self) -> impl Iterator<Item = (&IOPProof<E>, &Vec<E>)> {
         self.sumcheck_proofs
             .iter()
             .zip(self.round_evaluations.iter())
@@ -353,6 +371,14 @@ impl<E: ExtensionField> LogUpProof<E> {
 
     pub fn proof_type(&self) -> ProofType {
         self.proof_type
+    }
+
+    pub fn num_instances(&self) -> usize {
+        self.num_vars_per_instance.len()
+    }
+
+    pub fn final_round_evals(&self) -> Vec<E> {
+        self.round_evaluations.last().unwrap().clone()
     }
 }
 
@@ -390,5 +416,69 @@ impl<E: ExtensionField> LogUpVerifierClaim<E> {
 
     pub fn point(&self) -> &[E] {
         &self.claims[0].point
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogUpBatchVerifierClaim<E: ExtensionField> {
+    /// This is the final claim returned by the GKR circuit
+    claim: E,
+    /// The full point for the final claims
+    point: Vec<E>,
+    /// All poly evaluations in order
+    poly_evals: Vec<E>,
+    /// Final alpha challenge
+    alpha: E,
+    /// Final lambda challenge
+    lambda: E,
+    numerators: Vec<E>,
+    denominators: Vec<E>,
+}
+
+impl<E: ExtensionField> LogUpBatchVerifierClaim<E> {
+    pub fn new(
+        claim: E,
+        point: Vec<E>,
+        poly_evals: Vec<E>,
+        alpha: E,
+        lambda: E,
+        numerators: Vec<E>,
+        denominators: Vec<E>,
+    ) -> LogUpBatchVerifierClaim<E> {
+        LogUpBatchVerifierClaim {
+            claim,
+            point,
+            poly_evals,
+            alpha,
+            lambda,
+            numerators,
+            denominators,
+        }
+    }
+
+    pub fn numerators(&self) -> &[E] {
+        &self.numerators
+    }
+
+    pub fn denominators(&self) -> &[E] {
+        &self.denominators
+    }
+
+    pub fn point(&self) -> &[E] {
+        &self.point
+    }
+
+    pub fn claim(&self) -> E {
+        self.claim
+    }
+
+    pub fn alpha(&self) -> E {
+        self.alpha
+    }
+    pub fn lambda(&self) -> E {
+        self.lambda
+    }
+    pub fn poly_evals(&self) -> &[E] {
+        &self.poly_evals
     }
 }

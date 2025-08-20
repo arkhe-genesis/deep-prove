@@ -13,7 +13,6 @@ version.workspace = true
 ignored = ["prost", "prost-types"]
 
 [features]
-blake = ["mpcs/blake"]
 default = []
 # Enable worker's AWS marketplace billing
 aws-marketplace = ["dep:aws-config", "dep:aws-sdk-marketplacemetering"]
@@ -35,8 +34,8 @@ axum = { workspace = true, features = ["http1", "json"] }
 base64 = "0.22.1"
 clap = { workspace = true, features = ["cargo", "derive", "env"] }
 derive_more = { workspace = true, features = ["from"] }
-ff_ext = { workspace = true }
 exponential-backoff = "2.1.0"
+ff_ext = { workspace = true }
 futures = { version = "0.3.30" }
 grpc-worker = { git = "https://github.com/Lagrange-Labs/grpc-worker-rs", branch = "main" }
 humansize = "2.1.3"

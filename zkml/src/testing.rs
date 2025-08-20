@@ -2,10 +2,10 @@ use crate::{Element, quantization, rng_from_env_or_random, seed_from_env_or_rng}
 use ark_std::rand::{Rng, SeedableRng, rngs::StdRng};
 use ff_ext::{ExtensionField, FromUniformBytes};
 use itertools::Itertools;
-use mpcs::{Basefold, BasefoldRSParams, Hasher};
+use mpcs::{Basefold, BasefoldRSParams};
 
 // The hasher type is chosen depending on the feature flag
-pub(crate) type Pcs<E> = Basefold<E, BasefoldRSParams<Hasher>>;
+pub(crate) type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
 pub fn _random_vector<E: ExtensionField>(n: usize) -> Vec<E> {
     let mut rng = rng_from_env_or_random();

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams, Hasher};
+use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
 use zkml::{
     IO, Proof as ZkmlProof, default_transcript, inputs::Input, iop::context::VerifierContext,
@@ -14,13 +14,13 @@ pub type E = GoldilocksExt2;
 /// A wrapper for a proof and its ancillaries, required by the verifying process.
 #[derive(Serialize, Deserialize)]
 pub struct Provable {
-    pub proof: ZkmlProof<E, Basefold<E, BasefoldRSParams<Hasher>>>,
+    pub proof: ZkmlProof<E, Basefold<E, BasefoldRSParams>>,
     pub io: IO<E>,
-    pub ctx: VerifierContext<E, Basefold<E, BasefoldRSParams<Hasher>>>,
+    pub ctx: VerifierContext<E, Basefold<E, BasefoldRSParams>>,
 }
 impl Provable {
     pub fn verify(self) -> anyhow::Result<()> {
-        verify(self.ctx, self.proof, self.io, &mut default_transcript())
+        verify(&self.ctx, self.proof, self.io, &mut default_transcript())
     }
 }
 

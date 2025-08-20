@@ -9,7 +9,7 @@ use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tenstore::TenStore;
 use transcript::Transcript;
 
@@ -282,14 +282,18 @@ impl<N: Number> OpInfo for Positional<N> {
 const POSITIONAL_POLY_ID: &str = "PositionalMatrix";
 
 impl ProveInfo for Positional<Element> {
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        aux: ContextAux,
+    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let Self::Learned(pos) = self else {
             unimplemented!("ProveInfo not implemented for Positional::Rope")
         };
 
         let (ctx, mut aux) = pos.add_layer.step_info(id, aux)?;
 
-        let LayerCtx::Add(add_ctx) = ctx else {
+        let LayerCtx::<E>::Add(add_ctx) = ctx else {
             unreachable!()
         };
 
@@ -375,6 +379,8 @@ impl PadOp for Positional<Element> {
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
     for Positional<Element>
+where
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = PositionalCtx;
 
@@ -499,7 +505,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
             })
             .collect::<anyhow::Result<_>>()?;
 
-        prover.add_common_claims(node_id, common_claims)?;
+        prover.add_common_claims(node_id, common_claims);
 
         prover.push_proof(node_id, LayerProof::Positional(PositionalProof { proofs }));
 
@@ -578,7 +584,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             // compute shape step for add sub-layer
             let unpadded_input_shapes = vec![shape_step.unpadded_input_shape[i].clone(); 2];
             let padded_input_shapes = vec![shape_step.padded_input_shape[i].clone(); 2];
-            let shape_step = LayerCtx::Add(self.add_ctx.clone())
+            let shape_step = LayerCtx::<E>::Add(self.add_ctx.clone())
                 .shape_step(&unpadded_input_shapes, &padded_input_shapes);
 
             let mut claims =
@@ -629,9 +635,18 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             common_claims.insert(POSITIONAL_POLY_ID.to_string(), positional_matrix_claim);
         }
 
-        verifier.add_common_claims(self.node_id, common_claims)?;
+        verifier.add_common_claims(self.node_id, common_claims);
 
         Ok(output_claims)
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
     }
 }
 

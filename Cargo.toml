@@ -1,5 +1,5 @@
 [workspace]
-members = ["mpcs", "simple-frontend", "zkml", "deep-prove", "utils"]
+members = ["zkml", "deep-prove", "utils"]
 resolver = "2"
 
 [workspace.package]
@@ -30,7 +30,6 @@ ff = "0.13"
 hex = { version = "0.4" }
 itertools = "0.13"
 memmap2 = "0.9"
-mpcs = { version = "0.1.0", path = "mpcs" }
 num-bigint = "0.4"
 num-integer = "0.1"
 object_store = { version = "0.12", features = ["aws"] }
@@ -56,12 +55,15 @@ tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tract-onnx = "0.21"
 
+ceno-p3 = { package = "p3", git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
 ff_ext = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
+gkr_iop = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
+mpcs = { package = "mpcs", git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
 multilinear_extensions = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-p3 = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
 poseidon = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
 sumcheck = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
 transcript = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
+witness = { package = "witness", git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
 
 # Test must run fast, but still provides stacktraces.
 [profile.test]

@@ -1,13 +1,19 @@
 //! File containing code for generating the LogUp GKR circuit
 
+use std::collections::{BTreeSet, HashMap};
+
 use ark_std::Zero;
+use either::Either;
 use ff_ext::ExtensionField;
 
 use itertools::izip;
 use multilinear_extensions::{
+    Expression,
     mle::{ArcMultilinearExtension, MultilinearExtension},
     util::ceil_log2,
 };
+
+use crate::lookup::logup_gkr::structs::ProofType;
 
 use super::structs::Fraction;
 
@@ -321,13 +327,163 @@ impl<E: ExtensionField> LogUpCircuit<E> {
     }
 }
 
+pub(crate) fn construct_logup_expressions<E: ExtensionField>(
+    variables_set: &BTreeSet<usize>,
+    evals_set: &HashMap<usize, Vec<Vec<E>>>,
+    total_layers: usize,
+) -> (Vec<Expression<E>>, Vec<Expression<E>>) {
+    let mut layer_count = 0u16;
+    variables_set
+        .iter()
+        .rev()
+        .map(|size| {
+            let count = evals_set.get(size).unwrap().len();
+            let multiplier = E::from_canonical_u64(1 << (total_layers - *size));
+            let claim_expr_multiplier = Expression::Constant(Either::Right(multiplier));
+            let (sumcheck_expr, claim_expr) = (0..count).fold(
+                (
+                    Expression::Constant(Either::Right(E::ZERO)),
+                    Expression::Constant(Either::Right(E::ZERO)),
+                ),
+                |(sumcheck_acc, claim_acc), _| {
+                    let num_low_id = 4 * layer_count;
+                    let num_high_id = num_low_id + 1;
+                    let denom_low_id = num_high_id + 1;
+                    let denom_high_id = denom_low_id + 1;
+                    let sumcheck_expr =
+                        Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
+                            * (Expression::WitIn(num_low_id) * Expression::WitIn(denom_high_id)
+                                + Expression::WitIn(num_high_id) * Expression::WitIn(denom_low_id)
+                                + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                                    * Expression::WitIn(denom_low_id)
+                                    * Expression::WitIn(denom_high_id));
+
+                    let claim_expr =
+                        Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
+                            * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                                * (Expression::WitIn(num_high_id) - Expression::WitIn(num_low_id))
+                                + Expression::WitIn(num_low_id)
+                                + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                                    * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                                        * (Expression::WitIn(denom_high_id)
+                                            - Expression::WitIn(denom_low_id))
+                                        + Expression::WitIn(denom_low_id)));
+                    layer_count += 1;
+                    (sumcheck_acc + sumcheck_expr, claim_acc + claim_expr)
+                },
+            );
+            (sumcheck_expr, claim_expr * claim_expr_multiplier)
+        })
+        .unzip()
+}
+
+pub(crate) fn construct_final_round_logup_expressions<E: ExtensionField>(
+    variables_set: &BTreeSet<usize>,
+    evals_set: &HashMap<usize, Vec<Vec<E>>>,
+) -> Vec<Expression<E>> {
+    let mut layer_count = 0u16;
+    variables_set
+        .iter()
+        .rev()
+        .map(|size| {
+            let count = evals_set.get(size).unwrap().len();
+
+            (0..count).fold(
+                Expression::Constant(Either::Right(E::ZERO)),
+                |sumcheck_acc, _| {
+                    let denom_low_id = 2 * layer_count;
+                    let denom_high_id = denom_low_id + 1;
+                    let sumcheck_expr =
+                        Expression::Challenge(0u16, layer_count as usize, -E::ONE, E::ZERO)
+                            * (Expression::WitIn(denom_low_id)
+                                + Expression::WitIn(denom_high_id)
+                                + Expression::Challenge(1u16, 1, -E::ONE, E::ZERO)
+                                    * Expression::WitIn(denom_low_id)
+                                    * Expression::WitIn(denom_high_id));
+
+                    layer_count += 1;
+                    sumcheck_acc + sumcheck_expr
+                },
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn construct_final_round_claim_expression<E: ExtensionField>(
+    variables_set: &BTreeSet<usize>,
+    evals_set: &HashMap<usize, Vec<Vec<E>>>,
+    proof_type: ProofType,
+) -> Vec<Expression<E>> {
+    let mut layer_count = 0u16;
+    match proof_type {
+        ProofType::Table => variables_set
+            .iter()
+            .rev()
+            .map(|size| {
+                let count = evals_set.get(size).unwrap().len();
+
+                (0..count).fold(
+                    Expression::Constant(Either::Right(E::ZERO)),
+                    |sumcheck_acc, _| {
+                        let num_low_id = 4 * layer_count;
+                        let num_high_id = num_low_id + 1;
+                        let denom_low_id = num_high_id + 1;
+                        let denom_high_id = denom_low_id + 1;
+
+                        let claim_expr =
+                            Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
+                                * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                                    * (Expression::WitIn(num_high_id)
+                                        - Expression::WitIn(num_low_id))
+                                    + Expression::WitIn(num_low_id)
+                                    + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                                        * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                                            * (Expression::WitIn(denom_high_id)
+                                                - Expression::WitIn(denom_low_id))
+                                            + Expression::WitIn(denom_low_id)));
+                        layer_count += 1;
+                        sumcheck_acc + claim_expr
+                    },
+                )
+            })
+            .collect(),
+        ProofType::Lookup => variables_set
+            .iter()
+            .rev()
+            .map(|size| {
+                let count = evals_set.get(size).unwrap().len();
+
+                (0..count).fold(
+                    Expression::Constant(Either::Right(E::ZERO)),
+                    |sumcheck_acc, _| {
+                        let denom_low_id = 2 * layer_count;
+                        let denom_high_id = denom_low_id + 1;
+
+                        let claim_expr =
+                            Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
+                                * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                                    * (Expression::WitIn(denom_high_id)
+                                        - Expression::WitIn(denom_low_id))
+                                    + Expression::WitIn(denom_low_id));
+                        layer_count += 1;
+                        sumcheck_acc + claim_expr
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::testing::random_field_vector;
-    use ff_ext::GoldilocksExt2;
-    use p3_field::{Field, FieldAlgebra};
-    use p3_goldilocks::Goldilocks;
     use std::slice;
+
+    use crate::testing::random_field_vector;
+    use ceno_p3::{
+        field::{Field, FieldAlgebra},
+        goldilocks::Goldilocks,
+    };
+    use ff_ext::GoldilocksExt2;
 
     use super::*;
 

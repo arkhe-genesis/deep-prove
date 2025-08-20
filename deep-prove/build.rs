@@ -46,4 +46,3 @@ pub fn export_version_from_git() {
         println!("cargo:rustc-env=GIT_DESC_VER={version}");
     }
 }
-

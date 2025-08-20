@@ -2,7 +2,7 @@ use anyhow::bail;
 use clap::Parser;
 use csv::WriterBuilder;
 use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams, Hasher};
+use mpcs::{Basefold, BasefoldRSParams};
 use std::{collections::HashMap, fs::OpenOptions, path::Path, time};
 use timed_core::Output;
 use tracing_subscriber::EnvFilter;
@@ -13,7 +13,7 @@ use zkml::{
 
 type F = GoldilocksExt2;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
-type Pcs<E> = Basefold<E, BasefoldRSParams<Hasher>>;
+type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
 #[derive(Parser, Debug)]
 struct LLMArgs {

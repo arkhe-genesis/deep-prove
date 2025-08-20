@@ -313,7 +313,11 @@ impl PadOp for Embeddings<Element> {
 const EMBEDDING_POLY_ID: &str = "EmbeddingMat";
 
 impl ProveInfo for Embeddings<Element> {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.model_polys = Some(
             once((
@@ -382,6 +386,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = EmbeddingsCtx;
 
@@ -485,7 +490,7 @@ where
         prover.add_common_claims(
             node_id,
             once((EMBEDDING_POLY_ID.to_string(), embedding_claim)).collect(),
-        )?;
+        );
 
         prover.push_proof(
             node_id,
@@ -550,7 +555,7 @@ where
         verifier.add_common_claims(
             self.id,
             once((EMBEDDING_POLY_ID.to_string(), embedding_mat_claim)).collect(),
-        )?;
+        );
 
         // SUMCHECK verification part
         // Instead of computing the polynomial at the random point requested like this
@@ -612,6 +617,15 @@ where
         );
         Ok(())
     }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
+    }
 }
 
 fn one_hot_shape(input_shape: &Shape, vocab_size: usize, mode: PaddingMode) -> Shape {
@@ -624,8 +638,8 @@ fn one_hot_shape(input_shape: &Shape, vocab_size: usize, mode: PaddingMode) -> S
 #[cfg(test)]
 mod tests {
     use ark_std::rand::Rng;
+    use ceno_p3::field::FieldAlgebra;
     use ff_ext::GoldilocksExt2;
-    use p3_field::FieldAlgebra;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};
 

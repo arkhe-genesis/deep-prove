@@ -1,8 +1,7 @@
-use std::{fs::File, io::BufReader, sync::Arc};
+use std::{fs::File, io::BufReader};
 use tenstore::TenStore;
 use timed_core::Output;
-#[cfg(feature = "blake")]
-use transcript::blake::BlakeTranscript;
+
 use utils::{Metrics, init_csv_recorder, stream_data, stream_metrics};
 use zkml::{
     model::Model,
@@ -12,7 +11,7 @@ use zkml::{
 use anyhow::{Context as CC, Result, bail, ensure};
 use clap::Parser;
 use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams, Hasher};
+use mpcs::{Basefold, BasefoldRSParams};
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, fmt};
 use zkml::FloatOnnxLoader;
@@ -24,26 +23,13 @@ use rmp_serde::encode::to_vec_named;
 
 type F = GoldilocksExt2;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
-type Pcs<E> = Basefold<E, BasefoldRSParams<Hasher>>;
+type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
-// Choose transcript implementation at compile time
-#[cfg(feature = "blake")]
-type Transcript = BlakeTranscript;
-
-#[cfg(not(feature = "blake"))]
 type Transcript = transcript::basic::BasicTranscript<F>;
 
 // Create a new transcript instance
 fn new_transcript() -> Transcript {
-    #[cfg(feature = "blake")]
-    {
-        use transcript::blake::BlakeTranscript;
-        BlakeTranscript::new(b"bench")
-    }
-    #[cfg(not(feature = "blake"))]
-    {
-        default_transcript()
-    }
+    default_transcript()
 }
 
 #[derive(Parser, Debug)]
@@ -318,8 +304,6 @@ fn run(args: Args) -> anyhow::Result<()> {
         None
     };
 
-    let ctx = Arc::new(ctx);
-
     let span = metrics.to_span();
     stream_metrics("Context creation", &span);
     info!("== Context creation metrics: {} ==", span);
@@ -418,7 +402,7 @@ fn run(args: Args) -> anyhow::Result<()> {
 
         let mut verifier_transcript = new_transcript();
         verify::<_, _, _>(
-            ctx.as_ref().as_ref().unwrap().1.clone(),
+            &ctx.as_ref().as_ref().unwrap().1,
             proof,
             io,
             &mut verifier_transcript,

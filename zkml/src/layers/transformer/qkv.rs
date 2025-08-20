@@ -459,7 +459,11 @@ const BIAS_K_POLY_ID: &str = "BiasK";
 const BIAS_V_POLY_ID: &str = "BiasV";
 
 impl ProveInfo for QKV<Element> {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         ensure!(
             aux.last_output_shape.len() == 1,
             "expected one input shape for context of QKV layer"
@@ -514,6 +518,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = QKVCtx;
 
@@ -681,7 +686,7 @@ where
             .map(|(claim, id)| (id.to_string(), claim))
             .collect();
 
-        prover.add_common_claims(node_id, common_claims)?;
+        prover.add_common_claims(node_id, common_claims);
 
         // Aggregate input claims into a single one, which will be returned as output
         let mut same_poly_prover = same_poly::Prover::new(input_mle);
@@ -859,7 +864,7 @@ where
             .map(|(claim, id)| (id.to_string(), claim))
             .collect();
 
-        verifier.add_common_claims(self.node_id, common_claims)?;
+        verifier.add_common_claims(self.node_id, common_claims);
 
         // SUMCHECK verification part
         // Instead of computing the polynomial at the random point requested like this
@@ -892,6 +897,15 @@ where
             same_poly_verifier.verify(&proof.aggregation_proof, verifier.transcript)?;
 
         Ok(vec![aggregated_claim])
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
     }
 }
 

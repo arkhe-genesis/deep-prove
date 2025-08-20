@@ -2,7 +2,7 @@ use ff_ext::ExtensionField;
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-pub mod context;
+pub mod mmcs_context;
 pub mod same_poly;
 
 /// Compute the vector (beta(r,1), ... ,beta(r,2^{|r|}))
@@ -57,7 +57,7 @@ mod test {
     use ff_ext::GoldilocksExt2;
 
     use crate::{commit::identity_eval, testing::random_bool_vector};
-    use p3_field::FieldAlgebra;
+    use ceno_p3::field::FieldAlgebra;
     type F = GoldilocksExt2;
 
     #[test]

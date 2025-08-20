@@ -1,7 +1,6 @@
 //! Multihead attention layer:
 //! The module performs all the operations inside the multi-head attention layer, relying on
 //! ConcatMatMul and Softmax layers as building blocks.
-use std::iter::once;
 
 use crate::{
     Claim, Element, Prover, ScalingFactor,
@@ -30,11 +29,9 @@ use crate::{
     tensor::{Number, Shape},
 };
 use anyhow::{anyhow, bail, ensure};
-use ff_ext::{ExtensionField, FieldFrom, SmallField};
+use ff_ext::{ExtensionField, FieldFrom};
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
-use p3_field::FieldAlgebra;
-use p3_goldilocks::Goldilocks;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tenstore::TenStore;
@@ -52,11 +49,12 @@ pub struct MhaData<E: ExtensionField> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MhaCtx {
+#[serde(bound = "E: ExtensionField + DeserializeOwned")]
+pub struct MhaCtx<E: ExtensionField> {
     node_id: NodeId,
     inputs_reshape: ReshapeCtx,
     final_mul: ConcatMatMulCtx,
-    softmax: SoftmaxCtx,
+    softmax: SoftmaxCtx<E>,
     qk: ConcatMatMulCtx,
     final_reshape: ReshapeCtx,
 }
@@ -81,8 +79,8 @@ impl<'a, N: Number> From<&'a Mha<N>> for MhaOutputShaper<'a> {
     }
 }
 
-impl<'a> From<&'a MhaCtx> for MhaOutputShaper<'a> {
-    fn from(value: &'a MhaCtx) -> Self {
+impl<'a, E: ExtensionField> From<&'a MhaCtx<E>> for MhaOutputShaper<'a> {
+    fn from(value: &'a MhaCtx<E>) -> Self {
         Self {
             inputs_reshape: &value.inputs_reshape,
             final_mul: &value.final_mul,
@@ -130,6 +128,12 @@ pub struct MhaProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> MhaProof<E, PCS> {
     pub(crate) fn get_lookup_data(&self) -> (Vec<E>, Vec<E>) {
         self.softmax_proof.get_lookup_data()
+    }
+    pub(crate) fn write_commitment<T: Transcript<E>>(
+        &self,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        self.softmax_proof.write_commitment(transcript)
     }
 }
 
@@ -194,29 +198,24 @@ impl<N: Number> Mha<N> {
     // The id is ephemeral in the sense that it will not correspond to an actual node in the
     // model
     fn compute_ephemeral_node_id(node_id: NodeId, domain_separator: &str) -> NodeId {
-        let payload = once(Goldilocks::from_canonical_u64(
-            (*node_id)
-                .try_into()
-                .expect("can not convert NodeId to u64"),
-        ))
-        .chain(
-            domain_separator
-                .as_bytes()
-                .iter()
-                .map(|b| Goldilocks::from_canonical_u8(*b)),
-        )
-        .collect_vec();
-        usize::try_from(
-            mpcs::util::hash::poseidon_zkml::hash_or_noop(&payload).0[0].to_canonical_u64(),
-        )
-        .expect("can not convert u64 to usize")
-        .into()
+        let bytes = (*node_id)
+            .to_le_bytes()
+            .into_iter()
+            .chain(domain_separator.as_bytes().iter().copied())
+            .collect::<Vec<u8>>();
+
+        // Should be 32 bytes take the first 8
+        let output_bytes = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        let byte_array: [u8; 8] = output_bytes[0..8]
+            .try_into()
+            .expect("slice with incorrect length");
+        usize::from_be_bytes(byte_array).into()
     }
 
     fn qk_node_id(node_id: NodeId) -> NodeId {
         Self::compute_ephemeral_node_id(node_id, "qk")
     }
-
+    #[allow(dead_code)]
     fn softmax_node_id(node_id: NodeId) -> NodeId {
         Self::compute_ephemeral_node_id(node_id, "softmax")
     }
@@ -432,13 +431,17 @@ impl QuantizeOp for Mha<f32> {
 }
 
 impl ProveInfo for Mha<Element> {
-    fn step_info(&self, id: NodeId, aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        aux: ContextAux,
+    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let (ctx, mut reshaped_aux) = self.inputs_reshape.step_info(
             id, // No need to have an ad-hoc id
             aux,
         )?;
 
-        let LayerCtx::Reshape(inputs_reshape_ctx) = ctx else {
+        let LayerCtx::<E>::Reshape(inputs_reshape_ctx) = ctx else {
             unreachable!()
         };
 
@@ -460,11 +463,11 @@ impl ProveInfo for Mha<Element> {
 
         let (ctx, aux) = self.qk.step_info(Self::qk_node_id(id), qk_aux)?;
 
-        let LayerCtx::ConcatMatMul(qk_ctx) = ctx else {
+        let LayerCtx::<E>::ConcatMatMul(qk_ctx) = ctx else {
             unreachable!()
         };
 
-        let (ctx, mut aux) = self.softmax.step_info(Self::softmax_node_id(id), aux)?;
+        let (ctx, mut aux) = self.softmax.step_info(id, aux)?;
 
         let LayerCtx::Softmax(softmax_ctx) = ctx else {
             unreachable!()
@@ -480,7 +483,7 @@ impl ProveInfo for Mha<Element> {
         aux.last_output_shape.push(v_shape);
         let (ctx, aux) = self.final_mul.step_info(Self::final_mul_node_id(id), aux)?;
 
-        let LayerCtx::ConcatMatMul(final_mul_ctx) = ctx else {
+        let LayerCtx::<E>::ConcatMatMul(final_mul_ctx) = ctx else {
             unreachable!()
         };
 
@@ -489,7 +492,7 @@ impl ProveInfo for Mha<Element> {
             aux,
         )?;
 
-        let LayerCtx::Reshape(final_reshape_ctx) = ctx else {
+        let LayerCtx::<E>::Reshape(final_reshape_ctx) = ctx else {
             unreachable!()
         };
 
@@ -634,13 +637,16 @@ impl PadOp for Mha<Element> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Mha<Element> {
-    type Ctx = MhaCtx;
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Mha<Element>
+where
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+{
+    type Ctx = MhaCtx<E>;
 
     fn prove<T: Transcript<E>>(
         &self,
         node_id: NodeId,
-        _ctx: &Self::Ctx,
+        ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
@@ -697,6 +703,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         let (claims, softmax_proof) = self.softmax.prove_step(
             node_id,
             vec![&softmax_out_claim],
+            &ctx.softmax,
             &mha_data.softmax_data,
             prover,
         )?;
@@ -735,13 +742,13 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
         Ok(input_claims)
     }
 
-    fn gen_lookup_witness<'a>(
+    fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &'a crate::ProverContext<'a, E, PCS>,
+        ctx: &crate::ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         _store: &mut TenStore,
-    ) -> anyhow::Result<LookupWitnessGen<'a, E, PCS>> {
+    ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         let mha_data = step_data
             .node_outputs
             .try_mha_data()
@@ -751,7 +758,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> f
     }
 }
 
-impl OpInfo for MhaCtx {
+impl<E: ExtensionField> OpInfo for MhaCtx<E> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         MhaOutputShaper::from(self).output_shapes(input_shapes, padding_mode)
     }
@@ -775,7 +782,7 @@ impl OpInfo for MhaCtx {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for MhaCtx {
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for MhaCtx<E> {
     type Proof = MhaProof<E, PCS>;
 
     fn verify<T: transcript::Transcript<E>>(
@@ -798,22 +805,22 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             shape_step.padded_input_shape.len()
         );
 
-        let reshaped_inputs = LayerCtx::Reshape(self.inputs_reshape.clone()).shape_step(
+        let reshaped_inputs = LayerCtx::<E>::Reshape(self.inputs_reshape.clone()).shape_step(
             &shape_step.unpadded_input_shape,
             &shape_step.padded_input_shape,
         );
 
-        let qk_shapes = LayerCtx::ConcatMatMul(self.qk.clone()).shape_step(
+        let qk_shapes = LayerCtx::<E>::ConcatMatMul(self.qk.clone()).shape_step(
             &reshaped_inputs.unpadded_output_shape[..2],
             &reshaped_inputs.padded_output_shape[..2],
         );
 
-        let softmax_shapes = LayerCtx::Softmax(self.softmax.clone()).shape_step(
+        let softmax_shapes = LayerCtx::<E>::Softmax(self.softmax.clone()).shape_step(
             &qk_shapes.unpadded_output_shape,
             &qk_shapes.padded_output_shape,
         );
 
-        let final_mul_shapes = LayerCtx::ConcatMatMul(self.final_mul.clone()).shape_step(
+        let final_mul_shapes = LayerCtx::<E>::ConcatMatMul(self.final_mul.clone()).shape_step(
             &[
                 softmax_shapes.unpadded_output_shape[0].clone(),
                 reshaped_inputs.unpadded_output_shape[2].clone(),
@@ -858,6 +865,14 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         input_claims.push(v_input_claim);
 
         Ok(input_claims)
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        proof: &Self::Proof,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        proof.write_commitment(transcript)
     }
 }
 
@@ -936,7 +951,7 @@ mod test {
     use itertools::Itertools;
 
     use crate::{
-        Element, init_test_logging,
+        Element, init_test_logging, init_test_logging_default,
         layers::{
             Layer,
             matrix_mul::{MatMul, OperandMatrix},
@@ -1262,6 +1277,7 @@ mod test {
 
     #[test]
     fn test_proven_mha() {
+        init_test_logging_default();
         let num_heads = 5;
         let head_dim = 7;
         let seq_len = 10;

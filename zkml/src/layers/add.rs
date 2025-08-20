@@ -90,7 +90,10 @@ impl Add<Element> {
         last_claims: Vec<&Claim<E>>,
         inputs: &[A],
         prover: &mut Prover<E, T, PCS>,
-    ) -> anyhow::Result<(Vec<Claim<E>>, AddProof<E>)> {
+    ) -> anyhow::Result<(Vec<Claim<E>>, AddProof<E>)>
+    where
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    {
         ensure!(last_claims.len() == 1, "Add layer expects 1 claim");
         let last_claim = last_claims[0];
         ensure!(self.quant_info.is_some(), "Add layer is not quantized");
@@ -124,7 +127,7 @@ impl Add<Element> {
                     Claim::new(last_claim.point.clone(), right_eval),
                 );
                 // this claim gets verified by the PCS openings since it's a static one
-                prover.add_common_claims(node_id, claims)?;
+                prover.add_common_claims(node_id, claims);
                 right_eval
             }
             None => {
@@ -520,7 +523,11 @@ impl QuantizeOp for Add<f32> {
 }
 
 impl ProveInfo for Add<Element> {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> anyhow::Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let Some(ref quant_info) = self.quant_info else {
             bail!("Add layer is not quantized");
         };
@@ -566,6 +573,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = AddCtx;
 
@@ -634,13 +642,22 @@ where
                 OPERAND_POLY_ID.to_string(),
                 Claim::new(last_claim.point.clone(), proof.right_eval),
             );
-            verifier.add_common_claims(self.node_id, claims)?;
+            verifier.add_common_claims(self.node_id, claims);
             // in this case we return only the left claim since the right one is verified by PCS
             Ok(vec![left_claim])
         } else {
             // in this case we return both claims
             Ok(vec![left_claim, right_claim])
         }
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
     }
 }
 

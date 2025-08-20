@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    commit::context::ModelOpeningProof,
+    commit::mmcs_context::ModelOpeningProof,
     iop::{context::VerifierContext, prover::MergeClaimsProof},
     layers::{LayerProof, provable::NodeId},
-    lookup::logup_gkr::structs::LogUpProof,
+    lookup::logup_gkr::structs::LogUpBatchProof,
 };
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
@@ -43,7 +43,7 @@ where
     /// The commitment to the multiplicity polynomial
     multiplicity_commit: PCS::Commitment,
     /// the lookup protocol proof for the table fractional sumcheck
-    lookup: LogUpProof<E>,
+    lookup: LogUpBatchProof<E>,
 }
 
 impl<E, PCS> TableProof<E, PCS>
@@ -55,6 +55,14 @@ where
     /// gets a reference to the inner commitment
     pub fn get_commitment(&self) -> &PCS::Commitment {
         &self.multiplicity_commit
+    }
+
+    pub(crate) fn write_commitment<T: Transcript<E>>(
+        &self,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        PCS::write_commitment(&self.multiplicity_commit, transcript)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 }
 #[derive(Debug, Clone, Default)]
@@ -127,7 +135,7 @@ mod test {
         let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript = default_transcript();
-        verify::<_, _, _>(verifier_ctx, proof, io, &mut verifier_transcript)
+        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript)
             .expect("invalid proof");
     }
 
@@ -145,7 +153,7 @@ mod test {
         let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript = default_transcript();
-        verify::<_, _, _>(verifier_ctx, proof, io, &mut verifier_transcript)
+        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript)
             .expect("invalid proof");
     }
 }

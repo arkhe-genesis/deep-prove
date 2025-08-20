@@ -393,7 +393,7 @@ mod tests {
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
 
-        verify::<_, _, _>(verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 
     #[test]
@@ -439,7 +439,7 @@ mod tests {
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
-        verify::<_, _, _>(verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 
     #[test]

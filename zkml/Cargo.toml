@@ -21,7 +21,6 @@ name = "bench-llm"
 path = "src/bin/bench-llm.rs"
 
 [features]
-blake = ["mpcs/blake"]
 default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
 capture-layers-quant = []
@@ -36,6 +35,7 @@ average = { version = "0.16.0", features = ["std"] }
 burn = { version = "0.18.0", default-features = false }
 burn-cubecl = { version = "0.18.0", default-features = false, optional = true }
 candle-core = "0.9.1"
+ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 csv.workspace = true
 cubecl = { version = "0.6.0", default-features = false, features = [
@@ -74,6 +74,7 @@ tracing-subscriber = { workspace = true, features = [
 tract-onnx = { workspace = true }
 transcript = { workspace = true }
 utils = { path = "../utils" }
+witness = { workspace = true }
 
 
 [dev-dependencies]

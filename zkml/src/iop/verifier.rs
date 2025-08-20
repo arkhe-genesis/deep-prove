@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     Claim, Element,
-    commit::context::{CommitmentVerifier, PolyId},
+    commit::mmcs_context::{CommitmentVerifier, PolyId},
     iop::{
         ChallengeStorage,
         context::{ShapeStep, VerifierContext},
@@ -12,7 +12,7 @@ use crate::{
         LayerCtx, LayerProof,
         provable::{NodeCtx, NodeId, OpInfo, VerifiableCtx, compute_model_output_claims},
     },
-    lookup::{context::TableType, logup_gkr::verifier::verify_logup_proof},
+    lookup::{context::LookupContext, logup_gkr::verifier::verify_logup_proof_multiple_sizes},
     model::ToIterator,
     tensor::Tensor,
     try_unzip,
@@ -20,7 +20,7 @@ use crate::{
 use anyhow::{Context as _, anyhow, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
+use mpcs::{Point, PolynomialCommitmentScheme};
 use tracing::trace;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -81,8 +81,8 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
 {
-    pub(crate) fn new(ctx: &VerifierContext<E, PCS>, transcript: &'a mut T, io: IO<E>) -> Self {
-        let commit_verifier = CommitmentVerifier::<E, PCS>::new(&ctx.commitment_ctx);
+    pub(crate) fn new(transcript: &'a mut T, io: IO<E>) -> Self {
+        let commit_verifier = CommitmentVerifier::<E, PCS>::new();
         Self {
             io,
             commit_verifier,
@@ -102,14 +102,6 @@ where
 
         ctx.write_to_transcript(self.transcript)?;
 
-        // Here we generate and store all lookup related challenges
-        // TODO: make this part of verifier struct
-        self.challenge_storage = if ctx.lookup.is_empty() {
-            ChallengeStorage::<E>::default()
-        } else {
-            ChallengeStorage::<E>::initialise(ctx, self.transcript)
-        };
-
         // iterate over the step proofs in inference order
         for (node_id, node) in ctx.steps_info.to_forward_iterator() {
             if !node.ctx.has_proof() {
@@ -124,13 +116,25 @@ where
                 numerators.extend(num.into_iter());
                 denominators.extend(denom.into_iter());
             }
+            node.ctx
+                .write_proof_to_transcript(node_proof, self.transcript)?;
         }
 
-        proof.table_proofs.iter().for_each(|proof| {
+        proof.table_proofs.iter().try_for_each(|proof| {
             let (nums, denoms) = proof.lookup.fractional_outputs();
             numerators.extend(nums);
             denominators.extend(denoms);
-        });
+            proof.write_commitment(self.transcript)
+        })?;
+
+        // Here we generate and store all lookup related challenges
+        // TODO: make this part of verifier struct
+        self.challenge_storage = if ctx.lookup.is_empty() {
+            ChallengeStorage::<E>::default()
+        } else {
+            ChallengeStorage::<E>::initialise(ctx, self.transcript)
+        };
+
         // 2. Derive output claims
         // first, we bind each output to the node that computes it, so that we know whether we
         // need to compute the output claim or not
@@ -245,30 +249,16 @@ where
         }
 
         // 5. Verify the lookup table proofs
-        proof
-            .table_proofs
-            .iter()
-            .zip(ctx.lookup.iter())
-            .try_for_each(|(table_proof, table_type)| {
-                let (constant_challenge, column_separation_challenge) = self
-                    .challenge_storage
-                    .get_challenges_by_name(&table_type.name())
-                    .ok_or(anyhow!(
-                        "No challenges found for table of type: {:?} during verification",
-                        table_type.name()
-                    ))?;
-
-                verify_table::<_, _, _>(
-                    table_proof,
-                    table_type.clone(),
-                    &mut self.commit_verifier,
-                    self.transcript,
-                    constant_challenge,
-                    column_separation_challenge,
-                )?;
-
-                Result::<(), anyhow::Error>::Ok(())
-            })?;
+        if !proof.table_proofs.is_empty() {
+            verify_table::<_, _, _>(
+                &proof.table_proofs[0],
+                &ctx.lookup,
+                ctx.commitment_ctx.table_node_id(),
+                &mut self.commit_verifier,
+                self.transcript,
+                &self.challenge_storage,
+            )?;
+        }
 
         // inputs are assigned at inference time using the forward iterator so we need to use the same ordering here.
         let input_claims =
@@ -292,7 +282,7 @@ where
                 .nodes
                 .get(&node_id)
                 .ok_or(anyhow!("Node {node_id} not found"))?;
-            <LayerCtx as VerifiableCtx<E, PCS>>::verify_input_claim(
+            <LayerCtx<E> as VerifiableCtx<E, PCS>>::verify_input_claim(
                 &node_ctx.ctx,
                 inputs.as_slice(),
                 &claims,
@@ -301,7 +291,7 @@ where
 
         // 7. verify the opening of the accumulation of claims
         self.commit_verifier
-            .verify(&ctx.commitment_ctx, &proof.commit, self.transcript)?;
+            .verify(&ctx.commitment_ctx, proof.commit, self.transcript)?;
 
         let num_len = numerators.len();
         // 8. verify that the accumulated numerator is zero and accumulated denominator is non-zero
@@ -362,18 +352,14 @@ where
         proof.verify_proof(self.transcript, claims)
     }
 
-    pub(crate) fn add_common_claims(
-        &mut self,
-        node_id: NodeId,
-        claims: HashMap<PolyId, Claim<E>>,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn add_common_claims(&mut self, node_id: NodeId, claims: HashMap<PolyId, Claim<E>>) {
         self.commit_verifier.add_common_claims(node_id, claims)
     }
 }
 
 /// Verifies an inference proof given a context, a proof and the input / output of the model.
 pub fn verify<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
-    ctx: VerifierContext<E, PCS>,
+    ctx: &VerifierContext<E, PCS>,
     proof: Proof<E, PCS>,
     io: IO<E>,
     transcript: &mut T,
@@ -382,71 +368,93 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
 {
-    let verifier = Verifier::new(&ctx, transcript, io);
-    verifier.verify(&ctx, proof)
+    let verifier = Verifier::new(transcript, io);
+    verifier.verify(ctx, proof)
 }
 
 fn verify_table<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
     proof: &TableProof<E, PCS>,
-    table_type: TableType,
+    lookup_ctx: &LookupContext,
+    table_node_id: NodeId,
     witness_verifier: &mut CommitmentVerifier<E, PCS>,
     t: &mut T,
-    constant_challenge: E,
-    column_separation_challenge: E,
+    challenge_storage: &ChallengeStorage<E>,
 ) -> anyhow::Result<()>
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
 {
     // 1. Verify the lookup proof
-    let verifier_claims = verify_logup_proof(
-        &proof.lookup,
-        1,
-        constant_challenge,
-        column_separation_challenge,
-        t,
+    let TableProof {
+        multiplicity_commit,
+        lookup,
+    } = proof;
+    let batch_claim = verify_logup_proof_multiple_sizes(lookup, t)?;
+
+    let poly_evals = batch_claim.poly_evals();
+    let point = batch_claim.point();
+    let point_len = point.len();
+    let alpha = batch_claim.alpha();
+    let lambda = batch_claim.lambda();
+
+    let (mult_claims, _, calc_claim, _) = lookup_ctx.iter().try_fold(
+        (vec![], 0, E::ZERO, E::ONE),
+        |(mut acc, skip, eval_acc, chal_acc), tt| {
+            let take = tt.num_columns() + 1;
+            let nv = tt.multiplicity_poly_vars();
+            let evals = poly_evals
+                .iter()
+                .skip(skip)
+                .take(take)
+                .copied()
+                .collect::<Vec<E>>();
+            let mult_eval = evals[0];
+            let current_point = point[point_len - nv..].to_vec();
+            let mut column_evals = tt.evaluate_table_columns(&current_point)?;
+
+            acc.push((point[point_len - nv..].to_vec(), mult_eval));
+            if tt.has_committed_claims() {
+                column_evals.push(evals[take - 1]);
+                witness_verifier.add_table_claim(
+                    table_node_id,
+                    tt,
+                    Claim::<E>::new(point[point_len - nv..].to_vec(), evals[take - 1]),
+                );
+            }
+
+            let (constant_challenge, csc) = challenge_storage
+                .get_challenges_by_name(&tt.name())
+                .ok_or(anyhow!("No challenges for table type {}", tt.name()))?;
+            let column_eval = column_evals
+                .into_iter()
+                .fold((constant_challenge, E::ONE), |(acc, csc_acc), e| {
+                    (acc + csc_acc * e, csc_acc * csc)
+                })
+                .0;
+            Result::<(_, _, _, _), anyhow::Error>::Ok((
+                acc,
+                skip + take,
+                eval_acc + chal_acc * (mult_eval + lambda * column_eval),
+                chal_acc * alpha,
+            ))
+        },
     )?;
 
-    // 2. Accumulate the multiplicity poly claim into the witness commitment protocol
-    let poly_claims = verifier_claims.claims();
+    let grouped = mult_claims
+        .into_iter()
+        .into_group_map()
+        .into_iter()
+        .sorted_by(|a, b| Ord::cmp(&b.0.len(), &a.0.len()))
+        .collect::<Vec<(Point<E>, Vec<E>)>>();
 
-    witness_verifier.add_witness_claim(
-        proof.get_commitment().clone(),
-        poly_claims
-            .first()
-            .ok_or(anyhow!("Claims was empty in table verification!"))?
-            .clone(),
-    )?;
-    // Add any table poly claims to the commitment verifier
-    let table_poly_claims = table_type.table_claims(poly_claims);
-
-    if !table_poly_claims.is_empty() {
-        // If the table poly claims aren't empty there should only be 1
-        ensure!(
-            table_poly_claims.len() == 1,
-            "If table poly claims isn't empty we should only have 1, got: {}",
-            table_poly_claims.len()
-        );
-        witness_verifier.add_table_claim(table_type.clone(), table_poly_claims[0].clone())?;
-    }
-
-    // Hard indexing is okay here because we checked above that at least one claim exists
-    let expected_claim_evals = table_type.evaluate_table_columns::<E>(&poly_claims[0].point)?;
+    witness_verifier.add_witness_claim(table_node_id, multiplicity_commit.clone(), grouped);
 
     ensure!(
-        expected_claim_evals.len() == (poly_claims.len() - table_poly_claims.len() - 1),
-        "Expected {} table column evaluation claims, got {}, for table type: {}",
-        poly_claims.len() - table_poly_claims.len() - 1,
-        expected_claim_evals.len(),
-        table_type.name(),
+        calc_claim == batch_claim.claim(),
+        "Table Proof was incorrect, calculated claim: {:?} was not equal to claim from LogUp proof {:?}",
+        calc_claim,
+        batch_claim.claim()
     );
-    for (poly_claim, expected) in poly_claims[1..].iter().zip(expected_claim_evals.iter()) {
-        ensure!(
-            poly_claim.eval == *expected,
-            "Claimed table eval was wrong, claimed: {:?}, expected: {:?}",
-            poly_claim.eval,
-            expected
-        );
-    }
+
     Ok(())
 }

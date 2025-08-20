@@ -2,19 +2,22 @@
 
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, Tensor,
-    commit::compute_betas_eval,
+    commit::{compute_betas_eval, identity_eval},
     iop::{
+        ChallengeStorage,
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
     },
     layers::LayerProof,
     lookup::{
-        context::{COLUMN_SEPARATOR, CommsAndEvals, LookupWitnessGen, TableType, count_elements},
-        logup_gkr::{
-            prover::batch_prove as logup_batch_prove, structs::LogUpProof,
-            verifier::verify_logup_proof,
+        context::{
+            COLUMN_SEPARATOR, LayerLookupContext, LookupWitnessGen, TableType, count_elements,
         },
-        witness::LogUpWitness,
+        logup_gkr::{
+            prover::batch_multiple_sizes_prove,
+            structs::{LogUpBatchProof, LogUpInput},
+            verifier::verify_logup_proof_multiple_sizes,
+        },
     },
     model::StepData,
     padding::PaddingMode,
@@ -23,16 +26,21 @@ use crate::{
     to_base,
 };
 use anyhow::{Context as CC, Result, anyhow, ensure};
+use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use multilinear_extensions::{
-    Expression, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
+    Expression,
+    mle::IntoMLE,
+    util::{ceil_log2, transpose},
+    utils::eval_by_expr_with_instance,
+    virtual_poly::VPAuxInfo,
+    virtual_polys::VirtualPolynomialsBuilder,
 };
-use p3_field::FieldAlgebra;
+use witness::RowMajorMatrix;
 
-use mpcs::{PolynomialCommitmentScheme, sum_check::eq_xy_eval};
-use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
+use mpcs::PolynomialCommitmentScheme;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -75,9 +83,13 @@ pub struct Requant {
 
 /// Info related to the lookup protocol necessary to requantize
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RequantCtx {
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct RequantCtx<E: ExtensionField> {
     pub requant: Requant,
     pub node_id: NodeId,
+    pub num_vars: usize,
+    pub lookup_ctx: LayerLookupContext,
+    pub sumcheck_expression: Expression<E>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,11 +104,21 @@ where
     /// e.g. the "link" between an activation and requant layer
     pub(crate) io_accumulation: IOPProof<E>,
     /// The evalaution claims about witness polynomials from the io_accumulation sumcheck
-    pub(crate) accumulation_evals: Vec<E>,
-    /// The lookup proofs, there are one or two depending on if zero checks are required
-    pub(crate) lookup_proofs: Vec<LogUpProof<E>>,
+    pub(crate) io_eval: Vec<E>,
+    /// The logup batch proof for all the lookups
+    pub(crate) logup_proof: LogUpBatchProof<E>,
     /// COmmitments to lookup polynomials, they are in the order clamping commitments -> shifted commitments
-    pub(crate) commitments: Vec<PCS::Commitment>,
+    pub(crate) commitment: PCS::Commitment,
+}
+
+impl<E, PCS> RequantProof<E, PCS>
+where
+    E: ExtensionField,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
+        PCS::write_commitment(&self.commitment, transcript).map_err(|e| anyhow!("{e:?}"))
+    }
 }
 
 const IS_PROVABLE: bool = true;
@@ -129,29 +151,86 @@ impl Evaluate<Element> for Requant {
         inputs: &[&Tensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
-        ensure!(
-            inputs.len() == 1,
-            "Requant layer expects 1 input, got {}",
-            inputs.len()
-        );
-        Ok(LayerOut::from_vec(
-            inputs
-                .iter()
-                .map(|input| self.op(input))
-                .collect::<Result<Vec<_>>>()?,
-        ))
+        let result = inputs
+            .iter()
+            .map(|input| {
+                // We use this value to determine if any of the inputs are too large to be requantised (i.e. they fall outside the clamping table)
+                let max_abs_val: Element = 1 << self.intermediate_bit_size;
+                let res = input
+                    .get_data()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, elem)| {
+                        ensure!(
+                            elem.abs() <= max_abs_val,
+                            "Could not apply requantisation, tensor element {} had absolute value too large, given value: {}, max value: {}",
+                            i, elem, max_abs_val
+                        );
+
+                        let rounding: Element = 1 << (self.shift() - 1);
+                        let unclamped = (rounding + elem * self.fixed_point_multiplier) >> self.shift();
+
+                        if unclamped >= *quantization::MAX {
+                            Ok(*quantization::MAX)
+                        } else if unclamped <= *quantization::MIN {
+                            Ok(*quantization::MIN)
+                        } else {
+                            Ok(unclamped)
+                        }
+                    })
+                    .collect::<Result<Vec<Element>, anyhow::Error>>()?;
+                Ok(Tensor::<Element>::new(input.shape(), res))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(LayerOut::from_vec(result))
     }
 }
 
 impl ProveInfo for Requant {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         aux.tables.insert(TableType::Range);
 
         // Add ZeroTable to the aux if needed
-        if self.number_of_zero_chunks() != 0 {
+        let lookup_ctx = if self.number_of_zero_chunks() != 0 {
+            let (number_shifted_chunks, _, _) = self.shifted_chunks_data();
             aux.tables.insert(TableType::RequantZeroTable);
-        }
+            let tables = vec![TableType::Range, TableType::RequantZeroTable];
+            let instances_per_table = vec![number_shifted_chunks + 1, self.number_of_zero_chunks()];
+            LayerLookupContext::new(tables, instances_per_table)
+        } else {
+            let (number_shifted_chunks, _, _) = self.shifted_chunks_data();
 
+            let tables = vec![TableType::Range];
+            let instances_per_table = vec![number_shifted_chunks + 1];
+            LayerLookupContext::new(tables, instances_per_table)
+        };
+
+        let sumcheck_expression =
+            build_requant_sumcheck_expression::<E>(self.number_of_zero_chunks());
+
+        // `try_fold` would not allow returning of `Err` values
+        // from here and would short-circuit
+        // instead of looping over all values in the iterator
+        #[allow(clippy::manual_try_fold)]
+        let num_vars = aux
+            .last_output_shape
+            .iter_mut()
+            .fold(Ok(None), |expected_num_vars, shape| {
+                let num_vars = shape.iter().map(|dim| ceil_log2(*dim)).sum::<usize>();
+                if let Some(vars) = expected_num_vars? {
+                    ensure!(
+                        vars == num_vars,
+                        "All input shapes for requant layer \
+                        must have the same number of variables"
+                    );
+                }
+                Ok(Some(num_vars))
+            })?
+            .expect("No input shape found for requant layer?");
         // Set the model polys to be empty
         aux.model_polys = None;
         aux.max_poly_len = aux
@@ -160,13 +239,201 @@ impl ProveInfo for Requant {
             .fold(aux.max_poly_len, |acc, shapes| {
                 acc.max(shapes.next_power_of_two().product())
             });
+
         Ok((
             LayerCtx::Requant(RequantCtx {
                 requant: *self,
                 node_id: id,
+                num_vars,
+                lookup_ctx,
+                sumcheck_expression,
             }),
             aux,
         ))
+    }
+}
+
+/// Function used to construct the sumcheck to relate the outputs of the lookup to the input of the following layer.
+/// The number of zero chunks dictates what this expression looks like. If `number_zero_chunks` is non-zero then we have
+/// that the `last_claim.eval` should be the sum over the boolean hypercube of
+///  `(PROD zero_chunk_i) * value + (1 - (PROD zero_chunk_i)) * (quant_max + sign * (quant_max - quant_min))`
+/// in this case we also check that the `sign` polynomial is constructed correctly (it should only contain the values `0` and `-1`) using
+///  `sign * (1 + sign)`
+/// Finally in this case we also have to show that the `zero_chunk_i` and `value` polynomials are the same as the ones used in the lookup argument so we take a random
+/// linear combination of `zero_chunk_i` and `value + quant_max` (we have to add `quant_max` here because the lookup on `value` is performed on it shifted so that all its values are positive).
+///
+/// When `number_zero_chunks` is zero, we have a simpler case where we just need to show that the `last_claim.eval` is equal to `value` and that `value + quant_max` is the polynomial used in the lookup.
+fn build_requant_sumcheck_expression<E: ExtensionField>(
+    number_zero_chunks: usize,
+) -> Expression<E> {
+    // The first polynomial fed to the `VirtualPolynomialsBuilder` will be the `value` poly.
+    let value_expr = Expression::WitIn(0);
+    if number_zero_chunks != 0 {
+        // Here we construct the product of the zero chunks as well as their contribution to the random linear combination
+        let (zero_out_prod_expr, zero_out_sum) = (1..=number_zero_chunks).fold(
+            (
+                Expression::Constant(Either::Right(E::ONE)),
+                Expression::Constant(Either::Right(E::ZERO)),
+            ),
+            |(prod_acc, sum_acc), j| {
+                (
+                    prod_acc * Expression::WitIn(j as u16),
+                    sum_acc
+                        + Expression::WitIn(j as u16)
+                            * Expression::Challenge(0, 2 + j, E::ONE, E::ZERO),
+                )
+            },
+        );
+        // This is the offset for the IDs of the remaining witness polynomials, they should be `sign` and then the three `eq_polys` needed.
+        let id_offset = (1 + number_zero_chunks) as u16;
+        let sign_expr = Expression::WitIn(id_offset);
+        let last_claim_eq_expr = Expression::WitIn(id_offset + 1);
+        let sign_eq_expr = Expression::WitIn(id_offset + 2);
+        let logup_eq_expr = Expression::WitIn(id_offset + 3);
+        // Constants that we need in the expression
+        let quant_max_field: E = (*quantization::MAX).to_field();
+        let value_const = E::from_canonical_u64(1 << (*quantization::BIT_LEN - 1));
+        let sign_const = quant_max_field + quant_max_field + E::ONE;
+        // This is the part of the expression which relates `last_claim.eval` to the lookup outputs.
+        let first_part = last_claim_eq_expr
+            * (zero_out_prod_expr.clone() * value_expr.clone()
+                + (Expression::Constant(Either::Right(E::ONE)) - zero_out_prod_expr)
+                    * (Expression::Constant(Either::Right(quant_max_field))
+                        + sign_expr.clone() * Expression::Constant(Either::Right(sign_const))));
+        // This part of the expression proves correct construction of `sign`
+        let second_part = Expression::Challenge(0, 2, E::ONE, E::ZERO)
+            * sign_eq_expr
+            * (sign_expr.clone() * (Expression::Constant(Either::Right(E::ONE)) + sign_expr));
+        // This part of the expression directly links the lookup output claims to this sumcheck.
+        let third_part = logup_eq_expr
+            * (Expression::Challenge(0, 1, E::ONE, E::ZERO)
+                * (value_expr + Expression::Constant(Either::Right(value_const)))
+                + zero_out_sum);
+        first_part + second_part + third_part
+    } else {
+        // This is the case where there were no zero chunks so no clamping required, in which case the expression only deals with the `value` poly and
+        // two `eq_polys`
+        let value_const = E::from_canonical_u64(1 << (*quantization::BIT_LEN - 1));
+        Expression::WitIn(1) * value_expr.clone()
+            + Expression::Challenge(0, 1, E::ONE, E::ZERO)
+                * Expression::WitIn(2)
+                * (value_expr + Expression::Constant(Either::Right(value_const)))
+    }
+}
+
+impl LayerLookupContext {
+    /// Softmax behaves slightly differently to normal lookups so we have a custom method to generate the [`LogUpInput`].
+    pub fn create_logup_inputs_requant<PCS, E>(
+        &self,
+        layer_commitment: &PCS::CommitmentWithWitness,
+        challenge_storage: &ChallengeStorage<E>,
+    ) -> anyhow::Result<Vec<LogUpInput<E>>>
+    where
+        E: ExtensionField,
+        PCS: PolynomialCommitmentScheme<E>,
+    {
+        // First we extract the polynomials from the layer_commitment
+        let polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
+
+        // There should be at least as many polynomials as there are lookup columns total
+        let total_lookup_columns = self
+            .tables
+            .iter()
+            .zip(self.instances_per_table.iter())
+            .map(|(tt, &n)| tt.num_columns() * n)
+            .sum::<usize>();
+
+        ensure!(
+            polys.len() >= total_lookup_columns,
+            "Cannot create Softmax LogUp inputs because we were only provided with {} polynomials and expected {} lookup columns",
+            polys.len(),
+            total_lookup_columns
+        );
+
+        if self.tables.len() == 1 {
+            let mut column_evals = polys
+                .iter()
+                .take(polys.len() - 1)
+                .map(|p| p.get_base_field_vec().to_vec())
+                .collect::<Vec<Vec<E::BaseField>>>();
+            let value_evals = polys[polys.len() - 1]
+                .get_base_field_vec()
+                .iter()
+                .map(|&eval| {
+                    eval + E::BaseField::from_canonical_u64(1 << (*quantization::BIT_LEN - 1))
+                })
+                .collect::<Vec<E::BaseField>>();
+            column_evals.push(value_evals);
+
+            let (constant_challenge, column_separation_challenge) = challenge_storage
+                .get_challenges_by_name(&self.tables[0].name())
+                .ok_or(anyhow!(
+                    "No challenges found for Table {}, cannot generate Softmax LogUp input",
+                    self.tables[0].name()
+                ))?;
+            let logup_input = LogUpInput::<E>::new_lookup(
+                column_evals,
+                constant_challenge,
+                column_separation_challenge,
+                1,
+            )?;
+            Ok(vec![logup_input])
+        } else {
+            let number_zero_chunks = self.instances_per_table[1];
+            // subtract one for the sign poly, one for value and then twice the number of shifted chunks
+            let shifted_chunks = polys.len() - 2 - 2 * number_zero_chunks;
+
+            let mut range_column_evals = polys[..shifted_chunks]
+                .iter()
+                .map(|p| p.get_base_field_vec().to_vec())
+                .collect::<Vec<Vec<E::BaseField>>>();
+            let value_evals = polys[shifted_chunks + number_zero_chunks]
+                .get_base_field_vec()
+                .iter()
+                .map(|&eval| {
+                    eval + E::BaseField::from_canonical_u64(1 << (*quantization::BIT_LEN - 1))
+                })
+                .collect::<Vec<E::BaseField>>();
+            range_column_evals.push(value_evals);
+            let (constant_challenge, column_separation_challenge) = challenge_storage
+                .get_challenges_by_name(&self.tables[0].name())
+                .ok_or(anyhow!(
+                    "No challenges found for Table {}, cannot generate Softmax LogUp input",
+                    self.tables[0].name()
+                ))?;
+            let range_input = LogUpInput::<E>::new_lookup(
+                range_column_evals,
+                constant_challenge,
+                column_separation_challenge,
+                1,
+            )?;
+
+            let zero_column_evals = polys
+                .iter()
+                .skip(shifted_chunks)
+                .take(number_zero_chunks)
+                .interleave(
+                    polys
+                        .iter()
+                        .skip(shifted_chunks + number_zero_chunks + 1)
+                        .take(number_zero_chunks),
+                )
+                .map(|p| p.get_base_field_vec().to_vec())
+                .collect::<Vec<Vec<E::BaseField>>>();
+            let (constant_challenge, column_separation_challenge) = challenge_storage
+                .get_challenges_by_name(&self.tables[1].name())
+                .ok_or(anyhow!(
+                    "No challenges found for Table {}, cannot generate Softmax LogUp input",
+                    self.tables[1].name()
+                ))?;
+            let zero_input = LogUpInput::<E>::new_lookup(
+                zero_column_evals,
+                constant_challenge,
+                column_separation_challenge,
+                2,
+            )?;
+            Ok(vec![range_input, zero_input])
+        }
     }
 }
 
@@ -177,8 +444,9 @@ where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
-    type Ctx = RequantCtx;
+    type Ctx = RequantCtx<E>;
 
     fn prove<T: Transcript<E>>(
         &self,
@@ -189,20 +457,18 @@ where
         prover: &mut Prover<E, T, PCS>,
         _store: &mut TenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let claim = match self.number_of_zero_chunks() {
-            0 => self.prove_step_no_zero_chunks(prover, last_claims[0], ctx, id)?,
-            _ => self.prove_step(prover, last_claims[0], ctx, id)?,
-        };
+        let claim = self.prove_step(prover, last_claims[0], ctx, id)?;
+
         Ok(vec![claim])
     }
 
-    fn gen_lookup_witness<'a>(
+    fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &'a ProverContext<'a, E, PCS>,
+        ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut TenStore,
-    ) -> Result<LookupWitnessGen<'a, E, PCS>> {
+    ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors(store)?;
         ensure!(
             step_data.node_inputs.len() == 1,
@@ -245,7 +511,7 @@ where
         // because if it was in the correct range to begin with after multiplying by 2^5 it will be in the range 0..255, but if it was larger than 7 after multiplying by 2^5
         // it will no longer be in the range 0..255.
         let (number_shift_chunks, _, final_shift_chunk_multiplier) = self.shifted_chunks_data();
-        let shifted_chunks = (0..number_shift_chunks)
+        let mut shifted_chunks = (0..number_shift_chunks)
             .map(|j| {
                 if j != number_shift_chunks - 1 {
                     shifted_part
@@ -279,7 +545,16 @@ where
         });
 
         let value_chunk = chunks.remove(0);
-
+        let (zero_ins, zero_outs): (Vec<Vec<Element>>, Vec<Vec<Element>>) = chunks
+            .into_iter()
+            .map(|z_in| {
+                let z_out = z_in
+                    .iter()
+                    .map(|&v| if v == 0 { 1 } else { 0 })
+                    .collect::<Vec<Element>>();
+                (z_in, z_out)
+            })
+            .unzip();
         // Make the multiplicity counts for each of the lookups
         let range_check_count = count_elements(
             shifted_chunks.iter().flatten().copied().chain(
@@ -289,131 +564,59 @@ where
             ),
         );
 
+        let zero_check_count = count_elements(zero_ins.iter().zip(zero_outs.iter()).flat_map(
+            |(z_in, z_out)| {
+                z_in.iter()
+                    .zip(z_out.iter())
+                    .map(|(&i, &o)| i + COLUMN_SEPARATOR * o)
+                    .collect::<Vec<Element>>()
+            },
+        ));
+
         // Make the commitments
-        let num_vars = ceil_log2(value_chunk.len());
+        // We group them by (shifted_parts, zero_ins) and (value, zero_outs, sign) because they will be evaluated at different points
+        shifted_chunks.extend(zero_ins);
+        let width1 = shifted_chunks.len();
+        let values_1 = transpose(shifted_chunks);
 
-        let (mut range_commits, mut range_evals): CommsAndEvals<PCS, E> = shifted_chunks
-            .into_par_iter()
-            .map(|chunk| {
-                let evaluations = to_base::<E, _>(chunk);
-                let mle =
-                    MultilinearExtension::<E>::from_evaluations_vec(num_vars, evaluations.clone());
-                let commit = ctx.commitment_ctx.commit(&mle)?;
-                Ok(((commit, mle), evaluations))
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?
-            .into_iter()
-            .unzip();
+        let (width2, values_2) = if self.number_of_zero_chunks() != 0 {
+            let chained = [value_chunk]
+                .into_iter()
+                .chain(zero_outs)
+                .chain([sign])
+                .collect::<Vec<Vec<Element>>>();
+            (chained.len(), transpose(chained))
+        } else {
+            (1, vec![value_chunk])
+        };
 
-        let (value_poly_evals, value_evals): (Vec<E::BaseField>, Vec<E::BaseField>) = value_chunk
-            .into_iter()
-            .map(|v| {
-                let poly_f: E = v.to_field();
-                let f: E = (v + (1 << (*quantization::BIT_LEN - 1))).to_field();
-                (poly_f.as_bases()[0], f.as_bases()[0])
-            })
-            .unzip();
+        let rmm1 = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
+            ceno_p3::matrix::dense::DenseMatrix::new(to_base::<E, _>(values_1.concat()), width1),
+            witness::InstancePaddingStrategy::Default,
+        );
+        let rmm2 = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
+            ceno_p3::matrix::dense::DenseMatrix::new(to_base::<E, _>(values_2.concat()), width2),
+            witness::InstancePaddingStrategy::Default,
+        );
 
-        let value_mle = MultilinearExtension::from_evaluations_vec(num_vars, value_poly_evals);
-        let value_commit = ctx.commitment_ctx.commit(&value_mle)?;
-
-        range_commits.insert(0, (value_commit, value_mle));
-        range_evals.insert(0, value_evals);
+        let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm1, rmm2])?;
 
         let mut gen = LookupWitnessGen::<E, PCS>::default();
 
-        if number_output_chunks > 1 {
-            // This means there are chunks that need to be zero checked
-
-            let zero_check_count = count_elements(chunks.iter().flat_map(|a_vec| {
-                a_vec
-                    .iter()
-                    .map(|&a| if a != 0 { a } else { a + COLUMN_SEPARATOR })
-            }));
-
-            let (mut zero_commits, zero_evals): CommsAndEvals<PCS, E> = chunks
-                .into_iter()
-                .flat_map(|in_vec| {
-                    let out_vec = in_vec
-                        .iter()
-                        .map(|&v| if v == 0 { 1 } else { 0 })
-                        .collect::<Vec<Element>>();
-                    [in_vec, out_vec]
-                })
-                .collect::<Vec<Vec<Element>>>()
-                .into_par_iter()
-                .map(|vals| {
-                    let (commit_evals, evaluations): (Vec<E::BaseField>, Vec<E::BaseField>) = vals
-                        .into_iter()
-                        .map(|v| {
-                            let f: E = v.to_field();
-                            (f.as_bases()[0], f.as_bases()[0])
-                        })
-                        .unzip();
-                    let mle =
-                        MultilinearExtension::<E>::from_evaluations_vec(num_vars, commit_evals);
-                    let commit = ctx.commitment_ctx.commit(&mle)?;
-                    Ok(((commit, mle), evaluations))
-                })
-                .collect::<Result<Vec<_>, anyhow::Error>>()?
-                .into_iter()
-                .unzip();
-
-            let sign_mle = MultilinearExtension::<E>::from_evaluations_vec(
-                num_vars,
-                sign.into_iter()
-                    .map(|v| {
-                        let f: E = v.to_field();
-                        f.as_bases()[0]
-                    })
-                    .collect::<Vec<E::BaseField>>(),
-            );
-            let sign_commit = ctx.commitment_ctx.commit(&sign_mle)?;
-
-            zero_commits.push((sign_commit, sign_mle));
-            // Insert both logup witnesses
-            gen.logup_witnesses.insert(
-                id,
-                vec![
-                    LogUpWitness::<E, PCS>::new_lookup(
-                        zero_commits,
-                        zero_evals,
-                        2,
-                        TableType::RequantZeroTable,
-                    ),
-                    LogUpWitness::<E, PCS>::new_lookup(
-                        range_commits,
-                        range_evals,
-                        1,
-                        TableType::Range,
-                    ),
-                ],
-            );
-
+        if !zero_check_count.is_empty() {
             gen.element_count
                 .insert(TableType::RequantZeroTable, zero_check_count);
-        } else {
-            // No zero chunks
-            // Only insert the range checks
-            gen.logup_witnesses.insert(
-                id,
-                vec![LogUpWitness::<E, PCS>::new_lookup(
-                    range_commits,
-                    range_evals,
-                    1,
-                    TableType::Range,
-                )],
-            );
         }
 
         gen.element_count
             .insert(TableType::Range, range_check_count);
 
+        gen.logup_witnesses.insert(id, layer_commitment);
         Ok(gen)
     }
 }
 
-impl OpInfo for RequantCtx {
+impl<E: ExtensionField> OpInfo for RequantCtx<E> {
     fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes.to_vec()
     }
@@ -435,7 +638,7 @@ impl OpInfo for RequantCtx {
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for RequantCtx
+impl<E, PCS> VerifiableCtx<E, PCS> for RequantCtx<E>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
@@ -450,42 +653,17 @@ where
         verifier: &mut Verifier<E, T, PCS>,
         _shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
-        let claim = match self.requant.number_of_zero_chunks() {
-            0 => {
-                let (constant_challenge, _) = verifier
-                    .challenge_storage
-                    .get_challenges_by_name(&TableType::Range.name())
-                    .ok_or(anyhow!(
-                        "Couldn't get challenges for LookupType: {}",
-                        TableType::Range.name()
-                    ))?;
+        let claim = self.verify_requant(verifier, last_claims[0], proof)?;
 
-                self.verify_requant_no_zero_chunks(
-                    verifier,
-                    last_claims[0],
-                    proof,
-                    constant_challenge,
-                )
-            }
-            _ => {
-                let (constant_challenge, column_separation_challenge) = verifier
-                    .challenge_storage
-                    .get_challenges_by_name(&TableType::RequantZeroTable.name())
-                    .ok_or(anyhow!(
-                        "Couldn't get challenges for LookupType: {}",
-                        TableType::RequantZeroTable.name()
-                    ))?;
-                self.verify_requant(
-                    verifier,
-                    last_claims[0],
-                    proof,
-                    constant_challenge,
-                    column_separation_challenge,
-                )
-            }
-        };
+        Ok(vec![claim])
+    }
 
-        Ok(vec![claim?])
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        proof: &Self::Proof,
+        transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        proof.write_commitment(transcript)
     }
 }
 
@@ -642,163 +820,6 @@ impl Requant {
         (full_eval - rc_field) * fpm_inv
     }
 
-    pub(crate) fn prove_step_no_zero_chunks<
-        E,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
-    >(
-        &self,
-        prover: &mut Prover<E, T, PCS>,
-        last_claim: &Claim<E>,
-        _requant_info: &RequantCtx,
-        id: NodeId,
-    ) -> anyhow::Result<Claim<E>>
-    where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
-    {
-        let mut logup_witnesses = prover.lookup_witness(id)?;
-        // Check that we have one witness for requantisation
-        if logup_witnesses.len() != 1 {
-            return Err(anyhow!(
-                "There should only be one lookup witness during requantisation, node: {}, number of witnesses: {}",
-                id,
-                logup_witnesses.len()
-            ));
-        }
-        // Run the lookup protocol and return the lookup proof
-        let range_logup_witness = logup_witnesses.remove(0);
-        // Run the lookup protocol and return the lookup proofs
-        let range_prover_info = range_logup_witness.get_logup_input(&prover.challenge_storage)?;
-        let range_logup_proof = logup_batch_prove(&range_prover_info, prover.transcript)?;
-
-        let mut range_commitments = range_logup_witness.into_commitments();
-        let value_commitment = range_commitments.remove(0);
-
-        let num_vars = ceil_log2(range_prover_info.column_evals()[0].len());
-
-        let value_poly: MultilinearExtension<E> = value_commitment.1.clone();
-
-        let shifted_chunks_polys = range_commitments
-            .iter()
-            .map(|(_, poly)| poly.clone())
-            .collect::<Vec<MultilinearExtension<E>>>();
-
-        let last_claim_eq: MultilinearExtension<E> =
-            compute_betas_eval(&last_claim.point).into_mle();
-
-        let range_eq: MultilinearExtension<E> =
-            compute_betas_eval(&range_logup_proof.output_claims()[0].point).into_mle();
-
-        // Now we have to perform a sumcheck that shows the following:
-        //      1) last_claim_eq * (value_chunk)
-        //      2) We need all the polys to be evaluated at the same point so we add all of them multiplied by range_eq.
-
-        // Work out how many challenges we need for batching purposes
-        let batch_challenge_count = ceil_log2(shifted_chunks_polys.len() + 4);
-        let challenges = (0..batch_challenge_count)
-            .map(|_| {
-                prover
-                    .transcript
-                    .sample_and_append_challenge(b"batching")
-                    .elements
-            })
-            .collect::<Vec<E>>();
-
-        let batch_challenges = compute_betas_eval(&challenges);
-
-        // let mut vp = VirtualPolynomial::<E>::new(num_vars);
-        let value_challenge = batch_challenges[0];
-        let value_const: E = (*quantization::MAX + 1).to_field();
-
-        let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
-        let mut all_mles = Vec::new();
-        // We will add all the individual polynomials first
-        let range_expr = expr_builder.lift(Either::Left(&range_eq));
-        let value_expr = expr_builder.lift(Either::Left(&value_poly));
-        let value_chal_expr = Expression::Constant(Either::Right(value_challenge));
-        // vp.add_mle_list(vec![range_eq.clone().into(), value_poly.clone().into()], value_challenge);
-        let expr1 = range_expr.clone() * value_expr.clone() * value_chal_expr.clone();
-        all_mles.push(expr1);
-        // vp.add_mle_list(vec![range_eq.clone().into()], value_const * value_challenge);
-        let expr2 =
-            range_expr.clone() * Expression::Constant(Either::Right(value_const * value_challenge));
-        all_mles.push(expr2);
-
-        // let mut vp = shifted_chunks_polys
-        //    .iter()
-        //    .zip(batch_challenges.iter().skip(1))
-        //    .fold(vp, |mut vp_acc, (poly, &chal)| {
-        //        vp_acc.add_mle_list(vec![range_eq.clone().into(), poly.clone().into()], chal);
-        //        vp_acc
-        //    });
-        let shifted_exprs = shifted_chunks_polys
-            .iter()
-            .zip(batch_challenges.iter().skip(1))
-            .map(|(poly, &chal)| {
-                range_expr.clone()
-                    * expr_builder.lift(Either::Left(poly))
-                    * Expression::Constant(Either::Right(chal))
-            })
-            .collect::<Vec<Expression<E>>>();
-        all_mles.extend(shifted_exprs);
-
-        // And finally that the output corresponds to what we expect it to
-        let current_chal_index = shifted_chunks_polys.len() + 2;
-        let claim_challenge = batch_challenges[current_chal_index];
-        let claim_chal_expr = Expression::Constant(Either::Right(claim_challenge));
-        let last_claim_eq_expr = expr_builder.lift(Either::Left(&last_claim_eq));
-        // vp.add_mle_list(vec![value_poly, last_claim_eq.clone()], claim_challenge);
-        let expr3 = value_expr.clone() * last_claim_eq_expr * claim_chal_expr;
-        all_mles.push(expr3);
-
-        let virtual_poly = expr_builder.to_virtual_polys(&all_mles, &[]);
-        // Run the sumcheck prover
-        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
-        let evals = state.get_mle_flatten_final_evaluations();
-
-        let range_evals = &evals[1..2 + shifted_chunks_polys.len()];
-        let (value_eval, range_evals) = range_evals.split_at(1);
-
-        let point = &state.collect_raw_challenges();
-
-        // Now we calculate the claim about the input from the shifted chunks, zero_in evals, value eval and sign eval
-        let input_eval = self.recombine_claims(value_eval[0], range_evals, &[]);
-        let input_claim = Claim::<E>::new(point.clone(), input_eval);
-
-        // Add all the commitments to the commitment prover
-        let all_evals_iter = [&value_eval[0]].into_iter().chain(range_evals);
-        let all_commits_iter = [value_commitment].into_iter().chain(range_commitments);
-
-        let (commitments, evaluations): (Vec<PCS::Commitment>, Vec<E>) = all_commits_iter
-            .zip(all_evals_iter)
-            .map(|(comm_with_wit, &eval)| {
-                let commitment = PCS::get_pure_commitment(&comm_with_wit.0);
-                prover
-                    .commit_prover
-                    .add_witness_claim(comm_with_wit, Claim::<E>::new(point.clone(), eval))?;
-
-                Result::<(PCS::Commitment, E), anyhow::Error>::Ok((commitment, eval))
-            })
-            .collect::<Result<Vec<(PCS::Commitment, E)>, anyhow::Error>>()?
-            .into_iter()
-            .unzip();
-
-        // Add the layer proof to the list
-        prover.push_proof(
-            id,
-            LayerProof::Requant(RequantProof {
-                io_accumulation: proof,
-                accumulation_evals: evaluations,
-                lookup_proofs: vec![range_logup_proof],
-                commitments,
-            }),
-        );
-
-        Ok(input_claim)
-    }
-
     #[timed::timed_instrument(name = "Prover::prove_requant")]
     /// Method that proves requantisation was performed correctly. It does this by running any required lookups and then linking the `last_claim` to the
     /// `input` via a series of Sumchecks.
@@ -806,301 +827,107 @@ impl Requant {
         &self,
         prover: &mut Prover<E, T, PCS>,
         last_claim: &Claim<E>,
-        _requant_info: &RequantCtx,
+        ctx: &RequantCtx<E>,
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
-        let mut logup_witnesses = prover.lookup_witness(id)?;
-        // Check that we have two witnesses for requantisation
-        if logup_witnesses.len() != 2 {
-            return Err(anyhow!(
-                "There should be two lookup witnesses during requantisation, node: {}, number of witnesses: {}",
-                id,
-                logup_witnesses.len()
-            ));
-        }
-        // Run the lookup protocol and return the lookup proof
-        let zero_check_logup_witness = logup_witnesses.remove(0);
-        let zero_check_prover_info =
-            zero_check_logup_witness.get_logup_input(&prover.challenge_storage)?;
-        let range_logup_witness = logup_witnesses.remove(0);
-        let range_prover_info = range_logup_witness.get_logup_input(&prover.challenge_storage)?;
-        let mut range_commitments = range_logup_witness.into_commitments();
-        let value_commitment = range_commitments.remove(0);
-        let mut zero_commitments = zero_check_logup_witness.into_commitments();
-        let sign_commitment = zero_commitments.pop().ok_or(anyhow!(
-            "Had no zero check commitments during requant which should be impossible"
-        ))?;
+        let layer_commitment = prover.lookup_witness(id)?;
+        let logup_inputs = ctx
+            .lookup_ctx
+            .create_logup_inputs_requant::<PCS, E>(layer_commitment, &prover.challenge_storage)?;
+        let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
+        let commitment = PCS::get_pure_commitment(layer_commitment);
+        // Run the logup proving
+        let logup_batch_proof = batch_multiple_sizes_prove(&logup_inputs, prover.transcript)?;
+        let logup_point = logup_batch_proof.output_claims()[0].point.clone();
 
-        // Run the lookup protocol and return the lookup proofs
-        let zero_check_logup_proof = logup_batch_prove(&zero_check_prover_info, prover.transcript)?;
-        let range_logup_proof = logup_batch_prove(&range_prover_info, prover.transcript)?;
+        let eq_mles = if self.number_of_zero_chunks() != 0 {
+            let sign_challenges = (0..last_claim.point.len())
+                .map(|_| {
+                    prover
+                        .transcript
+                        .sample_and_append_challenge(b"sign")
+                        .elements
+                })
+                .collect::<Vec<E>>();
+            let last_claim_eq = compute_betas_eval(&last_claim.point).into_mle();
+            let sign_eq = compute_betas_eval(&sign_challenges).into_mle();
+            let logup_eq = compute_betas_eval(&logup_point).into_mle();
 
-        let zero_polys = zero_check_prover_info.column_evals();
-        let num_vars = ceil_log2(zero_polys[0].len());
+            vec![last_claim_eq, sign_eq, logup_eq]
+        } else {
+            let last_claim_eq = compute_betas_eval(&last_claim.point).into_mle();
+            let logup_eq = compute_betas_eval(&logup_point).into_mle();
+            vec![last_claim_eq, logup_eq]
+        };
 
-        // We need the input and output columns from the zero check lookup
-        let (zero_in, zero_out): (Vec<MultilinearExtension<E>>, Vec<MultilinearExtension<E>>) =
-            zero_commitments
-                .chunks(2)
-                .map(|chunk| (chunk[0].1.clone(), chunk[1].1.clone()))
-                .unzip();
-
-        let value_poly: MultilinearExtension<E> = value_commitment.1.clone();
-        let sign_poly: MultilinearExtension<E> = sign_commitment.1.clone();
-
-        let shifted_chunks_polys = range_commitments
+        let challenge = prover
+            .transcript
+            .sample_and_append_challenge(b"batching")
+            .elements;
+        let (number_shifted_chunks, _, _) = self.shifted_chunks_data();
+        let either_mles = layer_polys
             .iter()
-            .map(|(_, poly)| poly.clone())
-            .collect::<Vec<MultilinearExtension<E>>>();
+            .skip(number_shifted_chunks + self.number_of_zero_chunks())
+            .map(|p| Either::Left(p.as_ref()))
+            .chain(eq_mles.iter().map(Either::Left))
+            .collect::<Vec<Either<_, _>>>();
 
-        let last_claim_eq: MultilinearExtension<E> =
-            compute_betas_eval(&last_claim.point).into_mle();
-        let zero_eq: MultilinearExtension<E> =
-            compute_betas_eval(&zero_check_logup_proof.output_claims()[0].point).into_mle();
-        let range_eq: MultilinearExtension<E> =
-            compute_betas_eval(&range_logup_proof.output_claims()[0].point).into_mle();
-
-        // We squeeze a random challenge point from the transcript to enforce that sign_poly is either 0 or -1
-        let challenge_point = (0..last_claim.point.len())
-            .map(|_| {
-                prover
-                    .transcript
-                    .sample_and_append_challenge(b"sign")
-                    .elements
-            })
-            .collect::<Vec<E>>();
-        let sign_eq: MultilinearExtension<E> = compute_betas_eval(&challenge_point).into_mle();
-
-        // Now we have to perform a sumcheck that shows the following:
-        //      1) last_claim_eq * (zero_out.product() * (value_chunk) + (1 - zero_out.product()) * (*quantization::MAX  + sign_poly * (*quantization::MAX + *quantization::MIN.abs()))) = last_claim.eval
-        //      2) sign_eq * (sign_poly * (1 + sign_poly)) = 0
-        //      3) We need all the polys to be evaluated at the same point so we add all of them multiplied by either zero_eq or range_eq depending on which lookup they came from.
-
-        // Work out how many challenges we need for batching purposes
-        let batch_challenge_count = ceil_log2(2 * zero_in.len() + shifted_chunks_polys.len() + 4);
-        let challenges = (0..batch_challenge_count)
-            .map(|_| {
-                prover
-                    .transcript
-                    .sample_and_append_challenge(b"batching")
-                    .elements
-            })
-            .collect::<Vec<E>>();
-
-        let batch_challenges = compute_betas_eval(&challenges);
-
-        // We will add all the individual polynomials first
+        let num_vars = last_claim.point.len();
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
-        let mut all_exprs = Vec::new();
-        // NOTE: careful about the order of the lift here, as lift(a) -> lift(b) is not the same as lift(b) -> lift(a)
-        let zero_eq_expr = expr_builder.lift(Either::Left(&zero_eq));
-        // let mut vp = zero_in
-        //    .iter()
-        //    .chain(zero_out.iter())
-        //    .zip(batch_challenges.iter())
-        //    .fold(
-        //        VirtualPolynomial::<E>::new(num_vars),
-        //        |mut vp_acc, (poly, &chal)| {
-        //            vp_acc.add_mle_list(vec![zero_eq.clone(), poly.clone()], chal);
-        //            vp_acc
-        //        },
-        //    );
-        let zero_exprs = zero_in
-            .iter()
-            .chain(zero_out.iter())
-            .zip(batch_challenges.iter())
-            .map(|(poly, &chal)| {
-                let chal_expr = Expression::Constant(Either::Right(chal));
-                let poly_expr = expr_builder.lift(Either::Left(poly));
-                zero_eq_expr.clone() * poly_expr.clone() * chal_expr.clone()
-            })
-            .collect::<Vec<_>>();
-        all_exprs.extend(zero_exprs);
+        let expr_builder =
+            VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
+        let virtual_poly = expr_builder
+            .to_virtual_polys(std::slice::from_ref(&ctx.sumcheck_expression), &[challenge]);
 
-        // Add the value poly terms
-        let value_const: E = (*quantization::MAX + 1).to_field();
-        let value_const_expr = Expression::Constant(Either::Right(value_const));
-        let value_challenge = batch_challenges[2 * zero_in.len()];
-        let value_chal_expr = Expression::Constant(Either::Right(value_challenge));
-        let range_eq_expr = expr_builder.lift(Either::Left(&range_eq));
-        let value_expr = expr_builder.lift(Either::Left(&value_poly));
-        // vp.add_mle_list(vec![range_eq.clone(), value_poly.clone()], value_challenge);
-        let check_range_expr = range_eq_expr.clone() * value_expr * value_chal_expr.clone();
-        all_exprs.push(check_range_expr);
-
-        // vp.add_mle_list(vec![range_eq.clone()], value_const * value_challenge);
-        let check_const_expr =
-            range_eq_expr.clone() * value_const_expr.clone() * value_chal_expr.clone();
-        all_exprs.push(check_const_expr);
-        // let mut vp = shifted_chunks_polys
-        //    .iter()
-        //    .zip(batch_challenges.iter().skip(2 * zero_in.len() + 1))
-        //    .fold(vp, |mut vp_acc, (poly, &chal)| {
-        //        vp_acc.add_mle_list(vec![range_eq.clone(), poly.clone()], chal);
-        //        vp_acc
-        //    });
-        let shifted_exprs = shifted_chunks_polys
-            .iter()
-            .zip(batch_challenges.iter().skip(2 * zero_in.len() + 1))
-            .map(|(poly, &chal)| {
-                let poly_expr = expr_builder.lift(Either::Left(poly));
-                let chal_expr = Expression::Constant(Either::Right(chal));
-                range_eq_expr.clone() * poly_expr.clone() * chal_expr.clone()
-            })
-            .collect::<Vec<_>>();
-        all_exprs.extend(shifted_exprs);
-
-        // Now the check that the sign poly is constructed correctly
-        let current_chal_index = 2 * zero_in.len() + shifted_chunks_polys.len() + 1;
-        let sign_challenge = batch_challenges[current_chal_index];
-        let sign_poly_expr = expr_builder.lift(Either::Left(&sign_poly));
-        let sign_eq_expr = expr_builder.lift(Either::Left(&sign_eq));
-        let sign_chal_expr = Expression::Constant(Either::Right(sign_challenge));
-        // vp.add_mle_list(vec![sign_poly.clone(), sign_eq.clone()], sign_challenge);
-        let sign_expr = sign_poly_expr.clone() * sign_eq_expr.clone() * sign_chal_expr.clone();
-        all_exprs.push(sign_expr);
-        // vp.add_mle_list(
-        //    vec![sign_poly.clone(), sign_poly.clone(), sign_eq.clone()],
-        //    sign_challenge,
-        //);
-        let sign2_expr = sign_poly_expr.clone()
-            * sign_poly_expr.clone()
-            * sign_eq_expr.clone()
-            * sign_chal_expr.clone();
-        all_exprs.push(sign2_expr);
-
-        // And finally that the output corresponds to what we expect it to
-        let claim_challenge = batch_challenges[current_chal_index + 1];
-        let quant_max_field: E = (*quantization::MAX).to_field();
-
-        let prod_and_value = zero_out
-            .iter()
-            .chain([&value_poly, &last_claim_eq])
-            .map(|poly| expr_builder.lift(Either::Left(poly)))
-            .collect::<Vec<_>>();
-        let prod_and_sign = zero_out
-            .iter()
-            .chain([&sign_poly, &last_claim_eq])
-            .map(|poly| expr_builder.lift(Either::Left(poly)))
-            .collect::<Vec<_>>();
-
-        // vp.add_mle_list(prod_and_value, claim_challenge);
-        let claim_chal_expr = Expression::Constant(Either::Right(claim_challenge));
-        let prod_value_expr = prod_and_value
-            .into_iter()
-            .fold(Expression::Constant(Either::Right(E::ONE)), |acc, p| {
-                acc * p
-            });
-        let prod_value_expr = prod_value_expr * claim_chal_expr;
-        all_exprs.push(prod_value_expr);
-
-        let prod_sign_expr = prod_and_sign
-            .into_iter()
-            .fold(Expression::Constant(Either::Right(E::ONE)), |acc, p| {
-                acc * p
-            });
-        // vp.add_mle_list(
-        //    prod_and_sign,
-        //    -(quant_max_field + value_const) * claim_challenge,
-        //);
-        // Here we use `value_const` because it has the same value as `*quantization::MIN.abs()`
-        let prod_sign_chal_expr = Expression::Constant(Either::Right(
-            -(quant_max_field + value_const) * claim_challenge,
-        ));
-        let prod_sign_expr = prod_sign_expr * prod_sign_chal_expr;
-        all_exprs.push(prod_sign_expr);
-
-        // vp.add_mle_list(
-        //    vec![sign_poly, last_claim_eq.clone()],
-        //    (quant_max_field + value_const) * claim_challenge,
-        //);
-        let last_claim_eq_expr = expr_builder.lift(Either::Left(&last_claim_eq));
-        let last_claim_chal_expr = Expression::Constant(Either::Right(
-            (quant_max_field + value_const) * claim_challenge,
-        ));
-        let last_claim_sign_expr =
-            sign_poly_expr * last_claim_eq_expr.clone() * last_claim_chal_expr;
-        all_exprs.push(last_claim_sign_expr);
-
-        // zero_out.push(last_claim_eq.clone());
-        // vp.add_mle_list(zero_out, -quant_max_field * claim_challenge);
-        let extended_zero_out = zero_out
-            .iter()
-            .chain(std::iter::once(&last_claim_eq))
-            .collect::<Vec<_>>();
-        let zero_out_new_expr = extended_zero_out
-            .into_iter()
-            .map(|poly| expr_builder.lift(Either::Left(poly)))
-            .fold(Expression::Constant(Either::Right(E::ONE)), |acc, p| {
-                acc * p
-            });
-        let zero_out_new_chal =
-            Expression::Constant(Either::Right(-quant_max_field * claim_challenge));
-        let zero_out_new_expr = zero_out_new_expr * zero_out_new_chal;
-        all_exprs.push(zero_out_new_expr);
-
-        // vp.add_mle_list(vec![last_claim_eq], quant_max_field * claim_challenge);
-        let quant_max_field_expr =
-            Expression::Constant(Either::Right(quant_max_field * claim_challenge));
-        let last_claim_eq_expr = last_claim_eq_expr.clone() * quant_max_field_expr;
-        all_exprs.push(last_claim_eq_expr);
-
-        // Run the sumcheck prover
-        let virtual_poly = expr_builder.to_virtual_polys(&all_exprs, &[]);
         let (claim_acc_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
         let evals = state.get_mle_flatten_final_evaluations();
-        let all_zero_evals = &evals[1..1 + 2 * zero_in.len()];
-        let (zero_in_evals, zero_out_evals) = all_zero_evals.split_at(zero_in.len());
-        let range_evals =
-            &evals[2 + 2 * zero_in.len()..2 + 2 * zero_in.len() + shifted_chunks_polys.len() + 1];
-        let (value_eval, range_evals) = range_evals.split_at(1);
-        let sign_eval = evals[2 + 2 * zero_in.len() + shifted_chunks_polys.len() + 1];
+        let evaluations = if self.number_of_zero_chunks() != 0 {
+            evals[..evals.len() - 3].to_vec()
+        } else {
+            evals[..evals.len() - 2].to_vec()
+        };
 
         let point = state.collect_raw_challenges();
-        // let point = &claim_acc_proof.point;
 
         // Now we calculate the claim about the input from the shifted chunks, zero_in evals, value eval and sign eval
-        let input_eval = self.recombine_claims(value_eval[0], range_evals, zero_in_evals);
-        let input_claim = Claim::<E>::new(point.clone(), input_eval);
+        let logup_claims = logup_batch_proof.output_claims();
+
+        let shifted_claims = logup_claims
+            .iter()
+            .take(number_shifted_chunks)
+            .map(|c| c.eval)
+            .collect::<Vec<E>>();
+        let zero_in_evals = logup_claims
+            .iter()
+            .skip(number_shifted_chunks + 1)
+            .step_by(2)
+            .take(self.number_of_zero_chunks())
+            .map(|c| c.eval)
+            .collect::<Vec<E>>();
+        let logup_value_eval = logup_claims[number_shifted_chunks].eval
+            - E::from_canonical_u64(1 << (*quantization::BIT_LEN - 1));
+        let input_eval = self.recombine_claims(logup_value_eval, &shifted_claims, &zero_in_evals);
+        let input_claim = Claim::<E>::new(logup_point.clone(), input_eval);
 
         // Add all the commitments to the commitment prover
-        let all_evals_iter = zero_in_evals
-            .iter()
-            .interleave(zero_out_evals)
-            .chain([&sign_eval, &value_eval[0]])
-            .chain(range_evals);
-        let all_commits_iter = zero_commitments
-            .into_iter()
-            .chain([sign_commitment, value_commitment])
-            .chain(range_commitments.into_iter());
+        let first_commit = (logup_point, [shifted_claims, zero_in_evals].concat());
+        let second_commit = (point, evaluations.clone());
 
-        let (commitments, evaluations): (Vec<PCS::Commitment>, Vec<E>) = all_commits_iter
-            .zip(all_evals_iter)
-            .map(|(comm_with_wit, &eval)| {
-                let commitment = PCS::get_pure_commitment(&comm_with_wit.0);
-                prover
-                    .commit_prover
-                    .add_witness_claim(comm_with_wit, Claim::<E>::new(point.clone(), eval))?;
-
-                Result::<(PCS::Commitment, E), anyhow::Error>::Ok((commitment, eval))
-            })
-            .collect::<Result<Vec<(PCS::Commitment, E)>, anyhow::Error>>()?
-            .into_iter()
-            .unzip();
+        prover.add_witness_claim(id, vec![first_commit, second_commit]);
 
         // Add the layer proof to the list
         prover.push_proof(
             id,
             LayerProof::Requant(RequantProof {
                 io_accumulation: claim_acc_proof,
-                accumulation_evals: evaluations,
-                lookup_proofs: vec![zero_check_logup_proof, range_logup_proof],
-                commitments,
+                io_eval: evaluations,
+                logup_proof: logup_batch_proof,
+                commitment,
             }),
         );
 
@@ -1108,18 +935,16 @@ impl Requant {
     }
 }
 
-impl RequantCtx {
+impl<E: ExtensionField> RequantCtx<E> {
     /// Method that verifies requantisation has been performed correctly when supplied with a [`RequantProof`].
     /// It verifies both lookup argument proofs, calculates the initial claim for the sumcheck proof using the lookup argument claims
     /// and then verifies the sumcheck using this initial claim. It then takes the output claims provided by the prover, checks they relate to the sumcheck
     /// subclaim, adds them to the list of claims of commitment openings and then calculates the next claim.
-    pub(crate) fn verify_requant<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn verify_requant<T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
         proof: &RequantProof<E, PCS>,
-        constant_challenge: E,
-        column_separation_challenge: E,
     ) -> anyhow::Result<Claim<E>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -1128,321 +953,150 @@ impl RequantCtx {
         // 1. Verify the lookup proofs
         let RequantProof {
             io_accumulation,
-            accumulation_evals,
-            lookup_proofs,
-            commitments,
+            logup_proof,
+            io_eval,
+            commitment,
         } = proof;
-        // Work out how many instances of range check and zero check there are
+
+        let batch_claim = verify_logup_proof_multiple_sizes(logup_proof, verifier.transcript)?;
+        self.lookup_ctx
+            .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
+
+        let poly_evals = batch_claim.poly_evals();
+
+        // Calculate the claimed sum for the sumcheck proof
         let (shifted_instances, _, _) = self.requant.shifted_chunks_data();
-        // Add one to shifted instances because the value_chunk is also range checked
-        let range_instances = shifted_instances + 1;
 
-        let zero_check_instances = self.requant.number_of_zero_chunks();
+        let sign_challenges = if self.requant.number_of_zero_chunks() != 0 {
+            (0..last_claim.point.len())
+                .map(|_| {
+                    verifier
+                        .transcript
+                        .sample_and_append_challenge(b"sign")
+                        .elements
+                })
+                .collect::<Vec<E>>()
+        } else {
+            vec![]
+        };
 
-        // Verify both lookup arguments in the same order they are proved.
-        let zero_check_claims = verify_logup_proof(
-            &lookup_proofs[0],
-            zero_check_instances,
-            constant_challenge,
-            column_separation_challenge,
-            verifier.transcript,
-        )?;
-        let range_claims = verify_logup_proof(
-            &lookup_proofs[1],
-            range_instances,
-            constant_challenge,
-            E::ONE,
-            verifier.transcript,
-        )?;
+        let challenge = verifier
+            .transcript
+            .sample_and_append_challenge(b"batching")
+            .elements;
 
-        let (zero_in_evals, zero_out_evals): (Vec<E>, Vec<E>) = zero_check_claims
-            .claims()
-            .chunks(2)
-            .map(|chunk| (chunk[0].eval, chunk[1].eval))
-            .unzip();
-        let all_range_claims = range_claims.claims();
-        let value_eval = all_range_claims[0].eval;
-        let shifted_evals = all_range_claims[1..]
+        let challenge_cubed = challenge * challenge * challenge;
+        let logup_value_eval = poly_evals[shifted_instances];
+        let fold_initial = challenge * logup_value_eval;
+        let logup_claim_part = poly_evals
             .iter()
-            .map(|c| c.eval)
-            .collect::<Vec<E>>();
-
-        // We squeeze a random challenge point from the transcript for the check that sign_poly is either 0 or -1
-        let challenge_point = (0..last_claim.point.len())
-            .map(|_| {
-                verifier
-                    .transcript
-                    .sample_and_append_challenge(b"sign")
-                    .elements
+            .skip(shifted_instances + 2)
+            .step_by(2)
+            .fold((fold_initial, challenge_cubed), |(acc, chal_acc), &eval| {
+                (acc + eval * chal_acc, chal_acc * challenge)
             })
-            .collect::<Vec<E>>();
+            .0;
+        let claimed_sum = last_claim.eval + logup_claim_part;
+        let aux_info = VPAuxInfo {
+            max_num_variables: last_claim.point.len(),
+            max_degree: 2 + self.requant.number_of_zero_chunks(),
+            ..Default::default()
+        };
 
-        // Now we have to perform a sumcheck that shows the following:
-        //      1) last_claim_eq * (zero_out.product() * (value_chunk) + (1 - zero_out.product()) * (*quantization::MAX  + sign_poly * (*quantization::MAX + *quantization::MIN.abs()))) = last_claim.eval
-        //      2) sign_eq * (sign_poly * (1 + sign_poly)) = 0
-        //      3) We need all the polys to be evaluated at the same point so we add all of them multiplied by either zero_eq or range_eq depending on which lookup they came from.
-
-        // Work out how many challenges we need for batching purposes
-        let batch_challenge_count = ceil_log2(2 * zero_in_evals.len() + shifted_evals.len() + 4);
-        let challenges = (0..batch_challenge_count)
-            .map(|_| {
-                verifier
-                    .transcript
-                    .sample_and_append_challenge(b"batching")
-                    .elements
-            })
-            .collect::<Vec<E>>();
-
-        let batch_challenges = compute_betas_eval(&challenges);
-
-        // Now we reconstruct the initial evaluation for the sumcheck proof
-        let first_part = zero_in_evals
-            .iter()
-            .chain(zero_out_evals.iter())
-            .chain(std::iter::once(&value_eval))
-            .chain(shifted_evals.iter())
-            .zip(batch_challenges.iter())
-            .fold(E::ZERO, |acc, (&eval, &chal)| acc + eval * chal);
-
-        // The sign poly check has inital evaluation 0 so now we just need to skip a challenge and then add last_claim.eval multiplied by the correct challenge
-        let current_index = 2 * zero_in_evals.len() + 1 + shifted_evals.len();
-        let claim_challenge = batch_challenges[current_index + 1];
-
-        let last_claim_part = claim_challenge * last_claim.eval;
-
-        let quant_max_field: E = (*quantization::MAX).to_field();
-        let num_vars = last_claim.point.len();
-        // The highest degree term is the product of all zero_out polys with an eq poly and the value poly.
-        let aux_info =
-            crate::util::from_mle_list_dimensions(&[vec![num_vars; zero_out_evals.len() + 2]]);
-        // Run sumcheck verification
         let subclaim = IOPVerifierState::<E>::verify(
-            first_part + last_claim_part,
+            claimed_sum,
             io_accumulation,
             &aux_info,
             verifier.transcript,
         );
-
         let point = subclaim
             .point
             .iter()
-            .map(|p| p.elements)
-            .collect::<Vec<_>>();
+            .map(|c| c.elements)
+            .collect::<Vec<E>>();
+        let last_claim_eq = identity_eval(&last_claim.point, &point);
+        let logup_eq = identity_eval(batch_claim.point(), &point);
 
-        // Now that we have the subclaim we must check it links to the evaluations provided by the prover
-        let (zero_in_claims, zero_out_claims): (Vec<E>, Vec<E>) = accumulation_evals
-            .chunks(2)
-            .take(zero_in_evals.len())
-            .map(|chunk| (chunk[0], chunk[1]))
-            .unzip();
-        let sign_claim = accumulation_evals[2 * zero_in_evals.len()];
-        let value_claim = accumulation_evals[2 * zero_in_evals.len() + 1];
-        let shifted_claims = &accumulation_evals[2 * zero_in_evals.len() + 2..];
-
-        let last_claim_eq = eq_xy_eval(&last_claim.point, &point);
-        let zero_eq = eq_xy_eval(&zero_check_claims.claims()[0].point, &point);
-        let range_eq = eq_xy_eval(&range_claims.claims()[0].point, &point);
-        let sign_eq = eq_xy_eval(&challenge_point, &point);
-
-        // Reconstruct the subclaim eval
-        let zero_part = zero_eq
-            * zero_in_claims
+        let calc_claim = if self.requant.number_of_zero_chunks() != 0 {
+            let sign_eq = identity_eval(&sign_challenges, &point);
+            let evals = io_eval
                 .iter()
-                .chain(zero_out_claims.iter())
-                .zip(batch_challenges.iter())
-                .fold(E::ZERO, |acc, (&eval, &chal)| acc + eval * chal);
+                .copied()
+                .chain([last_claim_eq, sign_eq, logup_eq])
+                .collect::<Vec<E>>();
+            eval_by_expr_with_instance(
+                &[],
+                &evals,
+                &[],
+                &[],
+                &[challenge],
+                &self.sumcheck_expression,
+            )
+            .right()
+            .ok_or(anyhow!(
+                "Couldn't verify Requant, calculated claim was not an ExtensionField element"
+            ))?
+        } else {
+            let evals = io_eval
+                .iter()
+                .copied()
+                .chain([last_claim_eq, logup_eq])
+                .collect::<Vec<E>>();
+            eval_by_expr_with_instance(
+                &[],
+                &evals,
+                &[],
+                &[],
+                &[challenge],
+                &self.sumcheck_expression,
+            )
+            .right()
+            .ok_or(anyhow!(
+                "Couldn't verify Requant, calculated claim was not an ExtensionField element"
+            ))?
+        };
 
-        let value_part = batch_challenges[2 * zero_in_claims.len()]
-            * range_eq
-            * (value_claim + quant_max_field + E::ONE);
-        let with_range_part = shifted_claims
-            .iter()
-            .zip(batch_challenges.iter().skip(zero_in_claims.len() * 2 + 1))
-            .fold(zero_part + value_part, |acc, (&eval, &chal)| {
-                acc + range_eq * chal * eval
-            });
-        let with_sign_part = with_range_part
-            + batch_challenges[current_index] * sign_eq * sign_claim * (E::ONE + sign_claim);
-
-        // Finally the last claim part
-        let zero_out_prod = zero_out_claims.iter().copied().product::<E>();
-
-        let calc_subclaim = with_sign_part
-            + claim_challenge
-                * last_claim_eq
-                * (zero_out_prod * value_claim
-                    + (E::ONE - zero_out_prod)
-                        * (quant_max_field
-                            + sign_claim * (quant_max_field + quant_max_field + E::ONE)));
-
-        // Check the subclaims line up
         ensure!(
-            subclaim.expected_evaluation == calc_subclaim,
-            "Requant verification failed because the calculated subclaim evaluation {:?} did not equal the expected subclaim evaluation {:?}",
-            calc_subclaim,
+            calc_claim == subclaim.expected_evaluation,
+            "Requant Verification failed, calculated claim {:?}, did not equal the expected evaluation {:?}",
+            calc_claim,
             subclaim.expected_evaluation
         );
 
-        // Recombine for the input claim
+        // Make the input claim
+        let shifted_claims = poly_evals
+            .iter()
+            .take(shifted_instances)
+            .copied()
+            .collect::<Vec<E>>();
+        let zero_in_evals = poly_evals
+            .iter()
+            .skip(shifted_instances + 1)
+            .step_by(2)
+            .take(self.requant.number_of_zero_chunks())
+            .copied()
+            .collect::<Vec<E>>();
+        let logup_value_eval = poly_evals[shifted_instances]
+            - E::from_canonical_u64(1 << (*quantization::BIT_LEN - 1));
         let input_eval =
             self.requant
-                .recombine_claims(value_claim, shifted_claims, &zero_in_claims);
+                .recombine_claims(logup_value_eval, &shifted_claims, &zero_in_evals);
+        let input_claim = Claim::<E>::new(batch_claim.point().to_vec(), input_eval);
 
-        // Add the commitments to the commitment verifier
-        commitments
-            .iter()
-            .zip(accumulation_evals.iter())
-            .try_for_each(|(comm, &eval)| {
-                verifier
-                    .commit_verifier
-                    .add_witness_claim(comm.clone(), Claim::<E>::new(point.clone(), eval))
-            })?;
+        let first_commit = (
+            batch_claim.point().to_vec(),
+            [shifted_claims, zero_in_evals].concat(),
+        );
+        let second_commit = (point, io_eval.clone());
+
+        verifier.commit_verifier.add_witness_claim(
+            self.node_id,
+            commitment.clone(),
+            vec![first_commit, second_commit],
+        );
 
         // Pass the input claim
-        Ok(Claim::<E>::new(point, input_eval))
-    }
-
-    pub(crate) fn verify_requant_no_zero_chunks<
-        E,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
-    >(
-        &self,
-        verifier: &mut Verifier<E, T, PCS>,
-        last_claim: &Claim<E>,
-        proof: &RequantProof<E, PCS>,
-        constant_challenge: E,
-    ) -> anyhow::Result<Claim<E>>
-    where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
-    {
-        // 1. Verify the lookup proofs
-        let RequantProof {
-            io_accumulation,
-            accumulation_evals,
-            lookup_proofs,
-            commitments,
-        } = proof;
-        // Work out how many instances of range check and zero check there are
-        let (shifted_instances, _, _) = self.requant.shifted_chunks_data();
-        // Add one to shifted instances because the value_chunk is also range checked
-        let range_instances = shifted_instances + 1;
-
-        ensure!(
-            lookup_proofs.len() == 1,
-            "Found more than one lookup proof when verifying Requant with no zero chunks"
-        );
-
-        // Verify the lookup argument.
-
-        let range_claims = verify_logup_proof(
-            &lookup_proofs[0],
-            range_instances,
-            constant_challenge,
-            E::ONE,
-            verifier.transcript,
-        )?;
-
-        let all_range_claims = range_claims.claims();
-        let value_eval = all_range_claims[0].eval;
-        let shifted_evals = all_range_claims[1..]
-            .iter()
-            .map(|c| c.eval)
-            .collect::<Vec<E>>();
-
-        // Now we have to perform a sumcheck that shows the following:
-        //      1) last_claim_eq * (value_chunk) = last_claim.eval
-        //      2) We need all the polys to be evaluated at the same point so we add all of them multiplied by either zero_eq or range_eq depending on which lookup they came from.
-
-        // Work out how many challenges we need for batching purposes
-        let batch_challenge_count = ceil_log2(shifted_evals.len() + 4);
-        let challenges = (0..batch_challenge_count)
-            .map(|_| {
-                verifier
-                    .transcript
-                    .sample_and_append_challenge(b"batching")
-                    .elements
-            })
-            .collect::<Vec<E>>();
-
-        let batch_challenges = compute_betas_eval(&challenges);
-
-        // Now we reconstruct the initial evaluation for the sumcheck proof
-        let first_part = std::iter::once(&value_eval)
-            .chain(shifted_evals.iter())
-            .zip(batch_challenges.iter())
-            .fold(E::ZERO, |acc, (&eval, &chal)| acc + eval * chal);
-
-        // The sign poly check has inital evaluation 0 so now we just need to skip a challenge and then add last_claim.eval multiplied by the correct challenge
-        let current_index = 2 + shifted_evals.len();
-        let claim_challenge = batch_challenges[current_index];
-
-        let last_claim_part = claim_challenge * last_claim.eval;
-
-        let num_vars = last_claim.point.len();
-        // The highest degree term is the product of all zero_out polys with an eq poly and the value poly.
-        let aux_info = crate::util::from_mle_list_dimensions(&[vec![num_vars; 2]]);
-
-        // Run sumcheck verification
-        let subclaim = IOPVerifierState::<E>::verify(
-            first_part + last_claim_part,
-            io_accumulation,
-            &aux_info,
-            verifier.transcript,
-        );
-
-        let point = subclaim
-            .point
-            .iter()
-            .map(|p| p.elements)
-            .collect::<Vec<_>>();
-
-        // Now that we have the subclaim we must check it links to the evaluations provided by the prover
-        let value_claim = accumulation_evals[0];
-        let shifted_claims = &accumulation_evals[1..];
-
-        let last_claim_eq = eq_xy_eval(&last_claim.point, &point);
-        let range_eq = eq_xy_eval(&range_claims.claims()[0].point, &point);
-
-        // Reconstruct the subclaim eval
-        let value_const: E = (*quantization::MAX + 1).to_field();
-        let value_part = batch_challenges[0] * range_eq * (value_claim + value_const);
-        let range_part = shifted_claims
-            .iter()
-            .zip(batch_challenges.iter().skip(1))
-            .fold(value_part, |acc, (&eval, &chal)| {
-                acc + range_eq * chal * eval
-            });
-
-        // Finally the last claim part
-        let calc_subclaim = range_part + claim_challenge * last_claim_eq * value_claim;
-
-        // Check the subclaims line up
-        ensure!(
-            subclaim.expected_evaluation == calc_subclaim,
-            "Requant verification failed because the calculated subclaim evaluation {:?} did not equal the expected subclaim evaluation {:?}",
-            calc_subclaim,
-            subclaim.expected_evaluation
-        );
-
-        // Recombine for the input claim
-        let input_eval = self
-            .requant
-            .recombine_claims(value_claim, shifted_claims, &[]);
-
-        // Add the commitments to the commitment verifier
-        commitments
-            .iter()
-            .zip(accumulation_evals.iter())
-            .try_for_each(|(comm, &eval)| {
-                verifier
-                    .commit_verifier
-                    .add_witness_claim(comm.clone(), Claim::<E>::new(point.clone(), eval))
-            })?;
-
-        // Pass the input claim
-        Ok(Claim::<E>::new(point, input_eval))
+        Ok(input_claim)
     }
 }
 

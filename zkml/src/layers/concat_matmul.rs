@@ -481,7 +481,10 @@ impl ConcatMatMul {
         output: &Tensor<E>,
         inputs: &[R],
         prover: &mut Prover<E, T, PCS>,
-    ) -> Result<(Vec<crate::Claim<E>>, ConcatMatMulProof<E>)> {
+    ) -> Result<(Vec<crate::Claim<E>>, ConcatMatMulProof<E>)>
+    where
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    {
         let input_shapes = inputs
             .iter()
             .map(|input| input.as_ref().shape())
@@ -688,7 +691,11 @@ impl QuantizeOp for ConcatMatMul {
 }
 
 impl ProveInfo for ConcatMatMul {
-    fn step_info(&self, id: NodeId, mut aux: ContextAux) -> Result<(LayerCtx, ContextAux)> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
         let num_columns_left = aux.last_output_shape[0][self.permutations.left.mat_mul_dimension];
 
         let num_rows_right = aux.last_output_shape[1][self.permutations.right.mat_mul_dimension];
@@ -724,6 +731,7 @@ impl<E: ExtensionField + DeserializeOwned, PCS: PolynomialCommitmentScheme<E>> P
     for ConcatMatMul
 where
     E::BaseField: DeserializeOwned + Serialize,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Ctx = ConcatMatMulCtx;
 
@@ -898,6 +906,15 @@ where
         );
 
         Ok(vec![left_claim, right_claim])
+    }
+
+    fn write_proof_to_transcript<T: Transcript<E>>(
+        &self,
+        _proof: &Self::Proof,
+        _transcript: &mut T,
+    ) -> anyhow::Result<()> {
+        // No commitment so just return Ok(())
+        Ok(())
     }
 }
 
