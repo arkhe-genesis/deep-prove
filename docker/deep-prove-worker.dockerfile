@@ -8,7 +8,7 @@ RUN cargo install --locked --path deep-prove --bin deep-prove-worker
 
 
 # Create the actual final image
-FROM docker.io/library/ubuntu:22.04
+FROM docker.io/library/ubuntu:24.04
 
 ARG USER_ID=1000
 ARG GROUP_ID=1000
