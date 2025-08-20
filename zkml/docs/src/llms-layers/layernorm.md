@@ -8,7 +8,7 @@ $$ \begin{align*} \mathrm{LayerNorm}(A)_{i,j} := \gamma \cdot \frac{A_{i,j} - \m
 
 Here we have that $`\mu_{i}`$ is the mean of the values on the $`i`$-th row, $`\gamma `$ and $`\beta`$ are learned constants and $`\epsilon`$ is a normalisation factor.
 
-## Different Formula for Standrad Deviation
+## Different Formula for Standard Deviation
 
 In the above equation for $`\mathrm{LayerNorm}`$ we used the formula $`\sigma = \sqrt{\frac{1}{n}\cdot \sum_{l=1}^{n}(A_{i,l} - \mu_{i})^{2} + \epsilon}`$ for the standard deviation (plus the $`\epsilon`$ normalisation factor). We would like to avoid multiplying by $`1/n`$ where possible because when dealing with quantised integers this introduces some error. To avoid this we use a different formula derived below, we write $`\hat{\mu}_{i} := n\cdot \mu_{i}`$ and $`\hat{\nu_{i}}:= \sum_{l=1}^{n} A_{i,l}^{2}`$.
 

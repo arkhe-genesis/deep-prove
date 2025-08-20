@@ -35,7 +35,7 @@ use anyhow::{anyhow, ensure};
 use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
-use itertools::{Itertools, izip};
+use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{Expression, mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
 use rayon::prelude::*;
@@ -72,10 +72,6 @@ pub struct LogitsProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     max_eval: E,
     /// Commitment to the MLE of the vector of maximum values
     max_commitment: PCS::Commitment,
-    /// Sum-check proof to convert the vector of maximum values into a sparse matrix
-    sumcheck_proof: IOPProof<E>,
-    /// Evaluation of the sparse matrix of maximum values
-    max_mat_eval: E,
     /// Proof of hadamard product sum-check
     hadamard_proof: IOPProof<E>,
     /// Evaluation of the input tensor MLE got from the hadamard product sum-check
@@ -335,19 +331,6 @@ where
             .map(|out| out.to_element() as usize)
             .collect_vec();
 
-        let argmax_data = step_data
-            .node_outputs
-            .try_argmax_data()
-            .ok_or(anyhow!("Argmax data not found when proving Logits layer"))?;
-
-        ensure!(
-            argmax_data.max_values.len() == 1,
-            "Expected 1 tensor of max values in argmax data when proving Logits layer, found {}",
-            argmax_data.max_values.len(),
-        );
-
-        let max_values = &argmax_data.max_values[0];
-
         let layer_commitment = prover.lookup_witness(node_id)?;
 
         let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
@@ -372,7 +355,9 @@ where
 
         // evaluate max_values MLE on the same point of `diff_claim`
         // we need to extract the row-related coordinates from `diff_claim.point`
-        let (_, row_point) = Self::split_claim_point(&diff_claim.point, max_mle.num_vars())?;
+        let num_row_vars = max_mle.num_vars();
+        let num_col_vars = diff_claim.point.len() - num_row_vars;
+        let (_, row_point) = Self::split_claim_point(&diff_claim.point, num_row_vars)?;
 
         let max_eval = max_mle.evaluate(row_point);
 
@@ -382,39 +367,16 @@ where
 
         let input_claim = Claim::new(diff_claim.point.clone(), max_eval - diff_claim.eval);
 
-        // build the reduced MLE of the matrix `M`, which has the same shape of `input`, from `max_values` and `output`.
-        // More specifically, `M[i][j] = max_values[i] if j == output[i], 0 otherwise`. The MLE has the row variables
-        // already fixed to `row_point`, to be later employed in the sum-check
         let input_shape = input.shape();
 
-        let beta_vec = compute_betas_eval(row_point);
-        let mut reduced_m = vec![E::ZERO; input_shape.dim(input_shape.rank() - 1)];
-        izip!(beta_vec, &output, max_values.get_data())
-            .for_each(|(beta, &out_value, &max_value)| reduced_m[out_value] += beta * max_value);
-
-        let reduced_m_len = reduced_m.len();
-
-        let binding = Tensor::new(vec![reduced_m_len, 1].into(), reduced_m);
-        let reduced_mle = binding.to_mle_2d();
-        let num_vars = reduced_mle.num_vars();
-        let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
-        let reduced_expr = expr_builder.lift(Either::Left(&reduced_mle));
-        let virtual_poly = expr_builder.to_virtual_polys(&[reduced_expr], &[]);
-
-        let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
-
-        let max_matrix_eval = state.get_mle_flatten_final_evaluations()[0];
-
-        // build point for claim about matrix m
-        let claim_point = state
-            .collect_raw_challenges()
-            .iter()
+        let two_inv = E::TWO.inverse();
+        let num_cols = E::from_canonical_usize(1 << num_col_vars);
+        let sum_eq_point = vec![&two_inv; num_col_vars]
+            .into_iter()
             .chain(row_point)
             .cloned()
             .collect_vec();
-
-        let beta_mle = compute_betas_eval(&claim_point).into_mle();
+        let sum_eq_mle = compute_betas_eval(&sum_eq_point).into_mle();
 
         let input_mle = input.to_mle_2d();
 
@@ -433,11 +395,11 @@ where
         let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
         let input_expr = expr_builder.lift(Either::Left(&input_mle));
         let one_hot_expr = expr_builder.lift(Either::Left(&one_hot_mle));
-        let beta_expr = expr_builder.lift(Either::Left(&beta_mle));
+        let sum_eq_expr = expr_builder.lift(Either::Left(&sum_eq_mle));
         let input_eq_expr = expr_builder.lift(Either::Left(&input_eq_mle));
 
         let expr = input_expr
-            * (beta_expr * one_hot_expr
+            * (sum_eq_expr * one_hot_expr * Expression::Constant(Either::Right(num_cols))
                 + Expression::Challenge(0, 1, E::ONE, E::ZERO) * input_eq_expr);
         // squeeze the challenge to include `input_claim` produced by the lookup in the hadamard product sum-check
         let challenge = Self::squeeze_challenge(prover.transcript, &input_claim);
@@ -452,8 +414,6 @@ where
             logup_proof: logup_batch_proof,
             max_eval,
             max_commitment: commitment,
-            max_mat_eval: max_matrix_eval,
-            sumcheck_proof,
             hadamard_proof,
             input_eval,
         };
@@ -605,29 +565,10 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             vec![(row_point.to_vec(), vec![proof.max_eval])],
         );
 
-        // verify the sum-check to convert the vector of maximum values to the sparse matrix
-
-        let sumcheck_poly_aux = from_mle_list_dimensions(&[vec![num_col_vars]]);
-        let subclaim = IOPVerifierState::verify(
-            proof.max_eval,
-            &proof.sumcheck_proof,
-            &sumcheck_poly_aux,
-            verifier.transcript,
-        );
-
-        // verify sum-check: we compare the claimed sum-check evaluation with the evaluation of the sparse
-        // matrix of maximum values; note that if the prover used a different vector from 1^v, i.e., the constant vector
-        // with all `v` entries equal to 1, then this check should fail since with high probability the evaluation
-        // of the vector over `subclaim.point_flat` wouldn't be 1
-        ensure!(
-            subclaim.expected_evaluation == proof.max_mat_eval,
-            "Sparse-matrix Sumcheck evaluation failed when verifying Logits layer"
-        );
-
-        let max_mat_claim_point = subclaim
-            .point
+        let two_inv = E::TWO.inverse();
+        let num_cols = E::from_canonical_usize(1 << num_col_vars);
+        let sum_eq_point = vec![two_inv; num_col_vars]
             .iter()
-            .map(|p| &p.elements)
             .chain(row_point)
             .cloned()
             .collect_vec();
@@ -639,7 +580,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let hadamard_poly_aux =
             from_mle_list_dimensions(&[vec![input_num_vars, input_num_vars, input_num_vars]]);
         let subclaim = IOPVerifierState::verify(
-            proof.max_mat_eval + challenge * input_claim.eval,
+            proof.max_eval + challenge * input_claim.eval,
             &proof.hadamard_proof,
             &hadamard_poly_aux,
             verifier.transcript,
@@ -650,16 +591,16 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             .iter()
             .map(|p| p.elements)
             .collect::<Vec<_>>();
-        let beta_eval = identity_eval(&max_mat_claim_point, &sumcheck_point);
+        let beta_eval = identity_eval(&sum_eq_point, &sumcheck_point);
         let input_eq_eval = identity_eval(&input_claim.point, &sumcheck_point);
 
         // get expected evaluation of the claim for the output tensor MLE computed by the sum-check; we have that
-        // `subclaim.expected_evaluation = beta_eval*proof.input_eval*expected_output_eval + challenge*proof.input_eval*input_eq_eval`,
-        // so we compute `expected_output_eval` as `(subclaim.expected_evaluation - challenge*proof.input_eval*input_eq_eval)/(beta_eval*proof.input_eval)`
+        // `subclaim.expected_evaluation = num_cols*beta_eval*proof.input_eval*expected_output_eval + challenge*proof.input_eval*input_eq_eval`,
+        // so we compute `expected_output_eval` as `(subclaim.expected_evaluation - challenge*proof.input_eval*input_eq_eval)/(num_cols*beta_eval*proof.input_eval)`
 
         let expected_output_eval = (subclaim.expected_evaluation
             - challenge * proof.input_eval * input_eq_eval)
-            * (beta_eval * proof.input_eval).inverse();
+            * (num_cols * beta_eval * proof.input_eval).inverse();
 
         Self::verify_output_evaluation(
             verifier,

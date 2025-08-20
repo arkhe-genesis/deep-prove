@@ -7,7 +7,10 @@ This section describes how DeepProve proves the correct inference of a given LLM
 We first describe how to prove each of the major building blocks of LLMs. Then, we'll show how to prove an entire model composed by the major building blocks.
 
 ## LLMs Layers
-- [QKV layer](llms-layers/qkv.md)
-- [Positional Encoding](llms-layers/positionals.md)
-- [MHA Layer](llms-layers/mha.md)
-- [Embedding Layer](llms-layers/embeddings.md)
+- [Embeddings](./llms-layers/embeddings.md)
+- [Positional Encoding](./llms-layers/positionals.md)
+- [QKV Layer](./llms-layers/qkv.md)
+- [MHA Layer](./llms-layers/mha.md)
+- [Softmax](./softmax.md)
+- [LayerNorm](./llms-layers/layernorm.md)
+- [Argmax](./llms-layers/argmax.md)
