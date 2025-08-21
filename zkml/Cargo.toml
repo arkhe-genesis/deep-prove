@@ -38,9 +38,7 @@ candle-core = "0.9.1"
 ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 csv.workspace = true
-cubecl = { version = "0.6.0", default-features = false, features = [
-  "wgpu-msl",
-], optional = true }
+cubecl = { version = "0.6.0", default-features = false, optional = true }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }
@@ -76,6 +74,8 @@ transcript = { workspace = true }
 utils = { path = "../utils" }
 witness = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+burn = { version = "0.18.0", default-features = false, features = ["metal"] }
 
 [dev-dependencies]
 bincode = "2.0.1"
