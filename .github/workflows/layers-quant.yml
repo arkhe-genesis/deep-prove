@@ -69,6 +69,7 @@ jobs:
           cp ../scripts/ci/cmp-layers-quant.sh ~
 
       - name: Compare quantized traces
+        shell: devenv shell bash -- -e {0}
         run: |
           cd ~
           ./cmp-layers-quant.sh

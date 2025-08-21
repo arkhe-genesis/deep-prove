@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Compares the outputs of tests captured with `--features capture-layers-quant`
 # that get stored in `layers-quant` dir.
