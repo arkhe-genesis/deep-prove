@@ -28,3 +28,10 @@ repos:
     entry: "taplo fmt"
     language: system
     files: ^.*\.toml$
+  - id: typos
+    name: typos
+    description: "Check typos in the code"
+    stages: ["pre-commit", "pre-push"]
+    entry: "typos --config typos.toml --format brief --write-changes"
+    language: system
+    'types': [text]
