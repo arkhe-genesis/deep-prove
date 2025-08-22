@@ -45,6 +45,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS::ProverParam: Send + Sync,
 {
     ctx: &'a ProverContext<E, PCS>,
     // proofs for each layer being filled
@@ -136,8 +137,9 @@ where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     pub fn new(ctx: &'a ProverContext<E, PCS>, transcript: &'b mut T) -> Self {
         Self {

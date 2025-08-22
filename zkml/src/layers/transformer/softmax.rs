@@ -613,7 +613,7 @@ impl Softmax<Element> {
     #[allow(clippy::type_complexity)]
     pub(crate) fn prove_step<
         E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         T: transcript::Transcript<E>,
     >(
         &self,
@@ -624,7 +624,8 @@ impl Softmax<Element> {
         prover: &mut crate::Prover<E, T, PCS>,
     ) -> Result<(Vec<Claim<E>>, SoftmaxProof<E, PCS>)>
     where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         // Check number of claims
         ensure!(
@@ -776,7 +777,8 @@ impl Softmax<Element> {
         softmax_data: &SoftmaxData<E>,
     ) -> Result<LookupWitnessGen<E, PCS>>
     where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         // Get the data generated during quantised evaluation
         let SoftmaxData {
@@ -892,28 +894,22 @@ impl Softmax<Element> {
         let mut gen_w = LookupWitnessGen::<E, PCS>::default();
 
         // Add the looked up values to the generator so we can make multiplicity polys later
-        gen_w
-            .element_count
-            .insert(TableType::Range, range_elements_count);
+        gen_w.insert_element_count(TableType::Range, range_elements_count);
 
         // Need to recreate the parameters for the Softmax table
-        gen_w
-            .element_count
-            .insert(TableType::Softmax(*lut), softman_elements_count);
+        gen_w.insert_element_count(TableType::Softmax(*lut), softman_elements_count);
 
         let quant_one = OUTPUT_SCALE_FACTOR as Element;
-        gen_w.element_count.insert(
+        gen_w.insert_element_count(
             TableType::ErrorTable(quant_one, allowable_error),
             count_elements(normalisation_lookup),
         );
 
         if !zero_table_elements_count.is_empty() {
-            gen_w
-                .element_count
-                .insert(TableType::ZeroTable, zero_table_elements_count);
+            gen_w.insert_element_count(TableType::ZeroTable, zero_table_elements_count);
         }
 
-        gen_w.logup_witnesses.insert(id, layer_commit);
+        gen_w.insert_logup_witness(id, layer_commit);
         Ok(gen_w)
     }
 }
@@ -922,8 +918,9 @@ impl<E, PCS> ProvableOp<E, PCS> for Softmax<Element>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = SoftmaxCtx<E>;
 

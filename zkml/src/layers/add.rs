@@ -79,12 +79,7 @@ impl<N: Number> Add<N> {
 }
 
 impl Add<Element> {
-    pub(crate) fn prove_step<
-        A: AsRef<Tensor<E>>,
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
-    >(
+    pub(crate) fn prove_step<A: AsRef<Tensor<E>>, E: ExtensionField, T: Transcript<E>, PCS>(
         &self,
         node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
@@ -92,7 +87,9 @@ impl Add<Element> {
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<(Vec<Claim<E>>, AddProof<E>)>
     where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         ensure!(last_claims.len() == 1, "Add layer expects 1 claim");
         let last_claim = last_claims[0];
@@ -572,8 +569,9 @@ where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = AddCtx;
 

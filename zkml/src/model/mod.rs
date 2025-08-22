@@ -135,6 +135,13 @@ where
             .collect())
     }
 
+    /// iterates over all layers and resets their internal state if any
+    pub fn reset(&self) {
+        for (_, node) in self.nodes.iter() {
+            node.operation.reset();
+        }
+    }
+
     /// Build the inputs tensors, according to the expected input shapes,
     /// from a set of flat data
     pub fn load_input_flat(&self, input: Vec<Vec<N>>) -> Result<Vec<Tensor<N>>> {

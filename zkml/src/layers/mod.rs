@@ -122,7 +122,17 @@ impl<T> Layer<T> {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
+impl<T: Number> Layer<T> {
+    /// Resets the internal state of the layer if any
+    pub fn reset(&self) {
+        if let Layer::QKV(qkv) = self {
+            qkv.reset_cache();
+        } else if let Layer::Positional(Positional::Learned(pos)) = self {
+            pos.reset_cache();
+        }
+    }
+}
+
 /// Describes a steps wrt the polynomial to be proven/looked at. Verifier needs to know
 /// the sequence of steps and the type of each step from the setup phase so it can make sure the prover is not
 /// cheating on this.
@@ -672,8 +682,9 @@ impl<E, PCS> ProvableOp<E, PCS> for Layer<Element>
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = LayerCtx<E>;
 

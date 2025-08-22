@@ -296,9 +296,11 @@ impl PadOp for Logits {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Logits
+impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for Logits
 where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = LogitsCtx;
 
@@ -494,8 +496,8 @@ where
         let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm])?;
 
         let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.logup_witnesses.insert(id, layer_commitment);
-        gen.element_count.insert(TableType::Range, element_count);
+        gen.insert_logup_witness(id, layer_commitment);
+        gen.insert_element_count(TableType::Range, element_count);
 
         Ok(gen)
     }

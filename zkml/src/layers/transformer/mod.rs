@@ -526,6 +526,7 @@ pub(crate) mod manual_attention {
             .into_provable_model(&config, single_input.shape())?;
         model.describe();
         model.run_float(slice::from_ref(&single_input))?;
+        model.reset();
 
         let model = llm_model.into_provable_model(&config, input.shape())?;
         model.describe();

@@ -239,8 +239,9 @@ where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = ActivationCtx<E>;
 
@@ -317,8 +318,8 @@ where
         let commit = ctx.commitment_ctx.batch_commit(vec![rmm])?;
 
         let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.logup_witnesses.insert(id, commit);
-        gen.element_count.insert(self.table_type(), element_count);
+        gen.insert_logup_witness(id, commit);
+        gen.insert_element_count(self.table_type(), element_count);
 
         Ok(gen)
     }
@@ -381,7 +382,7 @@ impl<N> Activation<N> {
         }
     }
     #[timed::timed_instrument(name = "Prover::prove_activation_step")]
-    pub(crate) fn prove_step<'a, 'b, E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn prove_step<'a, 'b, E, T: Transcript<E>, PCS>(
         &self,
         prover: &mut Prover<'a, 'b, E, T, PCS>,
         last_claim: &Claim<E>,
@@ -391,7 +392,9 @@ impl<N> Activation<N> {
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         // Should only be one prover_info for this step
         let layer_commitment = prover.lookup_witness(node_id)?;

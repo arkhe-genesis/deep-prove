@@ -20,6 +20,7 @@ pub use iop::{
     verifier::{IO, verify},
 };
 pub use quantization::{ScalingFactor, ScalingStrategy};
+pub mod graph;
 pub mod layers;
 pub mod lookup;
 pub mod model;

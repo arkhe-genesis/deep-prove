@@ -7,7 +7,6 @@
 use crate::{
     IO, Proof, Prover, ProverContext,
     iop::context::VerifierContext,
-    layers::transformer::positional::Positional,
     padding::PaddingMode,
     quantization::{InferenceObserver, IntoElement, ScalingStrategy},
     verify,
@@ -305,15 +304,7 @@ where
         };
         // 3. model resetting: we need to _reset_ the cache of every QKV layer in the model - that's because we only
         // expect 1 token to be generated at a time after the first inference.
-        for (node_id, node) in self.model.nodes.iter() {
-            if let Layer::QKV(qkv) = &node.operation {
-                debug!(" RESETTING THE CACHE OF QKV LAYER {node_id}");
-                qkv.reset_cache();
-            } else if let Layer::Positional(Positional::Learned(pos)) = &node.operation {
-                debug!(" RESETTING THE CACHE OF POSITIONAL LAYER {node_id}");
-                pos.reset_cache();
-            }
-        }
+        self.model.reset();
         // 4. rerun to have a "clean" trace
         info!("Running last iteration (heavy) with {input_len} tokens");
 
@@ -378,7 +369,7 @@ impl Driver<Element> {
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
-        PCS: PolynomialCommitmentScheme<E>,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         // compute shapes for all possible input sequence lengths
@@ -408,7 +399,7 @@ impl Driver<Element> {
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
-        PCS: PolynomialCommitmentScheme<E>,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         debug!(
@@ -432,8 +423,9 @@ impl Driver<Element> {
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
-        PCS: PolynomialCommitmentScheme<E>,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
         let prover: Prover<'_, '_, E, _, _> = Prover::new(&ctx.prover_ctx, &mut tr);
@@ -576,7 +568,7 @@ mod test {
         init_test_logging("debug");
         let max_context = 10;
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
+        //let model_path = "assets/scripts/llms/toy_gpt2.gguf";
         let driver = Driver::load_external_model(&model_path)?.with_max_context(max_context);
         let sentence = "The sky is";
         let tokenizer = TokenizerData::load_tokenizer_from_gguf(&model_path)?;

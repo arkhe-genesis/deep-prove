@@ -11,7 +11,7 @@ use weight_lru::LruCache;
 
 use crate::{TensorKey, TensorStore, TenstoreError};
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
 struct Storage {
     allocated: usize,
     file: PathBuf,
@@ -19,6 +19,7 @@ struct Storage {
 
 /// A disk-backed tensor store featuring a bounded memory cache of the most
 /// accessed tensors.
+#[derive(Clone)]
 pub struct LocalStore<P: AsRef<Path>> {
     /// Keep track of the storage details associated to a stored tensor.
     ///

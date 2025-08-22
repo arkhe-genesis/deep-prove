@@ -37,6 +37,7 @@ burn-cubecl = { version = "0.18.0", default-features = false, optional = true }
 candle-core = "0.9.1"
 ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+crossbeam-channel = "0.5.15"
 csv.workspace = true
 cubecl = { version = "0.6.0", default-features = false, optional = true }
 derive_more = { workspace = true, features = ["full"] }
@@ -49,6 +50,7 @@ mpcs = { workspace = true }
 multilinear_extensions = { workspace = true, features = ["parallel"] }
 p3-field = { workspace = true }
 p3-goldilocks = { workspace = true }
+petgraph = "0.8.2"
 prost = { version = "0.13.3" }
 prost-tract-compat = { package = "prost", version = "0.11.9" }
 rayon.workspace = true
@@ -83,7 +85,6 @@ criterion = { "version" = "0.6", features = ["html_reports"] }
 ndarray = "0.16.1"
 proptest = "1.7.0"
 rstest = "0.25.0"
-tempfile.workspace = true
 zstd = "0.13.3"
 
 [[bench]]

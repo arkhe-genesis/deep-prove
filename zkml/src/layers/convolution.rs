@@ -380,7 +380,11 @@ impl Convolution<Element> {
         2 * (*quantization::BIT_LEN - 1) + ceil_log2(k_h * k_w * k_c + 1)
     }
 
-    pub fn prove_batch_fft_weights<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub fn prove_batch_fft_weights<
+        E,
+        T: Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    >(
         &self,
         prover: &mut Prover<E, T, PCS>,
         r: Vec<E>,
@@ -388,7 +392,8 @@ impl Convolution<Element> {
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         let padded_rows = 2 * self.filter.nw() * self.filter.nw();
         let mut w1_reduced: Vec<E> = vec![E::ZERO; self.filter.real_nw() * self.filter.real_nw()];
@@ -583,8 +588,9 @@ where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = ConvCtx;
 
@@ -673,7 +679,8 @@ impl Convolution<Element> {
     // Prove convolution of a CNN network. This is a convolution between in a 3D matrix X of dimension k_x * n_x * n_x
     // and a 4D filter matrix W of dimension k_w * k_x * n_w * n_w. The output is a 3D matrix Y of dimension k_w * n_x * n_x
     // We want to batch prove the following: Y[i] = iFFT(sum_{j \in [n_x]}(FFT(X[j]) o FFT(W[i][j])).
-    pub fn prove_convolution_step<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    #[timed::timed_instrument(name = "Prover::prove_convolution_step")]
+    pub fn prove_convolution_step<E, T: Transcript<E>, PCS>(
         &self,
         prover: &mut Prover<E, T, PCS>,
         // last random claim made
@@ -688,7 +695,9 @@ impl Convolution<Element> {
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         // First part is proving the clearing of the garbage has been done correctly.
         // For this, we create the clearing garbage tensor and just prove hadamard with the output.

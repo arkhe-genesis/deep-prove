@@ -483,7 +483,8 @@ impl ConcatMatMul {
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<(Vec<crate::Claim<E>>, ConcatMatMulProof<E>)>
     where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         let input_shapes = inputs
             .iter()
@@ -727,11 +728,12 @@ impl PadOp for ConcatMatMul {
     }
 }
 
-impl<E: ExtensionField + DeserializeOwned, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
-    for ConcatMatMul
+impl<E: ExtensionField + DeserializeOwned, PCS> ProvableOp<E, PCS> for ConcatMatMul
 where
     E::BaseField: DeserializeOwned + Serialize,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = ConcatMatMulCtx;
 

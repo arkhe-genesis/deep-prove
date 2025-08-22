@@ -443,8 +443,9 @@ impl<E, PCS> ProvableOp<E, PCS> for Requant
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = RequantCtx<E>;
 
@@ -604,14 +605,12 @@ where
         let mut gen = LookupWitnessGen::<E, PCS>::default();
 
         if !zero_check_count.is_empty() {
-            gen.element_count
-                .insert(TableType::RequantZeroTable, zero_check_count);
+            gen.insert_element_count(TableType::RequantZeroTable, zero_check_count);
         }
 
-        gen.element_count
-            .insert(TableType::Range, range_check_count);
+        gen.insert_element_count(TableType::Range, range_check_count);
 
-        gen.logup_witnesses.insert(id, layer_commitment);
+        gen.insert_logup_witness(id, layer_commitment);
         Ok(gen)
     }
 }
@@ -823,7 +822,7 @@ impl Requant {
     #[timed::timed_instrument(name = "Prover::prove_requant")]
     /// Method that proves requantisation was performed correctly. It does this by running any required lookups and then linking the `last_claim` to the
     /// `input` via a series of Sumchecks.
-    pub(crate) fn prove_step<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn prove_step<E, T: Transcript<E>, PCS>(
         &self,
         prover: &mut Prover<E, T, PCS>,
         last_claim: &Claim<E>,
@@ -833,7 +832,9 @@ impl Requant {
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         let layer_commitment = prover.lookup_witness(id)?;
         let logup_inputs = ctx

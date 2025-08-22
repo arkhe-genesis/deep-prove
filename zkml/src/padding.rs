@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use itertools::Itertools;
@@ -16,7 +19,10 @@ use crate::{
         pooling::Pooling,
         provable::{Node, NodeId, OpInfo},
         reshape::Reshape,
-        transformer::{mha::pad_matrix_to_ignore_mha_garbage, qkv::QKV},
+        transformer::{
+            mha::pad_matrix_to_ignore_mha_garbage,
+            qkv::{CacheQKV, QKV},
+        },
     },
     model::{Model, ToIterator},
     parser::{check_filter, safe_conv2d_shape, safe_maxpool2d_shape},
@@ -402,7 +408,9 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
 
 pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<Element>> {
     // reset QKV cache, as it might contain data from a previous inference
-    qkv.reset_cache();
+    // NOTE: we don't really reset we create a new instance, otherwise the same instance would be shared
+    // between the padded and non padded qkv layer
+    qkv.cache = Arc::new(Mutex::new(CacheQKV::new()));
     // qkv layer currently expects 1 input, so we check there is only 1 input shape
     ensure!(
         si.shapes.len() == 1,
@@ -497,7 +505,8 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
         })
         .collect();
 
-    qkv.cache.borrow_mut().padding_mode = PaddingMode::Padding;
+    qkv.cache.lock().unwrap().padding_mode = PaddingMode::Padding;
+    assert_eq!(qkv.cache.lock().unwrap().full_seq_len(), 0);
 
     Ok(qkv)
 }

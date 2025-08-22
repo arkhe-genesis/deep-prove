@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, ensure};
 use either::Either;
@@ -59,7 +59,7 @@ pub struct QKV<N> {
     /// The cache that gets updated at each pass.
     /// interior mutability for the cache to avoid borrowing issues.
     /// Given only the QKV layer needs to update itself, it's a reasonable trade-off.
-    pub cache: RefCell<CacheQKV<N>>,
+    pub cache: Arc<Mutex<CacheQKV<N>>>,
     pub(crate) num_heads: usize, // Needed to properly pad matrices for sub-sequent MHA layer
     pub(crate) head_dim: usize,  // Needed to properly pad matrices for sub-sequent MHA layer
 }
@@ -172,14 +172,14 @@ impl<N: Number> QKV<N> {
             weights_unpadded_shape: unpadded_shape,
             num_heads,
             head_dim,
-            cache: RefCell::new(CacheQKV::new()),
+            cache: Arc::new(Mutex::new(CacheQKV::new())),
         })
     }
 
     /// Resets the cache to its default empty state. This is useful
     /// when we want to start a new sequence as QKV is the only stateful layer.
     pub(crate) fn reset_cache(&self) {
-        *self.cache.borrow_mut() = CacheQKV::new();
+        self.cache.lock().unwrap().reset();
     }
 
     // Given the point of a claim referring to a 2d output tensor with `output_num_vars` variables,
@@ -251,8 +251,8 @@ impl<N: Number> OpInfo for QKV<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         assert_eq!(input_shapes.len(), 1, "Expected one input for QKV layer");
         let input_shape = input_shapes[0].clone();
-        let full_seq_len = if self.cache.borrow().is_initialized() {
-            self.cache.borrow().full_seq_len() // this assumes the `evaluate` method has already been called for the
+        let full_seq_len = if self.cache.lock().unwrap().is_initialized() {
+            self.cache.lock().unwrap().full_seq_len() // this assumes the `evaluate` method has already been called for the
         // current input, and so the cache is already updated with the size of the output
         } else {
             input_shape[0]
@@ -340,9 +340,9 @@ impl<N: Number> QKV<N> {
         let q = input.matmul(&self.q).add_dim2(&self.q_bias);
         let k = input.matmul(&self.k).add_dim2(&self.k_bias);
         let v = input.matmul(&self.v).add_dim2(&self.v_bias);
-        self.cache.borrow_mut().stack(k, v, unpadded_seq_len)?;
+        self.cache.lock().unwrap().stack(k, v, unpadded_seq_len)?;
         // vector Q, full K, full V
-        let cache = self.cache.borrow();
+        let cache = self.cache.lock().unwrap();
         let k = cache.k();
         let v = cache.v();
 
@@ -427,7 +427,12 @@ impl Evaluate<f32> for QKV<f32> {
         // f32 inference is only used for quantization parameter computation so we don't want
         // to make it stateful since it would have to make the quantization strategy be aware that
         // we're using caching and it's LLM. It's currently not in scope.
-        self.cache.borrow_mut().reset();
+        self.cache.lock().unwrap().reset();
+        assert_eq!(
+            self.cache.lock().unwrap().full_seq_len(),
+            0,
+            "Cache should be empty during float evaluation"
+        );
         self.evaluate_internal(inputs, unpadded_input_shapes)
     }
 }
@@ -443,7 +448,7 @@ impl Evaluate<Element> for QKV<Element> {
         // in case it's the first time we use it, then we accept to get any first user input to put in the cache.
         // NOTE: we dont enforce this check during float inference since this is used only to compute quantization factors
         // and this would force the quantization strategy to be aware of the specificities of the LLM logic.
-        if self.cache.borrow().is_initialized() {
+        if self.cache.lock().unwrap().is_initialized() {
             ensure!(inputs[0].shape()[0] == 1, "QKV: seq_len != 1");
         }
 
@@ -476,6 +481,10 @@ impl ProveInfo for QKV<Element> {
         );
         // reset the cache of QKV as it might be filled with data from a previous inference
         self.reset_cache();
+        ensure!(
+            self.cache.lock().unwrap().full_seq_len() == 0,
+            "Cache should be empty"
+        );
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.model_polys = Some(
             [
@@ -514,11 +523,13 @@ impl PadOp for QKV<Element> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for QKV<Element>
+impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for QKV<Element>
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = QKVCtx;
 
@@ -1097,6 +1108,9 @@ mod tests {
         assert_eq!(output[1].get_data(), out_k.get_data());
         out_v.concat(new_token_emb.matmul(&v).add_dim2(&v_bias));
         assert_eq!(output[2].get_data(), out_v.get_data());
+
+        qkv.cache.lock().unwrap().reset();
+        assert_eq!(qkv.cache.lock().unwrap().seq_len, 0);
     }
 
     //#[test]
@@ -1170,6 +1184,7 @@ mod tests {
             .as_slice()
             .into();
         let padded_layer = layer.clone().pad_node(&mut si).unwrap();
+        assert_eq!(padded_layer.cache.lock().unwrap().full_seq_len(), 0);
 
         let padded_weight_shape = weight_shape.next_power_of_two();
         let padded_bias_shape = bias_shape.next_power_of_two();
@@ -1190,6 +1205,11 @@ mod tests {
         let padded_output_shapes =
             padded_layer.output_shapes(slice::from_ref(&padded_input_shape), PaddingMode::Padding);
         assert_eq!(padded_output_shapes, si.padded_input_shapes(),);
+        assert!(matches!(
+            padded_layer.cache.lock().unwrap().padding_mode,
+            PaddingMode::Padding
+        ));
+        assert_eq!(padded_layer.cache.lock().unwrap().full_seq_len(), 0);
 
         assert_eq!(padded_layer.q.shape(), padded_weight_shape);
         assert_eq!(padded_layer.k.shape(), padded_weight_shape);
@@ -1261,6 +1281,7 @@ mod tests {
         );
 
         input.pad_to_shape(padded_input_shape);
+        assert_eq!(padded_layer.cache.lock().unwrap().full_seq_len(), 0);
         let padded_output = evaluate_layer::<GoldilocksExt2, _, _>(
             &padded_layer,
             &[&input],

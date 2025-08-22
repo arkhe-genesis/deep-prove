@@ -1,11 +1,14 @@
 //! File containing code for lookup witness generation.
 
+use crate::graph::Edge;
+use anyhow::{Context as CC, anyhow, bail, ensure};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, btree_map},
+    marker::PhantomData,
+    sync::Arc,
 };
 
-use anyhow::{anyhow, ensure};
 use ceno_p3::field::{Field, FieldAlgebra};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -23,6 +26,7 @@ use witness::{InstancePaddingStrategy, RowMajorMatrix};
 use super::logup_gkr::error::LogUpError;
 use crate::{
     Claim, Element,
+    graph::{ColoredGraph, ColoredNode, node::GraphNode},
     iop::{ChallengeStorage, context::ProverContext},
     layers::{
         activation::{GeluTableData, Relu},
@@ -845,8 +849,17 @@ pub struct LookupWitnessGen<E: ExtensionField, PCS: PolynomialCommitmentScheme<E
     /// Contains the count of elements per table type.
     ///
     /// These values are later used to compute the GKR's multiplicities.
-    pub(crate) element_count: BTreeMap<TableType, HashMap<Element, u64>>,
-    pub(crate) logup_witnesses: HashMap<NodeId, PCS::CommitmentWithWitness>,
+    element_count: BTreeMap<TableType, HashMap<Element, u64>>,
+    logup_witnesses: HashMap<NodeId, Arc<PCS::CommitmentWithWitness>>,
+}
+
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Clone for LookupWitnessGen<E, PCS> {
+    fn clone(&self) -> Self {
+        LookupWitnessGen {
+            element_count: self.element_count.clone(),
+            logup_witnesses: self.logup_witnesses.clone(),
+        }
+    }
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWitnessGen<E, PCS> {
@@ -859,6 +872,13 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWi
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, PCS> {
+    pub fn insert_logup_witness(&mut self, node_id: NodeId, witness: PCS::CommitmentWithWitness) {
+        self.logup_witnesses.insert(node_id, Arc::new(witness));
+    }
+    pub fn insert_element_count(&mut self, table_type: TableType, elements: HashMap<Element, u64>) {
+        self.element_count.insert(table_type, elements);
+    }
+
     /// Consume the lookups and witness of `other` into this instance.
     fn consume(&mut self, other: Self) {
         for (table_type, elements) in other.element_count.into_iter() {
@@ -880,6 +900,68 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, 
 
 pub(crate) const COLUMN_SEPARATOR: Element = 1 << 32;
 
+use tenstore::TenStore;
+/// Action to put inside the graph of tasks. This operation can be serialized over the network.
+#[derive(Debug, Clone)]
+struct GenerateWitness<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E> + Send + Sync>
+{
+    _phantom: PhantomData<(E, PCS)>,
+    _marker: PhantomData<(&'a (), &'b ())>,
+}
+
+struct GenerateWitnessContext<'a, 'b, E, PCS>
+where
+    E: ExtensionField,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+{
+    trace: &'a InferenceTrace<'a, E, Element>,
+    ctx: &'b ProverContext<E, PCS>,
+    store: TenStore,
+}
+
+#[derive(Clone)]
+enum GenerateWitnessIO<E, PCS>
+where
+    E: ExtensionField,
+    PCS: PolynomialCommitmentScheme<E>,
+{
+    Input(NodeId),
+    Output(LookupWitnessGen<E, PCS>),
+}
+
+impl<'a, 'b, E, PCS> GraphNode for GenerateWitness<'a, 'b, E, PCS>
+where
+    E: ExtensionField,
+    E::BaseField: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'b,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
+{
+    type IO = GenerateWitnessIO<E, PCS>;
+    type Context = GenerateWitnessContext<'a, 'b, E, PCS>;
+    fn run(&self, ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Self::IO> {
+        let input = input.first().context("expect only one node_id as input")?;
+        let GenerateWitnessIO::Input(node_id) = input else {
+            bail!("Expected input to be a node_id");
+        };
+        let step = ctx.trace.get_step(node_id).unwrap();
+        step.op
+            .gen_lookup_witness(*node_id, ctx.ctx, &step.step_data, &mut ctx.store.clone())
+            .map_err(|e| {
+                LogUpError::ParameterError(format!(
+                    "Error generating lookup witness for node {node_id:?} with error: {e:?}"
+                ))
+            })
+            .map(|gen_w| GenerateWitnessIO::Output(gen_w))
+            .context("Error generating lookup witness")
+    }
+    fn describe(&self) -> String {
+        "GenerateWitness".to_string()
+    }
+}
+
 #[derive(Debug)]
 pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     pub challenge_storage: ChallengeStorage<E>,
@@ -897,7 +979,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWi
     }
 }
 
-pub fn generate_lookup_witnesses<'a, 'b, E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+pub fn generate_lookup_witnesses<'a, 'b, E, T: Transcript<E>, PCS>(
     trace: &'b InferenceTrace<'a, E, Element>,
     ctx: &ProverContext<E, PCS>,
     transcript: &mut T,
@@ -905,7 +987,9 @@ pub fn generate_lookup_witnesses<'a, 'b, E, T: Transcript<E>, PCS: PolynomialCom
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     // If the lookup context is empty then there are no lookup witnesses to generate so we return default values
     if ctx.lookup.is_empty() {
@@ -917,24 +1001,77 @@ where
     debug!("== Witness poly fields generation ==");
     let metrics = Metrics::new();
     let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
-    let mut store = trace.store.clone();
+    let store = trace.store.clone();
 
-    for (node_id, _) in ctx.steps_info.to_forward_iterator() {
-        let step = trace
-            .get_step(&node_id)
-            .ok_or(LogUpError::ProvingError(format!(
-                "Node {node_id} not found in trace"
-            )))?;
-        let gen_w = step
-            .op
-            .gen_lookup_witness(node_id, ctx, &step.step_data, &mut store)
-            .map_err(|e| {
-                LogUpError::ParameterError(format!(
-                    "Error generating lookup witness for node {node_id} with error: {e}"
-                ))
-            })?;
+    // We create the graph here for showcasing the graph module.
+    // The end goal is that we create the graph at the top level and every functionality of the prover
+    // is appended to that graph
+    //
+    // We also spin up a local executor here, since this is for the first PR to showcase the graph module
+    // as well. The endgoal is that once the full graph is created, the executor will simply run the
+    // graph to completion. Since we haven't "graphized" the whole prover yet, we limit the scope to
+    // this small function.
+
+    // the colour for now doesn't matter too much since everything is sequential.
+    // later on, the local executor can use a threadpool to run the graph in parallel with a master thread
+    let max_colour = 2;
+    let mut graph = ColoredGraph::new();
+    let (_node_idxs, inputs): (Vec<_>, Vec<_>) = ctx
+        .steps_info
+        .to_forward_iterator()
+        .enumerate()
+        .map(|(idx, (node_id, _))| {
+            let node_idx = graph
+                .add_node(
+                    ColoredNode::new(
+                        GenerateWitness {
+                            _phantom: PhantomData,
+                            _marker: PhantomData,
+                        },
+                        idx % max_colour,
+                    ),
+                    vec![Edge::Input(idx)],
+                )
+                .expect("graph creation is failing");
+            let input = GenerateWitnessIO::Input(node_id);
+            (node_idx, input)
+        })
+        .unzip();
+
+    // here for the moment there is not yet a "parent node" so it's a directed graph ... but with no edges.
+    let graph_ctx = GenerateWitnessContext { ctx, store, trace };
+    use crate::graph::executor::SequentialExecutor;
+    let mut executor = SequentialExecutor::new(graph, graph_ctx);
+    //let executor = ThreadPoolExecutor::new(graph, graph_ctx);
+    for gen_w in executor
+        .run(inputs)
+        .map_err(|e| LogUpError::ProvingError(e.to_string()))?
+        .into_iter()
+    {
+        let GenerateWitnessIO::Output(gen_w) = gen_w else {
+            return Err(LogUpError::ProvingError(
+                "Expected output to be a logup witness".to_string(),
+            ));
+        };
         witness_gen.consume(gen_w);
     }
+
+    // for (node_id, _) in ctx.steps_info.to_forward_iterator() {
+    //    let step = trace
+    //        .get_step(&node_id)
+    //        .ok_or(LogUpError::ProvingError(format!(
+    //            "Node {node_id} not found in trace"
+    //        )))?;
+    //    let gen_w = step
+    //        .op
+    //        .gen_lookup_witness(node_id, ctx, &step.step_data, &mut store)
+    //        .map_err(|e| {
+    //            LogUpError::ParameterError(format!(
+    //                "Error generating lookup witness for node {node_id} with error: {e}"
+    //            ))
+    //        })?;
+    //    witness_gen.consume(gen_w);
+    //}
     debug!(
         "== Witness poly fields generation metrics {} ==",
         metrics.to_span()
@@ -1051,7 +1188,11 @@ where
 
     Ok(LookupWitness {
         challenge_storage,
-        logup_witnesses: witness_gen.logup_witnesses,
+        logup_witnesses: witness_gen
+            .logup_witnesses
+            .into_iter()
+            .map(|(k, v)| (k, Arc::into_inner(v).unwrap()))
+            .collect(),
         table_witnesses: Some(table_witness),
     })
 }

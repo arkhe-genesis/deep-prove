@@ -637,9 +637,11 @@ impl PadOp for Mha<Element> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS> for Mha<Element>
+impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for Mha<Element>
 where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = MhaCtx<E>;
 

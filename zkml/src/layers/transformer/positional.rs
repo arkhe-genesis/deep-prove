@@ -1,7 +1,7 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     iter::once,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, ensure};
@@ -65,7 +65,7 @@ pub struct PositionalProof<E> {
 pub struct Learned<N> {
     positional: Tensor<N>,
     unpadded_shape: Shape,
-    past_length: RefCell<LearnedCache>,
+    past_length: Arc<Mutex<LearnedCache>>,
     add_layer: Add<N>,
 }
 
@@ -110,7 +110,7 @@ impl<N> Learned<N> {
     }
 
     pub(crate) fn reset_cache(&self) {
-        self.past_length.borrow_mut().reset();
+        self.past_length.lock().unwrap().reset();
     }
 
     // Sample from the transcript `t` `num_coordinates` random coordinates to be employed
@@ -185,7 +185,7 @@ impl<N: Number> Positional<N> {
         Self::Learned(Learned {
             positional: matrix,
             unpadded_shape,
-            past_length: RefCell::new(LearnedCache::new()),
+            past_length: Arc::new(Mutex::new(LearnedCache::new())),
             add_layer: Add::new(),
         })
     }
@@ -214,12 +214,13 @@ where
             .iter()
             .map(|x| match self {
                 Self::Learned(pos) => {
-                    let past_length = pos.past_length.borrow().seq_len;
+                    let past_length = pos.past_length.lock().unwrap().seq_len;
                     let sub_pos = pos
                         .positional
                         .slice_2d(past_length, past_length + x.shape()[0]);
                     pos.past_length
-                        .borrow_mut()
+                        .lock()
+                        .unwrap()
                         .set_seq_len(past_length + unpadded_input_shapes[0][0])?;
                     pos.add_layer
                         .evaluate::<E>(&[x, &sub_pos], &vec![pos.unpadded_shape.clone(); 2])?
@@ -349,7 +350,7 @@ impl QuantizeOp for Positional<f32> {
         let quantized_pos = Learned {
             positional: pos.positional.quantize(&pos_scaling),
             unpadded_shape: pos.unpadded_shape,
-            past_length: RefCell::new(LearnedCache::new()),
+            past_length: Arc::new(Mutex::new(LearnedCache::new())),
             add_layer: quantized_add.quantized_op,
         };
 
@@ -377,10 +378,11 @@ impl PadOp for Positional<Element> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProvableOp<E, PCS>
-    for Positional<Element>
+impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for Positional<Element>
 where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = PositionalCtx;
 

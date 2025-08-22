@@ -185,8 +185,9 @@ impl<E, PCS> ProvableOp<E, PCS> for Pooling
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = PoolingCtx;
 
@@ -258,8 +259,8 @@ where
         let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm])?;
 
         let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.logup_witnesses.insert(id, layer_commitment);
-        gen.element_count.insert(TableType::Range, element_count);
+        gen.insert_logup_witness(id, layer_commitment);
+        gen.insert_element_count(TableType::Range, element_count);
 
         Ok(gen)
     }
@@ -349,7 +350,7 @@ impl Pooling {
     }
 
     #[timed::timed_instrument(name = "Prover::prove_pooling_step")]
-    pub fn prove_pooling<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub fn prove_pooling<E, T: Transcript<E>, PCS>(
         &self,
         prover: &mut Prover<E, T, PCS>,
         // last random claim made
@@ -362,7 +363,9 @@ impl Pooling {
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         assert_eq!(input.rank(), 3, "Maxpool needs 3D inputs.");
         let output_shapes = self.output_shapes(&[input.shape()], PaddingMode::Padding);

@@ -761,8 +761,9 @@ impl<E, PCS> ProvableOp<E, PCS> for LayerNorm<Element>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
 {
     type Ctx = LayerNormCtx<E>;
 
@@ -830,11 +831,7 @@ where
 
 type ProveOut<E, PCS> = (Vec<Claim<E>>, LayerNormProof<E, PCS>);
 impl LayerNorm<Element> {
-    pub(crate) fn prove_step<
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-        T: transcript::Transcript<E>,
-    >(
+    pub(crate) fn prove_step<E, T, PCS>(
         &self,
         node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
@@ -844,7 +841,11 @@ impl LayerNorm<Element> {
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<ProveOut<E, PCS>>
     where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        E: ExtensionField,
+        T: transcript::Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         // Check we have the correct number of claims
         ensure!(
@@ -1019,7 +1020,8 @@ impl LayerNorm<Element> {
     where
         E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E>,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
     {
         let mut wit_gen = LookupWitnessGen::<E, PCS>::default();
         // Get the data generated during quantised evaluation
@@ -1100,16 +1102,12 @@ impl LayerNorm<Element> {
         let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm1, rmm2])?;
 
         // Add the merged columns to the lookups lists
-        wit_gen
-            .element_count
-            .insert(TableType::Range, range_elements_count);
+        wit_gen.insert_element_count(TableType::Range, range_elements_count);
 
-        wit_gen
-            .element_count
-            .insert(TableType::InverseSQRT(*lut), inv_sqrt_element_count);
+        wit_gen.insert_element_count(TableType::InverseSQRT(*lut), inv_sqrt_element_count);
 
         // Insert the LogUpWitnesses
-        wit_gen.logup_witnesses.insert(id, layer_commitment);
+        wit_gen.insert_logup_witness(id, layer_commitment);
         Ok(wit_gen)
     }
 }
