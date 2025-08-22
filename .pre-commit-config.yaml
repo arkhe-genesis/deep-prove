@@ -1,0 +1,30 @@
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    - id: check-merge-conflict
+
+- repo: local
+  hooks:
+  - id: black
+    name: black
+    description: "Python formatter"
+    stages: ["pre-commit", "pre-push"]
+    entry: "black"
+    language: system
+    files: ^.*\.py$
+  - id: ripsecrets
+    name: ripsecrets
+    description: "Check when publishing secrets"
+    stages: ["pre-commit", "pre-push"]
+    'types': [text]
+    require_serial: true
+    entry: "ripsecrets --strict-ignore"
+    language: system
+  - id: taplo
+    name: taplo
+    description: "TOML formatter"
+    stages: ["pre-commit", "pre-push"]
+    entry: "taplo fmt"
+    language: system
+    files: ^.*\.toml$
