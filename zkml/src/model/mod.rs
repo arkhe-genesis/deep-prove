@@ -49,7 +49,7 @@ where
     fn compute_padded_input_shapes(unpadded_input_shapes: &[Shape]) -> Vec<Shape> {
         unpadded_input_shapes
             .iter()
-            .map(|shape| shape.iter().map(|dim| dim.next_power_of_two()).collect())
+            .map(|shape| shape.next_power_of_two())
             .collect()
     }
 
@@ -610,7 +610,7 @@ pub(crate) mod test {
         layers::{
             Layer,
             activation::{Activation, Relu},
-            convolution::{Convolution, SchoolBookConv},
+            convolution::Convolution,
             dense::Dense,
             matrix_mul::{MatMul, OperandMatrix},
             pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
@@ -627,17 +627,16 @@ pub(crate) mod test {
     use anyhow::{Ok, Result};
     use ark_std::rand::{Rng, RngCore};
     use either::Either;
-    use ff_ext::{ExtensionField, GoldilocksExt2};
+    use ff_ext::GoldilocksExt2;
     use itertools::Itertools;
     use multilinear_extensions::{mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
-    use std::slice;
     use sumcheck::{
         structs::{IOPProverState, IOPVerifierState},
         util::optimal_sumcheck_threads,
     };
     use tenstore::TenStore;
 
-    use crate::{Element, default_transcript, quantization::TensorFielder, tensor::Tensor};
+    use crate::{Element, default_transcript, tensor::Tensor};
 
     type F = GoldilocksExt2;
     const SELECTOR_DENSE: usize = 0;
@@ -789,131 +788,8 @@ pub(crate) mod test {
             .unwrap();
     }
 
-    pub fn check_tensor_consistency_field<E: ExtensionField>(
-        real_tensor: Tensor<E>,
-        padded_tensor: Tensor<E>,
-    ) {
-        let n_x = padded_tensor.shape()[1];
-        for i in 0..real_tensor.shape()[0] {
-            for j in 0..real_tensor.shape()[1] {
-                for k in 0..real_tensor.shape()[1] {
-                    // if(real_tensor.data[i*real_tensor.shape[1]*real_tensor.shape[1]+j*real_tensor.shape[1]+k] > 0){
-                    assert!(
-                        real_tensor[i * real_tensor.shape()[1] * real_tensor.shape()[1]
-                            + j * real_tensor.shape()[1]
-                            + k]
-                            == padded_tensor[i * n_x * n_x + j * n_x + k],
-                        "Error in tensor consistency"
-                    );
-                    //}else{
-                    //   assert!(-E::from(-real_tensor.data[i*real_tensor.shape[1]*real_tensor.shape[1]+j*real_tensor.shape[1]+k] as u64) == E::from(padded_tensor.data[i*n_x*n_x + j*n_x + k] as u64) ,"Error in tensor consistency");
-                    //}
-                }
-
-                // assert!(real_tensor.data[i*real_tensor.shape[1]*real_tensor.shape[1]+j ] == padded_tensor.data[i*n_x*n_x + j],"Error in tensor consistency");
-            }
-        }
-    }
-
     fn random_vector_quant(n: usize) -> Vec<Element> {
-        // vec![thread_rng().gen_range(-128..128); n]
         random_vector(n)
-    }
-
-    #[test]
-    fn test_cnn() {
-        let mut in_dimensions: Vec<Vec<usize>> =
-            vec![vec![1, 32, 32], vec![16, 29, 29], vec![4, 26, 26]];
-
-        for i in 0..in_dimensions.len() {
-            for j in 0..in_dimensions[0].len() {
-                in_dimensions[i][j] = (in_dimensions[i][j]).next_power_of_two();
-            }
-        }
-        // println!("in_dimensions: {:?}", in_dimensions);
-        let w1 = random_vector_quant(16 * 16);
-        let w2 = random_vector_quant(16 * 4 * 16);
-        let w3 = random_vector_quant(16 * 8);
-
-        let shape1 = vec![1 << 4, 1 << 0, 1 << 2, 1 << 2]; // [16, 1, 4, 4]
-        let shape2 = vec![1 << 2, 1 << 4, 1 << 2, 1 << 2]; // [4, 16, 4, 4]
-        let shape3 = vec![1 << 1, 1 << 2, 1 << 2, 1 << 2]; // [2, 4, 4, 4]
-        let bias1: Tensor<Element> = Tensor::zeros(vec![shape1[0]].into());
-        let bias2: Tensor<Element> = Tensor::zeros(vec![shape2[0]].into());
-        let bias3: Tensor<Element> = Tensor::zeros(vec![shape3[0]].into());
-
-        let trad_conv1: Tensor<Element> = Tensor::new(shape1.clone().into(), w1.clone());
-        let trad_conv2: Tensor<Element> = Tensor::new(shape2.clone().into(), w2.clone());
-        let trad_conv3: Tensor<Element> = Tensor::new(shape3.clone().into(), w3.clone());
-
-        let input_shape = vec![1, 32, 32];
-
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone().into()], PaddingMode::Padding);
-        let input = Tensor::random(&model.input_shapes()[0]);
-        let first_id = model
-            .add_consecutive_layer(
-                Layer::Convolution(
-                    Convolution::new(trad_conv1.clone(), bias1.clone())
-                        .into_padded_and_ffted(&in_dimensions[0].clone().into()),
-                ),
-                None,
-            )
-            .unwrap();
-        let second_id = model
-            .add_consecutive_layer(
-                Layer::Convolution(
-                    Convolution::new(trad_conv2.clone(), bias2.clone())
-                        .into_padded_and_ffted(&in_dimensions[1].clone().into()),
-                ),
-                Some(first_id),
-            )
-            .unwrap();
-        let _third_id = model
-            .add_consecutive_layer(
-                Layer::Convolution(
-                    Convolution::new(trad_conv3.clone(), bias3.clone())
-                        .into_padded_and_ffted(&in_dimensions[2].clone().into()),
-                ),
-                Some(second_id),
-            )
-            .unwrap();
-        model.route_output(None).unwrap();
-
-        // END TEST
-        let trace = model
-            .run::<F>(slice::from_ref(&input), None, &mut Default::default())
-            .unwrap();
-
-        let mut model2 =
-            Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
-        let first_id = model2
-            .add_consecutive_layer(
-                Layer::SchoolBookConvolution(SchoolBookConv(Convolution::new(trad_conv1, bias1))),
-                None,
-            )
-            .unwrap();
-        let second_id = model2
-            .add_consecutive_layer(
-                Layer::SchoolBookConvolution(SchoolBookConv(Convolution::new(trad_conv2, bias2))),
-                Some(first_id),
-            )
-            .unwrap();
-        let _third_id = model2
-            .add_consecutive_layer(
-                Layer::SchoolBookConvolution(SchoolBookConv(Convolution::new(trad_conv3, bias3))),
-                Some(second_id),
-            )
-            .unwrap();
-        model2.route_output(None).unwrap();
-        let trace2 = model
-            .run::<F>(&[input], None, &mut Default::default())
-            .unwrap();
-
-        check_tensor_consistency_field::<GoldilocksExt2>(
-            trace2.outputs().unwrap()[0].to_fields(),
-            trace.outputs().unwrap()[0].to_fields(),
-        );
     }
 
     #[test]
@@ -1173,7 +1049,7 @@ pub(crate) mod test {
         let _conv_layer = model
             .add_consecutive_layer(
                 Layer::Convolution(
-                    Convolution::new(conv1.clone(), Tensor::random(&vec![conv1.kw()].into()))
+                    Convolution::new(conv1.clone(), Tensor::random(&vec![conv1.dim(0)].into()))
                         .into_padded_and_ffted(&in_dimensions[0].clone().into()),
                 ),
                 None,

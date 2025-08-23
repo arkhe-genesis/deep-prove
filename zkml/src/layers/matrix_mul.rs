@@ -83,14 +83,7 @@ impl<T> OperandMatrix<T> {
         match self {
             OperandMatrix::Weight(mat) => match padding_mode {
                 PaddingMode::NoPadding => Some(mat.unpadded_shape.clone()),
-                PaddingMode::Padding => Some(
-                    mat.tensor
-                        .shape()
-                        .into_vec()
-                        .into_iter()
-                        .map(|dim| dim.next_power_of_two())
-                        .collect(),
-                ),
+                PaddingMode::Padding => Some(mat.tensor.shape().next_power_of_two()),
             },
             OperandMatrix::Input => None,
         }

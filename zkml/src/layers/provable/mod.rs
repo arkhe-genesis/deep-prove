@@ -726,7 +726,6 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Flatten => {
                 <Flatten as OpInfo>::output_shapes(&Flatten, input_shapes, padding_mode)
             }
-            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 
@@ -749,7 +748,6 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Requant(requant_ctx) => requant_ctx.num_outputs(num_inputs),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.num_outputs(num_inputs),
             LayerCtx::Flatten => <Flatten as OpInfo>::num_outputs(&Flatten, num_inputs),
-            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 
@@ -772,7 +770,6 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Requant(requant_ctx) => requant_ctx.describe(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.describe(),
             LayerCtx::Flatten => Flatten.describe(),
-            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 
@@ -795,7 +792,6 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Requant(requant_ctx) => requant_ctx.is_provable(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_provable(),
             LayerCtx::Flatten => Flatten.is_provable(),
-            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 }
@@ -860,9 +856,7 @@ where
             (LayerCtx::Softmax(softmax_ctx), LayerProof::Softmax(proof)) => {
                 softmax_ctx.verify(proof, last_claims, verifier, shape_step)
             }
-            (LayerCtx::SchoolBookConvolution(_), _)
-            | (LayerCtx::Flatten, _)
-            | (LayerCtx::Reshape(_), _) => {
+            (LayerCtx::Flatten, _) | (LayerCtx::Reshape(_), _) => {
                 unreachable!("Trying to verify a non-provable layer")
             }
             _ => bail!(
@@ -888,7 +882,6 @@ where
             LayerCtx::Convolution(conv_ctx) => {
                 compute_model_output_claims::<_, PCS, _, _>(conv_ctx, transcript, outputs)
             }
-            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
             LayerCtx::Activation(activation_ctx) => {
                 compute_model_output_claims::<_, PCS, _, _>(activation_ctx, transcript, outputs)
             }
@@ -981,7 +974,6 @@ where
                 inputs,
                 claims,
             ),
-            LayerCtx::SchoolBookConvolution(_) => unreachable!(),
         }
     }
 
@@ -1036,7 +1028,6 @@ where
             (LayerCtx::Pooling(ctx), LayerProof::Pooling(p)) => {
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
-            (LayerCtx::SchoolBookConvolution(_), _) => Ok(()),
             (LayerCtx::Flatten, _) => Ok(()),
             (LayerCtx::Reshape(_), _) => Ok(()),
             _ => bail!(

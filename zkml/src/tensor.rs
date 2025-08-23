@@ -269,51 +269,67 @@ pub fn index_u<E: ExtensionField>(u: &[E], n: usize) -> impl Iterator<Item = E> 
     let len = n * n;
     (0..u.len() / 2).map(move |i| u[len - 1 - i])
 }
+
+/// Returns a permutation to convert a vector from normal order to bit reverse
+/// order.
+///
+/// This can be used to start a FFT using decimation in time or to finalise a
+/// FFT with decimation in frequency.
+pub fn bitreverse_permutation(length: usize) -> impl Iterator<Item = usize> {
+    let shift = usize::BITS - length.ilog2();
+    (0..length).map(move |i| i.reverse_bits() >> shift)
+}
+
+/// Applies a bitreverse order to the slice.
+///
+/// This can be used to start a FFT using decimation in time or to finalise a
+/// FFT with decimation in frequency.
+pub fn bitreverse<T>(d: &mut [T]) {
+    for (orig, new) in bitreverse_permutation(d.len())
+        .enumerate()
+        // filter out duplicates
+        .filter(|(orig, new)| orig < new)
+    {
+        d.swap(orig, new)
+    }
+}
+
+/// Perform a radix-2 Cooley-Turkey FFT.
+///
 /// flag: false -> FFT
 /// flag: true -> iFFT
 pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) {
+    assert!(
+        v.len().is_power_of_two(),
+        "Input vector to fft must be a power of two",
+    );
+
     let n = v.len();
-    let logn = ark_std::log2(n);
-    let mut rev: Vec<usize> = vec![0; n];
-    let mut w: Vec<E> = vec![E::ZERO; n];
+    let logn = n.ilog2();
 
-    rev[0] = 0;
+    // Perform bit reverse permutation. The code below performs decimation in
+    // time (DIT), data is reordered prior to the butterflies.
+    bitreverse(v);
 
-    for i in 1..n {
-        rev[i] = rev[i >> 1] >> 1 | ((i) & 1) << (logn - 1);
-    }
-    w[0] = E::ONE;
-
-    let rou: E = get_root_of_unity(logn as usize);
-    w[1] = rou;
+    // Compute the twiddle factors
+    let mut twiddle: Vec<E> = vec![E::ZERO; n];
+    twiddle[0] = E::ONE;
+    twiddle[1] = get_root_of_unity(logn as usize);
 
     if flag {
-        w[1] = w[1].inverse();
+        twiddle[1] = twiddle[1].inverse();
     }
-
     for i in 2..n {
-        w[i] = w[i - 1] * w[1];
-    }
-
-    // Collect indices that need to be swapped
-    let swaps: Vec<(usize, usize)> = (0..n)
-        .into_par_iter()
-        .filter_map(|i| if rev[i] < i { Some((i, rev[i])) } else { None })
-        .collect();
-
-    // Perform swaps sequentially
-    for (i, j) in swaps {
-        v.swap(i, j);
+        twiddle[i] = twiddle[i - 1] * twiddle[1];
     }
 
     let mut i: usize = 2;
     while i <= n {
-        // Parallelize the FFT butterfly operations
         v.par_chunks_mut(i).for_each(|chunk| {
             let half_i = i >> 1;
             for k in 0..half_i {
                 let u = chunk[k];
-                let l = chunk[k + half_i] * w[n / i * k];
+                let l = chunk[k + half_i] * twiddle[n / i * k];
                 chunk[k] = u + l;
                 chunk[k + half_i] = u - l;
             }
@@ -340,13 +356,36 @@ pub struct ConvData<E>
 where
     E: Clone + ExtensionField,
 {
-    // real_input: For debugging purposes
-    pub real_input: Vec<E>, // Actual data before applying FFT and it is already padded with zeros.
-    pub input: Vec<Vec<E>>, // This is the result of applying index_x to real_input
-    pub input_fft: Vec<Vec<E>>, // FFT(input)
-    pub prod: Vec<Vec<E>>,  // FFT(input) * FFT(weights)
-    pub output: Vec<Vec<E>>, // iFFT(FFT(input) * FFT(weights)) ==> conv
-    pub output_as_element: Vec<Element>, // output as element
+    /// Convolution input data.
+    ///
+    /// This is the same as the convolution input data converted to extension
+    /// field elements, before padding or FFT.
+    ///
+    /// Used for debugging purposes
+    pub real_input: Vec<E>,
+
+    /// The input chunked and reversed
+    pub input: Vec<Vec<E>>,
+
+    /// The input after applying the FFT transformation.
+    ///
+    /// Same as `FFT(input)`.
+    pub input_fft: Vec<Vec<E>>,
+
+    /// The result of the convolution in the frequency domain.
+    ///
+    /// Same as `FFT(input) * FFT(filter)`.
+    pub prod: Vec<Vec<E>>,
+
+    /// The result of the convolution in its original domain.
+    ///
+    /// Same as `iFFT(FFT(input) * FFT(filter))`.
+    pub output: Vec<Vec<E>>,
+
+    /// The result converted to `Element`.
+    ///
+    /// Same as `output` after transforming its type.
+    pub output_as_element: Vec<Element>,
 }
 
 impl<E> ConvData<E>
@@ -651,37 +690,46 @@ impl<T> Tensor<T> {
         self.shape.len()
     }
 
-    /// Get the input shape of the tensor
-    /// TODO: Remove it
-    pub fn get_input_shape(&self) -> Shape {
-        assert!(!self.is_empty(), "Empty tensor");
-        self.og_shape.clone()
-    }
+    /// Returns a reference to the tensor data.
     pub fn get_data(&self) -> &[T] {
         &self.data
     }
 
+    /// Consumes the tensor and return its data.
     pub fn get_data_into(self) -> Vec<T> {
         self.data
     }
-    pub fn kx(&self) -> usize {
-        self.shape[1]
+
+    /// Returns the size of the given dimension.
+    ///
+    /// # Panics
+    ///
+    /// If the shape rank is lower-or-equal to `dim`.
+    pub fn dim(&self, dim: usize) -> usize {
+        self.shape[dim]
     }
-    pub fn kw(&self) -> usize {
-        self.shape[0]
+
+    /// Returns the size of the given dimension prior to padding.
+    ///
+    /// # Panics
+    ///
+    /// If the shape rank is lower-or-equal to `dim`.
+    pub fn og_dim(&self, dim: usize) -> usize {
+        self.og_shape[dim]
     }
-    pub fn nw(&self) -> usize {
-        self.shape[2]
-    }
-    pub fn real_nw(&self) -> usize {
-        self.og_shape[2]
-    }
-    pub fn real_shape(&self) -> Shape {
+
+    pub fn og_shape(&self) -> Shape {
         self.og_shape.clone()
     }
+
     // Returns the size of an individual filter
     pub fn filter_size(&self) -> usize {
         self.shape[2] * self.shape[2]
+    }
+
+    // Returns the size of an individual filter
+    pub fn og_filter_size(&self) -> usize {
+        self.og_shape[2] * self.og_shape[2]
     }
 
     pub fn get_conv_weights<F: ExtensionField>(&self) -> Vec<F>
@@ -725,7 +773,7 @@ impl Tensor<Element> {
         Tensor::new(self.shape.clone(), data)
     }
 
-    pub fn into_fft_conv(self, input_shape: &Shape) -> Self {
+    pub fn into_fft_conv(self, padded_input_shape: &Shape) -> Self {
         let og_shape = self.shape;
         assert!(
             og_shape.product() == self.data.len(),
@@ -742,7 +790,10 @@ impl Tensor<Element> {
         );
 
         // n_w is the padded version of the input
-        let n_w = (input_shape[1] - og_shape[2] + 1).next_power_of_two();
+        //
+        // NOTE: The shape is modified here, but the data is not reallocated. The actual padding
+        // is performed later on convolution evaluation, by the function [index_w];
+        let n_w = (padded_input_shape[1] - og_shape[2] + 1).next_power_of_two();
         let shape = Shape::new(vec![og_shape[0], og_shape[1], n_w, n_w]);
 
         Self {
@@ -757,12 +808,12 @@ impl Tensor<Element> {
     /// This function computes iFFT of the weights so that we can compute the scaling factors used.
     pub fn get_real_weights<F: ExtensionField>(&self) -> Vec<Vec<Vec<Element>>> {
         let mut real_weights =
-            vec![vec![vec![0 as Element; self.nw() * self.nw()]; self.kx()]; self.kw()];
+            vec![vec![vec![0 as Element; self.filter_size()]; self.dim(1)]; self.dim(0)];
 
         let mut ctr = 0;
-        for i in 0..self.kw() {
-            for j in 0..self.kx() {
-                for k in 0..(self.real_nw() * self.real_nw()) {
+        for i in 0..self.dim(0) {
+            for j in 0..self.dim(1) {
+                for k in 0..self.og_filter_size() {
                     real_weights[i][j][k] = self.data[ctr];
                     ctr += 1;
                 }
@@ -778,12 +829,50 @@ impl Tensor<Element> {
         &self,
         x: &Tensor<Element>,
     ) -> (Tensor<Element>, ConvData<F>) {
-        // input to field elements
+        // Sanity check, this layer must have been padded to perform the FFT
+        assert_eq!(
+            self.dim(0),
+            self.og_dim(0),
+            "The number of features maps must match after padding"
+        );
+        assert_eq!(
+            self.dim(1),
+            self.og_dim(1),
+            "The number of channels out must match after padding"
+        );
+        assert!(
+            self.og_dim(2) <= self.dim(2),
+            "The padded width must be greater-than-equal the original width",
+        );
+        assert!(
+            self.og_dim(3) <= self.dim(3),
+            "The padded height must be greater-than-equal the original height",
+        );
+        assert!(
+            self.dim(2).is_power_of_two(),
+            "The padded width must be a power of two",
+        );
+        assert!(
+            self.dim(3).is_power_of_two(),
+            "The padded height must be a power of two",
+        );
+        assert_eq!(x.shape().rank(), 3, "Only 3D input tensors are supported");
+        assert_eq!(
+            x.dim(0),
+            self.dim(1),
+            "Grouping is not support, input and output channels must match. got input {} kernel {}",
+            x.dim(0),
+            self.dim(1),
+        );
+
         let n_x = x.shape[1].next_power_of_two();
         let real_input = x.data.par_iter().map(|e| e.to_field()).collect::<Vec<_>>();
         let new_n = 2 * n_x * n_x;
 
-        let (x_vec, input): (Vec<Vec<F>>, Vec<Vec<F>>) = real_input
+        // Convert the convolution input to the frequency domain.
+        //
+        // This will also collect proving/debugging data.
+        let (input_fft, input): (Vec<Vec<F>>, Vec<Vec<F>>) = real_input
             .par_chunks(n_x * n_x)
             .map(|chunk| {
                 let xx_input = chunk.iter().cloned().rev().collect::<Vec<_>>();
@@ -797,38 +886,44 @@ impl Tensor<Element> {
                 (xx_fft, xx_input)
             })
             .unzip();
-        // let dim1 = x_vec.len();
-        // let dim2 = x_vec[0].len();
 
-        let mut out = vec![vec![F::ZERO; 2 * self.nw() * self.nw()]; self.kw()];
+        let mut output = vec![vec![F::ZERO; 2 * self.filter_size()]; self.dim(0)];
 
-        for i in 0..self.kw() {
-            for j in 0..self.kx() {
-                let range = (i * self.kx() * self.real_nw() * self.real_nw()
-                    + j * self.real_nw() * self.real_nw())
-                    ..(i * self.kx() * self.real_nw() * self.real_nw()
-                        + (j + 1) * self.real_nw() * self.real_nw());
+        // Convert the filter to frequency domain and perform the point-wise multiplication
+        //
+        // Compute a channel at the time.
+        for batch in 0..self.og_dim(0) {
+            for channel in 0..self.og_dim(1) {
+                // The data range for a single channel
+                let og_strides = self.og_shape().strides();
+                let start = batch * og_strides[0] + channel * og_strides[1];
+                let end = start + og_strides[1];
+
                 let mut w_fft_temp = index_w(
-                    &self.data[range],
-                    self.real_nw(),
-                    self.nw(),
-                    2 * self.nw() * self.nw(),
+                    &self.data[start..end],
+                    self.og_dim(2),
+                    self.dim(2),
+                    2 * self.filter_size(),
                 )
                 .collect::<Vec<F>>();
+
+                // Convert the convolution filter to frequency domain
                 fft(&mut w_fft_temp, false);
-                for k in 0..out[i].len() {
-                    out[i][k] += x_vec[j][k] * w_fft_temp[k];
+
+                // Perform the point wise multiplication
+                for k in 0..output[batch].len() {
+                    output[batch][k] += input_fft[channel][k] * w_fft_temp[k];
                 }
             }
         }
-        let prod = out.clone();
-        for elt in out.iter_mut() {
+
+        // Convert the result back from the frequency domain
+        let prod = output.clone();
+        for elt in output.iter_mut() {
             fft(elt, true);
         }
 
-        // TODO: remove the requirement to keep the output value intact
-        let output = out;
-        let conv_data = ConvData::new(real_input, input, x_vec, prod, output, n_x);
+        let conv_data = ConvData::new(real_input, input, input_fft, prod, output, n_x);
         (
             Tensor::new(
                 vec![self.shape[0], n_x, n_x].into(),
@@ -1129,50 +1224,104 @@ impl<T: Number> Tensor<T> {
         self.shape = Shape::new(vec![self.shape.product()]);
     }
 
-    /// Recursively pads the tensor so its ready to be viewed as an MLE
+    /// Pads the tensor to the next power-of-two.
     pub fn pad_next_power_of_two(&self) -> Self {
-        let shape = self.shape();
+        let new_shape = self.shape().next_power_of_two();
 
-        if shape.iter().all(|dim| dim.is_power_of_two()) {
+        // All dimensions are power of two, return a copy
+        if new_shape == self.shape() {
             return self.clone();
         }
 
-        let padded_data = Self::recursive_pad(self.get_data(), &shape, T::default());
-
-        let padded_shape = shape
+        // Walks the shapes in reverse and count number of equal dimensions, if any.
+        //
+        // This determines the copy chunk size, when the dimensions don't
+        // change no padding is necessary, so the data can be chunked together.
+        let equal = new_shape
             .iter()
-            .map(|dim| dim.next_power_of_two())
-            .collect::<Vec<usize>>();
+            .rev()
+            .zip(self.shape.iter().rev())
+            .take_while(|(new, old)| new == old)
+            .count();
 
-        Tensor::<T>::new(padded_shape.into(), padded_data)
-    }
+        let mut new_data = Vec::with_capacity(new_shape.numel());
 
-    fn recursive_pad(data: &[T], remaining_dims: &[usize], padding_value: T) -> Vec<T> {
-        match remaining_dims.len() {
-            // If the remaining dims show we are a vector simply pad
-            1 => data
-                .iter()
-                .cloned()
-                .chain(std::iter::repeat(padding_value))
-                .take(remaining_dims[0].next_power_of_two())
-                .collect::<Vec<T>>(),
-            // Otherwise we recurse
-            _ => {
-                let chunk_size = remaining_dims[1..].iter().product::<usize>();
-                let mut unpadded_data = data
-                    .par_chunks(chunk_size)
-                    .map(|data_chunk| {
-                        Self::recursive_pad(data_chunk, &remaining_dims[1..], padding_value)
-                    })
-                    .collect::<Vec<Vec<T>>>();
-                let elem_size = unpadded_data[0].len();
-                unpadded_data.resize(
-                    remaining_dims[0].next_power_of_two(),
-                    vec![padding_value; elem_size],
-                );
-                unpadded_data.concat()
+        // Corner case when a single copy is needed.
+        if equal + 1 == new_shape.len() {
+            new_data.extend(&self.data);
+            new_data.resize(new_shape.numel(), T::default());
+            return Tensor::<T>::new(new_shape, new_data);
+        }
+
+        // Allocate vector to backup padded data, prefill with zeros.
+        new_data.resize(new_shape.numel(), T::default());
+
+        // Compute the necessary padding at the end of each dimension
+        let new_strides = new_shape.strides();
+        let different = new_shape.len() - equal;
+
+        debug_assert_eq!(
+            &new_strides[different..],
+            &self.shape.strides()[different..],
+            "The lower strides must be equal",
+        );
+
+        let mut padding: Vec<_> = new_shape
+            .iter()
+            .zip(self.shape.iter())
+            .map(|(new, old)| new - old)
+            .enumerate()
+            .map(|(dim, diff)| new_strides[dim] * diff)
+            .take(different)
+            .collect();
+
+        // the top-most dimension padding is implicit. This pop aligns the dimensions to remove off-by-one
+        padding.remove(0);
+
+        // Compute the chunk size for each copy
+        let chunk = self
+            .shape
+            .iter()
+            .rev()
+            .take(equal + 1) // at least the last dimension can be copied in batches
+            .product::<usize>();
+
+        // The old data is being copied, so the number of copies is equal to the old shape
+        let mut copies = self.shape.clone();
+        copies.resize(different - 1, 0);
+
+        // Copy original data into the new position
+        let mut new_start_pos = 0;
+        let mut old_start_pos = 0;
+        while copies[0] != 0 {
+            let new_end_pos = new_start_pos + chunk;
+            let old_end_pos = old_start_pos + chunk;
+
+            new_data[new_start_pos..new_end_pos]
+                .copy_from_slice(&self.data[old_start_pos..old_end_pos]);
+
+            new_start_pos = new_end_pos;
+            old_start_pos = old_end_pos;
+
+            // Compute the new start taking padding into consideration
+            let mut dim = copies.len() - 1;
+            loop {
+                new_start_pos += padding[dim];
+                copies[dim] -= 1;
+
+                if copies[dim] == 0 {
+                    if dim == 0 {
+                        break;
+                    }
+                    copies[dim] = self.shape[dim];
+                    dim -= 1;
+                } else {
+                    break;
+                }
             }
         }
+
+        Tensor::<T>::new(new_shape, new_data)
     }
 
     /// Changes the shape of the current [Tensor] to `target_shape`.
@@ -1494,8 +1643,8 @@ impl<T: Number> Tensor<T> {
         // (M x C/group x kH x kW)
         let (feature_maps, channels_out, kernel_height, kernel_width) = kernels.get4d();
 
-        assert!(self.rank() <= 4, "Supports only at most 4D input.");
-        assert!(kernels.rank() <= 4, "Supports only at most 4D filters.");
+        assert!(self.rank() <= 4, "Supports at most 4D input.");
+        assert!(kernels.rank() <= 4, "Supports at most 4D filters.");
         assert_eq!(
             channels_in,
             channels_out,
@@ -2519,9 +2668,56 @@ mod test {
     use ff_ext::{FieldFrom, GoldilocksExt2};
     use ndarray::{Array, Ix2, Order};
 
-    use crate::{rng_from_env_or_random, testing::random_field_vector};
+    use crate::{
+        rng_from_env_or_random,
+        testing::{random_field_vector, random_vector},
+    };
 
     use super::*;
+
+    #[test]
+    fn test_bitreverse_permutation() {
+        for logn in 1..10 {
+            let n = 1 << logn;
+
+            let mut expected: Vec<usize> = vec![0; n];
+            for i in 1..n {
+                expected[i] = expected[i >> 1] >> 1 | (i & 1) << (logn - 1);
+            }
+
+            for (n, i) in expected.iter().zip(bitreverse_permutation(n)) {
+                assert_eq!(*n, i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitreverse() {
+        for logn in 1..10 {
+            let size = 1 << logn;
+            let mut data = random_vector(size);
+
+            let mut expected = data.clone();
+            let bit_reverse = bitreverse_permutation(size).collect_vec();
+            let permutation: Vec<(usize, usize)> = (0..size)
+                .into_par_iter()
+                .filter_map(|i| {
+                    if bit_reverse[i] < i {
+                        Some((i, bit_reverse[i]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (i, j) in permutation {
+                expected.swap(i, j);
+            }
+
+            bitreverse(&mut data);
+            assert_eq!(expected, data);
+        }
+    }
 
     #[test]
     fn test_tensor_basic_ops() {
@@ -2634,14 +2830,78 @@ mod test {
 
     #[test]
     fn test_tensor_next_pow_of_two() {
-        let shape = vec![3usize, 3].into();
-        let mat = Tensor::<Element>::random_seed(&shape, Some(213));
-        let new_shape = vec![shape[0].next_power_of_two(), shape[1].next_power_of_two()];
-        let new_mat = mat.pad_next_power_of_two();
+        let shape = Shape::new(vec![1, 1, 1, 1]);
+        let tensor = Tensor::new(shape.clone(), vec![1]);
         assert_eq!(
-            new_mat.shape(),
-            new_shape.into(),
-            "Matrix padding to next power of two failed."
+            tensor.pad_next_power_of_two(),
+            tensor,
+            "Tensor should not change if the shape is already power of two",
+        );
+
+        let shape = Shape::new(vec![2, 2]);
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2]);
+        assert_eq!(
+            tensor.pad_next_power_of_two(),
+            tensor,
+            "Tensor should not change if the shape is already power of two",
+        );
+
+        let shape = Shape::new(vec![4, 4]);
+        let tensor = Tensor::<Element>::random(&shape.clone());
+        assert_eq!(
+            tensor.pad_next_power_of_two(),
+            tensor,
+            "Tensor should not change if the shape is already power of two",
+        );
+
+        let shape = Shape::new(vec![3, 3]);
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 3, 1, 2, 3, 1, 2, 3]);
+        let new_tensor = tensor.pad_next_power_of_two();
+        assert_eq!(
+            new_tensor.shape(),
+            Shape::new(vec![4, 4]),
+            "Tensor padding to next power of two failed."
+        );
+        assert_eq!(
+            new_tensor.data(),
+            [1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 0, 0, 0, 0],
+            "Tensor padding to next power of two failed."
+        );
+
+        let shape = Shape::new(vec![3, 2]);
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2, 1, 2]);
+        let new_tensor = tensor.pad_next_power_of_two();
+        assert_eq!(
+            new_tensor.shape(),
+            Shape::new(vec![4, 2]),
+            "Tensor padding to next power of two failed."
+        );
+        assert_eq!(
+            new_tensor.data(),
+            [1, 2, 1, 2, 1, 2, 0, 0],
+            "Tensor padding to next power of two failed."
+        );
+
+        let shape = Shape::new(vec![2, 3, 3]);
+        let tensor = Tensor::new(
+            shape.clone(),
+            vec![
+                1, 1, 1, 2, 2, 2, 3, 3, 3, 11, 11, 11, 12, 12, 12, 13, 13, 13,
+            ],
+        );
+        let new_tensor = tensor.pad_next_power_of_two();
+        assert_eq!(
+            new_tensor.shape(),
+            Shape::new(vec![2, 4, 4]),
+            "Tensor padding to next power of two failed."
+        );
+        assert_eq!(
+            new_tensor.data(),
+            [
+                1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 0, 0, 0, 0, 0, 11, 11, 11, 0, 12, 12, 12, 0, 13,
+                13, 13, 0, 0, 0, 0, 0,
+            ],
+            "Tensor padding to next power of two failed."
         );
     }
 
@@ -2767,12 +3027,12 @@ mod test {
 
                         let filter_shape =
                             Shape::new(vec![feature_maps, channels, filter_size, filter_size]);
-                        let input_shape = Shape::new(vec![channels, input_size, input_size]);
-                        let input_size = input_shape.numel();
+                        let padded_input_shape = Shape::new(vec![channels, input_size, input_size]);
+                        let input_size = padded_input_shape.numel();
 
                         let filter = Tensor::random(&filter_shape);
-                        let fft_filter = filter.clone().into_fft_conv(&input_shape);
-                        let input = Tensor::new(input_shape, vec![3; input_size]);
+                        let fft_filter = filter.clone().into_fft_conv(&padded_input_shape);
+                        let input = Tensor::new(padded_input_shape, vec![3; input_size]);
 
                         let (result, _) = fft_filter.fft_conv::<GoldilocksExt2>(&input);
                         let bias = Tensor::<Element>::zero(Shape::new(vec![feature_maps]));
@@ -3508,5 +3768,56 @@ mod test {
         t1.concat_from_unpadded(6, t3, t3_shape.dim(0)).unwrap();
         let expected_shape = Shape(vec![9, 4, 4]);
         assert_eq!(t1.shape(), expected_shape);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_pad_next_power_of_two_prop(x in 1usize..5, y in 2usize..1028, z in 2usize..1028) {
+            pub fn pad_next_power_of_two(t: &Tensor<Element>) -> Tensor<Element> {
+                let shape = t.shape();
+
+                if shape.iter().all(|dim| dim.is_power_of_two()) {
+                    return t.clone();
+                }
+
+                let padded_data = recursive_pad(t.get_data(), &shape, Element::default());
+                let padded_shape = shape.next_power_of_two();
+                Tensor::new(padded_shape, padded_data)
+            }
+
+            fn recursive_pad(data: &[Element], remaining_dims: &[usize], padding_value: Element) -> Vec<Element> {
+                match remaining_dims.len() {
+                    1 => data
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::repeat(padding_value))
+                        .take(remaining_dims[0].next_power_of_two())
+                        .collect::<Vec<_>>(),
+                    _ => {
+                        let chunk_size = remaining_dims[1..].iter().product::<usize>();
+                        let mut unpadded_data = data
+                            .par_chunks(chunk_size)
+                            .map(|data_chunk| {
+                                recursive_pad(data_chunk, &remaining_dims[1..], padding_value)
+                            })
+                            .collect::<Vec<Vec<_>>>();
+                        let elem_size = unpadded_data[0].len();
+                        unpadded_data.resize(
+                            remaining_dims[0].next_power_of_two(),
+                            vec![padding_value; elem_size],
+                        );
+                        unpadded_data.concat()
+                    }
+                }
+            }
+
+            let shape = Shape::new(vec![x, y, z]);
+            let t = Tensor::<Element>::random(&shape);
+
+            assert_eq!(t.pad_next_power_of_two(), pad_next_power_of_two(&t), "original: {t:?}");
+        }
+
     }
 }

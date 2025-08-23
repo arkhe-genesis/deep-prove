@@ -62,7 +62,7 @@ use crate::{
     tensor::{ConvData, DryTensor, Number, Shape, Tensor},
 };
 use activation::ActivationCtx;
-use convolution::{ConvCtx, ConvProof, SchoolBookConv, SchoolBookConvCtx};
+use convolution::{ConvCtx, ConvProof};
 use dense::{DenseCtx, DenseProof};
 use matrix_mul::{MatMul, MatMulCtx, MatMulProof};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -72,11 +72,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub enum Layer<T> {
     Dense(Dense<T>),
     MatMul(MatMul<T>),
-    // TODO: replace this with a Tensor based implementation
     Convolution(Convolution<T>),
-    // Traditional convolution is used for debug purposes. That is because the actual convolution
-    // we use relies on the FFT algorithm. This convolution does not have a snark implementation.
-    SchoolBookConvolution(SchoolBookConv<T>),
     Activation(Activation<T>),
     // this is the output quant info. Since we always do a requant layer after each dense,
     // then we assume the inputs requant info are default()
@@ -101,7 +97,6 @@ impl<T> Layer<T> {
             Layer::Dense(_) => "DENS",
             Layer::MatMul(_) => "MMUL",
             Layer::Convolution(_) => "CONV",
-            Layer::SchoolBookConvolution(_) => "SBCN",
             Layer::Activation(_) => "ACTI",
             Layer::Requant(_) => "REQU",
             Layer::Pooling(_) => "POOL",
@@ -144,7 +139,6 @@ pub enum LayerCtx<E: ExtensionField> {
     Dense(DenseCtx),
     MatMul(MatMulCtx),
     Convolution(ConvCtx),
-    SchoolBookConvolution(SchoolBookConvCtx),
     Activation(ActivationCtx<E>),
     Requant(RequantCtx<E>),
     Pooling(PoolingCtx),
@@ -193,7 +187,6 @@ impl<T> Layer<T> {
         match self {
             Layer::Dense(_) => "dense",
             Layer::Convolution(_) => "convolution",
-            Layer::SchoolBookConvolution(_) => "school-book-convolution",
             Layer::Activation(_) => "activation",
             Layer::Requant(_) => "requant",
             Layer::Pooling(_) => "pooling",
@@ -228,7 +221,6 @@ impl<E: ExtensionField> LayerCtx<E> {
             Self::Reshape(_) => "Reshape".to_string(),
             Self::Positional(_) => "Positional".to_string(),
             Self::Embeddings(_) => "Embeddings".to_string(),
-            Self::SchoolBookConvolution(_) => "Traditional Convolution".to_string(),
             Self::Convolution(_) => "Convolution".to_string(),
             Self::Activation(_) => "Activation".to_string(),
             Self::Requant(_) => "Requant".to_string(),
@@ -238,7 +230,7 @@ impl<E: ExtensionField> LayerCtx<E> {
     }
 
     pub fn has_proof(&self) -> bool {
-        !matches!(self, Self::Flatten | Self::SchoolBookConvolution(_))
+        !matches!(self, Self::Flatten)
     }
 
     pub fn next_shape_step(&self, last_step: &ShapeStep) -> ShapeStep {
@@ -462,9 +454,6 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Softmax(softmax) => softmax.output_shapes(input_shapes, padding_mode),
             Layer::Embeddings(embeddings) => embeddings.output_shapes(input_shapes, padding_mode),
             Layer::Reshape(reshape) => reshape.output_shapes(input_shapes, padding_mode),
-            Layer::SchoolBookConvolution(convolution) => {
-                convolution.output_shapes(input_shapes, padding_mode)
-            }
             Layer::Activation(activation) => activation.output_shapes(input_shapes, padding_mode),
             Layer::Requant(requant) => requant.output_shapes(input_shapes, padding_mode),
             Layer::Pooling(pooling) => pooling.output_shapes(input_shapes, padding_mode),
@@ -487,7 +476,6 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Reshape(reshape) => reshape.num_outputs(num_inputs),
             Layer::Positional(positional) => positional.num_outputs(num_inputs),
             Layer::Embeddings(embeddings) => embeddings.num_outputs(num_inputs),
-            Layer::SchoolBookConvolution(convolution) => convolution.num_outputs(num_inputs),
             Layer::Activation(activation) => activation.num_outputs(num_inputs),
             Layer::Requant(requant) => requant.num_outputs(num_inputs),
             Layer::Pooling(pooling) => pooling.num_outputs(num_inputs),
@@ -510,7 +498,6 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Positional(positional) => positional.describe(),
             Layer::Reshape(reshape) => reshape.describe(),
             Layer::Embeddings(embeddings) => embeddings.describe(),
-            Layer::SchoolBookConvolution(convolution) => convolution.describe(),
             Layer::Activation(activation) => activation.describe(),
             Layer::Requant(requant) => requant.describe(),
             Layer::Pooling(pooling) => pooling.describe(),
@@ -533,7 +520,6 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Logits(logits) => logits.is_provable(),
             Layer::Reshape(reshape) => reshape.is_provable(),
             Layer::Embeddings(embeddings) => embeddings.is_provable(),
-            Layer::SchoolBookConvolution(school_book_conv) => !school_book_conv.is_provable(),
             Layer::Activation(activation) => activation.is_provable(),
             Layer::Requant(requant) => requant.is_provable(),
             Layer::Pooling(pooling) => pooling.is_provable(),
@@ -564,9 +550,6 @@ impl Evaluate<f32> for Layer<f32> {
             Layer::Positional(positional) => positional.evaluate(inputs, unpadded_input_shapes),
             Layer::Reshape(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
             Layer::Embeddings(embeddings) => embeddings.evaluate(inputs, unpadded_input_shapes),
-            Layer::SchoolBookConvolution(school_book_conv) => {
-                school_book_conv.evaluate(inputs, unpadded_input_shapes)
-            }
             Layer::Activation(activation) => activation.evaluate(inputs, unpadded_input_shapes),
             Layer::Requant(_) => unreachable!("Requant layer found when evaluating over float"),
             Layer::Pooling(pooling) => pooling.evaluate(inputs, unpadded_input_shapes),
@@ -597,9 +580,6 @@ impl Evaluate<Element> for Layer<Element> {
             Layer::Positional(positional) => positional.evaluate(inputs, unpadded_input_shapes),
             Layer::Embeddings(embeddings) => embeddings.evaluate(inputs, unpadded_input_shapes),
             Layer::Reshape(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
-            Layer::SchoolBookConvolution(school_book_conv) => {
-                school_book_conv.evaluate(inputs, unpadded_input_shapes)
-            }
             Layer::Activation(activation) => activation.evaluate(inputs, unpadded_input_shapes),
             Layer::Requant(requant) => requant.evaluate(inputs, unpadded_input_shapes),
             Layer::Pooling(pooling) => pooling.evaluate(inputs, unpadded_input_shapes),
@@ -639,7 +619,6 @@ impl ProveInfo for Layer<Element> {
             Layer::Reshape(reshape) => reshape.step_info(id, aux),
             Layer::MatMul(mat) => mat.step_info(id, aux),
             Layer::Convolution(conv) => conv.step_info(id, aux),
-            Layer::SchoolBookConvolution(conv) => conv.step_info(id, aux),
             Layer::Activation(activation) => activation.step_info(id, aux),
             Layer::Requant(requant) => requant.step_info(id, aux),
             Layer::Pooling(pooling) => pooling.step_info(id, aux),
@@ -666,9 +645,6 @@ impl PadOp for Layer<Element> {
             Layer::Positional(positional) => Layer::Positional(positional.pad_node(si)?),
             Layer::Embeddings(embeddings) => Layer::Embeddings(embeddings.pad_node(si)?),
             Layer::MatMul(mat) => Layer::MatMul(mat.pad_node(si)?),
-            Layer::SchoolBookConvolution(school_book_conv) => {
-                Layer::SchoolBookConvolution(school_book_conv.pad_node(si)?)
-            }
             Layer::Activation(activation) => Layer::Activation(activation.pad_node(si)?),
             Layer::Requant(requant) => Layer::Requant(requant.pad_node(si)?),
             Layer::Pooling(pooling) => Layer::Pooling(pooling.pad_node(si)?),
@@ -728,9 +704,6 @@ where
             (Layer::Logits(logits), LayerCtx::Logits(info)) => {
                 logits.prove(node_id, info, last_claims, step_data, prover, store)
             }
-            (Layer::SchoolBookConvolution(_), LayerCtx::SchoolBookConvolution(_)) => {
-                unreachable!("prove cannot be called for school book convolution")
-            }
             (Layer::Activation(activation), LayerCtx::Activation(info)) => {
                 activation.prove(node_id, info, last_claims, step_data, prover, store)
             }
@@ -786,11 +759,6 @@ where
             }
             Layer::Embeddings(embeddings) => {
                 embeddings.gen_lookup_witness(id, ctx, step_data, store)
-            }
-            Layer::SchoolBookConvolution(school_book_conv) => {
-                // check that the layer is not provable, so we don't need to call the method
-                assert!(!school_book_conv.is_provable());
-                Ok(Default::default())
             }
             Layer::Activation(activation) => {
                 activation.gen_lookup_witness(id, ctx, step_data, store)
@@ -890,14 +858,6 @@ impl QuantizeOp for Layer<f32> {
                 let output = embeddings.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(
                     Layer::Embeddings(output.quantized_op),
-                    output.output_scalings,
-                )
-                .maybe_requants(output.requant_layer)
-            }
-            Layer::SchoolBookConvolution(school_book_conv) => {
-                let output = school_book_conv.quantize_op::<S>(data, node_id, input_scaling)?;
-                QuantizeOutput::new(
-                    Layer::SchoolBookConvolution(output.quantized_op),
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)

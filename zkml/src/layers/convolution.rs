@@ -87,9 +87,6 @@ pub fn to_bits<E: ExtensionField>(mut num: usize, bitlen: usize) -> Vec<E> {
     bits
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SchoolBookConv<T>(pub(crate) Convolution<T>);
-
 /// Contains proof material related to one step of the inference for a convolution layer
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
@@ -129,7 +126,7 @@ pub struct ConvProof<E: ExtensionField> {
 impl<T> Convolution<T> {
     pub fn new(filter: Tensor<T>, bias: Tensor<T>) -> Self {
         assert_eq!(bias.rank(), 1);
-        assert_eq!(filter.kw(), bias.shape()[0]);
+        assert_eq!(filter.dim(0), bias.shape()[0]);
         assert_eq!(filter.rank(), 4);
         let filter_shape = filter.shape();
         Self {
@@ -143,7 +140,7 @@ impl<T> Convolution<T> {
         match padding_mode {
             // unpadded shape is the shape found in onxx file for example
             PaddingMode::NoPadding => conv2d_shape(input_shape, &self.unpadded_shape),
-            PaddingMode::Padding => padded_conv2d_shape(input_shape, &self.filter.real_shape()),
+            PaddingMode::Padding => padded_conv2d_shape(input_shape, &self.filter.og_shape()),
         }
     }
 
@@ -158,11 +155,11 @@ impl<T> Convolution<T> {
     }
 
     pub(crate) fn kw(&self) -> usize {
-        self.filter.kw()
+        self.filter.dim(0)
     }
 
     pub(crate) fn kx(&self) -> usize {
-        self.filter.kx()
+        self.filter.dim(1)
     }
 
     pub(crate) fn filter_size(&self) -> usize {
@@ -177,14 +174,17 @@ impl<T> Convolution<T> {
 
 impl<T: Number> Convolution<T> {
     pub(crate) fn new_without_bias(filter: Tensor<T>) -> Self {
-        let bias = Tensor::zeros(Shape::new(vec![filter.kw()]));
+        let bias = Tensor::zeros(Shape::new(vec![filter.dim(0)]));
         Self::new(filter, bias)
     }
 
     pub fn add_bias(&self, conv_out: &Tensor<T>) -> Tensor<T> {
         let mut arr = Tensor::zero(conv_out.shape().clone());
-        assert_eq!(conv_out.data_size(), conv_out.kw() * conv_out.filter_size());
-        for i in 0..conv_out.kw() {
+        assert_eq!(
+            conv_out.data_size(),
+            conv_out.dim(0) * conv_out.filter_size()
+        );
+        for i in 0..conv_out.dim(0) {
             for j in 0..conv_out.filter_size() {
                 let idx = i * conv_out.filter_size() + j;
                 arr[idx] = conv_out[idx] + self.bias[i];
@@ -209,10 +209,10 @@ impl<T: Number> OpInfo for Convolution<T> {
     fn describe(&self) -> String {
         format!(
             "Conv: ({},{},{},{})",
-            self.filter.kw(),
-            self.filter.kx(),
-            self.filter.nw(),
-            self.filter.nw()
+            self.filter.dim(0),
+            self.filter.dim(1),
+            self.filter.dim(2),
+            self.filter.dim(2),
         )
     }
 
@@ -336,10 +336,7 @@ impl Convolution<Element> {
     pub fn into_padded_and_ffted(mut self, unpadded_input_shape: &Shape) -> Self {
         self.filter = self.filter.pad_next_power_of_two();
         self.bias = self.bias.pad_next_power_of_two();
-        let padded_input_shape = unpadded_input_shape
-            .iter()
-            .map(|&x| x.next_power_of_two())
-            .collect::<Shape>();
+        let padded_input_shape = unpadded_input_shape.next_power_of_two();
         self.filter = self.filter.into_fft_conv(&padded_input_shape);
         self
     }
@@ -358,7 +355,7 @@ impl Convolution<Element> {
         // since the garbage might be of any value and we need to restrict the range of the output due to requantization proving logic.
         let unpadded_output_shape = conv2d_shape(unpadded_input_shape, &self.unpadded_shape);
         debug_assert_eq!(
-            { padded_conv2d_shape(&input.shape(), &self.filter.real_shape()) },
+            { padded_conv2d_shape(&input.shape(), &self.filter.og_shape()) },
             conv_output.shape(),
             "FFT output shape not computable"
         );
@@ -395,8 +392,8 @@ impl Convolution<Element> {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
-        let padded_rows = 2 * self.filter.nw() * self.filter.nw();
-        let mut w1_reduced: Vec<E> = vec![E::ZERO; self.filter.real_nw() * self.filter.real_nw()];
+        let padded_rows = 2 * self.filter.filter_size();
+        let mut w1_reduced: Vec<E> = vec![E::ZERO; self.filter.og_filter_size()];
 
         // Partition r in (r1,r2)
         let mut r1 = vec![E::ZERO; padded_rows.ilog2() as usize];
@@ -422,13 +419,13 @@ impl Convolution<Element> {
         );
 
         // compute X(i,r2)
-        let filter_size = self.filter.real_nw() * self.filter.real_nw();
-        (0..self.filter.kw()).for_each(|i| {
-            (0..self.filter.kx()).for_each(|j| {
+        let filter_size = self.filter.og_filter_size();
+        (0..self.filter.dim(0)).for_each(|i| {
+            (0..self.filter.dim(1)).for_each(|j| {
                 (0..filter_size).for_each(|k| {
-                    let index = i * filter_size * self.filter.kx() + j * filter_size + k;
+                    let index = i * filter_size * self.filter.dim(1) + j * filter_size + k;
                     let v: E = self.filter[index].to_field();
-                    w1_reduced[k] += beta[i * self.filter.kx() + j] * v;
+                    w1_reduced[k] += beta[i * self.filter.dim(1) + j] * v;
                 });
             });
         });
@@ -436,8 +433,8 @@ impl Convolution<Element> {
         let partial_evals = w1_reduced.clone();
         w1_reduced = index_wf(
             &w1_reduced,
-            self.filter.real_nw(),
-            self.filter.nw(),
+            self.filter.og_dim(2),
+            self.filter.dim(2),
             padded_rows,
         )
         .collect::<Vec<E>>();
@@ -500,11 +497,11 @@ impl ProveInfo for Convolution<Element> {
             node_id: id,
             kw: self.kw(),
             kx: self.kx(),
-            nw: self.filter.nw(),
-            real_nw: self.filter.real_nw(),
+            nw: self.filter.dim(2),
+            real_nw: self.filter.og_dim(2),
             filter_size: self.filter_size(),
             unpadded_filter_shape: self.unpadded_shape.clone(),
-            padded_filter_shape: self.filter.real_shape(),
+            padded_filter_shape: self.filter.og_shape(),
         });
 
         let filter_poly = self.filter.pad_next_power_of_two().into_data();
@@ -868,18 +865,18 @@ impl Convolution<Element> {
         // After computing w_reduced, observe that y = \sum_{k \in [n_x^2]} sum_{j \in [k_x]} beta2[k]*x[j][k]*w_reduced[j][k]
         // This is a cubic sumcheck where v1 = [x[0][0],...,x[k_x][n_x^2]], v2 = [w_reduced[0][0],...,w_reduced[k_x][n_x^2]]
         // and v3 = [beta2,..(k_x times)..,beta2]. So, first initialize v3 and then invoke the cubic sumceck.
-        let mut aggregated_filter =
-            vec![vec![E::ZERO; self.filter.real_nw() * self.filter.real_nw()]; self.filter.kx()];
-        let filter_size = self.filter.real_nw() * self.filter.real_nw();
+        let og_filter_size = self.filter.og_filter_size();
+        let mut aggregated_filter = vec![vec![E::ZERO; og_filter_size]; self.filter.dim(1)];
         // Compute aggregated_filter using iterators
         // TO DO: PARALLELIZE
-        (0..self.filter.kx()).for_each(|i| {
-            (0..self.filter.kw()).for_each(|j| {
+        (0..self.filter.dim(1)).for_each(|i| {
+            (0..self.filter.dim(0)).for_each(|j| {
                 aggregated_filter[i]
                     .iter_mut()
                     .enumerate()
                     .for_each(|(k, v)| {
-                        let index = j * self.filter.kx() * filter_size + i * filter_size + k;
+                        let index =
+                            j * self.filter.dim(1) * og_filter_size + i * og_filter_size + k;
                         let v_field: E = self.filter[index].to_field();
                         *v += beta1[j] * v_field;
                     });
@@ -887,9 +884,9 @@ impl Convolution<Element> {
 
             aggregated_filter[i] = index_wf(
                 &aggregated_filter[i],
-                self.filter.real_nw(),
-                self.filter.nw(),
-                2 * self.filter.nw() * self.filter.nw(),
+                self.filter.og_dim(2),
+                self.filter.dim(2),
+                2 * self.filter.filter_size(),
             )
             .collect::<Vec<E>>();
 
@@ -948,7 +945,7 @@ impl Convolution<Element> {
 
         let weights_rand: Vec<E> = prover
             .transcript
-            .read_challenges((self.filter.real_nw() * self.filter.real_nw()).ilog2() as usize);
+            .read_challenges((self.filter.og_filter_size()).ilog2() as usize);
         debug_assert!({
             let mut weights_point = fft_weight_point.clone();
             let mut v_weights = weights_point.pop().unwrap();
@@ -956,7 +953,7 @@ impl Convolution<Element> {
 
             let mut r = [
                 weights_rand.clone(),
-                point[(2 * self.filter.nw() * self.filter.nw()).ilog2() as usize..].to_vec(),
+                point[(2 * self.filter.filter_size()).ilog2() as usize..].to_vec(),
             ]
             .concat();
             // println!("({},{}), {}",proving_data.input.len(),proving_data.input[0].len(),p.len());
@@ -966,14 +963,14 @@ impl Convolution<Element> {
                 partial_evals.clone().into_mle().evaluate(&weights_rand),
                 "Error in fft_weights eval"
             );
-            let mut indexes = vec![0_usize; self.filter.real_nw() * self.filter.real_nw()];
-            for i in 0..self.filter.real_nw() {
-                for j in 0..self.filter.real_nw() {
-                    indexes[i * self.filter.real_nw() + j] = i * self.filter.nw() + j;
+            let mut indexes = vec![0_usize; self.filter.og_filter_size()];
+            for i in 0..self.filter.og_dim(2) {
+                for j in 0..self.filter.og_dim(2) {
+                    indexes[i * self.filter.og_dim(2) + j] = i * self.filter.dim(2) + j;
                 }
             }
-            r = weights_point[..(self.filter.nw() * self.filter.nw()).ilog2() as usize].to_vec();
-            let mut betas = vec![E::ZERO; self.filter.real_nw() * self.filter.real_nw()];
+            r = weights_point[..(self.filter.filter_size()).ilog2() as usize].to_vec();
+            let mut betas = vec![E::ZERO; self.filter.og_filter_size()];
             for i in 0..betas.len() {
                 betas[i] = identity_eval(&r, &to_bits(indexes[i], r.len()));
             }
@@ -993,7 +990,7 @@ impl Convolution<Element> {
         let filter_claim = Claim::new(
             [
                 weights_rand.clone(),
-                point[(2 * self.filter.nw() * self.filter.nw()).ilog2() as usize..].to_vec(),
+                point[(2 * self.filter.filter_size()).ilog2() as usize..].to_vec(),
             ]
             .concat(),
             partial_evals.clone().into_mle().evaluate(&weights_rand),
@@ -1397,80 +1394,6 @@ impl ConvCtx {
     }
 }
 
-impl<T: Number> OpInfo for SchoolBookConv<T> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        self.0.output_shapes(input_shapes, padding_mode)
-    }
-
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        self.0.num_outputs(num_inputs)
-    }
-
-    fn describe(&self) -> String {
-        todo!()
-    }
-
-    fn is_provable(&self) -> bool {
-        false
-    }
-}
-
-impl<T: Number> Evaluate<T> for SchoolBookConv<T> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&Tensor<T>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> anyhow::Result<LayerOut<T, E>> {
-        ensure!(
-            inputs.len() == 1,
-            "Found more than 1 input when evaluating schoolbook convolution layer"
-        );
-        let input = inputs[0];
-        Ok(LayerOut::from_vec(vec![input.conv2d(
-            &self.0.filter,
-            &self.0.bias,
-            1,
-        )]))
-    }
-}
-
-impl PadOp for SchoolBookConv<Element> {}
-
-impl QuantizeOp for SchoolBookConv<f32> {
-    type QuantizedOp = SchoolBookConv<Element>;
-
-    fn quantize_op<S: ScalingStrategy>(
-        self,
-        _: &S::AuxData,
-        _node_id: NodeId,
-        input_scaling: &[ScalingFactor],
-    ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        Ok(QuantizeOutput {
-            quantized_op: SchoolBookConv(self.0.quantize(
-                // we don't care about accurate quantization for schoolbook conv
-                &input_scaling[0],
-                &input_scaling[0],
-            )),
-            output_scalings: input_scaling.to_vec(),
-            requant_layer: None,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SchoolBookConvCtx;
-
-impl ProveInfo for SchoolBookConv<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        _id: NodeId,
-        aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
-        let conv_info = LayerCtx::SchoolBookConvolution(SchoolBookConvCtx);
-        Ok((conv_info, aux))
-    }
-}
-
 pub fn pow_two_omegas<E: ExtensionField>(n: usize, is_fft: bool) -> Vec<E> {
     let mut pows = vec![E::ZERO; n - 1];
     let mut rou: E = get_root_of_unity(n);
@@ -1592,11 +1515,7 @@ pub fn conv2d_shape(input_shape: &Shape, filter_shape: &Shape) -> Shape {
 
 /// Similar to conv2d_shape but pads the output shape such that it matches what the padded inference and proving expects
 pub fn padded_conv2d_shape(input_shape: &Shape, filter_shape: &Shape) -> Shape {
-    conv2d_shape(input_shape, filter_shape)
-        .into_vec()
-        .into_iter()
-        .map(|x| x.next_power_of_two())
-        .collect::<Shape>()
+    conv2d_shape(input_shape, filter_shape).next_power_of_two()
 }
 
 #[cfg(test)]
@@ -1649,17 +1568,10 @@ mod test {
 
     #[test]
     fn test_conv_clearing_garbage() {
-        let shape: Vec<usize> = vec![5, 18, 18];
-        let padded_shape = shape
-            .iter()
-            .map(|x| x.next_power_of_two())
-            .collect::<Shape>();
+        let shape = Shape::new(vec![5, 18, 18]);
+        let padded_shape = shape.next_power_of_two();
         let tensor = Tensor::random(&padded_shape);
-        subtest_clearing_methods(&tensor, &shape.into());
-        // let clearing_tensor = new_clearing_tensor(&shape, &padded_shape);
-        // let cleared_tensor = tensor.flatten().mul(&clearing_tensor);
-        // let auto_cleared_tensor = clear_garbage(&tensor, &shape);
-        // assert_eq!(cleared_tensor.get_data(), auto_cleared_tensor.get_data());
+        subtest_clearing_methods(&tensor, &shape);
     }
 
     #[test]
@@ -1676,8 +1588,6 @@ mod test {
     fn test_conv_unpadded_to_padded() {
         let input_shape: Shape = vec![1, 23, 23].into();
         let conv_shape_og: Shape = vec![7, 1, 3, 3].into();
-        // let input_shape: Shape = vec![1, 5, 5];
-        // let conv_shape_og: Shape = vec![1, 1, 2, 2];
         let weight = Tensor::random(&conv_shape_og);
         let bias: Tensor<Element> = Tensor::zeros(vec![conv_shape_og[0]].into());
         let input = Tensor::random(&input_shape);
@@ -1701,28 +1611,14 @@ mod test {
         assert_eq!(given_output_shape, exp_output_shape);
 
         // make sure we can reconstruct the fft output purely from conv_data since it's needed for proving
-        let weight_padded_shape = weight
-            .shape()
-            .iter()
-            .map(|x| x.next_power_of_two())
-            .collect::<Shape>();
-        let fft_output_shape = conv2d_shape(&padded_input.shape(), &weight_padded_shape);
-        let fft_output_shape = fft_output_shape
-            .iter()
-            .map(|x| x.next_power_of_two())
-            .collect::<Shape>();
-        println!("INSIDE TEST: fft_output.shape() : {:?}", fft_output.shape());
-        println!("INSIDE TEST: fft_output_shape conv2d_shape(): {fft_output_shape:?}");
-        println!(
-            "INSIDE TEST: padded_input shape: {:?}",
-            padded_input.shape()
-        );
+        let weight_padded_shape = weight.shape().next_power_of_two();
+        let fft_output_shape =
+            conv2d_shape(&padded_input.shape(), &weight_padded_shape).next_power_of_two();
         assert_eq!(fft_output.shape(), fft_output_shape);
-        // let fft_output_data = conv_data.output_as_element(padded_input.get_shape()[1].next_power_of_two());
+
         let fft_output_data = conv_data.output_as_element;
         let reconstructed_fft_tensor = Tensor::new(fft_output_shape.clone(), fft_output_data);
         subtest_clearing_methods(&reconstructed_fft_tensor, &output.shape());
-        // let cleared_reconstructed_fft_tensor = clear_garbage(&reconstructed_fft_tensor, &output.get_shape());
         let hadamard_clearing = new_clearing_tensor(&output.shape(), &fft_output_shape);
         let hadamard_cleared = reconstructed_fft_tensor.flatten().mul(&hadamard_clearing);
         assert_eq!(hadamard_cleared.get_data(), fft_output.get_data());
