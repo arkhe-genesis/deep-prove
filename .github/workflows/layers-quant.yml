@@ -1,16 +1,40 @@
-name: "Layer quantization regression tests"
+name: "Layer Quantization Regression Tests"
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
 
 concurrency:
   group: quant-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
+  changes:
+    runs-on: ['nix']
+    if: github.event.pull_request.draft == false
+    permissions:
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.filter.outputs.watches }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            watches:
+              - 'tenstore/**'
+              - 'utils/**'
+              - 'zkml/**'
+
+  quantization-validation:
+    name: Run Layer Quantization Regression Tests
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
     runs-on: ['nix']
     steps:
-
       - name: Clean previous outputs
         run: |
           rm -r ~/layers-quant 2> /dev/null || true
