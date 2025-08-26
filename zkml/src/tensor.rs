@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use ark_std::rand::Rng;
-use burn::tensor::{Int, Tensor as BTensor, TensorData};
+use burn::tensor::{BasicOps, Int, Numeric, Tensor as BTensor, TensorData, TensorKind};
 use ceno_p3::{
     field::{Field, FieldAlgebra, TwoAdicField},
     goldilocks::Goldilocks,
@@ -952,8 +952,7 @@ impl Tensor<Element> {
 
     /// Consumes this tensor and creates a [burn::tensor::Tensor].
     pub fn into_btensor<const D: usize>(self) -> BTensor<Backend, D, Int> {
-        let shape = self.shape();
-        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
+        IntoBTensor::into_btensor(self)
     }
 }
 
@@ -1008,8 +1007,7 @@ impl Tensor<f32> {
 
     /// Consumes this tensor and creates a [burn::tensor::Tensor].
     pub fn into_btensor<const D: usize>(self) -> BTensor<Backend, D> {
-        let shape = self.shape();
-        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
+        IntoBTensor::into_btensor(self)
     }
 }
 
@@ -2662,6 +2660,30 @@ pub fn get_broadcasted_shape(shape_a: &Shape, shape_b: &Shape) -> anyhow::Result
                 .collect::<Result<Vec<usize>, anyhow::Error>>()
                 .map(Shape::from)
         }
+    }
+}
+
+pub trait IntoBTensor {
+    type Kind: TensorKind<Backend> + BasicOps<Backend> + Numeric<Backend>;
+
+    fn into_btensor<const D: usize>(self) -> BTensor<Backend, D, Self::Kind>;
+}
+
+impl IntoBTensor for Tensor<f32> {
+    type Kind = burn::tensor::Float;
+
+    fn into_btensor<const D: usize>(self) -> BTensor<Backend, D, Self::Kind> {
+        let shape = self.shape();
+        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
+    }
+}
+
+impl IntoBTensor for Tensor<Element> {
+    type Kind = burn::tensor::Int;
+
+    fn into_btensor<const D: usize>(self) -> BTensor<Backend, D, Self::Kind> {
+        let shape = self.shape();
+        BTensor::from_data(TensorData::new(self.data, shape), &Default::default())
     }
 }
 

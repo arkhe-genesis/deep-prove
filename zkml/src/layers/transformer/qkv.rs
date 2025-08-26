@@ -37,7 +37,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
-    tensor::{Number, Shape},
+    tensor::{IntoBTensor, Number, Shape},
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
 };
@@ -312,7 +312,11 @@ impl<N: Number> OpInfo for QKV<N> {
     }
 }
 
-impl<N: Number> QKV<N> {
+impl<N> QKV<N>
+where
+    N: Number + burn::tensor::Element,
+    Tensor<N>: IntoBTensor,
+{
     /// Returns x[-1,..] * Q, X * K, X * V
     fn evaluate_internal<E: ExtensionField>(
         &self,
@@ -335,20 +339,38 @@ impl<N: Number> QKV<N> {
         // NOTE: we take the _whole_ input and not just the last row / token.
         // The reason is because the _first_ time we infere via this layer, this is on the user input which is X token long.
         // The subsequent times, it's just to run with the newly generated token, so there is only one here.
-        let input = inputs[0];
+        let input = inputs[0].clone().into_btensor::<2>();
         let unpadded_seq_len = unpadded_input_shapes[0].dim(0);
-        let q = input.matmul(&self.q).add_dim2(&self.q_bias);
-        let k = input.matmul(&self.k).add_dim2(&self.k_bias);
-        let v = input.matmul(&self.v).add_dim2(&self.v_bias);
-        self.cache.lock().unwrap().stack(k, v, unpadded_seq_len)?;
-        // vector Q, full K, full V
-        let cache = self.cache.lock().unwrap();
+        let q = self.q.clone().into_btensor::<2>();
+        let q_bias = self.q_bias.clone().into_btensor::<1>();
+        let q_out_shape = Shape::new(vec![shape[0], self.q.shape()[1]]);
+        let k = self.k.clone().into_btensor::<2>();
+        let k_bias = self.k_bias.clone().into_btensor::<1>();
+        let k_out_shape = Shape::new(vec![shape[0], self.k.shape()[1]]);
+        let v = self.v.clone().into_btensor::<2>();
+        let v_bias = self.v_bias.clone().into_btensor::<1>();
+        let v_out_shape = Shape::new(vec![shape[0], self.v.shape()[1]]);
+
+        let q = input.clone().matmul(q).add(q_bias.unsqueeze());
+        let k = input.clone().matmul(k).add(k_bias.unsqueeze());
+        let v = input.matmul(v).add(v_bias.unsqueeze());
+
+        let q_data = q.into_data().into_vec().unwrap();
+        let k_data = k.into_data().into_vec().unwrap();
+        let v_data = v.into_data().into_vec().unwrap();
+        let q = Tensor::new(q_out_shape, q_data);
+        let k = Tensor::new(k_out_shape, k_data);
+        let v = Tensor::new(v_out_shape, v_data);
+
+        let mut cache = self.cache.lock().unwrap();
+        cache.stack(k, v, unpadded_seq_len)?;
         let k = cache.k();
         let v = cache.v();
 
         Ok(LayerOut::from_vec(vec![q, k, v]))
     }
 }
+
 impl QuantizeOp for QKV<f32> {
     type QuantizedOp = QKV<Element>;
 
@@ -433,6 +455,7 @@ impl Evaluate<f32> for QKV<f32> {
             0,
             "Cache should be empty during float evaluation"
         );
+
         self.evaluate_internal(inputs, unpadded_input_shapes)
     }
 }
@@ -1026,7 +1049,8 @@ impl<N: Number> CacheQKV<N> {
 #[cfg(test)]
 mod tests {
     use ff_ext::GoldilocksExt2;
-    use std::slice;
+    use proptest::prelude::*;
+    use std::{fmt::Debug, ops::Range, slice};
 
     use crate::{
         layers::{Layer, provable::evaluate_layer},
@@ -1401,5 +1425,107 @@ mod tests {
         model.route_output(None).unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    proptest! {
+        #[test]
+        fn test_qkv_with_f32(input in any_input::<f32>(1..32, 1..256, 1..8, 1..256)) {
+            let Input { q, q_bias, k, k_bias, v, v_bias, num_heads, input } = input;
+
+            let expected_q = input.matmul(&q).add_dim2(&q_bias);
+            let expected_k = input.matmul(&k).add_dim2(&k_bias);
+            let expected_v = input.matmul(&v).add_dim2(&v_bias);
+
+            let layer = QKV::<f32>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
+            let input_shape = input.shape();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[input_shape]).expect("qkv evaluation must be successful");
+
+            prop_assert_eq!(expected_q.shape(), computed.outputs[0].shape());
+            prop_assert_eq!(expected_k.shape(), computed.outputs[1].shape());
+            prop_assert_eq!(expected_v.shape(), computed.outputs[2].shape());
+            let assert_data = |a: &Tensor<f32>, b: &Tensor<f32>| {
+                for (a, b) in a.data().iter().zip(b.data()) {
+                    let abs = (a - b).abs();
+                    // The differences are in tensor matmul
+                    const THRESHOLD: f32 =  1e-3;
+                    prop_assert!(abs < THRESHOLD, "Absolute diff {} not within threshold {}", abs, THRESHOLD);
+                }
+                Ok(())
+            };
+            assert_data(&expected_q, &computed.outputs[0])?;
+            assert_data(&expected_k, &computed.outputs[1])?;
+            assert_data(&expected_v, &computed.outputs[2])?;
+        }
+
+        #[test]
+        fn test_qkv_with_element(input in any_input::<Element>(1..32, 1..256, 1..8, 1..256)) {
+            let Input { q, q_bias, k, k_bias, v, v_bias, num_heads, input } = input;
+
+            let expected_q = input.matmul(&q).add_dim2(&q_bias);
+            let expected_k = input.matmul(&k).add_dim2(&k_bias);
+            let expected_v = input.matmul(&v).add_dim2(&v_bias);
+
+            let layer = QKV::<Element>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
+            let input_shape = input.shape();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[input_shape]).expect("qkv evaluation must be successful");
+
+            prop_assert_eq!(expected_q.shape(), computed.outputs[0].shape());
+            prop_assert_eq!(expected_k.shape(), computed.outputs[1].shape());
+            prop_assert_eq!(expected_v.shape(), computed.outputs[2].shape());
+            prop_assert_eq!(&expected_q, &computed.outputs[0]);
+            prop_assert_eq!(&expected_k, &computed.outputs[1]);
+            prop_assert_eq!(&expected_v, &computed.outputs[2]);
+        }
+    }
+
+    struct Input<T> {
+        q: Tensor<T>,
+        q_bias: Tensor<T>,
+        k: Tensor<T>,
+        k_bias: Tensor<T>,
+        v: Tensor<T>,
+        v_bias: Tensor<T>,
+        num_heads: usize,
+        input: Tensor<T>,
+    }
+
+    impl<T> Debug for Input<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Input").finish_non_exhaustive()
+        }
+    }
+
+    fn any_input<T: Number>(
+        num_heads: Range<usize>,
+        dim_x: Range<usize>,
+        dim_y: Range<usize>,
+        dim_input: Range<usize>,
+    ) -> impl Strategy<Value = Input<T>> {
+        (num_heads, dim_x, dim_y, dim_input).prop_flat_map(
+            |(num_heads, dim_x, dim_y, dim_input)| {
+                let dim_y = dim_y * num_heads;
+                let shape_2d = Shape::new(vec![dim_x, dim_y]);
+                let shape_1d = Shape::new(vec![dim_y]);
+                let q = Tensor::<T>::any(shape_2d.clone());
+                let q_bias = Tensor::<T>::any(shape_1d.clone());
+                let k = Tensor::<T>::any(shape_2d.clone());
+                let k_bias = Tensor::<T>::any(shape_1d.clone());
+                let v = Tensor::<T>::any(shape_2d);
+                let v_bias = Tensor::<T>::any(shape_1d);
+                let input = Tensor::<T>::any(Shape::new(vec![dim_input, dim_x]));
+                (q, q_bias, k, k_bias, v, v_bias, Just(num_heads), input).prop_map(
+                    |(q, q_bias, k, k_bias, v, v_bias, num_heads, input)| Input {
+                        q,
+                        q_bias,
+                        k,
+                        k_bias,
+                        v,
+                        v_bias,
+                        num_heads,
+                        input,
+                    },
+                )
+            },
+        )
     }
 }

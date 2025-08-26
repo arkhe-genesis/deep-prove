@@ -5,8 +5,12 @@ use ff_ext::GoldilocksExt2;
 use zkml::{
     Element, ScalingFactor, Tensor,
     layers::{
-        activation::GELU, add::Add, convolution::Convolution, dense::Dense, provable::Evaluate,
-        transformer::embeddings::Embeddings,
+        activation::GELU,
+        add::Add,
+        convolution::Convolution,
+        dense::Dense,
+        provable::Evaluate,
+        transformer::{embeddings::Embeddings, qkv::QKV},
     },
     tensor::{Number, Shape},
 };
@@ -189,12 +193,72 @@ fn gelu_layer(c: &mut Criterion) {
     }
 }
 
+fn qkv_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+
+        let num_heads = 1;
+        let q = Tensor::<Element>::random(&vec![1, size].into());
+        let q_bias = Tensor::random(&vec![size].into());
+        let k = Tensor::random(&vec![1, size].into());
+        let k_bias = Tensor::random(&vec![size].into());
+        let v = Tensor::random(&vec![1, size].into());
+        let v_bias = Tensor::random(&vec![size].into());
+        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
+
+        let layer = QKV::<Element>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("qkv/Element", format!("{size}x{size}")),
+            &input,
+            |b, input| {
+                b.iter(|| {
+                    layer.evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                });
+            },
+        );
+    }
+
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+
+        let num_heads = 1;
+        let q = Tensor::<f32>::random(&vec![1, size].into());
+        let q_bias = Tensor::random(&vec![size].into());
+        let k = Tensor::random(&vec![1, size].into());
+        let k_bias = Tensor::random(&vec![size].into());
+        let v = Tensor::random(&vec![1, size].into());
+        let v_bias = Tensor::random(&vec![size].into());
+        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+
+        let layer = QKV::<f32>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("qkv/f32", format!("{size}x{size}")),
+            &input,
+            |b, input| {
+                b.iter(|| {
+                    layer.evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     add_layer,
     dense_layer,
     convolution_layer,
     embeddings_layer,
-    gelu_layer
+    gelu_layer,
+    qkv_layer,
 );
 criterion_main!(benches);
