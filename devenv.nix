@@ -7,8 +7,7 @@
     # General dev.
     pkgs.git pkgs.git-lfs pkgs.openssl pkgs.cmake
     # Rust crates build deps
-    pkgs.protobuf pkgs.openssl
-    pkgs.llvmPackages.libclang.lib
+    pkgs.openssl pkgs.llvmPackages.libclang.lib
   ];
 
   env = {

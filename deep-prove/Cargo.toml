@@ -80,9 +80,3 @@ uuid = "1.17.0"
 zeroize = "1.8.1"
 zkml = { path = "../zkml" }
 zstd = "0.13.3"
-
-[build-dependencies]
-# worker-related dependencies
-miette = { version = "7.2", features = ["fancy"] }
-protox = { version = "0.7.1" }
-tonic-build = { version = "0.12.3" }

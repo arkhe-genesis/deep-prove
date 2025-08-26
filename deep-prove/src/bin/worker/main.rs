@@ -21,10 +21,6 @@ mod api;
 mod immediate;
 mod lpn;
 
-mod lagrange {
-    tonic::include_proto!("lagrange");
-}
-
 /// From a proof request wrapped in a [`DeepProveRequestV1`] and a [`Store`]
 /// implementation (to interact with the PPs), attempt to generate proofs for a
 /// list of inputs.
