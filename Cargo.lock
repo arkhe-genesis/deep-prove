@@ -3023,6 +3023,7 @@ name = "deep-prove"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-signer",
  "anyhow",
  "aws-config",
  "aws-sdk-marketplacemetering",
@@ -3045,6 +3046,7 @@ dependencies = [
  "prost-types",
  "prost-wkt-types",
  "protox",
+ "redact",
  "rmp-serde",
  "rustls 0.23.31",
  "semver 1.0.26",
@@ -3063,6 +3065,7 @@ dependencies = [
  "ureq",
  "url",
  "uuid 1.18.0",
+ "zeroize",
  "zkml",
  "zstd",
 ]
@@ -7032,6 +7035,9 @@ name = "redact"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcecefd225c2fb69914585a7a6f8878929feb316a7ecb61c07d79e361d46d8ac"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "redox_syscall"

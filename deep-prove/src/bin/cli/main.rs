@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use deep_prove::middleware::v1::{DeepProveRequest as DeepProveRequestV1, Output};
+use redact::Secret;
 use std::{io::BufReader, path::PathBuf};
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
@@ -48,7 +49,7 @@ enum Executor {
 
         /// The client ETH private key.
         #[clap(short, long, env)]
-        private_key: String,
+        private_key: Secret<String>,
 
         #[command(subcommand)]
         command: Command,
