@@ -4,7 +4,6 @@ use crate::{S3Args, S3Store, StoreKind, store};
 use anyhow::Context;
 use tracing::info;
 
-pub mod grpc;
 pub mod http;
 
 fn instantiate_store(args: S3Args) -> anyhow::Result<StoreKind> {

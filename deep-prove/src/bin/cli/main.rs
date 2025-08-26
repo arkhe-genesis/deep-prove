@@ -19,28 +19,6 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Executor {
-    /// Interact with a LPN gateway with the gRPC protocol.
-    LpnGrpc {
-        /// The URL of the LPN gateway.
-        #[clap(short, long, env)]
-        gw_url: Url,
-
-        /// The client ETH private key.
-        #[clap(short, long, env)]
-        private_key: String,
-
-        /// Max message size passed through gRPC (in MBytes).
-        #[arg(long, default_value = "100")]
-        max_message_size: usize,
-
-        /// Timeout for the task in seconds.
-        #[arg(long, default_value = "3600")]
-        timeout: u64,
-
-        #[command(subcommand)]
-        command: Command,
-    },
-
     /// Interact with a LPN gateway with the HTTP.
     LpnHttp {
         /// The URL of the LPN gateway.
@@ -135,7 +113,6 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.executor {
-        gw_config @ Executor::LpnGrpc { .. } => lpn::grpc::connect(gw_config).await,
         http_config @ Executor::LpnHttp { .. } => lpn::http::connect(http_config).await,
         local_config @ Executor::LocalApi { .. } => local::connect(local_config).await,
         Executor::Verify { proof } => {

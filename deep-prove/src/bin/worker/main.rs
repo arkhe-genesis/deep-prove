@@ -7,7 +7,7 @@ use deep_prove::{
     },
     store::{self, MemStore, S3Store, Store},
 };
-use std::{net::SocketAddr, path::PathBuf};
+use std::path::PathBuf;
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt::format::FmtSpan};
 use url::Url;
@@ -240,45 +240,6 @@ struct S3Args {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum RunMode {
-    /// Connect to a LPN gateway to receive inference tasks
-    #[command(
-        name = "lpn",
-        group(ArgGroup::new("s3_store")
-        .multiple(true)
-        .args(&["s3_region", "s3_bucket", "s3_endpoint", "s3_access_key_id", "s3_secret_access_key"])
-        .requires_all(&["s3_region", "s3_bucket", "s3_endpoint", "s3_access_key_id", "s3_secret_access_key"])
-    ))]
-    Grpc {
-        #[arg(long, env, default_value = "http://localhost:10000")]
-        gw_url: String,
-
-        /// An address of the `/health` probe.
-        #[arg(long, env, default_value = "127.0.0.1:8080")]
-        healthcheck_addr: SocketAddr,
-
-        #[arg(long, env, default_value = "deep-prove-1")]
-        worker_class: String,
-
-        /// The operator name.
-        #[arg(long, env, default_value = "Lagrange Labs")]
-        operator_name: String,
-
-        /// The operator private key.
-        #[arg(long, env)]
-        private_key: String,
-
-        /// Max message size passed through gRPC (in MBytes)
-        #[arg(long, env, default_value = "100")]
-        max_message_size: usize,
-
-        /// Print the logs in JSON format
-        #[arg(long, env)]
-        json: bool,
-
-        /// If set, use S3 to store & fetch PPs, otherwise use memory.
-        #[command(flatten)]
-        s3_args: S3Args,
-    },
     /// Connect to a LPN gateway to receive inference tasks.
     #[command(
         group(ArgGroup::new("s3_store")
@@ -337,7 +298,6 @@ enum RunMode {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.run_mode {
-        grpc_args @ RunMode::Grpc { .. } => lpn::grpc::run(grpc_args).await,
         local_args @ RunMode::OneShot { .. } => immediate::run(local_args).await,
         api_args @ RunMode::LocalApi { .. } => api::serve(api_args).await,
         http_args @ RunMode::Http { .. } => lpn::http::run(http_args).await,
