@@ -28,6 +28,7 @@ jobs:
               - 'tenstore/**'
               - 'utils/**'
               - 'zkml/**'
+              - '.github/workflows/layers-quant.yml'
 
   quantization-validation:
     name: Run Layer Quantization Regression Tests
@@ -46,12 +47,33 @@ jobs:
           echo RNG seed: "$seed"
           echo RNG_SEED="$seed" >> "$GITHUB_ENV"
 
+      - name: 'Checkout PR branch'
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: 'Find the merge-base commit hash'
+        id: find-branch-point
+        env:
+          branch_main: ${{ github.event.pull_request.base.ref }}
+          branch_topic: ${{ github.event.pull_request.head.ref }}
+        run: |
+          # Fetch enough history to find a common ancestor commit (aka merge-base):
+          git fetch origin ${{ env.branch_topic }} --depth $(( ${{ github.event.pull_request.commits }} + 1 ))
+          git fetch origin ${{ env.branch_main }} --depth 50
+
+          BRANCH_POINT=$( git merge-base origin/${{ env.branch_main }} ${{ env.branch_topic }} )
+          echo "branch-point: $BRANCH_POINT"
+          echo "branch-point=$BRANCH_POINT" >> "$GITHUB_OUTPUT"
+
       - name: Checkout base
+        env:
+          branch_point: ${{ steps.find-branch-point.outputs.branch-point }}
         uses: actions/checkout@v4
         with:
           clean: "false"
           lfs: 'true'
-          ref: ${{ github.base_ref || 'master' }}
+          ref: "${{ env.branch_point }}"
 
       - name: Capture layers outputs on base
         shell: devenv shell bash -- -e {0}
