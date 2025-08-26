@@ -552,11 +552,6 @@ pub trait LLMTokenizer {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        fs::File,
-        io::{BufReader, BufWriter},
-    };
-
     use crate::{
         init_test_logging,
         parser::{
@@ -588,37 +583,17 @@ mod test {
 
         // Generate or load the prover & verifier contexts
         let (driver, ctx): (_, LLMContext<GoldilocksExt2, Pcs<GoldilocksExt2>>) =
-            match file_cache::from_cache(&cache_filename) {
-                Ok(cache_file) => {
-                    info!("reading existing cache file `{}`", cache_file.display());
-                    rmp_serde::from_read(BufReader::new(
-                        &File::open(&cache_file).context("opening cache file")?,
-                    ))
-                    .context("deserializing cached data")?
-                }
-                _ => {
-                    let cache_target_file = file_cache::write_to(&cache_filename)
-                        .context("generating filename for cached data")?;
+            file_cache::deserialize_or_create_with(&cache_filename, || {
+                let driver = Driver::load_external_model(&model_path)?
+                    .with_max_context(MAX_CONTEXT)
+                    .into_provable_llm()?;
 
-                    let driver = Driver::load_external_model(&model_path)?
-                        .with_max_context(MAX_CONTEXT)
-                        .into_provable_llm()?;
+                let ctx = driver
+                    .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+                    .with_max_context(MAX_CONTEXT);
 
-                    let ctx = driver
-                        .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
-                        .with_max_context(MAX_CONTEXT);
-
-                    info!("writing contexts to `{}`", cache_target_file.display());
-                    let r = (driver, ctx);
-
-                    rmp_serde::encode::write(
-                        &mut BufWriter::new(File::create(&cache_target_file)?),
-                        &r,
-                    )?;
-
-                    r
-                }
-            };
+                Ok((driver, ctx))
+            })?;
 
         // Generate the trace
         let sentence = "The sky is";

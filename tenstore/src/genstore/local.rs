@@ -21,12 +21,12 @@ impl Storage {
     }
 }
 
-/// A disk-backed tensor store featuring a bounded memory cache of the most
-/// accessed tensors.
+/// A disk-backed page store featuring a bounded memory cache of the most
+/// accessed pages.
 pub struct LocalStore<P: AsRef<Path>> {
-    /// Keep track of the storage details associated to a stored tensor.
+    /// Keep track of the storage details associated to a stored page.
     ///
-    /// This is string-indexed instead of [`TensorKey`]-indexed because data
+    /// This is string-indexed instead of [`StoreKey`]-indexed because data
     /// of multiple type can be stored in the same place.
     storage: HashMap<CompactString, Storage>,
     /// A LRU cache of the serialized value of the data.
@@ -86,7 +86,7 @@ impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
                     BufReader::new(std::fs::File::open(s.file).map_err(StoreError::from)?);
                 reader.read_to_end(&mut buffer).map_err(StoreError::from)?;
 
-                let buffer_len = NonZero::new(buffer.len()).ok_or(StoreError::EmptyPage)?;
+                let buffer_len = NonZero::new(buffer.len()).ok_or(StoreError::EmptyStore)?;
 
                 Ok::<_, StoreError>((buffer, buffer_len))
             })?)?;
@@ -111,7 +111,7 @@ impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
         });
 
         let serialized = rmp_serde::to_vec(&data).map_err(StoreError::from)?;
-        let weight = NonZero::new(serialized.len()).ok_or(StoreError::EmptyPage)?;
+        let weight = NonZero::new(serialized.len()).ok_or(StoreError::EmptyStore)?;
         BufWriter::new(std::fs::File::create(&storage.file).map_err(StoreError::from)?)
             .write_all(&serialized)?;
         self.cache.put(k_str, serialized, weight);

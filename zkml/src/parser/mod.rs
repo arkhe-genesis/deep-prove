@@ -272,8 +272,13 @@ pub fn load_float_model(model: &ModelProto) -> Result<Model<f32>> {
 
 // Module for caching downloaded files
 pub mod file_cache {
-    use anyhow::ensure;
-    use std::{path::PathBuf, sync::LazyLock};
+    use anyhow::{Context, ensure};
+    use serde::{Deserialize, Serialize};
+    use std::{
+        io::{BufReader, BufWriter},
+        path::PathBuf,
+        sync::LazyLock,
+    };
 
     // Directory to store cached files.
     static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -292,10 +297,32 @@ pub mod file_cache {
         Ok(path)
     }
 
-    pub fn write_to<S: AsRef<str>>(file: S) -> anyhow::Result<PathBuf> {
-        let path = CACHE_DIR.join(file.as_ref());
-        ensure!(!path.exists(), "`{}` already exists", path.display());
-        Ok(path)
+    /// Attempt to deserialize the `T` contained in `filename`. If `filename`
+    /// does not exist in the cache, generate the `T` from `f` and serialize it
+    /// into `filename`.
+    pub fn deserialize_or_create_with<T: Serialize + for<'a> Deserialize<'a>, S: AsRef<str>>(
+        filename: S,
+        f: impl Fn() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let path = CACHE_DIR.join(filename.as_ref());
+        if path.exists() {
+            rmp_serde::from_read(BufReader::new(
+                std::fs::File::open(&path)
+                    .with_context(|| format!("opening `{}`", path.display()))?,
+            ))
+            .context("deserializing target value")
+        } else {
+            let t = f()?;
+            rmp_serde::encode::write(
+                &mut BufWriter::new(
+                    std::fs::File::create(&path)
+                        .with_context(|| format!("creating `{}`", path.display()))?,
+                ),
+                &t,
+            )
+            .context("serializing target value")?;
+            Ok(t)
+        }
     }
 }
 

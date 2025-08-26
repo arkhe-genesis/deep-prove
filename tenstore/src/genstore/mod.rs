@@ -63,8 +63,8 @@ impl GenStore {
         ))))
     }
 
-    /// Ensure that the tensor indexed by `new_k` exists. If it does not, create
-    /// it by mapping `f` over the tensor `old_k`.
+    /// Create a new page of type `U` derived from `old_k` by mapping `f` on it.
+    /// If it already exists, do nothing.
     pub fn cast<
         T: Serialize + for<'a> Deserialize<'a>,
         U: Serialize + for<'a> Deserialize<'a>,
@@ -77,9 +77,8 @@ impl GenStore {
         self.cast_and_fetch(old_k, f).map(|x| x.0)
     }
 
-    /// Attempt to return the tensor indexed by `new_k`. If it does not exist,
-    /// allocate a new tensor with the same size as `old_k`, and generate its
-    /// data by mapping `f` unto it.
+    /// Create and return a new page of type `U` derived from `old_k` by mapping
+    /// `f` on it. If it already exists, do nothing.
     pub fn cast_and_fetch<
         T: Serialize + for<'a> Deserialize<'a>,
         U: Serialize + for<'a> Deserialize<'a>,
@@ -93,10 +92,10 @@ impl GenStore {
         match self.fetch::<U>(&new_k) {
             Ok(data) => Ok((new_k, data)),
             Err(StoreError::KeyUnknown) => {
-                let old_tensor = self.fetch::<T>(old_k)?;
-                let new_tensor = f(&old_tensor);
-                self.store(&new_k, &new_tensor)?;
-                Ok((new_k, new_tensor))
+                let old_page = self.fetch::<T>(old_k)?;
+                let new_page = f(&old_page);
+                self.store(&new_k, &new_page)?;
+                Ok((new_k, new_page))
             }
             Err(err) => Err(err),
         }

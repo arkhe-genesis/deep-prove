@@ -15,5 +15,5 @@ pub enum StoreError {
     #[error("deserialization failed: {0}")]
     DeserializationError(#[from] rmp_serde::decode::Error),
     #[error("empty page")]
-    EmptyPage,
+    EmptyStore,
 }

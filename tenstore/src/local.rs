@@ -17,18 +17,18 @@ struct Storage {
     file: PathBuf,
 }
 
-/// A disk-backed tensor store featuring a bounded memory cache of the most
-/// accessed tensors.
+/// A disk-backed page store featuring a bounded memory cache of the most
+/// accessed pages.
 #[derive(Clone)]
 pub struct LocalStore<P: AsRef<Path>> {
-    /// Keep track of the storage details associated to a stored tensor.
+    /// Keep track of the storage details associated to a stored page.
     ///
-    /// This is string-indexed instead of [`TensorKey`]-indexed because tensors
+    /// This is string-indexed instead of [`StoreKey`]-indexed because pages
     /// of multiple type can be stored in the same place.
     storage: HashMap<CompactString, Storage>,
-    /// A LRU cache of the serialized value of the tensors.
+    /// A LRU cache of the serialized value of the pages.
     cache: LruCache<CompactString, Vec<u8>>,
-    /// The root folder of where to store the file-backing of the tensors.
+    /// The root folder of where to store the file-backing of the pages.
     root: P,
 }
 impl<P: AsRef<Path>> LocalStore<P> {

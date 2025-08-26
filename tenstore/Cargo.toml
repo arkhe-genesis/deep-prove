@@ -1,6 +1,6 @@
 [package]
 name = "tenstore"
-description = "a facade to store & retrieve tensor backings"
+description = "a facade to store & retrieve stored pages"
 categories.workspace = true
 edition.workspace = true
 keywords.workspace = true
