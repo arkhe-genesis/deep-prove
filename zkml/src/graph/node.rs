@@ -8,7 +8,7 @@ pub trait GraphNode: Clone {
     /// called either locally or on remote worker. The context
     /// can hold references to the setup parameters that we don't want to send over the wire.
     type Context;
-    /// A description of the node. This is used to
+    /// A description of the node, helpful for debugging and logging purposes.
     fn describe(&self) -> String;
     /// Runs the operation with the given context and inputs.
     /// The inputs comes from the graph processing (output of predecessor nodes).

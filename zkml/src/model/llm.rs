@@ -572,6 +572,7 @@ mod test {
 
         // Load the model file
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
+        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
         let cache_filename = {
             let mut hasher = blake3::Hasher::new();
             hasher

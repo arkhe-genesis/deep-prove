@@ -2,16 +2,17 @@
 //! as well as the scheduler and executor to get the output of the computation.
 //! This graph module is used to represent the proving logic of the IOP such that nodes
 //! in this graph can be executed in parallel and even over a network.
-use petgraph::visit::EdgeRef;
+use petgraph::{Direction, visit::EdgeRef};
 use std::collections::{HashMap, HashSet};
 
 use anyhow::ensure;
-use petgraph::graph::{DiGraph, NodeIndex as NodeIdx};
+pub use petgraph::graph::{DiGraph, NodeIndex as NodeIdx};
 
 use node::GraphNode;
 
 pub mod executor;
 pub mod node;
+pub mod partition;
 
 /// Basic structure that contains a graph and a list of input nodes.
 /// The graph is colored, e.g. each node is associated with a color that corresponds to which machine or thread etc
@@ -22,9 +23,9 @@ pub mod node;
 /// input from the graph input data.
 #[derive(Debug, Clone)]
 pub struct ColoredGraph<N: GraphNode, C> {
-    graph: DiGraph<ColoredNode<N, C>, Option<N::IO>>,
+    pub(crate) graph: DiGraph<ColoredNode<N, C>, Option<N::IO>>,
     /// maps the indices of the input vector to which node they should be given to.
-    input_nodes: HashMap<NodeIdx, Vec<usize>>,
+    pub(crate) input_nodes: HashMap<NodeIdx, Vec<usize>>,
 }
 
 /// A proving node that is also colored with a color.
@@ -33,7 +34,7 @@ pub struct ColoredGraph<N: GraphNode, C> {
 /// or same thread, etc.
 #[derive(Debug, Clone)]
 pub struct ColoredNode<N, C> {
-    proving_node: N,
+    node: N,
     color: C,
 }
 
@@ -50,51 +51,79 @@ pub enum Edge {
 impl<N, C> ColoredNode<N, C> {
     pub fn new(proving_node: N, color: C) -> Self {
         Self {
-            proving_node,
+            node: proving_node,
             color,
         }
     }
-    #[allow(dead_code)]
-    fn color(&self) -> &C {
+    pub fn color(&self) -> &C {
         &self.color
     }
 }
 
-impl<N: GraphNode, C> ColoredGraph<N, C> {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+impl<N: GraphNode, C> Default for ColoredGraph<N, C> {
+    fn default() -> Self {
         Self {
             graph: DiGraph::new(),
             input_nodes: Default::default(),
         }
     }
+}
+
+impl<N: GraphNode, C> ColoredGraph<N, C> {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Add a node to the graph.
     /// If the node has no predecessors, it is considered an input node.
     /// For every predecessors, it creates the edge with no data at the moment.
-    pub fn add_node(
-        &mut self,
-        node: ColoredNode<N, C>,
-        connections: Vec<Edge>,
-    ) -> anyhow::Result<NodeIdx> {
-        ensure!(
-            !connections.is_empty(),
-            "A node must have at least one connection to the graph"
-        );
+    pub fn add_node(&mut self, node: ColoredNode<N, C>, edges: Vec<Edge>) -> NodeIdx {
         let nidx = self.graph.add_node(node);
-        for connection in connections {
-            match connection {
-                Edge::Pred(pred) => {
-                    // currently, there is no data so we just set None - when the predecessors have been executed,
-                    // the edge will be updated to contain the output
-                    self.graph.add_edge(pred, nidx, None);
-                }
-                Edge::Input(idx) => {
-                    self.input_nodes.entry(nidx).or_default().push(idx);
-                }
+        for edge in edges {
+            self.add_edge(nidx, edge);
+        }
+        nidx
+    }
+    fn add_edge(&mut self, nidx: NodeIdx, edge: Edge) {
+        match edge {
+            Edge::Pred(pred) => {
+                // currently, there is no data so we just set None - when the predecessors have been executed,
+                // the edge will be updated to contain the output
+                self.graph.add_edge(pred, nidx, None);
+            }
+            Edge::Input(idx) => {
+                self.input_nodes.entry(nidx).or_default().push(idx);
             }
         }
-        Ok(nidx)
+    }
+    pub fn output_nodes(&self) -> Vec<NodeIdx> {
+        self.graph
+            .node_indices()
+            .filter(|idx| {
+                self.graph
+                    .neighbors_directed(*idx, Direction::Outgoing)
+                    .count()
+                    == 0
+            })
+            .collect()
+    }
+
+    /// Returns all the neighbors of a node with the direction starting from `node`.
+    /// e.g. (10,Direction::Incoming) means that the node 10 is a predecessor of `node`, there is
+    /// a link 10 -> node
+    /// (reason for this method to exist is because petgraph only returns outgoing nodes by default)
+    pub fn neighbors(
+        &self,
+        node: NodeIdx,
+    ) -> impl Iterator<Item = (NodeIdx, Direction)> + use<'_, N, C> {
+        self.graph
+            .edges_directed(node, Direction::Outgoing)
+            .map(|e| (e.target(), Direction::Outgoing))
+            .chain(
+                self.graph
+                    .edges_directed(node, Direction::Incoming)
+                    .map(|e| (e.source(), Direction::Incoming)),
+            )
     }
 }
 
@@ -117,14 +146,10 @@ impl ReleasePolicy {
             ReleasePolicy::All => true,
             ReleasePolicy::UniqueColoring => {
                 let node_color = &scheduler.graph.graph[node_index].color;
-                if scheduler
-                    .pending_nodes
+                scheduler
+                    .running_nodes
                     .iter()
                     .all(|nidx| &scheduler.graph.graph[*nidx].color != node_color)
-                {
-                    return true;
-                }
-                false
             }
         }
     }
@@ -132,9 +157,8 @@ impl ReleasePolicy {
 
 /// A node that also contains the input to run.
 /// It needs to be coupled with the context such that the node can finally be executed.
-
 #[derive(Debug, Clone)]
-struct ReadyNode<N: GraphNode, C> {
+pub struct ReadyNode<N: GraphNode, C> {
     /// Node that contains the operation and its color
     pub(crate) node: ColoredNode<N, C>,
     /// Input data for the node's operation
@@ -144,25 +168,19 @@ struct ReadyNode<N: GraphNode, C> {
 }
 
 impl<N: GraphNode, C> ReadyNode<N, C> {
-    #[allow(dead_code)]
-    fn color(&self) -> &C {
-        &self.node.color
-    }
     pub fn run(&mut self, ctx: &N::Context) -> anyhow::Result<N::IO> {
-        self.node
-            .proving_node
-            .run(ctx, self.inputs.drain(..).collect())
+        self.node.node.run(ctx, self.inputs.drain(..).collect())
     }
 }
 
 /// A scheduler for a colored graph. It is responsible for scheduling the nodes to be executed,
 /// marking the nodes as done and updating the ready nodes until all nodes have been executed.
 #[derive(Debug, Clone)]
-struct GraphScheduler<N: GraphNode, C> {
+pub struct GraphScheduler<N: GraphNode, C> {
     graph: ColoredGraph<N, C>,
     waiting_input_data: HashMap<NodeIdx, Vec<N::IO>>,
     /// Nodes that are currently being executed
-    pending_nodes: HashSet<NodeIdx>,
+    running_nodes: HashSet<NodeIdx>,
 
     /// Nodes that are already executed
     done_nodes: HashSet<NodeIdx>,
@@ -180,7 +198,7 @@ where
     pub fn new(graph: ColoredGraph<N, C>) -> Self {
         Self {
             graph,
-            pending_nodes: HashSet::new(),
+            running_nodes: HashSet::new(),
             done_nodes: HashSet::new(),
             release_policy: ReleasePolicy::UniqueColoring,
             waiting_input_data: HashMap::new(),
@@ -188,17 +206,7 @@ where
     }
 
     pub fn output_nodes(&self) -> Vec<NodeIdx> {
-        self.graph
-            .graph
-            .node_indices()
-            .filter(|idx| {
-                self.graph
-                    .graph
-                    .neighbors_directed(*idx, petgraph::Direction::Outgoing)
-                    .count()
-                    == 0
-            })
-            .collect()
+        self.graph.output_nodes()
     }
 
     /// Sets the release policy for this scheduler. By default, it is the UniqueColoring policy.
@@ -210,7 +218,7 @@ where
     /// spits out the list of input nodes along with the data required to run the node's operations
     /// input_data is a vector of vectors of input data for each input node as described in the graph input nodes
     pub fn init_nodes(&mut self, input_data: Vec<N::IO>) -> anyhow::Result<Vec<ReadyNode<N, C>>> {
-        ensure!(self.pending_nodes.is_empty(), "Pending nodes must be empty");
+        ensure!(self.running_nodes.is_empty(), "Running nodes must be empty");
         ensure!(
             self.graph
                 .input_nodes
@@ -232,13 +240,13 @@ where
                 if self
                     .graph
                     .graph
-                    .neighbors_directed(*node_idx, petgraph::Direction::Incoming)
+                    .neighbors_directed(*node_idx, Direction::Incoming)
                     .count()
                     == 0
                 {
                     // if the input node has no incoming edges, it is an *full* input node
                     // in this case, we mark them directly as pending since we'll return them in this function
-                    self.pending_nodes.insert(*node_idx);
+                    self.running_nodes.insert(*node_idx);
                     // and prepare the ready node
                     let node = self.graph.graph[*node_idx].clone();
                     Some(ReadyNode {
@@ -273,20 +281,15 @@ where
 
     /// Mark a node as done and give the output of its execution.
     fn mark_done(&mut self, node_idx: NodeIdx, output: N::IO) -> anyhow::Result<()> {
-        ensure!(
-            self.pending_nodes.contains(&node_idx),
-            "Node is not pending"
-        );
-        ensure!(!self.done_nodes.contains(&node_idx), "Node is already done");
-        self.pending_nodes.remove(&node_idx);
-        self.done_nodes.insert(node_idx);
+        ensure!(self.running_nodes.remove(&node_idx), "node was not running");
+        ensure!(self.done_nodes.insert(node_idx), "node was already done");
         // now look at all the nodes that are ready to run and put them in pending
         let successors = self
             .graph
             .graph
-            .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+            .neighbors_directed(node_idx, Direction::Outgoing)
             // do not take nodes that are already done or pending
-            .filter(|idx| !self.done_nodes.contains(idx) && !self.pending_nodes.contains(idx))
+            .filter(|idx| !self.done_nodes.contains(idx) && !self.running_nodes.contains(idx))
             .collect::<Vec<_>>();
         for idx in successors {
             // Set the data to the edge such that the successors may run afterwards
@@ -309,7 +312,7 @@ where
             .filter(|nidx| {
                 self.graph
                     .graph
-                    .edges_directed(*nidx, petgraph::Direction::Incoming)
+                    .edges_directed(*nidx, Direction::Incoming)
                     .count()
                     > 0
             })
@@ -317,11 +320,11 @@ where
             .filter(|nidx| {
                 self.graph
                     .graph
-                    .edges_directed(*nidx, petgraph::Direction::Incoming)
+                    .edges_directed(*nidx, Direction::Incoming)
                     .all(|e| e.weight().is_some())
             })
             // exclude nodes that are already pending - it shouldn't happen but just in case
-            .filter(|node_idx| !self.pending_nodes.contains(node_idx))
+            .filter(|node_idx| !self.running_nodes.contains(node_idx))
             .collect::<Vec<_>>();
         for node_idx in ready_node_idx {
             // need to check here if the node is ready to run - each time we add a new node to the pending nodes,
@@ -329,12 +332,12 @@ where
             if !self.release_policy.accept(node_idx, self) {
                 continue;
             }
-            self.pending_nodes.insert(node_idx);
+            self.running_nodes.insert(node_idx);
             // collect both the input data and the input from the edges
             let input_edges = self
                 .graph
                 .graph
-                .edges_directed(node_idx, petgraph::Direction::Incoming)
+                .edges_directed(node_idx, Direction::Incoming)
                 .map(|e| e.id())
                 .collect::<Vec<_>>();
             let input_data = input_edges
@@ -369,7 +372,7 @@ where
 
     /// Returns true when the graph is done, i.e. all nodes have been executed.
     fn is_done(&self) -> bool {
-        self.pending_nodes.is_empty() && self.done_nodes.len() == self.graph.graph.node_count()
+        self.running_nodes.is_empty() && self.done_nodes.len() == self.graph.graph.node_count()
     }
 }
 
@@ -412,19 +415,17 @@ mod tests {
     fn instantiate(num_colors: usize) -> ColoredGraph<TestOperation, usize> {
         let mut graph = ColoredGraph::new();
         let mut color = 0;
-        let test1_node = graph
-            .add_node(
-                ColoredNode {
-                    proving_node: TestOperation::Test1,
-                    color,
-                },
-                vec![Edge::Input(0)],
-            )
-            .unwrap();
+        let test1_node = graph.add_node(
+            ColoredNode {
+                node: TestOperation::Test1,
+                color,
+            },
+            vec![Edge::Input(0)],
+        );
         color = (color + 1) % num_colors;
         let _test2_node = graph.add_node(
             ColoredNode {
-                proving_node: TestOperation::Test2,
+                node: TestOperation::Test2,
                 color,
             },
             vec![Edge::Pred(test1_node)],
@@ -452,7 +453,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        assert!(matches!(ready_node.node.proving_node, TestOperation::Test1));
+        assert!(matches!(ready_node.node.node, TestOperation::Test1));
         let output = ready_node.run(&()).unwrap();
         assert_eq!(
             output,
@@ -460,13 +461,13 @@ mod tests {
         );
         scheduler.mark_done(ready_node.node_idx, output).unwrap();
         assert_eq!(scheduler.done_nodes.len(), 1);
-        assert_eq!(scheduler.pending_nodes.len(), 0);
+        assert_eq!(scheduler.running_nodes.len(), 0);
 
         let mut ready_node = scheduler.next_ready_nodes().pop().unwrap();
         assert!(
-            matches!(ready_node.node.proving_node, TestOperation::Test2),
+            matches!(ready_node.node.node, TestOperation::Test2),
             "Node {ready_node:?} has operation {:?}",
-            ready_node.node.proving_node
+            ready_node.node.node
         );
         let output = ready_node.run(&()).unwrap();
         assert_eq!(
@@ -478,7 +479,7 @@ mod tests {
         );
         scheduler.mark_done(ready_node.node_idx, output).unwrap();
         println!("done_nodes: {:?}", scheduler.done_nodes);
-        println!("pending_nodes: {:?}", scheduler.pending_nodes);
+        println!("running_nodes: {:?}", scheduler.running_nodes);
         assert!(scheduler.is_done());
     }
 }

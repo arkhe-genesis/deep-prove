@@ -1,6 +1,6 @@
 //! File containing code for lookup witness generation.
 
-use crate::graph::Edge;
+use crate::graph::{Edge, GraphScheduler, executor::SequentialExecutor};
 use anyhow::{Context as CC, anyhow, bail, ensure};
 use std::{
     cmp::Ordering,
@@ -10,6 +10,7 @@ use std::{
 };
 use tenstore::GenStore;
 
+use crate::graph::executor::Executor;
 use ceno_p3::field::{Field, FieldAlgebra};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -909,6 +910,17 @@ struct GenerateWitness<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentSchem
     _marker: PhantomData<(&'a (), &'b ())>,
 }
 
+impl<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E> + Send + Sync> Default
+    for GenerateWitness<'a, 'b, E, PCS>
+{
+    fn default() -> Self {
+        Self {
+            _phantom: PhantomData,
+            _marker: PhantomData,
+        }
+    }
+}
+
 struct GenerateWitnessContext<'a, 'b, E, PCS>
 where
     E: ExtensionField,
@@ -1021,18 +1033,10 @@ where
         .to_forward_iterator()
         .enumerate()
         .map(|(idx, (node_id, _))| {
-            let node_idx = graph
-                .add_node(
-                    ColoredNode::new(
-                        GenerateWitness {
-                            _phantom: PhantomData,
-                            _marker: PhantomData,
-                        },
-                        idx % max_colour,
-                    ),
-                    vec![Edge::Input(idx)],
-                )
-                .expect("graph creation is failing");
+            let node_idx = graph.add_node(
+                ColoredNode::new(GenerateWitness::default(), idx % max_colour),
+                vec![Edge::Input(idx)],
+            );
             let input = GenerateWitnessIO::Input(node_id);
             (node_idx, input)
         })
@@ -1040,11 +1044,11 @@ where
 
     // here for the moment there is not yet a "parent node" so it's a directed graph ... but with no edges.
     let graph_ctx = GenerateWitnessContext { ctx, store, trace };
-    use crate::graph::executor::SequentialExecutor;
-    let mut executor = SequentialExecutor::new(graph, graph_ctx);
-    // let executor = ThreadPoolExecutor::new(graph, graph_ctx);
-    for gen_w in executor
-        .run(inputs)
+    let scheduler = GraphScheduler::new(graph);
+    // NOTE: until https://github.com/Plonky3/Plonky3/pull/999 is fixed, we have to use the sequential executor
+    // and not the threadpool executor.
+    // let mut executor = SequentialExecutor::new(graph, graph_ctx);
+    for gen_w in SequentialExecutor::run(&(), scheduler, inputs, &graph_ctx)
         .map_err(|e| LogUpError::ProvingError(e.to_string()))?
         .into_iter()
     {
@@ -1056,22 +1060,6 @@ where
         witness_gen.consume(gen_w);
     }
 
-    // for (node_id, _) in ctx.steps_info.to_forward_iterator() {
-    //    let step = trace
-    //        .get_step(&node_id)
-    //        .ok_or(LogUpError::ProvingError(format!(
-    //            "Node {node_id} not found in trace"
-    //        )))?;
-    //    let gen_w = step
-    //        .op
-    //        .gen_lookup_witness(node_id, ctx, &step.step_data, &mut store)
-    //        .map_err(|e| {
-    //            LogUpError::ParameterError(format!(
-    //                "Error generating lookup witness for node {node_id} with error: {e}"
-    //            ))
-    //        })?;
-    //    witness_gen.consume(gen_w);
-    //}
     debug!(
         "== Witness poly fields generation metrics {} ==",
         metrics.to_span()

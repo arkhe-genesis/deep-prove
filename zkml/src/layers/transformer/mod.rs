@@ -526,6 +526,8 @@ pub(crate) mod manual_attention {
             .into_provable_model(&config, single_input.shape())?;
         model.describe();
         model.run_float(slice::from_ref(&single_input))?;
+        // Reset is needed here because the `llm_model` contains layer that contains some cache.
+        // When we clone a layer, we just clone a Arc<Mutex<_>>, so the cache data itself is not cloned.
         model.reset();
 
         let model = llm_model.into_provable_model(&config, input.shape())?;

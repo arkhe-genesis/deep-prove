@@ -11,7 +11,7 @@ use weight_lru::LruCache;
 
 use crate::{TensorKey, TensorStore, TenstoreError};
 
-#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct Storage {
     allocated: usize,
     file: PathBuf,
