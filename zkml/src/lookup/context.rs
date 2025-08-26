@@ -8,6 +8,7 @@ use std::{
     marker::PhantomData,
     sync::Arc,
 };
+use tenstore::GenStore;
 
 use ceno_p3::field::{Field, FieldAlgebra};
 use ff_ext::ExtensionField;
@@ -900,7 +901,6 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, 
 
 pub(crate) const COLUMN_SEPARATOR: Element = 1 << 32;
 
-use tenstore::TenStore;
 /// Action to put inside the graph of tasks. This operation can be serialized over the network.
 #[derive(Debug, Clone)]
 struct GenerateWitness<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E> + Send + Sync>
@@ -918,7 +918,7 @@ where
 {
     trace: &'a InferenceTrace<'a, E, Element>,
     ctx: &'b ProverContext<E, PCS>,
-    store: TenStore,
+    store: GenStore,
 }
 
 #[derive(Clone)]
@@ -1042,7 +1042,7 @@ where
     let graph_ctx = GenerateWitnessContext { ctx, store, trace };
     use crate::graph::executor::SequentialExecutor;
     let mut executor = SequentialExecutor::new(graph, graph_ctx);
-    //let executor = ThreadPoolExecutor::new(graph, graph_ctx);
+    // let executor = ThreadPoolExecutor::new(graph, graph_ctx);
     for gen_w in executor
         .run(inputs)
         .map_err(|e| LogUpError::ProvingError(e.to_string()))?

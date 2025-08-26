@@ -38,6 +38,7 @@ derive_more = { workspace = true, features = ["from"] }
 exponential-backoff = "2.1.0"
 ff_ext = { workspace = true }
 futures = { version = "0.3.30" }
+get-size2 = { version = "0.6.2", features = ["derive"] }
 grpc-worker = { git = "https://github.com/Lagrange-Labs/grpc-worker-rs", branch = "main" }
 humansize = "2.1.3"
 machine-uid = "0.5.3"

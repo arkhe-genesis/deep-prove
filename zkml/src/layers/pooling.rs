@@ -34,7 +34,7 @@ use sumcheck::{
     structs::{IOPProof, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::TenStore;
+use tenstore::GenStore;
 use transcript::Transcript;
 use witness::RowMajorMatrix;
 
@@ -198,7 +198,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors(store)?;
 
@@ -216,7 +216,7 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let input_tensors = step_data.input_tensors(store)?;
         let output_tensors = step_data.output_tensors(store)?;

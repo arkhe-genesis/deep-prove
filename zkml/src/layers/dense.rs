@@ -29,7 +29,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::TenStore;
+use tenstore::GenStore;
 use tracing::warn;
 use transcript::Transcript;
 
@@ -324,7 +324,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensor = step_data.input_tensor_at(0, store)?;
         let output_tensor = step_data.output_tensor_at(0, store)?;
@@ -860,7 +860,7 @@ mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model, &mut TenStore::default()).unwrap();
+        prove_model(model, &mut GenStore::default()).unwrap();
     }
 
     proptest! {

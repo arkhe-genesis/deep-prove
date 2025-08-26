@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
-use tenstore::TenStore;
+use tenstore::GenStore;
 use zkml::{
     Element, FloatOnnxLoader, Prover, default_transcript,
     inputs::Input,
@@ -41,7 +41,7 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
             .expect("failed to call load_input_flat on the model");
 
         let trace = model
-            .run(&input_tensor, None, &mut TenStore::default())
+            .run(&input_tensor, None, &mut GenStore::default())
             .unwrap_or_else(|_| panic!("input #{i} failed"));
 
         let mut prover_transcript = new_transcript();

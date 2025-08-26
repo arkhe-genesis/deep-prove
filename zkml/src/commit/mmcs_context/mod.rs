@@ -1,5 +1,4 @@
 //! Module containing the logic to commit to instance and witness polynomials for a model using a MMCS
-
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
@@ -13,6 +12,8 @@ use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{Expression, mle::MultilinearExtension, util::transpose};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tracing::debug;
+use utils::Metrics;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 use sumcheck::structs::IOPProof;
@@ -94,12 +95,17 @@ where
             })
             .next_power_of_two();
 
-        let param = PCS::setup(max_poly_size, mpcs::SecurityLevel::Conjecture100bits)
-            .map_err(|e| anyhow!("{:?}", e))
-            .context("setting up params")?;
-        let (prover_params, verifier_params) = PCS::trim(param, max_poly_size)
-            .map_err(|e| anyhow!("{:?}", e))
-            .context("trimming params")?;
+        let m = Metrics::new();
+        let (prover_params, verifier_params) = {
+            let param = PCS::setup(max_poly_size, mpcs::SecurityLevel::Conjecture100bits)
+                .map_err(|e| anyhow!("{:?}", e))
+                .context("setting up params")?;
+
+            PCS::trim(param, max_poly_size)
+                .map_err(|e| anyhow!("{:?}", e))
+                .context("trimming params")?
+        };
+        debug!("{} PPs & VPs built", m.to_span());
 
         // Find the maximum node id used in this model so we can pick a unique node id for table related commitments.
         let table_node_id = NodeId(max_node_id.0 + 1);
@@ -108,6 +114,7 @@ where
         // Then we do the same for any table commitments but here we set all of them to have `table_node_id`.
         let table_commitments_check = lookup_ctx.iter().any(|tt| tt.has_committed_claims());
         let (model_commitment, model_comms_map) = if !polys.is_empty() || table_commitments_check {
+            let m = Metrics::new();
             let map = polys
                 .into_iter()
                 .flat_map(|(node_id, hash_map)| {
@@ -135,12 +142,15 @@ where
                         map_acc
                     },
                 );
+            debug!("{} map created", m.to_span());
 
             // Here we build the RowMajorMatrices and `model_comms_map`.
             // The `model_comms_map` stores the order of the polynomials in each RowMajorMatrix
+            let m = Metrics::new();
             let (model_comms_map, rmms) = map.into_iter().rev().fold(
                 (BTreeMap::new(), Vec::new()),
                 |(mut map_acc, mut rmm_acc), (nv, (values, polys))| {
+                    let im = Metrics::new();
                     let matrix_values = transpose(
                         polys
                             .into_iter()
@@ -156,13 +166,19 @@ where
                     );
                     rmm_acc.push(rmm);
                     map_acc.insert(nv, values);
+                    debug!("{} {nv} processed.", im.to_span());
+
                     (map_acc, rmm_acc)
                 },
             );
+            debug!("{} model_comms_map built", m.to_span());
+
             // Build the batch commitment
+            let m = Metrics::new();
             let model_commitment = PCS::batch_commit(&prover_params, rmms)
                 .map_err(|e| anyhow!("{:?}", e))
                 .context("Batch Commitment")?;
+            debug!("{} model commitment built", m.to_span());
             (Some(model_commitment), model_comms_map)
         } else {
             (None, BTreeMap::new())
@@ -181,8 +197,8 @@ where
 
         let max_model_num_vars = model_comms_map.keys().max().copied().unwrap_or(0usize);
         Ok(GlobalCommitmentContext {
-            prover_params,
             verifier_params,
+            prover_params,
             model_commitment,
             model_comms_map,
             table_node_id,

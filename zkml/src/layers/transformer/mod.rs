@@ -35,7 +35,7 @@ pub(crate) mod manual_attention {
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use serde::Deserialize;
-    use tenstore::TenStore;
+    use tenstore::GenStore;
 
     use crate::{
         Tensor, init_test_logging,
@@ -483,7 +483,7 @@ pub(crate) mod manual_attention {
         let _last_node_id = first_attention.write_to_model(&mut model, None, &config)?;
         model.route_output(None)?;
         let output1 =
-            model.run::<GoldilocksExt2>(slice::from_ref(&input), None, &mut TenStore::default())?;
+            model.run::<GoldilocksExt2>(slice::from_ref(&input), None, &mut GenStore::default())?;
         let output = model.run_float(slice::from_ref(&input))?;
         assert_eq!(output1.outputs()?[0].get_data(), output[0].get_data());
         println!("graph output: {:?}", output[0].shape());

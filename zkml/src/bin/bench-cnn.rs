@@ -1,5 +1,5 @@
 use std::{fs::File, io::BufReader};
-use tenstore::TenStore;
+use tenstore::GenStore;
 use timed_core::Output;
 
 use utils::{Metrics, init_csv_recorder, stream_data, stream_metrics};
@@ -317,7 +317,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         let metrics = Metrics::new();
         let input_tensor = model.load_input_flat(vec![input])?;
 
-        let trace_result = model.run(&input_tensor, None, &mut TenStore::default());
+        let trace_result = model.run(&input_tensor, None, &mut GenStore::default());
 
         let span = metrics.to_span();
         stream_metrics(format!("Inference {i}"), &span);

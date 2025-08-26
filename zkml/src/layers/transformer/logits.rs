@@ -44,7 +44,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::TenStore;
+use tenstore::GenStore;
 use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
@@ -311,7 +311,7 @@ where
         _last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
             step_data.node_inputs.len() == 1,
@@ -430,7 +430,7 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         ensure!(
             step_data.node_inputs.len() == 1,
@@ -750,6 +750,6 @@ mod test {
 
         model.route_output(None).unwrap();
 
-        prove_model(model, &mut TenStore::default()).unwrap();
+        prove_model(model, &mut GenStore::default()).unwrap();
     }
 }

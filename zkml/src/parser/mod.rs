@@ -13,7 +13,7 @@ use crate::{
 };
 use anyhow::{Context, Error, Result, bail, ensure};
 use itertools::Either;
-use tenstore::TenStore;
+use tenstore::GenStore;
 use tracing::debug;
 use tract_onnx::{pb::ModelProto, prelude::*};
 
@@ -92,7 +92,7 @@ impl<'a, S: ScalingStrategy> FloatOnnxLoader<'a, S> {
         // We may wish to change the store type depending on the workload in the future.
         let (quantized_model, mut md) = self
             .scaling_strategy
-            .quantize(float_model, &mut TenStore::default())?;
+            .quantize(float_model, &mut GenStore::default())?;
         let padded_model = pad_model(quantized_model)?;
         md.float_model = kept_float;
         Ok((padded_model, md))
@@ -291,6 +291,12 @@ pub mod file_cache {
         ensure!(path.is_file(), "`{}` is not a file", path.display());
         Ok(path)
     }
+
+    pub fn write_to<S: AsRef<str>>(file: S) -> anyhow::Result<PathBuf> {
+        let path = CACHE_DIR.join(file.as_ref());
+        ensure!(!path.exists(), "`{}` already exists", path.display());
+        Ok(path)
+    }
 }
 
 #[cfg(test)]
@@ -301,7 +307,7 @@ mod tests {
         testing::Pcs, verify,
     };
     use ff_ext::GoldilocksExt2;
-    use tenstore::TenStore;
+    use tenstore::GenStore;
     use tracing::info;
     use transcript::BasicTranscript;
 
@@ -331,7 +337,7 @@ mod tests {
             crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0]).quantize(&md.input[0]);
         let input = model.prepare_inputs(vec![input]).unwrap();
         let trace = model
-            .run::<F>(&input, None, &mut TenStore::default())
+            .run::<F>(&input, None, &mut GenStore::default())
             .unwrap();
         println!("Result: {:?}", trace.outputs());
     }
@@ -373,7 +379,7 @@ mod tests {
         let input = model.prepare_inputs(inputs).unwrap();
         info!("RUNNING MODEL...");
         let trace = model
-            .run::<F>(&input, None, &mut TenStore::default())
+            .run::<F>(&input, None, &mut GenStore::default())
             .unwrap();
         info!("RUNNING MODEL DONE...");
         println!("Result: {:?}", trace.outputs());
@@ -424,7 +430,7 @@ mod tests {
             .collect();
         let input = model.prepare_inputs(native_input).unwrap();
         let trace = model
-            .run::<F>(&input, None, &mut TenStore::default())
+            .run::<F>(&input, None, &mut GenStore::default())
             .unwrap();
         println!("Result: {:?}", trace.outputs());
 

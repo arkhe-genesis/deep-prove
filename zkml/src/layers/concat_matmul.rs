@@ -29,7 +29,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::TenStore;
+use tenstore::GenStore;
 use tracing::trace;
 use transcript::Transcript;
 
@@ -744,7 +744,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<Vec<crate::Claim<E>>> {
         let input_tensors = step_data.input_tensors(store)?;
         let output_tensors = step_data.output_tensors(store)?;
@@ -1041,7 +1041,7 @@ mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let outputs = prove_model(model, &mut TenStore::default()).unwrap();
+        let outputs = prove_model(model, &mut GenStore::default()).unwrap();
 
         // check output shape
         assert_eq!(
@@ -1071,7 +1071,7 @@ mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let outputs = prove_model(model, &mut TenStore::default()).unwrap();
+        let outputs = prove_model(model, &mut GenStore::default()).unwrap();
         assert_eq!(
             outputs[0].shape(),
             Shape::new(vec![5, 14, 18]).next_power_of_two()
@@ -1123,7 +1123,7 @@ mod test {
 
         model.route_output(None).unwrap();
 
-        let outputs = prove_model(model, &mut TenStore::default()).unwrap();
+        let outputs = prove_model(model, &mut GenStore::default()).unwrap();
         assert_eq!(
             outputs[0].shape(),
             Shape::new(vec![21, 7, 17]).next_power_of_two()

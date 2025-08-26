@@ -539,7 +539,6 @@ where
             } = trace
                 .get_step(&node_id)
                 .ok_or(anyhow!("Step in trace not found for node {}", node_id))?;
-            // TODO: #2 - insert an hydration step here
             trace!(
                 "Proving node with id {node_id}: {:?}",
                 node_operation.describe()
@@ -556,14 +555,18 @@ where
                 node_id,
             )?;
             let claims = if node_operation.is_provable() {
-                node_operation.prove(
-                    node_id,
-                    &ctx.ctx,
-                    claims_for_prove.iter().collect::<Vec<_>>(),
-                    step_data,
-                    &mut self,
-                    &mut store,
-                )?
+                node_operation
+                    .prove(
+                        node_id,
+                        &ctx.ctx,
+                        claims_for_prove.iter().collect::<Vec<_>>(),
+                        step_data,
+                        &mut self,
+                        &mut store,
+                    )
+                    .with_context(|| {
+                        format!("proving {}: {}", node_id, node_operation.describe())
+                    })?
             } else {
                 // we only propagate the claims, without changing them, as a non-provable layer
                 // shouldn't change the input values

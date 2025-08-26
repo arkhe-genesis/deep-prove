@@ -18,7 +18,7 @@ use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::Path;
-use tenstore::TenStore;
+use tenstore::GenStore;
 use tracing::{debug, info};
 use transcript::BasicTranscript;
 
@@ -50,7 +50,8 @@ pub struct Driver<N: Number> {
 }
 
 /// The main struct responsible for verifying the proof related to the LLM proving.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct LLMContext<E, PCS>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
@@ -150,7 +151,7 @@ impl Driver<f32> {
         self.model.input_shapes = vec![Shape::from(vec![numel, 1])];
         let (quantized_model, _md) =
             InferenceObserver::new_with_representative_input(vec![representative_inputs])
-                .quantize(self.model, &mut TenStore::default())?;
+                .quantize(self.model, &mut GenStore::default())?;
         Ok(Driver {
             model: quantized_model,
             config: self.config,
@@ -251,7 +252,7 @@ where
                 unpadded_seq_len,
                 tensor.shape()
             );
-            let mut store = TenStore::default();
+            let mut store = GenStore::default();
             let trace = if let PaddingMode::NoPadding = self.padding_mode {
                 self.model
                     // TODO: make it re-usable at least for the static weights
@@ -308,7 +309,7 @@ where
         // 4. rerun to have a "clean" trace
         info!("Running last iteration (heavy) with {input_len} tokens");
 
-        let mut store = TenStore::default();
+        let mut store = GenStore::default();
         let trace = self.model.run::<E>(
             &[tensor],
             Some(vec![Shape::new(vec![input_len])]),
@@ -395,6 +396,7 @@ impl Driver<Element> {
         })
     }
 
+    /// Create the prover & verifier for a given model
     pub fn context<E, PCS>(&self) -> anyhow::Result<LLMContext<E, PCS>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -550,6 +552,11 @@ pub trait LLMTokenizer {
 
 #[cfg(test)]
 mod test {
+    use std::{
+        fs::File,
+        io::{BufReader, BufWriter},
+    };
+
     use crate::{
         init_test_logging,
         parser::{
@@ -565,15 +572,58 @@ mod test {
 
     #[test]
     fn test_llm_driver_prove() -> anyhow::Result<()> {
+        const MAX_CONTEXT: usize = 10;
         init_test_logging("debug");
-        let max_context = 10;
+
+        // Load the model file
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        //let model_path = "assets/scripts/llms/toy_gpt2.gguf";
-        let driver = Driver::load_external_model(&model_path)?.with_max_context(max_context);
+        let cache_filename = {
+            let mut hasher = blake3::Hasher::new();
+            hasher
+                .update_mmap(&model_path)
+                .context("hashing model file")?;
+            let hash = hasher.finalize();
+            format!("cache-{GPT2_Q8_0}-{hash}.bin")
+        };
+
+        // Generate or load the prover & verifier contexts
+        let (driver, ctx): (_, LLMContext<GoldilocksExt2, Pcs<GoldilocksExt2>>) =
+            match file_cache::from_cache(&cache_filename) {
+                Ok(cache_file) => {
+                    info!("reading existing cache file `{}`", cache_file.display());
+                    rmp_serde::from_read(BufReader::new(
+                        &File::open(&cache_file).context("opening cache file")?,
+                    ))
+                    .context("deserializing cached data")?
+                }
+                _ => {
+                    let cache_target_file = file_cache::write_to(&cache_filename)
+                        .context("generating filename for cached data")?;
+
+                    let driver = Driver::load_external_model(&model_path)?
+                        .with_max_context(MAX_CONTEXT)
+                        .into_provable_llm()?;
+
+                    let ctx = driver
+                        .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+                        .with_max_context(MAX_CONTEXT);
+
+                    info!("writing contexts to `{}`", cache_target_file.display());
+                    let r = (driver, ctx);
+
+                    rmp_serde::encode::write(
+                        &mut BufWriter::new(File::create(&cache_target_file)?),
+                        &r,
+                    )?;
+
+                    r
+                }
+            };
+
+        // Generate the trace
         let sentence = "The sky is";
         let tokenizer = TokenizerData::load_tokenizer_from_gguf(&model_path)?;
         let user_tokens = tokenizer.tokenize(sentence);
-        let driver = driver.into_provable_llm()?;
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
             Some(LLMTokenizerObserver {
@@ -581,13 +631,19 @@ mod test {
                 tokenizer: &tokenizer,
             }),
         )?;
-        let ctx = driver
-            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
-            .with_max_context(max_context);
+
+        // Prove the trace
         let proof = driver.prove(&ctx, trace)?;
+
+        // Serialize the proof
         let proof_bytes =
             bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
-        info!("Proof size: {}", proof_bytes.len());
+        info!(
+            "Proof size: {}",
+            humansize::format_size(proof_bytes.len(), humansize::BINARY)
+        );
+
+        // Verify the proof
         ctx.verify(proof, user_tokens)?;
         Ok(())
     }

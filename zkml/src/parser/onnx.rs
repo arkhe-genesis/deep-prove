@@ -723,7 +723,7 @@ mod tests {
     use super::*;
     use anyhow::Ok;
     use ff_ext::GoldilocksExt2;
-    use tenstore::TenStore;
+    use tenstore::GenStore;
 
     #[test]
     fn test_parser_load_conv() {
@@ -732,7 +732,7 @@ mod tests {
 
         let input_tensor = crate::tensor::Tensor::random(&input_shape);
         let trace = model
-            .run::<GoldilocksExt2>(&[input_tensor], None, &mut TenStore::default())
+            .run::<GoldilocksExt2>(&[input_tensor], None, &mut GenStore::default())
             .unwrap();
         assert!(!trace.steps.is_empty());
     }

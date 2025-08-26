@@ -27,7 +27,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::TenStore;
+use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{
@@ -390,7 +390,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         // we first construct the one hot encoding from the input indices and then we run
         // the matmul protocol.
@@ -684,7 +684,7 @@ mod tests {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model_with(model, vec![input], &mut TenStore::default())?;
+        prove_model_with(model, vec![input], &mut GenStore::default())?;
 
         Ok(())
     }

@@ -31,7 +31,7 @@ use std::{
     fmt::{self, Debug},
     ops::{Bound, RangeBounds},
 };
-use tenstore::{TenStore, TensorKey, TensorStore, TenstoreError};
+use tenstore::{GenStore, GenericStore, StoreError, StoreKey};
 
 use crate::{
     Element,
@@ -426,18 +426,18 @@ where
 /// from a store.
 #[derive(Clone, Debug)]
 pub struct DryTensor<T> {
-    /// A key pointing to the tensor data in a [`TenStore`]
-    k: TensorKey<T>,
+    /// A key pointing to the tensor data in a [`GenStore`]
+    k: StoreKey<Vec<T>>,
     /// The shape of the tensor.
     shape: Shape,
 }
 impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
-    pub(crate) fn new(k: TensorKey<T>, shape: Shape) -> Self {
+    pub(crate) fn new(k: StoreKey<Vec<T>>, shape: Shape) -> Self {
         Self { k, shape }
     }
 
     /// Return a reference to this dry tensor key.
-    pub(crate) fn key(&self) -> &TensorKey<T> {
+    pub(crate) fn key(&self) -> &StoreKey<Vec<T>> {
         &self.k
     }
 
@@ -447,7 +447,7 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
     }
 
     /// Hydrate this dry tensor from `store`, generating a [`Tensor`] from it.
-    pub(crate) fn hydrate(&self, mut store: TenStore) -> Result<Tensor<T>, TenstoreError> {
+    pub(crate) fn hydrate(&self, mut store: GenStore) -> Result<Tensor<T>, StoreError> {
         store
             .fetch(&self.k)
             .map(|data| Tensor::new(self.shape.clone(), data))
@@ -458,13 +458,13 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
     /// dried version.
     pub(crate) fn dry_cast<S>(
         &self,
-        mut store: TenStore,
+        mut store: GenStore,
         f: impl Fn(&T) -> S,
-    ) -> Result<DryTensor<S>, TenstoreError>
+    ) -> Result<DryTensor<S>, StoreError>
     where
         S: Serialize + for<'a> Deserialize<'a>,
     {
-        let new_k = store.cast(&self.k, f)?;
+        let new_k = store.cast(&self.k, |xs| xs.iter().map(&f).collect())?;
         Ok(DryTensor::<S>::new(new_k, self.shape.clone()))
     }
 
@@ -472,14 +472,14 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
     /// build it by mapping `f` over `self`, store it, then return its data.
     pub(crate) fn hydrated_cast<S>(
         &self,
-        mut store: TenStore,
+        mut store: GenStore,
         f: impl Fn(&T) -> S,
-    ) -> Result<Tensor<S>, TenstoreError>
+    ) -> Result<Tensor<S>, StoreError>
     where
         S: Serialize + for<'a> Deserialize<'a>,
     {
         store
-            .cast_and_fetch(&self.k, f)
+            .cast_and_fetch(&self.k, |xs| xs.iter().map(&f).collect())
             .map(|bytes| Tensor::new(self.shape.clone(), bytes.1))
     }
 }
@@ -512,6 +512,11 @@ impl<T> Tensor<T> {
 
     /// Return an immutable reference to this tensor data.
     pub fn data(&self) -> &[T] {
+        &self.data
+    }
+
+    /// Return an immutable reference to this tensor data.
+    pub fn data_vec(&self) -> &Vec<T> {
         &self.data
     }
 

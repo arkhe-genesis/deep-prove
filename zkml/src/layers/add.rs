@@ -1,7 +1,7 @@
 use multilinear_extensions::{mle::IntoMLE, util::ceil_log2};
 use serde::de::DeserializeOwned;
 use std::{cmp::Ordering, collections::HashMap};
-use tenstore::TenStore;
+use tenstore::GenStore;
 
 use anyhow::{Context, bail, ensure};
 use ff_ext::ExtensionField;
@@ -582,7 +582,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
         T: Transcript<E>,
@@ -732,7 +732,7 @@ mod test {
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
             model.route_output(None).unwrap();
             model.describe();
-            prove_model(model, &mut TenStore::default()).unwrap();
+            prove_model(model, &mut GenStore::default()).unwrap();
         }
     }
 
@@ -747,7 +747,7 @@ mod test {
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
             model.route_output(None).unwrap();
             model.describe();
-            prove_model(model, &mut TenStore::default()).unwrap();
+            prove_model(model, &mut GenStore::default()).unwrap();
         }
     }
 

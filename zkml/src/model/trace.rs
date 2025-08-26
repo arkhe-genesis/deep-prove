@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Debug};
 use anyhow::Context;
 use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize};
-use tenstore::{TenStore, TenstoreError};
+use tenstore::{GenStore, StoreError};
 
 use crate::{
     Element, IO, Tensor,
@@ -14,7 +14,7 @@ use crate::{
 
 #[derive(Default, Clone)]
 pub struct Trace<'a, E: ExtensionField, N, D> {
-    pub(crate) store: TenStore,
+    pub(crate) store: GenStore,
     pub(crate) steps: HashMap<NodeId, InferenceStep<'a, E, N, D>>,
     // TODO: convert to TensorKey
     pub(crate) input: Vec<DryTensor<D>>,
@@ -41,7 +41,7 @@ where
 
     /// Compute the inputs and outputs tensors from the trace, which are necessary
     /// for the verifier to verify the proof of the model inference
-    pub fn to_verifier_io(&self) -> Result<IO<E>, TenstoreError>
+    pub fn to_verifier_io(&self) -> Result<IO<E>, StoreError>
     where
         D: Fieldizer<E>,
     {
@@ -49,13 +49,13 @@ where
             .input
             .iter()
             .map(|dry| dry.hydrated_cast(self.store.clone(), |x| x.to_field()))
-            .collect::<Result<Vec<_>, TenstoreError>>()?;
+            .collect::<Result<Vec<_>, StoreError>>()?;
 
         let outputs = self
             .output
             .iter()
             .map(|dry| dry.hydrated_cast(self.store.clone(), |x| x.to_field()))
-            .collect::<Result<Vec<_>, TenstoreError>>()?;
+            .collect::<Result<Vec<_>, StoreError>>()?;
         Ok(IO::new(inputs, outputs))
     }
 
@@ -70,13 +70,13 @@ where
             .input
             .into_iter()
             .map(|dry| dry.dry_cast(self.store.clone(), |x: &D| x.to_field()))
-            .collect::<Result<Vec<DryTensor<E>>, TenstoreError>>()
+            .collect::<Result<Vec<DryTensor<E>>, StoreError>>()
             .context("converting input")?;
         let output = self
             .output
             .into_iter()
             .map(|dry| dry.dry_cast(self.store.clone(), |x: &D| x.to_field()))
-            .collect::<Result<Vec<DryTensor<E>>, TenstoreError>>()
+            .collect::<Result<Vec<DryTensor<E>>, StoreError>>()
             .context("converting output")?;
         let field_steps = self
             .steps
@@ -124,7 +124,7 @@ where
             .output
             .iter()
             .map(|dry| dry.hydrate(self.store.clone()))
-            .collect::<Result<Vec<_>, TenstoreError>>()?)
+            .collect::<Result<Vec<_>, StoreError>>()?)
     }
 
     /// Get the inputs tensors of the inference represented by this trace
@@ -133,7 +133,7 @@ where
             .input
             .iter()
             .map(|dry| dry.hydrate(self.store.clone()))
-            .collect::<Result<Vec<_>, TenstoreError>>()?)
+            .collect::<Result<Vec<_>, StoreError>>()?)
     }
 
     /// Get the (hydrated) ith input tensor of the inference represented by
@@ -161,20 +161,20 @@ impl<'a, E: ExtensionField> InferenceTrace<'a, E, Element> {
     pub fn dequantized(
         &self,
         md: &ModelMetadata,
-    ) -> Result<Trace<'a, E, Element, f32>, TenstoreError> {
+    ) -> Result<Trace<'a, E, Element, f32>, StoreError> {
         let inputs = self
             .input
             .iter()
             .zip(&md.input)
             .map(|(dry, s)| dry.dry_cast(self.store.clone(), |x| s.dequantize(x)))
-            .collect::<Result<Vec<DryTensor<f32>>, TenstoreError>>()?;
+            .collect::<Result<Vec<DryTensor<f32>>, StoreError>>()?;
 
         let outputs = self
             .output
             .iter()
             .zip(&md.output)
             .map(|(dry, s)| dry.dry_cast(self.store.clone(), |x| s.dequantize(x)))
-            .collect::<Result<Vec<DryTensor<f32>>, TenstoreError>>()?;
+            .collect::<Result<Vec<DryTensor<f32>>, StoreError>>()?;
         let steps = self
             .steps
             .iter()
@@ -191,7 +191,7 @@ impl<'a, E: ExtensionField> InferenceTrace<'a, E, Element> {
                     },
                 ))
             })
-            .collect::<Result<HashMap<_, _>, TenstoreError>>()?;
+            .collect::<Result<HashMap<_, _>, StoreError>>()?;
         Ok(Trace {
             store: self.store.clone(),
             steps,
@@ -223,9 +223,9 @@ impl<'a, E: ExtensionField, N> InferenceStep<'a, E, N, Element> {
     pub fn to_dequantize(
         &self,
         md: &ModelMetadata,
-        store: TenStore,
+        store: GenStore,
         node_id: NodeId,
-    ) -> Result<InferenceStep<'a, E, N, f32>, TenstoreError> {
+    ) -> Result<InferenceStep<'a, E, N, f32>, StoreError> {
         Ok(InferenceStep {
             op: self.op,
             step_data: self.step_data.to_dequantize(md, store, node_id)?,
@@ -244,43 +244,40 @@ pub struct StepData<D, E: ExtensionField> {
 }
 impl<D: Serialize + for<'a> Deserialize<'a>, E: ExtensionField> StepData<D, E> {
     /// Hydrate all the input tensors of the node corresponding to this step.
-    pub(crate) fn input_tensors(
-        &self,
-        store: &mut TenStore,
-    ) -> Result<Vec<Tensor<D>>, TenstoreError> {
+    pub(crate) fn input_tensors(&self, store: &mut GenStore) -> Result<Vec<Tensor<D>>, StoreError> {
         self.node_inputs
             .iter()
             .map(|dry| dry.hydrate(store.clone()))
-            .collect::<Result<Vec<_>, TenstoreError>>()
+            .collect::<Result<Vec<_>, StoreError>>()
     }
 
     /// Hydrate one of the input tensors of the node corresponding to this step.
     pub(crate) fn input_tensor_at(
         &self,
         i: usize,
-        store: &mut TenStore,
-    ) -> Result<Tensor<D>, TenstoreError> {
+        store: &mut GenStore,
+    ) -> Result<Tensor<D>, StoreError> {
         self.node_inputs[i].hydrate(store.clone())
     }
 
     /// Hydrate all the output tensors of the node corresponding to this step.
     pub(crate) fn output_tensors(
         &self,
-        store: &mut TenStore,
-    ) -> Result<Vec<Tensor<D>>, TenstoreError> {
+        store: &mut GenStore,
+    ) -> Result<Vec<Tensor<D>>, StoreError> {
         self.node_outputs
             .outputs
             .iter()
             .map(|dry| dry.hydrate(store.clone()))
-            .collect::<Result<Vec<_>, TenstoreError>>()
+            .collect::<Result<Vec<_>, StoreError>>()
     }
 
     /// Hydrate one of the output tensors of the node corresponding to this step.
     pub(crate) fn output_tensor_at(
         &self,
         i: usize,
-        store: &mut TenStore,
-    ) -> Result<Tensor<D>, TenstoreError> {
+        store: &mut GenStore,
+    ) -> Result<Tensor<D>, StoreError> {
         self.node_outputs.outputs[i].hydrate(store.clone())
     }
 }
@@ -289,9 +286,9 @@ impl<E: ExtensionField> StepData<Element, E> {
     pub(crate) fn to_dequantize(
         &self,
         md: &ModelMetadata,
-        store: TenStore,
+        store: GenStore,
         node_id: NodeId,
-    ) -> Result<StepData<f32, E>, TenstoreError> {
+    ) -> Result<StepData<f32, E>, StoreError> {
         Ok(StepData {
             node_inputs: self
                 .node_inputs
@@ -300,7 +297,7 @@ impl<E: ExtensionField> StepData<Element, E> {
                 .map(|(dry, scale_factor)| {
                     dry.dry_cast(store.clone(), |x| scale_factor.dequantize(x))
                 })
-                .collect::<Result<Vec<_>, TenstoreError>>()?,
+                .collect::<Result<Vec<_>, StoreError>>()?,
             node_outputs: self.node_outputs.to_dequantize(md, store, node_id)?,
             unpadded_output_shapes: self.unpadded_output_shapes.clone(),
             unpadded_input_shapes: self.unpadded_input_shapes.clone(),

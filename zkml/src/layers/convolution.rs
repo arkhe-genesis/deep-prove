@@ -24,7 +24,7 @@ use burn::tensor::{module::conv2d, ops::ConvOptions};
 use either::Either;
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
-use tenstore::TenStore;
+use tenstore::GenStore;
 // use itertools::assert_equal;
 use crate::{
     Element,
@@ -598,7 +598,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let output_tensor = step_data.output_tensor_at(0, store)?;
 

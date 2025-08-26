@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{debug, trace};
 use transcript::Transcript;
+use utils::Metrics;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
@@ -107,6 +108,7 @@ impl Model<Element> {
             debug!("Context : layer info generation ...");
             let mut max_node_id = NodeId(0);
             for (id, node) in self.to_forward_iterator() {
+                let inner_metrics = Metrics::new();
                 ctx_aux = compute_node_shape::<E>(
                     ctx_aux,
                     &mut model_polys,
@@ -118,25 +120,37 @@ impl Model<Element> {
                 )?;
                 max_poly_len = max_poly_len.max(ctx_aux.max_poly_len);
                 max_node_id = max_node_id.max(id);
-                debug!("node: {id}, max_poly_len: {max_poly_len}");
+                debug!(
+                    "{} node: {id} ({}), max_poly_len: {max_poly_len}",
+                    inner_metrics.to_span(),
+                    node.describe(),
+                );
             }
             // Check to see if we use a lookup table alrger than any of the individual polynomials
             ctx_aux.tables.iter().for_each(|table_type| {
+                let inner_metrics = Metrics::new();
                 let multiplicity_vars = table_type.multiplicity_poly_vars();
                 max_poly_len = max_poly_len.max(1 << multiplicity_vars);
-                debug!("table type: {table_type:?}, max_poly_len: {max_poly_len}");
+                debug!(
+                    "{} table type: {table_type:?}, max_poly_len: {max_poly_len}",
+                    inner_metrics.to_span()
+                );
             });
 
-            debug!("Context : lookup generation ...");
+            let metrics = Metrics::new();
+            debug!("Context: lookup generation ...");
             let lookup_ctx = LookupContext::new(&ctx_aux.tables);
+            debug!("{} lookup generated.", metrics.to_span());
 
-            debug!("Context : commitment generating ...");
+            let metrics = Metrics::new();
+            debug!("Context: commitment generating ...");
             let commitment_ctx = GlobalCommitmentContext::<E, PCS>::new(
                 max_poly_len,
                 model_polys,
                 &lookup_ctx.tables,
                 max_node_id,
             )?;
+            debug!("{} commitment generated.", metrics.to_span());
             (step_infos, commitment_ctx, lookup_ctx)
         };
 
@@ -309,7 +323,7 @@ fn compute_node_input_shapes(
                 // input node
                 ensure!(
                     edge.index < model_input_shapes.len(),
-                    "Input for node {} is the input {} of the model, 
+                    "Input for node {} is the input {} of the model,
                         but the model has only {} inputs",
                     id,
                     edge.index,

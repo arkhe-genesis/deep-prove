@@ -272,7 +272,7 @@ mod test {
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
     use itertools::Itertools;
     use multilinear_extensions::mle::IntoMLE;
-    use tenstore::TenStore;
+    use tenstore::GenStore;
 
     use crate::{
         FloatOnnxLoader, default_transcript,
@@ -319,7 +319,7 @@ mod test {
         println!("input: {:?}", input.get_data());
         let input = model.prepare_inputs(vec![input])?;
 
-        let trace = model.run(&input, None, &mut TenStore::default()).unwrap();
+        let trace = model.run(&input, None, &mut GenStore::default()).unwrap();
         let output = trace.output_at(0)?;
         println!("[+] Run inference. Result: {output:?}");
 

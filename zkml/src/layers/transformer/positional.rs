@@ -10,7 +10,7 @@ use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::TenStore;
+use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{
@@ -393,7 +393,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
             last_claims.len() == step_data.node_inputs.len(),
@@ -707,7 +707,7 @@ mod tests {
         #[case] embedding_size: usize,
         #[case] context_length: usize,
     ) {
-        use tenstore::TenStore;
+        use tenstore::GenStore;
 
         let input_shape = vec![seq_len, embedding_size];
 
@@ -727,6 +727,6 @@ mod tests {
 
         model.route_output(None).unwrap();
 
-        let _ = prove_model(model, &mut TenStore::default()).unwrap();
+        let _ = prove_model(model, &mut GenStore::default()).unwrap();
     }
 }

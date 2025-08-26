@@ -57,7 +57,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::TenStore;
+use tenstore::GenStore;
 use transcript::Transcript;
 
 /// The base 2 logarithm of the scale factor used in exponential lookup tables
@@ -931,7 +931,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut crate::Prover<E, T, PCS>,
-        _store: &mut TenStore,
+        _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
             "Softmax LayerOut didn't have any ProvingData::Softmax"
@@ -950,7 +950,7 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let output_tensors = step_data.output_tensors(store)?;
         ensure!(
@@ -1855,6 +1855,6 @@ mod tests {
 
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model, &mut TenStore::default()).unwrap();
+        prove_model(model, &mut GenStore::default()).unwrap();
     }
 }

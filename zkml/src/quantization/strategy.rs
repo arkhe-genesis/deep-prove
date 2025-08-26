@@ -13,7 +13,7 @@ use average::{Estimate, Max, Min, Quantile, Variance};
 use ff_ext::GoldilocksExt2;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use tenstore::TenStore;
+use tenstore::GenStore;
 use tracing::{debug, info, warn};
 
 use super::ScalingFactor;
@@ -27,7 +27,7 @@ pub trait ScalingStrategy: std::fmt::Debug {
     fn quantize(
         &self,
         model: Model<f32>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<(Model<Element>, ModelMetadata)>;
 
     /// Returns the scaling factors for the outputs of the node with the given ID. The number of
@@ -84,7 +84,7 @@ impl ScalingStrategy for InferenceObserver {
     fn quantize(
         &self,
         model: Model<f32>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<(Model<Element>, ModelMetadata)> {
         let tracking_mode = InferenceTrackingMode::MinMax;
         // Alternatively:
@@ -293,7 +293,7 @@ impl ScalingStrategy for AbsoluteMax {
     fn quantize(
         &self,
         model: Model<f32>,
-        _store: &mut TenStore,
+        _store: &mut GenStore,
     ) -> Result<(Model<Element>, ModelMetadata)> {
         let input_scaling_factor = if let Some(ref input) = self.0 {
             let input_tensor = model.load_input_flat(input.clone())?;

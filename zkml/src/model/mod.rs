@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::{TenStore, TensorStore, TenstoreError};
+use tenstore::{GenStore, GenericStore, StoreError};
 use trace::Trace;
 use tracing::{debug, info};
 
@@ -426,7 +426,7 @@ where
 
 impl Model<f32> {
     pub fn run_float(&self, input: &[Tensor<f32>]) -> anyhow::Result<Vec<Tensor<f32>>> {
-        self.run::<GoldilocksExt2>(input, None, &mut TenStore::default())?
+        self.run::<GoldilocksExt2>(input, None, &mut GenStore::default())?
             .outputs()
     }
 }
@@ -437,7 +437,7 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
         inputs: &[Tensor<N>],
         unpadded_input_shapes: Option<Vec<Shape>>,
         mut tracker: Option<&mut InferenceTracker>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -454,9 +454,9 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
                     .map(|(i, tensor)| {
                         let key = crate::layers::provable::Edge::tkey_for_input::<N>(None, i);
                         padded_input_shapes.insert(key.clone(), tensor.shape());
-                        Ok((key, tensor.data()))
+                        Ok((key, tensor.data_vec()))
                     })
-                    .collect::<Result<Vec<_>, TenstoreError>>()?
+                    .collect::<Result<Vec<_>, StoreError>>()?
                     .as_slice(),
             )
             .context("creating root inputs")?;
@@ -585,7 +585,7 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
         &self,
         input: &[Tensor<N>],
         unpadded_input_shapes: Option<Vec<Shape>>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
         E::BaseField: Serialize + DeserializeOwned,
@@ -634,7 +634,7 @@ pub(crate) mod test {
         structs::{IOPProverState, IOPVerifierState},
         util::optimal_sumcheck_threads,
     };
-    use tenstore::TenStore;
+    use tenstore::GenStore;
 
     use crate::{Element, default_transcript, tensor::Tensor};
 
@@ -861,7 +861,7 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
 
-        let mut store = TenStore::default();
+        let mut store = GenStore::default();
         let trace = model.run::<F>(&[input], None, &mut store).unwrap();
         assert_eq!(trace.steps.len(), 2);
         // Verify first step
@@ -966,7 +966,7 @@ pub(crate) mod test {
     #[test]
     #[ignore = "This test should be deleted since there is no requant and it is not testing much"]
     fn test_single_matvec_prover() {
-        let mut store = TenStore::default();
+        let mut store = GenStore::default();
         let w1 = random_vector_quant(1024 * 1024);
         let conv1 = Tensor::new(vec![1024, 1024].into(), w1.clone());
         let w2 = random_vector_quant(1024);
@@ -1018,7 +1018,7 @@ pub(crate) mod test {
             .prepare_inputs(vec![Tensor::new(input_shape, input)])
             .unwrap();
 
-        let mut store = TenStore::default();
+        let mut store = GenStore::default();
         let trace = model.run::<F>(&input_tensor, None, &mut store).unwrap();
         let mut tr = BasicTranscript::<F>::new(b"matmul");
         let (prover_ctx, verifier_ctx) = model
@@ -1057,7 +1057,7 @@ pub(crate) mod test {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        let mut store = TenStore::default();
+        let mut store = GenStore::default();
         let trace = model.run::<F>(&[input], None, &mut store).unwrap();
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
@@ -1149,7 +1149,7 @@ pub(crate) mod test {
         model: Model<f32>,
         float_inputs: Vec<Tensor<f32>>,
         representative_inputs: Option<Vec<Tensor<f32>>>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<(Model<Element>, Vec<Tensor<Element>>)> {
         let (quantized_model, md) = if let Some(repr_inputs) = representative_inputs {
             InferenceObserver::new_with_representative_input(vec![
@@ -1176,7 +1176,7 @@ pub(crate) mod test {
     pub(crate) fn prove_quantized_model(
         model: Model<Element>,
         inputs: Vec<Tensor<Element>>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Tensor<Element>>> {
         let model = pad_model(model)?;
 
@@ -1202,7 +1202,7 @@ pub(crate) mod test {
     pub(crate) fn prove_model_with(
         model: Model<f32>,
         float_inputs: Vec<Tensor<f32>>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Tensor<Element>>> {
         let (quantized_model, quantized_inputs) = quantize_model(model, float_inputs, None, store)?;
         println!("QUANTIZED MODEL: {:?}", quantized_model.describe());
@@ -1211,7 +1211,7 @@ pub(crate) mod test {
 
     pub(crate) fn prove_model(
         model: Model<f32>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Tensor<Element>>> {
         let float_inputs = model
             .input_shapes()

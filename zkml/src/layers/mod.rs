@@ -27,7 +27,7 @@ use provable::{
     QuantizeOp, QuantizeOutput,
 };
 use requant::RequantCtx;
-use tenstore::{TenStore, TensorKey, TensorStore, TenstoreError};
+use tenstore::{GenStore, GenericStore, StoreError, TensorKey};
 use transcript::Transcript;
 use transformer::{
     layernorm::LayerNormData, logits::ArgmaxData, mha::MhaData, softmax::SoftmaxData,
@@ -260,7 +260,7 @@ pub(crate) struct NodeOut<T, E: ExtensionField> {
     pub(crate) proving_data: ProvingData<E>,
 }
 impl<T, E: ExtensionField> NodeOut<T, E> {
-    pub(crate) fn into_fields<U>(self, store: TenStore) -> anyhow::Result<NodeOut<U, E>>
+    pub(crate) fn into_fields<U>(self, store: GenStore) -> anyhow::Result<NodeOut<U, E>>
     where
         T: Serialize + for<'a> Deserialize<'a>,
         U: Serialize + for<'a> Deserialize<'a>,
@@ -320,9 +320,9 @@ impl<E: ExtensionField> NodeOut<Element, E> {
     pub(crate) fn to_dequantize(
         &self,
         md: &ModelMetadata,
-        store: TenStore,
+        store: GenStore,
         node_id: NodeId,
-    ) -> Result<NodeOut<f32, E>, TenstoreError> {
+    ) -> Result<NodeOut<f32, E>, StoreError> {
         Ok(NodeOut {
             _t: PhantomData,
             outputs: self
@@ -332,7 +332,7 @@ impl<E: ExtensionField> NodeOut<Element, E> {
                 .map(|(dry, scale_factor)| {
                     dry.dry_cast(store.clone(), |x| scale_factor.dequantize(x))
                 })
-                .collect::<Result<Vec<_>, TenstoreError>>()?,
+                .collect::<Result<Vec<_>, StoreError>>()?,
             proving_data: self.proving_data.clone(),
         })
     }
@@ -357,7 +357,7 @@ where
         unpadded_input_shapes: &[Shape],
         padded_input_shapes: &HashMap<TensorKey<N>, Shape>,
         tracker: &mut Option<&mut InferenceTracker>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<NodeOut<N, E>>
     where
         N: Number,
@@ -389,7 +389,7 @@ where
             .map(|(i, tensor)| {
                 let key = provable::Edge::tkey_for_output::<N>(Some(my_id), i);
                 store
-                    .store(&key, tensor.data())
+                    .store(&key, tensor.data_vec())
                     .with_context(|| format!("storing outputs for tensor {key}"))
                     .unwrap();
                 Ok(DryTensor::new(key, tensor.shape().clone()))
@@ -671,7 +671,7 @@ where
         last_claims: Vec<&crate::Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {
             (Layer::Dense(dense), LayerCtx::Dense(info)) => {
@@ -737,7 +737,7 @@ where
         id: provable::NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         match self {
             Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data, store),

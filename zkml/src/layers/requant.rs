@@ -48,7 +48,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::TenStore;
+use tenstore::GenStore;
 use transcript::Transcript;
 
 use super::{
@@ -345,7 +345,7 @@ impl LayerLookupContext {
 
         ensure!(
             polys.len() >= total_lookup_columns,
-            "Cannot create Softmax LogUp inputs because we were only provided with {} polynomials and expected {} lookup columns",
+            "Cannot create ReQuant LogUp inputs because we were only provided with {} polynomials and expected {} lookup columns",
             polys.len(),
             total_lookup_columns
         );
@@ -456,7 +456,7 @@ where
         last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        _store: &mut TenStore,
+        _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let claim = self.prove_step(prover, last_claims[0], ctx, id)?;
 
@@ -468,7 +468,7 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors(store)?;
         ensure!(
@@ -1128,6 +1128,6 @@ mod tests {
             .unwrap();
         model.route_output(None).unwrap();
         model.describe();
-        prove_model(model, &mut TenStore::default()).unwrap();
+        prove_model(model, &mut GenStore::default()).unwrap();
     }
 }

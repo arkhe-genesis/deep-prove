@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt::Debug,
 };
-use tenstore::{TenStore, TensorKey};
+use tenstore::{GenStore, TensorKey};
 use transcript::Transcript;
 
 use crate::{
@@ -507,7 +507,7 @@ where
         _last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
         _prover: &mut Prover<'c, 'd, E, T, PCS>,
-        _store: &mut TenStore,
+        _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
         assert!(
@@ -523,7 +523,7 @@ where
         _id: NodeId,
         _ctx: &ProverContext<E, PCS>,
         _step_data: &StepData<Element, E>,
-        _store: &mut TenStore,
+        _store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         Ok(Default::default())
     }

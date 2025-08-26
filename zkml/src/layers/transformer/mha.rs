@@ -34,7 +34,7 @@ use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::TenStore;
+use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{Tensor, layers::provable::LayerOut};
@@ -652,7 +652,7 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut TenStore,
+        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors(store)?;
         let output_tensors = step_data.output_tensors(store)?;
@@ -749,7 +749,7 @@ where
         id: NodeId,
         ctx: &crate::ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
-        _store: &mut TenStore,
+        _store: &mut GenStore,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         let mha_data = step_data
             .node_outputs
@@ -1295,7 +1295,7 @@ mod test {
         _ = model.add_consecutive_layer(Layer::Mha(mha), None).unwrap();
         model.route_output(None).unwrap();
 
-        _ = prove_model(model, &mut TenStore::default()).unwrap();
+        _ = prove_model(model, &mut GenStore::default()).unwrap();
     }
 
     #[test]
@@ -1348,12 +1348,12 @@ mod test {
         let input = vec![Tensor::random(&input_shape)];
 
         let (quantized_model, quantized_input) =
-            quantize_model(model.clone(), input, None, &mut TenStore::default()).unwrap();
+            quantize_model(model.clone(), input, None, &mut GenStore::default()).unwrap();
 
         // need to clone the model as subsequent calls expect seq_len = 1 due to caching
         // and the trace keeps an immutable reference so the cloned model lifetime still needs to be active
         let trace = quantized_model
-            .run::<GoldilocksExt2>(&quantized_input, None, &mut TenStore::default())
+            .run::<GoldilocksExt2>(&quantized_input, None, &mut GenStore::default())
             .unwrap();
         let outputs = trace.outputs().unwrap();
 
@@ -1369,7 +1369,7 @@ mod test {
         let outputs = prove_quantized_model(
             quantized_model.clone(),
             quantized_input,
-            &mut TenStore::default(),
+            &mut GenStore::default(),
         )
         .unwrap();
 
@@ -1532,11 +1532,11 @@ mod test {
             model,
             inputs.clone(),
             Some(inputs),
-            &mut TenStore::default(),
+            &mut GenStore::default(),
         )
         .unwrap();
 
-        prove_quantized_model(quantized_model, inputs, &mut TenStore::default())?;
+        prove_quantized_model(quantized_model, inputs, &mut GenStore::default())?;
 
         Ok(())
     }
@@ -1573,7 +1573,7 @@ mod test {
         let inputs = vec![Tensor::random(&input_shape)];
 
         let (quantized_model, inputs) =
-            quantize_model(model, inputs, None, &mut TenStore::default()).unwrap();
+            quantize_model(model, inputs, None, &mut GenStore::default()).unwrap();
         quantized_model
             .to_forward_iterator()
             .for_each(|(node_id, node)| {
@@ -1581,7 +1581,7 @@ mod test {
             });
         // run to get unpadded output
         let mut outputs = quantized_model
-            .run::<GoldilocksExt2>(&inputs, None, &mut TenStore::default())
+            .run::<GoldilocksExt2>(&inputs, None, &mut GenStore::default())
             .unwrap()
             .outputs()
             .unwrap();
@@ -1598,7 +1598,7 @@ mod test {
 
         // compute padded evaluation, with garbage removal in matmul
         let mut outputs = padded_model
-            .run::<GoldilocksExt2>(&padded_inputs, None, &mut TenStore::default())
+            .run::<GoldilocksExt2>(&padded_inputs, None, &mut GenStore::default())
             .unwrap()
             .outputs()
             .unwrap();
