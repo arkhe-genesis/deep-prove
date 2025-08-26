@@ -33,12 +33,6 @@ jobs:
         with:
           clean: "false"
           submodules: "recursive"
-      - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy
-          # Manually configure rust-cache
-          cache: false
       - uses: bencherdev/bencher@main
         shell: devenv shell bash -- -e {0}
         run: |
