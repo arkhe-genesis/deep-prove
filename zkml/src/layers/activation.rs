@@ -1,6 +1,5 @@
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor,
-    backend::zkml_gelu,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
@@ -22,6 +21,7 @@ use crate::{
     quantization::{self, Fieldizer},
     tensor::{Number, Shape},
 };
+use burn::tensor::activation::gelu;
 use either::Either;
 use ff_ext::ExtensionField;
 use witness::RowMajorMatrix;
@@ -673,7 +673,7 @@ impl Evaluate<f32> for GELU<f32> {
                 tensor.to_1d();
                 let tensor = tensor.into_btensor::<1>();
 
-                let result = zkml_gelu(tensor);
+                let result = gelu(tensor);
 
                 let data = result.to_data().into_vec().expect("Failed to compute GELU");
                 Tensor::new(shape, data)
@@ -838,7 +838,7 @@ mod test {
             let tensor = Tensor::<f32>::random(&shape);
 
             let btensor = tensor.clone().into_btensor::<1>();
-            let data = zkml_gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
+            let data = gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
             let resultb = Tensor::<f32>::new(shape.clone(), data);
 
             let data = tensor.get_data();

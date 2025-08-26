@@ -25,21 +25,19 @@ default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
 capture-layers-quant = []
 cpu = ["burn/ndarray"]
-gpu = ["burn/wgpu", "dep:cubecl", "dep:burn-cubecl"]
+gpu = ["burn/wgpu", "burn/fusion"]
 mem-track = ["utils/mem-track"]
 
 [dependencies]
 anyhow.workspace = true
 ark-std.workspace = true
 average = { version = "0.16.0", features = ["std"] }
-burn = { version = "0.18.0", default-features = false }
-burn-cubecl = { version = "0.18.0", default-features = false, optional = true }
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false }
 candle-core = "0.9.1"
 ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 crossbeam-channel = "0.5.15"
 csv.workspace = true
-cubecl = { version = "0.6.0", default-features = false, optional = true }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }
@@ -80,7 +78,9 @@ utils = { path = "../utils" }
 witness = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { version = "0.18.0", default-features = false, features = ["metal"] }
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false, features = [
+  "metal",
+] }
 
 [dev-dependencies]
 bincode = "2.0.1"
