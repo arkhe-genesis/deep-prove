@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
@@ -9,6 +9,7 @@ use zkml::{
         add::Add,
         convolution::Convolution,
         dense::Dense,
+        flatten::Flatten,
         provable::Evaluate,
         transformer::{embeddings::Embeddings, qkv::QKV},
     },
@@ -177,6 +178,46 @@ fn embeddings_layer(c: &mut Criterion) {
     group.finish();
 }
 
+fn flatten_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    const DATA_SIZE_POWS: Range<i32> = 4..7;
+    const RANKS: RangeInclusive<usize> = 2..=4;
+
+    for pow2 in DATA_SIZE_POWS {
+        for rank in RANKS {
+            let size = 1 << pow2;
+            let input = Tensor::<Element>::random(&Shape::new([size].repeat(rank)));
+            let layer = Flatten;
+
+            group.bench_function(
+                BenchmarkId::new("flatten/Element", format!("{size}^{rank}")),
+                |b| {
+                    b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&input], &[]));
+                },
+            );
+        }
+    }
+
+    for pow2 in DATA_SIZE_POWS {
+        for rank in RANKS {
+            let size = 1 << pow2;
+            let input = Tensor::<f32>::random(&Shape::new([size].repeat(rank)));
+            let layer = Flatten;
+
+            group.bench_function(
+                BenchmarkId::new("flatten/f32", format!("{size}^{rank}")),
+                |b| {
+                    b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&input], &[]));
+                },
+            );
+        }
+    }
+}
+
 fn gelu_layer(c: &mut Criterion) {
     let mut group = c.benchmark_group("run-layers");
     group
@@ -255,9 +296,10 @@ fn qkv_layer(c: &mut Criterion) {
 criterion_group!(
     benches,
     add_layer,
-    dense_layer,
     convolution_layer,
+    dense_layer,
     embeddings_layer,
+    flatten_layer,
     gelu_layer,
     qkv_layer,
 );
