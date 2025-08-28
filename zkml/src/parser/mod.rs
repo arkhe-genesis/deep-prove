@@ -340,8 +340,6 @@ mod tests {
 
     type F = GoldilocksExt2;
 
-    // cargo test --release --package zkml -- onnx_parse::tests::test_tract --nocapture
-
     #[test]
     fn test_load_mlp() {
         let filepath = "assets/scripts/MLP/mlp-iris-01.onnx";
@@ -448,6 +446,7 @@ mod tests {
         assert!(result.is_ok(), "Failed: {:?}", result.unwrap_err());
 
         let (model, md) = result.unwrap();
+        // let model = pad_model(model).unwrap();
         model.describe();
         let native_input = model
             .unpadded_input_shapes()
@@ -459,7 +458,6 @@ mod tests {
         let trace = model
             .run::<F>(&input, None, &mut GenStore::default())
             .unwrap();
-        println!("Result: {:?}", trace.outputs());
 
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
@@ -499,10 +497,6 @@ mod tests {
                     output.fact.shape.dims()
                 );
             }
-            // for node_input in &node.inputs {
-            //     let label = opt.outlet_label(*node_input);
-            //     println!("Node input label: {:?}", label);
-            // }
         });
 
         let opt = opt.into_decluttered().unwrap();
@@ -522,10 +516,6 @@ mod tests {
                     output.fact.shape.dims()
                 );
             }
-            // for node_input in &node.inputs {
-            //     let label = opt.outlet_label(*node_input);
-            //     println!("Node input label: {:?}", label);
-            // }
         });
 
         let mut values = SymbolValues::default();
@@ -533,22 +523,6 @@ mod tests {
         values.set(&symbol, 1);
 
         let opt = opt.concretize_dims(&values).unwrap();
-
-        // let eval_order = opt.eval_order().unwrap();
-
-        // eval_order.into_iter().for_each(|id| {
-        //     let node = opt.node(id);
-        //     let outputs = &node.outputs;
-        //     for (i, output) in outputs.iter().enumerate() {
-        //         println!(
-        //             "Node: {},  Output {} shape: {:?}",
-        //             node,
-        //             i,
-        //             output.fact.shape.dims()
-        //         );
-        //     }
-        // });
-
         let plan = SimplePlan::new(opt).unwrap();
 
         for node_id in plan.order_without_consts() {

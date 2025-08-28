@@ -1,3 +1,4 @@
+use core::slice;
 use std::ops::{Range, RangeInclusive};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -36,7 +37,11 @@ fn add_layer(c: &mut Criterion) {
             BenchmarkId::new("add/Element", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[input], &[]));
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Add should succeed")
+                });
             },
         );
     }
@@ -53,7 +58,11 @@ fn add_layer(c: &mut Criterion) {
             BenchmarkId::new("add/f32", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[input], &[]));
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Add should succeed")
+                });
             },
         );
     }
@@ -79,7 +88,11 @@ fn dense_layer(c: &mut Criterion) {
             BenchmarkId::new("dense/Element", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], &[]));
+                b.iter(|| {
+                    dense
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Dense should succeed")
+                });
             },
         );
     }
@@ -96,7 +109,11 @@ fn dense_layer(c: &mut Criterion) {
             BenchmarkId::new("dense/f32", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], &[]));
+                b.iter(|| {
+                    dense
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Dense should succeed")
+                });
             },
         );
     }
@@ -116,13 +133,46 @@ fn convolution_layer(c: &mut Criterion) {
         let kernels = Tensor::<f32>::random(&Shape::new(vec![batches, channels, 3, 3]));
         let bias = Tensor::<f32>::random(&Shape::new(vec![batches]));
 
-        let dense = Convolution::<f32>::new(kernels.clone(), bias.clone());
+        let input_shape = input.shape();
+        let convolution = Convolution::<f32>::new(kernels.clone(), bias.clone());
 
         group.bench_with_input(
             BenchmarkId::new("convolution/f32", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| dense.evaluate::<GoldilocksExt2>(&[input], &[]));
+                b.iter(|| {
+                    convolution
+                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(&input_shape))
+                        .expect("Convolution should succeed")
+                });
+            },
+        );
+    }
+
+    // NOTE: as it is currently implemented, conv2d_i performs one kernel invocation per output.
+    // the maximum supported input size on a M2 is 2**12.
+    let range = 7..12;
+    let batches = 1;
+    let channels = 3;
+    for pow2 in range {
+        let size = 1 << pow2;
+        let input = Tensor::<Element>::random(&Shape::new(vec![batches, channels, size, size]));
+        let kernels = Tensor::<Element>::random(&Shape::new(vec![batches, channels, 3, 3]));
+        let bias = Tensor::<Element>::random(&Shape::new(vec![batches]));
+
+        let input_shape = input.shape();
+        let convolution = Convolution::<Element>::new(kernels.clone(), bias.clone())
+            .into_padded_and_ffted(&input_shape);
+
+        group.bench_with_input(
+            BenchmarkId::new("convolution/Element", format!("{size}x{size}")),
+            &input,
+            |b, input| {
+                b.iter(|| {
+                    convolution
+                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(&input_shape))
+                        .expect("Convolution should succeed")
+                });
             },
         );
     }
@@ -154,7 +204,11 @@ fn embeddings_layer(c: &mut Criterion) {
             BenchmarkId::new("embeddings/Element", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[input], &[]));
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Embeddings should succeed")
+                });
             },
         );
     }
@@ -170,7 +224,11 @@ fn embeddings_layer(c: &mut Criterion) {
             BenchmarkId::new("embeddings/f32", format!("{size}x{size}")),
             &input,
             |b, input| {
-                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[input], &[]));
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Embeddings should succeed")
+                });
             },
         );
     }
@@ -196,7 +254,11 @@ fn flatten_layer(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new("flatten/Element", format!("{size}^{rank}")),
                 |b| {
-                    b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&input], &[]));
+                    b.iter(|| {
+                        layer
+                            .evaluate::<GoldilocksExt2>(&[&input], &[])
+                            .expect("Flatten should succeed")
+                    });
                 },
             );
         }
@@ -211,7 +273,11 @@ fn flatten_layer(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new("flatten/f32", format!("{size}^{rank}")),
                 |b| {
-                    b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&input], &[]));
+                    b.iter(|| {
+                        layer
+                            .evaluate::<GoldilocksExt2>(&[&input], &[])
+                            .expect("Flatten should succeed")
+                    });
                 },
             );
         }
@@ -229,7 +295,10 @@ fn gelu_layer(c: &mut Criterion) {
         let gelu = GELU::<f32>::new();
 
         group.bench_with_input(BenchmarkId::new("gelu", size), &input, |b, input| {
-            b.iter(|| gelu.evaluate::<GoldilocksExt2>(&[input], &[]));
+            b.iter(|| {
+                gelu.evaluate::<GoldilocksExt2>(&[input], &[])
+                    .expect("GeLU should succeed")
+            });
         });
     }
 }
@@ -259,7 +328,9 @@ fn qkv_layer(c: &mut Criterion) {
             &input,
             |b, input| {
                 b.iter(|| {
-                    layer.evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                        .expect("QKV should succeed")
                 });
             },
         );
@@ -284,7 +355,9 @@ fn qkv_layer(c: &mut Criterion) {
             &input,
             |b, input| {
                 b.iter(|| {
-                    layer.evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                        .expect("QKV should succeed")
                 });
             },
         );

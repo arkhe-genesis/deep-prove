@@ -606,11 +606,11 @@ pub struct ModelCtx<E: ExtensionField> {
 #[cfg(test)]
 pub(crate) mod test {
     use crate::{
-        ScalingFactor, ScalingStrategy, init_test_logging, init_test_logging_default,
+        Prover, ScalingFactor, ScalingStrategy, init_test_logging, init_test_logging_default,
         layers::{
             Layer,
             activation::{Activation, Relu},
-            convolution::Convolution,
+            convolution::{ConvCtx, Convolution},
             dense::Dense,
             matrix_mul::{MatMul, OperandMatrix},
             pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
@@ -623,6 +623,7 @@ pub(crate) mod test {
         tensor::{Number, Shape},
         testing::{Pcs, random_bool_vector, random_vector},
         util::from_mle_list_dimensions,
+        verify,
     };
     use anyhow::{Ok, Result};
     use ark_std::rand::{Rng, RngCore};
@@ -635,7 +636,9 @@ pub(crate) mod test {
         util::optimal_sumcheck_threads,
     };
     use tenstore::GenStore;
+    use transcript::BasicTranscript;
 
+    use super::Model;
     use crate::{Element, default_transcript, tensor::Tensor};
 
     type F = GoldilocksExt2;
@@ -958,11 +961,6 @@ pub(crate) mod test {
         );
     }
 
-    use crate::{Prover, verify};
-    use transcript::BasicTranscript;
-
-    use super::Model;
-
     #[test]
     #[ignore = "This test should be deleted since there is no requant and it is not testing much"]
     fn test_single_matvec_prover() {
@@ -1046,15 +1044,27 @@ pub(crate) mod test {
 
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::Padding);
         let input = Tensor::random(&model.input_shapes()[0]);
-        let _conv_layer = model
-            .add_consecutive_layer(
-                Layer::Convolution(
-                    Convolution::new(conv1.clone(), Tensor::random(&vec![conv1.dim(0)].into()))
-                        .into_padded_and_ffted(&in_dimensions[0].clone().into()),
-                ),
-                None,
-            )
+        let conv_layer =
+            Convolution::new(conv1.clone(), Tensor::random(&vec![conv1.dim(0)].into()))
+                .into_padded_and_ffted(&in_dimensions[0].clone().into());
+        let conv_layer_id = model
+            .add_consecutive_layer(Layer::Convolution(conv_layer.clone()), None)
             .unwrap();
+
+        assert_eq!(
+            conv_layer.conv_context(conv_layer_id),
+            ConvCtx {
+                node_id: conv_layer_id,
+                kw: 16,
+                kx: 2,
+                real_nw: 4,
+                nw: 32,
+                filter_size: 1024,
+                unpadded_filter_shape: Shape::new(vec![16, 2, 4, 4]),
+                padded_filter_shape: Shape::new(vec![16, 2, 4, 4]),
+            },
+        );
+
         model.route_output(None).unwrap();
         model.describe();
         let mut store = GenStore::default();

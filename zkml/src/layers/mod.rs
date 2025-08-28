@@ -59,7 +59,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, InferenceTracker, ModelMetadata, ScalingFactor},
-    tensor::{ConvData, DryTensor, Number, Shape, Tensor},
+    tensor::{ConvFFTData, DryTensor, Number, Shape, Tensor},
 };
 use activation::ActivationCtx;
 use convolution::{ConvCtx, ConvProof};
@@ -280,7 +280,7 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
         })
     }
 
-    pub fn try_convdata(&self) -> Option<&ConvData<E>> {
+    pub fn try_convdata(&self) -> Option<&ConvFFTData> {
         match self.proving_data {
             ProvingData::Convolution(ref conv_data) => Some(conv_data),
             _ => None,

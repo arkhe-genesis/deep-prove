@@ -290,7 +290,7 @@ pub struct ContextAux {
     pub tables: BTreeSet<TableType>,
     pub last_output_shape: Vec<Shape>,
     pub model_polys: Option<HashMap<PolyId, Vec<Element>>>,
-    /// THis field is only used in macro layers like MHA
+    /// This field is only used in macro layers like MHA
     pub max_poly_len: usize,
 }
 

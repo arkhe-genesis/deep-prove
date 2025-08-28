@@ -22,7 +22,7 @@ use crate::{
     lookup::context::LookupWitnessGen,
     model::trace::StepData,
     padding::{PaddingMode, ShapeInfo},
-    tensor::{ConvData, Number, Shape},
+    tensor::{ConvFFTData, Number, Shape},
 };
 
 use super::{
@@ -168,7 +168,7 @@ impl<N: Number> Node<N> {
 #[allow(clippy::large_enum_variant)]
 pub enum ProvingData<E: ExtensionField> {
     /// Variant for extra data used in proving that we compute during evalaution of quantised convolution.
-    Convolution(ConvData<E>),
+    Convolution(ConvFFTData),
     /// Variant for extra data used to prove [Softmax][`crate::layers::transformer::softmax::Softmax`] that we compute anyway during quantised evaluation.
     Softmax(SoftmaxData<E>),
     /// Variant for extra data used to prove Mha layer, computed during quantised evaluation
@@ -211,7 +211,7 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
         Self::from_vec(vec![out])
     }
 
-    pub fn try_convdata(&self) -> Option<&ConvData<E>> {
+    pub fn try_convdata(&self) -> Option<&ConvFFTData> {
         match self.proving_data {
             ProvingData::Convolution(ref conv_data) => Some(conv_data),
             _ => None,

@@ -128,17 +128,6 @@ type LoadFn<'a, I> = fn(
     iter: &mut Peekable<I>,
 ) -> Result<(NodeId, CustomNode)>;
 
-// static PARSER_FACTORY: Lazy<HashMap<&'static str, LoadFn>> = Lazy::new(|| {
-// let mut m = HashMap::new();
-// m.insert("Conv", load_conv as LoadFn);
-// m.insert("Gemm.ab", load_gemm as LoadFn);
-// m.insert("MatMul", load_gemm as LoadFn);
-// m.insert("Relu", load_relu as LoadFn);
-// m.insert("Flatten", load_flatten as LoadFn);
-// m.insert("Pool", load_maxpool as LoadFn);
-// m
-// });
-
 struct ParserFactory<'a, I: Iterator<Item = &'a usize> + Sized>(
     HashMap<&'static str, LoadFn<'a, I>>,
 );
@@ -603,7 +592,6 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
     let filter_const = extract_const_tensor(filter_node)?;
     let bias_const = extract_const_tensor(bias_node)?;
     let conv = if bias_const.is_empty() {
-        // it's a convolution layer without bias
         Convolution::new_without_bias(filter_const)
     } else {
         Convolution::new(filter_const, bias_const)

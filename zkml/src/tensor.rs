@@ -27,7 +27,7 @@ use rayon::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cmp::{Ordering, PartialEq},
+    cmp::{Ordering, PartialEq, min},
     fmt::{self, Debug},
     ops::{Bound, RangeBounds},
 };
@@ -223,6 +223,27 @@ impl Number for GoldilocksExt2 {
     }
 }
 
+/// Return's the filter size.
+///
+/// This work for convolutions filters/inputs/outputs.
+///
+/// NOTE: This only works if the filter is square (height == width).
+pub(crate) fn filter_size(shape: &Shape) -> usize {
+    // NOTE:
+    // - This assumes the filter is square, meaning width and height are the same
+    // - Given the above, this works for both 3D and 4D tensors.
+    debug_assert!(
+        shape.rank() != 4 || shape.dim(2) == shape.dim(3),
+        "Width and height must match. shape {shape:?}",
+    );
+    debug_assert!(
+        shape.rank() != 3 || shape.dim(1) == shape.dim(2),
+        "Width and height must match. shape {shape:?}",
+    );
+
+    shape.dim(2) * shape.dim(2)
+}
+
 /// Returns an n-th root of unity by starting with a 32nd root of unity and squaring it (32-n) times.
 /// Each squaring operation halves the order of the root of unity:
 ///   - For n=16: squares it 16 times (32-16) to get a 16th root of unity
@@ -349,6 +370,13 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) {
             *val *= ilen;
         });
     }
+}
+
+/// Caries the data needed to perform the FFT convolution.
+#[derive(Debug, Clone)]
+pub struct ConvFFTData {
+    pub input: Tensor<Element>,
+    pub unpadded_input_shape: Shape,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -523,12 +551,6 @@ impl<T> Tensor<T> {
     /// Consume this tensore, returning its backing.
     pub fn into_data(self) -> Vec<T> {
         self.data
-    }
-
-    /// Return the number of elements contained in this tensor, independently of
-    /// its shape.
-    pub fn data_size(&self) -> usize {
-        self.data.len()
     }
 
     /// Returns an iterator that yields slices of the last dimension.
@@ -727,16 +749,6 @@ impl<T> Tensor<T> {
         self.og_shape.clone()
     }
 
-    // Returns the size of an individual filter
-    pub fn filter_size(&self) -> usize {
-        self.shape[2] * self.shape[2]
-    }
-
-    // Returns the size of an individual filter
-    pub fn og_filter_size(&self) -> usize {
-        self.og_shape[2] * self.og_shape[2]
-    }
-
     pub fn get_conv_weights<F: ExtensionField>(&self) -> Vec<F>
     where
         T: Fieldizer<F>,
@@ -746,6 +758,41 @@ impl<T> Tensor<T> {
             data[i] = self.data[i].to_field();
         }
         data
+    }
+
+    /// Ensure width and height are the same power-of-two.
+    ///
+    /// This prepares the filter to be used with a fft. Note the shape may be
+    /// altered without the underlying data being padded, the padding happens
+    /// during layer evaluation.
+    pub fn into_fft_conv(self, padded_input_shape: &Shape) -> Self {
+        let og_shape = self.shape;
+        assert!(
+            og_shape.product() == self.data.len(),
+            "Shape does not match data length."
+        );
+        assert!(
+            og_shape.rank() == 4,
+            "Tensor shape does not match a convolution. expected 4 got {}",
+            og_shape.rank(),
+        );
+        assert!(
+            og_shape[2].is_power_of_two(),
+            "Filter dimension is not power of two"
+        );
+
+        // n_w is the padded version of the input
+        //
+        // NOTE: The shape is modified here, but the data is not reallocated. The actual padding
+        // is performed later on convolution evaluation, by the function [index_w];
+        let n_w = (padded_input_shape[1] - og_shape[2] + 1).next_power_of_two();
+        let shape = Shape::new(vec![og_shape[0], og_shape[1], n_w, n_w]);
+
+        Self {
+            data: self.data,
+            shape,
+            og_shape,
+        }
     }
 }
 
@@ -778,47 +825,18 @@ impl Tensor<Element> {
         Tensor::new(self.shape.clone(), data)
     }
 
-    pub fn into_fft_conv(self, padded_input_shape: &Shape) -> Self {
-        let og_shape = self.shape;
-        assert!(
-            og_shape.product() == self.data.len(),
-            "Shape does not match data length."
-        );
-        assert!(
-            og_shape.rank() == 4,
-            "Tensor shape does not match a convolution. expected 4 got {}",
-            og_shape.rank(),
-        );
-        assert!(
-            og_shape[2].is_power_of_two(),
-            "Filter dimension is not power of two"
-        );
-
-        // n_w is the padded version of the input
-        //
-        // NOTE: The shape is modified here, but the data is not reallocated. The actual padding
-        // is performed later on convolution evaluation, by the function [index_w];
-        let n_w = (padded_input_shape[1] - og_shape[2] + 1).next_power_of_two();
-        let shape = Shape::new(vec![og_shape[0], og_shape[1], n_w, n_w]);
-
-        Self {
-            data: self.data,
-            shape,
-            og_shape,
-        }
-    }
     /// Recall that weights are not plain text to the "snark". Rather it is FFT(weights).
     /// Aka there is no need to compute the FFT(input) "in-circuit".
     /// It is okay to assume the inputs to the prover is already the FFT version and the prover can commit to the FFT values.
     /// This function computes iFFT of the weights so that we can compute the scaling factors used.
     pub fn get_real_weights<F: ExtensionField>(&self) -> Vec<Vec<Vec<Element>>> {
         let mut real_weights =
-            vec![vec![vec![0 as Element; self.filter_size()]; self.dim(1)]; self.dim(0)];
+            vec![vec![vec![0 as Element; filter_size(&self.shape)]; self.dim(1)]; self.dim(0)];
 
         let mut ctr = 0;
         for i in 0..self.dim(0) {
             for j in 0..self.dim(1) {
-                for k in 0..self.og_filter_size() {
+                for k in 0..filter_size(&self.og_shape) {
                     real_weights[i][j][k] = self.data[ctr];
                     ctr += 1;
                 }
@@ -832,26 +850,35 @@ impl Tensor<Element> {
     /// needed to generate a convolution proof
     pub fn fft_conv<F: ExtensionField>(
         &self,
-        x: &Tensor<Element>,
+        input: &Tensor<Element>,
+        bias: &Tensor<Element>,
     ) -> (Tensor<Element>, ConvData<F>) {
         // Sanity check, this layer must have been padded to perform the FFT
         assert_eq!(
-            self.dim(0),
             self.og_dim(0),
-            "The number of features maps must match after padding"
+            self.dim(0),
+            "The number of features maps must match after padding. original {:?} padded {:?}",
+            self.og_shape,
+            self.shape,
         );
         assert_eq!(
-            self.dim(1),
             self.og_dim(1),
-            "The number of channels out must match after padding"
+            self.dim(1),
+            "The number of channels out must match after padding. original {:?} padded {:?}",
+            self.og_shape,
+            self.shape,
         );
         assert!(
             self.og_dim(2) <= self.dim(2),
-            "The padded width must be greater-than-equal the original width",
+            "The padded width must be greater-than-equal the original width. original {:?} padded {:?}",
+            self.og_shape,
+            self.shape,
         );
         assert!(
             self.og_dim(3) <= self.dim(3),
-            "The padded height must be greater-than-equal the original height",
+            "The padded height must be greater-than-equal the original height. original {:?} padded {:?}",
+            self.og_shape,
+            self.shape,
         );
         assert!(
             self.dim(2).is_power_of_two(),
@@ -861,17 +888,31 @@ impl Tensor<Element> {
             self.dim(3).is_power_of_two(),
             "The padded height must be a power of two",
         );
-        assert_eq!(x.shape().rank(), 3, "Only 3D input tensors are supported");
         assert_eq!(
-            x.dim(0),
+            input.shape().rank(),
+            3,
+            "Only 3D input tensors are supported",
+        );
+        assert_eq!(
+            input.dim(0),
             self.dim(1),
-            "Grouping is not support, input and output channels must match. got input {} kernel {}",
-            x.dim(0),
-            self.dim(1),
+            "Grouping is not support, input and output channels must match. input {:?} padded {:?}",
+            input,
+            self.shape,
+        );
+        assert_eq!(
+            input.dim(1),
+            input.dim(2),
+            "Input must be square. shape {:?}",
+            input.shape(),
         );
 
-        let n_x = x.shape[1].next_power_of_two();
-        let real_input = x.data.par_iter().map(|e| e.to_field()).collect::<Vec<_>>();
+        let n_x = input.shape[1].next_power_of_two();
+        let real_input = input
+            .data
+            .par_iter()
+            .map(|e| e.to_field())
+            .collect::<Vec<_>>();
         let new_n = 2 * n_x * n_x;
 
         // Convert the convolution input to the frequency domain.
@@ -892,7 +933,7 @@ impl Tensor<Element> {
             })
             .unzip();
 
-        let mut output = vec![vec![F::ZERO; 2 * self.filter_size()]; self.dim(0)];
+        let mut output = vec![vec![F::ZERO; 2 * filter_size(&self.shape)]; self.dim(0)];
 
         // Convert the filter to frequency domain and perform the point-wise multiplication
         //
@@ -908,7 +949,7 @@ impl Tensor<Element> {
                     &self.data[start..end],
                     self.og_dim(2),
                     self.dim(2),
-                    2 * self.filter_size(),
+                    2 * filter_size(&self.shape),
                 )
                 .collect::<Vec<F>>();
 
@@ -928,14 +969,32 @@ impl Tensor<Element> {
             fft(elt, true);
         }
 
-        let conv_data = ConvData::new(real_input, input, input_fft, prod, output, n_x);
-        (
-            Tensor::new(
-                vec![self.shape[0], n_x, n_x].into(),
-                conv_data.output_as_element.clone(),
-            ),
-            conv_data,
-        )
+        let mut conv_data = ConvData::new(real_input, input, input_fft, prod, output, n_x);
+        let mut result = Tensor::new(
+            vec![self.shape[0], n_x, n_x].into(),
+            conv_data.output_as_element.clone(),
+        );
+        assert_eq!(
+            result.data.len(),
+            result.shape.product(),
+            "Result should have the correct number of elements",
+        );
+
+        for i in 0..result.dim(0) {
+            for j in 0..filter_size(&result.shape) {
+                let idx = i * filter_size(&result.shape) + j;
+                result[idx] += bias[i];
+            }
+        }
+
+        // Record here the output _after_ the bias addition. It's needed for
+        // proving since we're proving the clearing garbage and that produces a
+        // new claim on this output.
+        //
+        // XXX: Deentagle ConvData and the result.
+        conv_data.set_output(result.get_data());
+
+        (result, conv_data)
     }
 
     pub fn evals_flat<F: ExtensionField>(&self) -> Vec<F> {
@@ -1076,12 +1135,9 @@ impl<T: Clone> Tensor<T> {
 }
 
 impl<T: Number> Tensor<T> {
+    /// Instantiate a new tensor with `shape` initialised to `default`.
     pub fn zero(shape: Shape) -> Self {
-        Tensor {
-            data: vec![T::zero(); shape.numel()],
-            og_shape: shape.clone(),
-            shape,
-        }
+        Self::initialised(shape, T::zero())
     }
 
     pub fn argmax(&self) -> usize {
@@ -1225,182 +1281,6 @@ impl<T: Number> Tensor<T> {
     /// Flattens the tensor into a 1D.
     pub fn to_1d(&mut self) {
         self.shape = Shape::new(vec![self.shape.product()]);
-    }
-
-    /// Pads the tensor to the next power-of-two.
-    pub fn pad_next_power_of_two(&self) -> Self {
-        let new_shape = self.shape().next_power_of_two();
-
-        // All dimensions are power of two, return a copy
-        if new_shape == self.shape() {
-            return self.clone();
-        }
-
-        // Walks the shapes in reverse and count number of equal dimensions, if any.
-        //
-        // This determines the copy chunk size, when the dimensions don't
-        // change no padding is necessary, so the data can be chunked together.
-        let equal = new_shape
-            .iter()
-            .rev()
-            .zip(self.shape.iter().rev())
-            .take_while(|(new, old)| new == old)
-            .count();
-
-        let mut new_data = Vec::with_capacity(new_shape.numel());
-
-        // Corner case when a single copy is needed.
-        if equal + 1 == new_shape.len() {
-            new_data.extend(&self.data);
-            new_data.resize(new_shape.numel(), T::default());
-            return Tensor::<T>::new(new_shape, new_data);
-        }
-
-        // Allocate vector to backup padded data, prefill with zeros.
-        new_data.resize(new_shape.numel(), T::default());
-
-        // Compute the necessary padding at the end of each dimension
-        let new_strides = new_shape.strides();
-        let different = new_shape.len() - equal;
-
-        debug_assert_eq!(
-            &new_strides[different..],
-            &self.shape.strides()[different..],
-            "The lower strides must be equal",
-        );
-
-        let mut padding: Vec<_> = new_shape
-            .iter()
-            .zip(self.shape.iter())
-            .map(|(new, old)| new - old)
-            .enumerate()
-            .map(|(dim, diff)| new_strides[dim] * diff)
-            .take(different)
-            .collect();
-
-        // the top-most dimension padding is implicit. This pop aligns the dimensions to remove off-by-one
-        padding.remove(0);
-
-        // Compute the chunk size for each copy
-        let chunk = self
-            .shape
-            .iter()
-            .rev()
-            .take(equal + 1) // at least the last dimension can be copied in batches
-            .product::<usize>();
-
-        // The old data is being copied, so the number of copies is equal to the old shape
-        let mut copies = self.shape.clone();
-        copies.resize(different - 1, 0);
-
-        // Copy original data into the new position
-        let mut new_start_pos = 0;
-        let mut old_start_pos = 0;
-        while copies[0] != 0 {
-            let new_end_pos = new_start_pos + chunk;
-            let old_end_pos = old_start_pos + chunk;
-
-            new_data[new_start_pos..new_end_pos]
-                .copy_from_slice(&self.data[old_start_pos..old_end_pos]);
-
-            new_start_pos = new_end_pos;
-            old_start_pos = old_end_pos;
-
-            // Compute the new start taking padding into consideration
-            let mut dim = copies.len() - 1;
-            loop {
-                new_start_pos += padding[dim];
-                copies[dim] -= 1;
-
-                if copies[dim] == 0 {
-                    if dim == 0 {
-                        break;
-                    }
-                    copies[dim] = self.shape[dim];
-                    dim -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        Tensor::<T>::new(new_shape, new_data)
-    }
-
-    /// Changes the shape of the current [Tensor] to `target_shape`.
-    ///
-    /// This method will modify the current tensor in place, extending it
-    /// to comply with the new shape.
-    ///
-    /// # Panics
-    ///
-    /// If the `target_shape` differs in rank or has a dimension smaller than
-    /// the current tensor.
-    pub fn pad_to_shape(&mut self, target_shape: Shape) {
-        assert!(
-            target_shape.rank() == self.shape.rank(),
-            "Target shape must have the same rank as the current tensor."
-        );
-
-        let distance = self
-            .shape
-            .iter()
-            .zip(target_shape.iter())
-            .map(|(original, new)| new.checked_sub(*original))
-            .collect::<Option<Vec<usize>>>();
-
-        assert!(
-            distance.is_some(),
-            "All dimensions of target shape must be greater-than-or-equal to the current tensor",
-        );
-        let distance = distance.unwrap();
-
-        // First expand the underlying storage vector to the new size
-        self.data.resize(target_shape.product(), T::default());
-
-        let original_shape = &self.shape;
-        let mut coord = original_shape.0.iter().map(|v| *v - 1).collect::<Vec<_>>();
-        let strides = target_shape.strides();
-
-        // Target contains the element's new position after re-shapping.
-        let mut target = coord
-            .iter()
-            .zip(strides.iter())
-            .map(|(pos, stride)| *pos * *stride)
-            .sum();
-
-        // Difference in size for a given dimension, i.e. how many empty spaces
-        // are in between the dimensions after re-shaping.
-        let distance = distance
-            .iter()
-            .zip(strides.iter())
-            .map(|(distance, new)| distance * new)
-            .collect::<Vec<_>>();
-
-        // Then move the data to its new position. Data is moved from back to the front to
-        // prevent overwriting.
-        let mut original = original_shape.product();
-        loop {
-            original -= 1;
-            self.data.swap(original, target);
-
-            if original == 0 {
-                break;
-            }
-
-            for (pos, el) in coord.iter_mut().enumerate().rev() {
-                if *el == 0 {
-                    *el = original_shape[pos] - 1;
-                    target -= distance[pos];
-                } else {
-                    *el -= 1;
-                    target -= 1;
-                    break;
-                }
-            }
-        }
-
-        self.shape = target_shape;
     }
 
     /// Perform matrix-matrix multiplication
@@ -2144,6 +2024,231 @@ impl<T: Default + Clone + Copy> Tensor<T> {
     }
 }
 
+impl<T: Copy> Tensor<T> {
+    /// Instantiate a new tensor with `shape` initialised to `default`.
+    pub fn initialised(shape: Shape, default: T) -> Self {
+        Tensor {
+            data: vec![default; shape.numel()],
+            og_shape: shape.clone(),
+            shape,
+        }
+    }
+}
+
+impl<T: Copy + Default> Tensor<T> {
+    /// Copies the sub-slice `new_shape` from this tensor.
+    ///
+    /// Returns a new [Tensor] with shape `new_shape` initialised from `self`.
+    pub fn reduce_to_shape(&self, new_shape: &Shape) -> Self {
+        assert!(
+            self.rank() >= new_shape.rank(),
+            "The target shape must be smaller than the current",
+        );
+        assert!(
+            self.shape()
+                .iter()
+                .rev()
+                .zip(new_shape.iter().rev())
+                .all(|(from, to)| from >= to),
+            "The target dimensions can not be larger than the current",
+        );
+        // current position being copied
+        let mut coord: Vec<_> = vec![0; new_shape.len()];
+        // number of copies is equal to the number of elements in the target shape
+        let mut copies = new_shape.numel();
+        // auxiliary variable to convert from target to source coordinates
+        let source_strides = self.shape.strides();
+        let target_strides = new_shape.strides();
+
+        let mut result = Tensor::initialised(new_shape.clone(), T::default());
+
+        while copies > 0 {
+            let source: usize = coord
+                .iter()
+                .zip(source_strides.iter())
+                .map(|(pos, source)| pos * source)
+                .sum();
+            let dest: usize = coord
+                .iter()
+                .zip(target_strides.iter())
+                .map(|(pos, target)| pos * target)
+                .sum();
+
+            result.data[dest] = self.data[source];
+            copies -= 1;
+
+            let mut rank = coord.len();
+            while rank > 0 {
+                rank -= 1;
+                coord[rank] += 1;
+
+                if coord[rank] == new_shape[rank] {
+                    coord[rank] = 0;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        result
+    }
+}
+
+impl<T: Default + Copy> Tensor<T> {
+    /// Pads the tensor to the next power-of-two.
+    pub fn pad_next_power_of_two(&self) -> Self {
+        let new_shape = self.shape().next_power_of_two();
+
+        // Pre allocate the necessary capacity
+        let mut new_data = Vec::with_capacity(new_shape.numel());
+        new_data.extend(&self.data);
+
+        // Create the new tensor and use the in-place implementation to change the shape
+        let mut new_tensor = Tensor {
+            data: new_data,
+            shape: self.shape.clone(),
+            og_shape: self.og_shape.clone(),
+        };
+        new_tensor.pad_to_shape(new_shape);
+
+        new_tensor
+    }
+
+    /// Changes the shape of the current [Tensor] to `target_shape`.
+    ///
+    /// This method will modify the current tensor in place, extending it
+    /// to comply with the new shape.
+    ///
+    /// # Panics
+    ///
+    /// If the `target_shape` differs in rank or has a dimension smaller than
+    /// the current tensor.
+    pub fn pad_to_shape(&mut self, target_shape: Shape) {
+        assert!(
+            target_shape.rank() == self.shape.rank(),
+            "Target shape must have the same rank as the current tensor. current {:?} target {:?}",
+            self.shape(),
+            target_shape,
+        );
+
+        if self.shape == target_shape {
+            return;
+        }
+
+        let distance = self
+            .shape
+            .iter()
+            .zip(target_shape.iter())
+            .map(|(original, new)| new.checked_sub(*original))
+            .collect::<Option<Vec<usize>>>();
+
+        assert!(
+            distance.is_some(),
+            "All dimensions of target shape must be greater-than-or-equal to the current tensor",
+        );
+
+        let distance = distance.unwrap();
+        debug_assert!(
+            distance.iter().any(|v| *v != 0),
+            "At least one dimensions must grown",
+        );
+
+        // At this point, the target_shape is known to be strictly bigger than the current shape.
+        // And at least one of the dimensions has a non-zero distance
+
+        // First expand the underlying storage vector to the new size
+        self.data.resize(target_shape.product(), T::default());
+
+        // Walks the shapes in reverse and count number of equal dimensions, if any.
+        //
+        // This determines the copy chunk size, when the dimensions don't
+        // change no padding is necessary, so the data can be chunked together.
+        let equal = distance.iter().rev().take_while(|v| **v == 0).count();
+        let different = distance.len() - equal;
+        debug_assert!(
+            equal != target_shape.len(),
+            "At least one dimensions must grown",
+        );
+
+        let strides = target_shape.strides();
+        debug_assert_eq!(
+            &strides[different..],
+            &self.shape.strides()[different..],
+            "The lower strides must be equal",
+        );
+
+        // Difference in size for a given dimension, i.e. how many empty spaces
+        // are in between the dimensions after re-shaping.
+        //
+        // NOTE: this is non cumulative, each dimension padding is applied
+        // separately.
+        let mut padding = distance
+            .iter()
+            .zip(strides.iter())
+            .map(|(distance, new)| distance * new)
+            .take(different)
+            .collect::<Vec<_>>();
+
+        // the top-most dimension padding is implicit. This pop aligns the dimensions to remove off-by-one
+        padding.remove(0);
+
+        // Compute the chunk size for each copy
+        let chunk = self
+            .shape
+            .iter()
+            .rev()
+            .take(equal + 1) // at least the last dimension can be copied in batches
+            .product::<usize>();
+
+        // The old data is being copied, so the number of copies is equal to the old shape
+        let mut counters = self.shape.clone();
+        debug_assert!(counters.len() > different - 1, "rank must not increase");
+        counters.resize(different - 1, 0);
+
+        // -1 because the very first entries are in the correct spot and don't need to be copied
+        let mut copies = counters.iter().product::<usize>() - 1;
+
+        let mut dest = target_shape.product();
+        let mut end_pos = self.shape.product();
+
+        // account for padding at the end
+        dest -= distance
+            .iter()
+            .zip(strides)
+            .map(|(dist, stride)| dist * stride)
+            .sum::<usize>();
+
+        // Copy original data into the new position, back to front to avoid overwrites
+        while copies > 0 {
+            copies -= 1;
+
+            let start_pos = end_pos - chunk;
+            dest -= chunk;
+
+            self.data.copy_within(start_pos..end_pos, dest); // copy data to new position
+            self.data[start_pos..min(end_pos, dest)].fill(T::default()); // write the padding
+
+            end_pos = start_pos;
+
+            // Compute the new destination taking padding into consideration
+            let mut dim = counters.len() - 1;
+            loop {
+                dest -= padding[dim];
+                counters[dim] -= 1;
+
+                if counters[dim] == 0 {
+                    counters[dim] = self.shape[dim];
+                    dim -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.shape = target_shape;
+    }
+}
+
 impl<T: Default> Tensor<T> {
     fn get_idx(&self, accessors: Vec<usize>) -> usize {
         assert!(self.shape.len() == accessors.len());
@@ -2687,6 +2792,63 @@ impl IntoBTensor for Tensor<Element> {
     }
 }
 
+/// Checks `conv2d_tensor` and `fft_tensor` have the same result.
+///
+/// The contents of `conv2d_tensor` must come from a [Tensor::conv2d]
+/// operation and have no padding. The `fff_tensor` must be the result of
+/// [Tensor::fft_conv]. This utility will skip the garbage values of the fft.
+///
+/// expected is std conv2d (kw, nx-nw+1, nx-nw+1)
+/// fft_tensor is results from fft conv (kw, nx, nx)
+#[cfg(test)]
+pub(crate) fn check_tensor_consistency(
+    conv2d_tensor: &Tensor<Element>,
+    fft_tensor: &Tensor<Element>,
+) {
+    assert_eq!(
+        fft_tensor.shape().rank(),
+        3,
+        "FFT tensor should not have batching. shape {:?}",
+        fft_tensor.shape(),
+    );
+    assert_eq!(
+        conv2d_tensor.shape().rank(),
+        3,
+        "Tensor should not have batching. shape {:?}",
+        conv2d_tensor.shape(),
+    );
+    assert_eq!(
+        fft_tensor.shape()[1],
+        fft_tensor.shape()[2],
+        "FFT tensor should have same height and width. shape {:?}",
+        fft_tensor.shape(),
+    );
+    assert!(
+        fft_tensor.shape()[2].is_power_of_two(),
+        "FFT tensor should have a power-of-two height and width. shape {:?}",
+        fft_tensor.shape(),
+    );
+
+    let fft_strides = fft_tensor.shape().strides();
+    let strides = conv2d_tensor.shape().strides();
+    for channel in 0..conv2d_tensor.shape[0] {
+        for height in 0..conv2d_tensor.shape[1] {
+            for width in 0..conv2d_tensor.shape[2] {
+                let expected_pos = channel * strides[0] + height * strides[1] + width * strides[2];
+                let fft_pos =
+                    channel * fft_strides[0] + height * fft_strides[1] + width * fft_strides[2];
+
+                assert!(
+                    conv2d_tensor.data[expected_pos] == fft_tensor.data[fft_pos],
+                    "Error in tensor consistency. channel {channel} height {height} width {width} got {} expected {}",
+                    fft_tensor.data[fft_pos],
+                    conv2d_tensor.data[expected_pos],
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::panic::catch_unwind;
@@ -2701,6 +2863,7 @@ mod test {
     };
 
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_bitreverse_permutation() {
@@ -2989,58 +3152,6 @@ mod test {
 
     type E = GoldilocksExt2;
 
-    /// Function testing the consistency between the actual convolution implementation and
-    /// the FFT one. Used for debugging purposes.
-    ///
-    /// expected is std conv2d (kw, nx-nw+1, nx-nw+1)
-    /// fft_tensor is results from fft conv (kw, nx, nx)
-    fn check_tensor_consistency(expected: Tensor<Element>, fft_tensor: Tensor<Element>) {
-        assert_eq!(
-            fft_tensor.shape().rank(),
-            3,
-            "FFT tensor should not have batching. shape {:?}",
-            fft_tensor.shape(),
-        );
-        assert_eq!(
-            fft_tensor.shape()[1],
-            fft_tensor.shape()[2],
-            "FFT tensor should have same height and width. shape {:?}",
-            fft_tensor.shape(),
-        );
-        assert!(
-            fft_tensor.shape()[2].is_power_of_two(),
-            "FFT tensor should have a power-of-two height and width. shape {:?}",
-            fft_tensor.shape(),
-        );
-
-        assert_eq!(
-            expected.shape().rank(),
-            3,
-            "Tensor should not have batching. shape {:?}",
-            expected.shape(),
-        );
-
-        let fft_strides = fft_tensor.shape().strides();
-        let strides = expected.shape().strides();
-        for channel in 0..expected.shape[0] {
-            for height in 0..expected.shape[1] {
-                for width in 0..expected.shape[2] {
-                    let expected_pos =
-                        channel * strides[0] + height * strides[1] + width * strides[2];
-                    let fft_pos =
-                        channel * fft_strides[0] + height * fft_strides[1] + width * fft_strides[2];
-
-                    assert!(
-                        expected.data[expected_pos] == fft_tensor.data[fft_pos],
-                        "Error in tensor consistency. channel {channel} height {height} width {width} got {} expected {}",
-                        fft_tensor.data[fft_pos],
-                        expected.data[expected_pos],
-                    );
-                }
-            }
-        }
-    }
-
     #[test]
     fn test_conv() {
         for channel in 0..3 {
@@ -3061,11 +3172,11 @@ mod test {
                         let fft_filter = filter.clone().into_fft_conv(&padded_input_shape);
                         let input = Tensor::new(padded_input_shape, vec![3; input_size]);
 
-                        let (result, _) = fft_filter.fft_conv::<GoldilocksExt2>(&input);
                         let bias = Tensor::<Element>::zero(Shape::new(vec![feature_maps]));
+                        let (result, _) = fft_filter.fft_conv::<GoldilocksExt2>(&input, &bias);
                         let expected = input.conv2d(&filter, &bias, 1);
                         let expected = expected.squeeze(0);
-                        check_tensor_consistency(expected, result);
+                        check_tensor_consistency(&expected, &result);
                     }
                 }
             }
@@ -3796,8 +3907,6 @@ mod test {
         let expected_shape = Shape(vec![9, 4, 4]);
         assert_eq!(t1.shape(), expected_shape);
     }
-
-    use proptest::prelude::*;
 
     proptest! {
         #[test]
