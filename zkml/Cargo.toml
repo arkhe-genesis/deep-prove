@@ -81,6 +81,10 @@ witness = { workspace = true }
 burn = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false, features = [
   "metal",
 ] }
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false, features = [
+  "vulkan",
+] }
 
 [dev-dependencies]
 bincode = "2.0.1"
