@@ -8,7 +8,8 @@ use anyhow::{Context, bail, ensure};
 use petgraph::{Direction, visit::EdgeRef};
 
 use super::{
-    ColoredGraph, ColoredNode, Edge, GraphNode, GraphScheduler, NodeIdx, executor::Executor,
+    Colored, Edge, Graph, GraphNode, NodeIdx, RunnableGraph, executor::Executor,
+    scheduler::GraphScheduler,
 };
 
 /// A partition of graph contains the subgraph whose nodes all share the same color.
@@ -21,7 +22,7 @@ pub struct Partition<N: GraphNode, C> {
     color: C,
     /// A partition is still a colored graph. The option is only to allow consuming the graph
     /// inside the partition scheduler without cloning.
-    graph: Option<ColoredGraph<N, C>>,
+    graph: Option<RunnableGraph<N, C>>,
     /// When a partition is done, its output needs to be sent to a parent partition if any.
     parent_partition: Option<C>,
     /// The "parent partition" when it receives all the outputs of its children partitions, it must
@@ -38,11 +39,11 @@ pub struct Partition<N: GraphNode, C> {
 
 impl<N: GraphNode, C> Partition<N, C>
 where
-    C: Ord,
+    C: Ord + Clone,
 {
     pub fn new(
         color: C,
-        graph: ColoredGraph<N, C>,
+        graph: RunnableGraph<N, C>,
         child_partition: BTreeSet<C>,
         inputs: Vec<N::IO>,
         parent_partition: Option<C>,
@@ -128,7 +129,7 @@ pub struct PartitionScheduler<N: GraphNode, C, E: Executor<N, C>> {
 
 impl<N, C, E> PartitionScheduler<N, C, E>
 where
-    N: GraphNode,
+    N: GraphNode + Clone,
     C: PartialEq + Eq + Clone + Hash + Ord + Debug,
     E: Executor<N, C>,
 {
@@ -243,7 +244,7 @@ where
     }
 }
 
-impl<N, C> ColoredGraph<N, C>
+impl<N, C> RunnableGraph<N, C>
 where
     C: PartialEq + Eq + Clone + Hash + Ord + Debug,
     N: GraphNode + Clone + Debug,
@@ -259,14 +260,14 @@ where
     /// Returns, for each partition, a fresh Graph containing just that partition.
     pub fn partition_by(
         &self,
-        node_color: impl Fn(&ColoredNode<N, C>) -> &C,
+        node_color: impl Fn(&Colored<N, C>) -> &C,
         inputs: Vec<N::IO>,
     ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C>>>> {
         let mut visited = HashSet::new();
         // for each color, we keep a list of its partitions:
         // first element is the vector graphs for all partitions
         // second element is the associated mapping original_graph_index => new_partition_index
-        let mut map = BTreeMap::<C, Vec<(ColoredGraph<N, C>, HashMap<NodeIdx, NodeIdx>)>>::new();
+        let mut map = BTreeMap::<C, Vec<(RunnableGraph<N, C>, HashMap<NodeIdx, NodeIdx>)>>::new();
 
         // We start itearting from the input nodes of the original graph, so we create the partitions "in order",
         // starting from the lower partitions to the higher ones as this is the order of the execution of the graph.
@@ -292,7 +293,7 @@ where
                     continue;
                 }
                 partition.push(n);
-                for (neighbor, _) in self.neighbors(n) {
+                for (_, neighbor, _) in self.neighbors(n) {
                     // there is a directly connected node sharing the same color, so it's part
                     // of the same partition.
                     if node_color(&self.graph[neighbor]) == color {
@@ -302,7 +303,7 @@ where
             }
 
             // Build a new Graph from this partition
-            let mut sub = ColoredGraph::new();
+            let mut sub = Graph::new();
             let mut local_map = HashMap::new();
             // add all nodes to the graph
             for &n in &partition {
@@ -321,7 +322,7 @@ where
                     if local_map.contains_key(&source_idx) {
                         let new_source_idx = local_map[&source_idx];
                         let new_target_idx = local_map[&n];
-                        sub.add_edge(new_target_idx, Edge::Pred(new_source_idx));
+                        sub.add_edge(new_target_idx, Edge::Pred(new_source_idx, None));
                     }
                 }
             }
@@ -488,41 +489,44 @@ mod tests {
     /// and the inputs indices should be [1,2,5,6,3,4,7,8]
     /// Reason to choose sub and div is to test the non commutativity nature of the tasks, so the partitioning
     /// should dispatch the inputs to the correct partition in the right order and place.
-    fn create_graph() -> (ColoredGraph<MathAST, usize>, NodeIdx) {
-        let mut graph = ColoredGraph::new();
+    fn create_graph() -> (RunnableGraph<MathAST, usize>, NodeIdx) {
+        let mut graph = Graph::new();
         // first partition
         let add1 = graph.add_node(
-            ColoredNode::new(MathAST::Add, 0),
+            Colored::new(MathAST::Add, 0),
             vec![Edge::Input(0), Edge::Input(1)],
         );
         let mul1 = graph.add_node(
-            ColoredNode::new(MathAST::Sub, 0),
+            Colored::new(MathAST::Sub, 0),
             vec![Edge::Input(4), Edge::Input(5)],
         );
         let agg1 = graph.add_node(
-            ColoredNode::new(MathAST::Div, 0),
-            vec![Edge::Pred(add1), Edge::Pred(mul1)],
+            Colored::new(MathAST::Div, 0),
+            vec![Edge::Pred(add1, None), Edge::Pred(mul1, None)],
         );
         // second partition
         let add2 = graph.add_node(
-            ColoredNode::new(MathAST::Add, 1),
+            Colored::new(MathAST::Add, 1),
             vec![Edge::Input(2), Edge::Input(3)],
         );
         let mul2 = graph.add_node(
-            ColoredNode::new(MathAST::Sub, 1),
+            Colored::new(MathAST::Sub, 1),
             vec![Edge::Input(6), Edge::Input(7)],
         );
         let agg2 = graph.add_node(
-            ColoredNode::new(MathAST::Div, 1),
-            vec![Edge::Pred(add2), Edge::Pred(mul2)],
+            Colored::new(MathAST::Div, 1),
+            vec![Edge::Pred(add2, None), Edge::Pred(mul2, None)],
         );
         // third partition
         let agg3 = graph.add_node(
-            ColoredNode::new(MathAST::Sub, 2),
-            vec![Edge::Pred(agg1), Edge::Pred(agg2)],
+            Colored::new(MathAST::Sub, 2),
+            vec![Edge::Pred(agg1, None), Edge::Pred(agg2, None)],
         );
-        let agg33 = graph.add_node(ColoredNode::new(MathAST::Pow2, 2), vec![Edge::Pred(agg3)]);
-        let pow1 = graph.add_node(ColoredNode::new(MathAST::Pow2, 0), vec![Edge::Pred(agg33)]);
+        let agg33 = graph.add_node(Colored::new(MathAST::Pow2, 2), vec![Edge::Pred(agg3, None)]);
+        let pow1 = graph.add_node(
+            Colored::new(MathAST::Pow2, 0),
+            vec![Edge::Pred(agg33, None)],
+        );
         (graph, pow1)
     }
 

@@ -1,6 +1,6 @@
 //! File containing code for lookup witness generation.
 
-use crate::graph::{Edge, GraphScheduler, executor::SequentialExecutor};
+use crate::graph::{Edge, executor::SequentialExecutor, scheduler::GraphScheduler};
 use anyhow::{Context as CC, anyhow, bail, ensure};
 use std::{
     cmp::Ordering,
@@ -28,7 +28,7 @@ use witness::{InstancePaddingStrategy, RowMajorMatrix};
 use super::logup_gkr::error::LogUpError;
 use crate::{
     Claim, Element,
-    graph::{ColoredGraph, ColoredNode, node::GraphNode},
+    graph::{Colored, Graph, GraphNode},
     iop::{ChallengeStorage, context::ProverContext},
     layers::{
         activation::{GeluTableData, Relu},
@@ -1027,14 +1027,14 @@ where
     // the colour for now doesn't matter too much since everything is sequential.
     // later on, the local executor can use a threadpool to run the graph in parallel with a master thread
     let max_colour = 2;
-    let mut graph = ColoredGraph::new();
+    let mut graph = Graph::new();
     let (_node_idxs, inputs): (Vec<_>, Vec<_>) = ctx
         .steps_info
         .to_forward_iterator()
         .enumerate()
         .map(|(idx, (node_id, _))| {
             let node_idx = graph.add_node(
-                ColoredNode::new(GenerateWitness::default(), idx % max_colour),
+                Colored::new(GenerateWitness::default(), idx % max_colour),
                 vec![Edge::Input(idx)],
             );
             let input = GenerateWitnessIO::Input(node_id);
@@ -1044,7 +1044,7 @@ where
 
     // here for the moment there is not yet a "parent node" so it's a directed graph ... but with no edges.
     let graph_ctx = GenerateWitnessContext { ctx, store, trace };
-    let scheduler = GraphScheduler::new(graph);
+    let scheduler = GraphScheduler::<GenerateWitness<E, PCS>, usize>::new(graph);
     // NOTE: until https://github.com/Plonky3/Plonky3/pull/999 is fixed, we have to use the sequential executor
     // and not the threadpool executor.
     // let mut executor = SequentialExecutor::new(graph, graph_ctx);

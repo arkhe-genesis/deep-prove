@@ -1,5 +1,7 @@
-use super::{GraphScheduler, ReleasePolicy, node::GraphNode};
-use crate::graph::NodeIdx;
+use super::{
+    GraphNode, NodeIdx,
+    scheduler::{GraphScheduler, ReleasePolicy},
+};
 use crossbeam_channel::unbounded;
 use rayon::scope;
 use std::collections::HashSet;
@@ -27,7 +29,7 @@ impl<N, C> Executor<N, C> for SequentialExecutor
 where
     N::IO: Clone,
     C: Clone + PartialEq,
-    N: GraphNode,
+    N: GraphNode + Clone,
 {
     type Config = ();
 
@@ -70,7 +72,7 @@ where
     // we only need Sync for the context as we don't want to give ownership to any specific thread
     // we want to share it across all the tasks.
     N::Context: Sync,
-    N: GraphNode + Send + Sync,
+    N: GraphNode + Clone + Send + Sync,
 {
     // TODO: Maybe change it to designate a threadpool size or a specific threadpool...
     type Config = ();
@@ -145,10 +147,11 @@ pub mod tests {
 
     use crate::graph::Edge;
 
-    use super::super::{ColoredGraph, ColoredNode};
+    use super::super::{Colored, Graph};
     use crate::graph::{
-        GraphNode, GraphScheduler,
+        GraphNode,
         executor::{Executor, SequentialExecutor, ThreadPoolExecutor},
+        scheduler::GraphScheduler,
     };
 
     #[derive(Debug, Clone)]
@@ -185,27 +188,27 @@ pub mod tests {
 
     #[test]
     fn test_graph_executor() {
-        let mut graph = ColoredGraph::new();
+        let mut graph = Graph::new();
         let add_node = graph.add_node(
-            ColoredNode {
+            Colored {
                 node: MathAST::Add,
                 color: 0,
             },
             vec![Edge::Input(0), Edge::Input(1)],
         );
         let mul_node = graph.add_node(
-            ColoredNode {
+            Colored {
                 node: MathAST::Mul,
                 color: 0,
             },
-            vec![Edge::Pred(add_node), Edge::Input(2)],
+            vec![Edge::Pred(add_node, None), Edge::Input(2)],
         );
         let _add_node_2 = graph.add_node(
-            ColoredNode {
+            Colored {
                 node: MathAST::Add,
                 color: 0,
             },
-            vec![Edge::Pred(add_node), Edge::Pred(mul_node)],
+            vec![Edge::Pred(add_node, None), Edge::Pred(mul_node, None)],
         );
         let colored_graph = graph;
         let scheduler = GraphScheduler::new(colored_graph);
