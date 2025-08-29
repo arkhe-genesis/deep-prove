@@ -894,28 +894,16 @@ impl LayerNorm<Element> {
                 .collect::<Vec<E::BaseField>>(),
         );
 
-        let gamma_poly: MultilinearExtension<E> = std::iter::repeat_n(
-            self.gamma
-                .get_data()
-                .iter()
-                .map(<Element as Fieldizer<E>>::to_field)
-                .collect::<Vec<E>>(),
-            1 << logup_vars,
-        )
-        .flatten()
-        .collect::<Vec<E>>()
-        .into_mle();
-        let beta_poly: MultilinearExtension<E> = std::iter::repeat_n(
-            self.beta
-                .get_data()
-                .iter()
-                .map(<Element as Fieldizer<E>>::to_field)
-                .collect::<Vec<E>>(),
-            1 << logup_vars,
-        )
-        .flatten()
-        .collect::<Vec<E>>()
-        .into_mle();
+        let gamma_poly: MultilinearExtension<E> =
+            std::iter::repeat_n(self.gamma.to_field::<E>(), 1 << logup_vars)
+                .flatten()
+                .collect::<Vec<E>>()
+                .into_mle();
+        let beta_poly: MultilinearExtension<E> =
+            std::iter::repeat_n(self.beta.to_field::<E>(), 1 << logup_vars)
+                .flatten()
+                .collect::<Vec<E>>()
+                .into_mle();
         let either_mles = [
             &input_poly,
             &mean_poly,

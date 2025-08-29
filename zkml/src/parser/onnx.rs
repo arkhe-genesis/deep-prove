@@ -385,7 +385,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         weight.set_shape(weight_shape.insert(0, 1));
     };
     ensure_onnx!(
-        weight.is_matrix(),
+        weight.shape().is_matrix(),
         "Weight for Gemm must be a matrix: {:?}",
         weight.shape()
     );
@@ -433,7 +433,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         }
     }
     ensure_onnx!(
-        weight.is_matrix(),
+        weight.shape().is_matrix(),
         "Weight for Gemm must be a matrix 2: {:?}",
         weight.shape()
     );
@@ -591,7 +591,7 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
     let bias_node = model.node(bias_link.node);
     let filter_const = extract_const_tensor(filter_node)?;
     let bias_const = extract_const_tensor(bias_node)?;
-    let conv = if bias_const.is_empty() {
+    let conv = if bias_const.shape().is_empty() {
         Convolution::new_without_bias(filter_const)
     } else {
         Convolution::new(filter_const, bias_const)

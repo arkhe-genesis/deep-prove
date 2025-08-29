@@ -496,7 +496,7 @@ impl Dense<Element> {
         );
         let bias_eval = self
             .bias
-            .evals_flat::<E>()
+            .to_field::<E>()
             .into_mle()
             .evaluate(&last_claim.point);
         // construct the MLE combining the input and the matrix

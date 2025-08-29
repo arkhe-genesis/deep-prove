@@ -930,7 +930,7 @@ pub(crate) mod test {
         let bias_eval = dense_layers[0]
             .1
             .bias
-            .evals_flat::<F>()
+            .to_field::<F>()
             .into_mle()
             .evaluate(&point1);
         let computed_eval1_no_bias = computed_eval1 - bias_eval;

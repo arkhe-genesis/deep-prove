@@ -775,7 +775,7 @@ mod tests {
     use crate::{commit::compute_betas_eval, default_transcript, rng_from_env_or_random, to_base};
 
     use super::*;
-    use crate::{quantization::Fieldizer, util::from_mle_list_dimensions};
+    use crate::util::from_mle_list_dimensions;
     use ark_std::rand::Rng;
     use ceno_p3::field::FieldAlgebra;
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
@@ -906,14 +906,7 @@ mod tests {
 
             let output_mle = MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
                 output_num_vars,
-                padded_output
-                    .get_data()
-                    .iter()
-                    .map(|val_i128| {
-                        let field: F = val_i128.to_field();
-                        field
-                    })
-                    .collect::<Vec<F>>(),
+                padded_output.to_field::<F>(),
             );
 
             let num_threads = optimal_sumcheck_threads(output_num_vars);

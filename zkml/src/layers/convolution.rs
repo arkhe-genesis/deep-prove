@@ -868,13 +868,9 @@ impl Convolution<Element> {
         }
         let mut bias_eval = E::ZERO;
         if !bias_point.is_empty() {
-            bias_eval = filter
-                .bias
-                .evals_flat::<E>()
-                .into_mle()
-                .evaluate(&bias_point);
+            bias_eval = filter.bias.to_field::<E>().into_mle().evaluate(&bias_point);
         } else if filter.bias.data().len() == 1 {
-            bias_eval = filter.bias.evals_flat::<E>()[0];
+            bias_eval = filter.bias.to_field::<E>()[0];
         }
 
         debug_assert!({
@@ -1062,7 +1058,7 @@ impl Convolution<Element> {
                 point[(2 * self.filter_size()).ilog2() as usize..].to_vec(),
             ]
             .concat();
-            let mut y = self.filter.get_conv_weights::<E>().into_mle().evaluate(&r);
+            let mut y = self.filter.to_field::<E>().into_mle().evaluate(&r);
             assert_eq!(
                 y,
                 partial_evals.clone().into_mle().evaluate(&weights_rand),

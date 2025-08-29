@@ -3,7 +3,6 @@ mod metadata;
 mod strategy;
 use derive_more::From;
 use ff_ext::{ExtensionField, SmallField};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::LazyLock};
 use tracing::warn;
@@ -11,6 +10,7 @@ use tracing::warn;
 use crate::{
     Element,
     tensor::{Number, Tensor, TensorSlice, is_close},
+    to_field,
 };
 pub use metadata::ModelMetadata;
 pub(crate) use strategy::InferenceTracker;
@@ -259,10 +259,7 @@ where
     T: Fieldizer<F>,
 {
     fn to_fields(self) -> Tensor<F> {
-        Tensor::new(
-            self.get_shape(),
-            self.get_data().iter().map(|i| i.to_field()).collect_vec(),
-        )
+        Tensor::new(self.get_shape(), to_field::<T, F, _>(self.get_data()))
     }
 }
 

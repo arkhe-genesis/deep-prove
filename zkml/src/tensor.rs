@@ -3,8 +3,9 @@ use crate::{
     NextPowerOfTwo, ScalingFactor,
     backend::Backend,
     quantization::{self, MAX_FLOAT, MIN_FLOAT},
+    to_field,
 };
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use ark_std::rand::Rng;
 use burn::tensor::{BasicOps, Int, Numeric, Tensor as BTensor, TensorData, TensorKind};
 use ceno_p3::{
@@ -613,22 +614,12 @@ impl<T> Tensor<T> {
         *self.shape.get_mut(0).unwrap() += added_higher;
         self.data.extend(other.data);
     }
-    /// Stack all the tensors in the iterator into a single tensor using `concat()`
-    /// Note this naively increase the highest dimension. If you wish to stack along a new higher dimension,
-    /// call `unsqueeze(0)` on the first or all tensors first.
-    /// e.g. [2,3] and [2,3] will be stacked into [4,3] naively. Calling `unsqueeze(0)` on both
-    /// will stack into [2,2,3].
-    pub fn stack_all<I: IntoIterator<Item = Self>>(tensors: I) -> anyhow::Result<Self> {
-        let mut it = tensors.into_iter();
-        let mut first = it
-            .next()
-            .ok_or(anyhow::anyhow!("Can't concat an empty list of tensors"))?;
-        for tensor in it {
-            first.concat(tensor);
-        }
-        Ok(first)
-    }
 
+    /// Adds a new dimension to the tensor with size 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is larger than the shape size.
     pub fn unsqueeze(self, index: usize) -> Self {
         let new_shape = self.shape.insert(index, 1);
         Self {
@@ -638,6 +629,12 @@ impl<T> Tensor<T> {
         }
     }
 
+    /// Removes a dimension from the tensor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is larger than the shape size, or if the
+    /// removed dimension size is not 1.
     pub fn squeeze(mut self, index: usize) -> Self {
         assert_eq!(
             self.shape[index], 1,
@@ -647,31 +644,13 @@ impl<T> Tensor<T> {
         self
     }
 
-    /// Is an empty tensor
-    pub fn is_empty(&self) -> bool {
-        self.shape.len() == 0
-    }
-
-    /// Is vector
-    pub fn is_vector(&self) -> bool {
-        self.shape().len() == 1 || (self.shape().len() == 2 && self.shape()[0] == 1)
-    }
-    /// Is matrix
-    pub fn is_matrix(&self) -> bool {
-        self.shape().len() == 2
-    }
-
-    pub fn is_convolution(&self) -> bool {
-        self.shape().len() == 4
-    }
-
     /// Get the number of rows from the matrix
     pub fn nrows_2d(&self) -> usize {
         let mut cols = 0;
         let dims = self.shape();
-        if self.is_matrix() {
+        if self.shape.is_matrix() {
             cols = dims[0];
-        } else if self.is_convolution() {
+        } else if self.shape.is_convolution() {
             cols = dims[0] * dims[2] * dims[2];
         }
         assert!(cols != 0, "Tensor is not a matrix or convolution");
@@ -682,9 +661,9 @@ impl<T> Tensor<T> {
     pub fn ncols_2d(&self) -> usize {
         let mut cols = 0;
         let dims = self.shape();
-        if self.is_matrix() {
+        if self.shape.is_matrix() {
             cols = dims[1];
-        } else if self.is_convolution() {
+        } else if self.shape.is_convolution() {
             cols = dims[1] * dims[2] * dims[2];
         }
         assert!(cols != 0, "Tensor is not a matrix or convolution");
@@ -696,7 +675,7 @@ impl<T> Tensor<T> {
 
     /// Get the dimensions of the tensor
     pub fn shape(&self) -> Shape {
-        assert!(!self.is_empty(), "Empty tensor");
+        assert!(!self.shape.is_empty(), "Empty tensor");
         self.shape.clone()
     }
 
@@ -707,7 +686,7 @@ impl<T> Tensor<T> {
 
     /// Force-set the tensor shape
     pub fn set_shape(&mut self, new_shape: Shape) {
-        assert!(!self.is_empty(), "Empty tensor");
+        assert!(!self.shape.is_empty(), "Empty tensor");
         assert!(self.shape.numel() == new_shape.numel());
         self.shape = new_shape;
     }
@@ -749,15 +728,12 @@ impl<T> Tensor<T> {
         self.og_shape.clone()
     }
 
-    pub fn get_conv_weights<F: ExtensionField>(&self) -> Vec<F>
+    /// Returns the tensor data converted to extension field elements.
+    pub fn to_field<F: ExtensionField>(&self) -> Vec<F>
     where
         T: Fieldizer<F>,
     {
-        let mut data = vec![F::ZERO; self.data.len()];
-        for i in 0..data.len() {
-            data[i] = self.data[i].to_field();
-        }
-        data
+        to_field::<T, F, _>(&self.data)
     }
 
     /// Ensure width and height are the same power-of-two.
@@ -811,7 +787,7 @@ impl Tensor<Element> {
         quantized_self_input_range: Option<usize>,
         quantized_other_input_range: Option<usize>,
     ) -> usize {
-        assert!(self.is_matrix(), "Tensor is not a matrix");
+        assert!(self.shape.is_matrix(), "Tensor is not a matrix");
         self.shape
             .matmul_output_bitsize(quantized_self_input_range, quantized_other_input_range)
     }
@@ -908,11 +884,7 @@ impl Tensor<Element> {
         );
 
         let n_x = input.shape[1].next_power_of_two();
-        let real_input = input
-            .data
-            .par_iter()
-            .map(|e| e.to_field())
-            .collect::<Vec<_>>();
+        let real_input = input.to_field::<F>();
         let new_n = 2 * n_x * n_x;
 
         // Convert the convolution input to the frequency domain.
@@ -997,10 +969,6 @@ impl Tensor<Element> {
         (result, conv_data)
     }
 
-    pub fn evals_flat<F: ExtensionField>(&self) -> Vec<F> {
-        self.data.par_iter().map(|e| e.to_field()).collect()
-    }
-
     pub fn to_2d_mle<F: ExtensionField>(&self) -> MultilinearExtension<'static, F> {
         let t = Tensor::<F>::from(self);
         t.to_mle_2d()
@@ -1017,7 +985,7 @@ impl Tensor<Element> {
 
 impl<F: ExtensionField> Tensor<F> {
     pub fn to_mle_2d(&self) -> MultilinearExtension<'static, F> {
-        assert!(self.is_matrix(), "Tensor is not a matrix");
+        assert!(self.shape.is_matrix(), "Tensor is not a matrix");
         assert!(
             self.nrows_2d().is_power_of_two(),
             "number of rows {} is not a power of two",
@@ -1047,7 +1015,7 @@ impl<F: Field> Tensor<F> {
 impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
     fn from(value: &Tensor<Element>) -> Self {
         Self {
-            data: value.evals_flat(),
+            data: value.to_field::<F>(),
             shape: value.shape.clone(),
             og_shape: value.og_shape.clone(),
         }
@@ -1099,14 +1067,14 @@ impl<T: Clone> Tensor<T> {
     /// Returns the boolean iterator indicating the given row in the right endianness to be
     /// evaluated by an MLE
     pub fn row_to_boolean_2d<F: ExtensionField>(&self, row: usize) -> impl Iterator<Item = F> {
-        assert!(self.is_matrix(), "Tensor is not a matrix");
+        assert!(self.shape.is_matrix(), "Tensor is not a matrix");
         let (nvars_rows, _) = self.shape().num_vars_2d();
         to_bit_sequence_le(row, nvars_rows).map(|b| F::from_canonical_u64(b as u64))
     }
     /// Returns the boolean iterator indicating the given row in the right endianness to be
     /// evaluated by an MLE
     pub fn col_to_boolean_2d<F: ExtensionField>(&self, col: usize) -> impl Iterator<Item = F> {
-        assert!(self.is_matrix(), "Tensor is not a matrix");
+        assert!(self.shape.is_matrix(), "Tensor is not a matrix");
         let (_, nvars_col) = self.shape().num_vars_2d();
         to_bit_sequence_le(col, nvars_col).map(|b| F::from_canonical_u64(b as u64))
     }
@@ -1114,7 +1082,7 @@ impl<T: Clone> Tensor<T> {
     /// format to evaluate the MLE.
     /// little endian so we need to read cols before rows
     pub fn position_to_boolean_2d<F: ExtensionField>(&self, row: usize, col: usize) -> Vec<F> {
-        assert!(self.is_matrix(), "Tensor is not a matrix");
+        assert!(self.shape.is_matrix(), "Tensor is not a matrix");
         self.col_to_boolean_2d(col)
             .chain(self.row_to_boolean_2d(row))
             .collect_vec()
@@ -1136,7 +1104,7 @@ impl<T: Clone> Tensor<T> {
 
 impl<T: Number> Tensor<T> {
     /// Instantiate a new tensor with `shape` initialised to `default`.
-    pub fn zero(shape: Shape) -> Self {
+    pub fn zeros(shape: Shape) -> Self {
         Self::initialised(shape, T::zero())
     }
 
@@ -1155,17 +1123,6 @@ impl<T: Number> Tensor<T> {
         self.data
             .iter()
             .fold(T::default(), |max, x| max.cmp_max(&x.absolute_value()))
-    }
-
-    /// Create a tensor filled with zeros
-    pub fn zeros(shape: Shape) -> Self {
-        let size = shape.product();
-        Self {
-            // data: vec![T::zero(); size],
-            data: vec![Default::default(); size],
-            shape,
-            og_shape: vec![0].into(),
-        }
     }
 
     /// Element-wise addition
@@ -1286,7 +1243,7 @@ impl<T: Number> Tensor<T> {
     /// Perform matrix-matrix multiplication
     pub fn matmul(&self, other: &Tensor<T>) -> Tensor<T> {
         assert!(
-            self.is_matrix() && other.is_matrix(),
+            self.shape.is_matrix() && other.shape.is_matrix(),
             "Both tensors must be 2D for matrix multiplication."
         );
         let (m, n) = (self.shape[0], self.shape[1]);
@@ -1318,8 +1275,11 @@ impl<T: Number> Tensor<T> {
     /// Perform matrix-vector multiplication
     /// TODO: actually getting the result should be done via proper tensor-like libraries
     pub fn matvec(&self, vector: &Tensor<T>) -> Tensor<T> {
-        assert!(self.is_matrix(), "First argument must be a matrix.");
-        assert!(vector.is_vector(), "Second argument must be a vector.");
+        assert!(self.shape.is_matrix(), "First argument must be a matrix.");
+        assert!(
+            vector.shape.is_vector(),
+            "Second argument must be a vector."
+        );
 
         let (m, n) = (self.shape[0], self.shape[1]);
         let vec_len = vector.shape[0];
@@ -1338,7 +1298,7 @@ impl<T: Number> Tensor<T> {
     }
     /// Transpose the matrix (2D tensor)
     pub fn transpose(&self) -> Tensor<T> {
-        assert!(self.is_matrix(), "Tensor is not a matrix.");
+        assert!(self.shape.is_matrix(), "Tensor is not a matrix.");
         let (m, n) = (self.shape[0], self.shape[1]);
 
         let mut result = Tensor::zeros(vec![n, m].into());
@@ -1356,8 +1316,8 @@ impl<T: Number> Tensor<T> {
     }
     /// Concatenate a matrix (2D tensor) with a vector (1D tensor) as columns
     pub fn concat_matvec_col(&self, vector: &Tensor<T>) -> Tensor<T> {
-        assert!(self.is_matrix(), "First tensor is not a matrix.");
-        assert!(vector.is_vector(), "Second tensor is not a vector.");
+        assert!(self.shape.is_matrix(), "First tensor is not a matrix.");
+        assert!(vector.shape.is_vector(), "Second tensor is not a vector.");
 
         let (rows, cols) = (self.shape[0], self.shape[1]);
         let vector_len = vector.shape[0];
@@ -1956,72 +1916,6 @@ impl<T: Default + Clone + Copy> Tensor<T> {
             og_shape: self.shape.clone(),
         }
     }
-
-    /// Expands a [`Tensor`] to the provided shape. In order for the expansion to be valid we require that
-    /// all dimensions in the provided shape are greater than or equal to the original shape. Additionally in all cases where
-    /// the provided shape dimension is larger we require the original shape dimension to be 1.
-    pub fn expand(&self, expansion_shape: &Shape) -> Result<Tensor<T>>
-    where
-        T: Clone,
-    {
-        // Check that the expanded shape has rank greater than or equal to self.shape and also that all dimensions are compatible
-        let expansion_rank = expansion_shape.rank();
-        if expansion_rank < self.rank() {
-            return Err(anyhow!(
-                "Cannot Expand to shape: {:?} as it has rank: {expansion_rank} which is smaller than the current rank: {}",
-                expansion_shape,
-                self.rank()
-            ));
-        }
-
-        let rank_diff = expansion_rank - self.rank();
-        let padded_shape = std::iter::repeat_n(1usize, rank_diff)
-            .chain(self.shape.iter().copied())
-            .collect::<Vec<usize>>();
-        expansion_shape.iter().zip(padded_shape.iter()).try_for_each(|(&new_dim, &dim)|{
-            // Check new_dim isn't zero
-            if new_dim == 0 {
-                Err(anyhow!("Cannot expand to new shape, new shape dim: {new_dim} was zero"))
-            } else if dim != 1 {
-                // In this case we need both to be equal
-                if dim != new_dim {
-                    Err(anyhow!("Cannot expand to new shape, new shape dim: {new_dim} was not equal to current dim: {dim}"))
-                } else {
-                    Ok(())
-                }
-            } else {
-                Ok(())
-            }
-        })?;
-
-        // Now that we know everything checks out we expand appropriately
-        let new_data = expansion_shape
-            .iter()
-            .zip(padded_shape.iter())
-            .rev()
-            .fold(
-                (self.data.clone(), 1usize),
-                |(data_acc, chunk_size), (&exp_dim, &current_dim)| {
-                    if current_dim == exp_dim {
-                        // Nothing to do in this case just update chunk_size
-                        (data_acc, chunk_size * exp_dim)
-                    } else {
-                        // We should split the current data_acc into chunk_size pieces and then repeat each chunk exp_dim times
-                        (
-                            data_acc
-                                .chunks(chunk_size)
-                                .flat_map(|chunk| vec![chunk; exp_dim].concat())
-                                .collect::<Vec<T>>(),
-                            chunk_size * exp_dim,
-                        )
-                    }
-                },
-            )
-            .0;
-
-        // Now that we have the expanded data make the tensor
-        Ok(Tensor::<T>::new(expansion_shape.clone(), new_data))
-    }
 }
 
 impl<T: Copy> Tensor<T> {
@@ -2538,12 +2432,27 @@ impl Shape {
     pub fn rank(&self) -> usize {
         self.0.len()
     }
+
+    /// True if the tensor is 0D, i.e. has no dimensions.
+    pub fn is_empty(&self) -> bool {
+        self.rank() == 0
+    }
+
+    /// True if the tensor is 1D, or if it is 2D but the first dimensions is 1.
+    pub fn is_vector(&self) -> bool {
+        self.rank() == 1 || (self.rank() == 2 && self.dim(0) == 1)
+    }
+
+    /// True if the tensor is 2D.
     pub fn is_matrix(&self) -> bool {
-        self.0.len() == 2
+        self.rank() == 2
     }
+
+    /// True if the tensor is 4D.
     pub fn is_convolution(&self) -> bool {
-        self.0.len() == 4
+        self.rank() == 4
     }
+
     pub fn ncols(&self) -> usize {
         assert!(self.is_matrix(), "Tensor is not a matrix");
         self.0[1]
@@ -2860,6 +2769,7 @@ mod test {
     use crate::{
         rng_from_env_or_random,
         testing::{random_field_vector, random_vector},
+        to_field,
     };
 
     use super::*;
@@ -3097,7 +3007,7 @@ mod test {
 
     impl Tensor<Element> {
         pub fn get_2d(&self, i: usize, j: usize) -> Element {
-            assert!(self.is_matrix());
+            assert!(self.shape.is_matrix());
             self.data[i * self.shape()[1] + j]
         }
 
@@ -3172,7 +3082,7 @@ mod test {
                         let fft_filter = filter.clone().into_fft_conv(&padded_input_shape);
                         let input = Tensor::new(padded_input_shape, vec![3; input_size]);
 
-                        let bias = Tensor::<Element>::zero(Shape::new(vec![feature_maps]));
+                        let bias = Tensor::<Element>::zeros(Shape::new(vec![feature_maps]));
                         let (result, _) = fft_filter.fft_conv::<GoldilocksExt2>(&input, &bias);
                         let expected = input.conv2d(&filter, &bias, 1);
                         let expected = expected.squeeze(0);
@@ -3191,11 +3101,11 @@ mod test {
         let vector_a_data = [10 as Element, 20, 30];
         let vector_b_data = [140 as Element, 320, 500];
 
-        let matrix_a_data: Vec<E> = matrix_a_data.iter().map(|x| x.to_field()).collect_vec();
-        let matrix_b_data: Vec<E> = matrix_b_data.iter().map(|x| x.to_field()).collect_vec();
-        let matrix_c_data: Vec<E> = matrix_c_data.iter().map(|x| x.to_field()).collect_vec();
-        let vector_a_data: Vec<E> = vector_a_data.iter().map(|x| x.to_field()).collect_vec();
-        let vector_b_data: Vec<E> = vector_b_data.iter().map(|x| x.to_field()).collect_vec();
+        let matrix_a_data: Vec<E> = to_field(matrix_a_data);
+        let matrix_b_data: Vec<E> = to_field(matrix_b_data);
+        let matrix_c_data: Vec<E> = to_field(matrix_c_data);
+        let vector_a_data: Vec<E> = to_field(vector_a_data);
+        let vector_b_data: Vec<E> = to_field(vector_b_data);
         let matrix = Tensor::new(vec![3usize, 3].into(), matrix_a_data.clone());
         let vector = Tensor::new(vec![3usize].into(), vector_a_data);
         let vector_expected = Tensor::new(vec![3usize].into(), vector_b_data);
@@ -3689,28 +3599,6 @@ mod test {
         assert_eq!(argmax, 2);
     }
 
-    #[test]
-    fn test_tensor_stack_all() {
-        let tensors = vec![
-            Tensor::<Element>::new(vec![2, 3].into(), vec![1, 2, 3, 4, 5, 6]),
-            Tensor::<Element>::new(vec![2, 3].into(), vec![7, 8, 9, 10, 11, 12]),
-        ];
-        let stacked = Tensor::<Element>::stack_all(tensors.clone()).unwrap();
-        assert_eq!(stacked.shape(), vec![4, 3].into());
-        assert_eq!(
-            stacked.get_data(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        );
-
-        let stacked =
-            Tensor::<Element>::stack_all(tensors.into_iter().map(|t| t.unsqueeze(0))).unwrap();
-        assert_eq!(stacked.shape(), vec![2, 2, 3].into());
-        assert_eq!(
-            stacked.get_data(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        );
-    }
-
     fn eval_lteq_poly(x_i: &[Element], y_i: &[Element]) -> Element {
         assert_eq!(x_i.len(), y_i.len());
         x_i.iter()
@@ -3816,66 +3704,6 @@ mod test {
         let tensor = Tensor::<Element>::tril(4, 1, -1);
         let real_value: Vec<Element> = vec![0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0];
         assert_eq!(tensor.get_data(), real_value);
-    }
-
-    #[test]
-    fn test_expand() {
-        let mut rng = rng_from_env_or_random();
-
-        for _ in 0..10 {
-            let dim = rng.gen_range(1usize..11);
-            let initial_shape: Shape = vec![dim].into();
-
-            let tensor = Tensor::<f32>::random(&initial_shape);
-            let data = tensor.get_data().to_vec();
-            let expanded_shape: Shape = vec![7, dim].into();
-
-            let expanded_tensor_res = tensor.expand(&expanded_shape);
-
-            // Check the result is OK
-            assert!(
-                expanded_tensor_res.is_ok(),
-                "error: {expanded_tensor_res:?}"
-            );
-
-            // Now check that the data is correct
-            let expanded_tensor = expanded_tensor_res.unwrap();
-            // We expect the tensor to have repeated each element 7 times
-            let correct_data = vec![data; 7].concat();
-
-            assert_eq!(expanded_tensor.data, correct_data);
-        }
-
-        // Now we check it expands along dimensions properly
-        let shape: Shape = vec![3, 1, 2].into();
-        #[rustfmt::skip]
-        let data = vec![
-            1.0, 2.0,
-
-            3.0, 4.0,
-
-            5.0, 6.0];
-
-        let expansion_shape: Shape = vec![3, 3, 2].into();
-        #[rustfmt::skip]
-        let expansion_data = vec![
-            1.0, 2.0,
-            1.0, 2.0, 
-            1.0, 2.0, 
-            
-            3.0, 4.0, 
-            3.0, 4.0, 
-            3.0, 4.0, 
-            
-            5.0, 6.0, 
-            5.0, 6.0, 
-            5.0, 6.0,
-        ];
-
-        let expanded_tensor = Tensor::<f64>::new(shape, data.clone())
-            .expand(&expansion_shape)
-            .unwrap();
-        assert_eq!(expanded_tensor.data, expansion_data);
     }
 
     #[test]

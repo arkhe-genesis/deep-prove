@@ -581,7 +581,7 @@ where
         );
         let input = &input_tensors[0];
         ensure!(
-            input.is_matrix(),
+            input.shape().is_matrix(),
             "Input tensor for QKV layer is not a matrix"
         );
         let ncols = input.ncols_2d();
@@ -625,7 +625,7 @@ where
                         point_for_column.len() == bias_vector.get_data().len().ilog2() as usize
                     );
                     let eval = bias_vector
-                        .evals_flat::<E>()
+                        .to_field::<E>()
                         .into_mle()
                         .evaluate(point_for_column);
                     let bias_claim = Claim::new(point_for_column.to_vec(), eval);
@@ -986,7 +986,7 @@ impl<N: Number> CacheQKV<N> {
             v.shape()
         );
         if self.initialized {
-            assert!(k.is_vector(), "k is not a vector {:?}", k.shape());
+            assert!(k.shape().is_vector(), "k is not a vector {:?}", k.shape());
             assert_eq!(
                 self.cache_k.shape()[1],
                 k.shape()[1],

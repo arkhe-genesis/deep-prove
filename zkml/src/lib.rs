@@ -193,6 +193,17 @@ where
         .collect()
 }
 
+/// Converts an iterator of elements to the extension field.
+pub(crate) fn to_field<T, E, I>(iter: I) -> Vec<E>
+where
+    I: IntoIterator,
+    I::Item: Borrow<T>,
+    T: Fieldizer<E>,
+    E: ExtensionField,
+{
+    iter.into_iter().map(|v| v.borrow().to_field()).collect()
+}
+
 /// Returns the maximum element in the slice `v`, and the position in `v`
 /// where such maximum element is located; in other words, it returns
 /// (max(v), argmax(v))

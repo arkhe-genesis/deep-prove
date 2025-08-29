@@ -74,7 +74,7 @@ impl<T> OperandMatrix<T> {
 
     pub(crate) fn is_matrix(&self) -> bool {
         match self {
-            OperandMatrix::Weight(mat) => mat.tensor.is_matrix(),
+            OperandMatrix::Weight(mat) => mat.tensor.shape().is_matrix(),
             OperandMatrix::Input => true,
         }
     }
@@ -753,11 +753,11 @@ impl MatMul<Element> {
             "More inputs provided than necessary: expected {expected_num_inputs}, found {num_inputs}"
         );
         ensure!(
-            left_matrix.is_matrix(),
+            left_matrix.shape().is_matrix(),
             "left input matrix for MatMul layer is not a matrix"
         );
         ensure!(
-            right_matrix.is_matrix(),
+            right_matrix.shape().is_matrix(),
             "right input matrix for MatMul layer is not a matrix"
         );
         let nrows_left = left_matrix.nrows_2d();
@@ -767,7 +767,7 @@ impl MatMul<Element> {
             right_matrix.ncols_2d()
         };
         ensure!(
-            output.is_matrix(),
+            output.shape().is_matrix(),
             "Output tensor for MatMul layer is not a matrix"
         );
         let (nrows_out, ncols_out) = (output.nrows_2d(), output.ncols_2d());
@@ -803,7 +803,7 @@ impl MatMul<Element> {
         let (point_for_left, point_for_right) = Self::split_claim(&init_split, num_vars_2d);
 
         if let Some(bias) = &self.bias {
-            let bias_eval = bias.evals_flat::<E>().into_mle().evaluate(point_for_right);
+            let bias_eval = bias.to_field::<E>().into_mle().evaluate(point_for_right);
             last_claim.eval -= bias_eval;
             common_claims.insert(
                 BIAS_POLY_ID.to_string(),
