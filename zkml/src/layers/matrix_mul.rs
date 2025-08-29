@@ -28,7 +28,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
     quantization::{self, bias_scaling_matmul},
-    tensor::Number,
+    tensor::{IntoBTensor, Number},
     util::from_mle_list_dimensions,
 };
 
@@ -208,8 +208,13 @@ impl<T> MatMul<T> {
             ensure!(bt.rank() == 1, "Bias must be a 1D tensor");
             match right_matrix {
                 OperandMatrix::Weight(ref mat) => {
+                    let expected_dim = if let Some(Config::TransposeB) = &config {
+                        mat.tensor.shape()[0]
+                    } else {
+                        mat.tensor.shape()[1]
+                    };
                     ensure!(
-                        mat.tensor.shape()[1] == bt.shape()[0],
+                        expected_dim == bt.shape()[0],
                         "bias shape {:?} is incompatible with right matrix shape {:?}",
                         bt.shape(),
                         mat.tensor.shape(),
@@ -228,52 +233,33 @@ impl<T> MatMul<T> {
 
     pub fn op(&self, inputs: Vec<&Tensor<T>>) -> Result<Tensor<T>>
     where
-        T: Number,
+        T: Number + burn::tensor::Element,
+        Tensor<T>: IntoBTensor,
     {
-        let matmul = match (&self.left_matrix, &self.right_matrix) {
+        let (left, right) = match (&self.left_matrix, &self.right_matrix) {
             (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => panic!(
                 "Found layer with 2 constant matrices, which is useless as the
                 product can be directly used instead"
             ),
             (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
-                let right_matrix = inputs
+                let left = mat.tensor.clone().into_btensor::<2>();
+
+                let right = *inputs
                     .first()
                     .ok_or(anyhow!("No matrix provided as input to MatMul"))?;
-                let transposed_matrix = if let Some(Config::TransposeB) = self.config {
-                    Some(right_matrix.transpose())
-                } else {
-                    None
-                };
-                let nrows = transposed_matrix
-                    .as_ref()
-                    .unwrap_or(right_matrix)
-                    .nrows_2d();
-                ensure!(
-                    nrows == mat.tensor.ncols_2d(),
-                    "Incompatible shape found for input matrix: expected {:?} rows, found {:?}",
-                    mat.tensor.ncols_2d(),
-                    nrows,
-                );
-                mat.tensor
-                    .matmul(transposed_matrix.as_ref().unwrap_or(right_matrix))
+                let right = right.clone().into_btensor::<2>();
+
+                (left, right)
             }
             (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-                let left_matrix = inputs
+                let left = *inputs
                     .first()
                     .ok_or(anyhow!("No matrix provided as input to MatMul"))?;
-                let transposed_matrix = if let Some(Config::TransposeB) = self.config {
-                    Some(mat.tensor.transpose())
-                } else {
-                    None
-                };
-                let nrows = transposed_matrix.as_ref().unwrap_or(&mat.tensor).nrows_2d();
-                ensure!(
-                    left_matrix.ncols_2d() == nrows,
-                    "Incompatible shape found for input matrix: expected {:?} columns, found {:?}",
-                    nrows,
-                    left_matrix.ncols_2d(),
-                );
-                left_matrix.matmul(transposed_matrix.as_ref().unwrap_or(&mat.tensor))
+                let left = left.clone().into_btensor::<2>();
+
+                let right = mat.tensor.clone().into_btensor::<2>();
+
+                (left, right)
             }
             (OperandMatrix::Input, OperandMatrix::Input) => {
                 ensure!(
@@ -281,32 +267,48 @@ impl<T> MatMul<T> {
                     "Not enough inputs provided to MatMul: expected 2, found {}",
                     inputs.len()
                 );
-                let transposed_matrix = if let Some(Config::TransposeB) = self.config {
-                    Some(inputs[1].transpose())
-                } else {
-                    None
-                };
-                let nrows = transposed_matrix.as_ref().unwrap_or(inputs[1]).nrows_2d();
-                ensure!(
-                    inputs[0].ncols_2d() == nrows,
-                    "Incompatible shape found for input matrices: left matrix has {} columns, right matrix has {} rows",
-                    inputs[0].ncols_2d(),
-                    nrows,
-                );
-                inputs[0].matmul(transposed_matrix.as_ref().unwrap_or(inputs[1]))
+                let left = inputs[0];
+                let left = left.clone().into_btensor::<2>();
+
+                let right = inputs[1];
+                let right = right.clone().into_btensor::<2>();
+
+                (left, right)
             }
         };
-        if let Some(bias) = self.bias.as_ref() {
+        let right = if let Some(Config::TransposeB) = self.config {
+            right.transpose()
+        } else {
+            right
+        };
+        let left_cols = left.shape().dims[0];
+        let left_rows = left.shape().dims[1];
+        let right_cols = right.shape().dims[0];
+        let right_rows = right.shape().dims[1];
+        ensure!(
+            left_rows == right_cols,
+            "Incompatible shape found for input matrix: expected {:?}, found {:?}",
+            left_rows,
+            right_cols,
+        );
+        let matmul = left.matmul(right);
+        let res = if let Some(bias) = self.bias.as_ref() {
+            let bias = bias.clone().into_btensor::<1>();
             ensure!(
-                matmul.shape()[1] == bias.shape()[0],
+                matmul.shape().dims[1] == bias.shape().dims[0],
                 "Bias shape {:?} is incompatible with matmul shape {:?}",
                 bias.shape(),
                 matmul.shape()
             );
-            Ok(matmul.add_dim2(bias))
+            let bias = bias.unsqueeze::<2>();
+            matmul.add(bias)
         } else {
-            Ok(matmul)
-        }
+            matmul
+        };
+        let data = res.to_data().into_vec().expect("Failed to compute MatMul");
+        let shape = Shape::new(vec![left_cols, right_rows]);
+        let out = Tensor::new(shape, data);
+        Ok(out)
     }
 
     pub fn is_right_transposed(&self) -> bool {
@@ -477,12 +479,23 @@ impl<N: Number> OpInfo for MatMul<N> {
     }
 }
 
-impl<N: Number> Evaluate<N> for MatMul<N> {
+impl Evaluate<f32> for MatMul<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&Tensor<f32>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<N, E>> {
+    ) -> Result<LayerOut<f32, E>> {
+        let output = self.op(inputs.to_vec())?;
+        Ok(LayerOut::from_vec(vec![output]))
+    }
+}
+
+impl Evaluate<Element> for MatMul<Element> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&Tensor<Element>],
+        _unpadded_input_shapes: &[Shape],
+    ) -> Result<LayerOut<Element, E>> {
         let output = self.op(inputs.to_vec())?;
         Ok(LayerOut::from_vec(vec![output]))
     }
@@ -1199,6 +1212,8 @@ mod tests {
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use itertools::Itertools;
+    use proptest::prelude::*;
+    use std::{fmt::Debug, ops::Range};
 
     use crate::{
         Element, ScalingFactor, Shape, Tensor,
@@ -1210,7 +1225,10 @@ mod tests {
         model::{Model, test::prove_model},
         padding::PaddingMode,
         rng_from_env_or_random,
+        tensor::Number,
     };
+
+    use super::WeightMatrix;
 
     fn test_matmul_padding(transpose: bool) {
         // Create a Mat mul layer with non-power-of-two dimensions
@@ -1565,5 +1583,171 @@ mod tests {
         model.route_output(None).unwrap();
         model.describe();
         prove_model(model, &mut Default::default()).unwrap();
+    }
+
+    proptest! {
+        #[test]
+        fn test_matmul_with_f32(input in any_input::<f32>(1..256, 1..256, 1..256)) {
+            let Input { left, right, kind, transpose_b, bias } = input;
+
+            let right_ = if transpose_b {
+                right.clone().transpose()
+            } else {
+                right.clone()
+            };
+            let expected = left.clone().matmul(&right_);
+            let expected = if let Some(bias) = bias.as_ref() {
+                expected.add_dim2(bias)
+            } else {
+                expected
+            };
+
+            let (left, right, inputs) = kind_to_layer_inputs(kind, left, right);
+
+            let config = transpose_b.then_some(Config::TransposeB);
+            let layer = MatMul::<f32>::new_internal(left, right, bias, config).unwrap();
+            let inputs:Vec<_> = inputs.iter().collect();
+            let computed = layer.evaluate::<GoldilocksExt2>(&inputs, &[]).expect("matmul evaluation must be successful");
+
+            for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
+                let abs = (left - right).abs();
+                // The differences are in tensor matmul
+                const THRESHOLD: f32 =  1e-3;
+                prop_assert!(abs < THRESHOLD, "Absolute diff {} not within threshold {}", abs, THRESHOLD);
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn test_matmul_with_element(input in any_input::<Element>(1..256, 1..256, 1..256)) {
+            let Input { left, right, kind, transpose_b, bias } = input;
+
+            let right_ = if transpose_b {
+                right.clone().transpose()
+            } else {
+                right.clone()
+            };
+            let expected = left.clone().matmul(&right_);
+            let expected = if let Some(bias) = bias.as_ref() {
+                expected.add_dim2(bias)
+            } else {
+                expected
+            };
+
+            let (left, right, inputs) = kind_to_layer_inputs(kind, left, right);
+
+            let config = transpose_b.then_some(Config::TransposeB);
+            let layer = MatMul::<Element>::new_internal(left, right, bias, config).unwrap();
+            let inputs:Vec<_> = inputs.iter().collect();
+            let computed = layer.evaluate::<GoldilocksExt2>(&inputs, &[]).expect("matmul evaluation must be successful");
+
+            prop_assert_eq!(&expected, &computed.outputs[0]);
+        }
+    }
+
+    fn kind_to_layer_inputs<N>(
+        kind: InputKind,
+        left: Tensor<N>,
+        right: Tensor<N>,
+    ) -> (OperandMatrix<N>, OperandMatrix<N>, Vec<Tensor<N>>) {
+        match kind {
+            InputKind::TwoInputs => {
+                let inputs = vec![left, right];
+                (OperandMatrix::Input, OperandMatrix::Input, inputs)
+            }
+            InputKind::LeftWeight => {
+                let inputs = vec![right];
+                let unpadded_shape = left.shape();
+                let weight = WeightMatrix {
+                    tensor: left,
+                    unpadded_shape,
+                };
+                (OperandMatrix::Weight(weight), OperandMatrix::Input, inputs)
+            }
+            InputKind::RightWeight => {
+                let inputs = vec![left];
+                let unpadded_shape = right.shape();
+                let weight = WeightMatrix {
+                    tensor: right,
+                    unpadded_shape,
+                };
+                (OperandMatrix::Input, OperandMatrix::Weight(weight), inputs)
+            }
+        }
+    }
+
+    struct Input<T> {
+        left: Tensor<T>,
+        right: Tensor<T>,
+        kind: InputKind,
+        transpose_b: bool,
+        bias: Option<Tensor<T>>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InputKind {
+        TwoInputs,
+        LeftWeight,
+        RightWeight,
+    }
+
+    impl<T> Debug for Input<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Input").finish_non_exhaustive()
+        }
+    }
+
+    fn any_input<T: 'static + Number>(
+        dim_x: Range<usize>,
+        dim_y: Range<usize>,
+        dim_z: Range<usize>,
+    ) -> impl Strategy<Value = Input<T>> {
+        (
+            (0..=2_u8),
+            dim_x,
+            dim_y,
+            dim_z,
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_flat_map(|(kind, dim_x, dim_y, dim_z, add_bias, transpose_right)| {
+                let kind: InputKind = match kind {
+                    0 => InputKind::TwoInputs,
+                    1 => InputKind::LeftWeight,
+                    2 => InputKind::RightWeight,
+                    _ => panic!("unexpected kind {kind}"),
+                };
+
+                let shape_left = Shape::new(vec![dim_x, dim_y]);
+                let shape_right = if transpose_right {
+                    Shape::new(vec![dim_z, dim_y])
+                } else {
+                    Shape::new(vec![dim_y, dim_z])
+                };
+                let tensor_left = Tensor::<T>::any(shape_left);
+                let tensor_right = Tensor::<T>::any(shape_right);
+
+                let bias = if add_bias {
+                    let shape = Shape::new(vec![dim_z]);
+                    Tensor::<T>::any(shape.clone()).prop_map(Some).boxed()
+                } else {
+                    Just(None).boxed()
+                };
+
+                (
+                    Just((kind, transpose_right)),
+                    tensor_left,
+                    tensor_right,
+                    bias,
+                )
+                    .prop_map(|((kind, transpose_b), left, right, bias)| Input {
+                        left,
+                        right,
+                        kind,
+                        transpose_b,
+                        bias,
+                    })
+            })
     }
 }

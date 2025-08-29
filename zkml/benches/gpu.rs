@@ -11,6 +11,7 @@ use zkml::{
         convolution::Convolution,
         dense::Dense,
         flatten::Flatten,
+        matrix_mul::{self, MatMul},
         provable::Evaluate,
         transformer::{embeddings::Embeddings, qkv::QKV},
     },
@@ -303,6 +304,59 @@ fn gelu_layer(c: &mut Criterion) {
     }
 }
 
+fn matrix_mul_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+        let left = Tensor::<Element>::random(&vec![size, size].into());
+        let right = Tensor::<Element>::random(&vec![size, size].into());
+        let bias = Tensor::<Element>::random(&vec![size].into());
+        let config = matrix_mul::Config::TransposeB;
+
+        let layer = MatMul::<Element>::new_with_config(
+            matrix_mul::OperandMatrix::Input,
+            matrix_mul::OperandMatrix::Input,
+            Some(bias),
+            config,
+        )
+        .unwrap();
+
+        group.bench_function(
+            BenchmarkId::new("matrix_mul/Element", format!("{size}x{size}")),
+            |b| {
+                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]));
+            },
+        );
+    }
+
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+        let left = Tensor::<f32>::random(&vec![size, size].into());
+        let right = Tensor::<f32>::random(&vec![size, size].into());
+        let bias = Tensor::<f32>::random(&vec![size].into());
+        let config = matrix_mul::Config::TransposeB;
+
+        let layer = MatMul::<f32>::new_with_config(
+            matrix_mul::OperandMatrix::Input,
+            matrix_mul::OperandMatrix::Input,
+            Some(bias),
+            config,
+        )
+        .unwrap();
+
+        group.bench_function(
+            BenchmarkId::new("matrix_mul/f32", format!("{size}x{size}")),
+            |b| {
+                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]));
+            },
+        );
+    }
+}
+
 fn qkv_layer(c: &mut Criterion) {
     let mut group = c.benchmark_group("run-layers");
     group
@@ -374,6 +428,7 @@ criterion_group!(
     embeddings_layer,
     flatten_layer,
     gelu_layer,
+    matrix_mul_layer,
     qkv_layer,
 );
 criterion_main!(benches);
