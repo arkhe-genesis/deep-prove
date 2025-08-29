@@ -4,12 +4,11 @@ pub mod llm;
 pub mod onnx;
 
 use crate::{
-    Element,
+    Element, Shape,
     layers::{convolution::conv2d_shape, pooling::maxpool2d_shape},
     model::Model,
     padding::pad_model,
     quantization::{AbsoluteMax, ModelMetadata, ScalingStrategy},
-    tensor::Shape,
 };
 use anyhow::{Context, Error, Result, bail, ensure};
 use itertools::Either;

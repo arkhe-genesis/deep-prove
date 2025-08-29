@@ -1,5 +1,5 @@
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor,
+    Claim, Element, Prover, ProverContext, ScalingFactor, Shape,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
@@ -19,7 +19,7 @@ use crate::{
     model::StepData,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 use burn::tensor::activation::gelu;
 use either::Either;

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy,
+    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         ChallengeStorage,
@@ -27,7 +27,6 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{IntoElement, TensorFielder},
-    tensor::Shape,
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };

@@ -34,7 +34,7 @@ use tracing::trace;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, Tensor,
+    Claim, Element, Prover, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
@@ -49,7 +49,7 @@ use crate::{
     },
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
-    tensor::{Number, Shape},
+    tensor::Number,
     util::from_mle_list_dimensions,
 };
 

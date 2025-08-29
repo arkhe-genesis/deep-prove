@@ -8,7 +8,7 @@ use trace::Trace;
 use tracing::{debug, info};
 
 use crate::{
-    Tensor,
+    Shape, Tensor,
     layers::{
         Layer,
         provable::{Edge, Evaluate, Node, NodeCtx, NodeId, OpInfo},
@@ -16,7 +16,7 @@ use crate::{
     },
     padding::PaddingMode,
     quantization::InferenceTracker,
-    tensor::{DryTensor, Number, Shape},
+    tensor::{DryTensor, Number},
     try_unzip,
 };
 
@@ -606,7 +606,8 @@ pub struct ModelCtx<E: ExtensionField> {
 #[cfg(test)]
 pub(crate) mod test {
     use crate::{
-        Prover, ScalingFactor, ScalingStrategy, init_test_logging, init_test_logging_default,
+        Prover, ScalingFactor, ScalingStrategy, Shape, init_test_logging,
+        init_test_logging_default,
         layers::{
             Layer,
             activation::{Activation, Relu},
@@ -620,7 +621,7 @@ pub(crate) mod test {
         padding::{PaddingMode, pad_model},
         quantization::{self, InferenceObserver},
         rng_from_env_or_random,
-        tensor::{Number, Shape},
+        tensor::Number,
         testing::{Pcs, random_bool_vector, random_vector},
         util::from_mle_list_dimensions,
         verify,

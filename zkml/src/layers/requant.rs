@@ -1,7 +1,7 @@
 //! Module containign code for performing proving friendly requantisation. This is done via a [fixed point multiplication](https://en.wikipedia.org/wiki/Fixed-point_arithmetic#Binary_fixed-point_multiplication) and use of lookup arguments.
 
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, Tensor,
+    Claim, Element, Prover, ProverContext, ScalingFactor, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         ChallengeStorage,
@@ -22,7 +22,6 @@ use crate::{
     model::StepData,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
-    tensor::Shape,
     to_base,
 };
 use anyhow::{Context as CC, Result, anyhow, ensure};

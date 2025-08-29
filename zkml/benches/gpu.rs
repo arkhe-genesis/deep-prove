@@ -4,7 +4,7 @@ use std::ops::{Range, RangeInclusive};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
 use zkml::{
-    Element, ScalingFactor, Tensor,
+    Element, ScalingFactor, Shape, Tensor,
     layers::{
         activation::GELU,
         add::Add,
@@ -14,7 +14,7 @@ use zkml::{
         provable::Evaluate,
         transformer::{embeddings::Embeddings, qkv::QKV},
     },
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 
 const DATA_SIZE_POWS: Range<i32> = 7..14;

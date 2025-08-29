@@ -31,7 +31,7 @@ use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, Tensor,
+    Claim, Element, Prover, Shape, Tensor,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -45,7 +45,7 @@ use crate::{
     },
     model::StepData,
     padding::{PaddingMode, ShapeInfo},
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

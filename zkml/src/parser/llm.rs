@@ -3,7 +3,7 @@ use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Tensor,
+    Shape, Tensor,
     layers::{
         Layer,
         activation::{Activation, GELU},
@@ -17,7 +17,7 @@ use crate::{
     },
     model::Model,
     padding::PaddingMode,
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 use rust_tokenizers::{
     tokenizer::{Gpt2Tokenizer, Tokenizer as RT},

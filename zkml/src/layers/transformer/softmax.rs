@@ -3,7 +3,7 @@ use core::f32;
 use std::{fmt::Debug, marker::PhantomData};
 
 use crate::{
-    Claim, Element, ScalingStrategy, Tensor,
+    Claim, Element, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         ChallengeStorage,
@@ -32,7 +32,7 @@ use crate::{
     model::StepData,
     padding::PaddingMode,
     quantization::{self, Fieldizer, ScalingFactor},
-    tensor::{Number, Shape},
+    tensor::Number,
     to_base,
 };
 

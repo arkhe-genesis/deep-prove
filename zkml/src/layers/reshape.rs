@@ -1,14 +1,13 @@
 use std::ops::{Range, RangeBounds};
 
 use crate::{
-    NextPowerOfTwo,
+    NextPowerOfTwo, Shape,
     iop::context::ContextAux,
     layers::{
         LayerCtx,
         provable::{NodeId, PadOp, ProveInfo, QuantizeOp, QuantizeOutput},
     },
     padding::{PaddingMode, pad_reshape_layer},
-    tensor::Shape,
 };
 use anyhow::ensure;
 use ff_ext::ExtensionField;

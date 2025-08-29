@@ -23,7 +23,7 @@ use tracing::{debug, info};
 use transcript::BasicTranscript;
 
 use crate::{
-    Element, Tensor,
+    Element, Shape, Tensor,
     layers::{Layer, provable::Evaluate},
     model::{InferenceTrace, Model},
     padding::pad_model,
@@ -31,7 +31,7 @@ use crate::{
         gguf, json,
         llm::{LLMConfig, Token},
     },
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 
 pub trait Observer<N: Number> {

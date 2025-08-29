@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -26,7 +26,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{self, Fieldizer},
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 
 use super::provable::LayerOut;

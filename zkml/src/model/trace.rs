@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use tenstore::{GenStore, StoreError};
 
 use crate::{
-    Element, IO, Tensor,
+    Element, IO, Shape, Tensor,
     layers::{Layer, NodeOut, provable::NodeId},
     quantization::{Fieldizer, ModelMetadata},
-    tensor::{DryTensor, Shape},
+    tensor::DryTensor,
 };
 
 #[derive(Default, Clone)]

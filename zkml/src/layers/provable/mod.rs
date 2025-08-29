@@ -12,7 +12,7 @@ use tenstore::{GenStore, TensorKey};
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
     VectorTranscript,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -22,7 +22,7 @@ use crate::{
     lookup::context::LookupWitnessGen,
     model::trace::StepData,
     padding::{PaddingMode, ShapeInfo},
-    tensor::{ConvFFTData, Number, Shape},
+    tensor::{ConvFFTData, Number},
 };
 
 use super::{

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    Claim, Element, Prover, ProverContext,
+    Claim, Element, Prover, ProverContext, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     iop::{context::ShapeStep, verifier::Verifier},
     layers::{ContextAux, LayerProof},
@@ -15,7 +15,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pooling},
     quantization::{Fieldizer, IntoElement},
-    tensor::{Number, Shape, Tensor},
+    tensor::Number,
     to_base,
 };
 use anyhow::{Result, ensure};

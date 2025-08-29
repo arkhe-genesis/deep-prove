@@ -32,7 +32,7 @@ use tracing::trace;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::compute_betas_eval,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -56,7 +56,7 @@ use crate::{
     padding::PaddingMode,
     parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
     quantization::{self, Fieldizer},
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 
 use burn::{module::Param, nn::LayerNormConfig as BLayerNormConfig};

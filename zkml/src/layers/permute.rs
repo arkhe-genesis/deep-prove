@@ -2,9 +2,9 @@ use anyhow::ensure;
 use ff_ext::ExtensionField;
 
 use crate::{
-    Tensor,
+    Shape, Tensor,
     layers::provable::{Evaluate, LayerOut},
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 
 pub struct Permute {

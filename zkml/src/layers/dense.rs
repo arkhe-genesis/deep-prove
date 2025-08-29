@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap};
 
 use crate::{
-    Claim, Prover, ScalingStrategy,
+    Claim, Prover, ScalingStrategy, Shape,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -10,7 +10,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
-    tensor::{Number, Shape},
+    tensor::Number,
     util::from_mle_list_dimensions,
 };
 use anyhow::{Result, ensure};

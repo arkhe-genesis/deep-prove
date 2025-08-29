@@ -1,5 +1,5 @@
 use crate::{
-    ScalingStrategy, VectorTranscript,
+    ScalingStrategy, Shape, VectorTranscript,
     backend::{Conv2dConfig, zkml_conv2d_i},
     iop::{context::ShapeStep, prover::BatchFFTProof},
     layers::{hadamard, provable::ProvingData, requant::Requant},
@@ -7,7 +7,7 @@ use crate::{
     padding::{PaddingMode, ShapeInfo},
     parser::{check_filter, safe_conv2d_shape},
     quantization::{BIT_LEN, TensorFielder},
-    tensor::{Shape, filter_size},
+    shape::filter_size,
     util::from_mle_list_dimensions,
 };
 use core::f32;

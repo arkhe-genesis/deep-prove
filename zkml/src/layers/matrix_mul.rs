@@ -19,7 +19,7 @@ use tracing::debug;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy,
+    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -28,7 +28,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
     quantization::{self, bias_scaling_matmul},
-    tensor::{Number, Shape, Tensor},
+    tensor::Number,
     util::from_mle_list_dimensions,
 };
 
@@ -1201,7 +1201,7 @@ mod tests {
     use itertools::Itertools;
 
     use crate::{
-        Element, ScalingFactor,
+        Element, ScalingFactor, Shape, Tensor,
         layers::{
             Layer,
             matrix_mul::{Config, MatMul, OperandMatrix},
@@ -1210,7 +1210,6 @@ mod tests {
         model::{Model, test::prove_model},
         padding::PaddingMode,
         rng_from_env_or_random,
-        tensor::{Shape, Tensor},
     };
 
     fn test_matmul_padding(transpose: bool) {

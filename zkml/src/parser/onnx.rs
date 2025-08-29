@@ -1,4 +1,5 @@
 use crate::{
+    Shape,
     layers::{
         Layer,
         activation::Activation,
@@ -8,7 +9,6 @@ use crate::{
     },
     model::Model,
     padding::PaddingMode,
-    tensor::Shape,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::HashMap, iter::Peekable};

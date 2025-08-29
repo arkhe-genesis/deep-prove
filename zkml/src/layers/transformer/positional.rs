@@ -14,7 +14,7 @@ use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -30,7 +30,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo},
     quantization::TensorFielder,
-    tensor::{Number, Shape, TensorSlice},
+    tensor::{Number, TensorSlice},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

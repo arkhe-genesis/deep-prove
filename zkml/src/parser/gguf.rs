@@ -13,7 +13,7 @@ use anyhow::{Context, bail, ensure};
 use candle_core::{CpuStorage, Device, Storage, quantized::gguf_file::Content};
 
 use crate::{
-    Tensor,
+    Shape, Tensor,
     layers::{
         matrix_mul::MatMul,
         transformer::{embeddings::Embeddings, layernorm::LayerNorm, positional::Positional},
@@ -22,7 +22,6 @@ use crate::{
         Attention, FeedForward, GPT2Model, INTERNAL_BOS, INTERNAL_EOS, LLMConfig, LLMModel,
         LLMVariant, TokenizerData,
     },
-    tensor::Shape,
 };
 
 impl LLMConfig {

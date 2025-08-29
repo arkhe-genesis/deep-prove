@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::{
-    Element, Tensor,
+    Element, Shape, Tensor,
     layers::{
         concat_matmul::ConcatMatMul,
         dense::Dense,
@@ -25,7 +25,6 @@ use crate::{
     },
     model::{Model, ToIterator},
     parser::safe_maxpool2d_shape,
-    tensor::Shape,
 };
 
 #[derive(Clone, Debug)]

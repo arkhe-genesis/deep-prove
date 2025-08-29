@@ -3,11 +3,11 @@ use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Element, Tensor,
+    Element, Shape, Tensor,
     iop::context::ContextAux,
     layers::LayerCtx,
     padding::{PaddingMode, ShapeInfo, reshape},
-    tensor::{IntoBTensor, Number, Shape},
+    tensor::{IntoBTensor, Number},
 };
 
 use super::provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProveInfo};
@@ -131,7 +131,7 @@ mod tests {
     use proptest::prelude::*;
     use std::ops::Range;
 
-    use crate::tensor::Shape;
+    use crate::Shape;
 
     use super::*;
 

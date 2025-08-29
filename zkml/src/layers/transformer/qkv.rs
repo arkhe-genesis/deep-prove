@@ -20,7 +20,7 @@ use tenstore::GenStore;
 use transcript::{Challenge, Transcript};
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::same_poly,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -37,7 +37,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
-    tensor::{IntoBTensor, Number, Shape},
+    tensor::{IntoBTensor, Number},
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
 };
@@ -1053,10 +1053,10 @@ mod tests {
     use std::{fmt::Debug, ops::Range, slice};
 
     use crate::{
+        Shape,
         layers::{Layer, provable::evaluate_layer},
         model::{Model, test::prove_model},
         padding::ShapeData,
-        tensor::Shape,
     };
 
     use super::*;

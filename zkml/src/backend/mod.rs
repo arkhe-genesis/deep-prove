@@ -1,6 +1,6 @@
 use burn::tensor::{Int, Tensor as BTensor, TensorData, ops::IntTensor, try_read_sync};
 
-use crate::{Element, Tensor, tensor::Shape};
+use crate::{Element, Shape, Tensor};
 
 #[cfg(feature = "gpu")]
 mod cubecl;

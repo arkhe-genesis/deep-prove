@@ -11,26 +11,30 @@ use rayon::iter::ParallelIterator;
 use serde::{Deserialize, Serialize};
 use std::{borrow::Borrow, env, str::FromStr};
 use transcript::{BasicTranscript, Transcript};
+mod backend;
 mod commit;
-pub mod iop;
-pub mod quantization;
-pub use iop::{
-    Proof, ProverContext,
-    prover::Prover,
-    verifier::{IO, verify},
-};
-pub use quantization::{ScalingFactor, ScalingStrategy};
 pub mod graph;
+pub mod inputs;
+pub mod iop;
 pub mod layers;
 pub mod lookup;
 pub mod model;
 pub mod padding;
 pub mod parser;
-pub use parser::{FloatOnnxLoader, ModelType};
+pub mod quantization;
+pub mod shape;
 pub mod tensor;
+
+// Re-exports
+pub use iop::{
+    Proof, ProverContext,
+    prover::Prover,
+    verifier::{IO, verify},
+};
+pub use parser::{FloatOnnxLoader, ModelType};
+pub use quantization::{ScalingFactor, ScalingStrategy};
+pub use shape::Shape;
 pub use tensor::Tensor;
-mod backend;
-pub mod inputs;
 
 #[cfg(feature = "capture-layers-quant")]
 pub mod capture;

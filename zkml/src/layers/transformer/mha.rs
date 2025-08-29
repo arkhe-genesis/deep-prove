@@ -3,7 +3,7 @@
 //! ConcatMatMul and Softmax layers as building blocks.
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor,
+    Claim, Element, Prover, ScalingFactor, Shape,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -26,7 +26,7 @@ use crate::{
     model::StepData,
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
-    tensor::{Number, Shape},
+    tensor::Number,
 };
 use anyhow::{anyhow, bail, ensure};
 use ff_ext::{ExtensionField, FieldFrom};

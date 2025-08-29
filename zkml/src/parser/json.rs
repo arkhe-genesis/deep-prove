@@ -5,13 +5,12 @@ use serde::Deserialize;
 use tracing::trace;
 
 use crate::{
-    Tensor,
+    Shape, Tensor,
     layers::{
         matrix_mul::MatMul,
         transformer::{embeddings::Embeddings, layernorm::LayerNorm, positional::Positional},
     },
     parser::llm::{Attention, FeedForward, GPT2Model, LLMConfig, LLMModel, LLMVariant},
-    tensor::Shape,
 };
 
 impl LLMConfig {

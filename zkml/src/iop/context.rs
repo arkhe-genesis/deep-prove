@@ -1,12 +1,11 @@
 use crate::{
-    Element,
+    Element, Shape,
     commit::mmcs_context::{
         CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext, PolyId,
     },
     layers::provable::{Node, NodeCtx, NodeId, OpInfo},
     lookup::context::{LookupContext, TableType},
     model::{Model, ModelCtx, ToIterator},
-    tensor::Shape,
     to_base,
 };
 use anyhow::{Ok, anyhow, ensure};

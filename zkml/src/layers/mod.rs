@@ -34,7 +34,7 @@ use transformer::{
 };
 
 use crate::{
-    Element, ProverContext, ScalingStrategy,
+    Element, ProverContext, ScalingStrategy, Shape, Tensor,
     iop::context::{ContextAux, ShapeStep},
     layers::{
         activation::{Activation, ActivationProof},
@@ -59,7 +59,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, InferenceTracker, ModelMetadata, ScalingFactor},
-    tensor::{ConvFFTData, DryTensor, Number, Shape, Tensor},
+    tensor::{ConvFFTData, DryTensor, Number},
 };
 use activation::ActivationCtx;
 use convolution::{ConvCtx, ConvProof};
