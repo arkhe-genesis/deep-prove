@@ -19,7 +19,7 @@ use cubecl::{
     std::FastDivmodArgs,
 };
 
-use crate::{backend::kernels, tensor::Shape};
+use crate::{Shape, backend::kernels};
 
 use super::ZKMLBackend;
 

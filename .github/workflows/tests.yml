@@ -77,7 +77,7 @@ jobs:
 
       - name: Clippy
         shell: devenv shell bash -- -e {0}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Rust Format
         shell: devenv shell bash -- -e {0}

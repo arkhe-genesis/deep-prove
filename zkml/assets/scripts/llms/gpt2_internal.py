@@ -5,7 +5,7 @@ import argparse
 import os
 from transformers import GPT2Model, GPT2Tokenizer
 from transformers import AutoModelForCausalLM
-from transformers.modeling_utils import Conv1D
+from transformers import Conv1D
 
 torch.set_printoptions(precision=6, sci_mode=False)
 
