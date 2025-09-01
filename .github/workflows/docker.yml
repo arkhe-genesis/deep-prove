@@ -69,7 +69,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image:  ${{ fromJSON(needs.changes.outputs.images-to-build) }}
+        image: ${{ (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) && fromJSON('["deep-prove-worker", "deep-prove-aws-client", "deep-prove-aws-worker"]') || fromJSON(needs.changes.outputs.images-to-build) }}
+
 
     steps:
       - uses: actions/checkout@v5
