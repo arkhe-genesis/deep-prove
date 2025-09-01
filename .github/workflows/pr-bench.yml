@@ -58,7 +58,7 @@ jobs:
               - '.github/workflows/pr-bench.yml'
 
       - uses: bencherdev/bencher@main
-        shell: devenv shell bash -- -e {0}
+      - name: Track PR Benchmarks with Bencher
         run: |
           cd zkml && \
           bencher run \

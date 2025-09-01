@@ -20,15 +20,13 @@ jobs:
               - 'mpcs/**'
               - '.github/workflows/main-bench.yml'
 
-  benchmark_pr_branch:
+  benchmark_master_branch:
     name: Master Benchmarking
-    runs-on: ["nix"]
     needs: changes
     if: ${{ needs.changes.outputs.should_run == 'true' }}
     permissions:
       checks: write
       contents: read
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,7 +34,6 @@ jobs:
           submodules: "recursive"
       - uses: bencherdev/bencher@main
       - name: Track PR Benchmarks with Bencher
-        shell: devenv shell bash -- -e {0}
         run: |
           cd zkml && \
           bencher run \
