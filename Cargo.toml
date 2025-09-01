@@ -55,15 +55,15 @@ tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tract-onnx = "0.21"
 
-ceno-p3 = { package = "p3", git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-ff_ext = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-gkr_iop = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-mpcs = { package = "mpcs", git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-multilinear_extensions = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-poseidon = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-sumcheck = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-transcript = { git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
-witness = { package = "witness", git = "https://github.com/Lagrange-Labs/ceno", branch = "fvs-split-ceno-codebase-fixes" }
+ceno-p3 = { package = "p3", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+ff_ext = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+gkr_iop = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+mpcs = { package = "mpcs", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+multilinear_extensions = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+poseidon = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+sumcheck = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+transcript = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+witness = { package = "witness", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 
 # Test must run fast, but still provides stacktraces.
 [profile.test]
@@ -84,19 +84,6 @@ lto = "off"
 [profile.fast]
 inherits = "release"
 lto = "fat"
-
-
-# [patch."https://github.com/Lagrange-Labs/ceno"]
-# ceno-p3 = { package = "p3", path = "../ceno/p3" }
-# ff_ext = { path = "../ceno/ff_ext" }
-# gkr_iop = { path = "../ceno/gkr_iop" }
-# mpcs = { path = "../ceno/mpcs" }
-# multilinear_extensions = { path = "../ceno/multilinear_extensions" }
-# poseidon = { path = "../ceno/poseidon" }
-# sumcheck = { path = "../ceno/sumcheck" }
-# transcript = { path = "../ceno/transcript" }
-# witness = { path = "../ceno/witness" }
-
 
 #[patch."https://github.com/nikkolasg/timed-rs"]
 #timed = { path = "/Users/nalos/prog/timed/timed" }
