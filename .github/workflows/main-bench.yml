@@ -34,6 +34,7 @@ jobs:
           clean: "false"
           submodules: "recursive"
       - uses: bencherdev/bencher@main
+      - name: Track PR Benchmarks with Bencher
         shell: devenv shell bash -- -e {0}
         run: |
           cd zkml && \
