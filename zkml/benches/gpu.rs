@@ -13,7 +13,7 @@ use zkml::{
         flatten::Flatten,
         matrix_mul::{self, MatMul},
         provable::Evaluate,
-        transformer::{embeddings::Embeddings, qkv::QKV},
+        transformer::{embeddings::Embeddings, logits::Logits, qkv::QKV},
     },
     tensor::Number,
 };
@@ -420,6 +420,53 @@ fn qkv_layer(c: &mut Criterion) {
     group.finish();
 }
 
+fn logits_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(10)
+        .measurement_time(std::time::Duration::from_secs(90));
+
+    // Rank-2 tensors
+    for pow2 in DATA_SIZE_POWS {
+        let rows = 1 << pow2;
+        let cols = 16384;
+        let shape = Shape::new(vec![rows, cols]);
+        let logits = Logits::Argmax;
+        let input_f32 = Tensor::<f32>::random(&shape);
+        group.bench_with_input(
+            BenchmarkId::new("logits/f32", format!("{rows}x{cols}")),
+            &input_f32,
+            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+        );
+        let input_elem = Tensor::<Element>::random(&shape);
+        group.bench_with_input(
+            BenchmarkId::new("logits/Element", format!("{rows}x{cols}")),
+            &input_elem,
+            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+        );
+    }
+
+    // Higher-rank tensors
+    for &(d1, d2, d3) in &[(2, 1024, 1024), (4, 1024, 2048)] {
+        let shape = Shape::new(vec![d1, d2, d3]);
+        let logits = Logits::Argmax;
+        let input_f32 = Tensor::<f32>::random(&shape);
+        group.bench_with_input(
+            BenchmarkId::new("logits_higher_rank/f32", format!("{d1}x{d2}x{d3}")),
+            &input_f32,
+            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+        );
+        let input_elem = Tensor::<Element>::random(&shape);
+        group.bench_with_input(
+            BenchmarkId::new("logits_higher_rank/Element", format!("{d1}x{d2}x{d3}")),
+            &input_elem,
+            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     add_layer,
@@ -430,5 +477,6 @@ criterion_group!(
     gelu_layer,
     matrix_mul_layer,
     qkv_layer,
+    logits_layer
 );
 criterion_main!(benches);

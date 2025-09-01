@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
+    backend::Backend,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         ChallengeStorage,
@@ -23,7 +24,6 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    max_in_slice,
     model::StepData,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{IntoElement, TensorFielder},
@@ -52,6 +52,7 @@ use crate::{
     layers::provable::{Evaluate, LayerOut, OpInfo},
     tensor::Number,
 };
+
 #[derive(Clone, Debug)]
 pub struct ArgmaxData<E> {
     max_values: Vec<Tensor<E>>,
@@ -95,31 +96,93 @@ pub enum Logits {
 }
 
 impl Logits {
-    fn evaluate_with_argmax_data<N: Number, E: ff_ext::ExtensionField>(
+    fn evaluate_with_argmax_data_f32<E: ff_ext::ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&Tensor<f32>],
         _unpadded_input_shapes: &[Shape],
-    ) -> anyhow::Result<(LayerOut<N, E>, ArgmaxData<N>)> {
+    ) -> anyhow::Result<(LayerOut<f32, E>, ArgmaxData<f32>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
             "Argmax is for tensors of rank >= 2",
         );
-
         match self {
             Logits::Argmax => {
                 let (indices, maximums): (Vec<_>, Vec<_>) = inputs
                     .iter()
                     .map(|input| {
-                        let (indices, maximums): (Vec<_>, Vec<_>) = input
-                            .slice_last_dim()
-                            .map(|row| {
-                                let (max, argmax) = max_in_slice(row).unwrap();
-                                (N::from_usize(argmax), max)
-                            })
-                            .unzip();
-                        let indices = Tensor::new(Shape::new(vec![indices.len(), 1]), indices);
-                        let maximums = Tensor::new(Shape::new(vec![maximums.len(), 1]), maximums);
-                        (indices, maximums)
+                        let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
+                        let binput: burn::tensor::Tensor<Backend, 2> =
+                            burn::tensor::Tensor::from_data(
+                                burn::tensor::TensorData::new(flat_data.to_vec(), [rows, last_dim]),
+                                &Default::default(),
+                            );
+                        let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
+                        let indices_vec: Vec<f32> = indices_bt
+                            .to_data()
+                            .into_vec()
+                            .expect("convert indices btensor to vec")
+                            .into_iter()
+                            .map(|i: i64| i as f32)
+                            .collect();
+                        let max_vals: Vec<f32> = max_bt
+                            .to_data()
+                            .into_vec()
+                            .expect("convert max btensor to vec");
+                        (
+                            Tensor::new(Shape::new(vec![rows, 1]), indices_vec),
+                            Tensor::new(Shape::new(vec![rows, 1]), max_vals),
+                        )
+                    })
+                    .unzip();
+                Ok((
+                    LayerOut::from_vec(indices),
+                    ArgmaxData {
+                        max_values: maximums,
+                    },
+                ))
+            }
+        }
+    }
+
+    fn evaluate_with_argmax_data_element<E: ff_ext::ExtensionField>(
+        &self,
+        inputs: &[&Tensor<Element>],
+        _unpadded_input_shapes: &[Shape],
+    ) -> anyhow::Result<(LayerOut<Element, E>, ArgmaxData<Element>)> {
+        ensure!(
+            inputs.iter().all(|i| i.rank() >= 2),
+            "Argmax is for tensors of rank >= 2",
+        );
+        match self {
+            Logits::Argmax => {
+                let (indices, maximums): (Vec<_>, Vec<_>) = inputs
+                    .iter()
+                    .map(|input| {
+                        let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
+                        let binput: burn::tensor::Tensor<Backend, 2, burn::tensor::Int> =
+                            burn::tensor::Tensor::from_data(
+                                burn::tensor::TensorData::new(flat_data.to_vec(), [rows, last_dim]),
+                                &Default::default(),
+                            );
+                        let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
+                        let indices_vec: Vec<Element> = indices_bt
+                            .to_data()
+                            .into_vec()
+                            .expect("convert indices btensor to vec")
+                            .into_iter()
+                            .map(|i: i64| Element::from_usize(i as usize))
+                            .collect();
+                        let max_vals: Vec<Element> = max_bt
+                            .to_data()
+                            .into_vec()
+                            .expect("convert max btensor to vec")
+                            .into_iter()
+                            .map(|v: i64| Element::from_usize(v as usize))
+                            .collect();
+                        (
+                            Tensor::new(Shape::new(vec![rows, 1]), indices_vec),
+                            Tensor::new(Shape::new(vec![rows, 1]), max_vals),
+                        )
                     })
                     .unzip();
                 Ok((
@@ -135,7 +198,10 @@ impl Logits {
     fn output_shapes(input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes
             .iter()
-            .map(|s| vec![s.dim(0), 1].into())
+            .map(|s| {
+                let rows: usize = (0..s.rank() - 1).map(|d| s.dim(d)).product();
+                vec![rows, 1].into()
+            })
             .collect()
     }
 
@@ -170,7 +236,7 @@ impl Evaluate<f32> for Logits {
         inputs: &[&Tensor<f32>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
-        let (output, _) = self.evaluate_with_argmax_data(inputs, unpadded_input_shapes)?;
+        let (output, _) = self.evaluate_with_argmax_data_f32(inputs, unpadded_input_shapes)?;
 
         Ok(output)
     }
@@ -183,7 +249,7 @@ impl Evaluate<Element> for Logits {
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         let (output, argmax_data) =
-            self.evaluate_with_argmax_data(inputs, unpadded_input_shapes)?;
+            self.evaluate_with_argmax_data_element(inputs, unpadded_input_shapes)?;
 
         // convert argmax_data to field elements
         let argmax_data = ArgmaxData {
@@ -458,10 +524,15 @@ where
         let max_values = &argmax_data.max_values[0];
 
         let input_shape = input.shape();
+        // For rank>2 inputs we flattened all leading dimensions when computing argmax which is enforced here
+        let expected_rows: usize = (0..input_shape.rank() - 1)
+            .map(|d| input_shape.dim(d))
+            .product();
         ensure!(
-            max_values.shape().dim(0) == input.shape().dim(0),
-            "Incompatible shapes between max values tensor and input tensor: {:?} vs {:?}",
-            max_values.shape(),
+            max_values.shape().dim(0) == expected_rows,
+            "Incompatible shapes between max values tensor (rows={}) and flattened input rows (expected_rows={}) for input shape {:?}",
+            max_values.shape().dim(0),
+            expected_rows,
             input.shape(),
         );
 
@@ -554,8 +625,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             shape_step.padded_input_shape.len(),
         );
 
-        let num_row_vars = shape_step.padded_input_shape[0].dim(0).ilog2() as usize;
-        let num_col_vars = shape_step.padded_input_shape[0].dim(1).ilog2() as usize;
+        let input_shape = &shape_step.padded_input_shape[0];
+        let num_row_vars = (0..input_shape.rank() - 1)
+            .map(|d| input_shape.dim(d))
+            .product::<usize>()
+            .ilog2() as usize;
+        let num_col_vars = input_shape.dim(input_shape.rank() - 1).ilog2() as usize;
         let (_, row_point) = Logits::split_claim_point(batch_claim.point(), num_row_vars)?;
 
         let input_claim = Claim::new(batch_claim.point().to_vec(), proof.max_eval - poly_evals[0]);
@@ -723,6 +798,34 @@ mod test {
         model::{Model, test::prove_model},
         tensor::Tensor,
     };
+    use proptest::prelude::*;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    // Strategy to generate random shapes (rank 2 or 3) and data with unique maxima per row
+    fn logits_input_strategy() -> impl Strategy<Value = (Vec<usize>, Vec<f32>, Vec<f32>)> {
+        (1usize..4, 1usize..4, 2usize..9, any::<u64>(), any::<bool>()).prop_flat_map(
+            |(d1, d2, last_dim, seed, rank3)| {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let shape: Vec<usize> = if rank3 {
+                    vec![d1, d2, last_dim]
+                } else {
+                    vec![d1, last_dim]
+                };
+                let rows: usize = shape[..shape.len() - 1].iter().product();
+                let mut data = vec![0f32; rows * last_dim];
+                let mut expected = Vec::with_capacity(rows);
+                for r in 0..rows {
+                    for c in 0..last_dim {
+                        data[r * last_dim + c] = (rng.random::<f32>() * 10.0).floor();
+                    }
+                    let arg_idx = rng.random_range(0..last_dim);
+                    data[r * last_dim + arg_idx] += 1000.0;
+                    expected.push(arg_idx as f32);
+                }
+                Just((shape, data, expected))
+            },
+        )
+    }
 
     #[test]
     fn test_logits_argmax() -> anyhow::Result<()> {
@@ -750,5 +853,54 @@ mod test {
         model.route_output(None).unwrap();
 
         prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    #[test]
+    fn test_logits_argmax_higher_rank() -> anyhow::Result<()> {
+        // Original shape: [2, 3, 4]. All leading dims (2 * 3) are flattened -> rows = 6; last_dim = 4.
+        // Expected flattened output indices tensor (shape [6,1])
+        let mut data = Vec::new();
+        for r in 0..6 {
+            for c in 0..4 {
+                let val = if c == r % 4 { 10.0 } else { c as f32 }; // ensure unique max
+                data.push(val);
+            }
+        }
+        let input = Tensor::new(vec![2, 3, 4].into(), data);
+        let logits = Logits::Argmax;
+        let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[])?;
+        let indices = out.outputs()[0].get_data();
+        assert_eq!(indices.len(), 6);
+        for (r, &idx) in indices.iter().enumerate() {
+            assert_eq!(idx as usize, r % 4);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn prop_logits_argmax_f32((shape, data, expected) in logits_input_strategy()) {
+            //  rows = product of all leading dims (shape[..rank-1]).
+            //  Each row has a unique argmax and the output tensor shape is [rows,1].
+            let input = Tensor::new(shape.clone().into(), data);
+            let logits = Logits::Argmax;
+            let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+            let indices = out.outputs()[0].get_data();
+            prop_assert_eq!(indices.len(), expected.len());
+            for (i, idx) in indices.iter().enumerate() { prop_assert!((*idx - expected[i]).abs() < 1e-6); }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_logits_argmax_element((shape, data, expected) in logits_input_strategy()) {
+            let data_elem: Vec<Element> = data.into_iter().map(|v| v.round() as Element).collect();
+            let input = Tensor::new(shape.clone().into(), data_elem);
+            let logits = Logits::Argmax;
+            let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+            let indices = out.outputs()[0].get_data();
+            prop_assert_eq!(indices.len(), expected.len());
+            for (i, idx) in indices.iter().enumerate() { prop_assert_eq!(*idx as usize, expected[i] as usize); }
+        }
     }
 }

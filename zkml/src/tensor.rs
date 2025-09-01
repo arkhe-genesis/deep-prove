@@ -537,6 +537,20 @@ impl<T> Tensor<T> {
         it
     }
 
+    /// Returns a zero-copy logical flatten of all leading dimensions into rows while preserving the last dimension.
+    /// For shape [d0,d1,...,dk-1, last] this yields (data slice, rows = d0*..*dk-1, last_dim = last).
+    pub fn flatten_leading_dims_view(&self) -> (&[T], usize, usize) {
+        let rank = self.shape.len();
+        assert!(rank >= 2, "Need rank >=2 to flatten leading dims view");
+        let last_dim = self.shape.dim(rank - 1);
+        let rows: usize = if rank == 2 {
+            self.shape.dim(0)
+        } else {
+            (0..rank - 1).map(|d| self.shape.dim(d)).product()
+        };
+        (&self.data, rows, last_dim)
+    }
+
     /// Returns an iterator of slices whose length corresponds to the subspace
     /// the dimension represents. Note dim is the dimension _index_ (0-based indexing).
     /// Example: if dimension is [2,3,4], and we call `slice_on_dim(1)`,
