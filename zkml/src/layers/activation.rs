@@ -626,7 +626,7 @@ impl GeluTableData {
     pub fn table_output(&self, input: Element) -> Element {
         let float_input = input as f32 / GELU_SCALE_FACTOR as f32;
         let float_output = gelu_float(&float_input);
-        (float_output * *quantization::MAX as f32).round() as Element
+        (float_output * *quantization::MAX as f32).round_ties_even() as Element
     }
 }
 
@@ -707,7 +707,8 @@ impl GELU<f32> {
         // the output range is 2^{7 + ceil_log2(multiplier)}
         // During lookup, we basically scale down back to the original
         // float value, apply GELU and multiply by 128 which is right now the output maximum range.
-        let multiplier = (GELU_SCALE_FACTOR as f32 * input_scaling.scale()).round() as Element;
+        let multiplier =
+            (GELU_SCALE_FACTOR as f32 * input_scaling.scale()).round_ties_even() as Element;
         assert!(
             multiplier > 0,
             "multiplier GELU is 0 -> change the scale factor"

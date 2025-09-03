@@ -159,8 +159,8 @@ impl<N: Number> LayerNorm<N> {
         // Get the dim size (N)
         let dim_size = self.normalisation_dim_size();
         // We work out what we have to multiply by so that everything is scaled to `LAYERNORM_SCALE_FACTOR` in quantised world
-        let multiplier =
-            (LAYERNORM_SCALE_FACTOR as f32 * input_scale * input_scale).round() as Element;
+        let multiplier = (LAYERNORM_SCALE_FACTOR as f32 * input_scale * input_scale)
+            .round_ties_even() as Element;
         // Work out the number of variables the table requires, this is likely to be far too large to actually materialise as a table
         let full_table_bit_size = 2 * (ceil_log2(dim_size) + *quantization::BIT_LEN - 1)
             + ceil_log2(multiplier as usize)
@@ -218,8 +218,8 @@ impl<N: Number> LayerNorm<N> {
 
         let bias_max = self.beta.max_abs_output().to_f32()?;
 
-        let quant_bias_min = (-bias_max / bias_scale).round() as Element;
-        let quant_bias_max = (bias_max / bias_scale).round() as Element;
+        let quant_bias_min = (-bias_max / bias_scale).round_ties_even() as Element;
+        let quant_bias_max = (bias_max / bias_scale).round_ties_even() as Element;
 
         let bias_scaling = ScalingFactor::from_parts(
             bias_max,
@@ -474,7 +474,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
 }
 
 fn is_close_to_integer(x: f32, tol: f32) -> bool {
-    (x - x.round()).abs() < tol
+    (x - x.round_ties_even()).abs() < tol
 }
 
 impl Requant {

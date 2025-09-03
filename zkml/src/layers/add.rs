@@ -355,8 +355,10 @@ impl QuantInfo {
                             (common_scale, true)
                         };
 
-                    let left_rescale = (left_scaling.scale() / common_scale).round() as Element;
-                    let right_rescale = (right_scaling.scale() / common_scale).round() as Element;
+                    let left_rescale =
+                        (left_scaling.scale() / common_scale).round_ties_even() as Element;
+                    let right_rescale =
+                        (right_scaling.scale() / common_scale).round_ties_even() as Element;
                     (left_rescale, right_rescale, common_scale, require_requant)
                 }
                 Ordering::Equal => {
@@ -374,8 +376,10 @@ impl QuantInfo {
                             (common_scale, true)
                         };
 
-                    let left_rescale = (left_scaling.scale() / common_scale).round() as Element;
-                    let right_rescale = (right_scaling.scale() / common_scale).round() as Element;
+                    let left_rescale =
+                        (left_scaling.scale() / common_scale).round_ties_even() as Element;
+                    let right_rescale =
+                        (right_scaling.scale() / common_scale).round_ties_even() as Element;
                     (left_rescale, right_rescale, common_scale, require_requant)
                 }
                 Ordering::Greater => {
@@ -390,8 +394,10 @@ impl QuantInfo {
                         (common_scale, true)
                     };
 
-                    let left_rescale = (left_scaling.scale() / common_scale).round() as Element;
-                    let right_rescale = (right_scaling.scale() / common_scale).round() as Element;
+                    let left_rescale =
+                        (left_scaling.scale() / common_scale).round_ties_even() as Element;
+                    let right_rescale =
+                        (right_scaling.scale() / common_scale).round_ties_even() as Element;
                     (left_rescale, right_rescale, common_scale, require_requant)
                 }
             }
@@ -699,7 +705,7 @@ mod test {
             qadd_result.outputs()[0]
                 .get_data()
                 .iter()
-                .map(|x| (*x as f32 * scale).round() as Element)
+                .map(|x| (*x as f32 * scale).round_ties_even() as Element)
                 .collect::<Vec<_>>(),
         );
         let computed_result = result_scaled.dequantize(&s3);

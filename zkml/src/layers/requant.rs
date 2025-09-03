@@ -680,7 +680,7 @@ impl Requant {
 
         let fp_scale = FIXED_POINT_SCALE;
         let fixed_point_multiplier =
-            (epsilon * (1u64 << FIXED_POINT_SCALE) as f32).round() as Element;
+            (epsilon * (1u64 << FIXED_POINT_SCALE) as f32).round_ties_even() as Element;
 
         // Assertion to check that we can perform requantisation, we need intermediate_bit_size + fp_scale <= 63
         assert!(

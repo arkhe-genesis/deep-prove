@@ -894,7 +894,7 @@ mod test {
     proptest! {
         #[test]
         fn prop_logits_argmax_element((shape, data, expected) in logits_input_strategy()) {
-            let data_elem: Vec<Element> = data.into_iter().map(|v| v.round() as Element).collect();
+            let data_elem: Vec<Element> = data.into_iter().map(|v| v.round_ties_even() as Element).collect();
             let input = Tensor::new(shape.clone().into(), data_elem);
             let logits = Logits::Argmax;
             let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();

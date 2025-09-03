@@ -130,7 +130,7 @@ impl SoftmaxTableData {
             0
         } else {
             let float_exp = (-prod as f32 / (SCALE_FACTOR as f32 * float_temperature)).exp();
-            (float_exp * OUTPUT_SCALE_FACTOR as f32).round() as Element
+            (float_exp * OUTPUT_SCALE_FACTOR as f32).round_ties_even() as Element
         }
     }
 }
@@ -164,7 +164,7 @@ impl InverseSQRTTableData {
         let float_output =
             1.0f32 / ((shifted_val as f32 / LAYERNORM_SCALE_FACTOR as f32) + epsilon).sqrt();
         // Now we use the output scale factor to recover the element value
-        (float_output * LAYERNORM_OUTPUT_SCALE_FACTOR as f32).round() as Element
+        (float_output * LAYERNORM_OUTPUT_SCALE_FACTOR as f32).round_ties_even() as Element
     }
 }
 

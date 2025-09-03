@@ -168,7 +168,7 @@ impl<N: Number> Softmax<N> {
         let input_scale_factor = input_scaling.scale();
         let temperature = self.scalar.to_f32()?;
         let inv_float_temperature = 1.0f32 / temperature;
-        let multiplier = (SCALE_FACTOR as f32 * input_scale_factor).round() as Element;
+        let multiplier = (SCALE_FACTOR as f32 * input_scale_factor).round_ties_even() as Element;
 
         // We want to be able to cover all possible inputs, to do this we need to work out what the minimum quantised input is.
         // this can be calculated by taking `input_scaling.domain().0` and then subtracting the maximum possible shift for normalisation.
@@ -178,7 +178,7 @@ impl<N: Number> Softmax<N> {
         // (-SCALE_FACTOR as f32) * (inv_float_temperature * (self.max_size as f32).ln() + input_scaling.max())
         let max_shift = (-(SCALE_FACTOR as f32)
             * (inv_float_temperature * (self.max_size as f32).ln() + input_scaling.max()))
-        .round() as Element;
+        .round_ties_even() as Element;
 
         // So the minimum possible input is `quantised_min * multiplier + max_shift`, we multiply by `multiplier` so everything has scaling factor `SCALE_FACTOR`.
         let min_softmax_input = quantised_min * multiplier + max_shift;
@@ -204,7 +204,7 @@ impl<N: Number> Softmax<N> {
         );
 
         let float_error = float_error.abs();
-        let bkm = bkm_float.round() as Element;
+        let bkm = bkm_float.round_ties_even() as Element;
         // Now that we have bkm we set the Softmax table size as `ceil_log2(bkm as usize >> 16)` (which is 17 in practice)
         let softmax_table_size = ceil_log2(bkm as usize >> 16);
         // We also work out how many additional chunks we need to cover anything between bkm >> 16 and significant_min_input
@@ -305,7 +305,8 @@ impl Softmax<Element> {
                         })
                         .sum::<f32>();
                     let log_sum = sum.ln();
-                    -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round() as Element
+                    -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round_ties_even()
+                        as Element
                         - max * self.scalar
                 })
                 .collect::<Vec<Element>>()
@@ -330,7 +331,8 @@ impl Softmax<Element> {
                             })
                             .sum::<f32>();
                         let log_sum = sum.ln();
-                        -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round() as Element
+                        -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round_ties_even()
+                            as Element
                             - max * self.scalar
                     }
                 })
@@ -793,7 +795,8 @@ impl Softmax<Element> {
         } = self.quant_info().ok_or(anyhow!(
             "Could not prove Softmax because it had no quantisation data"
         ))?;
-        let allowable_error = (*error_bound * OUTPUT_SCALE_FACTOR as f32).round() as Element;
+        let allowable_error =
+            (*error_bound * OUTPUT_SCALE_FACTOR as f32).round_ties_even() as Element;
 
         // Now we construct the polynomials used in the lookups
         // To do this we need the size of the last dimension
@@ -1224,7 +1227,8 @@ impl ProveInfo for Softmax<Element> {
             // We convert the `f32` to bits so that the compiler doesn't complain about trait implementations
             let float_temp_bits = inv_float_temperature.to_bits();
             // Calculate the allowable error in normalisation as an Element
-            let allowable_error = (*error_bound * OUTPUT_SCALE_FACTOR as f32).round() as Element;
+            let allowable_error =
+                (*error_bound * OUTPUT_SCALE_FACTOR as f32).round_ties_even() as Element;
 
             // Add the tables that Softmax requires
             aux.tables.insert(TableType::Range);
@@ -1804,7 +1808,7 @@ mod tests {
 
                     let diff_from_one = (row_sum - OUTPUT_SCALE_FACTOR as Element).abs();
 
-                    assert!(diff_from_one < max_error.round() as Element);
+                    assert!(diff_from_one < max_error.round_ties_even() as Element);
                 });
         }
     }

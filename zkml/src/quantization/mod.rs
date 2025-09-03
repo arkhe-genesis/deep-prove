@@ -137,7 +137,7 @@ impl ScalingFactor {
 
         // formula is q = round(r/S) + z
         // let scaled =((value.clamp(self.min,self.max) - self.min) / self.scale()).round() * self.scale() + self.min;
-        let scaled = (*value / self.scale()).round() as Element + zero_point;
+        let scaled = (*value / self.scale()).round_ties_even() as Element + zero_point;
         if scaled < self.quantized_domain.0 || scaled > self.quantized_domain.1 {
             warn!(
                 "Quantized value {} from {} is out of range [{}, {}]",
