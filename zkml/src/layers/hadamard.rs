@@ -98,8 +98,8 @@ pub fn prove<F: ExtensionField, T: Transcript<F>>(
         output_claim.point.len(),
         v2.get_data().len().ilog2() as usize
     );
-    assert!(v1.shape().into_vec().iter().all(|x| x.is_power_of_two()));
-    assert!(v2.shape().into_vec().iter().all(|x| x.is_power_of_two()));
+    assert!(v1.shape().iter().all(|x| x.is_power_of_two()));
+    assert!(v2.shape().iter().all(|x| x.is_power_of_two()));
     let beta_poly = compute_betas_eval(&output_claim.point).into_mle();
     let v1_mle = v1.to_field_mle::<F>();
     let v2_mle = v2.to_field_mle::<F>();

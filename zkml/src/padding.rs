@@ -218,7 +218,7 @@ pub(crate) fn pad_dense(mut d: Dense<Element>, si: &mut ShapeInfo) -> Result<Den
         "More than 1 input shape found when padding dense layer"
     );
     let sd = si.shapes.first_mut().unwrap();
-    let matrix_shape: Shape = d.matrix.shape();
+    let matrix_shape = d.matrix.shape().clone();
     let nrows = matrix_shape.nrows();
     sd.input_shape_og = vec![nrows].into();
     ensure!(
@@ -301,7 +301,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
             m.tensor
                 .reshape_to_fit_inplace_2d(vec![nrows, ncols].into());
             (
-                m.tensor.shape(),
+                m.tensor.shape().clone(),
                 padded_input_shapes.pop().unwrap(), /* safe to unwrap since we checked the number of inputs at the beginning */
             )
         }
@@ -317,7 +317,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
             } else {
                 m.tensor.reshape_to_fit_inplace_2d(padded_matrix_shape)
             };
-            (padded_input_shapes.pop().unwrap(), m.tensor.shape())
+            (padded_input_shapes.pop().unwrap(), m.tensor.shape().clone())
         }
         (OperandMatrix::Input, OperandMatrix::Input) => {
             let right_shape = padded_input_shapes.pop().unwrap();
@@ -403,7 +403,7 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
             sd.input_shape_padded.dim(1), weight_mat.nrows_2d(),
         );
 
-        weight_mat.reshape_in_place(Shape::new(vec![
+        weight_mat.reshape(Shape::new(vec![
             weight_mat.nrows_2d(),
             qkv.num_heads,
             head_dim,
@@ -412,7 +412,7 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
         weight_mat.pad_to_shape(
             vec![nrows, padded_num_heads, padded_head_dim].into()
         );
-        weight_mat.reshape_in_place(Shape::new(vec![
+        weight_mat.reshape(Shape::new(vec![
             nrows,
             padded_num_heads*padded_head_dim,
         ]));
@@ -423,9 +423,9 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
     [&mut qkv.q_bias, &mut qkv.k_bias, &mut qkv.v_bias]
         .into_iter()
         .for_each(|bias_vec| {
-            bias_vec.reshape_in_place(Shape::new(vec![qkv.num_heads, head_dim]));
+            bias_vec.reshape(Shape::new(vec![qkv.num_heads, head_dim]));
             bias_vec.pad_to_shape(vec![padded_num_heads, padded_head_dim].into());
-            bias_vec.reshape_in_place(Shape::new(vec![padded_num_heads * padded_head_dim]))
+            bias_vec.reshape(Shape::new(vec![padded_num_heads * padded_head_dim]))
         });
 
     let padded_output_shapes = qkv.output_shapes(

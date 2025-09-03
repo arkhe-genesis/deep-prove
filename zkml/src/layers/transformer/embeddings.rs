@@ -216,8 +216,8 @@ impl Evaluate<f32> for Embeddings<f32> {
         let emb = &w.tensor;
         let emb_size = emb.shape()[1];
 
-        let weights = emb.clone().into_btensor::<2>();
-        let indices = input.clone().into_btensor::<1>().int();
+        let weights = emb.clone().to_btensor::<2>();
+        let indices = input.clone().to_btensor::<1>().int();
 
         let res = Backend::float_select(
             weights.into_primitive().tensor(),
@@ -710,7 +710,7 @@ mod tests {
         let emb_size = 10;
         let one_hot = one_hot_encoding(indices.get_data(), vocab_size);
         let expected_shape: Shape = vec![indices.shape().numel(), vocab_size].into();
-        assert_eq!(one_hot.shape(), expected_shape);
+        assert_eq!(*one_hot.shape(), expected_shape);
         assert_eq!(
             one_hot.get_data(),
             vec![
@@ -753,7 +753,7 @@ mod tests {
         let out = embeddings
             .evaluate::<GoldilocksExt2>(&[&input], &[vec![indices_elem.len(), 1].into()])?;
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
-        assert_eq!(out.outputs()[0].shape(), expected_shape);
+        assert_eq!(*out.outputs()[0].shape(), expected_shape);
         let onehot_result = one_hot.matmul(&emb.to_fields());
         assert_eq!(
             onehot_result.get_data(),
@@ -785,7 +785,7 @@ mod tests {
             .collect::<Vec<_>>();
         let x = Tensor::new(vec![seq_len].into(), input_data.clone());
         let out = embeddings.evaluate::<GoldilocksExt2>(&[&x], &[vec![seq_len].into()])?;
-        assert_eq!(out.outputs()[0].shape(), vec![seq_len, emb_size].into());
+        assert_eq!(*out.outputs()[0].shape(), vec![seq_len, emb_size].into());
         // for each input index, check that the embedding vector is the correct one
         for (idx, table_idx) in input_data.iter().enumerate() {
             let emb = emb_vector(*table_idx as usize);
@@ -839,7 +839,7 @@ mod tests {
                 <f32 as Number>::MAX,
                 Some((0, vocab_size as Element)),
             );
-            let input = input.quantize(&scaling);
+            let input = input.to_quantized(&scaling);
 
             let emb_data = emb.get_data();
             let new_emb = input

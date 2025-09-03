@@ -211,7 +211,7 @@ impl<N: Number> LayerNorm<N> {
             })
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-        let quant_gamma = Tensor::<Element>::new(self.gamma.shape(), quant_gamma_data);
+        let quant_gamma = Tensor::<Element>::new(self.gamma.shape().clone(), quant_gamma_data);
         // Work out how to quantise the bias, it needs to have the same scale factor as the end product.
         // This will be `input_scaling.scale() * model_scaling.scale() * 1.0f32 / LAYERNORM_OUTPUT_SCALE_FACTOR as f32`
         let bias_scale = input_scale * model_scaling.scale() / LAYERNORM_OUTPUT_SCALE_FACTOR as f32;
@@ -237,7 +237,7 @@ impl<N: Number> LayerNorm<N> {
             })
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-        let quant_beta = Tensor::<Element>::new(self.beta.shape(), quant_bias_data);
+        let quant_beta = Tensor::<Element>::new(self.beta.shape().clone(), quant_bias_data);
 
         // To calculate the intermediate bit size we have that the output is `self.gamma * (N * input - SUM input) * lookup_output + self.beta`
         // So lets work out the left hand bit size
@@ -375,9 +375,9 @@ impl Evaluate<f32> for LayerNorm<f32> {
         // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
         // instead of re-implementing everything ourselves.
         // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/layer.rs.html#67
-        let input = input.clone().into_btensor::<2>();
-        let gamma = self.gamma.clone().into_btensor::<1>();
-        let beta = self.beta.clone().into_btensor::<1>();
+        let input = input.clone().to_btensor::<2>();
+        let gamma = self.gamma.clone().to_btensor::<1>();
+        let beta = self.beta.clone().to_btensor::<1>();
         let config = BLayerNormConfig::new(embedding_size).with_epsilon(self.eps as f64);
         let mut norm = config.init(&device);
         norm.gamma = Param::from_tensor(gamma);
@@ -467,7 +467,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
             range_check,
         };
 
-        let output_tensor = Tensor::<Element>::new(input.shape(), output_data);
+        let output_tensor = Tensor::<Element>::new(input.shape().clone(), output_data);
         Ok(LayerOut::from_tensor(output_tensor)
             .with_proving_data(ProvingData::LayerNorm(layernorm_data)))
     }
@@ -1305,7 +1305,7 @@ mod tests {
         };
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
         let output = layernorm.evaluate::<E>(&[&input], &[]).unwrap();
-        assert_eq!(output.outputs[0].shape(), vec![1, 1024].into());
+        assert_eq!(*output.outputs[0].shape(), vec![1, 1024].into());
         assert_eq!(output.outputs[0].get_data(), vec![0.0; 1024]);
     }
 
@@ -1328,7 +1328,7 @@ mod tests {
             layernorm.quantise(input_scaling, input_scaling).unwrap();
         // We quantise the float input to obtain `quant_tensor` and then we dequantise to obtain `dequant_input`
         // this lets us run quantised evaluation and floating point evaluation and compare the outputs.
-        let quant_tensor = input_tensor.quantize(&input_scaling);
+        let quant_tensor = input_tensor.to_quantized(&input_scaling);
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = layernorm

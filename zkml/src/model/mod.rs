@@ -453,7 +453,7 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
                     .enumerate()
                     .map(|(i, tensor)| {
                         let key = crate::layers::provable::Edge::tkey_for_input::<N>(None, i);
-                        padded_input_shapes.insert(key.clone(), tensor.shape());
+                        padded_input_shapes.insert(key.clone(), tensor.shape().clone());
                         Ok((key, tensor.data_vec()))
                     })
                     .collect::<Result<Vec<_>, StoreError>>()?
@@ -469,7 +469,7 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 .enumerate()
                 .map(|(i, tensor)| {
                     let key = crate::layers::provable::Edge::tkey_for_input::<N>(None, i);
-                    DryTensor::new(key, tensor.shape())
+                    DryTensor::new(key, tensor.shape().clone())
                 })
                 .collect(),
             output: vec![],
@@ -808,8 +808,7 @@ pub(crate) mod test {
         let conv_layer = model
             .add_consecutive_layer(
                 Layer::Convolution(
-                    Convolution::new(filter.clone(), bias1.clone())
-                        .into_padded_and_ffted(&input_shape),
+                    Convolution::new(filter.clone(), bias1.clone()).prepared_for_fft(&input_shape),
                 ),
                 None,
             )
@@ -1047,7 +1046,7 @@ pub(crate) mod test {
         let input = Tensor::random(&model.input_shapes()[0]);
         let conv_layer =
             Convolution::new(conv1.clone(), Tensor::random(&vec![conv1.dim(0)].into()))
-                .into_padded_and_ffted(&in_dimensions[0].clone().into());
+                .prepared_for_fft(&in_dimensions[0].clone().into());
         let conv_layer_id = model
             .add_consecutive_layer(Layer::Convolution(conv_layer.clone()), None)
             .unwrap();
@@ -1178,7 +1177,7 @@ pub(crate) mod test {
         let input_tensors = float_inputs
             .into_iter()
             .zip(&md.input)
-            .map(|(tensor, s)| tensor.quantize(s))
+            .map(|(tensor, s)| tensor.to_quantized(s))
             .collect_vec();
 
         Ok((quantized_model, input_tensors))

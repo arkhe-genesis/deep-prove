@@ -586,7 +586,7 @@ impl Relu {
 
     pub fn op<T: Number>(&self, input: &Tensor<T>) -> Tensor<T> {
         Tensor::new(
-            input.shape(),
+            input.shape().clone(),
             input
                 .get_data()
                 .par_iter()
@@ -668,10 +668,10 @@ impl Evaluate<f32> for GELU<f32> {
         let output_tensors: Vec<Tensor<f32>> = inputs
             .par_iter()
             .map(|tensor| {
-                let shape = tensor.shape();
+                let shape = tensor.shape().clone();
                 let mut tensor = (*tensor).clone();
                 tensor.to_1d();
-                let tensor = tensor.into_btensor::<1>();
+                let tensor = tensor.to_btensor::<1>();
 
                 let result = gelu(tensor);
 
@@ -816,7 +816,7 @@ mod test {
         assert_eq!(layer_out.outputs().len(), 1);
         let output_tensor = &layer_out.outputs()[0];
 
-        assert_eq!(output_tensor.shape(), vec![1, input_data.len()].into());
+        assert_eq!(*output_tensor.shape(), vec![1, input_data.len()].into());
         let actual_output_data = output_tensor.get_data();
 
         actual_output_data
@@ -837,7 +837,7 @@ mod test {
             let shape = Shape::new(vec![size]);
             let tensor = Tensor::<f32>::random(&shape);
 
-            let btensor = tensor.clone().into_btensor::<1>();
+            let btensor = tensor.clone().to_btensor::<1>();
             let data = gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
             let resultb = Tensor::<f32>::new(shape.clone(), data);
 

@@ -16,7 +16,7 @@ use csv::{Writer, WriterBuilder};
 use memory_stats::{MemoryStats, memory_stats};
 use thiserror::Error;
 use thousands::Separable;
-use tracing::warn;
+use tracing::{trace, warn};
 
 type CsvStreamer = StreamingRecorder<Writer<File>>;
 static CSV_RECORDER: Mutex<Option<CsvStreamer>> = Mutex::new(None);
@@ -55,7 +55,7 @@ pub fn stream_metrics(name: impl AsRef<str>, metrics: &MetricsSpan) {
                 }
             };
         }
-        None => warn!("CSV_RECORDER is not initialised"),
+        None => trace!("CSV_RECORDER is not initialised"),
     }
 }
 
@@ -75,7 +75,7 @@ where
                 }
             };
         }
-        None => warn!("CSV_RECORDER is not initialised"),
+        None => trace!("CSV_RECORDER is not initialised"),
     }
 }
 

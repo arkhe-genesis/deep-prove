@@ -394,11 +394,8 @@ impl Evaluate<f32> for Softmax<f32> {
         );
         let input = inputs[0];
         // Make the attention mask
-        let mask = AttentionMask::<f32>::new(
-            &input.shape(),
-            &unpadded_input_shapes[0],
-            f32::NEG_INFINITY,
-        )?;
+        let mask =
+            AttentionMask::<f32>::new(input.shape(), &unpadded_input_shapes[0], f32::NEG_INFINITY)?;
         let masked_input = mask.apply(input)?;
 
         let chunk_size = *input
@@ -428,7 +425,7 @@ impl Evaluate<f32> for Softmax<f32> {
                 scaled.iter().map(|x| x / sum).collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let output_tensor = Tensor::new(input.shape(), output);
+        let output_tensor = Tensor::new(input.shape().clone(), output);
         Ok(LayerOut::from_vec(vec![output_tensor]))
     }
 }
@@ -538,7 +535,7 @@ impl Evaluate<Element> for Softmax<Element> {
             })
             .collect::<Vec<Element>>();
 
-        let shifted_input = Tensor::<Element>::new(input.shape(), shifted_input_data);
+        let shifted_input = Tensor::<Element>::new(input.shape().clone(), shifted_input_data);
         // Apply the mask to the shifted input
         let masked_input = mask.apply(&shifted_input)?;
 
@@ -598,7 +595,7 @@ impl Evaluate<Element> for Softmax<Element> {
         });
 
         // Make the output tensor
-        let output = Tensor::<Element>::new(input.shape(), softmax_outputs);
+        let output = Tensor::<Element>::new(input.shape().clone(), softmax_outputs);
 
         Ok(LayerOut {
             outputs: vec![output],
@@ -1680,7 +1677,7 @@ impl<N: Number> AttentionMask<N> {
             Ok(input.mul(&self.tril).add(&self.bias))
         } else {
             let new_shape = input.shape().insert(0, 1);
-            let new_input = input.clone().reshape(new_shape);
+            let new_input = input.clone().reshaped(new_shape);
 
             if !new_input
                 .shape()
@@ -1694,7 +1691,7 @@ impl<N: Number> AttentionMask<N> {
             }
 
             let output = new_input.mul(&self.tril).add(&self.bias);
-            Ok(output.reshape(input.shape()))
+            Ok(output.reshaped(input.shape().clone()))
         }
     }
 }
@@ -1723,7 +1720,7 @@ mod tests {
         let output = softmax
             .evaluate::<GoldilocksExt2>(&[&input], &[vec![1, 3, 3].into()])
             .unwrap();
-        assert_eq!(output.outputs[0].shape(), vec![1, 3, 3].into());
+        assert_eq!(*output.outputs[0].shape(), vec![1, 3, 3].into());
 
         output.outputs[0].get_data().chunks(3).for_each(|chunk| {
             assert_eq!(chunk.iter().sum::<f32>(), 1.0);
@@ -1751,8 +1748,8 @@ mod tests {
                 Some((-1 << 24, 1 << 24)),
             );
 
-            let test_q_quant = test_q.clone().quantize(&q_scaling);
-            let test_k_quant = test_k.clone().quantize(&k_scaling);
+            let test_q_quant = test_q.to_quantized(&q_scaling);
+            let test_k_quant = test_k.to_quantized(&k_scaling);
 
             let test_qk_quant = test_q_quant.matmul(&test_k_quant);
 

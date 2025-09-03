@@ -85,7 +85,7 @@ fn output_shape(input_shape: &Shape, matrix_shape: &Shape) -> Shape {
 impl<T: Number> Dense<T> {
     pub fn new(matrix: Tensor<T>, bias: Tensor<T>) -> Self {
         assert_eq!(matrix.nrows_2d(), bias.shape()[0]);
-        let unpadded_matrix_shape = matrix.shape();
+        let unpadded_matrix_shape = matrix.shape().clone();
         Self {
             matrix,
             bias,
@@ -175,8 +175,8 @@ impl Evaluate<Element> for Dense<Element> {
         );
 
         let matrix = self.matrix.clone().into_btensor::<2>();
-        let input = inputs[0].flatten().into_btensor::<1>();
-        let bias = self.bias.flatten().into_btensor::<1>();
+        let input = inputs[0].to_flatten().into_btensor::<1>();
+        let bias = self.bias.to_flatten().into_btensor::<1>();
 
         // NOTE: Can not use the [burn::tensor::module::linear] because it
         // is defined only for floats
@@ -204,9 +204,9 @@ impl Evaluate<f32> for Dense<f32> {
         );
         let input = inputs[0];
 
-        let matrix = self.matrix.clone().into_btensor::<2>();
-        let input = input.flatten().into_btensor::<1>();
-        let bias = self.bias.flatten().into_btensor::<1>();
+        let matrix = self.matrix.clone().to_btensor::<2>();
+        let input = input.to_flatten().to_btensor::<1>();
+        let bias = self.bias.to_flatten().to_btensor::<1>();
         let res = linear(input, matrix.transpose(), Some(bias));
 
         let data = res.to_data().into_vec().expect("Failed to compute Dense");
@@ -234,7 +234,7 @@ impl ProveInfo for Dense<Element> {
         let dense_info = LayerCtx::Dense(DenseCtx {
             node_id: id,
             unpadded_matrix_shape: self.unpadded_matrix_shape.clone(),
-            padded_matrix_shape: self.matrix.shape(),
+            padded_matrix_shape: self.matrix.shape().clone(),
         });
 
         let weights_evals = self.matrix.pad_next_power_of_two().into_data();
@@ -397,8 +397,8 @@ impl Dense<f32> {
     /// Quantize the parameters of the dense layer. It uses a custom scaling factor `bias_s` for
     /// the bias, if provided, otherwise the same scaling factor of the weights (i.e., `s`) is used
     pub fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Dense<Element> {
-        let matrix = self.matrix.quantize(s);
-        let bias = self.bias.quantize(bias_s);
+        let matrix = self.matrix.to_quantized(s);
+        let bias = self.bias.to_quantized(bias_s);
         Dense::<Element> {
             matrix,
             bias,
@@ -407,7 +407,7 @@ impl Dense<f32> {
     }
 
     pub fn new_from_weights(weights: Tensor<f32>, bias: Tensor<f32>) -> Self {
-        let unpadded_matrix_shape = weights.shape();
+        let unpadded_matrix_shape = weights.shape().clone();
         Self {
             matrix: weights,
             bias,

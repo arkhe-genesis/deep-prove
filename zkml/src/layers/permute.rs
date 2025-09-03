@@ -49,6 +49,6 @@ mod test {
         let input = Tensor::<Element>::random(&vec![2, 3, 4].into());
         let permute = Permute::new(vec![1, 0, 2]);
         let output = permute.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
-        assert_eq!(output.outputs()[0].shape(), vec![3, 2, 4].into());
+        assert_eq!(*output.outputs()[0].shape(), vec![3, 2, 4].into());
     }
 }

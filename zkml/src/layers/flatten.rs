@@ -81,15 +81,15 @@ impl Flatten {
                 return Ok(LayerOut::from_vec(vec![input.clone()]));
             }
             2 => {
-                let input = input.clone().into_btensor::<2>();
+                let input = input.clone().to_btensor::<2>();
                 input.flatten::<1>(0, rank - 1)
             }
             3 => {
-                let input = input.clone().into_btensor::<3>();
+                let input = input.clone().to_btensor::<3>();
                 input.flatten::<1>(0, rank - 1)
             }
             4 => {
-                let input = input.clone().into_btensor::<4>();
+                let input = input.clone().to_btensor::<4>();
                 input.flatten::<1>(0, rank - 1)
             }
             _ => {
@@ -138,7 +138,7 @@ mod tests {
     proptest! {
         #[test]
         fn test_flatten_with_f32(input in any_input::<f32>(1..5, 1..8)) {
-            let expected = input.flatten();
+            let expected = input.to_flatten();
 
             let layer = Flatten;
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("flatten evaluation must be successful");
@@ -148,7 +148,7 @@ mod tests {
 
         #[test]
         fn test_flatten_with_element(input in any_input::<Element>(1..5, 1..8)) {
-            let expected = input.flatten();
+            let expected = input.to_flatten();
 
             let layer = Flatten;
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("flatten evaluation must be successful");

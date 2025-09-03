@@ -122,7 +122,7 @@ pub(crate) mod manual_attention {
             }
             let out = self.add.evaluate::<GoldilocksExt2>(
                 &[input, down.outputs()[0]],
-                &[input.shape(), down.outputs()[0].shape()],
+                &[input.shape().clone(), down.outputs()[0].shape().clone()],
             )?;
             Ok(out.outputs()[0].clone())
         }
@@ -224,9 +224,10 @@ pub(crate) mod manual_attention {
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_layernorm_close(normed.outputs()));
             }
-            let qkv = self
-                .qkv
-                .evaluate::<GoldilocksExt2>(&normed.outputs(), &[normed.outputs()[0].shape()])?;
+            let qkv = self.qkv.evaluate::<GoldilocksExt2>(
+                &normed.outputs(),
+                &[normed.outputs()[0].shape().clone()],
+            )?;
 
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_qkv_close(qkv.outputs()));
@@ -261,7 +262,10 @@ pub(crate) mod manual_attention {
             // and then residual connection, [1, hidden_size]
             let out = self.add.evaluate::<GoldilocksExt2>(
                 &[input, projected.outputs()[0]],
-                &[input.shape(), projected.outputs()[0].shape()],
+                &[
+                    input.shape().clone(),
+                    projected.outputs()[0].shape().clone(),
+                ],
             )?;
 
             if let Some(gpt2_output) = gpt2_output {
@@ -441,7 +445,7 @@ pub(crate) mod manual_attention {
             .evaluate::<GoldilocksExt2>(&[&input], &[])?;
         let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
             &[embedded.outputs()[0]],
-            &[embedded.outputs()[0].shape()],
+            &[embedded.outputs()[0].shape().clone()],
         )?;
         assert!(is_close(
             positioned.outputs()[0].get_data(),
@@ -479,7 +483,8 @@ pub(crate) mod manual_attention {
         let expected_output = &first_layer_output.manual_output;
         assert!(is_close(expected_output, output.get_data()));
         // Now try to run with the graph implementation
-        let mut model = Model::new_from_input_shapes(vec![input.shape()], PaddingMode::NoPadding);
+        let mut model =
+            Model::new_from_input_shapes(vec![input.shape().clone()], PaddingMode::NoPadding);
         let _last_node_id = first_attention.write_to_model(&mut model, None, &config)?;
         model.route_output(None)?;
         let output1 =
@@ -523,14 +528,14 @@ pub(crate) mod manual_attention {
         let single_input = Tensor::new(vec![1].into(), vec![max_token as f32]);
         let model = llm_model
             .clone()
-            .into_provable_model(&config, single_input.shape())?;
+            .into_provable_model(&config, single_input.shape().clone())?;
         model.describe();
         model.run_float(slice::from_ref(&single_input))?;
         // Reset is needed here because the `llm_model` contains layer that contains some cache.
         // When we clone a layer, we just clone a Arc<Mutex<_>>, so the cache data itself is not cloned.
         model.reset();
 
-        let model = llm_model.into_provable_model(&config, input.shape())?;
+        let model = llm_model.into_provable_model(&config, input.shape().clone())?;
         model.describe();
         let output = model.run_float(slice::from_ref(&input))?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,

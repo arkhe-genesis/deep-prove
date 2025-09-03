@@ -65,7 +65,7 @@ pub enum OperandMatrix<T> {
 
 impl<T> OperandMatrix<T> {
     pub fn new_weight_matrix(matrix: Tensor<T>) -> Self {
-        let unpadded_shape = matrix.shape();
+        let unpadded_shape = matrix.shape().clone();
         OperandMatrix::Weight(WeightMatrix {
             tensor: matrix,
             unpadded_shape,
@@ -91,7 +91,7 @@ impl<T> OperandMatrix<T> {
 
     pub(crate) fn get_actual_shape(&self) -> Option<Shape> {
         match self {
-            OperandMatrix::Weight(mat) => Some(mat.tensor.shape()),
+            OperandMatrix::Weight(mat) => Some(mat.tensor.shape().clone()),
             OperandMatrix::Input => None,
         }
     }
@@ -242,12 +242,12 @@ impl<T> MatMul<T> {
                 product can be directly used instead"
             ),
             (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
-                let left = mat.tensor.clone().into_btensor::<2>();
+                let left = mat.tensor.clone().to_btensor::<2>();
 
                 let right = *inputs
                     .first()
                     .ok_or(anyhow!("No matrix provided as input to MatMul"))?;
-                let right = right.clone().into_btensor::<2>();
+                let right = right.clone().to_btensor::<2>();
 
                 (left, right)
             }
@@ -255,9 +255,9 @@ impl<T> MatMul<T> {
                 let left = *inputs
                     .first()
                     .ok_or(anyhow!("No matrix provided as input to MatMul"))?;
-                let left = left.clone().into_btensor::<2>();
+                let left = left.clone().to_btensor::<2>();
 
-                let right = mat.tensor.clone().into_btensor::<2>();
+                let right = mat.tensor.clone().to_btensor::<2>();
 
                 (left, right)
             }
@@ -268,10 +268,10 @@ impl<T> MatMul<T> {
                     inputs.len()
                 );
                 let left = inputs[0];
-                let left = left.clone().into_btensor::<2>();
+                let left = left.clone().to_btensor::<2>();
 
                 let right = inputs[1];
-                let right = right.clone().into_btensor::<2>();
+                let right = right.clone().to_btensor::<2>();
 
                 (left, right)
             }
@@ -293,7 +293,7 @@ impl<T> MatMul<T> {
         );
         let matmul = left.matmul(right);
         let res = if let Some(bias) = self.bias.as_ref() {
-            let bias = bias.clone().into_btensor::<1>();
+            let bias = bias.clone().to_btensor::<1>();
             ensure!(
                 matmul.shape().dims[1] == bias.shape().dims[0],
                 "Bias shape {:?} is incompatible with matmul shape {:?}",
@@ -525,20 +525,20 @@ impl MatMul<f32> {
     ) -> MatMul<Element> {
         let left_matrix = match self.left_matrix {
             OperandMatrix::Weight(mat) => OperandMatrix::Weight(WeightMatrix {
-                tensor: mat.tensor.quantize(left_scaling),
+                tensor: mat.tensor.to_quantized(left_scaling),
                 unpadded_shape: mat.unpadded_shape,
             }),
             OperandMatrix::Input => OperandMatrix::Input, /* No need to quantize since it's an input, not a constant in the model */
         };
         let right_matrix = match self.right_matrix {
             OperandMatrix::Weight(mat) => OperandMatrix::Weight(WeightMatrix {
-                tensor: mat.tensor.quantize(right_scaling),
+                tensor: mat.tensor.to_quantized(right_scaling),
                 unpadded_shape: mat.unpadded_shape,
             }),
             OperandMatrix::Input => OperandMatrix::Input, /* No need to quantize since it's an input, not a constant in the model */
         };
         let bias = self.bias.map(|bias| {
-            bias.quantize(&bias_scaling.expect("Bias scaling is required for matmul with bias"))
+            bias.to_quantized(&bias_scaling.expect("Bias scaling is required for matmul with bias"))
         });
         MatMul {
             left_matrix,
@@ -904,12 +904,14 @@ impl MatMul<Element> {
         mut ctx_aux: ContextAux,
     ) -> Result<(MatMulCtx, ContextAux)> {
         let (left_shape, right_shape) = match (&self.left_matrix, &self.right_matrix) {
-            (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
-                (mat.tensor.shape(), ctx_aux.last_output_shape[0].clone())
-            }
-            (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-                (ctx_aux.last_output_shape[0].clone(), mat.tensor.shape())
-            }
+            (OperandMatrix::Weight(mat), OperandMatrix::Input) => (
+                mat.tensor.shape().clone(),
+                ctx_aux.last_output_shape[0].clone(),
+            ),
+            (OperandMatrix::Input, OperandMatrix::Weight(mat)) => (
+                ctx_aux.last_output_shape[0].clone(),
+                mat.tensor.shape().clone(),
+            ),
             (OperandMatrix::Input, OperandMatrix::Input) => (
                 ctx_aux.last_output_shape[0].clone(),
                 ctx_aux.last_output_shape[1].clone(),
@@ -1316,7 +1318,7 @@ mod tests {
 
         // Check dimensions remain the same
         assert_eq!(
-            matrix.shape(),
+            *matrix.shape(),
             padded.left_matrix.get_actual_shape().unwrap()
         );
 
@@ -1658,7 +1660,7 @@ mod tests {
             }
             InputKind::LeftWeight => {
                 let inputs = vec![right];
-                let unpadded_shape = left.shape();
+                let unpadded_shape = left.shape().clone();
                 let weight = WeightMatrix {
                     tensor: left,
                     unpadded_shape,
@@ -1667,7 +1669,7 @@ mod tests {
             }
             InputKind::RightWeight => {
                 let inputs = vec![left];
-                let unpadded_shape = right.shape();
+                let unpadded_shape = right.shape().clone();
                 let weight = WeightMatrix {
                     tensor: right,
                     unpadded_shape,

@@ -159,7 +159,7 @@ impl InputMatrixDimensions {
             mle
         } else {
             // no permutation needed, just compute the MLE
-            let mut mle = input.as_mle();
+            let mut mle = input.to_mle();
             if self.output_dimension == 0 {
                 // We need to fix the variables related to the first dimension, which are
                 // the most significant ones
@@ -488,13 +488,13 @@ impl ConcatMatMul {
     {
         let input_shapes = inputs
             .iter()
-            .map(|input| input.as_ref().shape())
+            .map(|input| input.as_ref().shape().clone())
             .collect_vec();
         self.ensure_shape_consistency(&input_shapes)?;
 
         let (point_for_concat, point_for_row, point_for_col) = self
             .permutations
-            .split_output_claim_point(output.shape(), &last_claims[0].point)?;
+            .split_output_claim_point(output.shape().clone(), &last_claims[0].point)?;
 
         // determine if we need to permute the left matrix for sum-check
         let left = self
@@ -598,7 +598,7 @@ impl<N: Number> Evaluate<N> for ConcatMatMul {
         let b = inputs[1];
         let a_shape = a.shape();
         let b_shape = b.shape();
-        self.ensure_shape_consistency(&[&a_shape, &b_shape])?;
+        self.ensure_shape_consistency(&[a_shape, b_shape])?;
         let permuted_a = self
             .permutations
             .compute_permutation_for_left_input()
@@ -619,8 +619,8 @@ impl<N: Number> Evaluate<N> for ConcatMatMul {
         );
         let results = (0..a_shape.dim(0))
             .map(|batch| {
-                let batch_a = a.slice_3d(batch, batch + 1).reshape(a_shape.slice(1..=2));
-                let batch_b = b.slice_3d(batch, batch + 1).reshape(b_shape.slice(1..=2));
+                let batch_a = a.slice_3d(batch, batch + 1).reshaped(a_shape.slice(1..=2));
+                let batch_b = b.slice_3d(batch, batch + 1).reshaped(b_shape.slice(1..=2));
                 batch_a.matmul(&batch_b)
             })
             .collect::<Vec<_>>();
@@ -629,7 +629,7 @@ impl<N: Number> Evaluate<N> for ConcatMatMul {
         let concat =
             it.next()
                 .unwrap()
-                .reshape(Shape::new(vec![1, a_shape.dim(1), b_shape.dim(2)]));
+                .reshaped(Shape::new(vec![1, a_shape.dim(1), b_shape.dim(2)]));
         let mut concat = it.fold(concat, |mut acc, x| {
             acc.concat(x);
             acc
@@ -982,9 +982,11 @@ mod test {
         );
         let expected = expected.permute3d(&[1, 0, 2]);
         assert_eq!(result.outputs[0].data(), expected.data());
-        let expected_shape =
-            concat_matmul.output_shapes(&[a.shape(), b.shape()], PaddingMode::NoPadding);
-        assert_eq!(result.outputs[0].shape(), expected_shape[0]);
+        let expected_shape = concat_matmul.output_shapes(
+            &[a.shape().clone(), b.shape().clone()],
+            PaddingMode::NoPadding,
+        );
+        assert_eq!(*result.outputs[0].shape(), expected_shape[0]);
     }
 
     #[test]
@@ -1017,9 +1019,11 @@ mod test {
             ],
         );
         assert_eq!(result.outputs[0].data(), expected.data());
-        let expected_shape =
-            concat_matmul.output_shapes(&[a.shape(), b.shape()], PaddingMode::NoPadding);
-        assert_eq!(result.outputs[0].shape(), expected_shape[0]);
+        let expected_shape = concat_matmul.output_shapes(
+            &[a.shape().clone(), b.shape().clone()],
+            PaddingMode::NoPadding,
+        );
+        assert_eq!(*result.outputs[0].shape(), expected_shape[0]);
     }
 
     #[test]
@@ -1045,7 +1049,7 @@ mod test {
 
         // check output shape
         assert_eq!(
-            outputs[0].shape(),
+            *outputs[0].shape(),
             Shape::new(vec![5, 14, 18]).next_power_of_two()
         );
     }
@@ -1073,7 +1077,7 @@ mod test {
         model.describe();
         let outputs = prove_model(model, &mut GenStore::default()).unwrap();
         assert_eq!(
-            outputs[0].shape(),
+            *outputs[0].shape(),
             Shape::new(vec![5, 14, 18]).next_power_of_two()
         );
     }
@@ -1125,7 +1129,7 @@ mod test {
 
         let outputs = prove_model(model, &mut GenStore::default()).unwrap();
         assert_eq!(
-            outputs[0].shape(),
+            *outputs[0].shape(),
             Shape::new(vec![21, 7, 17]).next_power_of_two()
         );
     }

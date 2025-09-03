@@ -178,7 +178,7 @@ impl Evaluate<Element> for Requant {
                         }
                     })
                     .collect::<Result<Vec<Element>, anyhow::Error>>()?;
-                Ok(Tensor::<Element>::new(input.shape(), res))
+                Ok(Tensor::<Element>::new(input.shape().clone(), res))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(LayerOut::from_vec(result))
@@ -756,7 +756,7 @@ impl Requant {
             .map(|(i,e)| {if e.abs() <= max_abs_val {Ok(self.apply(e))} else {Err(anyhow!("Could not apply requantisation, tensor element {} had absolute value too large, given value: {}, max value: {}", i, e, max_abs_val))}})
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-        Ok(Tensor::<Element>::new(input.shape(), res))
+        Ok(Tensor::<Element>::new(input.shape().clone(), res))
     }
 
     /// Function that tells us how many bits are not shifted away

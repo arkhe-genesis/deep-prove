@@ -303,7 +303,7 @@ impl ScalingStrategy for AbsoluteMax {
                 .zip(&input_tensor)
                 .try_for_each(|(shape, input)| {
                     ensure!(
-                        shape == input.shape(),
+                        shape == *input.shape(),
                         "input shape mismatch: expected {:?}, got {:?}",
                         shape,
                         input.shape()

@@ -143,13 +143,13 @@ impl Reshape {
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         let output_shapes =
-            self.internal_output(&inputs.iter().map(|x| x.shape()).collect::<Vec<_>>())?;
+            self.internal_output(&inputs.iter().map(|x| x.shape().clone()).collect::<Vec<_>>())?;
         #[allow(suspicious_double_ref_op)]
         let mut out_tensors = inputs.iter().map(|&x| x.clone()).collect::<Vec<_>>();
         output_shapes
             .into_iter()
             .zip(out_tensors.iter_mut())
-            .for_each(|(new_dim, input_tensor)| input_tensor.reshape_in_place(new_dim));
+            .for_each(|(new_dim, input_tensor)| input_tensor.reshape(new_dim));
         Ok(LayerOut::from_vec(out_tensors))
     }
 }
@@ -281,7 +281,7 @@ mod tests {
         let output = reshape
             .evaluate::<GoldilocksExt2>(&[&input], &[])
             .expect("reshape shouldn't fail");
-        assert_eq!(output.outputs[0].shape(), vec![3, 2, 3].into());
+        assert_eq!(*output.outputs[0].shape(), vec![3, 2, 3].into());
         assert_eq!(output.outputs[0].get_data(), input.get_data());
     }
 
@@ -292,7 +292,7 @@ mod tests {
         let output = reshape
             .evaluate::<GoldilocksExt2>(&[&input], &[])
             .expect("reshape shouldn't fail");
-        assert_eq!(output.outputs[0].shape(), vec![2, 1, 3].into());
+        assert_eq!(*output.outputs[0].shape(), vec![2, 1, 3].into());
         assert_eq!(output.outputs[0].get_data(), vec![0, 1, 2, 3, 4, 5]);
     }
 
@@ -314,7 +314,7 @@ mod tests {
         let output = reshape
             .evaluate::<GoldilocksExt2>(&[&input], &[])
             .expect("reshape shouldn't fail");
-        assert_eq!(output.outputs[0].shape(), vec![2, 3, 4].into());
+        assert_eq!(*output.outputs[0].shape(), vec![2, 3, 4].into());
         assert_eq!(
             output.outputs[0].get_data(),
             (0..24).map(|i| i as Element).collect::<Vec<_>>()
@@ -339,7 +339,7 @@ mod tests {
         let output = reshape
             .evaluate::<GoldilocksExt2>(&[&input], &[])
             .expect("reshape shouldn't fail");
-        assert_eq!(output.outputs[0].shape(), vec![2, 3, 4].into());
+        assert_eq!(*output.outputs[0].shape(), vec![2, 3, 4].into());
         assert_eq!(
             output.outputs[0].get_data(),
             (0..24).map(|i| i as Element).collect::<Vec<_>>()

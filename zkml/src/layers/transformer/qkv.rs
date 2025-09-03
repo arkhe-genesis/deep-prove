@@ -161,7 +161,7 @@ impl<N: Number> QKV<N> {
             "Expected number of heads to be a divisor of hidden size, but it's not: hidden_size = {hidden_size}, num_heads = {num_heads}"
         );
         let head_dim = hidden_size / num_heads;
-        let unpadded_shape = q.shape();
+        let weights_unpadded_shape = q.shape().clone();
         Ok(Self {
             q,
             q_bias,
@@ -169,7 +169,7 @@ impl<N: Number> QKV<N> {
             k_bias,
             v,
             v_bias,
-            weights_unpadded_shape: unpadded_shape,
+            weights_unpadded_shape,
             num_heads,
             head_dim,
             cache: Arc::new(Mutex::new(CacheQKV::new())),
@@ -339,16 +339,16 @@ where
         // NOTE: we take the _whole_ input and not just the last row / token.
         // The reason is because the _first_ time we infere via this layer, this is on the user input which is X token long.
         // The subsequent times, it's just to run with the newly generated token, so there is only one here.
-        let input = inputs[0].clone().into_btensor::<2>();
+        let input = inputs[0].clone().to_btensor::<2>();
         let unpadded_seq_len = unpadded_input_shapes[0].dim(0);
-        let q = self.q.clone().into_btensor::<2>();
-        let q_bias = self.q_bias.clone().into_btensor::<1>();
+        let q = self.q.clone().to_btensor::<2>();
+        let q_bias = self.q_bias.clone().to_btensor::<1>();
         let q_out_shape = Shape::new(vec![shape[0], self.q.shape()[1]]);
-        let k = self.k.clone().into_btensor::<2>();
-        let k_bias = self.k_bias.clone().into_btensor::<1>();
+        let k = self.k.clone().to_btensor::<2>();
+        let k_bias = self.k_bias.clone().to_btensor::<1>();
         let k_out_shape = Shape::new(vec![shape[0], self.k.shape()[1]]);
-        let v = self.v.clone().into_btensor::<2>();
-        let v_bias = self.v_bias.clone().into_btensor::<1>();
+        let v = self.v.clone().to_btensor::<2>();
+        let v_bias = self.v_bias.clone().to_btensor::<1>();
         let v_out_shape = Shape::new(vec![shape[0], self.v.shape()[1]]);
 
         let q = input.clone().matmul(q).add(q_bias.unsqueeze());
@@ -411,8 +411,8 @@ impl QKV<f32> {
                 let (model_scaling, bias_scaling) =
                     model_scaling_factor_from_tensor_and_bias(&input_scaling[0], &tensor, &bias);
                 let input_scaling = &input_scaling[0];
-                let quantized_matrix = tensor.quantize(&model_scaling);
-                let quantized_bias = bias.quantize(&bias_scaling);
+                let quantized_matrix = tensor.to_quantized(&model_scaling);
+                let quantized_bias = bias.to_quantized(&bias_scaling);
                 let intermediate_bitsize = quantized_matrix.matmul_output_bitsize(None, None);
                 let requant = Requant::from_scaling_factors(
                     *input_scaling,
@@ -597,7 +597,7 @@ where
             output_tensors.len()
         );
         output_tensors.iter().try_for_each(|out| {
-                ensure!(out.shape() == expected_output_shape,
+                ensure!(*out.shape() == expected_output_shape,
                     "Expected shape {expected_output_shape:?} for output of QKV layer, found shape {:?}", out.shape(),
                 );
                 Ok(())
@@ -1032,10 +1032,10 @@ impl<N: Number> CacheQKV<N> {
         }
         Ok(())
     }
-    pub fn k_shape(&self) -> Shape {
+    pub fn k_shape(&self) -> &Shape {
         self.cache_k.shape()
     }
-    pub fn v_shape(&self) -> Shape {
+    pub fn v_shape(&self) -> &Shape {
         self.cache_v.shape()
     }
     pub fn k(&self) -> Tensor<N> {
@@ -1106,12 +1106,12 @@ mod tests {
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
-        assert_eq!(output[0].shape(), Shape::from(vec![1, hidden_size]));
-        assert_eq!(output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
+        assert_eq!(*output[0].shape(), Shape::from(vec![1, hidden_size]));
+        assert_eq!(*output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
         let mut out_k = input.matmul(&k).add_dim2(&k_bias);
         assert_eq!(output[1].get_data(), out_k.get_data());
         let mut out_v = input.matmul(&v).add_dim2(&v_bias);
-        assert_eq!(output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
+        assert_eq!(*output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
         assert_eq!(output[2].get_data(), out_v.get_data());
         // second token
         let seq_len = 2;
@@ -1123,9 +1123,9 @@ mod tests {
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
-        assert_eq!(output[0].shape(), Shape::from(vec![1, hidden_size]));
-        assert_eq!(output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
-        assert_eq!(output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
+        assert_eq!(*output[0].shape(), Shape::from(vec![1, hidden_size]));
+        assert_eq!(*output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
+        assert_eq!(*output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
         let out_q = new_token_emb.matmul(&q).add_dim2(&q_bias);
         assert_eq!(output[0].get_data(), out_q.get_data());
         out_k.concat(new_token_emb.matmul(&k).add_dim2(&k_bias));
@@ -1235,12 +1235,12 @@ mod tests {
         ));
         assert_eq!(padded_layer.cache.lock().unwrap().full_seq_len(), 0);
 
-        assert_eq!(padded_layer.q.shape(), padded_weight_shape);
-        assert_eq!(padded_layer.k.shape(), padded_weight_shape);
-        assert_eq!(padded_layer.v.shape(), padded_weight_shape);
-        assert_eq!(padded_layer.q_bias.shape(), padded_bias_shape);
-        assert_eq!(padded_layer.k_bias.shape(), padded_bias_shape);
-        assert_eq!(padded_layer.v_bias.shape(), padded_bias_shape);
+        assert_eq!(*padded_layer.q.shape(), padded_weight_shape);
+        assert_eq!(*padded_layer.k.shape(), padded_weight_shape);
+        assert_eq!(*padded_layer.v.shape(), padded_weight_shape);
+        assert_eq!(*padded_layer.q_bias.shape(), padded_bias_shape);
+        assert_eq!(*padded_layer.k_bias.shape(), padded_bias_shape);
+        assert_eq!(*padded_layer.v_bias.shape(), padded_bias_shape);
 
         // check data in padded layer is the same of original layer
         let head_dim = layer.head_dim;
@@ -1301,7 +1301,7 @@ mod tests {
                 .outputs()
                 .into_iter()
                 .zip(&unpadded_output_shapes)
-                .all(|(out, expected_shape)| out.shape() == *expected_shape)
+                .all(|(out, expected_shape)| *out.shape() == *expected_shape)
         );
 
         input.pad_to_shape(padded_input_shape);
@@ -1318,7 +1318,7 @@ mod tests {
                 .outputs()
                 .into_iter()
                 .zip(&padded_output_shapes)
-                .all(|(out, expected_shape)| out.shape() == *expected_shape)
+                .all(|(out, expected_shape)| *out.shape() == *expected_shape)
         );
 
         // check that padded_output has same values of output in non-padded entries
@@ -1388,12 +1388,12 @@ mod tests {
             .output_shapes(slice::from_ref(&unpadded_input_shape), PaddingMode::Padding);
         assert_eq!(padded_output_shapes, si.padded_input_shapes(),);
 
-        assert_eq!(padded_layer.q.shape(), weight_shape);
-        assert_eq!(padded_layer.k.shape(), weight_shape);
-        assert_eq!(padded_layer.v.shape(), weight_shape);
-        assert_eq!(padded_layer.q_bias.shape(), bias_shape);
-        assert_eq!(padded_layer.k_bias.shape(), bias_shape);
-        assert_eq!(padded_layer.v_bias.shape(), bias_shape);
+        assert_eq!(*padded_layer.q.shape(), weight_shape);
+        assert_eq!(*padded_layer.k.shape(), weight_shape);
+        assert_eq!(*padded_layer.v.shape(), weight_shape);
+        assert_eq!(*padded_layer.q_bias.shape(), bias_shape);
+        assert_eq!(*padded_layer.k_bias.shape(), bias_shape);
+        assert_eq!(*padded_layer.v_bias.shape(), bias_shape);
 
         // check data in padded layer is the same of original layer
         [&layer.q, &layer.k, &layer.v]
@@ -1437,7 +1437,7 @@ mod tests {
             let expected_v = input.matmul(&v).add_dim2(&v_bias);
 
             let layer = QKV::<f32>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
-            let input_shape = input.shape();
+            let input_shape = input.shape().clone();
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[input_shape]).expect("qkv evaluation must be successful");
 
             prop_assert_eq!(expected_q.shape(), computed.outputs[0].shape());
@@ -1466,7 +1466,7 @@ mod tests {
             let expected_v = input.matmul(&v).add_dim2(&v_bias);
 
             let layer = QKV::<Element>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
-            let input_shape = input.shape();
+            let input_shape = input.shape().clone();
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[input_shape]).expect("qkv evaluation must be successful");
 
             prop_assert_eq!(expected_q.shape(), computed.outputs[0].shape());

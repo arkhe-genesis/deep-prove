@@ -256,9 +256,13 @@ where
             let trace = if let PaddingMode::NoPadding = self.padding_mode {
                 self.model
                     // TODO: make it re-usable at least for the static weights
-                    .run::<E>(&[tensor.clone()], Some(vec![tensor.shape()]), &mut store)
+                    .run::<E>(
+                        &[tensor.clone()],
+                        Some(vec![tensor.shape().clone()]),
+                        &mut store,
+                    )
             } else {
-                let unpadded_shape = tensor.shape();
+                let unpadded_shape = tensor.shape().clone();
                 let padded = tensor.pad_next_power_of_two();
                 info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
                 self.model

@@ -47,7 +47,7 @@ pub(crate) trait ZKMLBackend: burn::tensor::backend::Backend {
 
         let res: Tensor<Element> = input.conv2d(&kernels, &bias, config.stride);
 
-        let shape = res.shape();
+        let shape = res.shape().clone();
         Self::int_from_data(TensorData::new(res.into_data(), shape), &device)
     }
 }

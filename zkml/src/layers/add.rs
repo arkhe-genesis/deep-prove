@@ -186,11 +186,11 @@ impl Evaluate<f32> for Add<f32> {
             bail!("Add layer expects 1 or 2 inputs, got {}", inputs.len());
         };
 
-        let left = left.clone().into_btensor::<2>();
-        let right = right.clone().into_btensor::<2>();
+        let left = left.clone().to_btensor::<2>();
+        let right = right.clone().to_btensor::<2>();
         let res = left.add(right);
         let data = res.to_data().into_vec().expect("convert tensor to scalar");
-        let result = Tensor::<f32>::new(shape, data);
+        let result = Tensor::<f32>::new(shape.clone(), data);
         Ok(LayerOut::from_vec(vec![result]))
     }
 }
@@ -218,14 +218,14 @@ impl Evaluate<Element> for Add<Element> {
             }
         };
         let left_scaled = left_tensor.scalar_mul(&(quant_info.left_scale()));
-        let shape = left_scaled.shape();
+        let shape = left_scaled.shape().clone();
         let right_scaled = right_tensor.scalar_mul(&(quant_info.right_scale()));
 
         let left = left_scaled.into_btensor::<2>();
         let right = right_scaled.into_btensor::<2>();
         let res = left.add(right);
         let data = res.to_data().into_vec().expect("convert tensor to scalar");
-        let result = Tensor::<Element>::new(shape, data);
+        let result = Tensor::<Element>::new(shape.clone(), data);
         Ok(LayerOut::from_vec(vec![result]))
     }
 }
@@ -472,7 +472,9 @@ impl Add<f32> {
         };
         let quant_info = QuantInfo::new(&left_scaling, &right_scaling, &output_scaling);
         let quantized_model = Add::<Element> {
-            operand: self.operand.map(|(t, s)| (t.quantize(&right_scaling), s)),
+            operand: self
+                .operand
+                .map(|(t, s)| (t.to_quantized(&right_scaling), s)),
             quant_info: Some(quant_info.clone()),
         };
         // we need to decide if we need a requant layer or not, and if so, what the scaling factor should be
@@ -551,7 +553,7 @@ impl PadOp for Add<Element> {
         if let Some((op, og_shape)) = self.operand {
             ensure!(si.shapes.len() == 1, "Add layer expects 1 input shape");
             let op = op.pad_next_power_of_two();
-            let padded_shape = op.shape();
+            let padded_shape = op.shape().clone();
             self.operand = Some((op, og_shape.clone()));
             ShapeData::new(og_shape.clone());
             let sd = si.shapes.first_mut().unwrap();
@@ -684,8 +686,8 @@ mod test {
         let s1 = ScalingFactor::from_tensor(&t1, None);
         let s2 = ScalingFactor::from_tensor(&t2, None);
         let s3 = ScalingFactor::from_tensor(&t3, None);
-        let qt1 = t1.quantize(&s1); // x1_q = round(x1 / s1)
-        let qt2 = t2.quantize(&s2);
+        let qt1 = t1.to_quantized(&s1); // x1_q = round(x1 / s1)
+        let qt2 = t2.to_quantized(&s2);
         let qadd = add.quantize(&[s1, s2], s3).unwrap().quantized_op;
         let qadd_result = qadd
             .evaluate::<GoldilocksExt2>(&[&qt1, &qt2], &[vec![2, 2].into(), vec![2, 2].into()])
@@ -693,7 +695,7 @@ mod test {
 
         let scale = qadd.quant_info.as_ref().unwrap().common_scale() / s3.scale();
         let result_scaled = Tensor::<Element>::new(
-            qadd_result.outputs()[0].shape(),
+            qadd_result.outputs()[0].shape().clone(),
             qadd_result.outputs()[0]
                 .get_data()
                 .iter()
@@ -755,7 +757,7 @@ mod test {
     fn test_add_requant() {
         let t1 = Tensor::<f32>::random(&vec![4].into());
         let s1 = ScalingFactor::from_tensor(&t1, None);
-        let qt1 = t1.clone().quantize(&s1);
+        let qt1 = t1.clone().to_quantized(&s1);
         let ct1 = qt1.dequantize(&s1);
         println!("t1: {:?}", t1.get_data());
         println!("qt1: {:?}", qt1.get_data());

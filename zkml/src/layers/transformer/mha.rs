@@ -242,7 +242,10 @@ impl<N: Number> Mha<N> {
     {
         let unpadded_input_shapes = if unpadded_input_shapes.is_empty() {
             // take input shapes from inputs
-            inputs.iter().map(|input| input.shape()).collect::<Vec<_>>()
+            inputs
+                .iter()
+                .map(|input| input.shape().clone())
+                .collect::<Vec<_>>()
         } else {
             unpadded_input_shapes.to_vec()
         };
@@ -674,7 +677,7 @@ where
             &input_tensors.iter().collect_vec(),
             input_tensors
                 .iter()
-                .map(|input| input.shape())
+                .map(|input| input.shape().clone())
                 .collect::<Vec<_>>()
                 .as_slice(),
         )?;
@@ -1010,10 +1013,12 @@ mod test {
             assert_eq!(output.outputs.len(), 1);
             let qk = output.outputs.remove(0);
             // normally [1,seq_len] per head, so with all heads [num_heads, 1, seq_len]
-            assert_eq!(qk.shape(), vec![num_heads, q_len, seq_len].into());
-            let output_shapes =
-                mha_qk.output_shapes(&[q.shape(), k.shape()], PaddingMode::NoPadding);
-            assert_eq!(output_shapes, vec![qk.shape()]);
+            assert_eq!(*qk.shape(), vec![num_heads, q_len, seq_len].into());
+            let output_shapes = mha_qk.output_shapes(
+                &[q.shape().clone(), k.shape().clone()],
+                PaddingMode::NoPadding,
+            );
+            assert_eq!(output_shapes, vec![qk.shape().clone()]);
         }
     }
 
@@ -1043,14 +1048,16 @@ mod test {
                 .unwrap()
                 .final_mul;
             let mut output = mha_mul
-                .evaluate::<GoldilocksExt2>(&[&qk, &v], &[qk.shape(), v.shape()])
+                .evaluate::<GoldilocksExt2>(&[&qk, &v], &[qk.shape().clone(), v.shape().clone()])
                 .expect("mha_final_mul should not fail");
             assert_eq!(output.outputs.len(), 1);
             let out = output.outputs.remove(0);
-            assert_eq!(out.shape(), vec![q_len, num_heads, head_dim].into());
-            let output_shapes =
-                mha_mul.output_shapes(&[qk.shape(), v.shape()], PaddingMode::NoPadding);
-            assert_eq!(output_shapes, vec![out.shape()]);
+            assert_eq!(*out.shape(), vec![q_len, num_heads, head_dim].into());
+            let output_shapes = mha_mul.output_shapes(
+                &[qk.shape().clone(), v.shape().clone()],
+                PaddingMode::NoPadding,
+            );
+            assert_eq!(output_shapes, vec![out.shape().clone()]);
         }
     }
 
@@ -1496,7 +1503,7 @@ mod test {
             .evaluate::<GoldilocksExt2>(&[&input], &[])?;
         let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
             &[embedded.outputs()[0]],
-            &[embedded.outputs()[0].shape()],
+            &[embedded.outputs()[0].shape().clone()],
         )?;
 
         let input_shape = positioned.outputs()[0].shape();

@@ -143,7 +143,7 @@ fn convolution_layer(c: &mut Criterion) {
             |b, input| {
                 b.iter(|| {
                     convolution
-                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(&input_shape))
+                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(input_shape))
                         .expect("Convolution should succeed")
                 });
             },
@@ -163,7 +163,7 @@ fn convolution_layer(c: &mut Criterion) {
 
         let input_shape = input.shape();
         let convolution = Convolution::<Element>::new(kernels.clone(), bias.clone())
-            .into_padded_and_ffted(&input_shape);
+            .prepared_for_fft(input_shape);
 
         group.bench_with_input(
             BenchmarkId::new("convolution/Element", format!("{size}x{size}")),
@@ -171,7 +171,7 @@ fn convolution_layer(c: &mut Criterion) {
             |b, input| {
                 b.iter(|| {
                     convolution
-                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(&input_shape))
+                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(input_shape))
                         .expect("Convolution should succeed")
                 });
             },
@@ -197,7 +197,7 @@ fn embeddings_layer(c: &mut Criterion) {
             <f32 as Number>::MAX,
             Some((0, vocab_size as Element)),
         );
-        let input = input.quantize(&scaling);
+        let input = input.to_quantized(&scaling);
 
         let layer = Embeddings::<Element>::new(emb.clone()).unwrap();
 

@@ -368,7 +368,7 @@ impl Pooling {
         PCS::ProverParam: Send + Sync,
     {
         assert_eq!(input.rank(), 3, "Maxpool needs 3D inputs.");
-        let output_shapes = self.output_shapes(&[input.shape()], PaddingMode::Padding);
+        let output_shapes = self.output_shapes(&[input.shape().clone()], PaddingMode::Padding);
         let num_vars = Self::num_vars_for_outputs(output_shapes.as_slice())?;
         // Should only be one prover_info for this step
         let layer_commitment = prover.lookup_witness(id)?;

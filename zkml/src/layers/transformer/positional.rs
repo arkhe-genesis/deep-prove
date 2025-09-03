@@ -175,13 +175,13 @@ pub enum Positional<N> {
 impl<N: Number> Positional<N> {
     pub fn shape(&self) -> Shape {
         match self {
-            Self::Learned(pos) => pos.positional.shape(),
+            Self::Learned(pos) => pos.positional.shape().clone(),
             Self::Rope => unimplemented!("Rope not implemented"),
         }
     }
 
     pub fn new_learned(matrix: Tensor<N>) -> Self {
-        let unpadded_shape = matrix.shape();
+        let unpadded_shape = matrix.shape().clone();
         Self::Learned(Learned {
             positional: matrix,
             unpadded_shape,
@@ -348,7 +348,7 @@ impl QuantizeOp for Positional<f32> {
                 .quantize_op::<S>(data, node_id, &[input_scaling[0], pos_scaling])?;
 
         let quantized_pos = Learned {
-            positional: pos.positional.quantize(&pos_scaling),
+            positional: pos.positional.to_quantized(&pos_scaling),
             unpadded_shape: pos.unpadded_shape,
             past_length: Arc::new(Mutex::new(LearnedCache::new())),
             add_layer: quantized_add.quantized_op,
@@ -681,8 +681,8 @@ mod tests {
         };
 
         let padded_shape = padded_pos.positional.shape();
-        assert_eq!(padded_pos.unpadded_shape, positional_matrix.shape());
-        assert_eq!(padded_shape, positional_matrix.shape().next_power_of_two());
+        assert_eq!(padded_pos.unpadded_shape, *positional_matrix.shape());
+        assert_eq!(*padded_shape, positional_matrix.shape().next_power_of_two());
 
         // check that padded positional matrix has the same data of original matrix
         for i in 0..padded_shape[0] {

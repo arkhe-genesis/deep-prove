@@ -43,7 +43,7 @@ impl<T: Number> MatVec<T> {
     /// Note that it flattens the input vector, and the output is "flat" as in it's a vector.
     /// When integrating this into a convolution layer for example, one needs to reshape the output to the expected shape.
     pub fn op(&self, input: &Tensor<T>) -> Tensor<T> {
-        self.matrix.matvec(&input.flatten())
+        self.matrix.matvec(&input.to_flatten())
     }
     pub fn aux_info<E: ExtensionField>(&self) -> VPAuxInfo<E> {
         // we fix the rows variables during sumcheck so we only consider the columns

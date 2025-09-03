@@ -193,7 +193,7 @@ where
                         );
                         Ok((
                             ctx.unpadded_input_shapes[edge.index].clone(),
-                            self.io.input[edge.index].shape(),
+                            self.io.input[edge.index].shape().clone(),
                         ))
                     }
                 }))?;

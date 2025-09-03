@@ -278,6 +278,7 @@ pub mod file_cache {
         path::PathBuf,
         sync::LazyLock,
     };
+    use tracing::warn;
 
     // Directory to store cached files.
     static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -305,11 +306,21 @@ pub mod file_cache {
     ) -> anyhow::Result<T> {
         let path = CACHE_DIR.join(filename.as_ref());
         if path.exists() {
-            rmp_serde::from_read(BufReader::new(
+            match rmp_serde::from_read::<_, T>(BufReader::new(
                 std::fs::File::open(&path)
                     .with_context(|| format!("opening `{}`", path.display()))?,
             ))
             .context("deserializing target value")
+            {
+                Err(err) => {
+                    warn!("failed to retrieve data: {err:?}");
+                    warn!("deleting obsolete file `{}` and restarting", path.display());
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("deleting `{}`", path.display()))?;
+                    deserialize_or_create_with(filename, f)
+                }
+                t => t,
+            }
         } else {
             let t = f()?;
             rmp_serde::encode::write(
@@ -357,8 +368,8 @@ mod tests {
             .with_model_type(ModelType::MLP)
             .build()
             .unwrap();
-        let input =
-            crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0]).quantize(&md.input[0]);
+        let input = crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0])
+            .to_quantized(&md.input[0]);
         let input = model.prepare_inputs(vec![input]).unwrap();
         let trace = model
             .run::<F>(&input, None, &mut GenStore::default())
@@ -398,7 +409,7 @@ mod tests {
             .unpadded_input_shapes()
             .into_iter()
             .zip(&md.input)
-            .map(|(shape, s)| crate::tensor::Tensor::<f32>::random(&shape).quantize(s))
+            .map(|(shape, s)| crate::tensor::Tensor::<f32>::random(&shape).to_quantized(s))
             .collect();
         let input = model.prepare_inputs(inputs).unwrap();
         info!("RUNNING MODEL...");
@@ -451,7 +462,7 @@ mod tests {
             .unpadded_input_shapes()
             .into_iter()
             .zip(&md.input)
-            .map(|(shape, s)| crate::tensor::Tensor::<f32>::random(&shape).quantize(s))
+            .map(|(shape, s)| crate::tensor::Tensor::<f32>::random(&shape).to_quantized(s))
             .collect();
         let input = model.prepare_inputs(native_input).unwrap();
         let trace = model

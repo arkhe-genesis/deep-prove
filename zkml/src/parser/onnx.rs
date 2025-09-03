@@ -375,14 +375,14 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         return err(format!("Gemm {} has no constant input", node.name));
     };
     let mut weight = extract_const_tensor(model.node(weight_link.node))?;
-    let weight_shape = weight.shape();
+    let weight_shape = weight.shape().clone();
     if weight_shape.len() > 2 {
         let input_flattened = weight_shape[1..].iter().product::<usize>();
-        weight.set_shape(Shape::new(vec![weight_shape[0], input_flattened]));
+        weight.reshape(Shape::new(vec![weight_shape[0], input_flattened]));
     } else if weight_shape.len() == 1 {
         // A Gemm is always a matrix - so if there's only one dimension, we need to add 1 to
         // to the output features
-        weight.set_shape(weight_shape.insert(0, 1));
+        weight.reshape(weight_shape.insert(0, 1));
     };
     ensure_onnx!(
         weight.shape().is_matrix(),
@@ -413,7 +413,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         if *weight_shape.last().unwrap() == out_features {
             // Layout is likely [...in_features, out_features].
             let in_features = weight_size_flattened / out_features;
-            weight.set_shape(Shape::new(vec![in_features, out_features]));
+            weight.reshape(Shape::new(vec![in_features, out_features]));
             // Transpose to get [out_features, in_features] for subsequent logic.
             weight = weight.transpose();
         } else if weight_shape[0] == out_features {
@@ -425,7 +425,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
                 in_features,
                 input_size_flattened
             );
-            weight.set_shape(Shape::new(vec![out_features, in_features]));
+            weight.reshape(Shape::new(vec![out_features, in_features]));
         } else {
             return err(format!(
                 "Could not determine layout of weights for Gemm. Shape: {weight_shape:?}, expecting output dim of size {out_features}"
@@ -552,7 +552,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
             "Bias tensor must be 1D with batch: {:?}",
             bias_tensor.shape()
         );
-        bias_tensor.set_shape(bias_tensor.shape().slice(1..));
+        bias_tensor.reshape(bias_tensor.shape().slice(1..));
     }
     ensure_onnx!(
         bias_tensor.shape()[0] == weight.shape()[0],
