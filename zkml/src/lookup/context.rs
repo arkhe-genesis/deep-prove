@@ -136,7 +136,7 @@ impl SoftmaxTableData {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-/// Struct used to store Softmax table data
+/// Struct used to store inverse square root table data.
 pub struct InverseSQRTTableData {
     /// This is the result of calling [`f32::to_bits`] on the epsilon value.
     eps_bits: u32,
@@ -154,6 +154,11 @@ impl InverseSQRTTableData {
 
     pub(crate) fn float_epsilon(&self) -> f32 {
         f32::from_bits(self.eps_bits)
+    }
+
+    /// Returns this LUT's `range_check_bits`.
+    pub(crate) fn range_check_bits(&self) -> usize {
+        self.range_check_bits
     }
 
     pub(crate) fn table_output(&self, j: Element) -> Element {

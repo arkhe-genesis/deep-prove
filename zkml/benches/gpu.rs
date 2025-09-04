@@ -13,7 +13,7 @@ use zkml::{
         flatten::Flatten,
         matrix_mul::{self, MatMul},
         provable::Evaluate,
-        transformer::{embeddings::Embeddings, logits::Logits, qkv::QKV},
+        transformer::{embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, qkv::QKV},
     },
     tensor::Number,
 };
@@ -328,7 +328,11 @@ fn matrix_mul_layer(c: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("matrix_mul/Element", format!("{size}x{size}")),
             |b| {
-                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]));
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
+                        .expect("MatMul should succeed")
+                });
             },
         );
     }
@@ -351,7 +355,11 @@ fn matrix_mul_layer(c: &mut Criterion) {
         group.bench_function(
             BenchmarkId::new("matrix_mul/f32", format!("{size}x{size}")),
             |b| {
-                b.iter(|| layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]));
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
+                        .expect("MatMul should succeed")
+                });
             },
         );
     }
@@ -436,13 +444,25 @@ fn logits_layer(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("logits/f32", format!("{rows}x{cols}")),
             &input_f32,
-            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+            |b, input| {
+                b.iter(|| {
+                    logits
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Logits should succeed")
+                })
+            },
         );
         let input_elem = Tensor::<Element>::random(&shape);
         group.bench_with_input(
             BenchmarkId::new("logits/Element", format!("{rows}x{cols}")),
             &input_elem,
-            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+            |b, input| {
+                b.iter(|| {
+                    logits
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Logits should succeed")
+                })
+            },
         );
     }
 
@@ -454,14 +474,90 @@ fn logits_layer(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("logits_higher_rank/f32", format!("{d1}x{d2}x{d3}")),
             &input_f32,
-            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+            |b, input| {
+                b.iter(|| {
+                    logits
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Logits should succeed")
+                })
+            },
         );
         let input_elem = Tensor::<Element>::random(&shape);
         group.bench_with_input(
             BenchmarkId::new("logits_higher_rank/Element", format!("{d1}x{d2}x{d3}")),
             &input_elem,
-            |b, input| b.iter(|| logits.evaluate::<GoldilocksExt2>(&[input], &[])),
+            |b, input| {
+                b.iter(|| {
+                    logits
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Logits should succeed")
+                })
+            },
         );
+    }
+
+    group.finish();
+}
+
+fn norm_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    let eps = 1e-5;
+    for dim0_pow2 in 1..5 {
+        for dim1_pow2 in DATA_SIZE_POWS {
+            let dim0 = 1 << dim0_pow2;
+            let dim1 = 1 << dim1_pow2;
+
+            let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
+            let gamma = Tensor::<Element>::random(&Shape::new(vec![dim1]));
+            let beta = Tensor::<Element>::random(&Shape::new(vec![dim1]));
+
+            let layer = LayerNorm::<Element>::new(gamma, beta, eps);
+
+            let input_scaling = ScalingFactor::from_tensor(&input, None);
+            let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
+
+            group.bench_with_input(
+                BenchmarkId::new("norm/Element", format!("{dim0}x{dim1}")),
+                &input,
+                |b, input| {
+                    b.iter(|| {
+                        layer
+                            .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![dim0, dim1])])
+                            .expect("Norm should succeed")
+                    });
+                },
+            );
+        }
+    }
+
+    let eps = 1e-5;
+    for dim0_pow2 in 1..5 {
+        for dim1_pow2 in DATA_SIZE_POWS {
+            let dim0 = 1 << dim0_pow2;
+            let dim1 = 1 << dim1_pow2;
+
+            let input = Tensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
+            let gamma = Tensor::<f32>::random(&Shape::new(vec![dim1]));
+            let beta = Tensor::<f32>::random(&Shape::new(vec![dim1]));
+
+            let layer = LayerNorm::<f32>::new(gamma, beta, eps);
+
+            group.bench_with_input(
+                BenchmarkId::new("norm/f32", format!("{dim0}x{dim1}")),
+                &input,
+                |b, input| {
+                    b.iter(|| {
+                        layer
+                            .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![dim0, dim1])])
+                            .expect("Norm should succeed")
+                    });
+                },
+            );
+        }
     }
 
     group.finish();
@@ -477,6 +573,7 @@ criterion_group!(
     gelu_layer,
     matrix_mul_layer,
     qkv_layer,
-    logits_layer
+    logits_layer,
+    norm_layer,
 );
 criterion_main!(benches);

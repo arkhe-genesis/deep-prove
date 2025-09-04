@@ -9,7 +9,6 @@ use anyhow::{Result, anyhow, ensure};
 use ark_std::Zero;
 use either::Either;
 use ff_ext::ExtensionField;
-use itertools::izip;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     Expression,
@@ -71,10 +70,17 @@ pub(crate) const LAYERNORM_OUTPUT_SCALE_FACTOR: usize = 1 << 10;
 const GAMMA_POLY_ID: &str = "LayerNormGamma";
 const BETA_POLY_ID: &str = "LayerNormBeta";
 
+/// Struct storing all information needed to perform LayerNorm.
+///
+/// The `gamma` and `beta` fields are normally learned parameters that are
+/// applied elementwise. The `eps` field is used for normalisation when
+/// calculating the inverse square root.
+///
+/// # References
+///
+/// - PyTorch's [LayerNorm](https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html)
+/// - [Layer Normalization](https://arxiv.org/abs/1607.06450) paper
 #[derive(Debug, Clone, Serialize, Deserialize)]
-/// Struct storing all information needed to perform LayerNorm. The `gamma` and `beta` fields
-/// are normally learned parameters that are applied elementwise. The `eps` field is used for normalisation when calculating
-/// the inverse square root.
 pub struct LayerNorm<N> {
     /// Each element of the normalisation dimension is multiplied elementwise by this
     pub gamma: Tensor<N>,
@@ -98,8 +104,6 @@ pub struct QuantisedLayerNormData {
     lut: InverseSQRTTableData,
     /// The size of the dimension we average over
     dim_size: usize,
-    /// This is the number of bits that get range checked
-    range_check_bits: usize,
     /// The base 2 log of the value we have to multiply the most significant range check chunk by
     top_chunk_scalar_log: usize,
 }
@@ -107,17 +111,33 @@ pub struct QuantisedLayerNormData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Data obtained during quantised evaluation of [`LayerNorm`] that is used during proving
 pub struct LayerNormData {
-    /// The input of the inverse square root lookup
-    lookup_input: Vec<Element>,
     /// The output of the inverse square root lookup
     lookup_output: Vec<Element>,
-    /// The part of the input that need to be range checked
-    range_check: Vec<Element>,
+
+    /// The full value of the input.
+    ///
+    /// Both the part of the input that need to be range checked and the input
+    /// of the inverse square root lookup can be derived from this value.
+    full_value: Vec<Element>,
 }
 
 impl<N: Number> LayerNorm<N> {
     pub fn new(gamma: Tensor<N>, beta: Tensor<N>, eps: f32) -> Self {
-        assert_eq!(gamma.shape(), beta.shape());
+        assert_eq!(
+            gamma.shape(),
+            beta.shape(),
+            "Gamma and beta shape must match. gamma {:?} beta {:?}",
+            gamma.shape(),
+            beta.shape(),
+        );
+        assert_eq!(
+            gamma.rank(),
+            1,
+            "Gamma and beta must be 1D. gamma {:?} beta {:?}",
+            gamma.shape(),
+            beta.shape(),
+        );
+
         Self {
             gamma,
             beta,
@@ -140,7 +160,7 @@ impl<N: Number> LayerNorm<N> {
     /// constant [`LAYERNORM_SCALE_FACTOR`] as the input column scale factor. We need to work out how big the table needs to be to cover
     /// all of our possible inputs.
     ///
-    /// This method reutnrs the quantised [`LayerNorm`] as well as the `intermediate_bit_size` for the following requant layer.
+    /// This method returns the quantised [`LayerNorm`] as well as the `intermediate_bit_size` for the following requant layer.
     pub fn quantise(
         &self,
         input_scaling: ScalingFactor,
@@ -197,7 +217,6 @@ impl<N: Number> LayerNorm<N> {
             multiplier,
             lut: table_data,
             dim_size,
-            range_check_bits: range_checked_bits,
             top_chunk_scalar_log,
         };
 
@@ -363,8 +382,14 @@ impl Evaluate<f32> for LayerNorm<f32> {
         inputs: &[&Tensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
-        assert!(inputs.len() == 1);
+        assert_eq!(
+            inputs.len(),
+            1,
+            "Exactly one input must be provided to layer norm. got {}",
+            inputs.len(),
+        );
         let input = inputs[0];
+
         ensure!(
             input.rank() == 2,
             "layernorm input must have shape [seq_len, embedding_size]: found {:?}",
@@ -403,71 +428,130 @@ impl Evaluate<Element> for LayerNorm<Element> {
         // First we check to see if there is any quant_info, if not error
         ensure!(
             self.quant_info.is_some(),
-            "Cannot perform quantised LayerNorm evaluation if self.quant_info is None"
+            "Cannot perform quantised LayerNorm evaluation if self.quant_info is None",
         );
         // Ensure we have a single input
         ensure!(
             inputs.len() == 1,
             "LayerNorm should have a single input, had: {}",
-            inputs.len()
+            inputs.len(),
         );
         let input = inputs[0];
+
+        assert_eq!(self.gamma.rank(), 1, "Gamma must be 1D");
+        assert_eq!(self.beta.rank(), 1, "Beta must be 1D");
 
         let QuantisedLayerNormData {
             multiplier,
             lut,
             dim_size,
-            range_check_bits,
             ..
-        } = self.quant_info.as_ref().unwrap();
+        } = self
+            .quant_info
+            .as_ref()
+            .ok_or(anyhow!("Missing QuantisedLayerNormData"))?;
 
         // So we need to take the input data and calculate `N * multiplier * SUM (xi * xi) - multiplier * (SUM xi) * (SUM xi)`
         let final_dim = *input.shape().last().ok_or(anyhow!(
-            "Cannot evaluate LayerNorm, input didn't have a shape"
+            "Cannot evaluate LayerNorm, input didn't have a shape",
         ))?;
 
-        let range_check_mask: Element = (1 << range_check_bits) - 1;
+        assert_eq!(
+            final_dim,
+            self.gamma.dim(0),
+            "Input's final dimension must be equal to gamma's size. input: {:?} gamma: {:?}",
+            input.shape(),
+            self.gamma.shape(),
+        );
+        assert_eq!(
+            final_dim,
+            self.beta.dim(0),
+            "Input's final dimension must be equal to beta's size. input: {:?} beta: {:?}",
+            input.shape(),
+            self.beta.shape(),
+        );
 
-        let ((inv_sqrt_input, inv_sqrt_output), range_check): (
-            (Vec<Element>, Vec<Element>),
-            Vec<Element>,
-        ) = input
-            .get_data()
-            .chunks(final_dim)
-            .map(|chunk| {
-                let sum_squares = chunk.iter().map(|x| *x * *x).sum::<Element>();
-                let sum = chunk.iter().sum::<Element>();
-                let full_value =
-                    *dim_size as Element * multiplier * sum_squares - multiplier * sum * sum;
-                let range_checked = full_value & range_check_mask;
-                let inv_sqrt = full_value >> range_check_bits;
-                let inv_sqrt_output = lut.table_output(inv_sqrt);
-                ((inv_sqrt, inv_sqrt_output), range_checked)
-            })
-            .unzip();
+        let shape = input.shape();
 
-        let output_data = input
-            .get_data()
-            .chunks(final_dim)
-            .zip(inv_sqrt_output.iter())
-            .flat_map(|(input_chunk, denominator)| {
-                let sum = input_chunk.iter().sum::<Element>();
-                izip!(input_chunk, self.gamma.get_data(), self.beta.get_data())
-                    .map(|(&v, &gamma, &beta)| {
-                        gamma * (*dim_size as Element * v - sum) * *denominator + beta
-                    })
-                    .collect::<Vec<Element>>()
-            })
-            .collect::<Vec<Element>>();
+        let input = input.clone().into_btensor::<2>();
+        let sum = input.clone().sum_dim(1);
+        let square_sum = sum.clone() * sum.clone();
+        let sum_square = (input.clone() * input.clone()).sum_dim(1);
 
-        // Make the proving data
+        // NOTE: can not use mul_scalar here due to tracel-ai/burn#3659
+        //
+        // let full_value = sum_square.mul_scalar(*dim_size as Element * multiplier)
+        //     - square_sum.mul_scalar(*multiplier);
+
+        let multiplier = sum_square.full_like(*multiplier);
+        let full_value = sum_square.mul(multiplier.clone().mul_scalar(*dim_size as Element))
+            - square_sum.mul(multiplier);
+
+        let value = full_value
+            .clone()
+            // clear low bits
+            .bitwise_right_shift_scalar(lut.range_check_bits() as Element)
+            .bitwise_left_shift_scalar(lut.range_check_bits() as Element)
+            .float();
+
+        let inv_sqrt = value
+            // compute `v/LAYERNORM_SCALE_FACTOR + eps`
+            .div_scalar(LAYERNORM_SCALE_FACTOR as f32)
+            .add_scalar(lut.float_epsilon())
+            // compute `1/sqrt(v)`
+            .sqrt()
+            .recip()
+            .mul_scalar(LAYERNORM_OUTPUT_SCALE_FACTOR as f32)
+            .round()
+            .int();
+
+        let gamma = self
+            .gamma
+            .clone()
+            .into_btensor::<1>()
+            .unsqueeze_dim::<2>(0)
+            .expand([shape.dim(0) as i32, -1]);
+
+        let beta = self
+            .beta
+            .clone()
+            .into_btensor::<1>()
+            .unsqueeze_dim::<2>(0)
+            .expand([shape.dim(0) as i32, -1]);
+
+        let denominator = inv_sqrt
+            .clone()
+            .unsqueeze::<2>()
+            .expand([-1, final_dim as i32]);
+
+        let output = input
+            .mul_scalar(*dim_size as Element)
+            .sub(sum)
+            .mul(gamma)
+            .mul(denominator)
+            .add(beta);
+
+        let lookup_output = inv_sqrt
+            .to_data()
+            .into_vec()
+            .expect("Failed to compute LayerNorm");
+        let full_value = full_value
+            .to_data()
+            .into_vec()
+            .expect("Failed to compute LayerNorm");
+
         let layernorm_data = LayerNormData {
-            lookup_input: inv_sqrt_input,
-            lookup_output: inv_sqrt_output,
-            range_check,
+            lookup_output,
+            full_value,
         };
 
-        let output_tensor = Tensor::<Element>::new(input.shape().clone(), output_data);
+        let output_tensor = Tensor::<Element>::new(
+            shape.clone(),
+            output
+                .to_data()
+                .into_vec()
+                .expect("Failed to compute LayerNorm"),
+        );
         Ok(LayerOut::from_tensor(output_tensor)
             .with_proving_data(ProvingData::LayerNorm(layernorm_data)))
     }
@@ -475,6 +559,11 @@ impl Evaluate<Element> for LayerNorm<Element> {
 
 fn is_close_to_integer(x: f32, tol: f32) -> bool {
     (x - x.round_ties_even()).abs() < tol
+}
+
+/// Given a `bit` position, return the bitmask to all bits equal to or lower than it.
+fn bit_to_mask(bit: usize) -> Element {
+    (1 << bit) - 1
 }
 
 impl Requant {
@@ -598,7 +687,6 @@ impl ProveInfo for LayerNorm<Element> {
             let QuantisedLayerNormData {
                 multiplier,
                 dim_size,
-                range_check_bits,
                 top_chunk_scalar_log,
                 lut,
                 ..
@@ -608,7 +696,7 @@ impl ProveInfo for LayerNorm<Element> {
             aux.tables.insert(TableType::Range);
             aux.tables.insert(TableType::InverseSQRT(*lut));
 
-            let num_range_checks = (*range_check_bits - 1) / *quantization::BIT_LEN + 1;
+            let num_range_checks = (lut.range_check_bits() - 1) / *quantization::BIT_LEN + 1;
             let tables = vec![TableType::Range, TableType::InverseSQRT(*lut)];
             let instances_per_table = vec![num_range_checks, 1];
 
@@ -639,7 +727,7 @@ impl ProveInfo for LayerNorm<Element> {
                 LayerCtx::LayerNorm(LayerNormCtx {
                     node_id: id,
                     eps: self.eps.to_bits(),
-                    range_check_bits: *range_check_bits,
+                    range_check_bits: lut.range_check_bits(),
                     dim_size: *dim_size,
                     multiplier: *multiplier,
                     top_chunk_scalar_log: *top_chunk_scalar_log,
@@ -1014,21 +1102,26 @@ impl LayerNorm<Element> {
         let mut wit_gen = LookupWitnessGen::<E, PCS>::default();
         // Get the data generated during quantised evaluation
         let LayerNormData {
-            lookup_input,
+            full_value,
             lookup_output,
-            range_check,
         } = layernorm_data;
 
         // We need to work out how many chunks to split the shifted away part into to be range checked
         let QuantisedLayerNormData {
-            range_check_bits,
             top_chunk_scalar_log,
             lut,
             ..
         } = self.quant_info().ok_or(anyhow!(
             "Could not prove LayerNorm because it had no quantisation data"
         ))?;
-        let number_range_checks = (range_check_bits - 1) / *quantization::BIT_LEN + 1;
+        let number_range_checks = (lut.range_check_bits() - 1) / *quantization::BIT_LEN + 1;
+
+        let range_check_mask: Element = bit_to_mask(lut.range_check_bits());
+        let lookup_input: Vec<Element> = full_value
+            .iter()
+            .map(|v| v >> lut.range_check_bits())
+            .collect();
+        let range_check: Vec<Element> = full_value.iter().map(|v| v & range_check_mask).collect();
 
         // Split `range_check` into its constituent parts
         let range_mask: Element = (1 << *quantization::BIT_LEN) - 1;
@@ -1270,11 +1363,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fmt::{Debug, Display},
+        ops::Range,
+    };
+
     use ff_ext::GoldilocksExt2;
+    use itertools::izip;
+    use proptest::prelude::*;
 
     use crate::{
         init_test_logging_default,
-        layers::Layer,
+        layers::{Evaluate, Layer},
         model::{Model, test::prove_model},
         tensor::is_close_with_tolerance,
     };
@@ -1375,5 +1475,206 @@ mod tests {
         model.route_output(None).unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    #[derive(Clone)]
+    struct Input<T> {
+        input: Tensor<T>,
+        beta: Tensor<T>,
+        gamma: Tensor<T>,
+    }
+
+    impl<T: Debug> Debug for Input<T> {
+        fn fmt(
+            &self,
+            fmt: &mut std::fmt::Formatter<'_>,
+        ) -> std::result::Result<(), std::fmt::Error> {
+            fmt.debug_struct("Input")
+                .field("input", &format_args!("{:?}", self.input))
+                .field("beta", &format_args!("{:?}", self.beta))
+                .field("gamma", &format_args!("{:?}", self.gamma))
+                .finish()
+        }
+    }
+
+    impl<T> Display for Input<T> {
+        fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+            write!(
+                fmt,
+                "Input{{input: {:?}, beta: {:?}, gamma: {:?}}}",
+                self.input.shape(),
+                self.beta.shape(),
+                self.gamma.shape(),
+            )
+        }
+    }
+
+    fn input<T: Number>(dim0: Range<usize>, dim1: Range<usize>) -> impl Strategy<Value = Input<T>> {
+        (dim0, dim1).prop_flat_map(|(dim0, dim1)| {
+            let input = Tensor::any(Shape::new(vec![dim0, dim1]));
+            let beta = Tensor::any(Shape::new(vec![dim1]));
+            let gamma = Tensor::any(Shape::new(vec![dim1]));
+            (input, beta, gamma).prop_map(|(input, beta, gamma)| Input { input, beta, gamma })
+        })
+    }
+
+    fn evaluate(
+        input: &Tensor<Element>,
+        beta: &Tensor<Element>,
+        gamma: &Tensor<Element>,
+        quant_info: &QuantisedLayerNormData,
+    ) -> (Vec<Element>, Vec<Element>, Vec<Element>) {
+        let QuantisedLayerNormData {
+            multiplier,
+            lut,
+            dim_size,
+            ..
+        } = quant_info;
+        let final_dim = *input.shape().last().unwrap();
+
+        let (inv_sqrt_output, full_value): (Vec<Element>, Vec<Element>) = input
+            .get_data()
+            .chunks(final_dim)
+            .map(|chunk| {
+                let sum_squares = chunk.iter().map(|x| *x * *x).sum::<Element>();
+                let sum = chunk.iter().sum::<Element>();
+                let full_value =
+                    *dim_size as Element * multiplier * sum_squares - multiplier * sum * sum;
+                let inv_sqrt = full_value >> lut.range_check_bits();
+                let inv_sqrt_output = lut.table_output(inv_sqrt);
+
+                (inv_sqrt_output, full_value)
+            })
+            .unzip();
+
+        let output_data = input
+            .get_data()
+            .chunks(final_dim)
+            .zip(inv_sqrt_output.iter())
+            .flat_map(|(input_chunk, denominator)| {
+                let sum = input_chunk.iter().sum::<Element>();
+                izip!(input_chunk, gamma.get_data(), beta.get_data())
+                    .map(|(&v, &gamma, &beta)| {
+                        gamma * (*dim_size as Element * v - sum) * *denominator + beta
+                    })
+                    .collect::<Vec<Element>>()
+            })
+            .collect::<Vec<Element>>();
+
+        (inv_sqrt_output, full_value, output_data)
+    }
+
+    #[test]
+    fn test_layernorm_simple() {
+        let dim0 = 2;
+        let dim1 = 5;
+
+        let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
+        let gamma = Tensor::<Element>::random(&Shape::new(vec![dim1]));
+        let beta = Tensor::random(&Shape::new(vec![dim1]));
+
+        // NOTE:
+        // Layer quantisation changes the values of beta and gamma, use the
+        // values stored in the layer for the comparison.
+        let layer = LayerNorm::new(gamma, beta, 1e-5);
+        let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
+
+        let expected = evaluate(
+            &input,
+            &layer.beta,
+            &layer.gamma,
+            layer.quant_info.as_ref().unwrap(),
+        );
+        let result = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+        assert_eq!(result.outputs()[0].data(), &expected.2, "Output mismatch");
+
+        let expected_proof_data = result.try_layernorm_data().unwrap();
+        assert_eq!(
+            &expected_proof_data.full_value, &expected.1,
+            "Full value mismatch"
+        );
+        assert_eq!(
+            &expected_proof_data.lookup_output, &expected.0,
+            "Lookup output mismatch"
+        );
+    }
+
+    /// Ensures the CPU and GPU implementation agrees on the rounding of 0.5 values.
+    ///
+    /// The values of the test below have been found via property testing.
+    #[test]
+    fn test_regression_layernorm_rounding() {
+        let dim0 = 2;
+        let dim1 = 25;
+
+        let input = Tensor::<Element>::new(
+            Shape::new(vec![dim0, dim1]),
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 69,
+                -126, -128, 105, -111, -47, 89, -113, 9, -64, 42, -111, 54, 104, 62, 127, 12, 84,
+                7, -54, -80, 0, -122, -41,
+            ],
+        );
+        let gamma = Tensor::<Element>::new(
+            Shape::new(vec![dim1]),
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+        let beta = Tensor::new(
+            Shape::new(vec![dim1]),
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+
+        // NOTE:
+        // Layer quantisation changes the values of beta and gamma, use the
+        // values stored in the layer for the comparison.
+        let layer = LayerNorm::new(gamma, beta, 1e-5);
+        let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
+
+        let expected = evaluate(
+            &input,
+            &layer.beta,
+            &layer.gamma,
+            layer.quant_info.as_ref().unwrap(),
+        );
+        let result = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+        assert_eq!(result.outputs()[0].data(), &expected.2, "Output mismatch");
+
+        let expected_proof_data = result.try_layernorm_data().unwrap();
+        assert_eq!(
+            &expected_proof_data.full_value, &expected.1,
+            "Full value mismatch"
+        );
+        assert_eq!(
+            &expected_proof_data.lookup_output, &expected.0,
+            "Lookup output mismatch"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_layer_norm_evaluate_element(input in input(1usize..64, 1usize..64)) {
+            // NOTE:
+            // Layer quantisation changes the values of beta and gamma, use the
+            // values stored in the layer for the comparison.
+            let data = input.clone();
+            let layer = LayerNorm::new(input.gamma, input.beta, 1e-5);
+            let input_scaling = ScalingFactor::from_tensor(&input.input, None);
+            let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
+
+            let expected = evaluate(&input.input, &layer.beta, &layer.gamma, layer.quant_info.as_ref().unwrap());
+            let result = layer.evaluate::<GoldilocksExt2>(&[&input.input], &[]).unwrap();
+            prop_assert_eq!(result.outputs()[0].data(), &expected.2, "Output mismatch. input {:?}", data);
+
+            let expected_proof_data = result.try_layernorm_data().unwrap();
+            prop_assert_eq!(&expected_proof_data.full_value, &expected.1, "Full value mismatch. input {:?}", data);
+            prop_assert_eq!(&expected_proof_data.lookup_output, &expected.0, "Lookup output mismatch. input {:?}", data);
+        }
+
     }
 }
