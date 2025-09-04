@@ -29,7 +29,7 @@ use super::ZKMLBackend;
 /// which calls the kernel the correct number of times, otherwise there will be
 /// extra invocations.
 fn fit_to_cube(total: u32, (max_x, max_y, max_z): (u32, u32, u32)) -> CubeCount {
-    let maximum = max_x * max_y * max_z;
+    let maximum = max_x.saturating_mul(max_y.saturating_mul(max_z));
     assert!(
         total <= maximum,
         "Request number of calls exceeds the maximum supported. requested {total} maximum {maximum}"
