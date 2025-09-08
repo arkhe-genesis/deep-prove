@@ -221,8 +221,8 @@ impl Evaluate<Element> for Add<Element> {
         let shape = left_scaled.shape().clone();
         let right_scaled = right_tensor.scalar_mul(&(quant_info.right_scale()));
 
-        let left = left_scaled.into_btensor::<2>();
-        let right = right_scaled.into_btensor::<2>();
+        let left = left_scaled.to_btensor::<2>();
+        let right = right_scaled.to_btensor::<2>();
         let res = left.add(right);
         let data = res.to_data().into_vec().expect("convert tensor to scalar");
         let result = Tensor::<Element>::new(shape.clone(), data);

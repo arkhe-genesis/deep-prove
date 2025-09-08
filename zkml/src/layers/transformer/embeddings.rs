@@ -258,8 +258,8 @@ impl Evaluate<Element> for Embeddings<Element> {
         let emb = &w.tensor;
         let emb_size = emb.shape()[1];
 
-        let weights = emb.clone().into_btensor::<2>();
-        let indices = input.clone().into_btensor::<1>();
+        let weights = emb.clone().to_btensor::<2>();
+        let indices = input.clone().to_btensor::<1>();
 
         let res = Backend::int_select(weights.into_primitive(), 0, indices.into_primitive());
 

@@ -745,7 +745,7 @@ impl Tensor<Element> {
     }
 
     /// Consumes this tensor and creates a [burn::tensor::Tensor].
-    pub fn into_btensor<const D: usize>(&self) -> BTensor<Backend, D, Int> {
+    pub fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D, Int> {
         IntoBTensor::to_btensor(self)
     }
 }
@@ -1634,37 +1634,77 @@ impl<'a, T> TensorSlice<'a, T> {
     }
 }
 impl<T: Default + Clone + Copy> Tensor<T> {
-    /// Permute a tensor, changing its shape according to the `order` specified as input.
-    /// The `i`-th entry in the `order` vector specifies which dimension of the original
+    /// Permute a tensor.
+    ///
+    /// The tensor's dimensions will be moved according to `order`. The `i`-th
+    /// entry in the `order` vector specifies which dimension of the original
     /// tensor should become the `i`-th dimension of the output tensor.
-    /// For instance, given an input tensor with shape `[7, 14, 23]` and `order = [2, 0, 1]`,
-    /// then the shape of the output tensor will be `[23, 7, 14]`
+    ///
+    /// ```
+    /// # use zkml::{Tensor, Shape};
+    /// let tensor = Tensor::<i64>::random(&Shape::new(vec![2,3,5]));
+    /// let permuted = tensor.permute3d(&[2,1, 0]);
+    /// assert_eq!(tensor.dim(0), permuted.dim(2));
+    /// assert_eq!(tensor.dim(1), permuted.dim(1));
+    /// assert_eq!(tensor.dim(2), permuted.dim(0));
+    /// ```
     pub fn permute3d(&self, order: &[usize]) -> Self {
-        assert!(self.shape.len() == 3 && order.len() == 3);
-        assert!(order.iter().all(|x| *x < 3));
-        let (a, b, c) = (self.shape[0], self.shape[1], self.shape[2]);
-        let new_a = self.shape[order[0]];
-        let new_b = self.shape[order[1]];
-        let new_c = self.shape[order[2]];
-        let new_shape = vec![new_a, new_b, new_c].into();
-        let mut data = vec![T::default(); a * b * c];
+        assert!(
+            self.rank() == 3,
+            "Current tensor must be 3D. got {}",
+            self.rank(),
+        );
+        assert!(
+            order.len() == 3,
+            "New order must be 3D. got {}",
+            order.len(),
+        );
+        let count = order.iter().filter(|x| **x < 3).sorted().dedup().count();
+        assert!(
+            count == 3,
+            "Order must have unique elements 0, 1, 2. got {order:?}",
+        );
+
+        // Special case, do nothing
+        if order == [0, 1, 2] {
+            return self.clone();
+        }
+
+        let new_shape = Shape::new(vec![
+            self.dim(order[0]),
+            self.dim(order[1]),
+            self.dim(order[2]),
+        ]);
+
+        // reverse map from old position of a dimension to its new position
+        let old_to_new = [
+            order.iter().position(|v| *v == 0).unwrap(),
+            order.iter().position(|v| *v == 1).unwrap(),
+            order.iter().position(|v| *v == 2).unwrap(),
+        ];
+        let new_strides = new_shape.strides();
+        let reverse_strides = [
+            new_strides[old_to_new[0]],
+            new_strides[old_to_new[1]],
+            new_strides[old_to_new[2]],
+        ];
+
+        let (a, b, c) = (self.dim(0), self.dim(1), self.dim(2));
+        let mut pos = 0;
+        let mut data = vec![T::default(); self.shape.numel()];
+
         for i in 0..a {
             for j in 0..b {
                 for k in 0..c {
-                    let old_loc = i * b * c + j * c + k;
-                    let pos = [i, j, k];
-                    let new_i = pos[order[0]];
-                    let new_j = pos[order[1]];
-                    let new_k = pos[order[2]];
-                    let new_loc = new_i * new_b * new_c + new_j * new_c + new_k;
-                    assert!(
-                        new_loc < new_a * new_b * new_c,
-                        "Failed for {i}, {j}, {k} and {new_i}, {new_j}, {new_k}"
-                    );
-                    data[new_loc] = self.data[old_loc];
+                    let new_loc =
+                        i * reverse_strides[0] + j * reverse_strides[1] + k * reverse_strides[2];
+
+                    data[new_loc] = self.data[pos];
+                    pos += 1;
                 }
             }
         }
+
         Self {
             data,
             shape: new_shape,
@@ -2903,13 +2943,20 @@ mod test {
 
     #[test]
     fn test_tensor_permute3d() {
+        #[rustfmt::skip]
         let tensor = Tensor::<Element>::new(
             vec![2, 3, 3].into(),
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                1, 2, 3,
+                4, 5, 6,
+                7, 8, 9,
+
+                10, 11, 12,
+                13, 14, 15,
+                16, 17, 18,
             ],
         );
-        // i,j,k --> j,i,k -> new shape = 3,2,3
+
         let permuted = tensor.permute3d(&[1, 0, 2]);
         assert_eq!(*permuted.shape(), vec![3, 2, 3].into());
         for i in 0..2 {
@@ -2925,7 +2972,7 @@ mod test {
 
         let tensor = Tensor::<Element>::random(&vec![18, 5, 27].into());
         let permuted = tensor.permute3d(&[1, 2, 0]);
-        assert_eq!(*permuted.shape(), vec![5, 27, 18].into())
+        assert_eq!(*permuted.shape(), Shape::new(vec![5, 27, 18]));
     }
 
     #[test]
@@ -3182,6 +3229,51 @@ mod test {
             let t = Tensor::<Element>::random(&shape);
 
             assert_eq!(t.pad_next_power_of_two(), pad_next_power_of_two(&t), "original: {t:?}");
+        }
+
+        #[test]
+        fn proptest_tensor_permute3d(a in 2usize..128, b in 2usize..128, c in 2usize..128) {
+            fn permute3d<T: Default + Copy>(tensor: &Tensor<T>, order: &[usize]) -> Tensor<T> {
+                let (a, b, c) = (tensor.shape[0], tensor.shape[1], tensor.shape[2]);
+                let new_a = tensor.shape[order[0]];
+                let new_b = tensor.shape[order[1]];
+                let new_c = tensor.shape[order[2]];
+
+                let mut data = vec![T::default(); tensor.shape.numel()];
+                for i in 0..a {
+                    for j in 0..b {
+                        for k in 0..c {
+                            let old_loc = i * b * c + j * c + k;
+                            let pos = [i, j, k];
+                            let new_i = pos[order[0]];
+                            let new_j = pos[order[1]];
+                            let new_k = pos[order[2]];
+                            let new_loc = new_i * new_b * new_c + new_j * new_c + new_k;
+                            data[new_loc] = tensor.data[old_loc];
+                        }
+                    }
+                }
+                Tensor {
+                    data,
+                    shape: Shape::new(vec![new_a, new_b, new_c]),
+                }
+            }
+
+            let permutations = [
+                [0, 1, 2],
+                [1, 0, 2],
+                [1, 2, 0],
+                [0, 2, 1],
+                [2, 0, 1],
+                [2, 1, 0],
+            ];
+
+            let data = Tensor::<Element>::random(&Shape::new(vec![a, b, c]));
+            for order in &permutations {
+                let expected = permute3d(&data, order);
+                let result = data.permute3d(order);
+                prop_assert_eq!(&expected, &result, "order {:?} original {:?}", order, data);
+            }
         }
 
     }

@@ -473,7 +473,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
 
         let shape = input.shape();
 
-        let input = input.clone().into_btensor::<2>();
+        let input = input.clone().to_btensor::<2>();
         let sum = input.clone().sum_dim(1);
         let square_sum = sum.clone() * sum.clone();
         let sum_square = (input.clone() * input.clone()).sum_dim(1);
@@ -508,14 +508,14 @@ impl Evaluate<Element> for LayerNorm<Element> {
         let gamma = self
             .gamma
             .clone()
-            .into_btensor::<1>()
+            .to_btensor::<1>()
             .unsqueeze_dim::<2>(0)
             .expand([shape.dim(0) as i32, -1]);
 
         let beta = self
             .beta
             .clone()
-            .into_btensor::<1>()
+            .to_btensor::<1>()
             .unsqueeze_dim::<2>(0)
             .expand([shape.dim(0) as i32, -1]);
 

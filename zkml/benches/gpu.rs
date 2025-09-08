@@ -12,6 +12,7 @@ use zkml::{
         dense::Dense,
         flatten::Flatten,
         matrix_mul::{self, MatMul},
+        permute::Permute,
         provable::Evaluate,
         transformer::{embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, qkv::QKV},
     },
@@ -563,6 +564,55 @@ fn norm_layer(c: &mut Criterion) {
     group.finish();
 }
 
+fn permute_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    for pow2 in 2..5 {
+        let size = 1 << pow2;
+        let shape = Shape::new(vec![size, size, size]);
+
+        let input = Tensor::<Element>::random(&shape);
+        let layer = Permute::new(vec![2, 1, 0]);
+
+        group.bench_with_input(
+            BenchmarkId::new("permute/Element", format!("{size}x{size}x{size}")),
+            &input,
+            |b, input| {
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Permute should succeed")
+                });
+            },
+        );
+    }
+
+    for pow2 in 2..5 {
+        let size = 1 << pow2;
+        let shape = Shape::new(vec![size, size, size]);
+
+        let input = Tensor::<f32>::random(&shape);
+        let layer = Permute::new(vec![2, 1, 0]);
+
+        group.bench_with_input(
+            BenchmarkId::new("permute/f32", format!("{size}x{size}x{size}")),
+            &input,
+            |b, input| {
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[input], &[])
+                        .expect("Permute should succeed")
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     add_layer,
@@ -575,5 +625,6 @@ criterion_group!(
     qkv_layer,
     logits_layer,
     norm_layer,
+    permute_layer,
 );
 criterion_main!(benches);

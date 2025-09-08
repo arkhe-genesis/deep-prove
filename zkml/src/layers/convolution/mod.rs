@@ -588,9 +588,9 @@ impl Evaluate<Element> for Convolution<Element> {
         let n_x = input.dim(1).next_power_of_two();
         let fft_shape = Shape::new(vec![tensor.dim(0), n_x, n_x]);
 
-        let kernels = kernels.into_btensor::<4>();
-        let bias = bias.into_btensor::<1>();
-        let input = input.into_btensor::<3>();
+        let kernels = kernels.to_btensor::<4>();
+        let bias = bias.to_btensor::<1>();
+        let input = input.to_btensor::<3>();
         let input = input.unsqueeze_dim(0);
 
         // Compute the convolution using the traditional convolution hardware accelerated.
