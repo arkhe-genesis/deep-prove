@@ -151,7 +151,11 @@ pub struct Mha<N> {
     final_reshape: Reshape, /* ToDo: can be removed once we will handle unpadding in subsequent linear layer */
 }
 
-impl<N: Number> Mha<N> {
+impl<N> Mha<N>
+where
+    N: Number,
+    ConcatMatMul: Evaluate<N>,
+{
     pub fn new(context_length: usize, num_heads: usize, head_dim: usize) -> anyhow::Result<Self> {
         let inputs_reshape = Reshape::new_subspace(1..2, vec![num_heads, head_dim]);
         let qk = ConcatMatMul::new(

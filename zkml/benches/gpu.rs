@@ -8,6 +8,7 @@ use zkml::{
     layers::{
         activation::GELU,
         add::Add,
+        concat_matmul::{self, ConcatMatMul},
         convolution::Convolution,
         dense::Dense,
         flatten::Flatten,
@@ -64,6 +65,67 @@ fn add_layer(c: &mut Criterion) {
                     layer
                         .evaluate::<GoldilocksExt2>(&[input], &[])
                         .expect("Add should succeed")
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn concat_matmul(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    const CONCATS: usize = 8;
+
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+
+        let left_perm = concat_matmul::InputMatrixDimensions::new(1, 2, 0);
+        let right_perm = concat_matmul::InputMatrixDimensions::new(1, 0, 2);
+        let out_perm = concat_matmul::Permutation::new(vec![2, 1, 0]);
+
+        // concat dim must match the `left_perm` and `right_perm` config
+        let shape = Shape::new(vec![size, CONCATS, size]);
+        let left = Tensor::<Element>::random(&shape);
+        let right = Tensor::<Element>::random(&shape);
+        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
+
+        group.bench_function(
+            BenchmarkId::new("concat_matmul/Element", format!("{CONCATS}x{size}x{size}")),
+            |b| {
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
+                        .expect("ConcatMatMul should succeed")
+                });
+            },
+        );
+    }
+
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+
+        let left_perm = concat_matmul::InputMatrixDimensions::new(1, 2, 0);
+        let right_perm = concat_matmul::InputMatrixDimensions::new(1, 0, 2);
+        let out_perm = concat_matmul::Permutation::new(vec![2, 1, 0]);
+
+        // concat dim must match the `left_perm` and `right_perm` config
+        let shape = Shape::new(vec![size, CONCATS, size]);
+        let left = Tensor::<f32>::random(&shape);
+        let right = Tensor::<f32>::random(&shape);
+        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
+
+        group.bench_function(
+            BenchmarkId::new("concat_matmul/f32", format!("{CONCATS}x{size}x{size}")),
+            |b| {
+                b.iter(|| {
+                    layer
+                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
+                        .expect("ConcatMatMul should succeed")
                 });
             },
         );
@@ -616,6 +678,7 @@ fn permute_layer(c: &mut Criterion) {
 criterion_group!(
     benches,
     add_layer,
+    concat_matmul,
     convolution_layer,
     dense_layer,
     embeddings_layer,

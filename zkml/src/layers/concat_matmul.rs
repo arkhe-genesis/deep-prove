@@ -34,7 +34,7 @@ use tracing::trace;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, Shape, Tensor,
+    Claim, Element, Number, Prover, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
@@ -49,7 +49,7 @@ use crate::{
     },
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
-    tensor::Number,
+    tensor::IntoBTensor,
     util::from_mle_list_dimensions,
 };
 /// Short name used to identify the concat matmul layer.
@@ -73,6 +73,10 @@ impl Permutation {
 
     pub fn apply(&self, shape: &Shape) -> Shape {
         shape.permute(&self.0)
+    }
+
+    fn to_3d_axes(&self) -> [isize; 3] {
+        [self.0[0] as isize, self.0[1] as isize, self.0[2] as isize]
     }
 }
 
@@ -589,7 +593,11 @@ impl ConcatMatMul {
     }
 }
 
-impl<N: Number> Evaluate<N> for ConcatMatMul {
+impl<N> Evaluate<N> for ConcatMatMul
+where
+    N: Number + burn::tensor::Element,
+    Tensor<N>: IntoBTensor,
+{
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
@@ -601,45 +609,42 @@ impl<N: Number> Evaluate<N> for ConcatMatMul {
         let a_shape = a.shape();
         let b_shape = b.shape();
         self.ensure_shape_consistency(&[a_shape, b_shape])?;
-        let permuted_a = self
-            .permutations
-            .compute_permutation_for_left_input()
-            .map(|p| a.permute3d(&p.0));
-        let permuted_b = self
-            .permutations
-            .compute_permutation_for_right_input()
-            .map(|p| b.permute3d(&p.0));
-        let a = permuted_a.as_ref().unwrap_or(a);
-        let b = permuted_b.as_ref().unwrap_or(b);
-        let a_shape = a.shape();
-        let b_shape = b.shape();
-        ensure!(
-            a_shape.dim(0) == b_shape.dim(0),
-            "ConcatMatMul expects inputs with same batch size: {} vs {}",
-            a_shape.dim(0),
-            b_shape.dim(0),
-        );
-        let results = (0..a_shape.dim(0))
-            .map(|batch| {
-                let batch_a = a.slice_3d(batch, batch + 1).reshaped(a_shape.slice(1..=2));
-                let batch_b = b.slice_3d(batch, batch + 1).reshaped(b_shape.slice(1..=2));
-                batch_a.matmul(&batch_b)
-            })
-            .collect::<Vec<_>>();
-        let mut it = results.into_iter();
-        // reshape because concat expects a 3d tensor so he can accumulate in the highest dimension.
-        let concat =
-            it.next()
-                .unwrap()
-                .reshaped(Shape::new(vec![1, a_shape.dim(1), b_shape.dim(2)]));
-        let mut concat = it.fold(concat, |mut acc, x| {
-            acc.concat(x);
-            acc
-        });
-        if let Some(ref transpose) = self.permutations.permute {
-            concat = concat.permute3d(&transpose.0);
-        }
-        Ok(LayerOut::from_vec(vec![concat]))
+
+        let a = a.to_btensor::<3>();
+        let b = b.to_btensor::<3>();
+
+        let a = if let Some(permute) = self.permutations.compute_permutation_for_left_input() {
+            a.permute(permute.to_3d_axes())
+        } else {
+            a
+        };
+        let b = if let Some(permute) = self.permutations.compute_permutation_for_right_input() {
+            b.permute(permute.to_3d_axes())
+        } else {
+            b
+        };
+
+        let muled: Vec<_> = a
+            .iter_dim(0)
+            .zip(b.iter_dim(0))
+            .map(|(batch_a, batch_b)| batch_a.matmul(batch_b))
+            .collect();
+
+        let cated = burn::tensor::Tensor::cat(muled, 0);
+
+        let res = if let Some(transpose) = &self.permutations.permute {
+            cated.permute(transpose.to_3d_axes())
+        } else {
+            cated
+        };
+
+        let data = res
+            .to_data()
+            .into_vec()
+            .expect("Failed to compute ConcatMatMul");
+        let shape = res.shape().into();
+        let out = Tensor::<N>::new(shape, data);
+        Ok(LayerOut::from_vec(vec![out]))
     }
 }
 
@@ -924,7 +929,10 @@ where
 
 #[cfg(test)]
 mod test {
+    use crate::tensor::Number;
     use ff_ext::GoldilocksExt2;
+    use proptest::prelude::*;
+    use std::{fmt::Debug, ops::Range};
 
     use crate::{
         Tensor,
@@ -1134,5 +1142,168 @@ mod test {
             *outputs[0].shape(),
             Shape::new(vec![21, 7, 17]).next_power_of_two()
         );
+    }
+
+    proptest! {
+        #[test]
+        fn test_concat_matmul_with_element(input in any_input::<Element>(1..128, 1..128, 1..128)) {
+            let Input { left, right, left_perm, right_perm, out_perm } = input;
+
+            let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
+
+            let expected = layer.evaluate_original::<Element, GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+
+            prop_assert_eq!(&expected.outputs[0], &computed.outputs[0]);
+        }
+
+        #[test]
+        fn test_concat_matmul_with_f32(input in any_input::<f32>(1..128, 1..128, 1..128)) {
+            let Input { left, right, left_perm, right_perm, out_perm } = input;
+
+            let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
+
+            let expected = layer.evaluate_original::<f32, GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+
+            for (left, right) in expected.outputs[0].get_data().iter().zip(computed.outputs[0].get_data().iter()) {
+                let abs = (left - right).abs();
+                // The differences are in tensor matmul
+                const THRESHOLD: f32 =  1e-3;
+                prop_assert!(abs < THRESHOLD, "Absolute diff {} not within threshold {}", abs, THRESHOLD);
+            }
+        }
+    }
+
+    struct Input<T> {
+        left: Tensor<T>,
+        right: Tensor<T>,
+        left_perm: InputMatrixDimensions,
+        right_perm: InputMatrixDimensions,
+        out_perm: Permutation,
+    }
+
+    impl<T> Debug for Input<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Input").finish_non_exhaustive()
+        }
+    }
+
+    fn any_input<T: 'static + Number>(
+        dim_x: Range<usize>,
+        dim_y: Range<usize>,
+        dim_z: Range<usize>,
+    ) -> impl Strategy<Value = Input<T>> {
+        (dim_x, dim_y, dim_z, any_dims(), any_dims(), any_dims()).prop_flat_map(
+            |(dim_x, dim_y, dim_z, left_perm, right_perm, out_perm)| {
+                let mut left_shape = vec![0_usize; 3];
+                left_shape[left_perm.concat_dimension] = dim_x;
+                left_shape[left_perm.mat_mul_dimension] = dim_y;
+                left_shape[left_perm.output_dimension] = dim_z;
+                let left_shape = Shape::new(left_shape);
+
+                let left = Tensor::<T>::any(left_shape);
+
+                let mut right_shape = vec![0_usize; 3];
+                right_shape[right_perm.concat_dimension] = dim_x;
+                right_shape[right_perm.mat_mul_dimension] = dim_y;
+                right_shape[right_perm.output_dimension] = dim_z;
+                let right_shape = Shape::new(right_shape);
+                let right = Tensor::<T>::any(right_shape);
+
+                let InputMatrixDimensions {
+                    concat_dimension,
+                    mat_mul_dimension,
+                    output_dimension,
+                } = out_perm;
+                let out_perm =
+                    Permutation(vec![concat_dimension, mat_mul_dimension, output_dimension]);
+
+                (left, right, Just((left_perm, right_perm, out_perm))).prop_map(
+                    |(left, right, (left_perm, right_perm, out_perm))| Input {
+                        left,
+                        right,
+                        left_perm,
+                        right_perm,
+                        out_perm,
+                    },
+                )
+            },
+        )
+    }
+
+    fn any_dims() -> impl Strategy<Value = InputMatrixDimensions> {
+        const PERMS: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        (0..PERMS.len()).prop_map(|ix| {
+            let [a, b, c] = PERMS[ix];
+            InputMatrixDimensions {
+                concat_dimension: a,
+                mat_mul_dimension: b,
+                output_dimension: c,
+            }
+        })
+    }
+
+    impl ConcatMatMul {
+        fn evaluate_original<N: Number, E: ExtensionField>(
+            &self,
+            inputs: &[&Tensor<N>],
+            _unpadded_input_shapes: &[Shape],
+        ) -> anyhow::Result<LayerOut<N, E>> {
+            ensure!(inputs.len() == 2, "ConcatMatMul expects 2 inputs");
+            let a = inputs[0];
+            let b = inputs[1];
+            let a_shape = a.shape();
+            let b_shape = b.shape();
+            self.ensure_shape_consistency(&[a_shape, b_shape])?;
+            let permuted_a = self
+                .permutations
+                .compute_permutation_for_left_input()
+                .map(|p| a.permute3d(&p.0));
+            let permuted_b = self
+                .permutations
+                .compute_permutation_for_right_input()
+                .map(|p| b.permute3d(&p.0));
+            let a = permuted_a.as_ref().unwrap_or(a);
+            let b = permuted_b.as_ref().unwrap_or(b);
+            let a_shape = a.shape();
+            let b_shape = b.shape();
+            ensure!(
+                a_shape.dim(0) == b_shape.dim(0),
+                "ConcatMatMul expects inputs with same batch size: {} vs {}",
+                a_shape.dim(0),
+                b_shape.dim(0),
+            );
+            let results = (0..a_shape.dim(0))
+                .map(|batch| {
+                    let batch_a = a.slice_3d(batch, batch + 1).reshaped(a_shape.slice(1..=2));
+                    let batch_b = b.slice_3d(batch, batch + 1).reshaped(b_shape.slice(1..=2));
+                    batch_a.matmul(&batch_b)
+                })
+                .collect::<Vec<_>>();
+            let mut it = results.into_iter();
+            // reshape because concat expects a 3d tensor so he can accumulate in the highest dimension.
+            let concat =
+                it.next()
+                    .unwrap()
+                    .reshaped(Shape::new(vec![1, a_shape.dim(1), b_shape.dim(2)]));
+            let mut concat = it.fold(concat, |mut acc, x| {
+                acc.concat(x);
+                acc
+            });
+            if let Some(ref transpose) = self.permutations.permute {
+                concat = concat.permute3d(&transpose.0);
+            }
+            Ok(LayerOut::from_vec(vec![concat]))
+        }
     }
 }

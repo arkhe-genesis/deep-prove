@@ -98,6 +98,9 @@ jobs:
           lfs: 'true'
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Force-check LFS
+        run: git lfs pull
+
       - name: Capture layers outputs on HEAD
         shell: devenv shell bash -- -e {0}
         run: |

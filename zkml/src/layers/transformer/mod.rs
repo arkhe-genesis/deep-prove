@@ -43,6 +43,7 @@ pub(crate) mod manual_attention {
         layers::{
             activation::GELU,
             add::{self, Add},
+            concat_matmul::ConcatMatMul,
             matrix_mul::{MatMul, OperandMatrix},
             provable::Evaluate,
         },
@@ -278,7 +279,11 @@ pub(crate) mod manual_attention {
         }
     }
 
-    impl<N: Number> FlatAttention<N> {
+    impl<N> FlatAttention<N>
+    where
+        N: Number,
+        ConcatMatMul: Evaluate<N>,
+    {
         pub fn random(emb_size: usize, num_heads: usize) -> anyhow::Result<Self> {
             // Note in LLM, it's always the case that hidden_size = emb_size so we can apply residual
             let hidden_size = emb_size;

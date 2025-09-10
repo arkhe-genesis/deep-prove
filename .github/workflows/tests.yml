@@ -48,6 +48,9 @@ jobs:
           lfs: "true"
           submodules: "recursive"
 
+      - name: Force-check LFS
+        run: git lfs pull
+
       - name: Set RNG seed
         run: |
           seed="$(date +%s)"
