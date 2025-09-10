@@ -6,6 +6,7 @@ pub mod logits;
 pub mod mha;
 pub mod positional;
 pub mod qkv;
+pub mod rmsnorm;
 pub mod softmax;
 
 /// Normally q_len == seq_len when the input is contains multiple tokens.

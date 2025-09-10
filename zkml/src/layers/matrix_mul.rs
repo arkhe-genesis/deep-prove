@@ -40,6 +40,8 @@ use super::{
     },
     requant::Requant,
 };
+/// The short name used to identify the matrix multiplication layer
+pub const MATMUL_LAYER: &str = "MMUL";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Config {
@@ -176,7 +178,7 @@ impl<T> MatMul<T> {
         let right_matrix = OperandMatrix::new_weight_matrix(right);
         Self::new_internal(OperandMatrix::Input, right_matrix, bias, None)
     }
-    fn new_internal(
+    pub(crate) fn new_internal(
         left_matrix: OperandMatrix<T>,
         right_matrix: OperandMatrix<T>,
         bias: Option<Tensor<T>>,

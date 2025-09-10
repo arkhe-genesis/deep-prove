@@ -38,6 +38,8 @@ use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{Tensor, layers::provable::LayerOut};
+/// Short name used to identify the MHA layer
+pub const MHA_LAYER: &str = "MHDA";
 
 #[derive(Clone, Debug)]
 pub struct MhaData<E: ExtensionField> {

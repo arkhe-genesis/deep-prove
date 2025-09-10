@@ -60,12 +60,15 @@ use sumcheck::{
 use tenstore::GenStore;
 use transcript::Transcript;
 
+/// The short name used to identify the Softmax layer
+pub const SOFTMAX_LAYER: &str = "SFTM";
+
 /// The base 2 logarithm of the scale factor used in exponential lookup tables
 pub(crate) const LOG_SCALE_FACTOR: usize = 24;
 /// The scale factor for our fixed point arithmetic
 pub(crate) const SCALE_FACTOR: usize = 1 << LOG_SCALE_FACTOR;
 /// The scale factor of the outputs of the `exp` lookup
-pub(crate) const OUTPUT_SCALE_FACTOR: usize = 1 << 12;
+pub(crate) const OUTPUT_SCALE_FACTOR: usize = 1 << 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Stores data about the Softmax operation, which is used to map a tensor of values to a tensor of probability distributions.

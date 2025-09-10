@@ -50,6 +50,8 @@ use crate::{quantization::BIT_LEN, tensor::Tensor};
 use super::provable::{
     Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx,
 };
+/// The short name used to identify an activation layer.
+pub const ACTIVATION_LAYER: &str = "ACTI";
 
 use anyhow::{Result, anyhow, bail, ensure};
 const GELU_SCALE_EXP: usize = 12;

@@ -43,7 +43,7 @@ pub trait Observer<N: Number> {
 /// auto regressive loop correctly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Driver<N: Number> {
-    model: Model<N>,
+    pub(crate) model: Model<N>,
     config: LLMConfig,
     max_context: Option<usize>,
     padding_mode: PaddingMode,
@@ -176,7 +176,30 @@ impl Driver<f32> {
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
     {
-        self.run_internal::<E>(input, observer)
+        let user_len = input.len();
+
+        ensure!(
+            user_len < self.config.context_length - 1,
+            "Input sequence length must be less than the context length"
+        );
+        let input_tokens = input
+            .into_iter()
+            .map(|t| t.as_number::<f32>())
+            .collect::<Vec<_>>();
+
+        let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone());
+        let shape = tensor.shape().clone();
+        let mut store = GenStore::default();
+
+        let trace = self
+            .model
+            .run::<E>(&[tensor], Some(vec![shape]), &mut store)?;
+
+        if let Some(ref obs) = observer {
+            obs.observe(0, &trace);
+        }
+
+        Ok(trace)
     }
 }
 

@@ -15,6 +15,7 @@ use crate::{
             NodeId, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
         },
+        transformer::mha::eval_zeroifier_mle,
     },
     lookup::{
         context::{LayerLookupContext, LookupWitnessGen, TableType},
@@ -30,7 +31,7 @@ use crate::{
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, bail, ensure};
 use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -50,8 +51,10 @@ use witness::{InstancePaddingStrategy, RowMajorMatrix};
 use crate::{
     Tensor,
     layers::provable::{Evaluate, LayerOut, OpInfo},
-    tensor::Number,
 };
+
+/// The short name used to identify the logits layer.
+pub const LOGITS_LAYER: &str = "LGIT";
 
 #[derive(Clone, Debug)]
 pub struct ArgmaxData<E> {
@@ -68,14 +71,12 @@ pub struct LogitsCtx {
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct LogitsProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     logup_proof: LogUpBatchProof<E>,
-    /// Evaluation of the vector of maximum values
-    max_eval: E,
     /// Commitment to the MLE of the vector of maximum values
     max_commitment: PCS::Commitment,
     /// Proof of hadamard product sum-check
     hadamard_proof: IOPProof<E>,
-    /// Evaluation of the input tensor MLE got from the hadamard product sum-check
-    input_eval: E,
+    /// Evaluation of the input tensor MLE and max values MLE in this order, got from the hadamard product sum-check
+    sumcheck_evals: Vec<E>,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LogitsProof<E, PCS> {
@@ -147,7 +148,7 @@ impl Logits {
     fn evaluate_with_argmax_data_element<E: ff_ext::ExtensionField>(
         &self,
         inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: &[Shape],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<(LayerOut<Element, E>, ArgmaxData<Element>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
@@ -157,11 +158,20 @@ impl Logits {
             Logits::Argmax => {
                 let (indices, maximums): (Vec<_>, Vec<_>) = inputs
                     .iter()
-                    .map(|input| {
+                    .zip(unpadded_input_shapes.iter())
+                    .map(|(input, shape)| {
+                        let unpadded_dim_size = shape.dim(shape.rank() - 1);
                         let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
+                        let truncated_data = flat_data
+                            .chunks(last_dim)
+                            .flat_map(|chunk| chunk[..unpadded_dim_size].to_vec())
+                            .collect::<Vec<_>>();
                         let binput: burn::tensor::Tensor<Backend, 2, burn::tensor::Int> =
                             burn::tensor::Tensor::from_data(
-                                burn::tensor::TensorData::new(flat_data.to_vec(), [rows, last_dim]),
+                                burn::tensor::TensorData::new(
+                                    truncated_data,
+                                    [rows, unpadded_dim_size],
+                                ),
                                 &Default::default(),
                             );
                         let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
@@ -170,14 +180,12 @@ impl Logits {
                             .into_vec()
                             .expect("convert indices btensor to vec")
                             .into_iter()
-                            .map(|i: i64| Element::from_usize(i as usize))
                             .collect();
                         let max_vals: Vec<Element> = max_bt
                             .to_data()
                             .into_vec()
                             .expect("convert max btensor to vec")
                             .into_iter()
-                            .map(|v: i64| Element::from_usize(v as usize))
                             .collect();
                         (
                             Tensor::new(Shape::new(vec![rows, 1]), indices_vec),
@@ -248,6 +256,14 @@ impl Evaluate<Element> for Logits {
         inputs: &[&Tensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
+        // We check that we have as many unpadded_input_shapes as inputs
+        ensure!(
+            unpadded_input_shapes.len() == inputs.len(),
+            "Expected {} unpadded input shapes, found {}",
+            inputs.len(),
+            unpadded_input_shapes.len()
+        );
+
         let (output, argmax_data) =
             self.evaluate_with_argmax_data_element(inputs, unpadded_input_shapes)?;
 
@@ -385,7 +401,9 @@ where
         );
         let input = step_data.input_tensor_at(0, store)?;
         let outputs = step_data.output_tensors(store)?;
-
+        // We need the final dim size to build the less than polynomial
+        let unpadded_dim_size =
+            step_data.unpadded_input_shapes[0].dim(step_data.unpadded_input_shapes[0].rank() - 1);
         ensure!(
             outputs.len() == 1,
             "Expected 1 output tensor for Logits layer, found {}",
@@ -408,6 +426,7 @@ where
             max_mle.get_base_field_vec(),
             &input,
             &prover.challenge_storage,
+            unpadded_dim_size,
         )?;
         let logup_batch_proof = batch_multiple_sizes_prove(&[logup_input], prover.transcript)?;
 
@@ -426,13 +445,7 @@ where
         let num_col_vars = diff_claim.point.len() - num_row_vars;
         let (_, row_point) = Self::split_claim_point(&diff_claim.point, num_row_vars)?;
 
-        let max_eval = max_mle.evaluate(row_point);
-
-        prover
-            .commit_prover
-            .add_witness_claim(node_id, vec![(row_point.to_vec(), vec![max_eval])]);
-
-        let input_claim = Claim::new(diff_claim.point.clone(), max_eval - diff_claim.eval);
+        let input_claim = Claim::new(diff_claim.point.clone(), diff_claim.eval);
 
         let input_shape = input.shape();
 
@@ -445,8 +458,26 @@ where
             .collect_vec();
         let sum_eq_mle = compute_betas_eval(&sum_eq_point).into_mle();
 
+        // Here we build the less than polynomial, for each row it should have 1s at every evaluation less than `unpadded_dim_size` and 0s otherwise
+        let base_lt_evals = (0usize..1 << num_col_vars)
+            .map(|i| {
+                if i < unpadded_dim_size {
+                    E::BaseField::ONE
+                } else {
+                    E::BaseField::ZERO
+                }
+            })
+            .collect::<Vec<E::BaseField>>();
+        // `base_lt_evals` is the MLE evals on the boolean hypercube for one row, now we need to repeat this number of rows times
+        let lt_mle = vec![base_lt_evals; 1 << num_row_vars].concat().into_mle();
         let input_mle = input.to_mle_2d();
 
+        let padded_max_evals = max_mle
+            .get_base_field_vec()
+            .iter()
+            .flat_map(|v| vec![*v; 1 << num_col_vars])
+            .collect::<Vec<E::BaseField>>()
+            .into_mle();
         // build one-hot encoded output matrix
         let mut one_hot_output = vec![E::BaseField::ZERO; input_shape.product()];
         output.iter().enumerate().for_each(|(i, out)| {
@@ -461,28 +492,50 @@ where
         let num_threads = optimal_sumcheck_threads(num_vars);
         let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
         let input_expr = expr_builder.lift(Either::Left(&input_mle));
+        let padded_max_expr = expr_builder.lift(Either::Left(&padded_max_evals));
         let one_hot_expr = expr_builder.lift(Either::Left(&one_hot_mle));
         let sum_eq_expr = expr_builder.lift(Either::Left(&sum_eq_mle));
         let input_eq_expr = expr_builder.lift(Either::Left(&input_eq_mle));
+        let lt_expr = expr_builder.lift(Either::Left(&lt_mle));
 
-        let expr = input_expr
-            * (sum_eq_expr * one_hot_expr * Expression::Constant(Either::Right(num_cols))
-                + Expression::Challenge(0, 1, E::ONE, E::ZERO) * input_eq_expr);
+        // Now we have to perform a sumcheck linking the range check to the inputs/outputs
+        // We show that the selected maximum values did come from the input via the check
+        // num_cols.inverse() * padded_max_expr - num_cols * sum_eq_expr * one_hot_expr * input_expr == 0
+        // and we show that max_values and input were used to construct the lookup input via
+        // input_eq_expr * lt_expr * (padded_max_expr - input_expr) == diff_claim
+        let expr_first_part = sum_eq_expr
+            * (padded_max_expr.clone()
+                - Expression::Constant(Either::Right(num_cols))
+                    * one_hot_expr.clone()
+                    * input_expr.clone());
+        let expr_second_part = input_eq_expr.clone()
+            * lt_expr.clone()
+            * (padded_max_expr.clone() - input_expr.clone());
+        let expr =
+            expr_first_part + Expression::Challenge(0, 1, E::ONE, E::ZERO) * expr_second_part;
+
         // squeeze the challenge to include `input_claim` produced by the lookup in the hadamard product sum-check
         let challenge = Self::squeeze_challenge(prover.transcript, &input_claim);
         let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[challenge]);
         let (hadamard_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
-        let input_eval = state.get_mle_flatten_final_evaluations()[0];
+        let point = state.collect_raw_challenges();
+        let sumcheck_evals = state.get_mle_flatten_final_evaluations()[..2].to_vec();
+        let input_eval = sumcheck_evals[0];
+        let max_eval = sumcheck_evals[1];
+
+        prover.commit_prover.add_witness_claim(
+            node_id,
+            vec![(point[num_col_vars..].to_vec(), vec![max_eval])],
+        );
 
         let final_input_claim = Claim::new(state.collect_raw_challenges(), input_eval);
 
         let proof = LogitsProof {
             logup_proof: logup_batch_proof,
-            max_eval,
             max_commitment: commitment,
             hadamard_proof,
-            input_eval,
+            sumcheck_evals,
         };
 
         prover.push_proof(node_id, LayerProof::Logits(proof));
@@ -536,15 +589,24 @@ where
             input.shape(),
         );
 
+        let unpadded_dim_size =
+            step_data.unpadded_input_shapes[0].dim(step_data.unpadded_input_shapes[0].rank() - 1);
+
         let merged_diff = input
-            .get_data()
-            .into_par_iter()
-            .enumerate()
-            .map(|(i, input)| {
-                let row_index = i / input_shape.dim(input_shape.len() - 1);
-                let current_max = max_values.get_data()[row_index];
-                let max_element = current_max.to_element();
-                max_element - input
+            .slice_last_dim()
+            .zip(max_values.get_data().iter())
+            .flat_map(|(row, row_max)| {
+                let current_max = row_max.to_element();
+                row.iter()
+                    .enumerate()
+                    .map(|(j, r)| {
+                        if j < unpadded_dim_size {
+                            current_max - *r
+                        } else {
+                            0
+                        }
+                    })
+                    .collect::<Vec<Element>>()
             })
             .collect::<Vec<Element>>();
         let element_count = merged_diff.iter().fold(HashMap::new(), |mut acc, diff| {
@@ -633,13 +695,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let num_col_vars = input_shape.dim(input_shape.rank() - 1).ilog2() as usize;
         let (_, row_point) = Logits::split_claim_point(batch_claim.point(), num_row_vars)?;
 
-        let input_claim = Claim::new(batch_claim.point().to_vec(), proof.max_eval - poly_evals[0]);
-
-        verifier.commit_verifier.add_witness_claim(
-            self.node_id,
-            proof.max_commitment.clone(),
-            vec![(row_point.to_vec(), vec![proof.max_eval])],
-        );
+        let input_claim = Claim::new(batch_claim.point().to_vec(), poly_evals[0]);
 
         let two_inv = E::TWO.inverse();
         let num_cols = E::from_canonical_usize(1 << num_col_vars);
@@ -656,7 +712,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let hadamard_poly_aux =
             from_mle_list_dimensions(&[vec![input_num_vars, input_num_vars, input_num_vars]]);
         let subclaim = IOPVerifierState::verify(
-            proof.max_eval + challenge * input_claim.eval,
+            challenge * input_claim.eval,
             &proof.hadamard_proof,
             &hadamard_poly_aux,
             verifier.transcript,
@@ -670,19 +726,39 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let beta_eval = identity_eval(&sum_eq_point, &sumcheck_point);
         let input_eq_eval = identity_eval(&input_claim.point, &sumcheck_point);
 
-        // get expected evaluation of the claim for the output tensor MLE computed by the sum-check; we have that
-        // `subclaim.expected_evaluation = num_cols*beta_eval*proof.input_eval*expected_output_eval + challenge*proof.input_eval*input_eq_eval`,
-        // so we compute `expected_output_eval` as `(subclaim.expected_evaluation - challenge*proof.input_eval*input_eq_eval)/(num_cols*beta_eval*proof.input_eval)`
+        // Here we make the less than poly eval
+        let unpadded_dim_size =
+            shape_step.unpadded_input_shape[0].dim(shape_step.unpadded_input_shape[0].rank() - 1);
+        // We subtract 1 from the unpadded dimension size because this function calculates the evaluation of the mle that checks x <= y.
+        let dim_size_bits = to_bit_sequence_le(unpadded_dim_size - 1, num_col_vars)
+            .map(E::from_canonical_usize)
+            .collect::<Vec<E>>();
+        let lt_eval = eval_zeroifier_mle(&sumcheck_point[..num_col_vars], &dim_size_bits);
 
+        // get expected evaluation of the claim for the output tensor MLE computed by the sum-check; we have that
+        // `subclaim.expected_evaluation = beta_eval * (max_eval - num_cols * proof.input_eval * expected_output_eval) + challenge * input_eq_eval * lt_eval * (max_eval - proof.input_eval)`,
+        // so we compute `expected_output_eval` as `(subclaim.expected_evaluation - challenge * input_eq_eval * lt_eval *(max_eval - proof.input_eval) - beta_eval * max_eval)/(-num_cols * beta_eval * proof.input_eval)`
+        let sumcheck_evals = &proof.sumcheck_evals;
+        let input_eval = sumcheck_evals[0];
+        let max_eval = sumcheck_evals[1];
         let expected_output_eval = (subclaim.expected_evaluation
-            - challenge * proof.input_eval * input_eq_eval)
-            * (num_cols * beta_eval * proof.input_eval).inverse();
+            - challenge * lt_eval * input_eq_eval * (max_eval - input_eval)
+            - beta_eval * max_eval)
+            * (-num_cols * beta_eval * input_eval).inverse();
 
         Self::verify_output_evaluation(
             verifier,
             Claim::new(sumcheck_point.clone(), expected_output_eval),
+            unpadded_dim_size,
         )?;
-        let final_input_claim = Claim::new(sumcheck_point, proof.input_eval);
+
+        // Add the max_values claim to the commitment verifier
+        verifier.commit_verifier.add_witness_claim(
+            self.node_id,
+            proof.max_commitment.clone(),
+            vec![(sumcheck_point[num_col_vars..].to_vec(), vec![max_eval])],
+        );
+        let final_input_claim = Claim::new(sumcheck_point, input_eval);
 
         Ok(vec![final_input_claim])
     }
@@ -715,6 +791,7 @@ impl LogitsCtx {
     >(
         verifier: &mut Verifier<E, T, PCS>,
         output_claim: Claim<E>,
+        unpadded_dim_size: usize,
     ) -> anyhow::Result<()> {
         ensure!(
             verifier.io.output.len() == 1,
@@ -730,18 +807,24 @@ impl LogitsCtx {
         let (column_point, row_point) =
             Logits::split_claim_point(&output_claim.point, num_row_vars)?;
         let beta = compute_betas_eval(row_point);
-        let computed_eval = output
-            .get_data()
-            .iter()
-            .zip(beta)
-            .fold(E::ZERO, |sum, (token, b1)| {
-                let token_value = token.to_canonical_u64_vec()[0] as usize;
-                let le_bits = to_bit_sequence_le(token_value, column_point.len())
-                    .map(|b| E::from_canonical_usize(b))
-                    .collect_vec();
-                let selector = b1 * identity_eval(column_point, &le_bits);
-                sum + selector
-            });
+        let column_beta = compute_betas_eval(column_point);
+        let computed_eval =
+            output
+                .get_data()
+                .iter()
+                .zip(beta)
+                .try_fold(E::ZERO, |sum, (token, b1)| {
+                    let token_value = token.to_canonical_u64_vec()[0] as usize;
+                    if token_value >= unpadded_dim_size {
+                        bail!(
+                            "Token value {} exceeds unpadded dimension size {}",
+                            token_value,
+                            unpadded_dim_size
+                        );
+                    }
+                    let selector = b1 * column_beta[token_value];
+                    Ok(sum + selector)
+                })?;
         ensure!(
             computed_eval == output_claim.eval,
             "Output claim evaluation check failed for Logits layer: Expected {}, found {}",
@@ -756,6 +839,7 @@ impl LogitsCtx {
         max_evals: &[E::BaseField],
         input: &Tensor<E>,
         challenge_storage: &ChallengeStorage<E>,
+        unpadded_dim_size: usize,
     ) -> anyhow::Result<LogUpInput<E>> {
         let input_shape = input.shape();
         let last_dim = input_shape.dim(input_shape.len() - 1);
@@ -767,7 +851,14 @@ impl LogitsCtx {
             .map(|(chunk, &max)| {
                 chunk
                     .iter()
-                    .map(|val| max - val.as_bases()[0])
+                    .enumerate()
+                    .map(|(i, val)| {
+                        if i < unpadded_dim_size {
+                            max - val.as_bases()[0]
+                        } else {
+                            E::BaseField::ZERO
+                        }
+                    })
                     .collect::<Vec<E::BaseField>>()
             })
             .collect::<Vec<Vec<E::BaseField>>>();
@@ -831,7 +922,9 @@ mod test {
     fn test_logits_argmax() -> anyhow::Result<()> {
         let input = Tensor::new(vec![3, 2].into(), vec![0.0, 1.0, 3.0, 2.0, 4.0, 5.0]);
         let logits = Logits::Argmax;
-        let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[])?;
+
+        let out =
+            logits.evaluate::<GoldilocksExt2>(&[&input], std::slice::from_ref(input.shape()))?;
         // first slice is [0,1] so argmax here is 1
         // second slice is [3,2] so argmax here is 0
         // the last dimension is [4,5] so argmax here is 1
@@ -897,7 +990,7 @@ mod test {
             let data_elem: Vec<Element> = data.into_iter().map(|v| v.round_ties_even() as Element).collect();
             let input = Tensor::new(shape.clone().into(), data_elem);
             let logits = Logits::Argmax;
-            let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+            let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[shape.clone().into()]).unwrap();
             let indices = out.outputs()[0].get_data();
             prop_assert_eq!(indices.len(), expected.len());
             for (i, idx) in indices.iter().enumerate() { prop_assert_eq!(*idx as usize, expected[i] as usize); }

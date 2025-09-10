@@ -37,22 +37,25 @@ use crate::{
     Element, ProverContext, ScalingStrategy, Shape, Tensor,
     iop::context::{ContextAux, ShapeStep},
     layers::{
-        activation::{Activation, ActivationProof},
-        add::{Add, AddCtx, AddProof},
-        concat_matmul::{ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof},
-        convolution::Convolution,
-        dense::Dense,
-        pooling::Pooling,
-        requant::{Requant, RequantProof},
-        reshape::{Reshape, ReshapeCtx},
+        activation::{ACTIVATION_LAYER, Activation, ActivationProof},
+        add::{ADD_LAYER, Add, AddCtx, AddProof},
+        concat_matmul::{CONCAT_MATMUL_LAYER, ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof},
+        convolution::{CONVOLUTION_LAYER, Convolution},
+        dense::{DENSE_LAYER, Dense},
+        flatten::FLATTEN_LAYER,
+        matrix_mul::MATMUL_LAYER,
+        pooling::{POOLING_LAYER, Pooling},
+        requant::{REQUANT_LAYER, Requant, RequantProof},
+        reshape::{RESHAPE_LAYER, Reshape, ReshapeCtx},
         transformer::{
-            embeddings::{Embeddings, EmbeddingsCtx, EmbeddingsProof},
-            layernorm::{LayerNorm, LayerNormCtx, LayerNormProof},
-            logits::{Logits, LogitsCtx, LogitsProof},
-            mha::{Mha, MhaCtx, MhaProof},
-            positional::{Positional, PositionalCtx, PositionalProof},
-            qkv::{QKV, QKVCtx, QKVProof},
-            softmax::{Softmax, SoftmaxCtx, SoftmaxProof},
+            embeddings::{EMBEDDINGS_LAYER, Embeddings, EmbeddingsCtx, EmbeddingsProof},
+            layernorm::{LAYERNORM_LAYER, LayerNorm, LayerNormCtx, LayerNormProof},
+            logits::{LOGITS_LAYER, Logits, LogitsCtx, LogitsProof},
+            mha::{MHA_LAYER, Mha, MhaCtx, MhaProof},
+            positional::{POSITIONAL_LAYER, Positional, PositionalCtx, PositionalProof},
+            qkv::{QKV, QKV_LAYER, QKVCtx, QKVProof},
+            rmsnorm::{RMSNORM_LAYER, RMSNorm, RMSNormCtx, RMSNormProof},
+            softmax::{SOFTMAX_LAYER, Softmax, SoftmaxCtx, SoftmaxProof},
         },
     },
     lookup::context::LookupWitnessGen,
@@ -84,6 +87,7 @@ pub enum Layer<T> {
     Mha(Mha<T>),
     ConcatMatMul(ConcatMatMul),
     LayerNorm(LayerNorm<T>),
+    RMSNorm(RMSNorm<T>),
     Softmax(Softmax<T>),
     Add(Add<T>),
     Reshape(Reshape),
@@ -94,23 +98,24 @@ pub enum Layer<T> {
 impl<T> Layer<T> {
     pub fn short_name(&self) -> &str {
         let r = match self {
-            Layer::Dense(_) => "DENS",
-            Layer::MatMul(_) => "MMUL",
-            Layer::Convolution(_) => "CONV",
-            Layer::Activation(_) => "ACTI",
-            Layer::Requant(_) => "REQU",
-            Layer::Pooling(_) => "POOL",
-            Layer::Flatten(_) => "FLTT",
-            Layer::QKV(_) => "_QKV",
-            Layer::Mha(_) => "MHDA",
-            Layer::ConcatMatMul(_) => "CMML",
-            Layer::LayerNorm(_) => "LNRM",
-            Layer::Softmax(_) => "SFTM",
-            Layer::Add(_) => "_ADD",
-            Layer::Reshape(_) => "RSHP",
-            Layer::Embeddings(_) => "EMBD",
-            Layer::Positional(_) => "POSI",
-            Layer::Logits(_) => "LGIT",
+            Layer::Dense(_) => DENSE_LAYER,
+            Layer::MatMul(_) => MATMUL_LAYER,
+            Layer::Convolution(_) => CONVOLUTION_LAYER,
+            Layer::Activation(_) => ACTIVATION_LAYER,
+            Layer::Requant(_) => REQUANT_LAYER,
+            Layer::Pooling(_) => POOLING_LAYER,
+            Layer::Flatten(_) => FLATTEN_LAYER,
+            Layer::QKV(_) => QKV_LAYER,
+            Layer::Mha(_) => MHA_LAYER,
+            Layer::ConcatMatMul(_) => CONCAT_MATMUL_LAYER,
+            Layer::LayerNorm(_) => LAYERNORM_LAYER,
+            Layer::RMSNorm(_) => RMSNORM_LAYER,
+            Layer::Softmax(_) => SOFTMAX_LAYER,
+            Layer::Add(_) => ADD_LAYER,
+            Layer::Reshape(_) => RESHAPE_LAYER,
+            Layer::Embeddings(_) => EMBEDDINGS_LAYER,
+            Layer::Positional(_) => POSITIONAL_LAYER,
+            Layer::Logits(_) => LOGITS_LAYER,
         };
         assert_eq!(r.len(), 4, "layer short name must be 4 chars long: {r}");
         r
@@ -146,6 +151,7 @@ pub enum LayerCtx<E: ExtensionField> {
     Mha(MhaCtx<E>),
     ConcatMatMul(ConcatMatMulCtx),
     LayerNorm(LayerNormCtx<E>),
+    RMSNorm(RMSNormCtx<E>),
     Flatten,
     Add(AddCtx),
     Softmax(SoftmaxCtx<E>),
@@ -174,6 +180,7 @@ where
     ConcatMatMul(ConcatMatMulProof<E>),
     Add(AddProof<E>),
     LayerNorm(LayerNormProof<E, PCS>),
+    RMSNorm(RMSNormProof<E, PCS>),
     Softmax(SoftmaxProof<E, PCS>),
     Embeddings(EmbeddingsProof<E>),
     Logits(LogitsProof<E, PCS>),
@@ -196,6 +203,7 @@ impl<T> Layer<T> {
             Layer::MatMul(_) => "mat-mul",
             Layer::ConcatMatMul(_) => "concat-mat-mul",
             Layer::LayerNorm(_) => "layer-norm",
+            Layer::RMSNorm(_) => "rms-norm",
             Layer::Softmax(_) => "softmax",
             Layer::Add(_) => "add",
             Layer::Reshape(_) => "reshape",
@@ -215,6 +223,7 @@ impl<E: ExtensionField> LayerCtx<E> {
             Self::Mha(_) => "MHA".to_string(),
             Self::ConcatMatMul(_) => "ConcatMatMul".to_string(),
             Self::LayerNorm(_) => "LayerNorm".to_string(),
+            Self::RMSNorm(_) => "RMSNorm".to_string(),
             Self::Softmax(_) => "Softmax".to_string(),
             Self::Add(_) => "Add".to_string(),
             Self::Logits(_) => "Logits".to_string(),
@@ -451,6 +460,7 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Logits(logits) => logits.output_shapes(input_shapes, padding_mode),
             Layer::Positional(positional) => positional.output_shapes(input_shapes, padding_mode),
             Layer::LayerNorm(layernorm) => layernorm.output_shapes(input_shapes, padding_mode),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.output_shapes(input_shapes, padding_mode),
             Layer::Softmax(softmax) => softmax.output_shapes(input_shapes, padding_mode),
             Layer::Embeddings(embeddings) => embeddings.output_shapes(input_shapes, padding_mode),
             Layer::Reshape(reshape) => reshape.output_shapes(input_shapes, padding_mode),
@@ -470,6 +480,7 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Mha(mha) => mha.num_outputs(num_inputs),
             Layer::ConcatMatMul(concat_matmul) => concat_matmul.num_outputs(num_inputs),
             Layer::LayerNorm(layernorm) => layernorm.num_outputs(num_inputs),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.num_outputs(num_inputs),
             Layer::Softmax(softmax) => softmax.num_outputs(num_inputs),
             Layer::Add(add) => add.num_outputs(num_inputs),
             Layer::Logits(logits) => logits.num_outputs(num_inputs),
@@ -492,6 +503,7 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Mha(mha) => mha.describe(),
             Layer::ConcatMatMul(concat_matmul) => concat_matmul.describe(),
             Layer::LayerNorm(layernorm) => layernorm.describe(),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.describe(),
             Layer::Softmax(softmax) => softmax.describe(),
             Layer::Add(add) => add.describe(),
             Layer::Logits(logits) => logits.describe(),
@@ -514,6 +526,7 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Mha(mha) => mha.is_provable(),
             Layer::ConcatMatMul(concat_matmul) => concat_matmul.is_provable(),
             Layer::LayerNorm(layernorm) => layernorm.is_provable(),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.is_provable(),
             Layer::Softmax(softmax) => softmax.is_provable(),
             Layer::Positional(positional) => positional.is_provable(),
             Layer::Add(add) => add.is_provable(),
@@ -544,6 +557,7 @@ impl Evaluate<f32> for Layer<f32> {
                 concat_matmul.evaluate(inputs, unpadded_input_shapes)
             }
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs, unpadded_input_shapes),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs, unpadded_input_shapes),
             Layer::Softmax(softmax) => softmax.evaluate(inputs, unpadded_input_shapes),
             Layer::Add(add) => add.evaluate(inputs, unpadded_input_shapes),
             Layer::Logits(logits) => logits.evaluate(inputs, unpadded_input_shapes),
@@ -574,6 +588,7 @@ impl Evaluate<Element> for Layer<Element> {
                 concat_matmul.evaluate(inputs, unpadded_input_shapes)
             }
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs, unpadded_input_shapes),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs, unpadded_input_shapes),
             Layer::Softmax(softmax) => softmax.evaluate(inputs, unpadded_input_shapes),
             Layer::Add(add) => add.evaluate(inputs, unpadded_input_shapes),
             Layer::Logits(logits) => logits.evaluate(inputs, unpadded_input_shapes),
@@ -612,6 +627,7 @@ impl ProveInfo for Layer<Element> {
             Layer::ConcatMatMul(concat_matmul) => concat_matmul.step_info(id, aux),
             Layer::Add(add) => add.step_info(id, aux),
             Layer::LayerNorm(layernorm) => layernorm.step_info(id, aux),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.step_info(id, aux),
             Layer::Softmax(softmax) => softmax.step_info(id, aux),
             Layer::Logits(logits) => logits.step_info(id, aux),
             Layer::Positional(positional) => positional.step_info(id, aux),
@@ -640,6 +656,7 @@ impl PadOp for Layer<Element> {
             Layer::ConcatMatMul(concat_matmul) => Layer::ConcatMatMul(concat_matmul.pad_node(si)?),
             Layer::Add(add) => Layer::Add(add.pad_node(si)?),
             Layer::LayerNorm(layernorm) => Layer::LayerNorm(layernorm.pad_node(si)?),
+            Layer::RMSNorm(rmsnorm) => Layer::RMSNorm(rmsnorm.pad_node(si)?),
             Layer::Softmax(softmax) => Layer::Softmax(softmax.pad_node(si)?),
             Layer::Logits(logits) => Layer::Logits(logits.pad_node(si)?),
             Layer::Positional(positional) => Layer::Positional(positional.pad_node(si)?),
@@ -722,6 +739,9 @@ where
             (Layer::LayerNorm(layernorm), LayerCtx::LayerNorm(info)) => {
                 layernorm.prove(node_id, info, last_claims, step_data, prover, store)
             }
+            (Layer::RMSNorm(rmsnorm), LayerCtx::RMSNorm(info)) => {
+                rmsnorm.prove(node_id, info, last_claims, step_data, prover, store)
+            }
 
             _ => bail!(
                 "Incompatible layer {} and ctx {} found for node id {}",
@@ -754,6 +774,7 @@ where
             Layer::Softmax(softmax) => softmax.gen_lookup_witness(id, ctx, step_data, store),
             Layer::Logits(logits) => logits.gen_lookup_witness(id, ctx, step_data, store),
             Layer::LayerNorm(layernorm) => layernorm.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.gen_lookup_witness(id, ctx, step_data, store),
             Layer::Positional(positional) => {
                 positional.gen_lookup_witness(id, ctx, step_data, store)
             }
@@ -831,6 +852,11 @@ impl QuantizeOp for Layer<f32> {
                 )
                 .maybe_requants(output.requant_layer)
             }
+            Layer::RMSNorm(rmsnorm) => {
+                let output = rmsnorm.quantize_op::<S>(data, node_id, input_scaling)?;
+                QuantizeOutput::new(Layer::RMSNorm(output.quantized_op), output.output_scalings)
+                    .maybe_requants(output.requant_layer)
+            }
             Layer::Softmax(softmax) => {
                 let output = softmax.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::Softmax(output.quantized_op), output.output_scalings)
@@ -899,6 +925,7 @@ where
             Self::Mha(_) => "MHA".to_string(),
             Self::ConcatMatMul(..) => "ConcatMatMul".to_string(),
             Self::LayerNorm(_) => "LayerNorm".to_string(),
+            Self::RMSNorm(_) => "RMSNorm".to_string(),
             Self::Softmax(_) => "Softmax".to_string(),
             Self::Logits(_) => "Logits".to_string(),
             Self::Positional(_) => "Positional".to_string(),
@@ -921,6 +948,7 @@ where
             LayerProof::ConcatMatMul(..) => None,
             LayerProof::Add(_) => None,
             LayerProof::LayerNorm(proof) => Some(proof.get_lookup_data()),
+            LayerProof::RMSNorm(proof) => Some(proof.get_lookup_data()),
             LayerProof::Softmax(proof) => Some(proof.get_lookup_data()),
             LayerProof::Logits(proof) => Some(proof.get_lookup_data()),
             LayerProof::Positional(_) => None,

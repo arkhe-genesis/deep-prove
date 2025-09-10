@@ -48,10 +48,13 @@ use crate::{
     tensor::Number,
 };
 
+/// The short name used to identify the embeddings layer
+pub const EMBEDDINGS_LAYER: &str = "EMBD";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Embeddings<N> {
-    mat: MatMul<N>,
-    emb_size: usize,
+    pub(crate) mat: MatMul<N>,
+    pub(crate) emb_size: usize,
     pub(crate) vocab_size: usize,
 }
 

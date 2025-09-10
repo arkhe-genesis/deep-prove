@@ -714,6 +714,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Positional(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Add(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::LayerNorm(ctx) => ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::RMSNorm(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Logits(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Embeddings(ctx) => ctx.output_shapes(input_shapes, padding_mode),
@@ -740,6 +741,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Positional(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::Add(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::LayerNorm(ctx) => ctx.num_outputs(num_inputs),
+            LayerCtx::RMSNorm(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.num_outputs(num_inputs),
             LayerCtx::Logits(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::Embeddings(ctx) => ctx.num_outputs(num_inputs),
@@ -762,6 +764,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Add(ctx) => ctx.describe(),
             LayerCtx::Positional(ctx) => ctx.describe(),
             LayerCtx::LayerNorm(ctx) => ctx.describe(),
+            LayerCtx::RMSNorm(ctx) => ctx.describe(),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.describe(),
             LayerCtx::Logits(ctx) => ctx.describe(),
             LayerCtx::Embeddings(ctx) => ctx.describe(),
@@ -785,6 +788,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Positional(ctx) => ctx.is_provable(),
             LayerCtx::Add(ctx) => ctx.is_provable(),
             LayerCtx::LayerNorm(ctx) => ctx.is_provable(),
+            LayerCtx::RMSNorm(ctx) => ctx.is_provable(),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.is_provable(),
             LayerCtx::Logits(ctx) => ctx.is_provable(),
             LayerCtx::Embeddings(ctx) => ctx.is_provable(),
@@ -847,6 +851,9 @@ where
             (LayerCtx::LayerNorm(layernorm_ctx), LayerProof::LayerNorm(proof)) => {
                 layernorm_ctx.verify(proof, last_claims, verifier, shape_step)
             }
+            (LayerCtx::RMSNorm(rmsnorm_ctx), LayerProof::RMSNorm(proof)) => {
+                rmsnorm_ctx.verify(proof, last_claims, verifier, shape_step)
+            }
             (LayerCtx::Requant(requant_ctx), LayerProof::Requant(proof)) => {
                 requant_ctx.verify(proof, last_claims, verifier, shape_step)
             }
@@ -903,6 +910,9 @@ where
             LayerCtx::LayerNorm(layernorm_ctx) => {
                 compute_model_output_claims::<_, PCS, _, _>(layernorm_ctx, transcript, outputs)
             }
+            LayerCtx::RMSNorm(rmsnorm_ctx) => {
+                compute_model_output_claims::<_, PCS, _, _>(rmsnorm_ctx, transcript, outputs)
+            }
             LayerCtx::Flatten => compute_model_output_claims::<_, PCS, _, _>(
                 &NonProvableVerifierCtx(&Flatten),
                 transcript,
@@ -955,6 +965,7 @@ where
                 verify_input_claim::<E, PCS, _, A>(activation_ctx, inputs, claims)
             }
             LayerCtx::LayerNorm(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
+            LayerCtx::RMSNorm(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
             LayerCtx::Softmax(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
             LayerCtx::Logits(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
             LayerCtx::Embeddings(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
@@ -1005,6 +1016,9 @@ where
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::LayerNorm(ctx), LayerProof::LayerNorm(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::RMSNorm(ctx), LayerProof::RMSNorm(p)) => {
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Softmax(ctx), LayerProof::Softmax(p)) => {

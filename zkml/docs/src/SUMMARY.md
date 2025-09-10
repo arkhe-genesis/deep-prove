@@ -14,4 +14,5 @@
     - [MHA Layer](./llms-layers/mha.md)
     - [Softmax](./softmax.md)
     - [LayerNorm](./llms-layers/layernorm.md)
+    - [RMSNorm](./llms-layers/rmsnorm.md)
     - [Argmax](./llms-layers/argmax.md)

@@ -52,6 +52,8 @@ use crate::{
     tensor::Number,
     util::from_mle_list_dimensions,
 };
+/// Short name used to identify the concat matmul layer.
+pub const CONCAT_MATMUL_LAYER: &str = "CMML";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Permutation(Vec<usize>);

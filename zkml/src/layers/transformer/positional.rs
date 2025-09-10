@@ -33,6 +33,9 @@ use crate::{
     tensor::{Number, TensorSlice},
 };
 
+/// The short name used to identify the positional layer.
+pub const POSITIONAL_LAYER: &str = "POSI";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PositionalCtx {
     add_ctx: AddCtx,
@@ -63,14 +66,14 @@ pub struct PositionalProof<E> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Learned<N> {
-    positional: Tensor<N>,
-    unpadded_shape: Shape,
-    past_length: Arc<Mutex<LearnedCache>>,
-    add_layer: Add<N>,
+    pub(crate) positional: Tensor<N>,
+    pub(crate) unpadded_shape: Shape,
+    pub(crate) past_length: Arc<Mutex<LearnedCache>>,
+    pub(crate) add_layer: Add<N>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LearnedCache {
+pub(crate) struct LearnedCache {
     seq_len: usize,
     initialized: bool,
 }

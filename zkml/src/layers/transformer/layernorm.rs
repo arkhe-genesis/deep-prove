@@ -61,12 +61,15 @@ use crate::{
 
 use burn::{module::Param, nn::LayerNormConfig as BLayerNormConfig};
 
+/// The short name used to identify the LayerNorm layer.
+pub(crate) const LAYERNORM_LAYER: &str = "LNRM";
+
 /// The base 2 logarithm of the scale factor used in the inverse square root lookup tables
 pub(crate) const LOG_LAYERNORM_SCALE_FACTOR: usize = 24;
 /// The scale factor for our fixed point arithmetic
 pub(crate) const LAYERNORM_SCALE_FACTOR: usize = 1 << LOG_LAYERNORM_SCALE_FACTOR;
 /// The scale factor of the outputs of the inverse square root lookup tables lookup
-pub(crate) const LAYERNORM_OUTPUT_SCALE_FACTOR: usize = 1 << 10;
+pub(crate) const LAYERNORM_OUTPUT_SCALE_FACTOR: usize = 1 << 20;
 
 const GAMMA_POLY_ID: &str = "LayerNormGamma";
 const BETA_POLY_ID: &str = "LayerNormBeta";

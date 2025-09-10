@@ -41,6 +41,8 @@ use crate::{
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
 };
+/// Short name used to identify the QKV layer
+pub const QKV_LAYER: &str = "_QKV";
 
 /// A layer that evaluates the tensor X against the matrices Q, K and V.
 /// NOTE: it performs optimizations with the cache, so it actually

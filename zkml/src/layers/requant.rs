@@ -54,6 +54,8 @@ use super::{
     LayerCtx,
     provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
 };
+/// Constant used to identify the requantisation layer
+pub const REQUANT_LAYER: &str = "REQU";
 
 /// Constant used in fixed point multiplication for normalised [`f32`] values
 const FIXED_POINT_SCALE: usize = 25;

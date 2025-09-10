@@ -511,6 +511,22 @@ impl<T> Tensor<T> {
         self.data
     }
 
+    /// Return the number of elements contained in this tensor, independently of
+    /// its shape.
+    pub fn data_size(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Iterates over the data in the tensor
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.data.iter()
+    }
+
+    /// Mutable Iterator over the data in the tensor
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.data.iter_mut()
+    }
+
     /// Returns an iterator that yields slices of the last dimension.
     /// For a tensor of shape [2,3,3], it will yield 6 slices (2*3) of 3 elements each.
     pub fn slice_last_dim(&self) -> impl Iterator<Item = &[T]> {
@@ -876,6 +892,13 @@ impl<T: Number> Tensor<T> {
     /// Instantiate a new tensor with `shape` initialised to `default`.
     pub fn zeros(shape: Shape) -> Self {
         Self::initialised(shape, T::zero())
+    }
+
+    pub fn one(shape: Shape) -> Self {
+        Tensor {
+            data: vec![T::unit(); shape.numel()],
+            shape,
+        }
     }
 
     pub fn argmax(&self) -> usize {

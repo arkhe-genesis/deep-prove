@@ -46,6 +46,8 @@ use super::{
     LayerCtx,
     provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
 };
+/// Short name used to identify the pooling layer.
+pub const POOLING_LAYER: &str = "POOL";
 
 pub const MAXPOOL2D_KERNEL_SIZE: usize = 2;
 

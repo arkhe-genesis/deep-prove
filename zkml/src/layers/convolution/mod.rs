@@ -42,6 +42,9 @@ use tenstore::GenStore;
 use tracing::{info, warn};
 use transcript::Transcript;
 
+/// The short name used to identify the convolution layer
+pub const CONVOLUTION_LAYER: &str = "CONV";
+
 const IS_PROVABLE: bool = true;
 
 pub(crate) mod proof;

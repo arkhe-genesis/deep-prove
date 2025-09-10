@@ -18,6 +18,9 @@ use crate::{Tensor, tensor::Number};
 
 use super::provable::{Evaluate, LayerOut, OpInfo};
 
+/// The short name used to identify the Reshape layer
+pub const RESHAPE_LAYER: &str = "RSHP";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Subspace {
     // Indices in the shape of the tensor that we want to remove

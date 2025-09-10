@@ -39,6 +39,8 @@ use super::provable::{
     Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
     VerifiableCtx,
 };
+/// The short name used to identify a dense layer
+pub const DENSE_LAYER: &str = "DENS";
 
 /// Description of the layer
 #[derive(Clone, Debug, Serialize, Deserialize)]

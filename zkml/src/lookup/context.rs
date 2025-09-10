@@ -35,6 +35,7 @@ use crate::{
         provable::{NodeId, ProvableOp},
         transformer::{
             layernorm::{LAYERNORM_OUTPUT_SCALE_FACTOR, LAYERNORM_SCALE_FACTOR},
+            rmsnorm::RMSTableData,
             softmax::{OUTPUT_SCALE_FACTOR, SCALE_FACTOR},
         },
     },
@@ -64,6 +65,8 @@ pub enum TableType {
     ZeroTable,
     /// Table used to calculate inverse square root, see the [`InverseSQRTTableData`] struct for more info.
     InverseSQRT(InverseSQRTTableData),
+    /// Table used in RMSNorm layers, contains the inner [`RMSTableData`]
+    RMSTable(RMSTableData),
 }
 
 // We impl PartialOrd and Ord ourselves on TableType, that way in a BTreeMap or BtreeSet they will always be ordered by the table with the most variables first.
@@ -283,6 +286,20 @@ impl TableType {
                     .unzip();
                 vec![in_column, out_column]
             }
+            TableType::RMSTable(table_data) => {
+                let table_max: Element = 1 << (2 * (*quantization::BIT_LEN - 1));
+                let table_min = -table_max;
+                let (in_column, out_column): (Vec<E::BaseField>, Vec<E::BaseField>) = (table_min
+                    ..table_max)
+                    .map(|i| {
+                        let out = table_data.table_output(i);
+                        let i_field: E = i.to_field();
+                        let out_field: E = out.to_field();
+                        (i_field.as_bases()[0], out_field.as_bases()[0])
+                    })
+                    .unzip();
+                vec![in_column, out_column]
+            }
         }
     }
     pub fn get_merged_table_column(&self, column_separator: Element) -> Vec<Element> {
@@ -341,6 +358,17 @@ impl TableType {
                     })
                     .collect()
             }
+            TableType::RMSTable(table_data) => {
+                let table_max: Element = 1 << (2 * (*quantization::BIT_LEN - 1));
+                let table_min = -table_max;
+
+                (table_min..table_max)
+                    .map(|i| {
+                        let out = table_data.table_output(i);
+                        i + COLUMN_SEPARATOR * out
+                    })
+                    .collect()
+            }
             TableType::RequantZeroTable => (*quantization::MIN..=*quantization::MAX)
                 .map(|i| {
                     let out = if i != 0 { 0 } else { 1 };
@@ -371,6 +399,12 @@ impl TableType {
                 table_data.range_check_bits
             ),
             TableType::RequantZeroTable => "Requant Zero Table".to_string(),
+            TableType::RMSTable(table_data) => format!(
+                "RMSNorm Table - normalisation: {}, shift: {}, dim size: {}",
+                table_data.float_epsilon(),
+                table_data.range_check_bits,
+                table_data.dim_size
+            ),
         }
     }
 
@@ -468,7 +502,7 @@ impl TableType {
                 );
                 Ok(vec![in_column_eval, out_column_eval])
             }
-            TableType::InverseSQRT(..) => {
+            TableType::InverseSQRT(..) | TableType::RMSTable(..) => {
                 if point.len() != 2 * (*quantization::BIT_LEN - 1) + 1 {
                     return Err(LogUpError::VerifierError(format!(
                         "Point was not the correct size to produce an InverseSQRT table evaluation, point size: {}, expected: {}",
@@ -533,6 +567,7 @@ impl TableType {
                     .sample_and_append_challenge(b"InverseSQRT")
                     .elements
             }
+            TableType::RMSTable(..) => transcript.sample_and_append_challenge(b"RMSTable").elements,
             TableType::RequantZeroTable => {
                 transcript
                     .sample_and_append_challenge(b"RequantZero")
@@ -551,7 +586,9 @@ impl TableType {
             | TableType::ZeroTable => *quantization::BIT_LEN,
             TableType::Softmax(table_data) => table_data.size(),
             TableType::ErrorTable(_, allowable_error) => ceil_log2(2 * *allowable_error as usize),
-            TableType::InverseSQRT(..) => 2 * (*quantization::BIT_LEN - 1) + 1,
+            TableType::InverseSQRT(..) | TableType::RMSTable(..) => {
+                2 * (*quantization::BIT_LEN - 1) + 1
+            }
         }
     }
 
@@ -563,7 +600,8 @@ impl TableType {
             | TableType::Softmax(..)
             | TableType::ZeroTable
             | TableType::Relu
-            | TableType::RequantZeroTable => 2,
+            | TableType::RequantZeroTable
+            | TableType::RMSTable(..) => 2,
             TableType::Range | TableType::ErrorTable(..) => 1,
         }
     }
@@ -620,6 +658,16 @@ impl TableType {
                     num_vars, column,
                 ))
             }
+            TableType::RMSTable(table_data) => {
+                let table_max: Element = 1 << (2 * (*quantization::BIT_LEN - 1));
+                let table_min = -table_max;
+                let column =
+                    to_base::<E, _>((table_min..table_max).map(|i| table_data.table_output(i)));
+                let num_vars = 2 * (*quantization::BIT_LEN - 1) + 1;
+                Some(MultilinearExtension::<E>::from_evaluations_vec(
+                    num_vars, column,
+                ))
+            }
 
             _ => None,
         }
@@ -631,7 +679,8 @@ impl TableType {
             TableType::Softmax(..)
             | TableType::ErrorTable(..)
             | TableType::InverseSQRT(..)
-            | TableType::GELU(..) => {
+            | TableType::GELU(..)
+            | TableType::RMSTable(..) => {
                 // For Softmax, InverSQRT and Error Table we just need the output column claim so the last of the slice
                 vec![claims.last().cloned().unwrap()]
             }
@@ -647,6 +696,7 @@ impl TableType {
                 | TableType::ErrorTable(..)
                 | TableType::InverseSQRT(..)
                 | TableType::GELU(..)
+                | TableType::RMSTable(..)
         )
     }
 }

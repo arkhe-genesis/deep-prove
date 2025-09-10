@@ -32,6 +32,9 @@ use crate::{
 use super::provable::LayerOut;
 const OPERAND_POLY_ID: u64 = 0xff;
 
+/// The short name used to identify the Add layer.
+pub const ADD_LAYER: &str = "_ADD";
+
 /// Add layer that adds two tensors together.
 /// If there is two inputs, no static weight, then the output shape is the same as the first input.
 #[derive(Clone, Debug, Serialize, Deserialize)]

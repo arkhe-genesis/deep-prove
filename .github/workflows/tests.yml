@@ -47,7 +47,6 @@ jobs:
         with:
           lfs: "true"
           submodules: "recursive"
-          clean: "false"
 
       - name: Set RNG seed
         run: |

@@ -11,6 +11,10 @@ use crate::{
 };
 
 use super::provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProveInfo};
+
+/// Short name used to identify the flatten layer
+pub const FLATTEN_LAYER: &str = "FLTT";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Flatten;
 /// Even if empty, we need a context such that it implements the default

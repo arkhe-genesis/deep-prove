@@ -23,6 +23,7 @@ use crate::{
 pub(crate) mod iterator;
 pub mod llm;
 pub(crate) mod trace;
+pub mod transform;
 pub use iterator::ToIterator;
 pub use trace::{InferenceStep, InferenceTrace, StepData};
 
@@ -208,20 +209,6 @@ where
                     Layer::Requant(requant),
                     vec![output_wires],
                 ))
-                // INPUT EDGES: for each output wire, we simply copy the index i, and set the node to be input_node_id
-                // let input_edges = wire
-                //    .edges
-                //    .iter()
-                //    .map(|_| Edge::new(input_node_id, i))
-                //    .collect();
-                //// OUTPUT EDGES: We simply copy the output wires of input_node since they are the same.
-                //// NOTE here we enforce that one requant  == one output wire. Later we might want to revisit that assumption if needed.
-                // let output_wires = wire.clone();
-                // Ok(Node::new_with_outputs(
-                //    input_edges,
-                //    Layer::Requant(requant),
-                //    vec![output_wires],
-                //))
             })
             .collect::<Result<Vec<_>>>()?;
         debug!(
@@ -421,6 +408,11 @@ where
                 }
             })
             .collect()
+    }
+
+    /// Returns the order the [NodeIds](NodeId) will be visited in a forward pass
+    pub fn eval_order(&self) -> Vec<NodeId> {
+        self.to_forward_iterator().map(|(id, _)| id).collect()
     }
 }
 
