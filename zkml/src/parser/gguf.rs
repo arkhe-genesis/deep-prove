@@ -1,7 +1,6 @@
 use super::json;
 use candle_core::quantized::{QTensor, gguf_file::Value};
 use std::{
-    collections::HashMap,
     fs::File,
     io::{BufReader, Read, Seek},
     ops::Deref,
@@ -18,22 +17,12 @@ use crate::{
         matrix_mul::MatMul,
         transformer::{embeddings::Embeddings, layernorm::LayerNorm, positional::Positional},
     },
-    parser::llm::{
-        Attention, FeedForward, GPT2Model, INTERNAL_BOS, INTERNAL_EOS, LLMConfig, LLMModel,
-        LLMVariant, TokenizerData,
-    },
+    parser::llm::{Attention, FeedForward, GPT2Model, LLMConfig, LLMModel, LLMVariant},
 };
 
 impl LLMConfig {
     pub fn from_content(l: &FileTensorLoader) -> anyhow::Result<Self> {
-        let variant_name = l
-            .content
-            .metadata
-            .get("general.name")
-            .or(l.content.metadata.get("general.architecture"))
-            .map(|v| v.to_string())
-            .context("no variant found")??;
-        let variant = LLMVariant::from_content(variant_name)?;
+        let variant = LLMVariant::from_loader(l)?;
         let embedding_size = l.content.metadata[variant.embedding_size_key()].to_u32()? as usize;
         let hidden_size = l.content.metadata[variant.hidden_size_key()].to_u32()? as usize;
         let num_heads = l.content.metadata[variant.num_heads_key()].to_u32()? as usize;
@@ -70,38 +59,45 @@ impl LLMVariant {
     pub fn num_heads_key(&self) -> &str {
         match self {
             Self::GPT2 => "gpt2.attention.head_count",
+            Self::Gemma3 => "gemma3.attention.head_count",
         }
     }
 
     pub fn context_length_key(&self) -> &str {
         match self {
             Self::GPT2 => "gpt2.context_length",
+            Self::Gemma3 => "gemma3.context_length",
         }
     }
     pub fn num_block_key(&self) -> &str {
         match self {
             Self::GPT2 => "gpt2.block_count",
+            Self::Gemma3 => "gemma3.block_count",
         }
     }
     pub fn embedding_size_key(&self) -> &str {
         match self {
             Self::GPT2 => "gpt2.embedding_length",
+            Self::Gemma3 => "gemma3.embedding_length",
         }
     }
     pub fn hidden_size_key(&self) -> &str {
         match self {
             // same size as embedding for gpt2
             Self::GPT2 => self.embedding_size_key(),
+            Self::Gemma3 => self.embedding_size_key(),
         }
     }
     pub fn norm_epsilon_key(&self) -> &str {
         match self {
             Self::GPT2 => "gpt2.attention.layer_norm_epsilon",
+            Self::Gemma3 => "gemma3.attention.layer_norm_epsilon",
         }
     }
     pub fn model(&self, l: &FileTensorLoader, config: &LLMConfig) -> anyhow::Result<LLMModel> {
         match self {
             Self::GPT2 => Ok(LLMModel::GPT2(GPT2Model::from_loader(l, config)?)),
+            Self::Gemma3 => bail!("Gemma3 is not supported yet"),
         }
     }
 }
@@ -239,6 +235,7 @@ impl Attention<f32> {
 impl Positional<f32> {
     pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         match c.specific_config {
+            LLMVariant::Gemma3 => bail!("Gemma3 is not supported yet"),
             LLMVariant::GPT2 => {
                 let position_embd = loader.get_tensor("position_embd.weight")?;
                 let shape = position_embd.shape();
@@ -264,37 +261,6 @@ impl Embeddings<f32> {
     pub fn from_loader(loader: &FileTensorLoader) -> anyhow::Result<Self> {
         let emb_tensor = loader.get_tensor("token_embd.weight")?;
         Embeddings::new(emb_tensor)
-    }
-}
-
-impl TokenizerData {
-    #[allow(dead_code)]
-    pub fn from_loader(loader: &FileTensorLoader) -> anyhow::Result<Self> {
-        let tokens = loader
-            .metadata::<Vec<Value>>("tokenizer.ggml.tokens")
-            .into_iter()
-            .map(|v| {
-                v.to_string()
-                    .cloned()
-                    .with_context(|| "failed to convert Value to String".to_string())
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let merges = loader
-            .metadata::<Vec<Value>>("tokenizer.ggml.merges")
-            .into_iter()
-            .map(|v| {
-                v.to_string()
-                    .cloned()
-                    .with_context(|| "failed to convert Value merges to String".to_string())
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut special_tokens = HashMap::new();
-        let bos = loader.metadata::<u32>("tokenizer.ggml.bos_token_id");
-        let eos = loader.metadata::<u32>("tokenizer.ggml.eos_token_id");
-        special_tokens.insert(INTERNAL_EOS.to_string(), eos);
-        special_tokens.insert(INTERNAL_BOS.to_string(), bos);
-        Ok(Self::new(tokens, merges, special_tokens))
     }
 }
 
@@ -510,12 +476,11 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
         dequantize(qtensor)
     }
 
-    pub fn metadata<T>(&self, key: &str) -> T
+    pub fn metadata<T>(&self, key: &str) -> Option<T>
     where
         Value: FromValue<T>,
     {
-        let v = &self.content.metadata[key];
-        Value::from_value(v)
+        self.content.metadata.get(key).map(Value::from_value)
     }
 }
 
@@ -545,7 +510,7 @@ pub mod tests {
         layers::transformer::embeddings::Embeddings,
         parser::{
             file_cache,
-            llm::{Attention, LLMConfig, TokenizerData},
+            llm::{Attention, LLMConfig, LLMTokenizer, LLMVariant, HFTokenizer},
         },
     };
 
@@ -553,6 +518,7 @@ pub mod tests {
     // pub const GPT2_Q8_0_PATH: &str = "assets/scripts/llms/gpt2.q8_0.gguf";
     // const GPT2_Q8_0_URL: &str = "https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF/resolve/main/gpt2.q8_0.gguf";
     pub const GPT2_Q8_0: &str = "gpt2.Q8_0.gguf";
+    pub const GEMMA3_Q8: &str = "gemma-3-270m-it-Q8_0.gguf";
 
     #[test]
     fn test_gguf_load_model() -> anyhow::Result<()> {
@@ -708,17 +674,26 @@ pub mod tests {
 
         Ok(())
     }
-    use crate::model::llm::LLMTokenizer;
 
     #[test]
     fn test_gguf_load_tokenizer() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
-        let tokenizer = TokenizerData::from_loader(&loader)?.into_tokenizer();
+        let tokenizer = HFTokenizer::from_loader(&loader)?;
         let s = "do or don't. there is no try.";
         let tokens = tokenizer.tokenize(s);
         let s2 = tokenizer.detokenize(&tokens);
         assert_eq!(s, s2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gguf_gemma3() -> anyhow::Result<()> {
+        let gemma = "gemma-3-270m-it-Q8_0.gguf";
+        let model_path = file_cache::from_cache(gemma)?;
+        let loader = FileTensorLoader::from_path(model_path)?;
+        println!("metadata: {:?}", loader.content.metadata.keys());
+        println!(" VARIANT: {:?}", LLMVariant::from_loader(&loader)?);
         Ok(())
     }
 }

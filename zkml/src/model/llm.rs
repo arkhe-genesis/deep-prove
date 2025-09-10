@@ -29,7 +29,7 @@ use crate::{
     padding::pad_model,
     parser::{
         gguf, json,
-        llm::{LLMConfig, Token},
+        llm::{LLMConfig, LLMTokenizer, Token},
     },
     tensor::Number,
 };
@@ -549,11 +549,6 @@ where
     }
 }
 
-pub trait LLMTokenizer {
-    fn tokenize(&self, sentence: &str) -> Vec<Token>;
-    fn detokenize(&self, ids: &[Token]) -> String;
-}
-
 #[cfg(test)]
 mod test {
     use crate::{
@@ -561,7 +556,7 @@ mod test {
         parser::{
             file_cache,
             gguf::tests::GPT2_Q8_0,
-            llm::{Token, TokenizerData},
+            llm::{Token, HFTokenizer},
         },
         testing::Pcs,
     };
@@ -602,7 +597,7 @@ mod test {
 
         // Generate the trace
         let sentence = "The sky is";
-        let tokenizer = TokenizerData::load_tokenizer_from_gguf(&model_path)?;
+        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
@@ -640,7 +635,7 @@ mod test {
         let sentence = "The sky is";
 
         // Best to load the tokenizer from the gguf file if it's available.
-        let tokenizer = TokenizerData::load_tokenizer_from_gguf(&model_path)?;
+        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let detokenized = tokenizer.detokenize(&user_tokens);
         assert_eq!(detokenized, sentence);

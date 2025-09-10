@@ -7,8 +7,11 @@ use std::{collections::HashMap, fs::OpenOptions, path::Path, time};
 use timed_core::Output;
 use tracing_subscriber::EnvFilter;
 use zkml::{
-    model::llm::{LLMContext, LLMTokenizer, LLMTokenizerObserver},
-    parser::{file_cache, llm::TokenizerData},
+    model::llm::{LLMContext, LLMTokenizerObserver},
+    parser::{
+        file_cache,
+        llm::tokenizer::{LLMTokenizer, HFTokenizer},
+    },
 };
 
 type F = GoldilocksExt2;
@@ -66,7 +69,7 @@ fn main() -> anyhow::Result<()> {
         "gpt2" => {
             let driver =
                 Driver::load_external_model(&model_path)?.with_max_context(args.max_context);
-            let tokenizer = TokenizerData::load_tokenizer_from_gguf(&model_path)?;
+            let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
             (driver, tokenizer)
         }
         _ => bail!("Model {:?} not supported", args.model),

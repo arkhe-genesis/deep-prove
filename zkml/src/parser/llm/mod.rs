@@ -1,6 +1,8 @@
-use crate::model::llm::LLMTokenizer;
-use anyhow::bail;
+pub mod tokenizer;
+use crate::parser::gguf::FileTensorLoader;
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+pub use tokenizer::{LLMTokenizer, HFTokenizer};
 
 use crate::{
     Shape, Tensor,
@@ -19,11 +21,6 @@ use crate::{
     padding::PaddingMode,
     tensor::Number,
 };
-use rust_tokenizers::{
-    tokenizer::{Gpt2Tokenizer, Tokenizer as RT},
-    vocab::Vocab,
-};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::From, derive_more::Into)]
 pub struct Token(pub(crate) usize);
@@ -90,25 +87,39 @@ pub struct LLMConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LLMVariant {
     GPT2,
+    Gemma3,
 }
+
+pub const GPT2_VARIANTS: &[&str] = &["gpt2", "Tmkrzx_X", "distilgpt2", "toy_gpt2"];
+pub const GEMMA3_VARIANTS: &[&str] = &["gemma-3"];
+
 impl LLMVariant {
-    pub fn from_content(variant: &str) -> anyhow::Result<Self> {
-        // Convert gguf_file::Value to String, then get &str
-        let variant_str = variant.to_string();
-        match variant_str.as_str() {
-            "gpt2" | "Tmkrzx_X" | "distilgpt2" | "toy_gpt2" => Ok(Self::GPT2),
-            a => bail!("unsupported architecture: {:?}", a),
+    pub fn from_loader(loader: &FileTensorLoader) -> anyhow::Result<Self> {
+        let variant_name = loader
+            .metadata::<String>("general.name")
+            .or(loader.metadata::<String>("general.architecture"))
+            .or(loader.metadata::<String>("general.basename"))
+            .or(loader.metadata::<String>("general.base_model.0.name"))
+            .map(|v| v.to_string())
+            .context("no variant found")?;
+        match variant_name.as_str().to_lowercase() {
+            a if GEMMA3_VARIANTS.iter().any(|v| a.contains(v)) => Ok(Self::Gemma3),
+            _ if GPT2_VARIANTS.contains(&variant_name.as_str()) => Ok(Self::GPT2),
+            _ => bail!("unsupported architecture variant: {:?}", variant_name),
         }
     }
+
     /// Signals the end of the sequence token, e.g. when should the generation stop.
     pub fn eos_token(&self) -> Token {
         match self {
             Self::GPT2 => 50256usize.into(),
+            Self::Gemma3 => todo!(),
         }
     }
     pub fn vocab_size(&self) -> usize {
         match self {
             Self::GPT2 => 50257,
+            Self::Gemma3 => todo!(),
         }
     }
 }
@@ -277,78 +288,5 @@ impl Attention<f32> {
             Layer::Add(add::Add::new()),
         ))?;
         self.feedforward.write_to_model(model, last_node_id)
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) const INTERNAL_BOS: &str = "<|startoftext|>";
-pub(crate) const INTERNAL_EOS: &str = "<|endoftext|>";
-
-#[allow(dead_code)]
-pub struct TokenizerData {
-    tokens: Vec<String>,
-    merges: Vec<String>,
-    special_tokens: HashMap<String, u32>,
-}
-
-impl TokenizerData {
-    #[allow(dead_code)]
-    pub fn new(
-        tokens: Vec<String>,
-        merges: Vec<String>,
-        special_tokens: HashMap<String, u32>,
-    ) -> Self {
-        Self {
-            tokens,
-            merges,
-            special_tokens,
-        }
-    }
-
-    pub fn load_tokenizer_from_gguf(
-        path: impl AsRef<std::path::Path>,
-    ) -> anyhow::Result<impl LLMTokenizer> {
-        use crate::parser::gguf;
-
-        let loader = gguf::FileTensorLoader::from_path(path)?;
-        let tokenizer = TokenizerData::from_loader(&loader)?.into_tokenizer();
-        Ok(tokenizer)
-    }
-
-    pub fn into_tokenizer(self) -> impl LLMTokenizer {
-        use std::io::Write;
-
-        // Prepare vocab.json content
-        let values: HashMap<String, i64> = self
-            .tokens
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| (s, i as i64))
-            .collect();
-        let vocab_file = tempfile::NamedTempFile::new().unwrap();
-        serde_json::to_writer(&vocab_file, &values).unwrap();
-
-        // Prepare merges.txt content
-        let merges_content = self.merges.join("\n");
-        let mut merges_file = tempfile::NamedTempFile::new().unwrap();
-        merges_file.write_all(merges_content.as_bytes()).unwrap();
-
-        Gpt2Tokenizer::from_file(vocab_file, merges_file, false)
-            .expect("unable to extract tokenizer")
-    }
-}
-
-impl LLMTokenizer for Gpt2Tokenizer {
-    fn tokenize(&self, sentence: &str) -> Vec<Token> {
-        let tokenized = self.tokenize_list(&[sentence]);
-        tokenized
-            .into_iter()
-            .take(1)
-            .flat_map(|s| s.into_iter().map(|t| self.vocab().token_to_id(&t).into()))
-            .collect::<Vec<_>>()
-    }
-    fn detokenize(&self, ids: &[Token]) -> String {
-        let tokens = ids.iter().map(|i| i.into()).collect::<Vec<i64>>();
-        self.decode(&tokens, true, true)
     }
 }

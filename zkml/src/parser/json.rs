@@ -42,6 +42,7 @@ impl LLMVariant {
     pub fn model_json(&self, l: &FileTensorLoader, config: &LLMConfig) -> anyhow::Result<LLMModel> {
         match self {
             Self::GPT2 => Ok(LLMModel::GPT2(GPT2Model::from_json(l, config)?)),
+            Self::Gemma3 => bail!("Gemma3 is not supported yet"),
         }
     }
     pub fn from_json(l: &FileTensorLoader) -> anyhow::Result<Self> {
