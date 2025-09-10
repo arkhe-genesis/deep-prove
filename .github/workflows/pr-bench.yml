@@ -45,9 +45,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          clean: "false"
-          lfs: 'true'
           submodules: "recursive"
+          clean: "false"
+          lfs: "true"
+
+      - name: Force-check LFS
+        run: git lfs pull
 
       - uses: dorny/paths-filter@v3
         id: filter
