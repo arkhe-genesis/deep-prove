@@ -5,3 +5,6 @@ extend-exclude = ["*.nix"]
 check-filename = true
 extend-identifiers = { "Ein" = "Ein", "EinSum" = "EinSum", "NdArray" = "NdArray" }
 format = "brief"
+
+[default.extend-words]
+arange = "arange"

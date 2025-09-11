@@ -15,7 +15,10 @@ use zkml::{
         matrix_mul::{self, MatMul},
         permute::Permute,
         provable::Evaluate,
-        transformer::{embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, qkv::QKV},
+        transformer::{
+            embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, qkv::QKV,
+            softmax::Softmax,
+        },
     },
     tensor::Number,
 };
@@ -675,6 +678,49 @@ fn permute_layer(c: &mut Criterion) {
     group.finish();
 }
 
+fn softmax_layer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("run-layers");
+    group
+        .sample_size(20)
+        .measurement_time(std::time::Duration::from_secs(80));
+
+    for pow2 in DATA_SIZE_POWS {
+        let size = 1 << pow2;
+        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+
+        group.bench_with_input(
+            BenchmarkId::new("softmax/f32", format!("{size}x{size}")),
+            &input,
+            |b, input| {
+                b.iter(|| {
+                    Softmax::new()
+                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                        .expect("Softmax should succeed")
+                });
+            },
+        );
+
+        let input_elem = Tensor::<Element>::random(&Shape::new(vec![size, size]));
+        group.bench_with_input(
+            BenchmarkId::new("softmax/Element", format!("{size}x{size}")),
+            &input_elem,
+            |b, input| {
+                let input_scaling = ScalingFactor::from_tensor(input, None);
+                let softmax_quantised = Softmax::<f32>::new()
+                    .quantise(input_scaling)
+                    .expect("Softmax quantise should succeed");
+                b.iter(|| {
+                    softmax_quantised
+                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
+                        .expect("Softmax should succeed")
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     add_layer,
@@ -689,5 +735,6 @@ criterion_group!(
     logits_layer,
     norm_layer,
     permute_layer,
+    softmax_layer
 );
 criterion_main!(benches);

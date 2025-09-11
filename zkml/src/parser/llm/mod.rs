@@ -2,7 +2,7 @@ pub mod tokenizer;
 use crate::parser::gguf::FileTensorLoader;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-pub use tokenizer::{LLMTokenizer, HFTokenizer};
+pub use tokenizer::{HFTokenizer, LLMTokenizer};
 
 use crate::{
     Shape, Tensor,

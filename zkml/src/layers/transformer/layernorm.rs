@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use anyhow::Context;
+use std::collections::HashMap;
 
 use crate::{
     commit::identity_eval,
@@ -312,7 +312,9 @@ impl LayerNorm<f32> {
             c.embedding_size,
             beta.shape()
         );
-        let eps = loader.metadata::<f32>(c.specific_config.norm_epsilon_key()).context("norm_epsilon not found")?;
+        let eps = loader
+            .metadata::<f32>(c.specific_config.norm_epsilon_key())
+            .context("norm_epsilon not found")?;
         Ok(Self::new(gamma, beta, eps))
     }
 }

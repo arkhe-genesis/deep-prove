@@ -32,6 +32,7 @@ use crate::{
     util::from_mle_list_dimensions,
 };
 use anyhow::{anyhow, bail, ensure};
+use burn::tensor::{Int as BInt, Tensor as BTensor, TensorData};
 use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -112,11 +113,10 @@ impl Logits {
                     .iter()
                     .map(|input| {
                         let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
-                        let binput: burn::tensor::Tensor<Backend, 2> =
-                            burn::tensor::Tensor::from_data(
-                                burn::tensor::TensorData::new(flat_data.to_vec(), [rows, last_dim]),
-                                &Default::default(),
-                            );
+                        let binput: BTensor<Backend, 2> = BTensor::from_data(
+                            TensorData::new(flat_data.to_vec(), [rows, last_dim]),
+                            &Default::default(),
+                        );
                         let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
                         let indices_vec: Vec<f32> = indices_bt
                             .to_data()
@@ -166,14 +166,10 @@ impl Logits {
                             .chunks(last_dim)
                             .flat_map(|chunk| chunk[..unpadded_dim_size].to_vec())
                             .collect::<Vec<_>>();
-                        let binput: burn::tensor::Tensor<Backend, 2, burn::tensor::Int> =
-                            burn::tensor::Tensor::from_data(
-                                burn::tensor::TensorData::new(
-                                    truncated_data,
-                                    [rows, unpadded_dim_size],
-                                ),
-                                &Default::default(),
-                            );
+                        let binput: BTensor<Backend, 2, BInt> = BTensor::from_data(
+                            TensorData::new(truncated_data, [rows, unpadded_dim_size]),
+                            &Default::default(),
+                        );
                         let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
                         let indices_vec: Vec<Element> = indices_bt
                             .to_data()
@@ -982,9 +978,7 @@ mod test {
             prop_assert_eq!(indices.len(), expected.len());
             for (i, idx) in indices.iter().enumerate() { prop_assert!((*idx - expected[i]).abs() < 1e-6); }
         }
-    }
 
-    proptest! {
         #[test]
         fn prop_logits_argmax_element((shape, data, expected) in logits_input_strategy()) {
             let data_elem: Vec<Element> = data.into_iter().map(|v| v.round_ties_even() as Element).collect();

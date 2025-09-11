@@ -60,9 +60,7 @@ impl HFTokenizer {
             .metadata::<Vec<Value>>("tokenizer.ggml.scores")
             .context("scores metadata not found")?
             .into_iter()
-            .map(|v| {
-                Ok(v.to_f32().unwrap() as f64)
-            })
+            .map(|v| Ok(v.to_f32().unwrap() as f64))
             .collect::<Result<Vec<_>>>()?;
 
         let unk_id = loader

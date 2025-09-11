@@ -10,7 +10,7 @@ use zkml::{
     model::llm::{LLMContext, LLMTokenizerObserver},
     parser::{
         file_cache,
-        llm::tokenizer::{LLMTokenizer, HFTokenizer},
+        llm::tokenizer::{HFTokenizer, LLMTokenizer},
     },
 };
 

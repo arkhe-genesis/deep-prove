@@ -4,6 +4,7 @@ use std::{fmt::Debug, marker::PhantomData};
 
 use crate::{
     Claim, Element, ScalingStrategy, Shape, Tensor,
+    backend::Backend,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         ChallengeStorage,
@@ -39,6 +40,9 @@ use crate::{
 use anyhow::{Result, anyhow, ensure};
 
 use ark_std::Zero;
+use burn::tensor::{
+    Float as BFloat, Int as BInt, Tensor as BTensor, TensorData, activation::softmax,
+};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -69,6 +73,12 @@ pub(crate) const LOG_SCALE_FACTOR: usize = 24;
 pub(crate) const SCALE_FACTOR: usize = 1 << LOG_SCALE_FACTOR;
 /// The scale factor of the outputs of the `exp` lookup
 pub(crate) const OUTPUT_SCALE_FACTOR: usize = 1 << 18;
+
+type ShiftDataResult = (
+    Tensor<Element>,
+    AttentionMask<Element>,
+    BTensor<Backend, 2, BInt>,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Stores data about the Softmax operation, which is used to map a tensor of values to a tensor of probability distributions.
@@ -261,9 +271,10 @@ impl Softmax<Element> {
     /// as [`AttentionMask`].
     pub(crate) fn calculate_shift_data(
         &self,
-        input: &Tensor<Element>,
+        binput: &BTensor<Backend, 2, BInt>,
+        input_shape: &[usize],
         unpadded_input_shape: &[usize],
-    ) -> Result<(Tensor<Element>, AttentionMask<Element>)> {
+    ) -> Result<ShiftDataResult> {
         let QuantisedSoftmaxData {
             input_scale_factor,
             inv_float_temperature,
@@ -278,85 +289,132 @@ impl Softmax<Element> {
         // 3. sum along the desired dim
         let negative_infinity = -((bkm >> 16) + 1) << 16;
 
-        // New way is calculate shift row by row (as if a mask is being used)
-        // apply shift
-        // apply mask
+        // Compute row-wise shift entirely on device using burn ops.
+        let rows = binput.shape().dims[0];
+        let last_dim = input_shape[input_shape.len() - 1];
+        let second_dim = input_shape[input_shape.len() - 2];
+        assert_eq!(
+            binput.shape().dims.len(),
+            2,
+            "Expected flattened 2D burn tensor for quantised softmax input"
+        );
+        assert_eq!(
+            last_dim,
+            binput.shape().dims[1],
+            "Expected last dimension of burn tensor to match last dimension of input shape"
+        );
+        assert_eq!(
+            input_shape
+                .iter()
+                .take(input_shape.len() - 1)
+                .product::<usize>(),
+            binput.shape().dims[0],
+            "Expected leading dimensions of input shape to match first dimension of burn tensor"
+        );
+        let unpadded_last = *unpadded_input_shape.last().unwrap_or(&last_dim);
 
-        // We need a mask
-        let final_dim = *input
-            .shape()
-            .last()
-            .ok_or(anyhow!("Input tensor had no shape in quantised Softmax"))?;
-        // We also need the second to last dim
-        let second_dim = input.shape()[input.shape().len() - 2];
-        let shift_data = if second_dim == 1 && second_dim != final_dim {
-            input
-                .get_data()
-                .chunks(final_dim)
-                .map(|chunk| {
-                    let max = *chunk
-                        .iter()
-                        .take(*unpadded_input_shape.last().unwrap())
-                        .max()
-                        .unwrap();
-                    let sum = chunk
-                        .iter()
-                        .take(*unpadded_input_shape.last().unwrap())
-                        .map(|x| {
-                            (input_scale_factor.dequantize(&(x - max)) / inv_float_temperature)
-                                .exp()
-                        })
-                        .sum::<f32>();
-                    let log_sum = sum.ln();
-                    -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round_ties_even()
-                        as Element
-                        - max * self.scalar
-                })
-                .collect::<Vec<Element>>()
+        // Construct mask on device to avoid large host allocation & memcpy.
+        let device = &Default::default();
+        let col_idx: BTensor<Backend, 1, BInt> = BTensor::arange(0..(last_dim as i64), device);
+        // Non-causal case: where second_dim == 1 && last_dim != second_dim.
+        // Active columns are first `unpadded_last` entries; mask identical across rows.
+        let mask_int: BTensor<Backend, 2, BInt> = if second_dim == 1 && second_dim != last_dim {
+            let active = unpadded_last.min(last_dim) as Element; // scalar threshold
+            // lower_elem returns Bool tensor; cast to int (0/1), then reshape & repeat
+            let col_mask_bool = col_idx.clone().lower_elem(active);
+            let col_mask_int: BTensor<Backend, 1, BInt> = col_mask_bool.int();
+            col_mask_int.reshape([1, last_dim]).repeat_dim(0, rows)
         } else {
-            input
-                .get_data()
-                .chunks(final_dim)
-                .enumerate()
-                .map(|(i, chunk)| {
-                    // We add the check here to see if we are in the first row of a new channel, the first row has to be calculated
-                    // differently so as to avoid getting rounding errors that lead to values we can't lookup.
-                    if i % second_dim == 0 {
-                        -chunk[0] * self.scalar
-                    } else {
-                        let max = *chunk.iter().take(i % second_dim + 1).max().unwrap();
-                        let sum = chunk
-                            .iter()
-                            .take(i % second_dim + 1)
-                            .map(|x| {
-                                (input_scale_factor.dequantize(&(x - max)) / inv_float_temperature)
-                                    .exp()
-                            })
-                            .sum::<f32>();
-                        let log_sum = sum.ln();
-                        -(SCALE_FACTOR as f32 * inv_float_temperature * log_sum).round_ties_even()
-                            as Element
-                            - max * self.scalar
-                    }
-                })
-                .collect::<Vec<Element>>()
+            // Causal mask where second_dim > 1. Typically second_dim == last_dim and rows is
+            // a multiple of last_dim, so we can build a block lower-triangular mask once and repeat.
+            // NOTE: If shapes always satisfy this block case (second_dim == last_dim
+            // and rows % last_dim == 0), we could simplify further by replacing this comparison-
+            // based construction with burn's tril mask API for readability.
+            if second_dim == last_dim && rows % last_dim == 0 {
+                let row_idx_block: BTensor<Backend, 1, BInt> =
+                    BTensor::arange(0..(last_dim as i64), device);
+                let row_idx_block_2d = row_idx_block
+                    .reshape([last_dim, 1])
+                    .expand([last_dim, last_dim]);
+                let col_idx_2d = col_idx.reshape([1, last_dim]).expand([last_dim, last_dim]);
+                // Active where col < row + 1 (i.e., lower triangular including diagonal)
+                let cmp_bool_block = col_idx_2d.lower(row_idx_block_2d.add_scalar(1 as Element));
+                let block_mask_int: BTensor<Backend, 2, BInt> = cmp_bool_block.int();
+                let repeats = rows / last_dim;
+                block_mask_int.repeat_dim(0, repeats)
+            } else {
+                // General case: Active length per row = (row_idx % second_dim) + 1. Use remainder to avoid division.
+                let row_idx: BTensor<Backend, 1, BInt> = BTensor::arange(0..(rows as i64), device);
+                let row_mod = row_idx.remainder_scalar(second_dim as Element); // row % second_dim
+                let active_len = row_mod.add_scalar(1 as Element); // +1
+                // Broadcast shapes: active_len [rows] -> [rows,1]; col_idx [last_dim] -> [1,last_dim]
+                let active_len_2d = active_len.reshape([rows, 1]);
+                let col_idx_2d = col_idx.reshape([1, last_dim]);
+                // Broadcast both to [rows, last_dim] then compare elementwise: col_idx < active_len.
+                let active_len_full = active_len_2d.expand([rows, last_dim]);
+                let col_idx_full = col_idx_2d.expand([rows, last_dim]);
+                let cmp_bool = col_idx_full.lower(active_len_full);
+                cmp_bool.int()
+            }
         };
-        // Make a tensor for the shift data
-        let shift_shape = input
-            .shape()
+        // Float mask reused for exp weighting.
+        let mask_float: BTensor<Backend, 2, BFloat> = mask_int.clone().float();
+
+        // Precompute combined scale to avoid an extra division on device:
+        // centered_logits = (binput - row_max) * (dequant_scale / inv_float_temperature)
+        let dequant_scale: f32 = input_scale_factor.scale();
+        let combined_scale: f32 = dequant_scale / *inv_float_temperature;
+
+        // Compute exact integer row-wise max over active positions on device.
+        let inverse_mask_int = mask_int.ones_like() - mask_int.clone();
+        let fill_val: Element = i32::MIN as Element;
+        let negative_fill = inverse_mask_int.mul_scalar(fill_val);
+        let masked_input_int = binput.clone() * mask_int.clone() + negative_fill;
+        // Calculate the exponential in a stable fashion. To achieve this subtract
+        // the maximum value in each row from every element, so the exponential is
+        // always on negative numbers. Discard padding data to ensure the maximum
+        // is correct.
+        //
+        // NOTE: Rows made entirely of padding data are not important, ignore them
+        let row_max_input_int = masked_input_int.clone().max_dim(1);
+
+        // Compute the row-wise log-sum-exp using float ops on device
+        let centered_int = masked_input_int - row_max_input_int.clone();
+        let centered_logits = centered_int.float().mul_scalar(combined_scale);
+        // Zero out inactive contributions and exponentiate only after centering to keep values stable
+        let exp_centered_masked = centered_logits.exp() * mask_float;
+        let row_exp_sum = exp_centered_masked.sum_dim(1);
+        // Some rows have no active elements, making row_exp_sum = 0 and log(0) = -inf.
+        // Detect those rows and add 1.0 before log so log becomes 0.0, keeping shifts finite.
+        let active_count_int: BTensor<Backend, 2, BInt> = mask_int.sum_dim(1);
+        let zeros = active_count_int.zeros_like();
+        let zero_rows_mask_int: BTensor<Backend, 2, BInt> = active_count_int.equal(zeros).int();
+        // Build non-zero mask while we still have the int mask available.
+        let non_zero_rows_mask_int = zero_rows_mask_int.ones_like() - zero_rows_mask_int.clone();
+        let no_active_float: BTensor<Backend, 2, BFloat> = zero_rows_mask_int.float();
+        let clamped_row_exp_sum = row_exp_sum + no_active_float; // +1.0 for fully-padded rows, +0.0 otherwise
+        let log_row_exp_sum = clamped_row_exp_sum.log();
+
+        // shift_scale_factor = -SCALE_FACTOR * inv_float_temperature * lse
+        // term1 = round(-(SCALE_FACTOR * inv_float_temperature) * log_row_exp_sum)
+        let shift_scale_factor: f32 = SCALE_FACTOR as f32 * inv_float_temperature;
+        let pre_round_shift = log_row_exp_sum.mul_scalar(-shift_scale_factor);
+        let rounded_shift_int: BTensor<Backend, 2, BInt> = pre_round_shift.round().int();
+        let base_shift = rounded_shift_int - row_max_input_int.mul_scalar(self.scalar);
+        let shift_bt: BTensor<Backend, 2, BInt> = base_shift * non_zero_rows_mask_int;
+        let shift_values: Vec<Element> = shift_bt.to_data().into_vec().expect("shift values vec");
+
+        let shift_shape = input_shape
             .iter()
             .take(unpadded_input_shape.len() - 1)
             .copied()
             .chain(std::iter::once(1usize))
             .collect::<Vec<usize>>();
-        let shift_tensor = Tensor::<Element>::new(shift_shape.into(), shift_data);
-        let mask = AttentionMask::<Element>::new(
-            input.shape().as_slice(),
-            unpadded_input_shape,
-            negative_infinity,
-        )?;
+        let shift_tensor = Tensor::<Element>::new(shift_shape.into(), shift_values);
+        let mask =
+            AttentionMask::<Element>::new(input_shape, unpadded_input_shape, negative_infinity)?;
 
-        Ok((shift_tensor, mask))
+        Ok((shift_tensor, mask, shift_bt))
     }
 }
 
@@ -401,36 +459,26 @@ impl Evaluate<f32> for Softmax<f32> {
         // Make the attention mask
         let mask =
             AttentionMask::<f32>::new(input.shape(), &unpadded_input_shapes[0], f32::NEG_INFINITY)?;
-        let masked_input = mask.apply(input)?;
+        // Flatten all leading dimensions except the last one so we can run an efficient 2D softmax using burn.
+        let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
+        ensure!(last_dim > 0, "Softmax last dimension must be > 0");
 
-        let chunk_size = *input
-            .shape()
-            .last()
-            .ok_or(anyhow!("Input shape was empty for float Softmax"))?;
-        let output = masked_input
-            .get_data()
-            .chunks(chunk_size)
-            .flat_map(|vec| {
-                let max: f32 = *vec
-                    .iter()
-                    .max_by(|i, j| i.partial_cmp(j).unwrap_or(std::cmp::Ordering::Less))
-                    .unwrap();
-                let scaled = vec
-                    .iter()
-                    .map(|x| {
-                        if *x != f32::NEG_INFINITY {
-                            self.scalar * (x - max)
-                        } else {
-                            *x
-                        }
-                    })
-                    .map(|x| x.exp())
-                    .collect::<Vec<_>>();
-                let sum = scaled.iter().sum::<f32>();
-                scaled.iter().map(|x| x / sum).collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let output_tensor = Tensor::new(input.shape().clone(), output);
+        let binput: BTensor<Backend, 2, BFloat> = BTensor::from_data(
+            TensorData::new(flat_data.to_vec(), [rows, last_dim]),
+            &Default::default(),
+        );
+        // Apply mask on-device directly on the 2D burn tensor, then scale and softmax.
+        let masked_bt = mask.apply(&binput)?;
+        let scaled = masked_bt * self.scalar;
+        let probs = softmax(scaled, 1);
+
+        // Convert back to Vec<f32>
+        let output_vec: Vec<f32> = probs
+            .to_data()
+            .into_vec()
+            .expect("Failed to extract softmax output data");
+
+        let output_tensor = Tensor::new(input.shape().clone(), output_vec);
         Ok(LayerOut::from_vec(vec![output_tensor]))
     }
 }
@@ -502,7 +550,7 @@ impl Evaluate<Element> for Softmax<Element> {
         inputs: &[&Tensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
-        // First we heck that we have some quantisation info.
+        // First we check that we have some quantisation info.
         ensure!(
             self.quant_info.is_some(),
             "Could not evaluate quantised softmax because the operation has not been quantised"
@@ -523,69 +571,101 @@ impl Evaluate<Element> for Softmax<Element> {
         } = self.quant_info().unwrap();
 
         let input = inputs[0];
-        let (shift_tensor, mask) = self.calculate_shift_data(input, &unpadded_input_shapes[0])?;
 
-        let dim = *input.shape().last().ok_or(anyhow!(
-            "Softmax input had no shape in quantised evaluation"
-        ))?;
-        let shifted_input_data = input
-            .get_data()
-            .chunks(dim)
-            .zip(shift_tensor.get_data().iter())
-            .flat_map(|(row, shift)| {
-                // For each row we rescale the input to the correct scale factor and add the shift (its already been negated)
-                row.iter()
-                    .map(|elem| elem * self.scalar + shift)
-                    .collect::<Vec<Element>>()
-            })
-            .collect::<Vec<Element>>();
+        // Flatten early and build burn tensor once so we can reuse for shift calculation without extra conversions.
+        let (flat_input, rows, last_dim) = input.flatten_leading_dims_view();
+        ensure!(last_dim > 0, "Softmax last dimension must be > 0");
+        let binput: BTensor<Backend, 2, BInt> = BTensor::from_data(
+            TensorData::new(flat_input.to_vec(), [rows, last_dim]),
+            &Default::default(),
+        );
 
-        let shifted_input = Tensor::<Element>::new(input.shape().clone(), shifted_input_data);
-        // Apply the mask to the shifted input
-        let masked_input = mask.apply(&shifted_input)?;
+        let (shift_tensor, mask, bshift) = self.calculate_shift_data(
+            &binput,
+            input.shape().as_slice(),
+            &unpadded_input_shapes[0],
+        )?;
+        let scaled = binput.clone() * self.scalar;
+        let shifted_bt = scaled + bshift;
+        let masked_bt = mask.apply(&shifted_bt)?;
+        let shifted_input = Tensor::<Element>::new(
+            input.shape().clone(),
+            shifted_bt
+                .to_data()
+                .into_vec()
+                .expect("Failed to read shifted burn tensor data"),
+        );
 
         // We use the mask to extract 8-bit chunks of the input, these are the smallest fractional bits
         // and so we can assume that they get mapped to 1 under `exp`
-        let bit_mask: Element = 255;
         let softmax_table_vars = ceil_log2(*bkm as usize >> 16);
-        let softmax_table_mask: Element = (1 << softmax_table_vars) - 1;
         let zero_table_mask: Element = (1 << *quantization::BIT_LEN) - 1;
-        // Now we chunk the rescaled, masked input
-        let mut low_range_check = Vec::<Element>::new();
-        let mut high_range_check = Vec::<Element>::new();
-        let mut lookups = Vec::<Element>::new();
-        let mut outputs = Vec::<Element>::new();
-        let mut zero_chunks_in: Vec<Vec<Element>> = vec![vec![]; *number_zero_chunks];
-        let mut zero_chunks_out: Vec<Vec<Element>> = vec![vec![]; *number_zero_chunks];
-        let mut softmax_outputs: Vec<Element> = Vec::<Element>::new();
+        let total_elems = rows * last_dim;
+        let bvals: BTensor<Backend, 1, BInt> = masked_bt.abs().reshape([rows * last_dim]).clone();
+        // We decompose each (non-negative) absolute value into:
+        // low 8 bits, next 8 bits, variable-width softmax lookup bits, then remaining zero-table chunks.
+        let bit_mask: Element = 0xFF; // 8-bit mask
+        let softmax_width: Element = softmax_table_vars as Element; // number of bits for lookup chunk
+        let softmax_mask: Element = if softmax_table_vars == 0 {
+            0
+        } else {
+            (1 << softmax_table_vars) - 1
+        };
 
-        for input_elem in masked_input.get_data().iter() {
-            // We take the absolute value as this is guaranteed to be negative or zero
-            let mut rescaled = input_elem.abs();
-            low_range_check.push(rescaled & bit_mask);
-            rescaled >>= 8;
-            high_range_check.push(rescaled & bit_mask);
-            rescaled >>= 8;
-            let lookup = rescaled & softmax_table_mask;
-            let exp_output = lut.table_output(lookup);
-            outputs.push(exp_output);
-            lookups.push(lookup);
-            rescaled >>= softmax_table_vars;
-            // Now we iterate over the number of zero chunks, if any of these are non-zero the output of softmax should be 0 for this element.
-            // We fold with initial input exp_output, at each step we append the zero chunk lookup values to their respective lists.
-            let softmax_output = zero_chunks_in
-                .iter_mut()
-                .zip(zero_chunks_out.iter_mut())
-                .fold(exp_output, |acc, (in_vec, out_vec)| {
-                    let in_lookup = rescaled & zero_table_mask;
-                    let out_lookup: Element = if in_lookup != 0 { 0 } else { 1 };
-                    in_vec.push(in_lookup);
-                    out_vec.push(out_lookup);
-                    rescaled >>= *quantization::BIT_LEN;
-                    acc * out_lookup
-                });
-            softmax_outputs.push(softmax_output);
+        // Convert scalars we need into 1D tensors for broadcast bitwise ops.
+        // Extract low 8 bits.
+        let low_bt = bvals.clone().bitwise_and_scalar(bit_mask);
+        // Shift right by 8 for next stage.
+        let q0 = bvals.bitwise_right_shift_scalar(8 as Element);
+        // Extract high 8 bits.
+        let high_bt = q0.clone().bitwise_and_scalar(bit_mask);
+        // Shift to remove those 8 bits.
+        let q1 = q0.bitwise_right_shift_scalar(8 as Element);
+        // Extract variable-width softmax lookup chunk (can be zero width if table vars == 0).
+        let lookup_bt = if softmax_table_vars == 0 {
+            // No bits allocated: create a zero tensor of same shape.
+            q1.clone().bitwise_and_scalar(0)
+        } else {
+            q1.clone().bitwise_and_scalar(softmax_mask)
+        };
+        // Residual after removing softmax bits.
+        let residual_bt = if softmax_table_vars == 0 {
+            q1
+        } else {
+            q1.bitwise_right_shift_scalar(softmax_width as Element)
+        };
+
+        let low_range_check = low_bt.to_data().into_vec().expect("low vec");
+        let high_range_check = high_bt.to_data().into_vec().expect("high vec");
+        let lookups = lookup_bt.to_data().into_vec().expect("lookup vec");
+        let outputs: Vec<Element> = lookups.iter().map(|&lk| lut.table_output(lk)).collect();
+        let device = &Default::default();
+        let outputs_bt: BTensor<Backend, 1, BInt> =
+            BTensor::from_data(TensorData::new(outputs.clone(), [total_elems]), device);
+
+        let mut residual_acc: BTensor<Backend, 1, BInt> = residual_bt.clone();
+        let mut zero_mult: BTensor<Backend, 1, BInt> = residual_bt.ones_like(); // starts as all ones
+        let mut zero_chunks_in: Vec<Vec<Element>> =
+            vec![Vec::with_capacity(total_elems); *number_zero_chunks];
+        let mut zero_chunks_out: Vec<Vec<Element>> =
+            vec![Vec::with_capacity(total_elems); *number_zero_chunks];
+        for j in 0..*number_zero_chunks {
+            let chunk_j: BTensor<Backend, 1, BInt> =
+                residual_acc.clone().bitwise_and_scalar(zero_table_mask);
+            let zeros_j = chunk_j.clone() - chunk_j.clone();
+            let out_j_bt: BTensor<Backend, 1, BInt> = chunk_j.clone().equal(zeros_j).int();
+            zero_mult = zero_mult * out_j_bt.clone();
+            zero_chunks_in[j] = chunk_j.to_data().into_vec().expect("zero in vec");
+            zero_chunks_out[j] = out_j_bt.to_data().into_vec().expect("zero out vec");
+            residual_acc =
+                residual_acc.bitwise_right_shift_scalar(*quantization::BIT_LEN as Element);
         }
+
+        let final_out_bt: BTensor<Backend, 1, BInt> = outputs_bt * zero_mult;
+        let softmax_outputs: Vec<Element> = final_out_bt
+            .to_data()
+            .into_vec()
+            .expect("final outputs vec");
 
         // We store all the information that has been computed in this step that will be useful later for proving.
         let proving_data = ProvingData::Softmax(SoftmaxData {
@@ -1657,49 +1737,54 @@ impl<N: Number> AttentionMask<N> {
 
         Ok(())
     }
+}
 
-    /// Apply the mask to an input, this method allows the input to have two or three dims and adjusts accordingly.
-    /// It elementwise multiplies by `self.tril` and then adds `self.bias`.
-    fn apply(&self, input: &Tensor<N>) -> Result<Tensor<N>> {
-        // Check the the input has 2 or 3 dims
-        let num_input_dims = input.rank();
+impl AttentionMask<f32> {
+    pub fn apply(
+        &self,
+        binput: &BTensor<Backend, 2, BFloat>,
+    ) -> Result<BTensor<Backend, 2, BFloat>> {
+        let rows = binput.shape().dims[0];
+        let last = binput.shape().dims[1];
+        let expected = rows * last;
         ensure!(
-            num_input_dims == 2 || num_input_dims == 3,
-            "To apply Attention Mask input need to have 2 or 3 dims, got: {}",
-            num_input_dims
+            self.tril.get_data().len() == expected && self.bias.get_data().len() == expected,
+            "Mask shapes do not match input when flattened (expected {} elements)",
+            expected
         );
-        // If the input only has 2 dims reshape to have 3
-        if num_input_dims == 3 {
-            if !input
-                .shape()
-                .iter()
-                .zip(self.tril.shape().iter())
-                .all(|(a, b)| *a == *b)
-            {
-                return Err(anyhow!(
-                    "Cannot apply attention mask, input did not have the same shape as mask"
-                ));
-            }
+        let tril_bt: BTensor<Backend, 2, BFloat> = BTensor::from_data(
+            TensorData::new(self.tril.get_data().to_vec(), [rows, last]),
+            &Default::default(),
+        );
+        let bias_bt: BTensor<Backend, 2, BFloat> = BTensor::from_data(
+            TensorData::new(self.bias.get_data().to_vec(), [rows, last]),
+            &Default::default(),
+        );
+        // out = input * tril + bias; bias already encodes (1 - tril) * -inf
+        Ok(binput.clone() * tril_bt + bias_bt)
+    }
+}
 
-            Ok(input.mul(&self.tril).add(&self.bias))
-        } else {
-            let new_shape = input.shape().insert(0, 1);
-            let new_input = input.clone().reshaped(new_shape);
-
-            if !new_input
-                .shape()
-                .iter()
-                .zip(self.tril.shape().iter())
-                .all(|(a, b)| *a == *b)
-            {
-                return Err(anyhow!(
-                    "Cannot apply attention mask, input did not have the same shape as mask"
-                ));
-            }
-
-            let output = new_input.mul(&self.tril).add(&self.bias);
-            Ok(output.reshaped(input.shape().clone()))
-        }
+impl AttentionMask<Element> {
+    pub fn apply(&self, binput: &BTensor<Backend, 2, BInt>) -> Result<BTensor<Backend, 2, BInt>> {
+        let rows = binput.shape().dims[0];
+        let last = binput.shape().dims[1];
+        let expected = rows * last;
+        ensure!(
+            self.tril.get_data().len() == expected && self.bias.get_data().len() == expected,
+            "Mask shapes do not match input when flattened (expected {} elements)",
+            expected
+        );
+        let tril_bt: BTensor<Backend, 2, BInt> = BTensor::from_data(
+            TensorData::new(self.tril.get_data().to_vec(), [rows, last]),
+            &Default::default(),
+        );
+        let bias_bt: BTensor<Backend, 2, BInt> = BTensor::from_data(
+            TensorData::new(self.bias.get_data().to_vec(), [rows, last]),
+            &Default::default(),
+        );
+        // out = input * tril + bias; bias already encodes (1 - tril) * -inf
+        Ok(binput.clone() * tril_bt + bias_bt)
     }
 }
 
@@ -1710,10 +1795,13 @@ mod tests {
 
     use crate::{
         Tensor,
+        backend::Backend,
         layers::Layer,
         model::{Model, test::prove_model},
         padding::PaddingMode,
     };
+    use burn::tensor::{Int as BInt, Tensor as BTensor, TensorData as BTensorData};
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -1860,5 +1948,256 @@ mod tests {
         model.route_output(None).unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    #[derive(Clone)]
+    struct SoftmaxInput {
+        n: usize,
+        data: Vec<f32>,
+    }
+    impl core::fmt::Debug for SoftmaxInput {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("SoftmaxInput")
+                .field("n", &self.n)
+                .field("data", &self.data)
+                .finish()
+        }
+    }
+
+    fn any_softmax_input(range: core::ops::Range<f32>) -> impl Strategy<Value = SoftmaxInput> {
+        (1usize..16).prop_flat_map(move |n| {
+            let len = n * n;
+            prop::collection::vec(range.clone(), len).prop_map(move |v| SoftmaxInput { n, data: v })
+        })
+    }
+
+    fn masked_softmax_ref(xs: &[f32], n: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(xs.len());
+        for (row_idx, row) in xs.chunks(n).enumerate() {
+            let active = (row_idx + 1).min(n);
+            let slice = &row[..active];
+            let m = slice.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let exps: Vec<f32> = slice.iter().map(|&v| (v - m).exp()).collect();
+            let denom: f32 = exps.iter().sum();
+            let inv = 1.0 / denom;
+            out.extend(exps.into_iter().map(|e| e * inv));
+            // Fill remaining (masked) positions with zeros efficiently.
+            if active < n {
+                out.extend(std::iter::repeat_n(0.0, n - active));
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #[test]
+        fn prop_softmax_f32(input in any_softmax_input(-4.0..4.0)) {
+            let SoftmaxInput { n, data } = input;
+            let tensor = Tensor::new(vec![1, n, n].into(), data.clone());
+            let layer = Softmax::<f32>::default();
+            let eval = layer.evaluate::<GoldilocksExt2>(&[&tensor], &[vec![1,n,n].into()]).unwrap();
+            let got = eval.outputs[0].get_data();
+            let expected = masked_softmax_ref(&data, n);
+
+            const VAL_TOL: f32 = 2e-4;
+            for (g,e) in got.iter().zip(expected.iter()) { prop_assert!((g-e).abs() <= VAL_TOL); }
+            for row in got.chunks(n) { prop_assert!(((row.iter().sum::<f32>() - 1.0).abs()) < 1e-4 * n as f32 + 1e-6); }
+        }
+
+        #[test]
+        fn prop_softmax_quantized(input in any_softmax_input(-2.0..2.0)) {
+            let SoftmaxInput { n, data } = input;
+            let float_tensor = Tensor::<f32>::new(vec![1, n, n].into(), data.clone());
+            let scaling = ScalingFactor::from_tensor(&float_tensor, None);
+            let quant_input = float_tensor.to_quantized(&scaling);
+            let layer_f = Softmax::<f32>::default();
+            let layer_q = layer_f.quantise(scaling).unwrap();
+
+            let out_f = layer_f.evaluate::<GoldilocksExt2>(&[&float_tensor], &[vec![1,n,n].into()]).unwrap();
+            let out_q = layer_q.evaluate::<GoldilocksExt2>(&[&quant_input], &[vec![1,n,n].into()]).unwrap();
+
+            let float_rows = out_f.outputs[0].get_data();
+            let quant_rows = out_q.outputs[0].get_data();
+            let qi = layer_q.quant_info().unwrap();
+            let row_err_bound_scaled = qi.error_bound * OUTPUT_SCALE_FACTOR as f32;
+            let val_tol = (row_err_bound_scaled / OUTPUT_SCALE_FACTOR as f32).max(0.02);
+
+            for (row_q, row_f) in quant_rows.chunks(n).zip(float_rows.chunks(n)) {
+                // Row sum closeness (integer domain)
+                let row_sum: Element = row_q.iter().copied().sum();
+                let diff = (row_sum - OUTPUT_SCALE_FACTOR as Element).abs() as f32;
+                prop_assert!(diff <= row_err_bound_scaled + 2.0);
+
+                // Element-wise (after dequant)
+                for (q,f) in row_q.iter().zip(row_f.iter()) {
+                    let qf = *q as f32 / OUTPUT_SCALE_FACTOR as f32;
+                    prop_assert!((qf - *f).abs() <= val_tol + 1e-6);
+                }
+            }
+        }
+
+        #[test]
+        fn prop_softmax_f32_no_nan_and_mask_zero(input in any_softmax_input(-6.0..6.0)) {
+            let SoftmaxInput { n, data } = input;
+            let tensor = Tensor::new(vec![1,n,n].into(), data.clone());
+            let layer = Softmax::<f32>::default();
+            let eval = layer.evaluate::<GoldilocksExt2>(&[&tensor], &[vec![1,n,n].into()]).unwrap();
+            let out = eval.outputs[0].get_data();
+            for (row_idx,row) in out.chunks(n).enumerate() {
+                // Active prefix length
+                let active = (row_idx+1).min(n);
+                // Active slice positive & finite
+                for v in &row[..active] { prop_assert!(!v.is_nan() && *v >= 0.0); }
+                // Tail strictly zero
+                for v in &row[active..] { prop_assert!(*v == 0.0); }
+            }
+        }
+
+        #[test]
+        fn prop_softmax_quantized_zero_tail(input in any_softmax_input(-3.0..3.0)) {
+            let SoftmaxInput { n, data } = input;
+            let float_tensor = Tensor::<f32>::new(vec![1,n,n].into(), data.clone());
+            let scaling = ScalingFactor::from_tensor(&float_tensor, None);
+            let quant_input = float_tensor.to_quantized(&scaling);
+            let layer_q = Softmax::<f32>::default().quantise(scaling).unwrap();
+            let out_q = layer_q.evaluate::<GoldilocksExt2>(&[&quant_input], &[vec![1,n,n].into()]).unwrap();
+            let qi = layer_q.quant_info().unwrap();
+            let err_bound = qi.error_bound * OUTPUT_SCALE_FACTOR as f32;
+            for (row_idx,row) in out_q.outputs[0].get_data().chunks(n).enumerate() {
+                let active = (row_idx+1).min(n);
+                let row_sum: Element = row.iter().copied().sum();
+                let diff = (row_sum - OUTPUT_SCALE_FACTOR as Element).abs() as f32;
+                prop_assert!(diff <= err_bound + 2.0);
+                for &tail in &row[active..] { prop_assert_eq!(tail, 0); }
+            }
+        }
+
+        #[test]
+        fn prop_mask_block_vs_remainder(n in 2usize..8, reps in 1usize..4) {
+            let rows = reps * n;
+            let last_dim = n;
+            let device = &Default::default();
+            let col_idx: BTensor<Backend, 1, BInt> = BTensor::arange(0..(last_dim as i64), device);
+
+            let row_idx_block: BTensor<Backend, 1, BInt> = BTensor::arange(0..(last_dim as i64), device);
+            let row_idx_block_2d = row_idx_block.reshape([last_dim, 1]).expand([last_dim, last_dim]);
+            let col_idx_2d = col_idx.clone().reshape([1, last_dim]).expand([last_dim, last_dim]);
+            let cmp_bool_block = col_idx_2d.lower(row_idx_block_2d.add_scalar(1 as Element));
+            let block_mask_int: BTensor<Backend, 2, BInt> = cmp_bool_block.int();
+            let block_mask_repeated = block_mask_int.repeat_dim(0, rows / last_dim);
+
+            let row_idx: BTensor<Backend, 1, BInt> = BTensor::arange(0..(rows as i64), device);
+            let row_mod = row_idx.remainder_scalar(last_dim as Element);
+            let active_len = row_mod.add_scalar(1 as Element);
+            let active_len_full = active_len.reshape([rows, 1]).expand([rows, last_dim]);
+            let col_idx_full = col_idx.reshape([1, last_dim]).expand([rows, last_dim]);
+            let mask_general: BTensor<Backend, 2, BInt> = col_idx_full.lower(active_len_full).int();
+
+            let eq_count: Element = block_mask_repeated
+                .equal(mask_general)
+                .int()
+                .sum()
+                .to_data()
+                .into_vec::<Element>()
+                .unwrap()[0];
+            prop_assert_eq!(eq_count as usize, rows * last_dim);
+        }
+
+        #[test]
+        fn prop_masked_row_max_correct(
+            n in 2usize..8,
+            reps in 1usize..4,
+            mut vals in prop::collection::vec(-10_000i64..10_000i64, 2..3000)
+        ) {
+            let rows = reps * n;
+            let last_dim = n;
+            let need = rows * last_dim;
+            if vals.len() < need { vals.extend(std::iter::repeat_n(0, need - vals.len())); }
+            vals.truncate(need);
+            let original = vals.clone();
+
+            for r in 0..rows {
+                let active = (r % n) + 1;
+                for c in active..last_dim {
+                    vals[r * last_dim + c] = i64::MAX / 4;
+                }
+            }
+
+            let device = &Default::default();
+            let binput: BTensor<Backend, 2, BInt> = BTensor::from_data(
+                BTensorData::new(vals, [rows, last_dim]),
+                device,
+            );
+
+            let col_idx: BTensor<Backend, 1, BInt> = BTensor::arange(0..(last_dim as i64), device);
+            let row_idx: BTensor<Backend, 1, BInt> = BTensor::arange(0..(rows as i64), device);
+            let row_mod = row_idx.remainder_scalar(last_dim as Element);
+            let active_len = row_mod.add_scalar(1 as Element);
+            let active_len_full = active_len.reshape([rows, 1]).expand([rows, last_dim]);
+            let col_idx_full = col_idx.reshape([1, last_dim]).expand([rows, last_dim]);
+            let mask_int: BTensor<Backend, 2, BInt> = col_idx_full.lower(active_len_full).int();
+            let inverse_mask_int = mask_int.ones_like() - mask_int.clone();
+            let negative_fill = inverse_mask_int.mul_scalar(i32::MIN as Element);
+            let masked_input_int = binput * mask_int + negative_fill;
+            let row_max_burn: Vec<Element> = masked_input_int
+                .max_dim(1)
+                .to_data()
+                .into_vec::<Element>()
+                .unwrap();
+
+            for r in 0..rows {
+                let active = (r % n) + 1;
+                let expected = original[r*last_dim..r*last_dim+active].iter().copied().max().unwrap();
+                prop_assert_eq!(row_max_burn[r], expected);
+            }
+        }
+
+        #[test]
+        fn prop_softmax_single_token_float(
+            l in 2usize..16,
+            m in 1usize..16,
+            data in prop::collection::vec(-4.0f32..4.0f32, 2..64)
+        ) {
+            let last_dim = l;
+            let unpadded = (m.min(l)).max(1);
+            let mut xs = data;
+            if xs.len() < last_dim { xs.extend(std::iter::repeat_n(0.0, last_dim - xs.len())); }
+            xs.truncate(last_dim);
+            let t = Tensor::<f32>::new(vec![1,1,last_dim].into(), xs.clone());
+            let layer = Softmax::<f32>::default();
+            let out = layer.evaluate::<GoldilocksExt2>(&[&t], &[vec![1,1,unpadded].into()]).unwrap();
+            let row = out.outputs[0].get_data();
+            prop_assert_eq!(row.len(), last_dim);
+            for v in &row[..unpadded] { prop_assert!(!v.is_nan() && *v >= 0.0); }
+            for v in &row[unpadded..] { prop_assert_eq!(*v, 0.0); }
+            let s: f32 = row.iter().sum();
+            prop_assert!((s - 1.0).abs() <= 1e-4 * last_dim as f32 + 1e-6);
+        }
+
+        #[test]
+        fn prop_softmax_single_token_quantized(
+            l in 2usize..16,
+            m in 1usize..16,
+            data in prop::collection::vec(-3.0f32..3.0f32, 2..64)
+        ) {
+            let last_dim = l;
+            let unpadded = (m.min(l)).max(1);
+            let mut xs = data;
+            if xs.len() < last_dim { xs.extend(std::iter::repeat_n(0.0, last_dim - xs.len())); }
+            xs.truncate(last_dim);
+            let tf = Tensor::<f32>::new(vec![1,1,last_dim].into(), xs);
+            let scaling = ScalingFactor::from_tensor(&tf, None);
+            let tq = tf.to_quantized(&scaling);
+            let layer_q = Softmax::<f32>::default().quantise(scaling).unwrap();
+            let out_q = layer_q.evaluate::<GoldilocksExt2>(&[&tq], &[vec![1,1,unpadded].into()]).unwrap();
+            let row = out_q.outputs[0].get_data();
+            prop_assert_eq!(row.len(), last_dim);
+            for &v in &row[unpadded..] { prop_assert_eq!(v, 0); }
+            let row_sum: Element = row.iter().copied().sum();
+            let qi = layer_q.quant_info().unwrap();
+            let err = qi.error_bound * OUTPUT_SCALE_FACTOR as f32;
+            let diff = (row_sum - OUTPUT_SCALE_FACTOR as Element).abs() as f32;
+            prop_assert!(diff <= err + 2.0);
+        }
     }
 }

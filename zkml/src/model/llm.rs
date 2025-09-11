@@ -579,7 +579,7 @@ mod test {
         parser::{
             file_cache,
             gguf::tests::GPT2_Q8_0,
-            llm::{Token, HFTokenizer},
+            llm::{HFTokenizer, Token},
         },
         testing::Pcs,
     };

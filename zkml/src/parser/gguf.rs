@@ -510,7 +510,7 @@ pub mod tests {
         layers::transformer::embeddings::Embeddings,
         parser::{
             file_cache,
-            llm::{Attention, LLMConfig, LLMTokenizer, LLMVariant, HFTokenizer},
+            llm::{Attention, HFTokenizer, LLMConfig, LLMTokenizer, LLMVariant},
         },
     };
 
