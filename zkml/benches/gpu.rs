@@ -1,261 +1,215 @@
-use core::slice;
-use std::ops::{Range, RangeInclusive};
-
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use ff_ext::GoldilocksExt2;
-use zkml::{
-    Element, ScalingFactor, Shape, Tensor,
-    layers::{
-        activation::GELU,
-        add::Add,
-        concat_matmul::{self, ConcatMatMul},
-        convolution::Convolution,
-        dense::Dense,
-        flatten::Flatten,
-        matrix_mul::{self, MatMul},
-        permute::Permute,
-        provable::Evaluate,
-        transformer::{
-            embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, qkv::QKV,
-            softmax::Softmax,
-        },
-    },
-    tensor::Number,
-};
+use std::ops::Range;
 
 const DATA_SIZE_POWS: Range<i32> = 7..14;
 
-fn add_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[derive(Debug, Copy, Clone)]
+struct Args {
+    pow2: i32,
+}
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
-        let shape = Shape::new(vec![size, size]);
-        let operand = Tensor::<Element>::random(&shape);
-        let input = Tensor::<Element>::random(&shape);
+fn default_sizes() -> impl Iterator<Item = Args> {
+    DATA_SIZE_POWS.map(|pow2| Args { pow2 })
+}
 
-        let layer = Add::<Element>::new_with(operand.clone(), shape.clone());
+fn sizes(range: Range<i32>) -> impl Iterator<Item = Args> {
+    range.map(|pow2| Args { pow2 })
+}
 
-        group.bench_with_input(
-            BenchmarkId::new("add/Element", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Add should succeed")
-                });
-            },
-        );
-    }
+#[divan::bench_group]
+mod add_layer {
+    use core::slice;
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        ScalingFactor, Shape, Tensor,
+        layers::{add::Add, provable::Evaluate},
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size]);
         let operand = Tensor::<f32>::random(&shape);
         let input = Tensor::<f32>::random(&shape);
+        let result = operand.add(&input);
+        let layer = Add::<f32>::new_with(operand.clone(), shape.clone());
+
+        let operand_scaling = ScalingFactor::from_tensor(&operand, None);
+        let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let result_scaling = ScalingFactor::from_tensor(&result, None);
+
+        let input = input.to_quantized(&input_scaling);
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = layer
+            .quantize(&[operand_scaling, input_scaling], result_scaling)
+            .unwrap()
+            .quantized_op;
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Add should succeed")
+        });
+    }
+
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let shape = Shape::new(vec![size, size]);
+        let operand = Tensor::<f32>::random(&shape);
+
+        let input = Tensor::<f32>::random(&shape);
+        let input_shape = slice::from_ref(input.shape());
 
         let layer = Add::<f32>::new_with(operand.clone(), shape.clone());
 
-        group.bench_with_input(
-            BenchmarkId::new("add/f32", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Add should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Add should succeed")
+        });
     }
-
-    group.finish();
 }
 
-fn concat_matmul(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod dense_layer {
+    use core::slice;
 
-    const CONCATS: usize = 8;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{dense::Dense, provable::Evaluate},
+    };
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    use crate::{Args, default_sizes};
 
-        let left_perm = concat_matmul::InputMatrixDimensions::new(1, 2, 0);
-        let right_perm = concat_matmul::InputMatrixDimensions::new(1, 0, 2);
-        let out_perm = concat_matmul::Permutation::new(vec![2, 1, 0]);
-
-        // concat dim must match the `left_perm` and `right_perm` config
-        let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = Tensor::<Element>::random(&shape);
-        let right = Tensor::<Element>::random(&shape);
-        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
-
-        group.bench_function(
-            BenchmarkId::new("concat_matmul/Element", format!("{CONCATS}x{size}x{size}")),
-            |b| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
-                        .expect("ConcatMatMul should succeed")
-                });
-            },
-        );
-    }
-
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
-
-        let left_perm = concat_matmul::InputMatrixDimensions::new(1, 2, 0);
-        let right_perm = concat_matmul::InputMatrixDimensions::new(1, 0, 2);
-        let out_perm = concat_matmul::Permutation::new(vec![2, 1, 0]);
-
-        // concat dim must match the `left_perm` and `right_perm` config
-        let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = Tensor::<f32>::random(&shape);
-        let right = Tensor::<f32>::random(&shape);
-        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
-
-        group.bench_function(
-            BenchmarkId::new("concat_matmul/f32", format!("{CONCATS}x{size}x{size}")),
-            |b| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
-                        .expect("ConcatMatMul should succeed")
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn dense_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
-
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let matrix = Tensor::<Element>::random(&Shape::new(vec![size, size]));
         let bias = Tensor::<Element>::random(&Shape::new(vec![size]));
+
         let input = Tensor::<Element>::random(&Shape::new(vec![size]));
+        let input_shape = slice::from_ref(input.shape());
 
-        let dense = Dense::<Element>::new(matrix.clone(), bias.clone());
+        let layer = Dense::<Element>::new(matrix.clone(), bias.clone());
 
-        group.bench_with_input(
-            BenchmarkId::new("dense/Element", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    dense
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Dense should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Dense should succeed")
+        });
     }
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let matrix = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let bias = Tensor::<f32>::random(&Shape::new(vec![size]));
+
         let input = Tensor::<f32>::random(&Shape::new(vec![size]));
+        let input_shape = slice::from_ref(input.shape());
 
-        let dense = Dense::<f32>::new(matrix.clone(), bias.clone());
+        let layer = Dense::<f32>::new(matrix.clone(), bias.clone());
 
-        group.bench_with_input(
-            BenchmarkId::new("dense/f32", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    dense
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Dense should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Dense should succeed")
+        });
     }
 }
 
-fn convolution_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod convolution_layer {
+    use core::slice;
+    use std::ops::Range;
 
-    let batches = 1;
-    let channels = 3;
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
-        let input = Tensor::<f32>::random(&Shape::new(vec![batches, channels, size, size]));
-        let kernels = Tensor::<f32>::random(&Shape::new(vec![batches, channels, 3, 3]));
-        let bias = Tensor::<f32>::random(&Shape::new(vec![batches]));
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{convolution::Convolution, provable::Evaluate},
+    };
 
-        let input_shape = input.shape();
-        let convolution = Convolution::<f32>::new(kernels.clone(), bias.clone());
+    use crate::{Args, default_sizes, sizes};
 
-        group.bench_with_input(
-            BenchmarkId::new("convolution/f32", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    convolution
-                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(input_shape))
-                        .expect("Convolution should succeed")
-                });
-            },
-        );
+    // Can not execute convolution layer with size 1<<12 [1]
+    //
+    // Burn's convolution implementation fails when autotune is used and the
+    // input size is 1<<12 or larger. There are two fixes:
+    //
+    // 1. don't use autotune
+    // 2. reduce the input size
+    //
+    // Unfortunately the first option can not be used, because that completely
+    // breaks matmul [2], limiting the input sizes here is a trade off that
+    // allows all layers to run with some input.
+    //
+    // [1]: https://github.com/tracel-ai/burn/issues/3524
+    // [2]: https://github.com/tracel-ai/burn/issues/3660
+    const F32_SIZES: Range<i32> = 7..12;
+
+    const BATCHES: usize = 1;
+    const CHANNELS: usize = 3;
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let kernels = Tensor::<Element>::random(&Shape::new(vec![BATCHES, CHANNELS, 3, 3]));
+        let bias = Tensor::<Element>::random(&Shape::new(vec![BATCHES]));
+
+        let input = Tensor::<Element>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Convolution::<Element>::new(kernels.clone(), bias.clone())
+            .prepared_for_fft(input.shape());
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Convolution should succeed")
+        });
     }
 
-    // NOTE: as it is currently implemented, conv2d_i performs one kernel invocation per output.
-    // the maximum supported input size on a M2 is 2**12.
-    let range = 7..12;
-    let batches = 1;
-    let channels = 3;
-    for pow2 in range {
-        let size = 1 << pow2;
-        let input = Tensor::<Element>::random(&Shape::new(vec![batches, channels, size, size]));
-        let kernels = Tensor::<Element>::random(&Shape::new(vec![batches, channels, 3, 3]));
-        let bias = Tensor::<Element>::random(&Shape::new(vec![batches]));
+    #[divan::bench(args = sizes(F32_SIZES))]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let kernels = Tensor::<f32>::random(&Shape::new(vec![BATCHES, CHANNELS, 3, 3]));
+        let bias = Tensor::<f32>::random(&Shape::new(vec![BATCHES]));
 
-        let input_shape = input.shape();
-        let convolution = Convolution::<Element>::new(kernels.clone(), bias.clone())
-            .prepared_for_fft(input_shape);
+        let input = Tensor::<f32>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
+        let input_shape = slice::from_ref(input.shape());
 
-        group.bench_with_input(
-            BenchmarkId::new("convolution/Element", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    convolution
-                        .evaluate::<GoldilocksExt2>(&[input], slice::from_ref(input_shape))
-                        .expect("Convolution should succeed")
-                });
-            },
-        );
+        let layer = Convolution::<f32>::new(kernels.clone(), bias.clone());
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Convolution should succeed")
+        });
     }
-
-    group.finish();
 }
 
-fn embeddings_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod embeddings_layer {
+    use core::slice;
 
-    for pow2 in DATA_SIZE_POWS {
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, ScalingFactor, Shape, Tensor,
+        layers::{provable::Evaluate, transformer::embeddings::Embeddings},
+        tensor::Number,
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
         let vocab_size = 100;
-        let size = 1 << pow2;
+        let size = 1 << args.pow2;
         let emb = Tensor::<Element>::random(&Shape::new(vec![vocab_size, size]));
         let input = Tensor::<f32>::random(&Shape::new(vec![size]));
         let scaling = ScalingFactor::from_span(
@@ -263,121 +217,141 @@ fn embeddings_layer(c: &mut Criterion) {
             <f32 as Number>::MAX,
             Some((0, vocab_size as Element)),
         );
+
         let input = input.to_quantized(&scaling);
+        let input_shape = slice::from_ref(input.shape());
 
         let layer = Embeddings::<Element>::new(emb.clone()).unwrap();
-
-        group.bench_with_input(
-            BenchmarkId::new("embeddings/Element", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Embeddings should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Embeddings should succeed")
+        });
     }
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let emb = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+
         let input = Tensor::<f32>::random(&Shape::new(vec![size]));
+        let input_shape = slice::from_ref(input.shape());
 
         let layer = Embeddings::<f32>::new(emb.clone()).unwrap();
-
-        group.bench_with_input(
-            BenchmarkId::new("embeddings/f32", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Embeddings should succeed")
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn flatten_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
-
-    const DATA_SIZE_POWS: Range<i32> = 4..7;
-    const RANKS: RangeInclusive<usize> = 2..=4;
-
-    for pow2 in DATA_SIZE_POWS {
-        for rank in RANKS {
-            let size = 1 << pow2;
-            let input = Tensor::<Element>::random(&Shape::new([size].repeat(rank)));
-            let layer = Flatten;
-
-            group.bench_function(
-                BenchmarkId::new("flatten/Element", format!("{size}^{rank}")),
-                |b| {
-                    b.iter(|| {
-                        layer
-                            .evaluate::<GoldilocksExt2>(&[&input], &[])
-                            .expect("Flatten should succeed")
-                    });
-                },
-            );
-        }
-    }
-
-    for pow2 in DATA_SIZE_POWS {
-        for rank in RANKS {
-            let size = 1 << pow2;
-            let input = Tensor::<f32>::random(&Shape::new([size].repeat(rank)));
-            let layer = Flatten;
-
-            group.bench_function(
-                BenchmarkId::new("flatten/f32", format!("{size}^{rank}")),
-                |b| {
-                    b.iter(|| {
-                        layer
-                            .evaluate::<GoldilocksExt2>(&[&input], &[])
-                            .expect("Flatten should succeed")
-                    });
-                },
-            );
-        }
-    }
-}
-
-fn gelu_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
-
-    for size in [1 << 5, 1 << 10, 1 << 15, 1 << 20, 1 << 22] {
-        let input = Tensor::<f32>::random(&Shape::new(vec![size]));
-        let gelu = GELU::<f32>::new();
-
-        group.bench_with_input(BenchmarkId::new("gelu", size), &input, |b, input| {
-            b.iter(|| {
-                gelu.evaluate::<GoldilocksExt2>(&[input], &[])
-                    .expect("GeLU should succeed")
-            });
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Embeddings should succeed")
         });
     }
 }
 
-fn matrix_mul_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod flatten_layer {
+    use core::slice;
+    use std::ops::{Range, RangeInclusive};
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{flatten::Flatten, provable::Evaluate},
+    };
+
+    #[derive(Debug, Copy, Clone)]
+    struct Args {
+        pow2: i32,
+        rank: usize,
+    }
+
+    fn args() -> impl Iterator<Item = Args> {
+        const DATA_SIZE_POWS: Range<i32> = 4..7;
+        const RANKS: RangeInclusive<usize> = 2..=4;
+
+        DATA_SIZE_POWS
+            .zip(RANKS)
+            .map(|(pow2, rank)| Args { pow2, rank })
+    }
+
+    #[divan::bench(args = args())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let input = Tensor::<Element>::random(&Shape::new([size].repeat(args.rank)));
+        let input_shape = slice::from_ref(input.shape());
+        let layer = Flatten;
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Flatten should succeed")
+        });
+    }
+
+    #[divan::bench(args = args())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let input = Tensor::<f32>::random(&Shape::new([size].repeat(args.rank)));
+        let input_shape = slice::from_ref(input.shape());
+        let layer = Flatten;
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Flatten should succeed")
+        });
+    }
+}
+
+#[divan::bench_group]
+mod gelu_layer {
+    use core::slice;
+
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Shape, Tensor,
+        layers::{activation::GELU, provable::Evaluate},
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let input = Tensor::<f32>::random(&Shape::new(vec![size]));
+        let input_shape = slice::from_ref(input.shape());
+        let layer = GELU::<f32>::new();
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("GeLU should succeed")
+        });
+    }
+}
+
+#[divan::bench_group]
+mod matmul_layer {
+
+    use std::ops::Range;
+
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Tensor,
+        layers::{
+            matrix_mul::{self, MatMul},
+            provable::Evaluate,
+        },
+    };
+
+    use crate::{Args, default_sizes, sizes};
+
+    // XXX: beyond these sizes the benchmarks for elements are extremely slow.
+    //
+    //                   fastest | slowest | median  | mean    | samples │ iters
+    // Args { pow2: 11 } 10.26 s | 10.87 s | 10.44 s | 10.52 s | 3       | 3
+    // Args { pow2: 12 } 1.357 m | 1.357 m | 1.357 m | 1.357 m | 1       | 1
+    // Args { pow2: 13 }  1.67 h |  1.67 h |  1.67 h |  1.67 h | 1       | 1
+    const ELEMENT_SIZES: Range<i32> = 7..10;
+
+    #[divan::bench(args = sizes(ELEMENT_SIZES))]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let left = Tensor::<Element>::random(&vec![size, size].into());
         let right = Tensor::<Element>::random(&vec![size, size].into());
         let bias = Tensor::<Element>::random(&vec![size].into());
@@ -390,21 +364,19 @@ fn matrix_mul_layer(c: &mut Criterion) {
             config,
         )
         .unwrap();
-
-        group.bench_function(
-            BenchmarkId::new("matrix_mul/Element", format!("{size}x{size}")),
-            |b| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
-                        .expect("MatMul should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(
+                    &[&left, &right],
+                    &[left.shape().clone(), right.shape().clone()],
+                )
+                .expect("MatMul should succeed")
+        });
     }
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let left = Tensor::<f32>::random(&vec![size, size].into());
         let right = Tensor::<f32>::random(&vec![size, size].into());
         let bias = Tensor::<f32>::random(&vec![size].into());
@@ -418,323 +390,429 @@ fn matrix_mul_layer(c: &mut Criterion) {
         )
         .unwrap();
 
-        group.bench_function(
-            BenchmarkId::new("matrix_mul/f32", format!("{size}x{size}")),
-            |b| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[&left, &right], &[])
-                        .expect("MatMul should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(
+                    &[&left, &right],
+                    &[left.shape().clone(), right.shape().clone()],
+                )
+                .expect("MatMul should succeed")
+        });
     }
 }
 
-fn qkv_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod concat_matmul_layer {
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    use std::ops::Range;
 
-        let num_heads = 1;
-        let q = Tensor::<Element>::random(&vec![1, size].into());
-        let q_bias = Tensor::random(&vec![size].into());
-        let k = Tensor::random(&vec![1, size].into());
-        let k_bias = Tensor::random(&vec![size].into());
-        let v = Tensor::random(&vec![1, size].into());
-        let v_bias = Tensor::random(&vec![size].into());
-        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{
+            concat_matmul::{ConcatMatMul, InputMatrixDimensions, Permutation},
+            provable::Evaluate,
+        },
+    };
 
-        let layer = QKV::<Element>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
+    use crate::{Args, default_sizes, sizes};
 
-        group.bench_with_input(
-            BenchmarkId::new("qkv/Element", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
-                        .expect("QKV should succeed")
-                });
-            },
-        );
+    // XXX: beyond this point benchmarks for elements are too slow, see matmul
+    // benches for measurements.
+    //
+    // Args { pow2: 11 } 3.206 m | 3.206 m | 3.206 m | 3.206 m | 1 | 1
+    const ELEMENT_SIZES: Range<i32> = 7..10;
+    const CONCATS: usize = 8;
+
+    #[divan::bench(args = sizes(ELEMENT_SIZES))]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let left_perm = InputMatrixDimensions::new(1, 2, 0);
+        let right_perm = InputMatrixDimensions::new(1, 0, 2);
+        let out_perm = Permutation::new(vec![2, 1, 0]);
+
+        // concat dim must match the `left_perm` and `right_perm` config
+        let shape = Shape::new(vec![size, CONCATS, size]);
+        let left = Tensor::<Element>::random(&shape);
+        let right = Tensor::<Element>::random(&shape);
+
+        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(
+                    &[&left, &right],
+                    &[left.shape().clone(), right.shape().clone()],
+                )
+                .expect("ConcatMatMul should succeed")
+        });
     }
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let left_perm = InputMatrixDimensions::new(1, 2, 0);
+        let right_perm = InputMatrixDimensions::new(1, 0, 2);
+        let out_perm = Permutation::new(vec![2, 1, 0]);
+
+        // concat dim must match the `left_perm` and `right_perm` config
+        let shape = Shape::new(vec![size, CONCATS, size]);
+        let left = Tensor::<f32>::random(&shape);
+        let right = Tensor::<f32>::random(&shape);
+        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(
+                    &[&left, &right],
+                    &[left.shape().clone(), right.shape().clone()],
+                )
+                .expect("ConcantMatMul should succeed")
+        });
+    }
+}
+
+#[divan::bench_group]
+mod qkv_layer {
+    use core::slice;
+    use std::ops::Range;
+
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{provable::Evaluate, transformer::qkv::QKV},
+    };
+
+    use crate::{Args, default_sizes, sizes};
+
+    // XXX: beyond this point benchmarks for elements are too slow, see matmul
+    // benches for measurements.
+    //
+    //                   fastest | slowest | median  | mean    | samples │ iters
+    // Args { pow2: 11 } 2.36 m  | 2.36 m  | 2.36 m  | 2.36 m  | 1       | 1
+    const ELEMENT_SIZES: Range<i32> = 7..10;
+
+    #[divan::bench(args = sizes(ELEMENT_SIZES))]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
 
         let num_heads = 1;
-        let q = Tensor::<f32>::random(&vec![1, size].into());
+        let q = Tensor::<Element>::random(&vec![size, size].into());
         let q_bias = Tensor::random(&vec![size].into());
-        let k = Tensor::random(&vec![1, size].into());
+        let k = Tensor::random(&vec![size, size].into());
         let k_bias = Tensor::random(&vec![size].into());
-        let v = Tensor::random(&vec![1, size].into());
+        let v = Tensor::random(&vec![size, size].into());
         let v_bias = Tensor::random(&vec![size].into());
+
+        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
+
+        bencher
+            .with_inputs(|| {
+                // The Element QKV layer has a cache and it works only on first evaluation
+                QKV::<Element>::new(
+                    q.clone(),
+                    q_bias.clone(),
+                    k.clone(),
+                    k_bias.clone(),
+                    v.clone(),
+                    v_bias.clone(),
+                    num_heads,
+                )
+                .unwrap()
+            })
+            .bench_refs(|layer| {
+                layer
+                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .expect("QKV should succeed");
+            });
+    }
+
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+
+        let num_heads = 1;
+        let q = Tensor::<f32>::random(&vec![size, size].into());
+        let q_bias = Tensor::random(&vec![size].into());
+        let k = Tensor::random(&vec![size, size].into());
+        let k_bias = Tensor::random(&vec![size].into());
+        let v = Tensor::random(&vec![size, size].into());
+        let v_bias = Tensor::random(&vec![size].into());
+
         let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
 
         let layer = QKV::<f32>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
-
-        group.bench_with_input(
-            BenchmarkId::new("qkv/f32", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
-                        .expect("QKV should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("QKV should succeed")
+        });
     }
-
-    group.finish();
 }
 
-fn logits_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(10)
-        .measurement_time(std::time::Duration::from_secs(90));
+#[divan::bench_group]
+mod logits_layer {
+    use core::slice;
 
-    // Rank-2 tensors
-    for pow2 in DATA_SIZE_POWS {
-        let rows = 1 << pow2;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{provable::Evaluate, transformer::logits::Logits},
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let rows = 1 << args.pow2;
         let cols = 16384;
         let shape = Shape::new(vec![rows, cols]);
-        let logits = Logits::Argmax;
-        let input_f32 = Tensor::<f32>::random(&shape);
-        group.bench_with_input(
-            BenchmarkId::new("logits/f32", format!("{rows}x{cols}")),
-            &input_f32,
-            |b, input| {
-                b.iter(|| {
-                    logits
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Logits should succeed")
-                })
-            },
-        );
-        let input_elem = Tensor::<Element>::random(&shape);
-        group.bench_with_input(
-            BenchmarkId::new("logits/Element", format!("{rows}x{cols}")),
-            &input_elem,
-            |b, input| {
-                b.iter(|| {
-                    logits
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Logits should succeed")
-                })
-            },
-        );
+
+        let input = Tensor::<Element>::random(&shape);
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Logits::Argmax;
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Logits should succeed")
+        });
     }
 
-    // Higher-rank tensors
-    for &(d1, d2, d3) in &[(2, 1024, 1024), (4, 1024, 2048)] {
-        let shape = Shape::new(vec![d1, d2, d3]);
-        let logits = Logits::Argmax;
-        let input_f32 = Tensor::<f32>::random(&shape);
-        group.bench_with_input(
-            BenchmarkId::new("logits_higher_rank/f32", format!("{d1}x{d2}x{d3}")),
-            &input_f32,
-            |b, input| {
-                b.iter(|| {
-                    logits
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Logits should succeed")
-                })
-            },
-        );
-        let input_elem = Tensor::<Element>::random(&shape);
-        group.bench_with_input(
-            BenchmarkId::new("logits_higher_rank/Element", format!("{d1}x{d2}x{d3}")),
-            &input_elem,
-            |b, input| {
-                b.iter(|| {
-                    logits
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Logits should succeed")
-                })
-            },
-        );
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let rows = 1 << args.pow2;
+        let cols = 16384;
+        let shape = Shape::new(vec![rows, cols]);
+
+        let input = Tensor::<f32>::random(&shape);
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Logits::Argmax;
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Logits should succeed")
+        });
     }
 
-    group.finish();
+    #[derive(Debug, Copy, Clone)]
+    struct ArgsHighRank {
+        d0: usize,
+        d1: usize,
+        d2: usize,
+    }
+
+    fn highrank() -> impl Iterator<Item = ArgsHighRank> {
+        [(2, 1024, 1024), (4, 1024, 2048)]
+            .into_iter()
+            .map(|(d0, d1, d2)| ArgsHighRank { d0, d1, d2 })
+    }
+
+    #[divan::bench(args = highrank())]
+    fn element_highrank(bencher: divan::Bencher, args: ArgsHighRank) {
+        let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
+
+        let input = Tensor::<Element>::random(&shape);
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Logits::Argmax;
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Logits high rank should succeed")
+        });
+    }
+
+    #[divan::bench(args = highrank())]
+    fn f32_highrank(bencher: divan::Bencher, args: ArgsHighRank) {
+        let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
+
+        let input = Tensor::<f32>::random(&shape);
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Logits::Argmax;
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Logits high rank should succeed")
+        });
+    }
 }
 
-fn norm_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod norm_layer {
+    use core::slice;
+    use std::ops::Range;
 
-    let eps = 1e-5;
-    for dim0_pow2 in 1..5 {
-        for dim1_pow2 in DATA_SIZE_POWS {
-            let dim0 = 1 << dim0_pow2;
-            let dim1 = 1 << dim1_pow2;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, ScalingFactor, Shape, Tensor,
+        layers::{provable::Evaluate, transformer::layernorm::LayerNorm},
+    };
 
-            let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
-            let gamma = Tensor::<Element>::random(&Shape::new(vec![dim1]));
-            let beta = Tensor::<Element>::random(&Shape::new(vec![dim1]));
+    use crate::DATA_SIZE_POWS;
 
-            let layer = LayerNorm::<Element>::new(gamma, beta, eps);
-
-            let input_scaling = ScalingFactor::from_tensor(&input, None);
-            let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
-
-            group.bench_with_input(
-                BenchmarkId::new("norm/Element", format!("{dim0}x{dim1}")),
-                &input,
-                |b, input| {
-                    b.iter(|| {
-                        layer
-                            .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![dim0, dim1])])
-                            .expect("Norm should succeed")
-                    });
-                },
-            );
-        }
+    #[derive(Debug, Copy, Clone)]
+    struct Args {
+        dim0_pow2: i32,
+        dim1_pow2: i32,
     }
 
-    let eps = 1e-5;
-    for dim0_pow2 in 1..5 {
-        for dim1_pow2 in DATA_SIZE_POWS {
-            let dim0 = 1 << dim0_pow2;
-            let dim1 = 1 << dim1_pow2;
+    const DIM0: Range<i32> = 1..5;
+    const EPS: f32 = 1e-5;
 
-            let input = Tensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
-            let gamma = Tensor::<f32>::random(&Shape::new(vec![dim1]));
-            let beta = Tensor::<f32>::random(&Shape::new(vec![dim1]));
-
-            let layer = LayerNorm::<f32>::new(gamma, beta, eps);
-
-            group.bench_with_input(
-                BenchmarkId::new("norm/f32", format!("{dim0}x{dim1}")),
-                &input,
-                |b, input| {
-                    b.iter(|| {
-                        layer
-                            .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![dim0, dim1])])
-                            .expect("Norm should succeed")
-                    });
-                },
-            );
-        }
+    fn args() -> impl Iterator<Item = Args> {
+        DIM0.zip(DATA_SIZE_POWS).map(|(dim0_pow2, dim1_pow2)| Args {
+            dim0_pow2,
+            dim1_pow2,
+        })
     }
 
-    group.finish();
+    #[divan::bench(args = args())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let dim0 = 1 << args.dim0_pow2;
+        let dim1 = 1 << args.dim1_pow2;
+
+        let gamma = Tensor::<Element>::random(&Shape::new(vec![dim1]));
+        let beta = Tensor::<Element>::random(&Shape::new(vec![dim1]));
+        let layer = LayerNorm::<Element>::new(gamma, beta, EPS);
+
+        let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
+        let input_shape = slice::from_ref(input.shape());
+
+        let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Norm should succeed")
+        });
+    }
+
+    #[divan::bench(args = args())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let dim0 = 1 << args.dim0_pow2;
+        let dim1 = 1 << args.dim1_pow2;
+
+        let input = Tensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
+        let input_shape = slice::from_ref(input.shape());
+
+        let gamma = Tensor::<f32>::random(&Shape::new(vec![dim1]));
+        let beta = Tensor::<f32>::random(&Shape::new(vec![dim1]));
+        let layer = LayerNorm::<f32>::new(gamma, beta, EPS);
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Norm should succeed")
+        });
+    }
 }
 
-fn permute_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod permute_layer {
+    use core::slice;
+    use std::ops::Range;
 
-    for pow2 in 2..5 {
-        let size = 1 << pow2;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{permute::Permute, provable::Evaluate},
+    };
+
+    use crate::{Args, sizes};
+
+    // XXX: 2**10 fails with `BufferTooBig(8589934592)`
+    const SIZES: Range<i32> = 7..10;
+
+    #[divan::bench(args = sizes(SIZES))]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size, size]);
 
         let input = Tensor::<Element>::random(&shape);
+        let input_shape = slice::from_ref(input.shape());
+
         let layer = Permute::new(vec![2, 1, 0]);
 
-        group.bench_with_input(
-            BenchmarkId::new("permute/Element", format!("{size}x{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Permute should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Permute should succeed")
+        });
     }
 
-    for pow2 in 2..5 {
-        let size = 1 << pow2;
+    #[divan::bench(args = sizes(SIZES))]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size, size]);
 
         let input = Tensor::<f32>::random(&shape);
+        let input_shape = slice::from_ref(input.shape());
+
         let layer = Permute::new(vec![2, 1, 0]);
-
-        group.bench_with_input(
-            BenchmarkId::new("permute/f32", format!("{size}x{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    layer
-                        .evaluate::<GoldilocksExt2>(&[input], &[])
-                        .expect("Permute should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Permute should succeed")
+        });
     }
-
-    group.finish();
 }
 
-fn softmax_layer(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run-layers");
-    group
-        .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+#[divan::bench_group]
+mod softmax_layer {
+    use core::slice;
 
-    for pow2 in DATA_SIZE_POWS {
-        let size = 1 << pow2;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, ScalingFactor, Shape, Tensor,
+        layers::{provable::Evaluate, transformer::softmax::Softmax},
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+
+        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
+
+        let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let layer = Softmax::<f32>::new()
+            .quantise(input_scaling)
+            .expect("Softmax quantise should succeed");
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Softmax should succeed")
+        });
+    }
+
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+
         let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
 
-        group.bench_with_input(
-            BenchmarkId::new("softmax/f32", format!("{size}x{size}")),
-            &input,
-            |b, input| {
-                b.iter(|| {
-                    Softmax::new()
-                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
-                        .expect("Softmax should succeed")
-                });
-            },
-        );
+        let layer = Softmax::new();
 
-        let input_elem = Tensor::<Element>::random(&Shape::new(vec![size, size]));
-        group.bench_with_input(
-            BenchmarkId::new("softmax/Element", format!("{size}x{size}")),
-            &input_elem,
-            |b, input| {
-                let input_scaling = ScalingFactor::from_tensor(input, None);
-                let softmax_quantised = Softmax::<f32>::new()
-                    .quantise(input_scaling)
-                    .expect("Softmax quantise should succeed");
-                b.iter(|| {
-                    softmax_quantised
-                        .evaluate::<GoldilocksExt2>(&[input], &[Shape::new(vec![size, size])])
-                        .expect("Softmax should succeed")
-                });
-            },
-        );
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Softmax should succeed")
+        });
     }
-
-    group.finish();
 }
 
-criterion_group!(
-    benches,
-    add_layer,
-    concat_matmul,
-    convolution_layer,
-    dense_layer,
-    embeddings_layer,
-    flatten_layer,
-    gelu_layer,
-    matrix_mul_layer,
-    qkv_layer,
-    logits_layer,
-    norm_layer,
-    permute_layer,
-    softmax_layer
-);
-criterion_main!(benches);
+fn main() {
+    divan::main();
+}

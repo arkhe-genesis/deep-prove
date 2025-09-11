@@ -423,7 +423,7 @@ pub trait ProveInfo {
 /// Output of `QuantizeOp` method over a layer
 pub struct QuantizeOutput<Op> {
     /// The actual layer after quantization
-    pub(crate) quantized_op: Op,
+    pub quantized_op: Op,
     /// The scaling factor of the output wires of the operation
     pub(crate) output_scalings: Vec<ScalingFactor>,
     /// The requant layer to be added to the model, if any

@@ -469,7 +469,7 @@ impl QuantInfo {
 ///
 /// Currently we require `s3` to be at least 8 bits more precise than `s1` or `s2` in order to not requantise.
 impl Add<f32> {
-    fn quantize(
+    pub fn quantize(
         self,
         input_scaling: &[ScalingFactor],
         output_scaling: ScalingFactor,
