@@ -24,7 +24,7 @@ use crate::{
     quantization::{self, Fieldizer},
     to_base,
 };
-use anyhow::{Context as CC, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -152,37 +152,40 @@ impl Evaluate<Element> for Requant {
         inputs: &[&Tensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
-        let result = inputs
-            .iter()
-            .map(|input| {
-                // We use this value to determine if any of the inputs are too large to be requantised (i.e. they fall outside the clamping table)
-                let max_abs_val: Element = 1 << self.intermediate_bit_size;
-                let res = input
-                    .get_data()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, elem)| {
-                        ensure!(
-                            elem.abs() <= max_abs_val,
-                            "Could not apply requantisation, tensor element {} had absolute value too large, given value: {}, max value: {}",
-                            i, elem, max_abs_val
-                        );
+        let max_abs_val: Element = 1 << self.intermediate_bit_size;
+        let rounding: Element = 1 << (self.shift() - 1);
+        let shift = self.shift().try_into().context("Shift too large")?;
 
-                        let rounding: Element = 1 << (self.shift() - 1);
-                        let unclamped = (rounding + elem * self.fixed_point_multiplier) >> self.shift();
+        let mut result = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let flat = (**input).clone().flatten(0..input.rank()).to_btensor::<1>();
+            let el: Element = flat
+                .clone()
+                .max_abs()
+                .into_data()
+                .as_slice()
+                .map_err(|_| anyhow!("Failed to get max abs on Requant"))?[0];
+            ensure!(
+                el <= max_abs_val,
+                "Could not apply requantisation, tensor had absolute value too large, given value: {el}, max value: {max_abs_val}",
+            );
 
-                        if unclamped >= *quantization::MAX {
-                            Ok(*quantization::MAX)
-                        } else if unclamped <= *quantization::MIN {
-                            Ok(*quantization::MIN)
-                        } else {
-                            Ok(unclamped)
-                        }
-                    })
-                    .collect::<Result<Vec<Element>, anyhow::Error>>()?;
-                Ok(Tensor::<Element>::new(input.shape().clone(), res))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            let unclamped = flat
+                .mul_scalar(self.fixed_point_multiplier)
+                .add_scalar(rounding)
+                .bitwise_right_shift_scalar(shift);
+            let clamped = unclamped
+                .clamp_max(*quantization::MAX)
+                .clamp_min(*quantization::MIN);
+
+            let data: Vec<Element> = clamped
+                .to_data()
+                .into_vec()
+                .map_err(|_| anyhow!("Failed to compute Requant"))?;
+
+            result.push(Tensor::new(input.shape().clone(), data));
+        }
+
         Ok(LayerOut::from_vec(result))
     }
 }
@@ -671,7 +674,7 @@ impl Requant {
     /// Method used to instantiate a new [`Requant`] from the multiplier employed to requantize the layer.
     /// The `intermediate_bit_size` is layer dependant and so should be passed as input. It can be calculated based on how many times you need to multiply and add
     /// to get each value in the output tensor.
-    pub(crate) fn from_multiplier(multiplier: f32, intermediate_bit_size: usize) -> Requant {
+    pub fn from_multiplier(multiplier: f32, intermediate_bit_size: usize) -> Requant {
         let log_m = multiplier.log2();
         // This is the right shift
         let int_part = log_m.trunc().abs() as usize;
@@ -1104,6 +1107,10 @@ impl<E: ExtensionField> RequantCtx<E> {
 
 #[cfg(test)]
 mod tests {
+    use core::slice;
+
+    use ff_ext::GoldilocksExt2;
+    use proptest::prelude::*;
 
     use crate::{
         layers::{Layer, matrix_mul::MatMul},
@@ -1130,5 +1137,53 @@ mod tests {
         model.route_output(None).unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    fn requant_reference(layer: &Requant, inputs: &[&Tensor<Element>]) -> Vec<Tensor<Element>> {
+        inputs
+            .iter()
+            .map(|input| {
+                // We use this value to determine if any of the inputs are too large to be requantised (i.e. they fall outside the clamping table)
+                let res = input
+                    .get_data()
+                    .iter()
+                    .map(|elem| {
+                        let max_abs_val: Element = 1 << layer.intermediate_bit_size;
+                        assert!(*elem <= max_abs_val);
+
+                        let rounding: Element = 1 << (layer.shift() - 1);
+                        let unclamped =
+                            (rounding + elem * layer.fixed_point_multiplier) >> layer.shift();
+
+                        if unclamped >= *quantization::MAX {
+                            *quantization::MAX
+                        } else if unclamped <= *quantization::MIN {
+                            *quantization::MIN
+                        } else {
+                            unclamped
+                        }
+                    })
+                    .collect();
+                Tensor::<Element>::new(input.shape().clone(), res)
+            })
+            .collect()
+    }
+
+    fn input() -> impl Strategy<Value = Tensor<Element>> {
+        (1usize..1024).prop_flat_map(|size| Tensor::<Element>::any(Shape::new(vec![size])))
+    }
+
+    proptest! {
+        #[test]
+        fn test_requant_with_element(
+            tensor in input()
+        ) {
+            let layer = Requant::from_multiplier(2.0, 8);
+            let input_sizes = slice::from_ref(tensor.shape());
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&tensor], input_sizes).unwrap().outputs;
+            let expected = requant_reference(&layer, &[&tensor]);
+
+            prop_assert_eq!(&expected, &computed);
+        }
     }
 }

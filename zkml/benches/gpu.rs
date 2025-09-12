@@ -813,6 +813,35 @@ mod softmax_layer {
     }
 }
 
+#[divan::bench_group]
+mod requant_layer {
+    use core::slice;
+
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{provable::Evaluate, requant::Requant},
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+
+        let input = Tensor::<Element>::random(&Shape::new(vec![size]));
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Requant::from_multiplier(2.0, 8);
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Requant should succeed")
+        });
+    }
+}
+
 fn main() {
     divan::main();
 }

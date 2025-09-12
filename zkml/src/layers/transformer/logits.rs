@@ -112,11 +112,11 @@ impl Logits {
                 let (indices, maximums): (Vec<_>, Vec<_>) = inputs
                     .iter()
                     .map(|input| {
-                        let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
-                        let binput: BTensor<Backend, 2> = BTensor::from_data(
-                            TensorData::new(flat_data.to_vec(), [rows, last_dim]),
-                            &Default::default(),
-                        );
+                        let binput = (**input)
+                            .clone()
+                            .flatten(0..input.rank() - 1)
+                            .to_btensor::<2>();
+                        let rows = binput.shape().dims[0];
                         let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
                         let indices_vec: Vec<f32> = indices_bt
                             .to_data()

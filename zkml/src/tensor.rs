@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::{Ordering, PartialEq, min},
     fmt::{self, Debug},
+    ops::Range,
 };
 use tenstore::{GenStore, GenericStore, StoreError, StoreKey};
 
@@ -528,10 +529,21 @@ impl<T> Tensor<T> {
     }
 
     /// Returns an iterator that yields slices of the last dimension.
-    /// For a tensor of shape [2,3,3], it will yield 6 slices (2*3) of 3 elements each.
+    ///
+    /// For a tensor of shape `[2, 3, 3]`, it will yield 6 slices `2 * 3` of 3 elements each.
     pub fn slice_last_dim(&self) -> impl Iterator<Item = &[T]> {
         let (it, _) = self.slice_on_dim(self.shape.len() - 2);
         it
+    }
+
+    /// Consumes this tensor and returns a new one with the given dimensions flattened.
+    ///
+    /// # Panics
+    ///
+    /// If the given dimensions are out-of-bounds.
+    pub fn flatten(mut self, dims: Range<usize>) -> Self {
+        self.shape = self.shape.flatten(dims);
+        self
     }
 
     /// Returns a zero-copy logical flatten of all leading dimensions into rows while preserving the last dimension.

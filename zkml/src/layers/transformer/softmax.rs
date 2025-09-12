@@ -459,14 +459,14 @@ impl Evaluate<f32> for Softmax<f32> {
         // Make the attention mask
         let mask =
             AttentionMask::<f32>::new(input.shape(), &unpadded_input_shapes[0], f32::NEG_INFINITY)?;
-        // Flatten all leading dimensions except the last one so we can run an efficient 2D softmax using burn.
-        let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
-        ensure!(last_dim > 0, "Softmax last dimension must be > 0");
 
-        let binput: BTensor<Backend, 2, BFloat> = BTensor::from_data(
-            TensorData::new(flat_data.to_vec(), [rows, last_dim]),
-            &Default::default(),
+        // Flatten all leading dimensions except the last one so we can run an efficient 2D softmax using burn.
+        let binput = input.clone().flatten(0..input.rank() - 1).to_btensor::<2>();
+        ensure!(
+            binput.shape().dims[1] > 0,
+            "Softmax last dimension must be > 0",
         );
+
         // Apply mask on-device directly on the 2D burn tensor, then scale and softmax.
         let masked_bt = mask.apply(&binput)?;
         let scaled = masked_bt * self.scalar;

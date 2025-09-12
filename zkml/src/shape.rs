@@ -3,7 +3,7 @@ use multilinear_extensions::util::ceil_log2;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::PartialEq,
-    ops::{Bound, RangeBounds},
+    ops::{Bound, Range, RangeBounds},
 };
 
 /// Return's the filter size.
@@ -47,6 +47,13 @@ pub(crate) fn filter_size(shape: &Shape) -> usize {
 pub struct Shape(Vec<usize>);
 
 impl Shape {
+    /// Creates a new shape from the iterator.
+    ///
+    /// ```
+    /// # use zkml::Shape;
+    /// let first = Shape::from_it([1, 2, 3]);
+    /// Shape::from_it(first.iter());
+    /// ```
     pub fn from_it<V: std::borrow::Borrow<usize>, I: IntoIterator<Item = V>>(iter: I) -> Self {
         Self(iter.into_iter().map(|v| *v.borrow()).collect())
     }
@@ -59,6 +66,25 @@ impl Shape {
     pub fn new(shape: Vec<usize>) -> Self {
         assert!(!shape.is_empty(), "Shape can not be empty");
         Self(shape)
+    }
+
+    /// Returns a new [Shape] with the `dimensions` flattened.
+    ///
+    /// ```
+    /// # use zkml::Shape;
+    /// let shape = Shape::from_it([2, 3, 5, 7]);
+    /// assert_eq!(shape.flatten(1..3), Shape::from_it([2, 15, 7]))
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the given dimensions are out-of-bounds.
+    pub fn flatten(&self, dims: Range<usize>) -> Shape {
+        let mut newdims = Vec::with_capacity(self.len() - (dims.end - dims.start));
+        newdims.extend(&self.0[0..dims.start]);
+        newdims.push(self.0[dims.clone()].iter().product());
+        newdims.extend(&self.0[dims.end..]);
+        Shape(newdims)
     }
 
     pub fn slice<R: RangeBounds<usize>>(&self, range: R) -> Shape {
