@@ -75,6 +75,9 @@ jobs:
           lfs: 'true'
           ref: "${{ env.branch_point }}"
 
+      - name: Force-check LFS base
+        run: git lfs pull
+
       - name: Capture layers outputs on base
         shell: devenv shell bash -- -e {0}
         run: |
@@ -98,7 +101,7 @@ jobs:
           lfs: 'true'
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Force-check LFS
+      - name: Force-check LFS HEAD
         run: git lfs pull
 
       - name: Capture layers outputs on HEAD
