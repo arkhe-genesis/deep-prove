@@ -3,6 +3,7 @@ import re
 import json
 import argparse
 import os
+from pathlib import Path
 from transformers import GPT2Model, GPT2Tokenizer
 from transformers import AutoModelForCausalLM
 from transformers import Conv1D
@@ -41,11 +42,6 @@ model_hf_id = model_map.get(
     args.model_name, args.model_name
 )  # Use the mapping or the direct name
 print(f"ℹ️ Using model: {model_hf_id}")
-
-# Ensure output directory exists
-if not os.path.exists(args.output_dir):
-    os.makedirs(args.output_dir)
-    print(f"Created output directory: {args.output_dir}")
 
 # Load tokenizer and model
 print(f"ℹ️ Loading model: {model_hf_id}")
@@ -347,10 +343,13 @@ with torch.no_grad():
     print(f"LOGITS: {output_json['logits'][0:5]}")
     output_json["logits_max_diff"] = logits_diff.item()
 
-# Save the debug tensor outputs
-output_debug_fname = os.path.join(
+# Ensure output directory exists
+output_debug_fname = Path(
     args.output_dir, f"{args.model_name.replace('-', '_')}_debug_output.json"
 )
+output_debug_fname.parent.mkdir(parents=True, exist_ok=True)
+
+# Save the debug tensor outputs
 with open(output_debug_fname, "w") as f:
     json.dump(output_json, f, indent=2)
 # Print absolute path for clarity
