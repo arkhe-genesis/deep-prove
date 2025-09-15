@@ -365,6 +365,7 @@ mod test {
             .map(|b| E::from_canonical_u64(b as u64))
             .collect_vec();
         let output = mle.evaluate(&eval);
+
         assert_eq!(output, v[random_index]);
     }
 }

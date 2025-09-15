@@ -12,7 +12,7 @@ repos:
     stages: ["pre-commit", "pre-push"]
     entry: "black"
     language: system
-    files: ^.*\.py$
+    'types': [file, python]
   - id: ripsecrets
     name: ripsecrets
     description: "Check when publishing secrets"
@@ -27,7 +27,7 @@ repos:
     stages: ["pre-commit", "pre-push"]
     entry: "taplo fmt"
     language: system
-    files: ^.*\.toml$
+    'types': [file, toml]
   - id: typos
     name: typos
     description: "Check typos in the code"
@@ -35,3 +35,33 @@ repos:
     entry: "typos --config typos.toml --format brief --write-changes"
     language: system
     'types': [text]
+  - id: cargo-fmt
+    name: cargo fmt
+    description: "Format rust files with cargo fmt"
+    stages: ["pre-commit", "pre-push"]
+    entry: "cargo fmt --all"
+    language: system
+    'types': [file, rust]
+    require_serial: true
+    pass_filenames: false
+    fail_fast: true
+  - id: cargo-clippy
+    name: cargo clippy
+    description: "Run cargo clippy lint tool"
+    stages: ["pre-commit", "pre-push"]
+    entry: "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+    language: system
+    'types': [file, rust]
+    require_serial: true
+    pass_filenames: false
+    fail_fast: true
+  - id: cargo-check
+    name: cargo check
+    description: "Run cargo check for compilation errors"
+    stages: ["pre-commit", "pre-push"]
+    entry: "cargo check"
+    language: system
+    'types': [file, rust]
+    require_serial: true
+    pass_filenames: false
+    fail_fast: true
