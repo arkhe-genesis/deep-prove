@@ -25,14 +25,15 @@ struct LLMArgs {
     gguf: String,
 
     /// max context length (in tokens)
-    #[arg(short, long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 1024)]
     max_context: usize,
+
     /// number of samples to process
     #[arg(short, long, default_value_t = 30)]
     num_samples: usize,
 
     /// min user input length (in tokens)
-    #[arg(short, long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1)]
     min_user_len: usize,
 
     /// model to use
