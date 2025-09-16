@@ -46,6 +46,12 @@ pub(crate) fn filter_size(shape: &Shape) -> usize {
 )]
 pub struct Shape(Vec<usize>);
 
+impl<const T: usize> From<[usize; T]> for Shape {
+    fn from(value: [usize; T]) -> Self {
+        Self(value.into_iter().collect())
+    }
+}
+
 impl Shape {
     /// Creates a new shape from the iterator.
     ///

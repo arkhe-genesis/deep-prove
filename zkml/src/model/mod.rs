@@ -677,7 +677,13 @@ pub(crate) mod test {
                         None,
                     );
                     let input_scaling_factor = ScalingFactor::from_scale(1.0, None);
-                    let max_model = dense.matrix.max_value().max(dense.bias.max_value()) as f32;
+                    let max_model = dense.matrix.max_value().max(
+                        dense
+                            .bias
+                            .as_ref()
+                            .map(|b| b.max_value())
+                            .unwrap_or(f32::MIN as i64),
+                    ) as f32;
                     let model_scaling_factor = ScalingFactor::from_absolute_max(max_model, None);
 
                     let intermediate_bit_size = dense.output_bitsize();
@@ -922,6 +928,8 @@ pub(crate) mod test {
         let bias_eval = dense_layers[0]
             .1
             .bias
+            .as_ref()
+            .unwrap() // safe because we know there is a bias
             .to_field::<F>()
             .into_mle()
             .evaluate(&point1);

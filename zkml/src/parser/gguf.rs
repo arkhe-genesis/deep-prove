@@ -1,4 +1,3 @@
-use super::json;
 use candle_core::quantized::{QTensor, gguf_file::Value};
 use std::{
     fs::File,
@@ -11,258 +10,7 @@ use std::{
 use anyhow::{Context, bail, ensure};
 use candle_core::{CpuStorage, Device, Storage, quantized::gguf_file::Content};
 
-use crate::{
-    Shape, Tensor,
-    layers::{
-        matrix_mul::MatMul,
-        transformer::{embeddings::Embeddings, layernorm::LayerNorm, positional::Positional},
-    },
-    parser::llm::{Attention, FeedForward, GPT2Model, LLMConfig, LLMModel, LLMVariant},
-};
-
-impl LLMConfig {
-    pub fn from_content(l: &FileTensorLoader) -> anyhow::Result<Self> {
-        let variant = LLMVariant::from_loader(l)?;
-        let embedding_size = l.content.metadata[variant.embedding_size_key()].to_u32()? as usize;
-        let hidden_size = l.content.metadata[variant.hidden_size_key()].to_u32()? as usize;
-        let num_heads = l.content.metadata[variant.num_heads_key()].to_u32()? as usize;
-        let context_length = l.content.metadata[variant.context_length_key()].to_u32()? as usize;
-        let norm_epsilon = l.content.metadata[variant.norm_epsilon_key()].to_f32()?;
-        let num_block = l.content.metadata[variant.num_block_key()].to_u32()? as usize;
-        let vocab_size = variant.vocab_size();
-        Ok(Self {
-            hidden_size,
-            embedding_size,
-            num_heads,
-            context_length,
-            norm_epsilon,
-            num_block,
-            vocab_size,
-            specific_config: variant,
-        })
-    }
-
-    pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_heads
-    }
-
-    pub fn model(&self, l: &FileTensorLoader) -> anyhow::Result<LLMModel> {
-        self.specific_config.model(l, self)
-    }
-
-    pub fn model_json(&self, l: &json::FileTensorLoader) -> anyhow::Result<LLMModel> {
-        self.specific_config.model_json(l, self)
-    }
-}
-
-impl LLMVariant {
-    pub fn num_heads_key(&self) -> &str {
-        match self {
-            Self::GPT2 => "gpt2.attention.head_count",
-            Self::Gemma3 => "gemma3.attention.head_count",
-        }
-    }
-
-    pub fn context_length_key(&self) -> &str {
-        match self {
-            Self::GPT2 => "gpt2.context_length",
-            Self::Gemma3 => "gemma3.context_length",
-        }
-    }
-    pub fn num_block_key(&self) -> &str {
-        match self {
-            Self::GPT2 => "gpt2.block_count",
-            Self::Gemma3 => "gemma3.block_count",
-        }
-    }
-    pub fn embedding_size_key(&self) -> &str {
-        match self {
-            Self::GPT2 => "gpt2.embedding_length",
-            Self::Gemma3 => "gemma3.embedding_length",
-        }
-    }
-    pub fn hidden_size_key(&self) -> &str {
-        match self {
-            // same size as embedding for gpt2
-            Self::GPT2 => self.embedding_size_key(),
-            Self::Gemma3 => self.embedding_size_key(),
-        }
-    }
-    pub fn norm_epsilon_key(&self) -> &str {
-        match self {
-            Self::GPT2 => "gpt2.attention.layer_norm_epsilon",
-            Self::Gemma3 => "gemma3.attention.layer_norm_epsilon",
-        }
-    }
-    pub fn model(&self, l: &FileTensorLoader, config: &LLMConfig) -> anyhow::Result<LLMModel> {
-        match self {
-            Self::GPT2 => Ok(LLMModel::GPT2(GPT2Model::from_loader(l, config)?)),
-            Self::Gemma3 => bail!("Gemma3 is not supported yet"),
-        }
-    }
-}
-
-impl GPT2Model {
-    pub fn from_loader(loader: &FileTensorLoader, config: &LLMConfig) -> anyhow::Result<Self> {
-        let embeddings = Embeddings::from_loader(loader)?;
-        let positional = Positional::from_loader(loader, config)?;
-        let num_layers = config.num_block;
-        let blocks = (0..num_layers)
-            .map(|i| Attention::from_loader(&loader.pp(&format!("blk.{i}.")), config))
-            .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
-        let final_norm = LayerNorm::from_loader(&loader.pp("output_"), config)?;
-        let proj_weights = loader.get_tensor("output.weight")?.transpose();
-        //  there might or not be a bias
-        let proj_bias = loader.get_tensor("output.bias").ok();
-        let final_proj = MatMul::new_constant(proj_weights, proj_bias)?;
-        Ok(Self::new(
-            embeddings, positional, blocks, final_norm, final_proj,
-        ))
-    }
-}
-
-impl FeedForward<f32> {
-    // Replaces from_var_builder and from_tensor_loader
-    // 'loader' is expected to be the block-level loader (e.g., scoped to "blk.N.")
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        // Create a sub-scope for the feed-forward network's LayerNorm
-        let ffn_norm_loader = loader.pp("ffn_");
-        // Use the new LayerNorm::from_loader
-        let norm = LayerNorm::from_loader(&ffn_norm_loader, c)?;
-
-        let up = loader.get_tensor("ffn_up.weight")?.transpose();
-        let up_bias = loader.get_tensor("ffn_up.bias")?;
-        let down = loader.get_tensor("ffn_down.weight")?.transpose();
-        let down_bias = loader.get_tensor("ffn_down.bias")?;
-        ensure!(
-            up.shape()[0] == c.hidden_size,
-            "up have shape {:?} but in features should be equal to hidden_size: {}",
-            up.shape(),
-            c.hidden_size
-        );
-        ensure!(
-            down.shape()[1] == c.embedding_size,
-            "down have shape {:?} but out features should be equal to embedding_size: {}",
-            down.shape(),
-            c.embedding_size
-        );
-        Ok(Self {
-            norm,
-            up,
-            up_bias,
-            down,
-            down_bias,
-        })
-    }
-}
-
-impl Attention<f32> {
-    // Replaces from_var_builder and from_tensor_loader
-    // 'loader' is expected to be the block-level loader (e.g., scoped to "blk.N.")
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        let embedding_size = c.embedding_size;
-        let hidden_size = c.hidden_size;
-        ensure!(
-            embedding_size == hidden_size,
-            "embedding_size must be equal to hidden_size"
-        );
-
-        let qkv_weight_qtensor = loader.get_qtensor("attn_qkv.weight")?;
-        let qkv_weight_candle = qkv_weight_qtensor.dequantize(&Device::Cpu)?;
-        let mut unfused_weights =
-            unfuse_tensors(qkv_weight_candle, embedding_size * embedding_size)?;
-        ensure!(unfused_weights.len() == 3, "qkv_weight must have 3 chunks");
-        let q = crate::Tensor::new(
-            vec![embedding_size, hidden_size].into(),
-            unfused_weights.remove(0),
-        )
-        .transpose();
-        let k = crate::Tensor::new(
-            vec![embedding_size, hidden_size].into(),
-            unfused_weights.remove(0),
-        )
-        .transpose();
-        let v = crate::Tensor::new(
-            vec![embedding_size, hidden_size].into(),
-            unfused_weights.remove(0),
-        )
-        .transpose();
-
-        let qkv_bias_qtensor = loader.get_qtensor("attn_qkv.bias")?;
-        let qkv_bias_candle = qkv_bias_qtensor.dequantize(&Device::Cpu)?;
-        let mut unfused_biases = unfuse_tensors(qkv_bias_candle, embedding_size)?;
-        ensure!(unfused_biases.len() == 3, "qkv_bias must have 3 chunks");
-        let q_bias = crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0));
-        let k_bias = crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0));
-        let v_bias = crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0));
-
-        let attn_norm_loader = loader.pp("attn_");
-        // Use new LayerNorm::from_loader
-        let norm = LayerNorm::from_loader(&attn_norm_loader, c)?;
-
-        // attn_output.weight is stored as [out_features, in_features] in GGUF (same as PyTorch)
-        // Our MatMul layer expects the right-hand constant to be in the orientation [in_features, out_features],
-        // so we transpose it once here after loading.
-        let out = loader.get_tensor("attn_output.weight")?.transpose();
-        let out_bias = loader.get_tensor("attn_output.bias")?;
-        ensure!(
-            out.shape().as_ref() == &[embedding_size, embedding_size],
-            "out must have shape [hidden_size, hidden_size]"
-        );
-        ensure!(
-            out_bias.shape().as_ref() == &[embedding_size],
-            "out_bias must have shape [hidden_size]"
-        );
-
-        // Use new FeedForward::from_loader
-        let ff = FeedForward::from_loader(loader, c)?;
-
-        Ok(Self {
-            out,
-            out_bias,
-            norm,
-            q,
-            q_bias,
-            k,
-            k_bias,
-            v,
-            v_bias,
-            feedforward: ff,
-        })
-    }
-}
-
-impl Positional<f32> {
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        match c.specific_config {
-            LLMVariant::Gemma3 => bail!("Gemma3 is not supported yet"),
-            LLMVariant::GPT2 => {
-                let position_embd = loader.get_tensor("position_embd.weight")?;
-                let shape = position_embd.shape();
-                ensure!(
-                    shape[0] == c.context_length,
-                    "position_embd must have shape [{}] vs given {:?}",
-                    c.context_length,
-                    position_embd.shape()
-                );
-                ensure!(
-                    shape[1] == c.embedding_size,
-                    "position_embd must have shape [{}] vs given {:?}",
-                    c.embedding_size,
-                    position_embd.shape()
-                );
-                Ok(Self::new_learned(position_embd))
-            }
-        }
-    }
-}
-impl Embeddings<f32> {
-    // TODO: make that a trait ? or part of the Layer enum ?
-    pub fn from_loader(loader: &FileTensorLoader) -> anyhow::Result<Self> {
-        let emb_tensor = loader.get_tensor("token_embd.weight")?;
-        Embeddings::new(emb_tensor)
-    }
-}
+use crate::{Shape, Tensor};
 
 fn dequantize(qtensor: Arc<QTensor>) -> anyhow::Result<Tensor<f32>> {
     let shape = Shape::new(qtensor.shape().dims().to_vec());
@@ -298,7 +46,10 @@ fn dequantize(qtensor: Arc<QTensor>) -> anyhow::Result<Tensor<f32>> {
     Ok(Tensor::new(shape, data))
 }
 
-fn unfuse_tensors(fused: candle_core::Tensor, chunk_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
+pub fn unfuse_tensors(
+    fused: candle_core::Tensor,
+    chunk_len: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
     let (s, _l) = fused.storage_and_layout();
     let data: Vec<f32> = match s.deref() {
         Storage::Cpu(cpu) => match cpu {
@@ -436,6 +187,15 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
         }
     }
 
+    pub fn get_tensor_shape(&self, name: &str) -> anyhow::Result<Shape> {
+        let info = self
+            .content
+            .tensor_infos
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("tensor not found: {name}"))?;
+        Ok(Shape::new(info.shape.dims().to_vec()))
+    }
+
     /// Retrieves a quantized tensor (`QTensor`) by its name relative to the current scope.
     /// The full tensor name is formed by `current_prefix + name`.
     /// This method is primarily for internal use or advanced scenarios where the `QTensor` is needed directly.
@@ -482,6 +242,10 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     {
         self.content.metadata.get(key).map(Value::from_value)
     }
+
+    pub fn raw_metadata(&self, key: &str) -> Option<&Value> {
+        self.content.metadata.get(key)
+    }
 }
 
 impl TensorLoader<BufReader<File>> {
@@ -498,6 +262,19 @@ impl TensorLoader<BufReader<File>> {
         let reader = BufReader::new(file);
         Self::from_reader(reader)
     }
+
+    pub fn meta_and_tensor_keys(&self) -> (Vec<String>, Vec<String>) {
+        let mut meta_keys = self.content.metadata.keys().cloned().collect::<Vec<_>>();
+        let mut tensor_keys = self
+            .content
+            .tensor_infos
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        meta_keys.sort();
+        tensor_keys.sort();
+        (meta_keys, tensor_keys)
+    }
 }
 
 #[cfg(test)]
@@ -510,7 +287,7 @@ pub mod tests {
         layers::transformer::embeddings::Embeddings,
         parser::{
             file_cache,
-            llm::{Attention, HFTokenizer, LLMConfig, LLMTokenizer, LLMVariant},
+            llm::{HFTokenizer, LLMConfig, LLMTokenizer, LLMVariant, transformer::Attention},
         },
     };
 
@@ -526,7 +303,7 @@ pub mod tests {
         let loader = FileTensorLoader::from_path(model_path)?;
         let config = LLMConfig::from_content(&loader)?;
         let _model = config.model(&loader)?;
-        println!("model: {:?}", config.specific_config);
+        println!("model: {:?}", config.variant);
         Ok(())
     }
 
@@ -688,12 +465,41 @@ pub mod tests {
     }
 
     #[test]
+    fn test_gguf_print_keys() -> anyhow::Result<()> {
+        for path in [GPT2_Q8_0, GEMMA3_Q8] {
+            let model_path = file_cache::from_cache(path)?;
+            let loader = FileTensorLoader::from_path(model_path)?;
+            let (meta_keys, tensor_keys) = loader.meta_and_tensor_keys();
+            println!("{path}");
+            println!("metadata:");
+            for key in meta_keys {
+                println!("\t- {key}");
+            }
+            println!("tensor_infos:");
+            for key in tensor_keys {
+                println!("\t- {key}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_gguf_gemma3() -> anyhow::Result<()> {
-        let gemma = "gemma-3-270m-it-Q8_0.gguf";
+        let gemma = GEMMA3_Q8;
         let model_path = file_cache::from_cache(gemma)?;
         let loader = FileTensorLoader::from_path(model_path)?;
-        println!("metadata: {:?}", loader.content.metadata.keys());
+        let (meta_keys, tensor_keys) = loader.meta_and_tensor_keys();
+        println!("metadata:");
+        for key in meta_keys {
+            println!("\t- {key}");
+        }
+
+        println!("tensor_infos:");
+        for key in tensor_keys {
+            println!("\t- {key}");
+        }
         println!(" VARIANT: {:?}", LLMVariant::from_loader(&loader)?);
+
         Ok(())
     }
 }

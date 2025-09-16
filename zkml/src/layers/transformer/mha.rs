@@ -977,7 +977,7 @@ mod test {
             file_cache,
             gguf::{FileTensorLoader, tests::GPT2_Q8_0},
             json::{self, test::TINY_GPT2_DEBUG_NAME},
-            llm::{LLMConfig, LLMModel},
+            llm::LLMConfig,
         },
         quantization::{self, Fieldizer},
         testing::random_field_vector,
@@ -1328,7 +1328,7 @@ mod test {
         // we pad in QKV node
         let qkv_node_id = model
             .add_consecutive_layer(
-                Layer::QKV(QKV::random(num_heads, embedding_size, hidden_size).unwrap()),
+                Layer::QKV(QKV::random(num_heads, embedding_size, hidden_size, true).unwrap()),
                 None,
             )
             .unwrap();
@@ -1493,8 +1493,7 @@ mod test {
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
         let config = LLMConfig::from_content(&loader)?;
-        let model = config.model(&loader)?;
-        let LLMModel::GPT2(llm_model) = model;
+        let llm_model = config.model(&loader)?;
         let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
             File::open(debug_output_path.clone())
                 .context(format!("failed to open file {}", debug_output_path.clone()))?,
@@ -1507,10 +1506,14 @@ mod test {
         let embedded = llm_model
             .embeddings
             .evaluate::<GoldilocksExt2>(&[&input], &[])?;
-        let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
-            &[embedded.outputs()[0]],
-            &[embedded.outputs()[0].shape().clone()],
-        )?;
+        let positioned = llm_model
+            .positional
+            .as_ref()
+            .unwrap()
+            .evaluate::<GoldilocksExt2>(
+                &[embedded.outputs()[0]],
+                &[embedded.outputs()[0].shape().clone()],
+            )?;
 
         let input_shape = positioned.outputs()[0].shape();
 
@@ -1527,12 +1530,13 @@ mod test {
                     llm_model.blocks[0].v.clone(),
                     llm_model.blocks[0].v_bias.clone(),
                     config.num_heads,
+                    config.num_heads,
                 )?),
                 None,
             )
             .unwrap();
 
-        let mha = Mha::new(config.context_length, config.num_heads, config.head_dim())?;
+        let mha = Mha::new(config.context_length, config.num_heads, config.head_size)?;
 
         let _mha_id = model
             .add_consecutive_layer(Layer::Mha(mha), Some(qkv_node_id))
@@ -1569,7 +1573,7 @@ mod test {
 
         let qkv_node_id = model
             .add_consecutive_layer(
-                Layer::QKV(QKV::random(num_heads, embedding_size, hidden_size).unwrap()),
+                Layer::QKV(QKV::random(num_heads, embedding_size, hidden_size, true).unwrap()),
                 None,
             )
             .unwrap();

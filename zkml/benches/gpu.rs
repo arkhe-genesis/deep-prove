@@ -512,11 +512,12 @@ mod qkv_layer {
                 // The Element QKV layer has a cache and it works only on first evaluation
                 QKV::<Element>::new(
                     q.clone(),
-                    q_bias.clone(),
+                    Some(q_bias.clone()),
                     k.clone(),
-                    k_bias.clone(),
+                    Some(k_bias.clone()),
                     v.clone(),
-                    v_bias.clone(),
+                    Some(v_bias.clone()),
+                    num_heads,
                     num_heads,
                 )
                 .unwrap()
@@ -543,7 +544,18 @@ mod qkv_layer {
         let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_shape = slice::from_ref(input.shape());
 
-        let layer = QKV::<f32>::new(q, q_bias, k, k_bias, v, v_bias, num_heads).unwrap();
+        let layer = QKV::<f32>::new(
+            q,
+            Some(q_bias),
+            k,
+            Some(k_bias),
+            v,
+            Some(v_bias),
+            num_heads,
+            num_heads,
+        )
+        .unwrap();
+
         bencher.bench(|| {
             layer
                 .evaluate::<GoldilocksExt2>(&[&input], input_shape)

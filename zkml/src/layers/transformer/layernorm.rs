@@ -313,7 +313,7 @@ impl LayerNorm<f32> {
             beta.shape()
         );
         let eps = loader
-            .metadata::<f32>(c.specific_config.norm_epsilon_key())
+            .metadata::<f32>(c.variant.norm_epsilon_key())
             .context("norm_epsilon not found")?;
         Ok(Self::new(gamma, beta, eps))
     }

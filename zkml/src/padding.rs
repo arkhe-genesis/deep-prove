@@ -221,12 +221,14 @@ pub(crate) fn pad_dense(mut d: Dense<Element>, si: &mut ShapeInfo) -> Result<Den
     let matrix_shape = d.matrix.shape().clone();
     let nrows = matrix_shape.nrows();
     sd.input_shape_og = vec![nrows].into();
-    ensure!(
-        d.bias.get_data().len() == nrows,
-        "Bias length {} does not match matrix width {}",
-        d.bias.get_data().len(),
-        nrows,
-    );
+    if let Some(ref bias) = d.bias {
+        ensure!(
+            bias.get_data().len() == nrows,
+            "Bias length {} does not match matrix width {}",
+            bias.get_data().len(),
+            nrows,
+        );
+    }
     ensure!(
         sd.input_shape_padded.is_power_of_two(),
         "Input shape for dense is not padded"
@@ -262,7 +264,7 @@ pub(crate) fn pad_dense(mut d: Dense<Element>, si: &mut ShapeInfo) -> Result<Den
         d.matrix
             .reshape_to_fit_inplace_2d(vec![nrows, ncols].into());
     }
-    d.bias = d.bias.pad_1d(nrows);
+    d.bias = d.bias.map(|b| b.pad_1d(nrows));
     sd.input_shape_padded = vec![nrows].into();
     Ok(d)
 }
@@ -423,9 +425,11 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
     [&mut qkv.q_bias, &mut qkv.k_bias, &mut qkv.v_bias]
         .into_iter()
         .for_each(|bias_vec| {
-            bias_vec.reshape(Shape::new(vec![qkv.num_heads, head_dim]));
-            bias_vec.pad_to_shape(vec![padded_num_heads, padded_head_dim].into());
-            bias_vec.reshape(Shape::new(vec![padded_num_heads * padded_head_dim]))
+            if let Some(bias) = bias_vec.as_mut() {
+                bias.reshape(Shape::new(vec![qkv.num_heads, head_dim]));
+                bias.pad_to_shape(vec![padded_num_heads, padded_head_dim].into());
+                bias.reshape(Shape::new(vec![padded_num_heads * padded_head_dim]));
+            }
         });
 
     let padded_output_shapes = qkv.output_shapes(

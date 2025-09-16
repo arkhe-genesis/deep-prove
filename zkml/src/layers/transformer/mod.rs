@@ -53,7 +53,7 @@ pub(crate) mod manual_attention {
             file_cache,
             gguf::{FileTensorLoader, tests::GPT2_Q8_0},
             json::test::{TINY_GPT2_DEBUG_NAME, TINY_GPT2_NAME},
-            llm::{Attention, FeedForward, LLMConfig, LLMModel},
+            llm::{Attention, FeedForward, LLMConfig, transformer::Norm},
         },
         rng_from_env_or_random,
         tensor::{Number, is_close},
@@ -71,7 +71,7 @@ pub(crate) mod manual_attention {
 
     impl FlatFFN<f32> {
         pub fn new_from_gguf(_c: &LLMConfig, ffn: FeedForward<f32>) -> Self {
-            let layernorm = ffn.norm;
+            let layernorm = ffn.pre_norm;
             let up = {
                 // normally we would do this
                 // Dense::new(ffn.up, ffn.up_bias);
@@ -90,6 +90,9 @@ pub(crate) mod manual_attention {
                 MatMul::new(left, weight).expect("failed to create MatMul")
             };
             let add = add::Add::new();
+            let Norm::LayerNorm(layernorm) = layernorm else {
+                panic!("layernorm is not a LayerNorm while it's json");
+            };
             Self {
                 layernorm,
                 up,
@@ -190,8 +193,9 @@ pub(crate) mod manual_attention {
                 att.v,
                 att.v_bias,
                 c.num_heads,
+                c.num_heads,
             )?;
-            let mha = mha::Mha::new(c.context_length, c.num_heads, c.head_dim())?;
+            let mha = mha::Mha::new(c.context_length, c.num_heads, c.head_size)?;
             let ffn = FlatFFN::new_from_gguf(c, att.feedforward);
 
             let out = {
@@ -200,13 +204,16 @@ pub(crate) mod manual_attention {
                 MatMul::new(left, weight).expect("failed to create MatMul")
             };
 
+            let Norm::LayerNorm(layernorm) = att.pre_norm else {
+                panic!("layernorm is not a LayerNorm while it's json");
+            };
             Ok(Self {
                 out,
                 hidden_size: c.hidden_size,
                 num_heads: c.num_heads,
-                head_dim: c.head_dim(),
+                head_dim: c.head_size,
                 qkv,
-                layernorm: att.norm,
+                layernorm,
                 mha,
                 add: Add::new(),
                 ffn,
@@ -289,7 +296,7 @@ pub(crate) mod manual_attention {
             let hidden_size = emb_size;
             let head_size = hidden_size / num_heads;
             let context_length = 1024;
-            let qkv = qkv::QKV::random(num_heads, emb_size, hidden_size)?;
+            let qkv = qkv::QKV::random(num_heads, emb_size, hidden_size, true)?;
             let mha = mha::Mha::new(context_length, num_heads, head_size)?;
             let layernorm = layernorm::LayerNorm::random(emb_size);
             // let out = Dense::random(vec![hidden_size, hidden_size]);
@@ -331,8 +338,8 @@ pub(crate) mod manual_attention {
         let path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(path)?;
         let config = LLMConfig::from_content(&loader)?;
-        let LLMModel::GPT2(mut model) = config.model(&loader)?;
-        println!("model: {:?}", config.specific_config);
+        let mut model = config.model(&loader)?;
+        println!("model: {:?}", config.variant);
         // 10 for first seq_len, then 1 for subsequent token since we use caching
         for seq_len in [10, 1] {
             let input = Tensor::<f32>::random(&vec![seq_len, config.embedding_size].into());
@@ -437,7 +444,7 @@ pub(crate) mod manual_attention {
         let debug_output_path = json::test::get_json_file(TINY_GPT2_DEBUG_NAME)?;
         let loader = json::FileTensorLoader::new_from_path(model_weights_path)?;
         let config = LLMConfig::from_json(&loader)?;
-        let LLMModel::GPT2(llm_model) = config.model_json(&loader)?;
+        let llm_model = config.model_json(&loader)?;
         let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
             File::open(debug_output_path.clone())
                 .context(format!("failed to open file {}", debug_output_path.clone()))?,
@@ -449,10 +456,14 @@ pub(crate) mod manual_attention {
         let embedded = llm_model
             .embeddings
             .evaluate::<GoldilocksExt2>(&[&input], &[])?;
-        let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
-            &[embedded.outputs()[0]],
-            &[embedded.outputs()[0].shape().clone()],
-        )?;
+        let positioned = llm_model
+            .positional
+            .as_ref()
+            .unwrap()
+            .evaluate::<GoldilocksExt2>(
+                &[embedded.outputs()[0]],
+                &[embedded.outputs()[0].shape().clone()],
+            )?;
         assert!(is_close(
             positioned.outputs()[0].get_data(),
             &gpt2_output.inputs_embeds
@@ -478,8 +489,8 @@ pub(crate) mod manual_attention {
             vec![gpt2_output.input_ids.len(), config.embedding_size].into(),
             gpt2_output.inputs_embeds.clone(),
         );
-        let LLMModel::GPT2(mut model) = config.model_json(&loader)?;
-        println!("model: {:?}", config.specific_config);
+        let mut model = config.model_json(&loader)?;
+        println!("model: {:?}", config.variant);
         // Try to run with the flat attention implementation
         let first_attention = model.blocks.remove(0);
         let mut att = FlatAttention::new_from_parser(&config, first_attention.clone()).unwrap();
@@ -517,7 +528,7 @@ pub(crate) mod manual_attention {
         // let debug_output_path = json::test::get_json_file(DISTIL_GPT2_DEBUG_NAME)?;
         let loader = json::FileTensorLoader::new_from_path(model_weights_path)?;
         let config = LLMConfig::from_json(&loader)?;
-        let LLMModel::GPT2(llm_model) = config.model_json(&loader)?;
+        let llm_model = config.model_json(&loader)?;
         let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
             File::open(debug_output_path.clone())
                 .context(format!("failed to open file {}", debug_output_path.clone()))?,

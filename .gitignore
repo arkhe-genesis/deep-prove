@@ -18,6 +18,8 @@ zkml/assets/scripts/covid/data*
 zkml/deepprove.csv
 zkml/bench.csv
 .venv
+venv
+*csv
 
 # Devenv
 .devenv*

@@ -403,6 +403,7 @@ fn rescale_qkv_layer(qkv: &QKV<f32>, scales: &Tensor<f32>, bias: &Tensor<f32>) -
         v,
         v_bias,
         num_heads,
+        num_groups,
         ..
     } = qkv;
 
@@ -423,7 +424,11 @@ fn rescale_qkv_layer(qkv: &QKV<f32>, scales: &Tensor<f32>, bias: &Tensor<f32>) -
             .flat_map(|(row, scale)| row.iter().map(|x| x * scale).collect::<Vec<f32>>())
             .collect::<Vec<f32>>();
         let new_mat = Tensor::new(old_matrix.shape().clone(), new_mat_data);
-        let new_bias = old_bias.add(&new_bias);
+        // If QKV does not have any bias, then we just take the one given
+        let new_bias = old_bias
+            .as_ref()
+            .map(|bias| bias.add(&new_bias))
+            .unwrap_or(new_bias);
         weights_and_biases.push((new_mat, new_bias));
     }
     let (new_v_mat, new_v_bias) = weights_and_biases.pop().unwrap();
@@ -431,7 +436,14 @@ fn rescale_qkv_layer(qkv: &QKV<f32>, scales: &Tensor<f32>, bias: &Tensor<f32>) -
     let (new_q_mat, new_q_bias) = weights_and_biases.pop().unwrap();
 
     QKV::new(
-        new_q_mat, new_q_bias, new_k_mat, new_k_bias, new_v_mat, new_v_bias, *num_heads,
+        new_q_mat,
+        Some(new_q_bias),
+        new_k_mat,
+        Some(new_k_bias),
+        new_v_mat,
+        Some(new_v_bias),
+        *num_heads,
+        *num_groups,
     )
 }
 

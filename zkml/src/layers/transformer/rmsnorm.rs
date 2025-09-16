@@ -1,5 +1,4 @@
 //! Implementation of the RMSNorm layer
-
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, ensure};
@@ -271,14 +270,10 @@ impl RMSNorm<f32> {
     // (e.g., loader.pp("attn_") or loader.pp("ffn_"))
     pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         let alpha = loader.get_tensor("norm.weight")?;
-        ensure!(
-            alpha.shape().as_ref() == &[c.embedding_size],
-            "norm_alpha must have shape [{}] vs given {:?}",
-            c.embedding_size,
-            alpha.shape()
-        );
+        // we can have any checks on the shape alpha here since it depends of the context
+        // a RMSNorm after  Q doesn't have the same shape as a RMSNorm after K or inside FeedForward etc
         let eps = loader
-            .metadata::<f32>(c.specific_config.norm_epsilon_key())
+            .metadata::<f32>(c.variant.norm_epsilon_key())
             .unwrap_or_default();
         Self::new(Some(alpha), eps, None)
     }

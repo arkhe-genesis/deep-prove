@@ -46,7 +46,7 @@ pub const DENSE_LAYER: &str = "DENS";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dense<T> {
     pub matrix: Tensor<T>,
-    pub bias: Tensor<T>,
+    pub bias: Option<Tensor<T>>,
     // set to matrix shape if the matrix is not padded
     pub unpadded_matrix_shape: Shape,
 }
@@ -57,6 +57,7 @@ pub struct DenseCtx {
     pub node_id: NodeId,
     pub unpadded_matrix_shape: Shape,
     pub padded_matrix_shape: Shape,
+    pub is_bias_present: bool,
 }
 
 /// Proof of the layer.
@@ -68,7 +69,8 @@ pub struct DenseProof<E: ExtensionField> {
     /// The evaluation of the bias at the previous claims in the proving flow.
     /// The verifier subtracts this from the previous claim to end up with one claim only
     /// about the matrix, without the bias.
-    bias_eval: E,
+    /// If there is no bias, then there is no bias eval
+    bias_eval: Option<E>,
     /// The individual evaluations of the individual polynomial for the last random part of the
     /// sumcheck. One for each polynomial involved in the "virtual poly". Since we only support quadratic right now it's
     /// a flat list.
@@ -86,7 +88,12 @@ fn output_shape(input_shape: &Shape, matrix_shape: &Shape) -> Shape {
 
 impl<T: Number> Dense<T> {
     pub fn new(matrix: Tensor<T>, bias: Tensor<T>) -> Self {
-        assert_eq!(matrix.nrows_2d(), bias.shape()[0]);
+        Self::new_with(matrix, Some(bias))
+    }
+    pub fn new_with(matrix: Tensor<T>, bias: Option<Tensor<T>>) -> Self {
+        if let Some(ref bbias) = bias {
+            assert_eq!(matrix.nrows_2d(), bbias.shape()[0]);
+        }
         let unpadded_matrix_shape = matrix.shape().clone();
         Self {
             matrix,
@@ -103,7 +110,7 @@ impl<T: Number> Dense<T> {
 
     pub fn pad_next_power_of_two(self) -> Self {
         let matrix = self.matrix.pad_next_power_of_two();
-        let bias = self.bias.pad_1d(matrix.nrows_2d());
+        let bias = self.bias.map(|b| b.pad_1d(matrix.nrows_2d()));
         Self {
             matrix,
             bias,
@@ -126,9 +133,12 @@ impl<T: Number> Dense<T> {
             self.matrix.ncols_2d(),
             !self
                 .bias
-                .get_data()
-                .iter()
-                .all(|x| x.compare(&T::default()) == Ordering::Equal)
+                .as_ref()
+                .map(|a| a
+                    .get_data()
+                    .iter()
+                    .all(|x| x.compare(&T::default()) == Ordering::Equal))
+                .unwrap_or(true)
         )
     }
 
@@ -178,14 +188,17 @@ impl Evaluate<Element> for Dense<Element> {
 
         let matrix = self.matrix.clone().to_btensor::<2>();
         let input = inputs[0].to_flatten().to_btensor::<1>();
-        let bias = self.bias.to_flatten().to_btensor::<1>();
+        let bias = self.bias.as_ref().map(|b| b.to_flatten().to_btensor::<1>());
 
         // NOTE: Can not use the [burn::tensor::module::linear] because it
         // is defined only for floats
         let input = input.unsqueeze_dim(1);
         let matmul = matrix.matmul(input);
         let matmul = matmul.squeeze(1);
-        let res = matmul.add(bias);
+        let res = match bias {
+            Some(b) => matmul.add(b),
+            None => matmul,
+        };
 
         let data = res.to_data().into_vec().expect("Failed to compute Dense");
         let shape = Shape::new(vec![data.len()]);
@@ -208,8 +221,8 @@ impl Evaluate<f32> for Dense<f32> {
 
         let matrix = self.matrix.clone().to_btensor::<2>();
         let input = input.to_flatten().to_btensor::<1>();
-        let bias = self.bias.to_flatten().to_btensor::<1>();
-        let res = linear(input, matrix.transpose(), Some(bias));
+        let bias = self.bias.as_ref().map(|b| b.to_flatten().to_btensor::<1>());
+        let res = linear(input, matrix.transpose(), bias);
 
         let data = res.to_data().into_vec().expect("Failed to compute Dense");
         let shape = Shape::new(vec![data.len()]);
@@ -237,15 +250,21 @@ impl ProveInfo for Dense<Element> {
             node_id: id,
             unpadded_matrix_shape: self.unpadded_matrix_shape.clone(),
             padded_matrix_shape: self.matrix.shape().clone(),
+            is_bias_present: self.bias.is_some(),
         });
 
         let weights_evals = self.matrix.pad_next_power_of_two().into_data();
-        let bias_evals = self.bias.pad_next_power_of_two().into_data();
+        let bias_evals = self
+            .bias
+            .as_ref()
+            .map(|b| b.pad_next_power_of_two().into_data());
 
         aux.model_polys = {
             let mut model_polys = HashMap::new();
             model_polys.insert(WEIGHT_POLY_ID.to_string(), weights_evals);
-            model_polys.insert(BIAS_POLY_ID.to_string(), bias_evals);
+            if let Some(evals) = bias_evals {
+                model_polys.insert(BIAS_POLY_ID.to_string(), evals);
+            }
             Some(model_polys)
         };
         Ok((dense_info, aux))
@@ -400,7 +419,7 @@ impl Dense<f32> {
     /// the bias, if provided, otherwise the same scaling factor of the weights (i.e., `s`) is used
     pub fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Dense<Element> {
         let matrix = self.matrix.to_quantized(s);
-        let bias = self.bias.to_quantized(bias_s);
+        let bias = self.bias.map(|b| b.to_quantized(bias_s));
         Dense::<Element> {
             matrix,
             bias,
@@ -408,7 +427,7 @@ impl Dense<f32> {
         }
     }
 
-    pub fn new_from_weights(weights: Tensor<f32>, bias: Tensor<f32>) -> Self {
+    pub fn new_from_weights(weights: Tensor<f32>, bias: Option<Tensor<f32>>) -> Self {
         let unpadded_matrix_shape = weights.shape().clone();
         Self {
             matrix: weights,
@@ -420,15 +439,22 @@ impl Dense<f32> {
     /// TODO: compute two different scaling factors for weights and bias
     pub fn max_abs_weight(&self) -> f32 {
         let max_weight = self.matrix.max_abs_output();
-        let max_bias = self.bias.max_abs_output();
-        let distance = (max_weight - max_bias).abs() / max_weight;
+        let max_bias = self.bias.as_ref().map(|b| b.max_abs_output());
+        let distance = max_bias
+            .map(|b| (max_weight - b).abs() / max_weight)
+            .unwrap_or(0.0);
         if distance > 0.1 {
             warn!(
                 "max_abs_weight DENSE: distance between max_weight and max_bias is too large: {:.2}%",
                 distance * 100.0
             );
         }
-        self.matrix.max_abs_output().max(self.bias.max_abs_output())
+        self.matrix.max_abs_output().max(
+            self.bias
+                .as_ref()
+                .map(|b| b.max_abs_output())
+                .unwrap_or(f32::MIN),
+        )
     }
 }
 
@@ -491,16 +517,17 @@ impl Dense<Element> {
         );
         // Evaluates the bias at the random point so verifier can subtract the evaluation
         // from the sumcheck claim that is only about the matrix2vec product.
-        assert_eq!(
-            self.bias.get_data().len().ilog2() as usize,
-            last_claim.point.len(),
-            "something's wrong with the randomness"
-        );
-        let bias_eval = self
-            .bias
-            .to_field::<E>()
-            .into_mle()
-            .evaluate(&last_claim.point);
+        // If there is no bias, then then there is no bias claim as well !
+        let bias_eval = if let Some(bias) = &self.bias {
+            assert_eq!(
+                bias.get_data().len().ilog2() as usize,
+                last_claim.point.len(),
+                "something's wrong with the randomness"
+            );
+            Some(bias.to_field::<E>().into_mle().evaluate(&last_claim.point))
+        } else {
+            None
+        };
         // construct the MLE combining the input and the matrix
         let mut mat_mle: MultilinearExtension<'_, E> = matrix.to_2d_mle();
         // fix the variables from the random input
@@ -530,14 +557,18 @@ impl Dense<Element> {
         let eval = state.get_mle_flatten_final_evaluations()[0];
         // add the bias claim over the last claim input, since that is what is needed to "remove" the bias
         // to only verify the matrix2vec product via the sumcheck proof.
-        let bias_claim = Claim::new(last_claim.point.clone(), bias_eval);
+        let bias_claim = bias_eval
+            .as_ref()
+            .map(|b| Claim::new(last_claim.point.clone(), *b));
         let weights_claim = Claim::new(point, eval);
 
         // Add common commitment claims to be proven
         let common_claims = {
             let mut claims = HashMap::new();
             claims.insert(WEIGHT_POLY_ID.to_string(), weights_claim);
-            claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+            if let Some(bias_claim) = bias_claim {
+                claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+            }
             claims
         };
         prover.add_common_claims(id, common_claims);
@@ -578,8 +609,17 @@ impl DenseCtx {
         last_claim: &Claim<E>,
         proof: &DenseProof<E>,
     ) -> anyhow::Result<Claim<E>> {
+        ensure!(
+            self.is_bias_present == proof.bias_eval.is_some(),
+            "bias eval is missing while expected"
+        );
         // Subtract the bias evaluation from the previous claim to remove the bias
-        let eval_no_bias = last_claim.eval - proof.bias_eval;
+        // if there is none that just means the last claim is the output of the dense matrix already
+        let eval_no_bias = if let Some(ref be) = proof.bias_eval {
+            last_claim.eval - *be
+        } else {
+            last_claim.eval
+        };
         // TODO: currently that API can panic - should remove panic for error
         let matrix_num_vars = self.padded_matrix_shape.num_vars()[1];
         let matrix_poly_aux = from_mle_list_dimensions(&[vec![matrix_num_vars, matrix_num_vars]]);
@@ -607,14 +647,16 @@ impl DenseCtx {
         // step.
         let pcs_eval_output = proof.individual_claims[0];
 
-        let bias_claim = Claim::new(last_claim.point.clone(), proof.bias_eval);
         let weights_claim = Claim::new(pcs_eval_input, pcs_eval_output);
 
         // add the common commitment claims to be verified
         let common_claims = {
             let mut claims = HashMap::new();
             claims.insert(WEIGHT_POLY_ID.to_string(), weights_claim);
-            claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+            if let Some(ref be) = proof.bias_eval {
+                let bias_claim = Claim::new(last_claim.point.clone(), *be);
+                claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+            }
             claims
         };
         verifier.add_common_claims(self.node_id, common_claims);
@@ -705,7 +747,7 @@ mod test {
         assert_eq!(padded_dims[1], 4); // Next power of 2 after 3
 
         // Check bias is padded
-        let bias_dims = padded.bias.shape();
+        let bias_dims = padded.bias.as_ref().unwrap().shape();
         assert_eq!(bias_dims[0], 4); // Next power of 2 after 3
 
         // Check original values are preserved
@@ -721,10 +763,10 @@ mod test {
         assert_eq!(padded.matrix.get_data()[15], 0);
 
         // Check bias values
-        assert_eq!(padded.bias.get_data()[0], 10);
-        assert_eq!(padded.bias.get_data()[1], 11);
-        assert_eq!(padded.bias.get_data()[2], 12);
-        assert_eq!(padded.bias.get_data()[3], 0); // Padding
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[0], 10);
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[1], 11);
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[2], 12);
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[3], 0); // Padding
     }
 
     #[test]
@@ -751,7 +793,7 @@ mod test {
         assert_eq!(padded_dims[1], 4);
 
         // Check bias dimensions remain the same
-        let bias_dims = padded.bias.shape();
+        let bias_dims = padded.bias.as_ref().unwrap().shape();
         assert_eq!(bias_dims[0], 4);
 
         // Check values are preserved
@@ -760,7 +802,10 @@ mod test {
         }
 
         for i in 0..4 {
-            assert_eq!(padded.bias.get_data()[i], dense.bias.get_data()[i]);
+            assert_eq!(
+                padded.bias.as_ref().unwrap().get_data()[i],
+                dense.bias.as_ref().unwrap().get_data()[i]
+            );
         }
     }
 
@@ -787,7 +832,7 @@ mod test {
         assert_eq!(padded_dims[1], 4); // Already a power of 2
 
         // Check bias is padded
-        let bias_dims = padded.bias.shape();
+        let bias_dims = padded.bias.as_ref().unwrap().shape();
         assert_eq!(bias_dims[0], 4); // Next power of 2 after 3
 
         // Check original values are preserved and padding is zeros
@@ -797,10 +842,10 @@ mod test {
         assert_eq!(padded.matrix.get_data()[12], 0); // Padding
 
         // Check bias values
-        assert_eq!(padded.bias.get_data()[0], 20);
-        assert_eq!(padded.bias.get_data()[1], 21);
-        assert_eq!(padded.bias.get_data()[2], 22);
-        assert_eq!(padded.bias.get_data()[3], 0); // Padding
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[0], 20);
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[1], 21);
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[2], 22);
+        assert_eq!(padded.bias.as_ref().unwrap().get_data()[3], 0); // Padding
     }
 
     #[test]

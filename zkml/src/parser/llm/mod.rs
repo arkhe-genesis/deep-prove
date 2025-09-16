@@ -1,28 +1,44 @@
+pub mod config;
 pub mod tokenizer;
-use crate::parser::gguf::FileTensorLoader;
-use anyhow::{Context, bail};
+pub mod transformer;
+pub use crate::parser::{
+    gguf::{self},
+    json,
+    llm::transformer::{Attention, FeedForward},
+};
+use anyhow::bail;
+pub use config::{AttentionType, LLMConfig, LLMVariant};
 use serde::{Deserialize, Serialize};
 pub use tokenizer::{HFTokenizer, LLMTokenizer};
 
 use crate::{
-    Shape, Tensor,
+    Shape,
     layers::{
         Layer,
-        activation::{Activation, GELU},
-        add,
         matrix_mul::MatMul,
-        provable::{Edge, Node, NodeId},
+        provable::NodeId,
         transformer::{
-            embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, mha::Mha,
-            positional::Positional, qkv::QKV,
+            embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, positional::Positional,
         },
     },
     model::Model,
     padding::PaddingMode,
+    parser::llm::transformer::Norm,
     tensor::Number,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::From, derive_more::Into)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    derive_more::From,
+    derive_more::Into,
+    Serialize,
+    Deserialize,
+)]
 pub struct Token(pub(crate) usize);
 
 // i64 is the type used by token_to_i
@@ -62,103 +78,24 @@ impl Token {
     }
 }
 
-/// Intermediary struct to hold the config of the model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LLMConfig {
-    /// The size of an embedding vector (each token gets translated to an embedding vector of this size)
-    pub embedding_size: usize,
-    /// Size of the attention layer matrices.
-    pub hidden_size: usize,
-    /// The number of "heads" that are used within each attention layer.
-    pub num_heads: usize,
-    /// The number of blocks / attention layers there is in the model
-    pub num_block: usize,
-    /// The maximum size that the tensor containing input + generated token can have. Beyond that, we should not
-    /// run the tensor through the model anymore.
-    pub context_length: usize,
-    /// LayerNorm needs an epsilon value to determine the precision. This is it.
-    pub norm_epsilon: f32,
-    /// The size of the vocabulary of the model, e.g. each token is an integer in [0, vocab_size)
-    pub vocab_size: usize,
-    /// The specific config for the variant.
-    pub specific_config: LLMVariant,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LLMVariant {
-    GPT2,
-    Gemma3,
-}
-
-pub const GPT2_VARIANTS: &[&str] = &["gpt2", "Tmkrzx_X", "distilgpt2", "toy_gpt2"];
-pub const GEMMA3_VARIANTS: &[&str] = &["gemma-3"];
-
-impl LLMVariant {
-    pub fn from_loader(loader: &FileTensorLoader) -> anyhow::Result<Self> {
-        let variant_name = loader
-            .metadata::<String>("general.name")
-            .or(loader.metadata::<String>("general.architecture"))
-            .or(loader.metadata::<String>("general.basename"))
-            .or(loader.metadata::<String>("general.base_model.0.name"))
-            .map(|v| v.to_string())
-            .context("no variant found")?;
-        match variant_name.as_str().to_lowercase() {
-            a if GEMMA3_VARIANTS.iter().any(|v| a.contains(v)) => Ok(Self::Gemma3),
-            _ if GPT2_VARIANTS.contains(&variant_name.as_str()) => Ok(Self::GPT2),
-            _ => bail!("unsupported architecture variant: {:?}", variant_name),
-        }
-    }
-
-    /// Signals the end of the sequence token, e.g. when should the generation stop.
-    pub fn eos_token(&self) -> Token {
-        match self {
-            Self::GPT2 => 50256usize.into(),
-            Self::Gemma3 => todo!(),
-        }
-    }
-    pub fn vocab_size(&self) -> usize {
-        match self {
-            Self::GPT2 => 50257,
-            Self::Gemma3 => todo!(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
-pub enum LLMModel {
-    GPT2(GPT2Model),
+pub struct LLMModel {
+    pub embeddings: Embeddings<f32>,
+    pub positional: Option<Positional<f32>>,
+    pub blocks: Vec<Attention<f32>>,
+    /// Final LayerNorm applied after all transformer blocks (ln_f in GPT-2)
+    pub final_norm: Norm<f32>,
+    /// final projection on token sizes to before selecting next token
+    pub final_proj: Option<MatMul<f32>>,
 }
 
 impl LLMModel {
-    pub fn into_runnable_model(
-        self,
-        c: &LLMConfig,
-        user_input_shape: Shape,
-    ) -> anyhow::Result<Model<f32>> {
-        match self {
-            Self::GPT2(model) => model.into_provable_model(c, user_input_shape),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GPT2Model {
-    pub embeddings: Embeddings<f32>,
-    pub positional: Positional<f32>,
-    pub blocks: Vec<Attention<f32>>,
-    /// Final LayerNorm applied after all transformer blocks (ln_f in GPT-2)
-    pub final_norm: LayerNorm<f32>,
-    /// final projection on token sizes to before selecting next token
-    pub final_proj: MatMul<f32>,
-}
-
-impl GPT2Model {
     pub fn new(
         embeddings: Embeddings<f32>,
-        positional: Positional<f32>,
+        positional: Option<Positional<f32>>,
         blocks: Vec<Attention<f32>>,
-        final_norm: LayerNorm<f32>,
-        final_proj: MatMul<f32>,
+        final_norm: Norm<f32>,
+        final_proj: Option<MatMul<f32>>,
     ) -> Self {
         Self {
             embeddings,
@@ -167,6 +104,61 @@ impl GPT2Model {
             final_norm,
             final_proj,
         }
+    }
+
+    pub fn from_loader(
+        loader: &gguf::FileTensorLoader,
+        config: &LLMConfig,
+    ) -> anyhow::Result<Self> {
+        let embeddings = Embeddings::from_loader(loader)?;
+        let positional = match config.variant {
+            LLMVariant::GPT2 => Some(Positional::from_loader(loader, config)?),
+            LLMVariant::Gemma3 => None,
+        };
+
+        let num_layers = config.num_block;
+        let blocks = (0..num_layers)
+            .map(|i| Attention::from_loader(&loader.pp(&format!("blk.{i}.")), config))
+            .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
+        let final_norm = config
+            .variant
+            .norm_type()
+            .from_loader(&loader.pp("output_"), config)?;
+        let final_proj = match config.variant {
+            LLMVariant::GPT2 => {
+                //  there might or not be a bias
+                let proj_weights = loader.get_tensor("output.weight")?.transpose();
+                let proj_bias = loader.get_tensor("output.bias").ok();
+                Some(MatMul::new_constant(proj_weights, proj_bias)?)
+            }
+            LLMVariant::Gemma3 => None,
+        };
+        Ok(Self::new(
+            embeddings, positional, blocks, final_norm, final_proj,
+        ))
+    }
+
+    pub fn from_json(l: &json::FileTensorLoader, config: &LLMConfig) -> anyhow::Result<Self> {
+        if let LLMVariant::Gemma3 = config.variant {
+            bail!("Gemma3 is not supported yet for custom JSON format");
+        }
+        let embeddings = Embeddings::from_json(l)?;
+        let positional = Positional::from_json(l, config)?;
+        let num_layers = config.num_block;
+        let blocks = (0..num_layers)
+            .map(|i| Attention::from_json(&l.pp(&format!("blk.{i}.")), config))
+            .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
+        let final_norm = Norm::LayerNorm(LayerNorm::from_json(&l.pp("output_"), config)?);
+        let proj_weights = l.get_tensor("output.weight")?.transpose();
+        let proj_bias = l.get_tensor("output.bias").ok();
+        let final_proj = MatMul::new_constant(proj_weights, proj_bias)?;
+        Ok(Self::new(
+            embeddings,
+            Some(positional),
+            blocks,
+            final_norm,
+            Some(final_proj),
+        ))
     }
     /// Creates a Model<f32> from the GPT2Model. Currently it does NOT support the embeddings and positional nor
     /// multiple passes.
@@ -181,112 +173,47 @@ impl GPT2Model {
 
         let mut last_node_id =
             Some(model.add_consecutive_layer(Layer::Embeddings(self.embeddings), None)?);
-        last_node_id =
-            Some(model.add_consecutive_layer(Layer::Positional(self.positional), last_node_id)?);
+        if let Some(positional) = self.positional {
+            last_node_id =
+                Some(model.add_consecutive_layer(Layer::Positional(positional), last_node_id)?);
+        }
         for block in self.blocks {
             last_node_id = Some(block.write_to_model(&mut model, last_node_id, c)?);
         }
-        last_node_id =
-            Some(model.add_consecutive_layer(Layer::LayerNorm(self.final_norm), last_node_id)?);
-        last_node_id =
-            Some(model.add_consecutive_layer(Layer::MatMul(self.final_proj), last_node_id)?);
+        last_node_id = Some(model.add_consecutive_layer(self.final_norm.to_layer(), last_node_id)?);
+        if let Some(final_proj) = self.final_proj {
+            last_node_id =
+                Some(model.add_consecutive_layer(Layer::MatMul(final_proj), last_node_id)?);
+        }
         model.add_consecutive_layer(Layer::Logits(Logits::Argmax), last_node_id)?;
         model.route_output(None)?;
         Ok(model)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Attention<N: Number> {
-    pub q: Tensor<N>,
-    pub q_bias: Tensor<N>,
-    pub k: Tensor<N>,
-    pub k_bias: Tensor<N>,
-    pub v: Tensor<N>,
-    pub v_bias: Tensor<N>,
-    pub out: Tensor<N>,
-    pub out_bias: Tensor<N>,
-    pub norm: LayerNorm<N>,
-    pub feedforward: FeedForward<N>,
-}
-#[derive(Debug, Clone)]
-pub struct FeedForward<N: Number> {
-    pub norm: LayerNorm<N>,
-    pub up: Tensor<N>,
-    pub up_bias: Tensor<N>,
-    pub down: Tensor<N>,
-    pub down_bias: Tensor<N>,
-}
-impl FeedForward<f32> {
-    pub fn write_to_model(
-        self,
-        model: &mut Model<f32>,
-        input_node_id: NodeId,
-    ) -> anyhow::Result<NodeId> {
-        let layernorm = self.norm;
-        // let up = MatMul::new_constant(self.up, self.up_bias);
-        // TODO bias
-        let up = MatMul::new_constant(self.up, Some(self.up_bias))?;
-        let activation = GELU::new();
-        // let down = MatMul::new_constant(self.down, self.down_bias);
-        let down = MatMul::new_constant(self.down, Some(self.down_bias))?;
-        let add = add::Add::new();
-        let last_node_id =
-            model.add_consecutive_layer(Layer::LayerNorm(layernorm), Some(input_node_id))?;
-        let last_node_id = model.add_consecutive_layer(Layer::MatMul(up), Some(last_node_id))?;
-        let last_node_id = model.add_consecutive_layer(
-            Layer::Activation(Activation::Gelu(activation)),
-            Some(last_node_id),
-        )?;
-        let last_node_id = model.add_consecutive_layer(Layer::MatMul(down), Some(last_node_id))?;
-        model.add_node(Node::new(
-            vec![Edge::new(input_node_id, 0), Edge::new(last_node_id, 0)],
-            Layer::Add(add),
-        ))
+#[cfg(test)]
+mod tests {
+    use crate::parser::{
+        file_cache,
+        gguf::tests::{GEMMA3_Q8, GPT2_Q8_0},
+    };
+
+    use super::*;
+
+    fn test_load_model_from_gguf(path: &str) {
+        let path = file_cache::from_cache(path).unwrap();
+        let loader = gguf::FileTensorLoader::from_path(path).unwrap();
+        let config = LLMConfig::from_content(&loader).unwrap();
+        LLMModel::from_loader(&loader, &config).unwrap();
     }
-}
 
-impl Attention<f32> {
-    pub fn write_to_model(
-        self,
-        model: &mut Model<f32>,
-        input_node_id: Option<NodeId>,
-        c: &LLMConfig,
-    ) -> anyhow::Result<NodeId> {
-        let qkv = QKV::new(
-            self.q,
-            self.q_bias,
-            self.k,
-            self.k_bias,
-            self.v,
-            self.v_bias,
-            c.num_heads,
-        )?;
-        let mha = Mha::new(c.context_length, c.num_heads, c.head_dim())?;
-        let out = MatMul::new_constant(self.out, Some(self.out_bias))?;
-        // input is [seq_len, emb_size]
-        let last_node_id =
-            model.add_consecutive_layer(Layer::LayerNorm(self.norm), input_node_id)?;
-        // shape goes to [seq_len, hidden_size] for each, Q K and V
-        let last_node_id = model.add_consecutive_layer(Layer::QKV(qkv), Some(last_node_id))?;
-        // then this output two tensors:
-        // * first one is [num_heads, seq_len] (Q @ K^T - all heads concatenated)
-        // * second one is [num_heads, seq_len, head_dim] (V)
-        let mha_id = model.add_consecutive_layer(Layer::Mha(mha), Some(last_node_id))?;
+    #[test]
+    fn test_load_model_from_gguf_gpt2() {
+        test_load_model_from_gguf(GPT2_Q8_0);
+    }
 
-        let last_node_id = model.add_consecutive_layer(Layer::MatMul(out), Some(mha_id))?;
-        let last_node_id = model.add_node(Node::new(
-            vec![
-                Edge {
-                    // here we dont know if the input is the input to the model or an input coming from previous layers
-                    // so if there is no layer before this attention, we take the input of the model
-                    node: input_node_id,
-                    index: 0,
-                },
-                Edge::new(last_node_id, 0),
-            ],
-            Layer::Add(add::Add::new()),
-        ))?;
-        self.feedforward.write_to_model(model, last_node_id)
+    #[test]
+    fn test_load_model_from_gguf_gemma3() {
+        test_load_model_from_gguf(GEMMA3_Q8);
     }
 }

@@ -209,7 +209,7 @@ fn test_conv_padding_garbage() {
         &dense_shape_padded.into(),
     );
     let padded_nrows = padded_dense.nrows();
-    padded_dense.bias = padded_dense.bias.pad_1d(padded_nrows);
+    padded_dense.bias = padded_dense.bias.map(|b| b.pad_1d(padded_nrows));
     let no_garbage_fft_output =
         evaluate_layer::<GoldilocksExt2, _, _>(&padded_dense, &[&flat_fft_output], None)
             .unwrap()

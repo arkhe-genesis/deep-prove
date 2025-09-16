@@ -1,3 +1,4 @@
+use crate::parser::{gguf, json};
 use std::iter::once;
 
 use crate::{
@@ -621,6 +622,17 @@ where
     ) -> anyhow::Result<()> {
         // No commitment so just return Ok(())
         Ok(())
+    }
+}
+
+impl Embeddings<f32> {
+    pub fn from_json(l: &json::FileTensorLoader) -> anyhow::Result<Self> {
+        let emb_tensor = l.get_tensor("token_embd.weight")?;
+        Embeddings::new(emb_tensor)
+    }
+    pub fn from_loader(loader: &gguf::FileTensorLoader) -> anyhow::Result<Self> {
+        let emb_tensor = loader.get_tensor("token_embd.weight")?;
+        Embeddings::new(emb_tensor)
     }
 }
 

@@ -1,10 +1,15 @@
+use crate::parser::{
+    gguf::FileTensorLoader,
+    json,
+    llm::{LLMConfig, LLMVariant},
+};
 use std::{
     collections::{BTreeMap, HashMap},
     iter::once,
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
@@ -652,6 +657,48 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
     ) -> anyhow::Result<()> {
         // No commitment so just return Ok(())
         Ok(())
+    }
+}
+
+impl Positional<f32> {
+    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
+        match c.variant {
+            LLMVariant::Gemma3 => bail!("Gemma3 is not supported yet"),
+            LLMVariant::GPT2 => {
+                let position_embd = loader.get_tensor("position_embd.weight")?;
+                let shape = position_embd.shape();
+                ensure!(
+                    shape[0] == c.context_length,
+                    "position_embd must have shape [{}] vs given {:?}",
+                    c.context_length,
+                    position_embd.shape()
+                );
+                ensure!(
+                    shape[1] == c.embedding_size,
+                    "position_embd must have shape [{}] vs given {:?}",
+                    c.embedding_size,
+                    position_embd.shape()
+                );
+                Ok(Self::new_learned(position_embd))
+            }
+        }
+    }
+    pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
+        let position_embd = l.get_tensor("position_embd.weight")?;
+        ensure!(position_embd.rank() == 2, "position_embd must be 2d");
+        ensure!(
+            position_embd.shape()[0] == c.context_length,
+            "position_embd must have shape [0] [{}] vs given {:?}",
+            c.context_length,
+            position_embd.shape()
+        );
+        ensure!(
+            position_embd.shape()[1] == c.embedding_size,
+            "position_embd must have shape [1] [{}] vs given {:?}",
+            c.embedding_size,
+            position_embd.shape()
+        );
+        Ok(Self::new_learned(position_embd))
     }
 }
 

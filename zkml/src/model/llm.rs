@@ -127,7 +127,7 @@ impl Driver<f32> {
         // even though the llm runtime doesn't care about the model input shape, which is designed for "static" input shapes, we still
         // need to provide one.
         let init_user_shape = Shape::from(vec![1]);
-        let model = llm_model.into_runnable_model(&config, init_user_shape)?;
+        let model = llm_model.into_provable_model(&config, init_user_shape)?;
         Ok(Self {
             model,
             config,
@@ -243,7 +243,7 @@ where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
     {
-        let eos_token: N = self.config.specific_config.eos_token().as_number();
+        let eos_token: N = self.config.eos_token.as_number();
         let user_len = input.len();
         // -1 because we at least want to generate ONE token
         ensure!(
@@ -490,13 +490,13 @@ where
             "output length is greater than the padded maximum context length"
         );
         // get the actual output length: could be either `max_window`, or when an eos token is found
-        let eos_token = self.config.specific_config.eos_token().0;
+        let eos_token = self.config.eos_token;
         let eos_token_found = output
             .get_data()
             .iter()
             .take(max_window) // consider only the first max_window tokens
             .skip(user_input.len() - 1) // the first user_input.len() - 1 are not meaningful
-            .find_position(|token| token.to_element() as usize == eos_token);
+            .find_position(|token| token.to_element() as usize == usize::from(eos_token));
         let unpadded_output_len = if let Some(pos) = &eos_token_found {
             pos.0
         } else {
