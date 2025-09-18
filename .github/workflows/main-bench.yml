@@ -44,8 +44,8 @@ jobs:
           --threshold-measure latency \
           --threshold-test percentage \
           --threshold-upper-boundary 0.20 \
-          --thresholds-reset \
           --thresholds-max-sample-size 15 \
+          --thresholds-reset \
           --testbed ci-runner \
           --err \
           --adapter rust_criterion \
