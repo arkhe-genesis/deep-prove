@@ -840,7 +840,6 @@ mod requant_layer {
     #[divan::bench(args = default_sizes())]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-
         let input = Tensor::<Element>::random(&Shape::new(vec![size]));
         let input_shape = slice::from_ref(input.shape());
 
@@ -850,6 +849,60 @@ mod requant_layer {
             layer
                 .evaluate::<GoldilocksExt2>(&[&input], input_shape)
                 .expect("Requant should succeed")
+        });
+    }
+}
+
+#[divan::bench_group]
+mod pooling_layer {
+    use core::slice;
+
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        Element, Shape, Tensor,
+        layers::{
+            pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
+            provable::Evaluate,
+        },
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+
+        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Pooling::Maxpool2D(Maxpool2D {
+            kernel_size: MAXPOOL2D_KERNEL_SIZE,
+            stride: MAXPOOL2D_KERNEL_SIZE,
+        });
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Softmax should succeed")
+        });
+    }
+
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+
+        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
+
+        let layer = Pooling::Maxpool2D(Maxpool2D {
+            kernel_size: MAXPOOL2D_KERNEL_SIZE,
+            stride: MAXPOOL2D_KERNEL_SIZE,
+        });
+
+        bencher.bench(|| {
+            layer
+                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .expect("Softmax should succeed")
         });
     }
 }

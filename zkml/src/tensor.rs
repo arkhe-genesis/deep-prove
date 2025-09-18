@@ -1176,6 +1176,15 @@ impl<T: Number> Tensor<T> {
         self.data = new_data;
     }
     pub fn maxpool2d(&self, kernel_size: usize, stride: usize) -> Tensor<T> {
+        assert!(
+            kernel_size == MAXPOOL2D_KERNEL_SIZE,
+            "Maxpool2D works only for kernel size {MAXPOOL2D_KERNEL_SIZE}"
+        );
+        assert!(
+            stride == MAXPOOL2D_KERNEL_SIZE,
+            "Maxpool2D works only for stride size {MAXPOOL2D_KERNEL_SIZE}"
+        );
+
         let dims = self.rank();
         assert!(dims >= 2, "Input tensor must have at least 2 dimensions.");
 

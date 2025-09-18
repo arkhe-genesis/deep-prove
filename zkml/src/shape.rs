@@ -138,6 +138,78 @@ impl Shape {
         self.0[index] = value;
     }
 
+    /// Removes `dims` dimensions from the front of [Shape].
+    ///
+    /// # Panics
+    ///
+    /// If any of the dimensions value is not `1` or if `dims` is bigger than `Shape`.
+    ///
+    /// ```
+    /// # use zkml::Shape;
+    /// let shape = Shape::new(vec![1, 1, 3, 5]);
+    /// let new_shape = shape.squeeze_front(2);
+    /// assert_eq!(new_shape.dim(0), 3);
+    /// assert_eq!(new_shape.dim(1), 5);
+    /// ```
+    pub fn squeeze_front(&self, dims: usize) -> Self {
+        assert!(
+            self.0.iter().take(dims).all(|v| *v == 1),
+            "Squeezing only allowed for dimensions of size 1. shape {self:?}",
+        );
+
+        let new_size = self.0.len() - dims;
+        let mut new_shape = Vec::with_capacity(new_size);
+        new_shape.extend(&self.0[dims..]);
+
+        debug_assert_eq!(new_shape.iter().product::<usize>(), self.product());
+        Self(new_shape)
+    }
+
+    /// Removes a dimension with size `1` from [Shape].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is larger than this shape size or if the dimension size
+    /// is not `1`.
+    ///
+    /// ```
+    /// # use zkml::Shape;
+    /// let shape = Shape::new(vec![3, 1, 5]);
+    /// let new_shape = shape.squeeze(1);
+    /// assert_eq!(new_shape.dim(0), 3);
+    /// assert_eq!(new_shape.dim(1), 5);
+    /// ```
+    pub fn squeeze(&self, index: usize) -> Self {
+        let mut new_shape = self.0.clone();
+        assert_eq!(
+            new_shape.remove(index),
+            1,
+            "Squeezed dimension must be 1. shape {self:?}",
+        );
+        Self(new_shape)
+    }
+
+    /// Adds `dims` extra dimensions with size `1` to the front of [Shape].
+    ///
+    /// ```
+    /// # use zkml::Shape;
+    /// let shape = Shape::new(vec![3, 5]);
+    /// let new_shape = shape.unsqueeze_front(2);
+    /// assert_eq!(new_shape.dim(0), 1);
+    /// assert_eq!(new_shape.dim(1), 1);
+    /// assert_eq!(new_shape.dim(2), 3);
+    /// assert_eq!(new_shape.dim(3), 5);
+    /// ```
+    pub fn unsqueeze_front(&self, dims: usize) -> Self {
+        let new_size = self.0.len() + dims;
+        let mut new_shape = Vec::with_capacity(new_size);
+        new_shape.resize(new_size, 1);
+        new_shape[dims..].copy_from_slice(self.0.as_slice());
+
+        debug_assert_eq!(new_shape.iter().product::<usize>(), self.product());
+        Self(new_shape)
+    }
+
     /// Adds an extra dimension with size `1` to [Shape].
     ///
     /// # Panics
@@ -382,5 +454,32 @@ mod test {
         let shape3 = Shape::new(vec![3, 3, 4]);
         let new = shape1.concat(&shape3);
         assert_eq!(new, vec![5, 3, 4].into());
+    }
+
+    #[test]
+    fn test_squeeze() {
+        let shape = Shape::new(vec![7]);
+        for i in [1, 2, 3, 4] {
+            let roundtrip = shape.unsqueeze_front(i).squeeze_front(i);
+            assert_eq!(roundtrip, shape);
+        }
+
+        let shape = Shape::new(vec![5, 7]);
+        for i in [1, 2, 3, 4] {
+            let roundtrip = shape.unsqueeze_front(i).squeeze_front(i);
+            assert_eq!(roundtrip, shape);
+        }
+
+        let shape = Shape::new(vec![3, 5, 7]);
+        for i in [1, 2, 3, 4] {
+            let roundtrip = shape.unsqueeze_front(i).squeeze_front(i);
+            assert_eq!(roundtrip, shape);
+        }
+
+        let shape = Shape::new(vec![2, 3, 5, 7]);
+        for i in [1, 2, 3, 4] {
+            let roundtrip = shape.unsqueeze_front(i).squeeze_front(i);
+            assert_eq!(roundtrip, shape);
+        }
     }
 }

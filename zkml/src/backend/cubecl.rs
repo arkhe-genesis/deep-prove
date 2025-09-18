@@ -21,7 +21,7 @@ use cubecl::{
 
 use crate::{Shape, backend::kernels};
 
-use super::ZKMLBackend;
+use super::{Maxpool2dConfig, ZKMLBackend};
 
 /// Returns a [CubeCount] that will perform at least `total` kernel invocations.
 ///
@@ -124,6 +124,17 @@ fn conv2d_i_out_shape(
     BShape::new([batch_size, feature_maps, height_out, width_out])
 }
 
+/// Computes the shape of the output tensor after performing the max_pool2d
+fn max_pool2d_i_out_shape(input_dims: [usize; 4], config: &super::Maxpool2dConfig) -> BShape {
+    // (N x C x H x W)
+    let [batch_size, channels, height_in, width_in] = input_dims;
+
+    // see [tensor::Tensor::maxpool2d] for details of the formula below
+    let height_out = (height_in - config.kernel_size) / config.stride + 1;
+    let width_out = (width_in - config.kernel_size) / config.stride + 1;
+    BShape::new([batch_size, channels, height_out, width_out])
+}
+
 impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBackend
     for CubeBackend<R, F, I, BT>
 {
@@ -138,11 +149,12 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
         assert!(bias.shape.num_dims() == 1);
 
         let shape_out = conv2d_i_out_shape(input.shape.dims(), kernels.shape.dims(), &config);
-        let output_strides = Shape::from(&shape_out).strides();
 
         let buffer = input
             .client
             .empty(shape_out.num_elements() * core::mem::size_of::<I>());
+
+        let output_strides = Shape::from(&shape_out).strides();
         let output = CubeTensor::new_contiguous(
             input.client.clone(),
             input.device.clone(),
@@ -198,6 +210,66 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
             bias.as_tensor_arg::<I>(1),
             output.as_tensor_arg::<I>(1),
             output_shape,
+            config.stride as u32,
+        );
+
+        output
+    }
+
+    fn zkml_max_pool2d_i(input: IntTensor<Self>, config: Maxpool2dConfig) -> IntTensor<Self> {
+        assert!(input.shape.num_dims() == 4);
+        let shape_out = max_pool2d_i_out_shape(input.shape.dims(), &config);
+
+        let buffer = input
+            .client
+            .empty(shape_out.num_elements() * core::mem::size_of::<I>());
+
+        let output_strides = Shape::from(&shape_out).strides();
+        let output = CubeTensor::new_contiguous(
+            input.client.clone(),
+            input.device.clone(),
+            shape_out,
+            buffer,
+            I::dtype(),
+        );
+
+        // Because of the rounding done by div_ceil, it is possible for the kernel to be
+        // called a few extra times. This is okay because the kernel handles out-of-bounds
+        // calls.
+        let cube_dim = CubeDim::default();
+        let cube_count = fit_to_cube(
+            (output.shape.num_elements() as u32).div_ceil(cube_dim.num_elems()),
+            R::max_cube_count(),
+        );
+
+        let input_strides = Shape::from(&input.shape).strides();
+        let input_strides = SequenceArg {
+            values: vec![
+                ScalarArg::new(input_strides[3] as u32),
+                ScalarArg::new(input_strides[2] as u32),
+                ScalarArg::new(input_strides[1] as u32),
+                ScalarArg::new(input_strides[0] as u32),
+            ],
+        };
+
+        let output_shape = SequenceArg {
+            values: vec![
+                FastDivmodArgs::new(&input.client, output_strides[3] as u32),
+                FastDivmodArgs::new(&input.client, output_strides[2] as u32),
+                FastDivmodArgs::new(&input.client, output_strides[1] as u32),
+                FastDivmodArgs::new(&input.client, output_strides[0] as u32),
+            ],
+        };
+
+        kernels::zkml_max_pool2d_i::zkml_max_pool2d_i_kernel::launch::<I, R>(
+            &input.client,
+            cube_count,
+            cube_dim,
+            input.as_tensor_arg::<I>(1),
+            input_strides,
+            output.as_tensor_arg::<I>(1),
+            output_shape,
+            config.kernel_size as u32,
             config.stride as u32,
         );
 

@@ -20,9 +20,11 @@ pub fn zkml_conv2d_i_kernel<I: Int>(
         terminate!();
     }
 
+    // decode the output position
     let (batch, rem) = output_shape.index(3).div_mod(ABSOLUTE_POS);
     let (o, rem) = output_shape.index(2).div_mod(rem);
     let (oh, ow) = output_shape.index(1).div_mod(rem);
+
     let (oh_stride, ow_stride) = (oh * output_stride, ow * output_stride);
 
     let mut sum = bias[o];
@@ -32,11 +34,13 @@ pub fn zkml_conv2d_i_kernel<I: Int>(
                 let h = oh_stride + kh;
                 let w = ow_stride + kw;
 
+                // compute the input position
                 let mut pos = batch * input_strides.index(3);
                 pos += channel * input_strides.index(2);
                 pos += h * input_strides.index(1);
                 pos += w;
 
+                // compute the kernel position
                 let mut kpos = o * kernels_strides.index(3);
                 kpos += channel * kernels_strides.index(2);
                 kpos += kh * kernels_strides.index(1);
