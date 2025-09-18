@@ -45,6 +45,7 @@ jobs:
           --threshold-test percentage \
           --threshold-upper-boundary 0.20 \
           --thresholds-reset \
+          --thresholds-max-sample-size 15 \
           --testbed ci-runner \
           --err \
           --adapter rust_criterion \
