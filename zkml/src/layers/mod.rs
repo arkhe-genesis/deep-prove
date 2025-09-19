@@ -127,7 +127,7 @@ impl<T: Number> Layer<T> {
     pub fn reset(&self) {
         if let Layer::QKV(qkv) = self {
             qkv.reset_cache();
-        } else if let Layer::Positional(Positional::Learned(pos)) = self {
+        } else if let Layer::Positional(pos) = self {
             pos.reset_cache();
         }
     }

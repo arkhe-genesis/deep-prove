@@ -9,7 +9,7 @@ use crate::{
         transformer::{
             embeddings::Embeddings,
             layernorm::{LAYERNORM_LAYER, LayerNorm},
-            positional::{Learned, POSITIONAL_LAYER, Positional},
+            positional::{POSITIONAL_LAYER, Positional, PositionalVariant, absolute::Absolute},
             qkv::QKV,
             rmsnorm::RMSNorm,
         },
@@ -286,13 +286,15 @@ fn modify_embeddings(embeddings: &Embeddings<f32>) -> Result<Embeddings<f32>> {
 /// Modify the positional encodings in a [`Positional`] layer so that the output has rows with mean 0.
 fn modify_positional(positional_layer: &Positional<f32>) -> Result<Positional<f32>> {
     // Match on the type of positional encoding, we expect `Learned` here
-    match positional_layer {
-        Positional::Learned(learned) => {
-            let Learned::<f32> { positional, .. } = learned;
+    match &positional_layer.variant {
+        PositionalVariant::Absolute(absolute) => {
+            let Absolute::<f32> { positional, .. } = absolute;
             let new_mat = mean_subtracted_matrix(positional);
-            Ok(Positional::new_learned(new_mat))
+            Ok(Positional::new_absolute(new_mat))
         }
-        _ => Err(anyhow::anyhow!("Expected Learned positional encoding")),
+        PositionalVariant::Rope(_) => unimplemented!(
+            "Transformation not implemented for Rope, expected to be applicable only with Absolute positional encoding"
+        ),
     }
 }
 
