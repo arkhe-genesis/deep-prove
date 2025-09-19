@@ -1,13 +1,14 @@
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, Shape,
+    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
     },
     layers::{
-        LayerCtx, LayerProof,
-        provable::{QuantizeOp, QuantizeOutput},
+        Layer, LayerCtx, LayerProof,
+        provable::{ProvingData, QuantizeOp, QuantizeOutput},
+        requant::Requant,
     },
     lookup::{
         context::{COLUMN_SEPARATOR, LayerLookupContext, LookupWitnessGen, TableType},
@@ -19,7 +20,7 @@ use crate::{
     model::StepData,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
-    tensor::Number,
+    tensor::{DryTensor, Number},
 };
 use burn::tensor::activation::gelu;
 use either::Either;
@@ -59,8 +60,24 @@ const GELU_SCALE_FACTOR: usize = 1 << GELU_SCALE_EXP;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Activation<N> {
+    /// Plain activation layer where we apply the activation function to each input independently
+    Plain(ActivationLayer<N>),
+    /// Variant of Activation employed in a Gated Linear Unit (GLU); in this case, the activation layer
+    /// has 2 inputs: one is passed through the activation function; the output of the layer is
+    /// computed as the element-wise product between the result of the activation function and the
+    /// other input. More specifically, for inputs x and y, the output is activation(x) * y
+    GLU(ActivationLayer<N>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ActivationLayer<N> {
     Relu(Relu),
     Gelu(GELU<N>),
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+
+pub struct ActivationData {
+    activation_output: Tensor<Element>,
 }
 
 /// Currently holds the poly info for the output polynomial of the RELU
@@ -100,199 +117,125 @@ where
     }
 }
 
-impl<N> OpInfo for Activation<N> {
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+/// Type wrapping an activation layer employed in GeGlu (i.e., a GLU with Gelu as activation function)
+pub struct GeGlu<N>(Activation<N>);
+
+impl<N> Activation<N> {
+    pub fn new_relu() -> Self {
+        Self::Plain(ActivationLayer::Relu(Relu))
     }
 
-    fn describe(&self) -> String {
+    pub fn new_gelu() -> Self {
+        Self::Plain(ActivationLayer::Gelu(GELU::new()))
+    }
+
+    /// Instantiate a new Activation layer configured to be used in a GLU.
+    pub fn new_for_glu(activation_type: ActivationLayer<N>) -> Self {
+        Self::GLU(activation_type)
+    }
+
+    pub fn new_geglu() -> GeGlu<N> {
+        GeGlu(Self::GLU(ActivationLayer::Gelu(GELU::new())))
+    }
+
+    pub(crate) fn activation_type(&self) -> &ActivationLayer<N> {
         match self {
-            Activation::Relu(_relu) => format!("RELU: {}", 1 << Relu::num_vars()),
-            Activation::Gelu(_gelu) => "GELU".to_string(),
+            Self::Plain(layer) | Self::GLU(layer) => layer,
         }
-    }
-
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec() // same as input shapes
-    }
-
-    fn is_provable(&self) -> bool {
-        true
     }
 }
 
-impl Evaluate<f32> for Activation<f32> {
+impl<N> From<GeGlu<N>> for Layer<N> {
+    fn from(geglu: GeGlu<N>) -> Self {
+        Layer::Activation(geglu.0)
+    }
+}
+
+impl<N> GeGlu<N> {
+    // Position expected in the set of layer inputs for the input value that is passed through Gelu
+    pub const GELU_INPUT_INDEX: usize = 0;
+    // Position expected in the set of layers inputs for the input value that is multiplied to the output of Gelu
+    pub const LINEAR_INPUT_INDEX: usize = 1;
+}
+
+impl ActivationLayer<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&Tensor<f32>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<f32, E>> {
+    ) -> Result<Vec<Tensor<f32>>> {
         match self {
-            Activation::Relu(relu) => Ok(LayerOut::from_vec(
-                inputs
-                    .iter()
-                    .map(|input| relu.op(input))
-                    .collect::<Vec<_>>(),
-            )),
-            Activation::Gelu(gelu) => gelu.evaluate::<E>(inputs, _unpadded_input_shapes),
+            ActivationLayer::Relu(relu) => Ok(inputs.iter().map(|input| relu.op(input)).collect()),
+            ActivationLayer::Gelu(gelu) => inputs
+                .iter()
+                .map(|input| {
+                    let mut outputs = gelu
+                        .evaluate::<E>(&[input], _unpadded_input_shapes)?
+                        .outputs;
+                    ensure!(outputs.len() == 1);
+                    Ok(outputs.pop().unwrap())
+                })
+                .collect::<anyhow::Result<Vec<_>>>(),
         }
     }
-}
 
-impl QuantizeOp for Activation<f32> {
-    type QuantizedOp = Activation<Element>;
-
-    fn quantize_op<S: crate::ScalingStrategy>(
+    fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
         node_id: NodeId,
-        input_scaling: &[crate::ScalingFactor],
-    ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len());
+        input_scaling: &[ScalingFactor],
+        num_outputs: usize,
+    ) -> anyhow::Result<QuantizeOutput<ActivationLayer<Element>>> {
         let output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
-        ensure!(
-            output_scalings.len() == 1,
-            "Output scaling for convolution layer different from 1"
-        );
-        let q_op = match self {
-            Activation::Relu(_) => Activation::Relu(Relu),
-            Activation::Gelu(g) => Activation::Gelu(g.quantize(input_scaling[0])?),
+        let quantized_op = match self {
+            ActivationLayer::Relu(_) => ActivationLayer::Relu(Relu),
+            ActivationLayer::Gelu(g) => ActivationLayer::Gelu(g.quantize(input_scaling[0])?),
         };
-        Ok(QuantizeOutput::new(q_op, output_scalings))
+        Ok(QuantizeOutput::new(quantized_op, output_scalings))
     }
 }
 
-impl Evaluate<Element> for Activation<Element> {
-    fn evaluate<E: ExtensionField>(
+impl ActivationLayer<Element> {
+    fn evaluate(
         &self,
         inputs: &[&Tensor<Element>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<Element, E>> {
-        let outputs = match self {
-            Activation::Relu(relu) => inputs
-                .iter()
-                .map(|input| relu.op(input))
-                .collect::<Vec<_>>(),
-            Activation::Gelu(g) => inputs
+    ) -> Result<Vec<Tensor<Element>>> {
+        match self {
+            ActivationLayer::Relu(relu) => Ok(inputs.iter().map(|input| relu.op(input)).collect()),
+            ActivationLayer::Gelu(g) => inputs
                 .iter()
                 .map(|input| input.try_map(|e| g.apply(e)))
-                .collect::<Result<Vec<_>>>()?,
-        };
-        Ok(LayerOut::from_vec(outputs))
-    }
-}
-
-impl ProveInfo for Activation<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
-        match self {
-            Activation::Relu(_) => aux.tables.insert(TableType::Relu),
-            // TODO: if we want to save on memory, we can use a pointer to the vector instead
-            Activation::Gelu(gelu) => aux.tables.insert(TableType::GELU(
-                gelu.quant_data.map(|q| q.table_data).unwrap(),
-            )),
-        };
-
-        // Set the model polys to be empty
-        aux.model_polys = None;
-        aux.max_poly_len = aux
-            .last_output_shape
-            .iter()
-            .fold(aux.max_poly_len, |acc, shapes| {
-                acc.max(shapes.next_power_of_two().product())
-            });
-        let (act, lookup_context) = match self {
-            Activation::Relu(relu) => (
-                Activation::Relu(*relu),
-                LayerLookupContext::new(vec![TableType::Relu], vec![1]),
-            ),
-            Activation::Gelu(g) => (
-                Activation::Gelu(g.clone()),
-                LayerLookupContext::new(
-                    vec![TableType::GELU(g.quant_data.map(|q| q.table_data).unwrap())],
-                    vec![1],
-                ),
-            ),
-        };
-        // Build the Sumcheck Expression, we presume the polynomials will be loaded in in the order: input_column, output_column, eq_polys
-        let sumcheck_expression = Expression::WitIn(0) * Expression::WitIn(2)
-            + Expression::WitIn(1)
-                * (Expression::Challenge(0, 1, E::ONE, E::ZERO) * Expression::WitIn(2)
-                    + Expression::Challenge(0, 2, E::ONE, E::ZERO) * Expression::WitIn(3));
-        Ok((
-            LayerCtx::Activation(ActivationCtx {
-                op: act,
-                lookup_context,
-                node_id: id,
-                sumcheck_expression: vec![sumcheck_expression],
-            }),
-            aux,
-        ))
-    }
-}
-
-impl<N> PadOp for Activation<N> {}
-
-impl<E, PCS> ProvableOp<E, PCS> for Activation<Element>
-where
-    E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
-{
-    type Ctx = ActivationCtx<E>;
-
-    fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
-        &'a self,
-        id: NodeId,
-        ctx: &'b Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
-        _step_data: &StepData<E, E>,
-        prover: &mut Prover<'c, 'd, E, T, PCS>,
-        _store: &mut GenStore,
-    ) -> Result<Vec<Claim<E>>> {
-        Ok(vec![self.prove_step(prover, last_claims[0], ctx, id)?])
+                .collect::<anyhow::Result<Vec<_>>>(),
+        }
     }
 
-    fn gen_lookup_witness(
+    fn lookup_witness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
-        store: &mut GenStore,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
-        let outputs = step_data.output_tensors(store)?;
-        ensure!(
-            step_data.node_inputs.len() == 1,
-            "Found more than 1 input tensor in inference step of activation layer"
-        );
-        ensure!(
-            outputs.len() == 1,
-            "Found more than 1 output tensor in inference step of activation layer"
-        );
-
-        let input_tensors = step_data.input_tensors(store)?;
-        let inputs = input_tensors[0].get_data();
-        let outputs = outputs[0].get_data();
+        activation_input: &Tensor<Element>,
+        activation_output: &Tensor<Element>,
+    ) -> Result<LookupWitnessGen<E, PCS>>
+    where
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    {
+        let input_data = activation_input.get_data();
+        let output_data = activation_output.get_data();
         debug_assert_eq!(
-            inputs.len(),
-            outputs.len(),
+            input_data.len(),
+            output_data.len(),
             "Input and outputs must have the same length",
         );
-        let size = inputs.len();
+        let size = input_data.len();
 
         let mut element_count = HashMap::<Element, u64>::new();
         let mut col_one = Vec::<E::BaseField>::with_capacity(size);
         let mut col_two = Vec::<E::BaseField>::with_capacity(size);
-        for (a, b) in inputs.iter().zip(outputs.iter()) {
+        for (a, b) in input_data.iter().zip(output_data.iter()) {
             let (a, a_field): (Element, E) = match self {
-                Activation::Relu(_) => (*a, a.to_field()),
-                Activation::Gelu(g) => {
+                ActivationLayer::Relu(_) => (*a, a.to_field()),
+                ActivationLayer::Gelu(g) => {
                     let scaled = a * g.quant_data.as_ref().unwrap().multiplier;
                     assert!(
                         scaled >= g.quant_data.as_ref().unwrap().table_data.min
@@ -324,6 +267,300 @@ where
         gen.insert_element_count(self.table_type(), element_count);
 
         Ok(gen)
+    }
+
+    fn table_type(&self) -> TableType {
+        match self {
+            ActivationLayer::Relu(_) => TableType::Relu,
+            ActivationLayer::Gelu(g) => {
+                TableType::GELU(g.quant_data.map(|q| q.table_data).unwrap())
+            }
+        }
+    }
+}
+
+impl<N> OpInfo for Activation<N> {
+    fn num_outputs(&self, num_inputs: usize) -> usize {
+        match self {
+            Self::Plain(_) => num_inputs,
+            Self::GLU(_) => 1,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self.activation_type() {
+            ActivationLayer::Relu(_relu) => format!("RELU: {}", 1 << Relu::num_vars()),
+            ActivationLayer::Gelu(_gelu) => "GELU".to_string(),
+        }
+    }
+
+    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
+        match self {
+            Self::Plain(_) => input_shapes.to_vec(), // same as input shapes,
+            Self::GLU(_) => vec![input_shapes[0].clone()], /* in GLU, there is only one output, which has the same shape as the first input */
+        }
+    }
+
+    fn is_provable(&self) -> bool {
+        true
+    }
+}
+
+const ACTIVATION_OUT_ID: &str = "ActivationOut";
+
+impl Evaluate<f32> for Activation<f32> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&Tensor<f32>],
+        unpadded_input_shapes: &[Shape],
+    ) -> Result<LayerOut<f32, E>> {
+        match self {
+            Activation::Plain(layer) => layer
+                .evaluate::<E>(inputs, unpadded_input_shapes)
+                .map(|outputs| LayerOut::from_vec(outputs)),
+            Activation::GLU(layer) => {
+                ensure!(
+                    inputs.len() == 2,
+                    "Expected 2 inputs for activation layer used in GLU, found {} inputs instead",
+                    inputs.len(),
+                );
+                let mut activation_outputs =
+                    layer.evaluate::<E>(&[inputs[0]], unpadded_input_shapes)?;
+                // double-check that there is only one output
+                assert_eq!(activation_outputs.len(), 1);
+                let activation_out = activation_outputs.pop().unwrap();
+                Ok(LayerOut::from_vec(
+                    // multiply `activation_out` with `inputs[1]`
+                    vec![activation_out.mul(inputs[1])],
+                )
+                .with_data_to_be_tracked(HashMap::from([(
+                    ACTIVATION_OUT_ID.to_string().into(),
+                    activation_out,
+                )])))
+            }
+        }
+    }
+}
+
+impl QuantizeOp for Activation<f32> {
+    type QuantizedOp = Activation<Element>;
+
+    fn quantize_op<S: crate::ScalingStrategy>(
+        self,
+        data: &S::AuxData,
+        node_id: NodeId,
+        input_scaling: &[crate::ScalingFactor],
+    ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
+        let num_outputs = self.num_outputs(input_scaling.len());
+        match self {
+            Self::Plain(layer) => layer
+                .quantize_op::<S>(data, node_id, input_scaling, num_outputs)
+                .map(|q_op| {
+                    QuantizeOutput::new(Activation::Plain(q_op.quantized_op), q_op.output_scalings)
+                }),
+            Self::GLU(layer) => {
+                ensure!(
+                    input_scaling.len() == 2,
+                    "Expected 2 input scaling factors for activation layer used in GLU, found {}",
+                    input_scaling.len(),
+                );
+                let q_op = layer.quantize_op::<S>(data, node_id, input_scaling, num_outputs)?;
+                ensure!(
+                    q_op.output_scalings.len() == 1,
+                    "Expected 1 output scaling factor for activation layer used in GLU, found {}",
+                    q_op.output_scalings.len(),
+                );
+                let activation_out_scaling = S::scaling_factor_for_intermediate_data(
+                    data,
+                    node_id,
+                    ACTIVATION_OUT_ID.to_string().into(),
+                );
+                let multiplier =
+                    activation_out_scaling.m(&input_scaling[1], &q_op.output_scalings[0]);
+                let intermediate_bit_size = 2 * *quantization::BIT_LEN; // we are multiplying 2 items with `quantization::BIT_LEN` bits
+                let requant = Requant::from_multiplier(multiplier, intermediate_bit_size);
+                Ok(
+                    QuantizeOutput::new(Activation::GLU(q_op.quantized_op), q_op.output_scalings)
+                        .with_requant(requant),
+                )
+            }
+        }
+    }
+}
+
+impl Evaluate<Element> for Activation<Element> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&Tensor<Element>],
+        unpadded_input_shapes: &[Shape],
+    ) -> Result<LayerOut<Element, E>> {
+        match self {
+            Activation::Plain(activation_layer) => activation_layer
+                .evaluate(inputs, unpadded_input_shapes)
+                .map(|outputs| LayerOut::from_vec(outputs)),
+            Activation::GLU(activation_layer) => {
+                ensure!(
+                    inputs.len() == 2,
+                    "Expected 2 inputs for activation layer used in GLU, found {} inputs instead",
+                    inputs.len(),
+                );
+                let mut activation_outputs =
+                    activation_layer.evaluate(&[inputs[0]], unpadded_input_shapes)?;
+                // double-check that there is only one output
+                assert_eq!(activation_outputs.len(), 1);
+                let activation_output = activation_outputs.pop().unwrap();
+                Ok(
+                    LayerOut::from_vec(vec![activation_output.mul(inputs[1])]).with_proving_data(
+                        ProvingData::Activation(ActivationData { activation_output }),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+impl ProveInfo for Activation<Element> {
+    fn step_info<E: ExtensionField>(
+        &self,
+        id: NodeId,
+        mut aux: ContextAux,
+    ) -> Result<(LayerCtx<E>, ContextAux)> {
+        let lookup_context = match self.activation_type() {
+            ActivationLayer::Relu(_) => {
+                aux.tables.insert(TableType::Relu);
+                LayerLookupContext::new(vec![TableType::Relu], vec![1])
+            }
+            // TODO: if we want to save on memory, we can use a pointer to the vector instead
+            ActivationLayer::Gelu(gelu) => {
+                aux.tables.insert(TableType::GELU(
+                    gelu.quant_data.map(|q| q.table_data).unwrap(),
+                ));
+                LayerLookupContext::new(
+                    vec![TableType::GELU(
+                        gelu.quant_data.map(|q| q.table_data).unwrap(),
+                    )],
+                    vec![1],
+                )
+            }
+        };
+
+        // Set the model polys to be empty
+        aux.model_polys = None;
+        aux.max_poly_len = aux
+            .last_output_shape
+            .iter()
+            .fold(aux.max_poly_len, |acc, shapes| {
+                acc.max(shapes.next_power_of_two().product())
+            });
+        let act = self.clone();
+        // Build the sumcheck Expression, we presume the polynomials will be loaded in in the order: input_column, output_column, eq_polys
+        let lookup_claims_expr = Expression::WitIn(2)
+            * (Expression::WitIn(0)
+                + Expression::WitIn(1) * Expression::Challenge(0, 1, E::ONE, E::ZERO));
+        let sumcheck_expression = match self {
+            Activation::GLU(_) =>
+            // if `self` is used in GLU, there is an additional input, which needs to be entry-wise multiplied with the output
+            // of the activation function (i.e., the output column of the lookup table); this additional input polynomial
+            // is assumed to be loaded as the last polynomial in the above list
+            {
+                lookup_claims_expr
+                    + Expression::Challenge(0, 2, E::ONE, E::ZERO)
+                        * Expression::WitIn(3)
+                        * Expression::WitIn(1)
+                        * Expression::WitIn(4)
+            }
+            Activation::Plain(_) => {
+                lookup_claims_expr
+                    + Expression::Challenge(0, 2, E::ONE, E::ZERO)
+                        * Expression::WitIn(3)
+                        * Expression::WitIn(1)
+            }
+        };
+
+        Ok((
+            LayerCtx::Activation(ActivationCtx {
+                op: act,
+                lookup_context,
+                node_id: id,
+                sumcheck_expression: vec![sumcheck_expression],
+            }),
+            aux,
+        ))
+    }
+}
+
+impl<N> PadOp for Activation<N> {}
+
+impl<E, PCS> ProvableOp<E, PCS> for Activation<Element>
+where
+    E: ExtensionField,
+    E::BaseField: Serialize + DeserializeOwned,
+    E: Serialize + DeserializeOwned,
+    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+    PCS::ProverParam: Send + Sync,
+{
+    type Ctx = ActivationCtx<E>;
+
+    fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
+        &'a self,
+        id: NodeId,
+        ctx: &'b Self::Ctx,
+        last_claims: Vec<&Claim<E>>,
+        step_data: &StepData<E, E>,
+        prover: &mut Prover<'c, 'd, E, T, PCS>,
+        store: &mut GenStore,
+    ) -> Result<Vec<Claim<E>>> {
+        let inputs = &step_data.node_inputs;
+        ensure!(
+            !inputs.is_empty(),
+            "Expected at least 1 input in inferece data for activation layer",
+        );
+        self.prove_step(prover, last_claims[0], ctx, inputs, id, store)
+    }
+
+    fn gen_lookup_witness(
+        &self,
+        id: NodeId,
+        ctx: &ProverContext<E, PCS>,
+        step_data: &StepData<Element, E>,
+        store: &mut GenStore,
+    ) -> Result<LookupWitnessGen<E, PCS>> {
+        let outputs = step_data.output_tensors(store)?;
+        ensure!(
+            outputs.len() == 1,
+            "Found more than 1 output tensor in inference step of activation layer"
+        );
+
+        match self {
+            Activation::Plain(activation_layer) => {
+                ensure!(
+                    step_data.node_inputs.len() == 1,
+                    "Found more than 1 input tensor in inference step of activation layer"
+                );
+                activation_layer.lookup_witness(
+                    id,
+                    ctx,
+                    &step_data.input_tensor_at(0, store)?,
+                    &outputs[0],
+                )
+            }
+            Activation::GLU(activation_layer) => {
+                ensure!(
+                    step_data.node_inputs.len() == 2,
+                    "Found more than 2 input tensor in inference step of activation layer"
+                );
+                let data = step_data.node_outputs.try_activation_data().ok_or(anyhow!(
+                    "Proving data not found in inference trace for activation layer"
+                ))?;
+                activation_layer.lookup_witness(
+                    id,
+                    ctx,
+                    &step_data.input_tensor_at(0, store)?,
+                    &data.activation_output,
+                )
+            }
+        }
     }
 }
 
@@ -361,11 +598,7 @@ where
         verifier: &mut Verifier<E, T, PCS>,
         _shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
-        Ok(vec![self.verify_activation(
-            verifier,
-            last_claims[0],
-            proof,
-        )?])
+        self.verify_activation(verifier, last_claims[0], proof)
     }
     fn write_proof_to_transcript<T: Transcript<E>>(
         &self,
@@ -376,21 +609,17 @@ where
     }
 }
 
-impl<N> Activation<N> {
-    fn table_type(&self) -> TableType {
-        match self {
-            Activation::Relu(_) => TableType::Relu,
-            Activation::Gelu(g) => TableType::GELU(g.quant_data.map(|q| q.table_data).unwrap()),
-        }
-    }
+impl Activation<Element> {
     #[timed::timed_instrument(name = "Prover::prove_activation_step")]
     pub(crate) fn prove_step<'a, 'b, E, T: Transcript<E>, PCS>(
         &self,
         prover: &mut Prover<'a, 'b, E, T, PCS>,
         last_claim: &Claim<E>,
         step: &ActivationCtx<E>,
+        inputs: &[DryTensor<E>],
         node_id: NodeId,
-    ) -> anyhow::Result<Claim<E>>
+        store: &mut GenStore,
+    ) -> anyhow::Result<Vec<Claim<E>>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -414,7 +643,7 @@ impl<N> Activation<N> {
         let logup_eq_poly = compute_betas_eval(logup_point).into_mle();
         let last_claim_eq = compute_betas_eval(&last_claim.point).into_mle();
 
-        let either_polys = layer_polys
+        let mut either_polys = layer_polys
             .iter()
             .map(|p| Either::Left(p.as_ref()))
             .chain(
@@ -423,6 +652,18 @@ impl<N> Activation<N> {
                     .map(|&p| Either::Left(p)),
             )
             .collect::<Vec<Either<_, _>>>();
+
+        // In case the layer is used in GLU, we need to add the MLE of second input tensor
+        // to the set of polynomials involved in the sum-check. We first build the MLE
+        // fro the second input tensor, if present
+        let input_mle = inputs
+            .get(1)
+            .map(|input| anyhow::Ok(input.hydrate(store.clone())?.into_mle()))
+            .unwrap_or(Ok(Default::default()))?;
+
+        if let Activation::GLU(_) = self {
+            either_polys.push(Either::Left(&input_mle));
+        }
 
         let num_threads = optimal_sumcheck_threads(logup_point.len());
         let expr_builder = VirtualPolynomialsBuilder::<E>::new_with_mles(
@@ -436,7 +677,7 @@ impl<N> Activation<N> {
             .elements;
         let virtual_poly = expr_builder.to_virtual_polys(&step.sumcheck_expression, &[challenge]);
         let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
-        let all_evals = state.get_mle_flatten_final_evaluations();
+        let mut all_evals = state.get_mle_flatten_final_evaluations();
         let point = state.collect_raw_challenges();
 
         // Add commitment claims to prover
@@ -445,19 +686,8 @@ impl<N> Activation<N> {
             vec![(point.clone(), vec![all_evals[0], all_evals[1]])],
         );
 
-        // Add the proof in
-        prover.push_proof(
-            node_id,
-            LayerProof::Activation(ActivationProof {
-                io_accumulation: proof,
-                evaluations: all_evals[..2].to_vec(),
-                lookup: logup_proof,
-                commit,
-            }),
-        );
-
-        let input_claim = match &self {
-            Activation::Gelu(g) => {
+        let input_claim = match self.activation_type() {
+            ActivationLayer::Gelu(g) => {
                 let m: E = g.quant_data.as_ref().unwrap().multiplier.to_field();
                 let mi = m.inverse();
                 let eval = all_evals[0] * mi;
@@ -466,7 +696,30 @@ impl<N> Activation<N> {
             _ => Claim::new(point.clone(), all_evals[0]),
         };
 
-        Ok(input_claim)
+        // collect evaluations to be placed in the proof
+        let evaluations = all_evals[..2].to_vec();
+        let mut proof = ActivationProof {
+            io_accumulation: proof,
+            evaluations,
+            lookup: logup_proof,
+            commit,
+        };
+        Ok(match self {
+            Activation::GLU(_) => {
+                // we need to add the evaluation for the second input MLE evaluation, which is the last
+                // polynomial in the sumcheck polynomials
+                let second_input_eval = all_evals.pop().unwrap();
+                proof.evaluations.push(second_input_eval);
+                prover.push_proof(node_id, LayerProof::Activation(proof));
+                // we need to return also the claim for the second input MLE
+                let second_input_claim = Claim::new(point, second_input_eval);
+                vec![input_claim, second_input_claim]
+            }
+            Activation::Plain(_) => {
+                prover.push_proof(node_id, LayerProof::Activation(proof));
+                vec![input_claim]
+            }
+        })
     }
 }
 
@@ -476,7 +729,7 @@ impl<E: ExtensionField> ActivationCtx<E> {
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
         proof: &ActivationProof<E, PCS>,
-    ) -> anyhow::Result<Claim<E>>
+    ) -> anyhow::Result<Vec<Claim<E>>>
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: Serialize + DeserializeOwned,
@@ -501,7 +754,10 @@ impl<E: ExtensionField> ActivationCtx<E> {
         let poly_evals = batch_claim.poly_evals();
         let claimed_sum = poly_evals[0] + challenge * (poly_evals[1] + challenge * last_claim.eval);
         let aux_info = VPAuxInfo {
-            max_degree: 2,
+            max_degree: match &self.op {
+                Activation::GLU(_) => 3, /* in this case, max degree is 3 because we add the term related to the hadamard product */
+                Activation::Plain(_) => 2,
+            },
             max_num_variables: last_claim.point.len(),
             ..Default::default()
         };
@@ -519,9 +775,14 @@ impl<E: ExtensionField> ActivationCtx<E> {
             .collect::<Vec<E>>();
         let lookup_eq = identity_eval(batch_claim.point(), &point);
         let last_claim_eq = identity_eval(&last_claim.point, &point);
-        let mut witnesses = evaluations.to_vec();
+        let lookup_evals = evaluations[..2].to_vec();
+        let mut witnesses = lookup_evals.clone();
         witnesses.push(lookup_eq);
         witnesses.push(last_claim_eq);
+        // add also the evaluation for the second input MLE, if present
+        if let Some(second_input_eval) = evaluations.get(2) {
+            witnesses.push(*second_input_eval);
+        }
 
         let calc_claim = self
             .sumcheck_expression
@@ -546,20 +807,27 @@ impl<E: ExtensionField> ActivationCtx<E> {
         verifier.commit_verifier.add_witness_claim(
             self.node_id,
             commit.clone(),
-            vec![(point.clone(), evaluations.clone())],
+            vec![(point.clone(), lookup_evals.clone())],
         );
         // 4. return the input claim for to be proven at subsequent step
-        let input_claim = match &self.op {
-            Activation::Relu(_) => Claim::<E>::new(point, evaluations[0]),
-            Activation::Gelu(g) => {
+        let input_claim = match self.op.activation_type() {
+            ActivationLayer::Relu(_) => Claim::<E>::new(point.clone(), evaluations[0]),
+            ActivationLayer::Gelu(g) => {
                 let m: E = g.quant_data.as_ref().unwrap().multiplier.to_field();
                 let mi = m.inverse();
                 let eval = evaluations[0] * mi;
-                Claim::new(point, eval)
+                Claim::new(point.clone(), eval)
             }
         };
 
-        Ok(input_claim)
+        Ok(match &self.op {
+            Activation::GLU(_) => {
+                // we need to return also the claim to the second input
+                let second_input_claim = Claim::new(point, evaluations[2]);
+                vec![input_claim, second_input_claim]
+            }
+            Activation::Plain(_) => vec![input_claim],
+        })
     }
 }
 
@@ -768,10 +1036,20 @@ mod test {
     fn test_activation_gelu_proving() -> anyhow::Result<()> {
         let input_shape = vec![3, 100].into();
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
-        model.add_consecutive_layer(
-            Layer::Activation(Activation::Gelu(GELU::<f32>::new())),
-            None,
-        )?;
+        model.add_consecutive_layer(Layer::Activation(Activation::new_gelu()), None)?;
+        model.route_output(None)?;
+        prove_model(model, &mut Default::default()).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn test_glu_activation_proving() -> anyhow::Result<()> {
+        let input_shape = vec![7, 94].into();
+        let mut model = Model::new_from_input_shapes(
+            vec![input_shape; 2], // 2 inputs in case of GLU variant
+            PaddingMode::NoPadding,
+        );
+        model.add_consecutive_layer(Activation::new_geglu().into(), None)?;
         model.route_output(None)?;
         prove_model(model, &mut Default::default()).unwrap();
         Ok(())

@@ -611,13 +611,14 @@ impl Evaluate<Element> for Convolution<Element> {
         let mut conv_output = conv_output.squeeze(0); // conv2d always return a 4D tensor
         conv_output.pad_to_shape(fft_shape);
 
-        Ok(LayerOut {
-            outputs: vec![conv_output],
-            proving_data: ProvingData::Convolution(ConvFFTData {
-                input: inputs[0].clone(),
-                unpadded_input_shape: unpadded_input_shape.clone(),
-            }),
-        })
+        Ok(
+            LayerOut::from_vec(vec![conv_output]).with_proving_data(ProvingData::Convolution(
+                ConvFFTData {
+                    input: inputs[0].clone(),
+                    unpadded_input_shape: unpadded_input_shape.clone(),
+                },
+            )),
+        )
     }
 }
 impl Convolution<Element> {

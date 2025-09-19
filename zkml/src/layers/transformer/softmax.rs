@@ -682,10 +682,7 @@ impl Evaluate<Element> for Softmax<Element> {
         // Make the output tensor
         let output = Tensor::<Element>::new(input.shape().clone(), softmax_outputs);
 
-        Ok(LayerOut {
-            outputs: vec![output],
-            proving_data,
-        })
+        Ok(LayerOut::from_vec(vec![output]).with_proving_data(proving_data))
     }
 }
 

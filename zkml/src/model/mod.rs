@@ -602,7 +602,7 @@ pub(crate) mod test {
         init_test_logging_default,
         layers::{
             Layer,
-            activation::{Activation, Relu},
+            activation::Activation,
             convolution::{ConvCtx, Convolution},
             dense::Dense,
             matrix_mul::{MatMul, OperandMatrix},
@@ -700,7 +700,7 @@ pub(crate) mod test {
                         Some(model.add_consecutive_layer(Layer::Requant(requant), last_node_id)?);
                 } else if selector % MOD_SELECTOR == SELECTOR_RELU {
                     last_node_id = Some(model.add_consecutive_layer(
-                        Layer::Activation(Activation::Relu(Relu::new())),
+                        Layer::Activation(Activation::new_relu()),
                         last_node_id,
                     )?);
                     // no need to change the `last_row` since RELU layer keeps the same shape
@@ -1107,7 +1107,7 @@ pub(crate) mod test {
             )
             .unwrap();
         // add activation layer
-        let relu = Activation::Relu(Relu::new());
+        let relu = Activation::new_relu();
         let relu_node = model
             .add_consecutive_layer(Layer::Activation(relu), Some(input_node))
             .unwrap();
@@ -1267,21 +1267,21 @@ pub(crate) mod test {
         let relu1 = model
             .add_node(Node::new(
                 vec![Edge::new_at_edge(0), Edge::new_at_edge(1)],
-                Layer::Activation(Activation::Relu(Relu)),
+                Layer::Activation(Activation::new_relu()),
             ))
             .unwrap();
         // here we take the first two outputs of relu1
         let relu2 = model
             .add_node(Node::new(
                 vec![Edge::new(relu1, 0), Edge::new(relu1, 1)],
-                Layer::Activation(Activation::Relu(Relu)),
+                Layer::Activation(Activation::new_relu()),
             ))
             .unwrap();
         // here we only want to take the first output of relu1
         let relu3 = model
             .add_node(Node::new(
                 vec![Edge::new(relu1, 0)],
-                Layer::Activation(Activation::Relu(Relu)),
+                Layer::Activation(Activation::new_relu()),
             ))
             .unwrap();
         let input_tensor = vec![
@@ -1360,7 +1360,7 @@ pub(crate) mod test {
             ))
             .unwrap();
         // add Relu nodes
-        let relu = Activation::Relu(Relu::new());
+        let relu = Activation::new_relu();
         let first_relu_node = model
             .add_consecutive_layer(Layer::Activation(relu.clone()), Some(first_input_dense))
             .unwrap();

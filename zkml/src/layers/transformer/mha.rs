@@ -363,6 +363,7 @@ impl Evaluate<Element> for Mha<Element> {
         let LayerOut {
             outputs,
             proving_data,
+            ..
         } = soft_out;
         let ProvingData::Softmax(softmax_data) = proving_data else {
             bail!("Softmax data not found while evaluating MhaLayer");

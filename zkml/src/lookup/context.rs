@@ -1014,15 +1014,15 @@ where
             bail!("Expected input to be a node_id");
         };
         let step = ctx.trace.get_step(node_id).unwrap();
-        step.op
+        Ok(step
+            .op
             .gen_lookup_witness(*node_id, ctx.ctx, &step.step_data, &mut ctx.store.clone())
             .map_err(|e| {
                 LogUpError::ParameterError(format!(
                     "Error generating lookup witness for node {node_id:?} with error: {e:?}"
                 ))
             })
-            .map(|gen_w| GenerateWitnessIO::Output(gen_w))
-            .context("Error generating lookup witness")
+            .map(|gen_w| GenerateWitnessIO::Output(gen_w))?)
     }
     fn describe(&self) -> String {
         "GenerateWitness".to_string()

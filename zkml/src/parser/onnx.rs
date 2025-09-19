@@ -324,7 +324,6 @@ fn load_relu<'a, I: Iterator<Item = &'a usize> + Sized>(
     node: &OnnxNode,
     _iter: &mut Peekable<I>,
 ) -> Result<(NodeId, CustomNode)> {
-    let relu = crate::layers::activation::Relu::new();
     // find the input node that corresponds to the const input of Relu - since tract_onnx transforms
     // a relu operation into Max(input, Const(0))
     // the input node would be the other one.
@@ -346,7 +345,7 @@ fn load_relu<'a, I: Iterator<Item = &'a usize> + Sized>(
     };
     let provable_node = crate::layers::provable::Node::new(
         vec![Edge::new(real_input_id.node.into(), real_input_id.slot)],
-        Layer::Activation(Activation::Relu(relu)),
+        Layer::Activation(Activation::new_relu()),
     );
     Ok((node_id, provable_node))
 }

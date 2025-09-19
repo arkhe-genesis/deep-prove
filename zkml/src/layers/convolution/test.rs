@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     layers::{
-        activation::{Activation, Relu},
+        activation::Activation,
         dense::Dense,
         pooling::{Maxpool2D, Pooling, maxpool2d_shape},
         provable::evaluate_layer,
@@ -255,7 +255,7 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     input_shape_padded = conv2d_shape(&input_shape_padded, dims).next_power_of_two();
 
     // add a RELU layer
-    let relu = Activation::Relu(Relu::new());
+    let relu = Activation::new_relu();
     let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output], None)
         .unwrap()
         .outputs()[0]
@@ -289,7 +289,7 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     input_shape_padded = conv2d_shape(&input_shape_padded, dims).next_power_of_two();
 
     // Add another RELU
-    let relu = Activation::Relu(Relu::new());
+    let relu = Activation::new_relu();
     let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output], None)
         .unwrap()
         .outputs()[0]

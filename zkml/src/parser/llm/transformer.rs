@@ -1,7 +1,7 @@
 use crate::{
     Number,
     layers::{
-        activation::{Activation, GELU, Relu},
+        activation::{Activation, GeGlu},
         add,
         matrix_mul::MatMul,
         provable::{Edge, Node},
@@ -57,6 +57,7 @@ pub struct Attention<N: Number> {
 #[derive(Debug, Clone)]
 pub struct FeedForward<N: Number> {
     pub pre_norm: Norm<N>,
+    pub gate: Option<MatMul<N>>, // used only for a Gated Linear Unit (GLU)
     pub up: Tensor<N>,
     pub up_bias: Option<Tensor<N>>,
     pub down: Tensor<N>,
@@ -114,7 +115,7 @@ impl Attention<f32> {
             ],
             Layer::Add(add::Add::new()),
         ))?;
-        last_node_id = self.feedforward.write_to_model(c, model, last_node_id)?;
+        last_node_id = self.feedforward.write_to_model(model, last_node_id)?;
         last_node_id = match self.post_ffw_norm {
             Some(norm) => model.add_consecutive_layer(norm.to_layer(), Some(last_node_id))?,
             None => last_node_id,
@@ -399,26 +400,39 @@ impl Attention<f32> {
 impl FeedForward<f32> {
     pub fn write_to_model(
         self,
-        config: &LLMConfig,
         model: &mut Model<f32>,
         input_node_id: NodeId,
     ) -> anyhow::Result<NodeId> {
         let layernorm = self.pre_norm.to_layer();
         let up = MatMul::new_constant(self.up, self.up_bias)?;
 
-        let activation = match config.variant {
-            LLMVariant::GPT2 => Activation::Gelu(GELU::new()),
-            // TODO: change
-            LLMVariant::Gemma3 => Activation::Relu(Relu::new()),
-        };
         // let down = MatMul::new_constant(self.down, self.down_bias);
         let down = MatMul::new_constant(self.down, self.down_bias)?;
         let add = add::Add::new();
-        let last_node_id = model.add_consecutive_layer(layernorm, Some(input_node_id))?;
-        let last_node_id = model.add_consecutive_layer(Layer::MatMul(up), Some(last_node_id))?;
+        let norm_node_id = model.add_consecutive_layer(layernorm, Some(input_node_id))?;
+        let up_node_id = model.add_consecutive_layer(Layer::MatMul(up), Some(norm_node_id))?;
+        let activation_node_id = if let Some(gate) = self.gate {
+            // in this case, the input is processed though another linear layer (i.e., gate_linear),
+            // which is then processed by the activation function and combined with the output of `up` linear
+            // component. Combining the output of activation function with `up` is already done inside the
+            // activation layer being instantiated
+            let gate_node_id =
+                model.add_consecutive_layer(Layer::MatMul(gate), Some(norm_node_id))?;
+            let geglu = Activation::new_geglu();
+            // build input wires for GeGlu
+            let geglu_inputs = {
+                let mut inputs = vec![Edge::default(); 2];
+                inputs[GeGlu::<f32>::GELU_INPUT_INDEX] = Edge::new(gate_node_id, 0); // output of gate is fed to Gelu
+                inputs[GeGlu::<f32>::LINEAR_INPUT_INDEX] = Edge::new(up_node_id, 0);
+                inputs
+            };
+            model.add_node(Node::new(geglu_inputs, geglu.into()))
+        } else {
+            // if there is no `self.gate`, then we just feed output of `up` linear component to the activation layer
+            model.add_consecutive_layer(Layer::Activation(Activation::new_gelu()), Some(up_node_id))
+        }?;
         let last_node_id =
-            model.add_consecutive_layer(Layer::Activation(activation), Some(last_node_id))?;
-        let last_node_id = model.add_consecutive_layer(Layer::MatMul(down), Some(last_node_id))?;
+            model.add_consecutive_layer(Layer::MatMul(down), Some(activation_node_id))?;
         let last_node_id = model.add_node(Node::new(
             vec![Edge::new(input_node_id, 0), Edge::new(last_node_id, 0)],
             Layer::Add(add),
@@ -434,6 +448,20 @@ impl FeedForward<f32> {
         let pre_norm = match c.variant.norm_type() {
             NormType::RMSNorm => Norm::RMSNorm(RMSNorm::from_loader(&ffn_norm_loader, c)?),
             NormType::LayerNorm => Norm::LayerNorm(LayerNorm::from_loader(&ffn_norm_loader, c)?),
+        };
+
+        let gate = match &c.variant {
+            LLMVariant::GPT2 => None,
+            LLMVariant::Gemma3 => {
+                let gate = loader.get_tensor("ffn_gate.weight")?.transpose();
+                ensure!(
+                    gate.shape()[0] == c.hidden_size,
+                    "gate have shape {:?} but in features should be equal to hidden_size: {}",
+                    gate.shape(),
+                    c.hidden_size
+                );
+                Some(MatMul::new_constant(gate, None)?)
+            }
         };
 
         let up = loader.get_tensor("ffn_up.weight")?.transpose();
@@ -462,6 +490,7 @@ impl FeedForward<f32> {
         );
         Ok(Self {
             pre_norm,
+            gate,
             up,
             up_bias,
             down,
@@ -492,6 +521,7 @@ impl FeedForward<f32> {
         );
         Ok(Self {
             pre_norm: Norm::LayerNorm(pre_norm),
+            gate: None,
             up,
             up_bias: Some(up_bias),
             down,

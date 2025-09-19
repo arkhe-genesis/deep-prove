@@ -18,7 +18,10 @@ use crate::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
     },
-    layers::transformer::{logits::ArgmaxData, mha::MhaData},
+    layers::{
+        activation::ActivationData,
+        transformer::{logits::ArgmaxData, mha::MhaData},
+    },
     lookup::context::LookupWitnessGen,
     model::trace::StepData,
     padding::{PaddingMode, ShapeInfo},
@@ -177,15 +180,36 @@ pub enum ProvingData<E: ExtensionField> {
     LayerNorm(LayerNormData),
     /// Variant used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
     ArgMax(ArgmaxData<E>),
+    /// Variant used for extra data used to prove activation layer
+    Activation(ActivationData),
     /// Variant used when no extra data is returned.
     None,
 }
+
+/// Identifier for an intermediate tensor of a layer, i.e., a tensor which is neither an
+/// input nor an output tensor of the layer. The ID is employed to keep track of the tensor
+/// for quantization purposes
+#[derive(
+    Clone,
+    From,
+    Into,
+    Hash,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    PartialOrd,
+    Ord,
+    derive_more::Debug,
+)]
+pub struct TrackedDataId(String);
 
 /// Represents the output of the evaluation of a node operation
 #[derive(Clone, Debug)]
 pub struct LayerOut<T, E: ExtensionField> {
     pub(crate) outputs: Vec<Tensor<T>>,
     pub(crate) proving_data: ProvingData<E>,
+    pub(crate) tracked_layer_data: Option<HashMap<TrackedDataId, Tensor<T>>>,
 }
 
 impl<T, E: ExtensionField> LayerOut<T, E> {
@@ -193,6 +217,7 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
         Self {
             outputs: out,
             proving_data: ProvingData::None,
+            tracked_layer_data: None,
         }
     }
 
@@ -200,6 +225,17 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
         Self {
             outputs: self.outputs,
             proving_data: data,
+            tracked_layer_data: self.tracked_layer_data,
+        }
+    }
+
+    /// Add a set of intermediate data tensors to be tracked for quantization purposes;
+    /// Each intermediate tensor is identified by a corresponding `TrackedDataId`
+    pub(crate) fn with_data_to_be_tracked(self, data: HashMap<TrackedDataId, Tensor<T>>) -> Self {
+        Self {
+            outputs: self.outputs,
+            proving_data: self.proving_data,
+            tracked_layer_data: Some(data),
         }
     }
 
@@ -242,6 +278,13 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
     pub fn try_layernorm_data(&self) -> Option<&LayerNormData> {
         match self.proving_data {
             ProvingData::LayerNorm(ref layernorm_data) => Some(layernorm_data),
+            _ => None,
+        }
+    }
+
+    pub fn try_activation_data(&self) -> Option<&ActivationData> {
+        match self.proving_data {
+            ProvingData::Activation(ref data) => Some(data),
             _ => None,
         }
     }

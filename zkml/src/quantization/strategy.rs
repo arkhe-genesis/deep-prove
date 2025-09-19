@@ -1,5 +1,5 @@
 use crate::{
-    layers::provable::{Node, NodeId, QuantizeOp},
+    layers::provable::{Node, NodeId, QuantizeOp, TrackedDataId},
     model::{Model, ToIterator},
     quantization::metadata::{MetadataBuilder, ModelMetadata},
     rng_from_env_or_random,
@@ -38,6 +38,12 @@ pub trait ScalingStrategy: std::fmt::Debug {
         node_id: NodeId,
         num_outputs: usize,
     ) -> Vec<ScalingFactor>;
+
+    fn scaling_factor_for_intermediate_data(
+        data: &Self::AuxData,
+        node_id: NodeId,
+        data_id: TrackedDataId,
+    ) -> ScalingFactor;
 
     fn name(&self) -> String;
 }
@@ -164,6 +170,14 @@ impl ScalingStrategy for InferenceObserver {
             })
             .collect()
     }
+
+    fn scaling_factor_for_intermediate_data(
+        tracker: &InferenceTracker,
+        node_id: NodeId,
+        data_id: TrackedDataId,
+    ) -> ScalingFactor {
+        tracker.scaling_factor_for_intermediate_data(node_id, data_id)
+    }
 }
 
 /// The inference tracker observes the execution of a model over a given set of
@@ -174,6 +188,9 @@ pub struct InferenceTracker {
     /// Streaming estimator of the selected statistics for each output of each
     /// node.
     accumulators: HashMap<(NodeId, usize), InferenceTrackingAccumulator>,
+    /// Streaming estimator of the selected statistics for given intermediate data of
+    /// each node, if any
+    intermediate_data_trackers: HashMap<(NodeId, TrackedDataId), InferenceTrackingAccumulator>,
 }
 /// Selects the statistic to use to generate the scaling range.
 enum InferenceTrackingMode {
@@ -245,6 +262,7 @@ impl InferenceTracker {
         Self {
             mode,
             accumulators: HashMap::new(),
+            intermediate_data_trackers: HashMap::new(),
         }
     }
     pub(crate) fn track(&mut self, node_id: NodeId, output_index: usize, output: Tensor<f32>) {
@@ -257,11 +275,39 @@ impl InferenceTracker {
         }
     }
 
+    pub(crate) fn track_intermediate_data(
+        &mut self,
+        node_id: NodeId,
+        data_id: TrackedDataId,
+        data: Tensor<f32>,
+    ) {
+        let accumulator = self
+            .intermediate_data_trackers
+            .entry((node_id, data_id))
+            .or_insert_with(|| self.mode.new_accumulator());
+        for x in data.get_data() {
+            accumulator.add(*x as f64);
+        }
+    }
+
     pub(crate) fn scaling_range(&self, node_id: NodeId, output_index: usize) -> (f32, f32) {
         self.accumulators
             .get(&(node_id, output_index))
             .unwrap()
             .scaling_range()
+    }
+
+    pub(crate) fn scaling_factor_for_intermediate_data(
+        &self,
+        node_id: NodeId,
+        data_id: TrackedDataId,
+    ) -> ScalingFactor {
+        let (min, max) = self
+            .intermediate_data_trackers
+            .get(&(node_id, data_id))
+            .unwrap()
+            .scaling_range();
+        ScalingFactor::from_absolute_max(min.abs().max(max.abs()), None)
     }
 }
 
@@ -328,6 +374,14 @@ impl ScalingStrategy for AbsoluteMax {
         num_outputs: usize,
     ) -> Vec<ScalingFactor> {
         vec![ScalingFactor::default(); num_outputs]
+    }
+
+    fn scaling_factor_for_intermediate_data(
+        _data: &Self::AuxData,
+        _node_id: NodeId,
+        _data_id: TrackedDataId,
+    ) -> ScalingFactor {
+        ScalingFactor::default()
     }
 }
 

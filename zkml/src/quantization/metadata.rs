@@ -103,8 +103,10 @@ impl MetadataBuilder {
                 .ok_or(anyhow!("Scaling factors not found for node {id}"))?;
             ensure!(
                 scalings.len() == node.outputs.len(),
-                "Number of scalings factors found for node {id} is different from
-                the expected number of outputs of the node"
+                "Number of scalings factors found for node {id} ({}) is different from
+                the expected number of outputs of the node ({})",
+                scalings.len(),
+                node.outputs.len(),
             );
             node.outputs.iter().enumerate().try_for_each(|(i, out)| {
                 if let Some(out_index) = out.edges.iter().find_map(|edge| {

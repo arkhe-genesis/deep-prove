@@ -37,7 +37,7 @@ use crate::{
     Element, ProverContext, ScalingStrategy, Shape, Tensor,
     iop::context::{ContextAux, ShapeStep},
     layers::{
-        activation::{ACTIVATION_LAYER, Activation, ActivationProof},
+        activation::{ACTIVATION_LAYER, Activation, ActivationData, ActivationProof},
         add::{ADD_LAYER, Add, AddCtx, AddProof},
         concat_matmul::{CONCAT_MATMUL_LAYER, ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof},
         convolution::{CONVOLUTION_LAYER, Convolution},
@@ -323,6 +323,13 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
             _ => None,
         }
     }
+
+    pub fn try_activation_data(&self) -> Option<&ActivationData> {
+        match self.proving_data {
+            ProvingData::Activation(ref data) => Some(data),
+            _ => None,
+        }
+    }
 }
 
 impl<E: ExtensionField> NodeOut<Element, E> {
@@ -409,6 +416,12 @@ where
         if let Some(tracker) = tracker.as_mut() {
             for (i, out) in layer_out.outputs.iter().enumerate() {
                 tracker.track(my_id, i, out.to_f32()?);
+            }
+            // track intermediate data, if any
+            if let Some(tracked_data) = layer_out.tracked_layer_data {
+                for (data_id, data) in tracked_data {
+                    tracker.track_intermediate_data(my_id, data_id, data.to_f32()?);
+                }
             }
         }
 
@@ -892,8 +905,9 @@ impl QuantizeOp for Layer<f32> {
                 let output = activation.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(
                     Layer::Activation(output.quantized_op),
-                    input_scaling.to_vec(),
+                    output.output_scalings,
                 )
+                .maybe_requants(output.requant_layer)
             }
             Layer::Requant(requant) => {
                 QuantizeOutput::new(Layer::Requant(requant), input_scaling.to_vec())
