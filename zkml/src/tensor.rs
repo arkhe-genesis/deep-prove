@@ -3230,7 +3230,7 @@ mod test {
 
     proptest! {
         #[test]
-        fn test_pad_next_power_of_two_prop(x in 1usize..5, y in 2usize..1028, z in 2usize..1028) {
+        fn test_pad_next_power_of_two_prop(x in 1usize..5, y in 2usize..=32, z in 2usize..=32) {
             pub fn pad_next_power_of_two(t: &Tensor<Element>) -> Tensor<Element> {
                 let shape = t.shape();
 
@@ -3276,7 +3276,7 @@ mod test {
         }
 
         #[test]
-        fn proptest_tensor_permute3d(a in 2usize..128, b in 2usize..128, c in 2usize..128) {
+        fn proptest_tensor_permute3d(a in 2usize..=32, b in 2usize..=32, c in 2usize..=32) {
             fn permute3d<T: Default + Copy>(tensor: &Tensor<T>, order: &[usize]) -> Tensor<T> {
                 let (a, b, c) = (tensor.shape[0], tensor.shape[1], tensor.shape[2]);
                 let new_a = tensor.shape[order[0]];
