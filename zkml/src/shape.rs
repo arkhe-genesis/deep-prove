@@ -117,15 +117,15 @@ impl Shape {
     /// assert_eq!(shape.dim(1), 5);
     /// assert_eq!(shape.dim(2), 7);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the given dimensions are out-of-bounds.
     pub fn dim(&self, index: usize) -> usize {
         self.0[index]
     }
 
     /// Sets the value of a given dimension.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is larger than this shape size.
     ///
     /// ```
     /// # use zkml::Shape;
@@ -133,6 +133,10 @@ impl Shape {
     /// shape.set_dim(1, 10);
     /// assert_eq!(shape.dim(1), 10);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the given dimensions are out-of-bounds.
     pub fn set_dim(&mut self, index: usize, value: usize) {
         assert!(index < self.0.len(), "Index out of bounds");
         self.0[index] = value;

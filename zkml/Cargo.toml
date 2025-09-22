@@ -117,6 +117,10 @@ name = "prove-model"
 harness = false
 name = "gpu"
 
+[[bench]]
+harness = false
+name = "tensor"
+
 [lints.clippy]
 dbg_macro = "deny"
 print_stderr = "deny"

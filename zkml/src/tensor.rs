@@ -39,6 +39,112 @@ use crate::{
     to_bit_sequence_le,
 };
 
+/// Chunk size tuned to allow for the compiler's auto vectorisation.
+///
+/// This value should be a multiple of the target's cache line (taking into
+/// consideration the number of bytes, including padding, of the data being
+/// iterated over). To support multiple architectures this should be the least
+/// common multiple of all target archictures.
+///
+/// This value is also used to increase utilisation when utilising rayon,
+/// reducing the overhead cost of the rayon framework for super cheap operation.
+/// (like a simple addition or subtraction).
+const AUTO_VECTORISATION_CHUNK: usize = 512;
+
+/// Macro to generate code that can be auto-vectorised over two tensors.
+///
+/// The auto vectorisation works by:
+///
+/// - Using `as_chunks`, which guarantees the data will be split in a continuous
+///   non-overlapping chunks.
+/// - The above chunks are then converted to an array with sizes known at compile
+///   time
+/// - The data is then iterated over the above arrays using a simple incrementing
+///   index
+macro_rules! auto_vec_binop {
+    ($self: ident, $other: ident, $op: tt) => {{
+        assert!(
+            $self.shape.product() == $other.shape.product(),
+            "Shape mismatch for addition {:?} != {:?}",
+            $self.shape,
+            $other.shape,
+        );
+
+        let mut data = Vec::with_capacity($self.data.len());
+        let spare_data = data.spare_capacity_mut();
+        assert!(
+            spare_data.len() >= $self.data.len(),
+            "Preallocated vector must have enough capacity"
+        );
+
+        let (left_chunks, left_remainder) = $self.data.as_chunks::<AUTO_VECTORISATION_CHUNK>();
+        let (right_chunks, right_remainder) = $other.data.as_chunks::<AUTO_VECTORISATION_CHUNK>();
+        let (result_chunks, result_remainder) = spare_data.as_chunks_mut::<AUTO_VECTORISATION_CHUNK>();
+
+        (left_chunks, right_chunks, result_chunks)
+            .into_par_iter()
+            .for_each(|(left, right, result)| {
+                for i in 0..AUTO_VECTORISATION_CHUNK {
+                    result[i].write(left[i] $op right[i]);
+                }
+            });
+
+        // Handle remainder data
+        for pos in 0..left_remainder.len()  {
+            result_remainder[pos].write(left_remainder[pos] $op right_remainder[pos]);
+        }
+
+        // Safety: the memory was initialised above
+        unsafe {
+            data.set_len($self.data.len());
+        }
+
+        Tensor {
+            shape: $self.shape.clone(),
+            data,
+        }
+    }}
+}
+
+/// Macro to apply an operation to each element of an array.
+///
+/// The expanded code is intended to be easily vectorisable, by using the
+/// `as_chunks` api.
+macro_rules! auto_vec_op {
+    ($data: expr, $op: expr) => {{
+        let mut result = Vec::with_capacity($data.len());
+        let spare_result = result.spare_capacity_mut();
+        assert!(
+            spare_result.len() >= $data.len(),
+            "Preallocated vector must have enough capacity"
+        );
+
+        let (left_chunks, left_remainder) = $data.as_chunks::<AUTO_VECTORISATION_CHUNK>();
+        let (result_chunks, result_remainder) =
+            spare_result.as_chunks_mut::<AUTO_VECTORISATION_CHUNK>();
+
+        (left_chunks, result_chunks)
+            .into_par_iter()
+            .for_each(|(left, result)| {
+                for i in 0..AUTO_VECTORISATION_CHUNK {
+                    result[i].write($op(left[i]));
+                }
+            });
+
+        // Handle remainder data
+        for pos in 0..left_remainder.len() {
+            result_remainder[pos].write($op(left_remainder[pos]));
+        }
+
+        // Safety: the memory was initialised above
+        unsafe {
+            result.set_len($data.len());
+        }
+
+        result
+    }};
+}
+
 pub trait Number:
     Copy
     + PartialEq
@@ -273,7 +379,7 @@ pub fn bitreverse<T>(d: &mut [T]) {
     }
 }
 
-/// Perform a radix-2 Cooley-Turkey FFT.
+/// Perform a radix-2 Cooley-Tukey FFT.
 ///
 /// flag: false -> FFT
 /// flag: true -> iFFT
@@ -764,10 +870,32 @@ impl Tensor<Element> {
         real_weights
     }
 
+    /// Converts this [Tensor<Element>] into [MultilinearExtension].
+    ///
+    /// This will convert the element into an extension field and convert that
+    /// into a multilinear extension.
+    ///
+    /// see [Tensor::into_mle_2d].
+    ///
+    /// # Panics
+    ///
+    /// If the input is not a 2D tensor or if either dimension is not a power of two.
     pub fn to_2d_mle<F: ExtensionField>(&self) -> MultilinearExtension<'static, F> {
-        let t = Tensor::<F>::from(self);
-        t.to_mle_2d()
+        Tensor::<F>::from(self).into_mle_2d()
     }
+
+    /// Converts this [Tensor<Element>] into a [MultilinearExtension].
+    ///
+    /// This will convert the element into an extension field and convert that
+    /// into a multilinear extension.
+    ///
+    /// This method does not enforce a dimensionality.
+    ///
+    /// see [Tensor::into_mle].
+    ///
+    /// # Panics
+    ///
+    /// If the number of elements in the Tensor is not a power of two.
     pub fn to_field_mle<F: ExtensionField>(&self) -> MultilinearExtension<'static, F> {
         Tensor::<F>::from(self).into_mle()
     }
@@ -779,7 +907,22 @@ impl Tensor<Element> {
 }
 
 impl<F: ExtensionField> Tensor<F> {
+    /// Clone this [Tensor] and convert into a [MultilinearExtension].
+    ///
+    /// see [Tensor::into_mle_2d].
     pub fn to_mle_2d(&self) -> MultilinearExtension<'static, F> {
+        self.clone().into_mle_2d()
+    }
+
+    /// Consumes this [Tensor] into a [MultilinearExtension].
+    ///
+    /// The [Tensor] must be in evaluation form.
+    ///
+    /// # Panics
+    ///
+    /// - If the tensor is not 2D.
+    /// - If either dimension is not a power-of-two.
+    fn into_mle_2d(self) -> MultilinearExtension<'static, F> {
         assert!(self.shape.is_matrix(), "Tensor is not a matrix");
         assert!(
             self.nrows_2d().is_power_of_two(),
@@ -793,17 +936,27 @@ impl<F: ExtensionField> Tensor<F> {
         );
         // N variable to address 2^N rows and M variables to address 2^M columns
         let num_vars = self.nrows_2d().ilog2() + self.ncols_2d().ilog2();
-        MultilinearExtension::from_evaluations_ext_vec(num_vars as usize, self.data.clone())
+        MultilinearExtension::from_evaluations_ext_vec(num_vars as usize, self.data)
     }
 }
 
 impl<F: Field> Tensor<F> {
-    pub fn into_mle<E: ExtensionField>(self) -> MultilinearExtension<'static, E> {
-        self.data.into_mle()
-    }
-
+    /// Clone this [Tensor] and convert into a [MultilinearExtension].
+    ///
+    /// see [Tensor::into_mle].
     pub fn to_mle<E: ExtensionField>(&self) -> MultilinearExtension<E> {
         self.data.clone().into_mle()
+    }
+
+    /// Consumes this [Tensor] into a [MultilinearExtension].
+    ///
+    /// The [Tensor] must be in evaluation form.
+    ///
+    /// # Panics
+    ///
+    /// - If the number of elements in the tensor is not a power of two.
+    pub fn into_mle<E: ExtensionField>(self) -> MultilinearExtension<'static, E> {
+        self.data.into_mle()
     }
 }
 
@@ -900,12 +1053,41 @@ impl<T: Clone> Tensor<T> {
     }
 }
 
+struct ArgMax<T> {
+    /// The biggest value in the tensor.
+    value: T,
+
+    /// The position of the biggest value.
+    position: usize,
+}
+
 impl<T: Number> Tensor<T> {
+    /// Finds the maximum value in the tensor and returns its value and position.
+    fn find_maximum(&self) -> ArgMax<T> {
+        let (position, value) = self.data.par_iter().cloned().enumerate().reduce(
+            || (usize::MAX, T::MIN),
+            |acc, (position, value)| match acc.1.compare(&value) {
+                Ordering::Less => (position, value),
+                _ => acc,
+            },
+        );
+
+        ArgMax { value, position }
+    }
+
     /// Instantiate a new tensor with `shape` initialised to `default`.
     pub fn zeros(shape: Shape) -> Self {
         Self::initialised(shape, T::zero())
     }
 
+    /// Creates a new [Tensor] with `shape` initialised to `T::unit`.
+    ///
+    /// ```rust
+    /// # use zkml::{Tensor, Shape, Element};
+    /// let shape = Shape::new(vec![2, 2]);
+    /// let tensor = Tensor::<Element>::one(shape);
+    /// assert_eq!(tensor.data(), [1, 1, 1, 1]);
+    /// ```
     pub fn one(shape: Shape) -> Self {
         Tensor {
             data: vec![T::unit(); shape.numel()],
@@ -913,40 +1095,45 @@ impl<T: Number> Tensor<T> {
         }
     }
 
+    /// Returns the first position of the largest element in the [Tensor].
+    ///
+    /// ```rust
+    /// # use zkml::{Tensor, Shape, Element};
+    /// let tensor = Tensor::<Element>::new(Shape::new(vec![4, 2]), vec![3, 1, 0, 11, 7, 11, 9, 2]);
+    /// assert_eq!(tensor.argmax(), 3);
+    /// ```
     pub fn argmax(&self) -> usize {
-        self.data
-            .iter()
-            .enumerate()
-            .fold((0, T::MIN), |acc, x| match acc.1.compare(x.1) {
-                Ordering::Less => (x.0, *x.1),
-                _ => acc,
-            })
-            .0
+        self.find_maximum().position
     }
 
+    /// Returns the largest value in the [Tensor].
+    ///
+    /// ```rust
+    /// # use zkml::{Tensor, Shape, Element};
+    /// let tensor = Tensor::<Element>::new(Shape::new(vec![4, 2]), vec![3, 1, 0, 11, 7, 11, 9, 2]);
+    /// assert_eq!(tensor.max_value(), 11);
+    /// ```
+    pub fn max_value(&self) -> T {
+        self.find_maximum().value
+    }
+
+    /// Returns the the largest absolute element in the [Tensor].
+    ///
+    /// ```rust
+    /// # use zkml::{Tensor, Shape, Element};
+    /// let tensor = Tensor::<Element>::new(Shape::new(vec![7]), vec![3, 1, 0, -11, 7, 9, 2]);
+    /// assert_eq!(tensor.max_abs_output(), 11);
+    /// ```
     pub fn max_abs_output(&self) -> T {
         self.data
-            .iter()
-            .fold(T::default(), |max, x| max.cmp_max(&x.absolute_value()))
+            .par_iter()
+            .cloned()
+            .reduce(|| T::zero(), |max, x| max.cmp_max(&x.absolute_value()))
     }
 
     /// Element-wise addition
     pub fn add(&self, other: &Tensor<T>) -> Tensor<T> {
-        assert!(
-            self.shape.product() == other.shape.product(),
-            "Shape mismatch for addition {:?} != {:?}",
-            self.shape,
-            other.shape
-        );
-        let mut data = vec![Default::default(); self.data.len()];
-        data.par_iter_mut().enumerate().for_each(|(i, val)| {
-            *val = self.data[i] + other.data[i];
-        });
-
-        Tensor {
-            shape: self.shape.clone(),
-            data,
-        }
+        auto_vec_binop!(self, other, +)
     }
 
     /// Add a vector to each sub-tensor of the second dimension of the tensor
@@ -973,45 +1160,27 @@ impl<T: Number> Tensor<T> {
 
     /// Element-wise subtraction
     pub fn sub(&self, other: &Tensor<T>) -> Tensor<T> {
-        assert!(self.shape == other.shape, "Shape mismatch for subtraction.");
-        let mut data = vec![Default::default(); self.data.len()];
-        data.par_iter_mut().enumerate().for_each(|(i, val)| {
-            *val = self.data[i] - other.data[i];
-        });
-
-        Tensor {
-            data,
-            shape: self.shape.clone(),
-        }
+        auto_vec_binop!(self, other, -)
     }
 
     /// Element-wise multiplication
     pub fn mul(&self, other: &Tensor<T>) -> Tensor<T> {
-        assert!(
-            self.shape.numel() == other.shape.numel(),
-            "Shape mismatch for multiplication: {:?} != {:?}",
-            self.shape,
-            other.shape
-        );
-        let data = self
-            .data
-            .par_iter()
-            .zip(other.data.par_iter())
-            .map(|(a, b)| *a * *b)
-            .collect::<Vec<_>>();
+        auto_vec_binop!(self, other, *)
+    }
+
+    /// Scalar multiplication
+    pub fn scalar_mul(&self, scalar: &T) -> Tensor<T> {
+        let scalar = *scalar;
+
+        let data = auto_vec_op!(self.data, |el| el * scalar);
 
         Tensor {
             data,
             shape: self.shape.clone(),
         }
     }
-    /// Scalar multiplication
-    pub fn scalar_mul(&self, scalar: &T) -> Tensor<T> {
-        Tensor {
-            data: self.data.par_iter().map(|x| *x * *scalar).collect(),
-            shape: self.shape.clone(),
-        }
-    }
+
+    /// Scalar multiplication with f32.
     pub fn scalar_mul_f32<N2: Number>(&self, scalar: N2) -> Tensor<T> {
         let scaled = self
             .data
@@ -1404,9 +1573,6 @@ impl<T: Number> Tensor<T> {
         Tensor::<T>::new(vec![num_matrices, matrix_dim, matrix_dim].into(), data)
     }
 
-    pub fn max_value(&self) -> T {
-        self.data.iter().fold(T::MIN, |max, x| max.cmp_max(x))
-    }
     pub fn min_value(&self) -> T {
         self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
     }
