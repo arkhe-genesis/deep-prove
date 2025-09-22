@@ -67,6 +67,7 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
             pretty_name,
             model_id,
             inputs,
+            max_fee,
         } => {
             let input = Input::from_file(&inputs).context("loading input")?;
 
@@ -84,6 +85,7 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
                     model_id: model_id.try_into().context("`model_id` is too large")?,
                     input,
                 },
+                max_fee,
             };
 
             // build the API endpoint request and send the whole thing

@@ -44,6 +44,9 @@ pub struct ClientToGw {
     #[serde(flatten)]
     /// The kind of class to run.
     pub class: TaskClass,
+
+    /// The max. cost the user is disposed to pay for the task to be executed.
+    pub max_fee: u128,
 }
 
 #[derive(Serialize, Deserialize)]

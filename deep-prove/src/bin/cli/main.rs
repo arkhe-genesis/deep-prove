@@ -77,6 +77,10 @@ enum Command {
         /// Path to the inputs to prove inference for.
         #[arg(short, long)]
         inputs: PathBuf,
+
+        /// The maximal price to pay (in $LA) for the task to be executed.
+        #[arg(long)]
+        max_fee: u128,
     },
 
     /// If it has not yet been processed, cancel this task.
