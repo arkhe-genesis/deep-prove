@@ -38,7 +38,7 @@ use crate::{
         llm::{LLMConfig, LLMVariant},
     },
     quantization::{Fieldizer, TensorFielder},
-    tensor::{Number, TensorSlice},
+    tensor::{IntoBTensor, Number, TensorSlice},
 };
 
 pub(crate) mod absolute;
@@ -279,6 +279,8 @@ impl<N: Number> Positional<N> {
 impl<N: Number> Evaluate<N> for Positional<N>
 where
     Add<N>: Evaluate<N>,
+    Tensor<N>: IntoBTensor,
+    N: burn::tensor::Element,
 {
     fn evaluate<E: ExtensionField>(
         &self,

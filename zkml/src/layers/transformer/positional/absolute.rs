@@ -26,7 +26,7 @@ use crate::{
     },
     model::StepData,
     quantization::TensorFielder,
-    tensor::{Number, TensorSlice},
+    tensor::{IntoBTensor, Number, TensorSlice},
 };
 
 /// Data structure containing the proof data for the absolute variant of positional encoding layer
@@ -80,11 +80,20 @@ impl<N: Number> Absolute<N> {
     ) -> anyhow::Result<LayerOut<N, E>>
     where
         Add<N>: Evaluate<N>,
+        Tensor<N>: IntoBTensor,
+        N: burn::tensor::Element,
     {
         let past_length = positional_cache.lock().unwrap().seq_len;
-        let sub_pos = self
-            .positional
-            .slice_2d(past_length, past_length + input.shape()[0]);
+        let pos_bt = self.positional.clone().to_btensor::<2>();
+        let sub_bt = pos_bt.slice([
+            past_length..past_length + input.shape()[0],
+            0..input.shape()[1],
+        ]);
+        let sub_data: Vec<N> = sub_bt
+            .to_data()
+            .into_vec()
+            .expect("convert burn tensor to scalar data");
+        let sub_pos = Tensor::<N>::new(vec![input.shape()[0], input.shape()[1]].into(), sub_data);
         positional_cache
             .lock()
             .unwrap()
@@ -294,16 +303,26 @@ impl AbsoluteCtx {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
+
     use rstest::rstest;
 
     use tenstore::GenStore;
 
     use crate::{
-        Tensor,
-        layers::{Layer, transformer::positional::Positional},
+        Element, Tensor,
+        layers::{
+            Layer,
+            provable::{Evaluate, PadOp},
+            transformer::positional::Positional,
+        },
         model::{Model, test::prove_model},
         padding::PaddingMode,
+        quantization::{AbsoluteMax, ScalingFactor},
+        tensor::{Number, is_close_with_tolerance},
     };
+    use ff_ext::GoldilocksExt2;
+    use proptest::prelude::*;
 
     #[rstest]
     #[case::less_input_than_context_length(14, 17, 31)]
@@ -332,5 +351,156 @@ mod tests {
         model.route_output(None).unwrap();
 
         let _ = prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    #[derive(Clone)]
+    struct Input<T> {
+        seq_len: usize,
+        embedding_size: usize,
+        context_length: usize,
+        input: Tensor<T>,
+        pos: Tensor<T>,
+    }
+
+    impl<T: Debug> Debug for Input<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AbsoluteInput")
+                .field("seq_len", &self.seq_len)
+                .field("embedding_size", &self.embedding_size)
+                .field("context_length", &self.context_length)
+                .finish_non_exhaustive()
+        }
+    }
+
+    fn input<T: Number>() -> impl Strategy<Value = Input<T>> {
+        (1..32usize, 1..64usize).prop_flat_map(|(seq_len, embedding_size)| {
+            (seq_len..=64usize).prop_map(move |context_length| {
+                let input = Tensor::<T>::random(&vec![seq_len, embedding_size].into());
+                let pos = Tensor::<T>::random(&vec![context_length, embedding_size].into());
+                Input {
+                    seq_len,
+                    embedding_size,
+                    context_length,
+                    input,
+                    pos,
+                }
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn test_absolute_f32(input in input::<f32>()) {
+            use crate::layers::transformer::positional::absolute::Absolute;
+            use crate::layers::transformer::positional::PositionalCache;
+            use std::sync::{Arc, Mutex};
+
+            let Input { seq_len, embedding_size, input, pos, .. } = input.clone();
+            let layer = Absolute::<f32>::new(pos.clone());
+
+            let cache = Arc::new(Mutex::new(PositionalCache::new()));
+            let out = layer
+                .evaluate::<GoldilocksExt2>(&input, &vec![seq_len, embedding_size].into(), &cache)
+                .expect("absolute evaluate should succeed")
+                .outputs
+                .pop()
+                .unwrap();
+
+            let in_data = input.data();
+            let pos_data = pos.data();
+            let mut expected_data = Vec::with_capacity(seq_len * embedding_size);
+            for i in 0..seq_len { for j in 0..embedding_size {
+                expected_data.push(in_data[i * embedding_size + j] + pos_data[i * embedding_size + j]);
+            }}
+            let expected = Tensor::new(vec![seq_len, embedding_size].into(), expected_data);
+            let close = is_close_with_tolerance(out.data(), expected.data(), 1e-6, 1e-5);
+            prop_assert!(close);
+        }
+
+        #[test]
+        fn test_absolute_element(input in input::<f32>()) {
+            use crate::layers::transformer::positional::absolute::Absolute;
+            use crate::layers::transformer::positional::PositionalCache;
+            use crate::tensor::TensorSlice;
+            use std::sync::{Arc, Mutex};
+
+            let Input { seq_len, embedding_size, input, pos, .. } = input.clone();
+            let layer = Absolute::<f32>::new(pos.clone());
+            let input_sf = ScalingFactor::from_tensor(&input, None);
+            let q = layer
+                .quantize::<AbsoluteMax>(&(), 0.into(), input_sf)
+                .expect("quantize absolute should succeed");
+            let layer_q = q.quantized_op;
+            let input_q = input.to_quantized(&input_sf);
+
+            let (pos_q, add_q, unpadded) = (layer_q.positional.clone(), &layer_q.add_layer, layer_q.unpadded_shape.clone());
+            let sub_slice = TensorSlice::from(&pos_q).slice_over_first_dim(0, seq_len);
+            let sub_pos_q = Tensor::new(sub_slice.get_shape(), sub_slice.get_data().to_vec());
+
+            let cache = Arc::new(Mutex::new(PositionalCache::new()));
+            let out = layer_q
+                .evaluate::<GoldilocksExt2>(&input_q, &vec![seq_len, embedding_size].into(), &cache)
+                .expect("quantized absolute evaluate should succeed")
+                .outputs
+                .pop()
+                .unwrap();
+
+            let expected = add_q
+                .evaluate::<GoldilocksExt2>(&[&input_q, &sub_pos_q], &vec![unpadded.clone(); 2])
+                .expect("quantized add evaluate should succeed")
+                .outputs
+                .pop()
+                .unwrap();
+            prop_assert_eq!(out, expected);
+        }
+
+        #[test]
+        fn test_absolute_padding_prop(input in input::<Element>()) {
+            use crate::layers::transformer::positional::absolute::Absolute;
+            use crate::padding::{ShapeData, ShapeInfo};
+
+            let Input { seq_len, embedding_size, pos: positional_matrix, .. } = input.clone();
+
+            let layer = Absolute::<Element>::new(positional_matrix.clone());
+
+            let mut si = ShapeInfo::from(vec![ShapeData::new(vec![seq_len, embedding_size].into())].as_slice());
+            let padded_layer = PadOp::pad_node(layer, &mut si).expect("pad_node should succeed");
+
+            let padded_shape = padded_layer.positional.shape();
+            prop_assert_eq!(&padded_layer.unpadded_shape, positional_matrix.shape());
+            prop_assert_eq!(padded_shape, &positional_matrix.shape().next_power_of_two());
+
+            for i in 0..padded_shape[0] {
+                for j in 0..padded_shape[1] {
+                    if i < padded_layer.unpadded_shape[0] && j < padded_layer.unpadded_shape[1] {
+                        prop_assert_eq!(padded_layer.positional.get_2d(i, j), positional_matrix.get_2d(i, j));
+                    } else {
+                        prop_assert_eq!(padded_layer.positional.get_2d(i, j), 0);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn test_absolute_proving_prop(input in input::<f32>()) {
+            use crate::layers::Layer;
+            use crate::layers::transformer::positional::Positional;
+            use crate::padding::PaddingMode;
+
+            let Input { seq_len, embedding_size, pos: positional_matrix, .. } = input.clone();
+            prop_assume!(seq_len >= 2 && embedding_size >= 2);
+
+            let input_shape = vec![seq_len, embedding_size];
+            let mut model = Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
+
+            model
+                .add_consecutive_layer(Layer::Positional(Positional::new_absolute(positional_matrix)), None)
+                .expect("add layer");
+            model.route_output(None).expect("route output");
+
+            let _ = prove_model(model, &mut GenStore::default()).expect("prove model");
+        }
     }
 }

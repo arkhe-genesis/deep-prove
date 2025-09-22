@@ -728,6 +728,68 @@ mod norm_layer {
 }
 
 #[divan::bench_group]
+mod positional_absolute_layer {
+    use core::slice;
+    use ff_ext::GoldilocksExt2;
+    use zkml::{
+        ScalingFactor, Shape, Tensor,
+        layers::{
+            provable::{Evaluate, QuantizeOp},
+            transformer::positional::Positional,
+        },
+        quantization::AbsoluteMax,
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2; // emb = size
+        let context = size * 2;
+
+        let pos = Tensor::<f32>::random(&Shape::new(vec![context, size]));
+        let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
+        let input = input_f32.to_quantized(&input_scaling);
+        let input_shape = slice::from_ref(input.shape());
+
+        bencher
+            .with_inputs(|| {
+                QuantizeOp::quantize_op::<AbsoluteMax>(
+                    Positional::<f32>::new_absolute(pos.clone()),
+                    &(),
+                    0usize.into(),
+                    &[input_scaling],
+                )
+                .expect("Quantize Positional")
+                .quantized_op
+            })
+            .bench_refs(|layer| {
+                layer
+                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .expect("Positional should succeed");
+            });
+    }
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2; // emb = size
+        let context = size * 2;
+
+        let pos = Tensor::<f32>::random(&Shape::new(vec![context, size]));
+
+        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
+        bencher
+            .with_inputs(|| Positional::<f32>::new_absolute(pos.clone()))
+            .bench_refs(|layer| {
+                layer
+                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .expect("Positional should succeed");
+            });
+    }
+}
+
+#[divan::bench_group]
 mod permute_layer {
     use core::slice;
     use std::ops::Range;
