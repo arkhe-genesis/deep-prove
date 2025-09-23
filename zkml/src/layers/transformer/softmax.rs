@@ -1636,8 +1636,7 @@ impl<N: Number> AttentionMask<N> {
         let correct_num_dims = num_dims == 2 || num_dims == 3;
         ensure!(
             correct_num_dims,
-            "In order to create an Attention Mask the input should have either 2 or 3 dimensions, got: {}",
-            num_dims
+            "In order to create an Attention Mask the input should have either 2 or 3 dimensions, got: {num_dims}"
         );
 
         // Now check that either the final two dimensions are the same or the second to last dimension is 1
@@ -1746,8 +1745,7 @@ impl AttentionMask<f32> {
         let expected = rows * last;
         ensure!(
             self.tril.get_data().len() == expected && self.bias.get_data().len() == expected,
-            "Mask shapes do not match input when flattened (expected {} elements)",
-            expected
+            "Mask shapes do not match input when flattened (expected {expected} elements)"
         );
         let tril_bt: BTensor<Backend, 2, BFloat> = BTensor::from_data(
             TensorData::new(self.tril.get_data().to_vec(), [rows, last]),
@@ -1769,8 +1767,7 @@ impl AttentionMask<Element> {
         let expected = rows * last;
         ensure!(
             self.tril.get_data().len() == expected && self.bias.get_data().len() == expected,
-            "Mask shapes do not match input when flattened (expected {} elements)",
-            expected
+            "Mask shapes do not match input when flattened (expected {expected} elements)"
         );
         let tril_bt: BTensor<Backend, 2, BInt> = BTensor::from_data(
             TensorData::new(self.tril.get_data().to_vec(), [rows, last]),

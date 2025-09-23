@@ -143,7 +143,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
         }
         // Run the PCS batch_verify protocol
         PCS::batch_verify(&ctx.verifier_params, rounds, &pcs_proof, transcript)
-            .map_err(|e| anyhow!("{:?}", e))
+            .map_err(|e| anyhow!("{e:?}"))
     }
 
     fn verify_model_sumcheck<T: Transcript<E>>(

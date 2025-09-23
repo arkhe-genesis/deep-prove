@@ -196,9 +196,7 @@ impl<T> MatMul<T> {
         if let (Some(left_cols), Some(right_rows)) = (left_matrix.ncols(), right_matrix.nrows()) {
             ensure!(
                 left_cols == right_rows,
-                "Number of columns in left matrix different from number of rows of right matrix: {} != {}",
-                left_cols,
-                right_rows,
+                "Number of columns in left matrix different from number of rows of right matrix: {left_cols} != {right_rows}",
             );
         }
         // check that we don't have 2 weight matrix being multiplied
@@ -290,9 +288,7 @@ impl<T> MatMul<T> {
         let right_rows = right.shape().dims[1];
         ensure!(
             left_rows == right_cols,
-            "Incompatible shape found for input matrix: expected {:?}, found {:?}",
-            left_rows,
-            right_cols,
+            "Incompatible shape found for input matrix: expected {left_rows:?}, found {right_cols:?}",
         );
         let matmul = left.matmul(right);
         let res = if let Some(bias) = self.bias.as_ref() {
@@ -789,15 +785,11 @@ impl MatMul<Element> {
         let (nrows_out, ncols_out) = (output.nrows_2d(), output.ncols_2d());
         ensure!(
             nrows_out == nrows_left,
-            "Wrong number of rows in output matrix: expected {}, found {}",
-            nrows_left,
-            nrows_out,
+            "Wrong number of rows in output matrix: expected {nrows_left}, found {nrows_out}",
         );
         ensure!(
             ncols_out == ncols_right,
-            "Wrong number of columns in output matrix: expected {}, found {}",
-            ncols_right,
-            ncols_out,
+            "Wrong number of columns in output matrix: expected {ncols_right}, found {ncols_out}",
         );
         let num_vars_2d = output.shape().num_vars_2d();
         let num_vars_out = num_vars_2d.0 + num_vars_2d.1;

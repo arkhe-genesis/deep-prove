@@ -113,10 +113,6 @@ fn conv2d_i_out_shape(
         channels_in == channels_out,
         "Grouping is currently not supported. channels in {channels_in} out {channels_out}",
     );
-    assert!(
-        batch_size == feature_maps,
-        "Bias dimension must match number of kernels. got {batch_size} expected {feature_maps}",
-    );
 
     // see [tensor::Tensor::conv2d] for details of the formula below
     let height_out = (height_in - kernel_height) / config.stride + 1;

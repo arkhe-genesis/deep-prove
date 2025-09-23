@@ -538,7 +538,7 @@ where
                 step_data,
             } = trace
                 .get_step(&node_id)
-                .ok_or(anyhow!("Step in trace not found for node {}", node_id))?;
+                .ok_or(anyhow!("Step in trace not found for node {node_id}"))?;
             trace!(
                 "Proving node with id {node_id}: {:?}",
                 node_operation.describe()

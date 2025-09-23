@@ -111,7 +111,7 @@ where
             let node_proof = proof
                 .steps
                 .get(&node_id)
-                .ok_or(anyhow!("Proof for node {} not found", node_id))?;
+                .ok_or(anyhow!("Proof for node {node_id} not found"))?;
             if let Some((num, denom)) = node_proof.get_lookup_data() {
                 numerators.extend(num.into_iter());
                 denominators.extend(denom.into_iter());
@@ -211,7 +211,7 @@ where
                 proof
                     .steps
                     .get(&node_id)
-                    .ok_or(anyhow!("Proof for node {} not found", node_id))?
+                    .ok_or(anyhow!("Proof for node {node_id} not found"))?
             } else {
                 &LayerProof::Dummy
             };
@@ -304,9 +304,7 @@ where
 
         ensure!(
             final_num == E::ZERO,
-            "Final numerator was non-zero, got: {:?} - numerator.len(): {}",
-            final_num,
-            num_len
+            "Final numerator was non-zero, got: {final_num:?} - numerator.len(): {num_len}"
         );
         ensure!(
             final_denom != E::ZERO,

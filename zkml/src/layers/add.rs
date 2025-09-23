@@ -167,9 +167,7 @@ impl Evaluate<f32> for Add<f32> {
 
             ensure!(
                 left_shape.product() == right_shape.product(),
-                "Add layer expects inputs to have the same shape: {:?} vs {:?}",
-                left_shape,
-                right_shape,
+                "Add layer expects inputs to have the same shape: {left_shape:?} vs {right_shape:?}",
             );
             right
         } else if inputs.len() == 1 {
@@ -180,9 +178,7 @@ impl Evaluate<f32> for Add<f32> {
             let operand_shape = operand.shape();
             ensure!(
                 shape.product() == operand_shape.product(),
-                "Add layer expects input and operand to have the same shape: {:?} vs {:?}",
-                shape,
-                operand_shape,
+                "Add layer expects input and operand to have the same shape: {shape:?} vs {operand_shape:?}",
             );
             operand
         } else {

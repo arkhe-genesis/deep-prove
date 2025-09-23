@@ -17,13 +17,11 @@ pub fn unfuse_crate_tensors(
 
     ensure!(
         expected_chunk_len_elements > 0,
-        "expected_chunk_len_elements must be positive, got {}",
-        expected_chunk_len_elements
+        "expected_chunk_len_elements must be positive, got {expected_chunk_len_elements}"
     );
     ensure!(
         num_chunks > 0,
-        "num_chunks must be positive, got {}",
-        num_chunks
+        "num_chunks must be positive, got {num_chunks}"
     );
 
     let expected_total_elements = expected_chunk_len_elements * num_chunks;

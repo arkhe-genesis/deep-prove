@@ -888,7 +888,7 @@ impl LookupContext {
                     constant_challenge,
                     column_separation_challenge,
                 )
-                .map_err(|e| anyhow!("{:?}", e))
+                .map_err(|e| anyhow!("{e:?}"))
             })
             .collect::<Result<Vec<LogUpInput<E>>, anyhow::Error>>()
     }

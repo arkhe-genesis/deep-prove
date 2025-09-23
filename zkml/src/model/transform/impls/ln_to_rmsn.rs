@@ -77,7 +77,7 @@ impl ModelTransform<f32> for LayerNormToRMSNorm {
                         POSITIONAL_LAYER => {
                             positional_was_previous_layer(&mut model, *input_node_id)?;
                         }
-                        layer_name => bail!("Unexpected layer type: {}", layer_name),
+                        layer_name => bail!("Unexpected layer type: {layer_name}"),
                     }
                 } else {
                     // LayerNorm should have an input node so we return an error if it doesn't
@@ -160,7 +160,7 @@ fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) -> Resu
                     }
                     ADD_LAYER | POSITIONAL_LAYER => Ok(()),
 
-                    _ => bail!("Expected MatMul or Add layer, found {}", add_input_op_name),
+                    _ => bail!("Expected MatMul or Add layer, found {add_input_op_name}"),
                 }
             }
             None => bail!("Expected input node for Add layer, found None"),

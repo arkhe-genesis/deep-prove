@@ -128,7 +128,7 @@ where
                     }
                     Err(e) => {
                         // transmit the error back to the main thread
-                        let err = anyhow::anyhow!("Error running node {:?}: {}", node_idx, e);
+                        let err = anyhow::anyhow!("Error running node {node_idx:?}: {e}");
                         outputs_sender.send(Err(err)).unwrap();
                         return;
                     }

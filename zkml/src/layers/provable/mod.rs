@@ -323,7 +323,7 @@ impl<E: ExtensionField> NodeCtx<E> {
             out.edges.iter().map(|edge| {
                 anyhow::Ok(if let Some(id) = &edge.node {
                 let claims_for_node = claims_by_node.get(id).ok_or(
-                    anyhow!("No claims found for layer {}", id)
+                    anyhow!("No claims found for layer {id}")
                 )?;
                 ensure!(edge.index < claims_for_node.len(),
                     "Not enough claims found for node {}: required claim for input {}, but {} claims found",
@@ -363,7 +363,7 @@ impl<E: ExtensionField> NodeCtx<E> {
                 if edge.node.is_none() {
                     let claims_for_node = claims_by_node
                         .get(&node_id)
-                        .ok_or(anyhow!("Claim not found for node {}", node_id))?;
+                        .ok_or(anyhow!("Claim not found for node {node_id}"))?;
                     node_claims.push((edge.index, &claims_for_node[i]));
                     input_edges.insert(edge.index);
                 }

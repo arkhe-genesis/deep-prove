@@ -325,9 +325,7 @@ where
         for (i, input_edge) in node.inputs.iter().enumerate() {
             if let Some(input_node_id) = &input_edge.node {
                 let input_node = self.nodes.get_mut(input_node_id).ok_or(anyhow!(
-                    "Node {} for input {} of new node not found in model",
-                    input_node_id,
-                    i,
+                    "Node {input_node_id} for input {i} of new node not found in model",
                 ))?;
                 ensure!(
                     input_edge.index < input_node.outputs.len(),
@@ -474,7 +472,7 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 try_unzip(node.inputs.iter().map(|edge| {
                     Ok(if let Some(n) = &edge.node {
                         let Some(step) = trace.get_step(n) else {
-                            anyhow::bail!("Node {} not found in trace", n);
+                            anyhow::bail!("Node {n} not found in trace");
                         };
 
                         let out_shape = step.step_data.unpadded_output_shapes[edge.index].clone();
@@ -531,7 +529,7 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
         for (id, out_node) in output_nodes {
             let node_outputs = trace
                 .get_step(&id)
-                .ok_or(anyhow!("Output node {} not found in trace", id))?
+                .ok_or(anyhow!("Output node {id} not found in trace"))?
                 .outputs();
             ensure!(
                 node_outputs.len() == out_node.outputs.len(),

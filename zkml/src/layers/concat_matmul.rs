@@ -279,8 +279,7 @@ impl MatrixPermutations {
         );
         ensure!(
             num_entries_mat_mul_dimension.is_power_of_two(),
-            "Number of columns in the mat mul dimension must be a power of two, found {}",
-            num_entries_mat_mul_dimension
+            "Number of columns in the mat mul dimension must be a power of two, found {num_entries_mat_mul_dimension}"
         );
         let num_vars = num_entries_mat_mul_dimension.ilog2() as usize;
 
@@ -528,9 +527,7 @@ impl ConcatMatMul {
         let num_rows_right = inputs[1].as_ref().shape()[self.permutations.right.mat_mul_dimension];
         ensure!(
             num_columns_left == num_rows_right,
-            "ConcatMatMul: found different mat mul dimensions in left and right input matrix {} vs {}",
-            num_columns_left,
-            num_rows_right
+            "ConcatMatMul: found different mat mul dimensions in left and right input matrix {num_columns_left} vs {num_rows_right}"
         );
 
         // create the beta vector necessary for the batched matrix multiplication
@@ -711,9 +708,7 @@ impl ProveInfo for ConcatMatMul {
 
         ensure!(
             num_columns_left == num_rows_right,
-            "ConcatMatMul: number of columns in left matrix chunk different from number of rows in right matrix chunk: {} vs {}",
-            num_columns_left,
-            num_rows_right,
+            "ConcatMatMul: number of columns in left matrix chunk different from number of rows in right matrix chunk: {num_columns_left} vs {num_rows_right}",
         );
 
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);

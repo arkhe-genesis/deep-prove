@@ -98,11 +98,11 @@ where
         let m = Metrics::new();
         let (prover_params, verifier_params) = {
             let param = PCS::setup(max_poly_size, mpcs::SecurityLevel::Conjecture100bits)
-                .map_err(|e| anyhow!("{:?}", e))
+                .map_err(|e| anyhow!("{e:?}"))
                 .context("setting up params")?;
 
             PCS::trim(param, max_poly_size)
-                .map_err(|e| anyhow!("{:?}", e))
+                .map_err(|e| anyhow!("{e:?}"))
                 .context("trimming params")?
         };
         debug!("{} PPs & VPs built", m.to_span());
@@ -176,7 +176,7 @@ where
             // Build the batch commitment
             let m = Metrics::new();
             let model_commitment = PCS::batch_commit(&prover_params, rmms)
-                .map_err(|e| anyhow!("{:?}", e))
+                .map_err(|e| anyhow!("{e:?}"))
                 .context("Batch Commitment")?;
             debug!("{} model commitment built", m.to_span());
             (Some(model_commitment), model_comms_map)

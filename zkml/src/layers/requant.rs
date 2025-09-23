@@ -758,7 +758,7 @@ impl Requant {
         let res = input
             .get_data()
             .iter().enumerate()
-            .map(|(i,e)| {if e.abs() <= max_abs_val {Ok(self.apply(e))} else {Err(anyhow!("Could not apply requantisation, tensor element {} had absolute value too large, given value: {}, max value: {}", i, e, max_abs_val))}})
+            .map(|(i,e)| {if e.abs() <= max_abs_val {Ok(self.apply(e))} else {Err(anyhow!("Could not apply requantisation, tensor element {i} had absolute value too large, given value: {e}, max value: {max_abs_val}"))}})
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
         Ok(Tensor::<Element>::new(input.shape().clone(), res))

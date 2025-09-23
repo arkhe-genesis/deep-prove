@@ -305,8 +305,7 @@ fn compute_node_input_shapes(
         .map(|edge| {
             Ok(if let Some(node_id) = &edge.node {
                 let node_shapes = shapes.get(node_id).ok_or(anyhow!(
-                    "Node {} not found in set of previous shapes",
-                    node_id
+                    "Node {node_id} not found in set of previous shapes"
                 ))?;
                 ensure!(
                     edge.index < node_shapes.len(),

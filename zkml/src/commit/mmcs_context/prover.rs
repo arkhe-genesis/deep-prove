@@ -182,7 +182,7 @@ where
                 .collect(),
             transcript,
         )
-        .map_err(|e| anyhow!("{:?}", e))?;
+        .map_err(|e| anyhow!("{e:?}"))?;
 
         Ok(ModelOpeningProof {
             sumcheck_proof,

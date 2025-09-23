@@ -701,7 +701,7 @@ fn downcast_to<T: Op>(node: &OnnxNode) -> Result<&T> {
 fn tdim_to_usize(tdim: &TDim) -> anyhow::Result<usize> {
     match tdim {
         TDim::Val(v) => Ok(*v as usize),
-        _ => bail!("Unsupported dimension: {:?}", tdim),
+        _ => bail!("Unsupported dimension: {tdim:?}"),
     }
 }
 

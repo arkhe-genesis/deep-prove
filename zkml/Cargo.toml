@@ -21,7 +21,7 @@ path = "src/bin/bench-llm.rs"
 default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
 capture-layers-quant = []
-cpu = ["burn/ndarray"]
+cpu = ["burn/ndarray", "dep:burn-ndarray"]
 gpu = [
   "burn/wgpu",
   "burn/fusion",
@@ -37,15 +37,19 @@ ahash = "0.8.12"
 anyhow.workspace = true
 ark-std.workspace = true
 average = { version = "0.16.0", features = ["std"] }
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false }
-burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false, optional = true }
-burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false, optional = true }
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "3a2a1a8941d4361b17e3aa02f7c89f5519e7d5c0", default-features = false }
+burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "3a2a1a8941d4361b17e3aa02f7c89f5519e7d5c0", default-features = false, optional = true }
+burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "3a2a1a8941d4361b17e3aa02f7c89f5519e7d5c0", default-features = false, optional = true }
+burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "3a2a1a8941d4361b17e3aa02f7c89f5519e7d5c0", optional = true, default-features = false, features = [
+  "std",
+  "multi-threads",
+] }
 candle-core = "0.9.1"
 ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 crossbeam-channel = "0.5.15"
 csv.workspace = true
-cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "d1273b10a233e3c1bd40243bed66d206302d7989", optional = true }
+cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "ad03f7892f4069d3406f936fd9fa3ac3b090c1fe", optional = true }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }
@@ -85,11 +89,12 @@ utils = { path = "../utils" }
 witness = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "3a2a1a8941d4361b17e3aa02f7c89f5519e7d5c0", default-features = false, features = [
   "metal",
 ] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "08d57d86a5b208c830deebcfc7f31af65f24fe00", default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "3a2a1a8941d4361b17e3aa02f7c89f5519e7d5c0", default-features = false, features = [
+  # "cuda",
   "vulkan",
 ] }
 

@@ -191,7 +191,7 @@ impl LLMVariant {
         match name.to_lowercase() {
             a if GEMMA3_VARIANTS.iter().any(|v| a.contains(v)) => Ok(Self::Gemma3),
             _ if GPT2_VARIANTS.contains(&name) => Ok(Self::GPT2),
-            _ => bail!("unsupported architecture variant: {:?}", name),
+            _ => bail!("unsupported architecture variant: {name:?}"),
         }
     }
 

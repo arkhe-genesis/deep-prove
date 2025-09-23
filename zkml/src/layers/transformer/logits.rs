@@ -813,9 +813,7 @@ impl LogitsCtx {
                     let token_value = token.to_canonical_u64_vec()[0] as usize;
                     if token_value >= unpadded_dim_size {
                         bail!(
-                            "Token value {} exceeds unpadded dimension size {}",
-                            token_value,
-                            unpadded_dim_size
+                            "Token value {token_value} exceeds unpadded dimension size {unpadded_dim_size}"
                         );
                     }
                     let selector = b1 * column_beta[token_value];
@@ -871,7 +869,7 @@ impl LogitsCtx {
             column_separation_challenge,
             1,
         )
-        .map_err(|e| anyhow!("{:?}", e))
+        .map_err(|e| anyhow!("{e:?}"))
     }
 }
 

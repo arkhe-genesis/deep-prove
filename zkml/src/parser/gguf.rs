@@ -66,9 +66,7 @@ pub fn unfuse_tensors(
     let num_elements = data.len();
     ensure!(
         num_elements % chunk_len == 0,
-        "Total elements {} is not divisible by chunk_len {} for unfusing",
-        num_elements,
-        chunk_len
+        "Total elements {num_elements} is not divisible by chunk_len {chunk_len} for unfusing"
     );
     let tensors: Vec<Vec<f32>> = data
         .chunks_exact(chunk_len)
@@ -208,16 +206,12 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     pub(crate) fn get_qtensor(&self, name: &str) -> anyhow::Result<Arc<QTensor>> {
         let full_name = format!("{}{}", self.current_prefix, name);
         let mut reader_guard = self.reader.lock().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to acquire reader lock for tensor '{}': {}",
-                full_name,
-                e
-            )
+            anyhow::anyhow!("Failed to acquire reader lock for tensor '{full_name}': {e}")
         })?;
         self.content
             .tensor(&mut *reader_guard, &full_name, &self.device)
             .map(Arc::new)
-            .map_err(|e| anyhow::anyhow!("Failed to load QTensor '{}' from GGUF: {}", full_name, e))
+            .map_err(|e| anyhow::anyhow!("Failed to load QTensor '{full_name}' from GGUF: {e}"))
     }
 
     /// Retrieves and dequantizes a tensor by its name relative to the current scope.
