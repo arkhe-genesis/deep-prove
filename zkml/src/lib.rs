@@ -19,11 +19,14 @@ pub mod iop;
 pub mod layers;
 pub mod lookup;
 pub mod model;
+pub mod number;
 pub mod padding;
 pub mod parser;
 pub mod quantization;
 pub mod shape;
 pub mod tensor;
+use crate::number::Number;
+use std::cmp::Ordering;
 
 // Re-exports
 pub use iop::{
@@ -239,9 +242,6 @@ impl NextPowerOfTwo for Vec<usize> {
         self.iter().map(|&i| i.next_power_of_two()).collect()
     }
 }
-
-use crate::tensor::Number;
-use std::cmp::Ordering;
 
 #[cfg(test)]
 static INIT: std::sync::Once = std::sync::Once::new();

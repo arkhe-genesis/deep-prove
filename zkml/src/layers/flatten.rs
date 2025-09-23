@@ -6,8 +6,9 @@ use crate::{
     Element, Shape, Tensor,
     iop::context::ContextAux,
     layers::LayerCtx,
+    number::Number,
     padding::{PaddingMode, ShapeInfo, reshape},
-    tensor::{IntoBTensor, Number},
+    tensor::IntoBTensor,
 };
 
 use super::provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProveInfo};

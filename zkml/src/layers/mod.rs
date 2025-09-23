@@ -60,9 +60,10 @@ use crate::{
     },
     lookup::context::LookupWitnessGen,
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, InferenceTracker, ModelMetadata, ScalingFactor},
-    tensor::{ConvFFTData, DryTensor, Number},
+    tensor::{ConvFFTData, DryTensor},
 };
 use activation::ActivationCtx;
 use convolution::{ConvCtx, ConvProof};

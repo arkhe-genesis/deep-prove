@@ -26,12 +26,12 @@ use crate::{
     Element, Shape, Tensor,
     layers::{Layer, provable::Evaluate},
     model::{InferenceTrace, Model},
+    number::Number,
     padding::pad_model,
     parser::{
         gguf, json,
         llm::{LLMConfig, LLMTokenizer, Token},
     },
-    tensor::Number,
 };
 
 pub trait Observer<N: Number> {

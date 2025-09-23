@@ -201,7 +201,7 @@ mod embeddings_layer {
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::embeddings::Embeddings},
-        tensor::Number,
+        number::Number,
     };
 
     use crate::{Args, default_sizes};

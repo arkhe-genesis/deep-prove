@@ -31,9 +31,9 @@ use crate::{
         },
     },
     model::StepData,
+    number::Number,
     padding::PaddingMode,
     quantization::{self, Fieldizer, ScalingFactor},
-    tensor::Number,
     to_base,
 };
 

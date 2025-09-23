@@ -24,9 +24,9 @@ use crate::{
     },
     lookup::context::LookupWitnessGen,
     model::StepData,
+    number::Number,
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
-    tensor::Number,
 };
 use anyhow::{anyhow, bail, ensure};
 use ff_ext::{ExtensionField, FieldFrom};

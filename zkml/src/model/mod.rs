@@ -14,9 +14,10 @@ use crate::{
         provable::{Edge, Evaluate, Node, NodeCtx, NodeId, OpInfo},
         requant::Requant,
     },
+    number::Number,
     padding::PaddingMode,
     quantization::InferenceTracker,
-    tensor::{DryTensor, Number},
+    tensor::DryTensor,
     try_unzip,
 };
 
@@ -610,10 +611,10 @@ pub(crate) mod test {
             provable::{Edge, Node, OpInfo, evaluate_layer},
             requant::Requant,
         },
+        number::Number,
         padding::{PaddingMode, pad_model},
         quantization::{self, InferenceObserver},
         rng_from_env_or_random,
-        tensor::Number,
         testing::{Pcs, random_bool_vector, random_vector},
         util::from_mle_list_dimensions,
         verify,

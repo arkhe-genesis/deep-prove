@@ -22,9 +22,9 @@ use crate::{
         },
     },
     model::Model,
+    number::Number,
     padding::PaddingMode,
     parser::llm::transformer::Norm,
-    tensor::Number,
 };
 
 #[derive(

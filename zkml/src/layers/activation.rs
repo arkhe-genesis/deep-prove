@@ -18,9 +18,10 @@ use crate::{
         },
     },
     model::StepData,
+    number::Number,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
-    tensor::{DryTensor, Number},
+    tensor::DryTensor,
 };
 use burn::tensor::activation::gelu;
 use either::Either;

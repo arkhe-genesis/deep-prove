@@ -34,7 +34,7 @@ use tracing::trace;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Number, Prover, Shape, Tensor,
+    Claim, Element, Prover, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         context::{ContextAux, ShapeStep},
@@ -48,6 +48,7 @@ use crate::{
         requant::Requant,
     },
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
     tensor::IntoBTensor,
     util::from_mle_list_dimensions,
@@ -929,7 +930,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::tensor::Number;
+    use crate::number::Number;
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};

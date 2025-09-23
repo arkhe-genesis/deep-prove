@@ -8,9 +8,9 @@ use crate::{
     },
     layers::{LayerCtx, LayerProof, requant::Requant},
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
-    tensor::Number,
     util::from_mle_list_dimensions,
 };
 use anyhow::{Result, ensure};

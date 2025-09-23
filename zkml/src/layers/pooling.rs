@@ -14,9 +14,9 @@ use crate::{
         },
     },
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo, pooling},
     quantization::{Fieldizer, IntoElement},
-    tensor::Number,
     to_base,
 };
 use anyhow::{Result, ensure};

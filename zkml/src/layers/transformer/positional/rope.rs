@@ -33,8 +33,9 @@ use crate::{
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
     model::StepData,
+    number::Number,
     quantization::{self, Fieldizer, TensorFielder},
-    tensor::{Number, TensorSlice, is_close_with_tolerance},
+    tensor::{TensorSlice, is_close_with_tolerance},
     util::from_mle_list_dimensions,
 };
 

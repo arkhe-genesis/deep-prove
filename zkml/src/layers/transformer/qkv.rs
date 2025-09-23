@@ -35,12 +35,14 @@ use crate::{
         requant::Requant,
     },
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
-    tensor::{IntoBTensor, Number},
+    tensor::IntoBTensor,
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
 };
+
 /// Short name used to identify the QKV layer
 pub const QKV_LAYER: &str = "_QKV";
 

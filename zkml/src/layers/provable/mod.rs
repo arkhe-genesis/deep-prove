@@ -24,8 +24,9 @@ use crate::{
     },
     lookup::context::LookupWitnessGen,
     model::trace::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo},
-    tensor::{ConvFFTData, Number},
+    tensor::ConvFFTData,
 };
 
 use super::{

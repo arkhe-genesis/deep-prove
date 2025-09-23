@@ -25,8 +25,9 @@ use crate::{
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
     model::StepData,
+    number::Number,
     quantization::TensorFielder,
-    tensor::{IntoBTensor, Number, TensorSlice},
+    tensor::{IntoBTensor, TensorSlice},
 };
 
 /// Data structure containing the proof data for the absolute variant of positional encoding layer
@@ -317,9 +318,10 @@ mod tests {
             transformer::positional::Positional,
         },
         model::{Model, test::prove_model},
+        number::Number,
         padding::PaddingMode,
         quantization::{AbsoluteMax, ScalingFactor},
-        tensor::{Number, is_close_with_tolerance},
+        tensor::is_close_with_tolerance,
     };
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;

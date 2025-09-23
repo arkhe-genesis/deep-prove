@@ -1,9 +1,9 @@
 use crate::{
     layers::provable::{Node, NodeId, QuantizeOp, TrackedDataId},
     model::{Model, ToIterator},
+    number::Number,
     quantization::metadata::{MetadataBuilder, ModelMetadata},
     rng_from_env_or_random,
-    tensor::Number,
 };
 use std::collections::HashMap;
 

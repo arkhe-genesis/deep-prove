@@ -50,11 +50,11 @@ use crate::{
         },
     },
     model::StepData,
+    number::Number,
     padding::PaddingMode,
     parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
     quantization::{self, Fieldizer},
     shape::Shape,
-    tensor::Number,
     to_base,
 };
 

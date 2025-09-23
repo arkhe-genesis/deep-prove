@@ -31,6 +31,7 @@ use crate::{
         },
     },
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo},
     parser::{
         gguf::FileTensorLoader,
@@ -38,7 +39,7 @@ use crate::{
         llm::{LLMConfig, LLMVariant},
     },
     quantization::{Fieldizer, TensorFielder},
-    tensor::{IntoBTensor, Number, TensorSlice},
+    tensor::{IntoBTensor, TensorSlice},
 };
 
 pub(crate) mod absolute;

@@ -3,7 +3,7 @@
 //! certain operations together. This is done by specifying the patterns to fuse, and a fusion function that defines
 //! how to map to the fused operations.
 
-use crate::{model::Model, tensor::Number};
+use crate::{model::Model, number::Number};
 use anyhow::Result;
 use std::fmt::Debug;
 

@@ -14,7 +14,7 @@ use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
-use crate::{Tensor, tensor::Number};
+use crate::{Tensor, number::Number};
 
 use super::provable::{Evaluate, LayerOut, OpInfo};
 

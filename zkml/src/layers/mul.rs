@@ -1,6 +1,6 @@
 use ff_ext::ExtensionField;
 
-use crate::{Tensor, tensor::Number};
+use crate::{Tensor, number::Number};
 
 use super::provable::LayerOut;
 

@@ -45,8 +45,8 @@ use crate::{
         },
     },
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo},
-    tensor::Number,
 };
 
 /// The short name used to identify the embeddings layer

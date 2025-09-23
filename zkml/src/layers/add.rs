@@ -24,9 +24,9 @@ use crate::{
         requant::Requant,
     },
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{self, Fieldizer},
-    tensor::Number,
 };
 
 use super::provable::LayerOut;

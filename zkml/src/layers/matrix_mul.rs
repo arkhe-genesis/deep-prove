@@ -26,9 +26,10 @@ use crate::{
     },
     layers::LayerProof,
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
     quantization::{self, bias_scaling_matmul},
-    tensor::{IntoBTensor, Number},
+    tensor::IntoBTensor,
     util::from_mle_list_dimensions,
 };
 
@@ -1227,9 +1228,9 @@ mod tests {
             provable::Evaluate,
         },
         model::{Model, test::prove_model},
+        number::Number,
         padding::PaddingMode,
         rng_from_env_or_random,
-        tensor::Number,
     };
 
     use super::WeightMatrix;

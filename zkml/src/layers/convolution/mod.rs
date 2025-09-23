@@ -12,11 +12,12 @@ use crate::{
     iop::{context::ContextAux, prover::BatchFFTProof},
     layers::{LayerProof, hadamard, provable::ProvingData, requant::Requant},
     model::StepData,
+    number::Number,
     padding::{PaddingMode, ShapeInfo},
     parser::{check_filter, safe_conv2d_shape},
     quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
     shape::filter_size,
-    tensor::{ConvData, ConvFFTData, Number, Tensor, fft},
+    tensor::{ConvData, ConvFFTData, Tensor, fft},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};

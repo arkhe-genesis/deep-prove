@@ -53,10 +53,10 @@ use crate::{
         logup_gkr::verifier::verify_logup_proof_multiple_sizes,
     },
     model::StepData,
+    number::Number,
     padding::PaddingMode,
     parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
     quantization::{self, Fieldizer},
-    tensor::Number,
 };
 
 use burn::{module::Param, nn::LayerNormConfig as BLayerNormConfig};

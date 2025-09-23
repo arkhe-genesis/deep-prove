@@ -48,6 +48,7 @@ pub(crate) mod manual_attention {
             provable::Evaluate,
         },
         model::Model,
+        number::Number,
         padding::PaddingMode,
         parser::{
             file_cache,
@@ -56,7 +57,7 @@ pub(crate) mod manual_attention {
             llm::{Attention, FeedForward, LLMConfig, transformer::Norm},
         },
         rng_from_env_or_random,
-        tensor::{Number, is_close},
+        tensor::is_close,
     };
 
     use super::{layernorm, mha, qkv};

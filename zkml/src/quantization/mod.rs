@@ -9,7 +9,8 @@ use tracing::warn;
 
 use crate::{
     Element,
-    tensor::{Number, Tensor, TensorSlice, is_close},
+    number::Number,
+    tensor::{Tensor, TensorSlice, is_close},
     to_field,
 };
 pub use metadata::ModelMetadata;
