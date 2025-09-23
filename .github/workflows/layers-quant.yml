@@ -46,6 +46,7 @@ jobs:
           seed="$(date +%s)"
           echo RNG seed: "$seed"
           echo RNG_SEED="$seed" >> "$GITHUB_ENV"
+          echo PROPTEST_RNG_SEED="$seed" >> "$GITHUB_ENV"
 
       - name: 'Checkout PR branch'
         uses: actions/checkout@v3
