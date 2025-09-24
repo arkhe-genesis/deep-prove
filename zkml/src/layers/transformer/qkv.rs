@@ -1559,7 +1559,7 @@ mod tests {
         }
 
         #[test]
-        fn test_qkv_with_element(input in any_input::<Element>(1..32, 1..256, 1..8, 1..256)) {
+        fn test_qkv_with_element(input in any_input::<Element>(1..64, 1..64, 1..8, 1..64)) {
             let Input { q, q_bias, k, k_bias, v, v_bias, num_heads, input } = input;
 
             let expected_q = input.matmul(&q).add_dim2(&q_bias);

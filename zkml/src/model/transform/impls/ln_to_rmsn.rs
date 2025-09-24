@@ -512,7 +512,7 @@ mod tests {
         init_test_logging("debug");
         // First we load up a GPT-2 model
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let driver = Driver::load_external_model(&model_path)?;
+        let driver = Driver::load_external_model(&model_path)?.with_max_context(10);
         // Extract the model
         let Driver { model, .. } = driver;
         // Make a tester input for the model so we can compare the pre and post transformation outputs

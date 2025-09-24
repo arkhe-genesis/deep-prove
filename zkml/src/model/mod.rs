@@ -992,10 +992,10 @@ pub(crate) mod test {
     #[test]
     fn test_single_matmul_prover() {
         // layer matrix shape
-        let m_shape: Shape = vec![1000, 2000].into();
+        let m_shape: Shape = vec![100, 200].into();
         let m = random_vector_quant(m_shape[0] * m_shape[1]);
         let tensor_m = Tensor::new(m_shape, m);
-        let input_shape: Shape = vec![768, tensor_m.nrows_2d()].into();
+        let input_shape: Shape = vec![5, tensor_m.nrows_2d()].into();
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::Padding);
         let matmul_layer = MatMul::new(

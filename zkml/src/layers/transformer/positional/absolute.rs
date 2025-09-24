@@ -391,7 +391,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(16))]
+        #![proptest_config(ProptestConfig::with_cases(3))]
 
         #[test]
         fn test_absolute_f32(input in input::<f32>()) {

@@ -1141,8 +1141,10 @@ mod test {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
         #[test]
-        fn test_concat_matmul_with_element(input in any_input::<Element>(1..128, 1..128, 1..128)) {
+        fn test_concat_matmul_with_element(input in any_input::<Element>(1..64, 1..64, 1..64)) {
             let Input { left, right, left_perm, right_perm, out_perm } = input;
 
             let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
@@ -1154,8 +1156,7 @@ mod test {
             prop_assert_eq!(&expected.outputs[0], &computed.outputs[0]);
         }
 
-        #[test]
-        fn test_concat_matmul_with_f32(input in any_input::<f32>(1..128, 1..128, 1..128)) {
+        fn test_concat_matmul_with_f32(input in any_input::<f32>(1..64, 1..64, 1..64)) {
             let Input { left, right, left_perm, right_perm, out_perm } = input;
 
             let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);

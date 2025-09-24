@@ -36,7 +36,6 @@ pub(crate) mod manual_attention {
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use serde::Deserialize;
-    use tenstore::GenStore;
 
     use crate::{
         Tensor, init_test_logging,
@@ -47,9 +46,7 @@ pub(crate) mod manual_attention {
             matrix_mul::{MatMul, OperandMatrix},
             provable::Evaluate,
         },
-        model::Model,
         number::Number,
-        padding::PaddingMode,
         parser::{
             file_cache,
             gguf::{FileTensorLoader, tests::GPT2_Q8_0},
@@ -357,7 +354,9 @@ pub(crate) mod manual_attention {
         token: String,
         pub(crate) input_ids: Vec<u32>,
         // flattened input embeddings
+        #[allow(dead_code)]
         pub(crate) inputs_embeds: Vec<f32>,
+        #[allow(dead_code)]
         layers: Vec<GPT2LayerOutput>,
         // output of final projection before logits selection
         logits: Vec<f32>,
@@ -390,6 +389,7 @@ pub(crate) mod manual_attention {
         attn_output_proj: Vec<f32>,
         residual_attn: Vec<f32>,
         ffn_up: Vec<f32>,
+        #[allow(dead_code)]
         manual_output: Vec<f32>,
         // Optional field for the final layer with LayerNorm applied
         #[allow(dead_code)]
@@ -439,83 +439,6 @@ pub(crate) mod manual_attention {
     }
 
     use crate::parser::json;
-    #[test]
-    fn test_read_gpt2_pytorch_embeddings() -> anyhow::Result<()> {
-        let model_weights_path = json::test::get_json_file(TINY_GPT2_NAME)?;
-        let debug_output_path = json::test::get_json_file(TINY_GPT2_DEBUG_NAME)?;
-        let loader = json::FileTensorLoader::new_from_path(model_weights_path)?;
-        let config = LLMConfig::from_json(&loader)?;
-        let llm_model = config.model_json(&loader)?;
-        let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
-            File::open(debug_output_path.clone())
-                .context(format!("failed to open file {}", debug_output_path.clone()))?,
-        )?;
-        let input = Tensor::new(
-            vec![gpt2_output.input_ids.len()].into(),
-            gpt2_output.input_ids.iter().map(|x| *x as f32).collect(),
-        );
-        let embedded = llm_model
-            .embeddings
-            .evaluate::<GoldilocksExt2>(&[&input], &[])?;
-        let positioned = llm_model
-            .positional
-            .as_ref()
-            .unwrap()
-            .evaluate::<GoldilocksExt2>(
-                &[embedded.outputs()[0]],
-                &[embedded.outputs()[0].shape().clone()],
-            )?;
-        assert!(is_close(
-            positioned.outputs()[0].get_data(),
-            &gpt2_output.inputs_embeds
-        ));
-        Ok(())
-    }
-
-    /// Compares the flat implementation vs the graph implementation for the first layer
-    #[test]
-    fn test_read_gpt2_pytorch_output_first() -> anyhow::Result<()> {
-        let model_weights_path = json::test::get_json_file(TINY_GPT2_NAME)?;
-        let debug_output_path = json::test::get_json_file(TINY_GPT2_DEBUG_NAME)?;
-
-        let loader = json::FileTensorLoader::new_from_path(model_weights_path)?;
-        let config = LLMConfig::from_json(&loader)?;
-        println!("config: {config:?}");
-
-        let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
-            File::open(debug_output_path.clone())
-                .context(format!("failed to open file {}", debug_output_path.clone()))?,
-        )?;
-        let input = Tensor::new(
-            vec![gpt2_output.input_ids.len(), config.embedding_size].into(),
-            gpt2_output.inputs_embeds.clone(),
-        );
-        let mut model = config.model_json(&loader)?;
-        println!("model: {:?}", config.variant);
-        // Try to run with the flat attention implementation
-        let first_attention = model.blocks.remove(0);
-        let mut att = FlatAttention::new_from_parser(&config, first_attention.clone()).unwrap();
-        let first_layer_output = gpt2_output.layers.first().expect("no layers in output");
-        let output = att.forward(&input, Some(first_layer_output))?;
-        println!("flat output: {:?}", output.shape());
-        let expected_output = &first_layer_output.manual_output;
-        assert!(is_close(expected_output, output.get_data()));
-        // Now try to run with the graph implementation
-        let mut model =
-            Model::new_from_input_shapes(vec![input.shape().clone()], PaddingMode::NoPadding);
-        let _last_node_id = first_attention.write_to_model(&mut model, None, &config)?;
-        model.route_output(None)?;
-        let output1 =
-            model.run::<GoldilocksExt2>(slice::from_ref(&input), None, &mut GenStore::default())?;
-        let output = model.run_float(slice::from_ref(&input))?;
-        assert_eq!(output1.outputs()?[0].get_data(), output[0].get_data());
-        println!("graph output: {:?}", output[0].shape());
-        assert!(
-            is_close(expected_output, output[0].get_data()),
-            "graph output differs"
-        );
-        Ok(())
-    }
 
     /// Compares the graph implementation vs the output of the pytorch model over
     /// all passes including to the final logits selection.

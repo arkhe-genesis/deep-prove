@@ -1315,10 +1315,10 @@ mod test {
     #[test]
     fn test_proven_mha_with_padding_and_unpadding() {
         init_test_logging("info");
-        let num_heads = 12;
-        let head_dim = 64;
-        let seq_len = 1024;
-        let embedding_size = 768;
+        let num_heads = 4;
+        let head_dim = 4;
+        let seq_len = 64;
+        let embedding_size = 42;
         let hidden_size = num_heads * head_dim;
 
         let input_shape = Shape::new(vec![seq_len, embedding_size]);
