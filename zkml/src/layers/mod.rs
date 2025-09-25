@@ -48,6 +48,9 @@ use crate::{
         requant::{REQUANT_LAYER, Requant, RequantProof},
         reshape::{RESHAPE_LAYER, Reshape, ReshapeCtx},
         transformer::{
+            attention::attention_mask::{
+                ATTENTION_MASK_LAYER, AttentionMask, AttentionMaskCtx, AttentionMaskProof,
+            },
             embeddings::{EMBEDDINGS_LAYER, Embeddings, EmbeddingsCtx, EmbeddingsProof},
             layernorm::{LAYERNORM_LAYER, LayerNorm, LayerNormCtx, LayerNormProof},
             logits::{LOGITS_LAYER, Logits, LogitsCtx, LogitsProof},
@@ -94,6 +97,7 @@ pub enum Layer<T> {
     Reshape(Reshape),
     Embeddings(Embeddings<T>),
     Positional(Positional<T>),
+    AttentionMask(AttentionMask<T>),
     Logits(Logits),
 }
 impl<T> Layer<T> {
@@ -117,6 +121,7 @@ impl<T> Layer<T> {
             Layer::Embeddings(_) => EMBEDDINGS_LAYER,
             Layer::Positional(_) => POSITIONAL_LAYER,
             Layer::Logits(_) => LOGITS_LAYER,
+            Layer::AttentionMask(_) => ATTENTION_MASK_LAYER,
         };
         assert_eq!(r.len(), 4, "layer short name must be 4 chars long: {r}");
         r
@@ -159,6 +164,7 @@ pub enum LayerCtx<E: ExtensionField> {
     Reshape(ReshapeCtx),
     Embeddings(EmbeddingsCtx),
     Positional(PositionalCtx),
+    AttentionMask(AttentionMaskCtx<E>),
     Logits(LogitsCtx),
 }
 
@@ -186,6 +192,7 @@ where
     Embeddings(EmbeddingsProof<E>),
     Logits(LogitsProof<E, PCS>),
     Positional(PositionalProof<E>),
+    AttentionMask(AttentionMaskProof<E>),
     Dummy, // To be used for non-provable layers
 }
 
@@ -211,6 +218,7 @@ impl<T> Layer<T> {
             Layer::Embeddings(_) => "embeddings",
             Layer::Positional(_) => "positional",
             Layer::Logits(_) => "logits",
+            Layer::AttentionMask(_) => "attention-mask",
         }
     }
 }
@@ -236,6 +244,7 @@ impl<E: ExtensionField> LayerCtx<E> {
             Self::Requant(_) => "Requant".to_string(),
             Self::Pooling(_) => "Pooling".to_string(),
             Self::Flatten => "Reshape".to_string(),
+            Self::AttentionMask(_) => "AttentionMask".to_string(),
         }
     }
 
@@ -297,7 +306,7 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
         }
     }
 
-    pub fn try_softmax_data(&self) -> Option<&SoftmaxData<E>> {
+    pub fn try_softmax_data(&self) -> Option<&SoftmaxData> {
         match self.proving_data {
             ProvingData::Softmax(ref softmax_data) => Some(softmax_data),
             _ => None,
@@ -482,6 +491,9 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Requant(requant) => requant.output_shapes(input_shapes, padding_mode),
             Layer::Pooling(pooling) => pooling.output_shapes(input_shapes, padding_mode),
             Layer::Flatten(reshape) => reshape.output_shapes(input_shapes, padding_mode),
+            Layer::AttentionMask(attention_mask) => {
+                attention_mask.output_shapes(input_shapes, padding_mode)
+            }
         }
     }
 
@@ -505,6 +517,7 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Requant(requant) => requant.num_outputs(num_inputs),
             Layer::Pooling(pooling) => pooling.num_outputs(num_inputs),
             Layer::Flatten(reshape) => reshape.num_outputs(num_inputs),
+            Layer::AttentionMask(attention_mask) => attention_mask.num_outputs(num_inputs),
         }
     }
 
@@ -528,6 +541,7 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Requant(requant) => requant.describe(),
             Layer::Pooling(pooling) => pooling.describe(),
             Layer::Flatten(reshape) => reshape.describe(),
+            Layer::AttentionMask(attention_mask) => attention_mask.describe(),
         }
     }
 
@@ -551,6 +565,7 @@ impl<N: Number> OpInfo for Layer<N> {
             Layer::Requant(requant) => requant.is_provable(),
             Layer::Pooling(pooling) => pooling.is_provable(),
             Layer::Flatten(reshape) => reshape.is_provable(),
+            Layer::AttentionMask(attention_mask) => attention_mask.is_provable(),
         }
     }
 }
@@ -582,6 +597,9 @@ impl Evaluate<f32> for Layer<f32> {
             Layer::Requant(_) => unreachable!("Requant layer found when evaluating over float"),
             Layer::Pooling(pooling) => pooling.evaluate(inputs, unpadded_input_shapes),
             Layer::Flatten(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
+            Layer::AttentionMask(attention_mask) => {
+                attention_mask.evaluate(inputs, unpadded_input_shapes)
+            }
         }
     }
 }
@@ -613,6 +631,9 @@ impl Evaluate<Element> for Layer<Element> {
             Layer::Requant(requant) => requant.evaluate(inputs, unpadded_input_shapes),
             Layer::Pooling(pooling) => pooling.evaluate(inputs, unpadded_input_shapes),
             Layer::Flatten(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
+            Layer::AttentionMask(attention_mask) => {
+                attention_mask.evaluate(inputs, unpadded_input_shapes)
+            }
         };
 
         #[cfg(feature = "capture-layers-quant")]
@@ -653,6 +674,7 @@ impl ProveInfo for Layer<Element> {
             Layer::Requant(requant) => requant.step_info(id, aux),
             Layer::Pooling(pooling) => pooling.step_info(id, aux),
             Layer::Flatten(reshape) => reshape.step_info(id, aux),
+            Layer::AttentionMask(attention_mask) => attention_mask.step_info(id, aux),
         }
     }
 }
@@ -681,6 +703,9 @@ impl PadOp for Layer<Element> {
             Layer::Pooling(pooling) => Layer::Pooling(pooling.pad_node(si)?),
             Layer::Flatten(flatten) => Layer::Flatten(flatten.pad_node(si)?),
             Layer::Reshape(reshape) => Layer::Reshape(reshape.pad_node(si)?),
+            Layer::AttentionMask(attention_mask) => {
+                Layer::AttentionMask(attention_mask.pad_node(si)?)
+            }
         })
     }
 }
@@ -756,6 +781,9 @@ where
             (Layer::RMSNorm(rmsnorm), LayerCtx::RMSNorm(info)) => {
                 rmsnorm.prove(node_id, info, last_claims, step_data, prover, store)
             }
+            (Layer::AttentionMask(attention_mask), LayerCtx::AttentionMask(info)) => {
+                attention_mask.prove(node_id, info, last_claims, step_data, prover, store)
+            }
 
             _ => bail!(
                 "Incompatible layer {} and ctx {} found for node id {}",
@@ -808,6 +836,9 @@ where
                 assert!(!r.is_provable());
                 Ok(Default::default())
             }
+            Layer::AttentionMask(attention_mask) => {
+                attention_mask.gen_lookup_witness(id, ctx, step_data, store)
+            }
         }
     }
 }
@@ -826,6 +857,7 @@ impl QuantizeOp for Layer<f32> {
                 let output = dense.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::Dense(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::Convolution(convolution) => {
                 let output = convolution.quantize_op::<S>(data, node_id, input_scaling)?;
@@ -834,21 +866,25 @@ impl QuantizeOp for Layer<f32> {
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)
+                .maybe_transform(output.post_quant_rule)
             }
             Layer::MatMul(mat) => {
                 let output = mat.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::MatMul(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::QKV(qkv) => {
                 let output = qkv.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::QKV(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::Mha(mha) => {
                 let output = mha.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::Mha(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::ConcatMatMul(concat_matmul) => {
                 let output = concat_matmul.quantize_op::<S>(data, node_id, input_scaling)?;
@@ -857,6 +893,7 @@ impl QuantizeOp for Layer<f32> {
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)
+                .maybe_transform(output.post_quant_rule)
             }
             Layer::LayerNorm(layernorm) => {
                 let output = layernorm.quantize_op::<S>(data, node_id, input_scaling)?;
@@ -865,26 +902,31 @@ impl QuantizeOp for Layer<f32> {
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)
+                .maybe_transform(output.post_quant_rule)
             }
             Layer::RMSNorm(rmsnorm) => {
                 let output = rmsnorm.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::RMSNorm(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::Softmax(softmax) => {
                 let output = softmax.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::Softmax(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::Add(add) => {
                 let output = add.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::Add(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::Logits(logits) => {
                 let output = logits.quantize_op::<S>(data, node_id, input_scaling)?;
                 QuantizeOutput::new(Layer::Logits(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
             Layer::Positional(positional) => {
                 let output = positional.quantize_op::<S>(data, node_id, input_scaling)?;
@@ -893,6 +935,7 @@ impl QuantizeOp for Layer<f32> {
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)
+                .maybe_transform(output.post_quant_rule)
             }
             Layer::Embeddings(embeddings) => {
                 let output = embeddings.quantize_op::<S>(data, node_id, input_scaling)?;
@@ -901,6 +944,7 @@ impl QuantizeOp for Layer<f32> {
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)
+                .maybe_transform(output.post_quant_rule)
             }
             Layer::Activation(activation) => {
                 let output = activation.quantize_op::<S>(data, node_id, input_scaling)?;
@@ -921,6 +965,15 @@ impl QuantizeOp for Layer<f32> {
             }
             Layer::Reshape(reshape) => {
                 QuantizeOutput::new(Layer::Reshape(reshape), input_scaling.to_vec())
+            }
+            Layer::AttentionMask(attention_mask) => {
+                let output = attention_mask.quantize_op::<S>(data, node_id, input_scaling)?;
+                QuantizeOutput::new(
+                    Layer::AttentionMask(output.quantized_op),
+                    output.output_scalings,
+                )
+                .maybe_requants(output.requant_layer)
+                .maybe_transform(output.post_quant_rule)
             }
         })
     }
@@ -951,6 +1004,7 @@ where
             Self::Requant(_) => "Requant".to_string(),
             Self::Pooling(_) => "Pooling".to_string(),
             Self::Dummy => "Dummy".to_string(),
+            Self::AttentionMask(_) => "AttentionMask".to_string(),
         }
     }
 
@@ -977,6 +1031,7 @@ where
             LayerProof::Requant(RequantProof { logup_proof, .. }) => {
                 Some(logup_proof.fractional_outputs())
             }
+            LayerProof::AttentionMask(_) => None,
         }
     }
 }

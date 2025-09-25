@@ -1,4 +1,6 @@
 use crate::{NextPowerOfTwo, quantization};
+use anyhow::{Result, ensure};
+use ff_ext::ExtensionField;
 use multilinear_extensions::util::ceil_log2;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -110,22 +112,48 @@ impl Shape {
 
     /// Returns the size of a given dimension.
     ///
+    ///
+    /// # Panics
+    ///
+    /// If the given dimensions are out-of-bounds.
+    ///
     /// ```
     /// # use zkml::Shape;
     /// let shape = Shape::new(vec![3, 5, 7]);
     /// assert_eq!(shape.dim(0), 3);
     /// assert_eq!(shape.dim(1), 5);
     /// assert_eq!(shape.dim(2), 7);
+    /// assert_eq!(shape.dim(-1), 7);
+    /// assert_eq!(shape.dim(-2), 5);
+    /// assert_eq!(shape.dim(-3), 3);
     /// ```
+    pub fn dim<I: IntoI32>(&self, index: I) -> usize {
+        let index = self.dim_to_index(index);
+        self.0[index]
+    }
+
+    fn dim_to_index<I: IntoI32>(&self, index: I) -> usize {
+        let i: i32 = index.into_i32();
+        let bound = self.0.len() as i32;
+        assert!(
+            i >= -bound && i < bound,
+            "Index {i} out of bounds (len = {bound})"
+        );
+        if i.is_negative() {
+            // We need to cast to i32 to avoid overflow
+            // it will panic if the index is too negative because
+            // the last "as usize" will panic.
+            (self.0.len() as i32 + i) as usize
+        } else {
+            i as usize
+        }
+    }
+
+    /// Sets the value of a given dimension.
     ///
     /// # Panics
     ///
     /// If the given dimensions are out-of-bounds.
-    pub fn dim(&self, index: usize) -> usize {
-        self.0[index]
-    }
-
-    /// Sets the value of a given dimension.
     ///
     /// ```
     /// # use zkml::Shape;
@@ -133,12 +161,8 @@ impl Shape {
     /// shape.set_dim(1, 10);
     /// assert_eq!(shape.dim(1), 10);
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// If the given dimensions are out-of-bounds.
-    pub fn set_dim(&mut self, index: usize, value: usize) {
-        assert!(index < self.0.len(), "Index out of bounds");
+    pub fn set_dim<I: IntoI32>(&mut self, index: I, value: usize) {
+        let index = self.dim_to_index(index);
         self.0[index] = value;
     }
 
@@ -418,6 +442,31 @@ impl Shape {
             self.ncols_2d().ilog2() as usize,
         )
     }
+
+    /// Given a [Point][mpcs::Point] that corresponds to the [MLE][multilinear_extension::MultilinearExtension] of a [Tensor] with this [`Shape`],
+    /// this method splits the point into its component parts corresponding to each dimension of the [Tensor].
+    pub fn split_point<'a, E: ExtensionField>(&self, point: &'a [E]) -> Result<Vec<&'a [E]>> {
+        // First we check that the point has the same number of elements as the shape's dimensions
+        ensure!(
+            point.len() == self.num_vars().iter().sum::<usize>(),
+            "Point length {} does not match shape number of variables {}",
+            point.len(),
+            self.num_vars().iter().sum::<usize>()
+        );
+
+        // Then we split the point into slices for each dimension
+        let slices = self
+            .iter()
+            .scan(point.len(), |end, &dim| {
+                let start = *end - dim.ilog2() as usize;
+                let slice = &point[start..*end];
+                *end = start;
+                Some(slice)
+            })
+            .collect::<Vec<&[E]>>();
+
+        Ok(slices)
+    }
 }
 
 impl FromIterator<usize> for Shape {
@@ -438,10 +487,31 @@ impl From<&burn::prelude::Shape> for Shape {
     }
 }
 
+/// Given there is no native From<usize> for i32, we need to implement this trait for basic conversions
+pub trait IntoI32 {
+    fn into_i32(self) -> i32;
+}
+
+impl IntoI32 for usize {
+    fn into_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+impl IntoI32 for i32 {
+    fn into_i32(self) -> i32 {
+        self
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::Shape;
+    use crate::{Shape, rng_from_env_or_random};
+    use ark_std::{UniformRand, rand::Rng};
+    use itertools::izip;
     use std::panic::catch_unwind;
+
+    use ff_ext::GoldilocksExt2 as F;
 
     #[test]
     fn test_shape() {
@@ -461,7 +531,40 @@ mod test {
     }
 
     #[test]
-    fn test_squeeze() {
+    fn test_split_point() {
+        let mut rng = rng_from_env_or_random();
+
+        for _ in 0..25 {
+            let rank: usize = rng.gen_range(1..6);
+            let shape: Shape = (0..rank)
+                .map(|_| 1 << rng.gen_range(1..5)) // dimensions between 2 and 16
+                .collect();
+            let individual_dims: Vec<Vec<F>> = shape
+                .num_vars()
+                .iter()
+                .rev()
+                .map(|&num_vars| (0..num_vars).map(|_| F::rand(&mut rng)).collect())
+                .collect();
+
+            let point = individual_dims.concat();
+
+            let split = shape.split_point(&point).unwrap();
+            assert_eq!(split.len(), shape.rank());
+            for (i, (dim, slice, individual)) in
+                izip!(shape.iter(), split, individual_dims.iter().rev()).enumerate()
+            {
+                assert_eq!(slice.len(), dim.ilog2() as usize);
+                assert_eq!(
+                    slice,
+                    individual.as_slice(),
+                    "Slices unequal at dim {i}, dim size was {dim}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_shape_squeeze() {
         let shape = Shape::new(vec![7]);
         for i in [1, 2, 3, 4] {
             let roundtrip = shape.unsqueeze_front(i).squeeze_front(i);

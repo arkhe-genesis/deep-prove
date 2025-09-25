@@ -495,6 +495,7 @@ where
     ) -> anyhow::Result<Proof<E, PCS>> {
         debug!("== Instantiate witness context ==");
 
+        let global_metrics = Metrics::new();
         let metrics = Metrics::new();
         self.ctx.write_to_transcript(self.transcript)?;
 
@@ -522,6 +523,14 @@ where
                 let r_i = self
                     .transcript
                     .read_challenges(out.get_data().len().ilog2() as usize);
+                // let r_i = (0..out.get_data().len().ilog2())
+                //    .map(|_| {
+                //        self.transcript
+                //            .sample_and_append_challenge(b"initial")
+                //            .elements
+                //    })
+                //    .collect::<Vec<E>>();
+                // println!("SECOND r_i: {:?}", r_i);
                 let y_i = out.get_data().to_vec().into_mle().evaluate(&r_i);
                 Claim {
                     point: r_i,
@@ -604,6 +613,10 @@ where
         let span = metrics.to_span();
         stream_metrics("Proof", &span);
         debug!("== Generate proof metrics {} ==", span);
+
+        let global_metrics_span = global_metrics.to_span();
+        stream_metrics("Global", &global_metrics_span);
+        debug!("== Global metrics {} ==", global_metrics_span);
         Ok(output_proof)
     }
 

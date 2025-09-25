@@ -847,6 +847,7 @@ mod softmax_layer {
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::softmax::Softmax},
+        quantization,
     };
 
     use crate::{Args, default_sizes};
@@ -859,8 +860,8 @@ mod softmax_layer {
         let input_shape = slice::from_ref(input.shape());
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
-        let layer = Softmax::<f32>::new()
-            .quantise(input_scaling)
+        let layer = Softmax::<f32>::new(size)
+            .quantise(input_scaling, *quantization::BIT_LEN)
             .expect("Softmax quantise should succeed");
 
         bencher.bench(|| {
@@ -877,7 +878,7 @@ mod softmax_layer {
         let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_shape = slice::from_ref(input.shape());
 
-        let layer = Softmax::new();
+        let layer = Softmax::new(size);
 
         bencher.bench(|| {
             layer

@@ -36,7 +36,7 @@ use crate::{
         transformer::{
             layernorm::{LAYERNORM_OUTPUT_SCALE_FACTOR, LAYERNORM_SCALE_FACTOR},
             rmsnorm::RMSTableData,
-            softmax::{OUTPUT_SCALE_FACTOR, SCALE_FACTOR},
+            softmax::ExpTable,
         },
     },
     lookup::logup_gkr::structs::{LogUpBatchVerifierClaim, LogUpInput},
@@ -56,7 +56,7 @@ pub enum TableType {
     /// Table used for range checking (its size is determined by the quantisation bit size)
     Range,
     /// Table type used for computing Softmax, see the [`SoftmaxTableData`] struct for more info.
-    Softmax(SoftmaxTableData),
+    ExpTable(ExpTable),
     /// Table used for checking the normalisation error in Softmax operations, the first inner [`Element`] is `1` quantised by the scale factor, the second inner [`Element`] is the absolute value of the allowable error
     ErrorTable(Element, Element),
     /// Table used in requantisation
@@ -84,56 +84,6 @@ impl Ord for TableType {
         ) {
             Ordering::Equal => Ord::cmp(&self.name(), &other.name()),
             order => order,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-/// Struct used to store Softmax table data
-pub struct SoftmaxTableData {
-    /// This is the result of calling [`f32::to_bits`] on the temperature value.
-    float_bits: u32,
-    /// The bit length of table size.
-    table_size: usize,
-    /// Any value larger than this gets mapped to zero.
-    bkm: Element,
-}
-
-impl SoftmaxTableData {
-    pub(crate) fn new(float_bits: u32, table_size: usize, bkm: Element) -> SoftmaxTableData {
-        SoftmaxTableData {
-            float_bits,
-            table_size,
-            bkm,
-        }
-    }
-
-    pub(crate) fn float_temperature(&self) -> f32 {
-        f32::from_bits(self.float_bits)
-    }
-
-    pub(crate) fn full_table_size(&self) -> Element {
-        1 << self.table_size
-    }
-
-    pub(crate) fn size(&self) -> usize {
-        self.table_size
-    }
-
-    pub(crate) fn bkm(&self) -> Element {
-        self.bkm
-    }
-
-    pub(crate) fn table_output(&self, j: Element) -> Element {
-        let float_temperature = self.float_temperature();
-        let base: Element = 1 << 16;
-        let bkm = self.bkm();
-        let prod = base * j;
-        if prod >= bkm {
-            0
-        } else {
-            let float_exp = (-prod as f32 / (SCALE_FACTOR as f32 * float_temperature)).exp();
-            (float_exp * OUTPUT_SCALE_FACTOR as f32).round_ties_even() as Element
         }
     }
 }
@@ -215,14 +165,14 @@ impl TableType {
                 vec![field]
             }
 
-            TableType::Softmax(table_data) => {
+            TableType::ExpTable(table_data) => {
                 let table_size = table_data.full_table_size();
 
                 let (in_column, out_column): (Vec<E::BaseField>, Vec<E::BaseField>) = (0
                     ..table_size)
                     .map(|j| {
-                        let out_elem = table_data.table_output(j);
-                        let in_field: E = j.to_field();
+                        let out_elem = table_data.table_output(-j);
+                        let in_field: E = (-j).to_field();
                         let out_field: E = out_elem.to_field();
 
                         (in_field.as_bases()[0], out_field.as_bases()[0])
@@ -316,14 +266,14 @@ impl TableType {
                 })
                 .collect(),
             TableType::Range => (0..1 << *quantization::BIT_LEN).collect(),
-            TableType::Softmax(table_data) => {
+            TableType::ExpTable(table_data) => {
                 let table_size = table_data.full_table_size();
 
                 (0..table_size)
                     .map(|j| {
-                        let out_elem = table_data.table_output(j);
+                        let out_elem = table_data.table_output(-j);
 
-                        j + COLUMN_SEPARATOR * out_elem
+                        -j + COLUMN_SEPARATOR * out_elem
                     })
                     .collect()
             }
@@ -384,8 +334,12 @@ impl TableType {
             TableType::Relu => "Relu".to_string(),
             TableType::GELU(qd) => format!("GELU: {qd:?}"),
             TableType::Range => "Range".to_string(),
-            TableType::Softmax(table_data) => {
-                format!("Softmax - temperature: {}", table_data.float_temperature())
+            TableType::ExpTable(table_data) => {
+                format!(
+                    "ExpTable: log2 Input SF {}, log2 Output SF {}",
+                    table_data.input_sf().log2(),
+                    table_data.output_sf().log2()
+                )
             }
             TableType::ErrorTable(quant_one, allowable_error) => {
                 format!(
@@ -465,18 +419,18 @@ impl TableType {
                 }) - E::from_canonical_u64(1u64 << (size - 1));
                 Ok(vec![first_column])
             }
-            TableType::Softmax(table_data) => {
-                let size = table_data.size();
+            TableType::ExpTable(table_data) => {
+                let size = table_data.table_bit_size();
                 if point.len() != size {
                     return Err(LogUpError::VerifierError(format!(
-                        "Point was not the correct size to produce a softmax table evaluation, point size: {}, expected: {}",
+                        "Point was not the correct size to produce a exp table evaluation, point size: {}, expected: {}",
                         point.len(),
                         size
                     )));
                 }
 
                 Ok(vec![
-                    point.iter().enumerate().fold(E::ZERO, |acc, (index, p)| {
+                    -point.iter().enumerate().fold(E::ZERO, |acc, (index, p)| {
                         acc + *p * E::from_canonical_u64(1u64 << index)
                     }),
                 ])
@@ -560,7 +514,7 @@ impl TableType {
                 // Theres only one column for a range check so we don't need to generate a challenge
                 E::ONE
             }
-            TableType::Softmax(..) => transcript.sample_and_append_challenge(b"Softmax").elements,
+            TableType::ExpTable(..) => transcript.sample_and_append_challenge(b"Exp").elements,
             TableType::ZeroTable => transcript.sample_and_append_challenge(b"Zero").elements,
             TableType::InverseSQRT(..) => {
                 transcript
@@ -584,7 +538,7 @@ impl TableType {
             | TableType::Relu
             | TableType::RequantZeroTable
             | TableType::ZeroTable => *quantization::BIT_LEN,
-            TableType::Softmax(table_data) => table_data.size(),
+            TableType::ExpTable(table_data) => table_data.table_bit_size(),
             TableType::ErrorTable(_, allowable_error) => ceil_log2(2 * *allowable_error as usize),
             TableType::InverseSQRT(..) | TableType::RMSTable(..) => {
                 2 * (*quantization::BIT_LEN - 1) + 1
@@ -597,7 +551,7 @@ impl TableType {
         match self {
             TableType::GELU(..)
             | TableType::InverseSQRT(..)
-            | TableType::Softmax(..)
+            | TableType::ExpTable(..)
             | TableType::ZeroTable
             | TableType::Relu
             | TableType::RequantZeroTable
@@ -618,14 +572,14 @@ impl TableType {
                     out_column,
                 ))
             }
-            TableType::Softmax(table_data) => {
+            TableType::ExpTable(table_data) => {
                 let table_size = table_data.full_table_size();
 
                 let out_column =
-                    to_base::<E, _>((0..table_size).map(|j| table_data.table_output(j)));
+                    to_base::<E, _>((0..table_size).map(|j| table_data.table_output(-j)));
 
                 Some(MultilinearExtension::<E>::from_evaluations_vec(
-                    table_data.size(),
+                    table_data.table_bit_size(),
                     out_column,
                 ))
             }
@@ -676,12 +630,12 @@ impl TableType {
     /// Method that takes all of the claims output by a logup table proof and outputs only those that need to be checked via commitment opening (excluding the multiplicity poly claim)
     pub fn table_claims<E: ExtensionField>(&self, claims: &[Claim<E>]) -> Vec<Claim<E>> {
         match self {
-            TableType::Softmax(..)
+            TableType::ExpTable(..)
             | TableType::ErrorTable(..)
             | TableType::InverseSQRT(..)
             | TableType::GELU(..)
             | TableType::RMSTable(..) => {
-                // For Softmax, InverSQRT and Error Table we just need the output column claim so the last of the slice
+                // For ExpTable, InverSQRT and Error Table we just need the output column claim so the last of the slice
                 vec![claims.last().cloned().unwrap()]
             }
 
@@ -692,7 +646,7 @@ impl TableType {
     pub fn has_committed_claims(&self) -> bool {
         matches!(
             self,
-            TableType::Softmax(..)
+            TableType::ExpTable(..)
                 | TableType::ErrorTable(..)
                 | TableType::InverseSQRT(..)
                 | TableType::GELU(..)
@@ -1065,7 +1019,7 @@ where
     }
 
     // Make the witness gen struct that stores relevant table lookup data
-    debug!("== Witness poly fields generation ==");
+    debug!("== Witness poly commitments generation ==");
     let metrics = Metrics::new();
     let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
     let store = trace.store.clone();
@@ -1116,11 +1070,11 @@ where
     }
 
     debug!(
-        "== Witness poly fields generation metrics {} ==",
+        "== Witness poly commitments generation metrics {} ==",
         metrics.to_span()
     );
 
-    debug!("== Witness table multiplicities generation ==");
+    debug!("== Witness table multiplicities commitment generation ==");
     let metrics = Metrics::new();
     // calculate the table multiplicities
 
@@ -1207,7 +1161,7 @@ where
         .batch_commit(rmms)
         .map_err(|e| LogUpError::ParameterError(format!("{e:?}")))?;
     debug!(
-        "== Witness table multiplicities metrics {} ==",
+        "== Witness table multiplicities commitment metrics {} ==",
         metrics.to_span()
     );
 

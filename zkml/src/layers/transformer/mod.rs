@@ -1,5 +1,6 @@
 use crate::Tensor;
 
+pub mod attention;
 pub mod embeddings;
 pub mod layernorm;
 pub mod logits;
@@ -60,7 +61,6 @@ pub(crate) mod manual_attention {
     use super::{layernorm, mha, qkv};
 
     struct FlatFFN<N> {
-        layernorm: layernorm::LayerNorm<N>,
         up: MatMul<N>,
         activation: GELU<N>,
         down: MatMul<N>,
@@ -69,7 +69,6 @@ pub(crate) mod manual_attention {
 
     impl FlatFFN<f32> {
         pub fn new_from_gguf(_c: &LLMConfig, ffn: FeedForward<f32>) -> Self {
-            let layernorm = ffn.pre_norm;
             let up = {
                 // normally we would do this
                 // Dense::new(ffn.up, ffn.up_bias);
@@ -88,11 +87,8 @@ pub(crate) mod manual_attention {
                 MatMul::new(left, weight).expect("failed to create MatMul")
             };
             let add = add::Add::new();
-            let Norm::LayerNorm(layernorm) = layernorm else {
-                panic!("layernorm is not a LayerNorm while it's json");
-            };
+
             Self {
-                layernorm,
                 up,
                 activation,
                 down,
@@ -105,11 +101,7 @@ pub(crate) mod manual_attention {
             input: &Tensor<f32>,
             output: Option<&GPT2LayerOutput>,
         ) -> anyhow::Result<Tensor<f32>> {
-            let normed = self.layernorm.evaluate::<GoldilocksExt2>(&[input], &[])?;
-            if let Some(gpt2_output) = output {
-                gpt2_output.is_prefnn_layernorm_close(normed.outputs());
-            }
-            let up = self.up.evaluate::<GoldilocksExt2>(&normed.outputs(), &[])?;
+            let up = self.up.evaluate::<GoldilocksExt2>(&[input], &[])?;
             if let Some(gpt2_output) = output {
                 assert!(gpt2_output.is_ffn_up_close(up.outputs()));
             }
@@ -133,7 +125,6 @@ pub(crate) mod manual_attention {
 
     impl<N: Number> FlatFFN<N> {
         pub fn random(hidden_size: usize, up_size: usize) -> Self {
-            let layernorm = layernorm::LayerNorm::random(hidden_size);
             let up = {
                 let weight = OperandMatrix::new_weight_matrix(Tensor::random(
                     &vec![up_size, hidden_size].into(),
@@ -152,7 +143,6 @@ pub(crate) mod manual_attention {
             };
             let add = add::Add::new();
             Self {
-                layernorm,
                 up,
                 activation,
                 down,
@@ -178,6 +168,7 @@ pub(crate) mod manual_attention {
         mha: mha::Mha<N>,
         out: MatMul<N>,
         add: add::Add<N>,
+        pre_ffn_norm: layernorm::LayerNorm<N>,
         ffn: FlatFFN<N>,
     }
 
@@ -205,11 +196,15 @@ pub(crate) mod manual_attention {
             let Norm::LayerNorm(layernorm) = att.pre_norm else {
                 panic!("layernorm is not a LayerNorm while it's json");
             };
+            let Norm::LayerNorm(pre_ffn_norm) = att.pre_ffn_norm else {
+                panic!("layernorm is not a LayerNorm while it's json");
+            };
             Ok(Self {
                 out,
                 hidden_size: c.hidden_size,
                 num_heads: c.num_heads,
                 head_dim: c.head_size,
+                pre_ffn_norm,
                 qkv,
                 layernorm,
                 mha,
@@ -239,7 +234,7 @@ pub(crate) mod manual_attention {
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_qkv_close(qkv.outputs()));
             }
-            let (mha, _, softmax_out, _) = self
+            let (mha, _, _, softmax_out, _) = self
                 .mha
                 .evaluate_with_intermediate_outputs::<GoldilocksExt2>(&qkv.outputs(), &[])?;
 
@@ -278,8 +273,15 @@ pub(crate) mod manual_attention {
             if let Some(gpt2_output) = gpt2_output {
                 ensure!(gpt2_output.is_residual_attn_close(out.outputs()));
             }
+
+            let normed = self
+                .pre_ffn_norm
+                .evaluate::<GoldilocksExt2>(&[input], &[])?;
+            if let Some(gpt2_output) = gpt2_output {
+                gpt2_output.is_prefnn_layernorm_close(normed.outputs());
+            }
             // and then FFN
-            let ffn_out = self.ffn.evaluate(out.outputs()[0], gpt2_output)?;
+            let ffn_out = self.ffn.evaluate(normed.outputs()[0], gpt2_output)?;
             Ok(ffn_out)
         }
     }
@@ -307,6 +309,7 @@ pub(crate) mod manual_attention {
             };
 
             let ffn = FlatFFN::random(hidden_size, hidden_size);
+            let pre_ffn_norm = layernorm::LayerNorm::random(hidden_size);
             Ok(Self {
                 out,
                 hidden_size,
@@ -315,6 +318,7 @@ pub(crate) mod manual_attention {
                 qkv,
                 layernorm,
                 mha,
+                pre_ffn_norm,
                 add: Add::new(),
                 ffn,
             })

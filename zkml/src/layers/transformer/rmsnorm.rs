@@ -52,7 +52,11 @@ use crate::{
     model::StepData,
     number::Number,
     padding::PaddingMode,
-    parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
+    parser::{
+        gguf::FileTensorLoader,
+        json,
+        llm::{LLMConfig, LLMVariant},
+    },
     quantization::{self, Fieldizer},
     shape::Shape,
     to_base,
@@ -268,8 +272,25 @@ impl RMSNorm<f32> {
     // Replaces from_var_builder and from_tensor_loader
     // The 'loader' passed here is expected to be pre-scoped by the caller
     // (e.g., loader.pp("attn_") or loader.pp("ffn_"))
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        let alpha = loader.get_tensor("norm.weight")?;
+    // HACK NOTE: "stack" is a temporary measure to counter the fact we dont have full GQA support yet
+    // so we stack K and V and therefore we need to stack the norms as well
+    pub fn from_loader(
+        loader: &FileTensorLoader,
+        c: &LLMConfig,
+        stack: bool,
+    ) -> anyhow::Result<Self> {
+        let mut alpha = loader.get_tensor("norm.weight")?;
+        if matches!(c.variant, LLMVariant::Gemma3) && stack {
+            let (it, _) = alpha.slice_on_dim(0);
+            let data = it
+                .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut shape = alpha.shape().clone();
+            let new_dim = shape.dim(-1) * c.num_heads;
+            shape.set_dim(-1, new_dim);
+            alpha = Tensor::new(shape, data);
+        }
         // we can have any checks on the shape alpha here since it depends of the context
         // a RMSNorm after  Q doesn't have the same shape as a RMSNorm after K or inside FeedForward etc
         let eps = loader

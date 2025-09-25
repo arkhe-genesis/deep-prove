@@ -1,11 +1,12 @@
 use crate::{
     Number,
     layers::{
-        activation::{Activation, GeGlu},
         add,
         matrix_mul::MatMul,
         provable::{Edge, Node},
-        transformer::{layernorm::LayerNorm, mha::Mha, qkv::QKV, rmsnorm::RMSNorm},
+        transformer::{
+            layernorm::LayerNorm, mha::Mha, positional::Positional, qkv::QKV, rmsnorm::RMSNorm,
+        },
     },
     parser::{
         gguf::FileTensorLoader,
@@ -21,7 +22,11 @@ use crate::{
     Tensor,
     layers::Layer,
     model::Model,
-    parser::{gguf::unfuse_tensors, json, llm::LLMConfig},
+    parser::{
+        gguf::unfuse_tensors,
+        json,
+        llm::{FeedForward, LLMConfig},
+    },
 };
 
 pub enum NormType {
@@ -50,18 +55,9 @@ pub struct Attention<N: Number> {
     pub out: Tensor<N>,
     pub out_bias: Option<Tensor<N>>,
     pub post_norm: Option<Norm<N>>,
+    pub pre_ffn_norm: Norm<N>,
     pub feedforward: FeedForward<N>,
-    pub post_ffw_norm: Option<Norm<N>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FeedForward<N: Number> {
-    pub pre_norm: Norm<N>,
-    pub gate: Option<MatMul<N>>, // used only for a Gated Linear Unit (GLU)
-    pub up: Tensor<N>,
-    pub up_bias: Option<Tensor<N>>,
-    pub down: Tensor<N>,
-    pub down_bias: Option<Tensor<N>>,
+    pub post_ffn_norm: Option<Norm<N>>,
 }
 
 impl Attention<f32> {
@@ -70,6 +66,7 @@ impl Attention<f32> {
         model: &mut Model<f32>,
         input_node_id: Option<NodeId>,
         c: &LLMConfig,
+        positional: Option<Positional<f32>>,
     ) -> anyhow::Result<NodeId> {
         let num_groups = match c.attention_type {
             AttentionType::MHA => c.num_heads,
@@ -93,11 +90,41 @@ impl Attention<f32> {
             model.add_consecutive_layer(self.pre_norm.to_layer(), input_node_id)?;
         // shape goes to [seq_len, hidden_size] for each, Q K and V
         last_node_id = model.add_consecutive_layer(Layer::QKV(qkv), Some(last_node_id))?;
-        // then this output two tensors:
+        // QKV outputs three tensors, but we may need to apply a norm on the second and third one
+        let (mut q_id, mut q_port): (NodeId, usize) = (last_node_id, 0);
+        let (mut k_id, mut k_port): (NodeId, usize) = (last_node_id, 1);
+        let (v_id, v_port): (NodeId, usize) = (last_node_id, 2);
+        if let LLMVariant::Gemma3 = c.variant {
+            let q_norm = self.q_norm.context("in gemma3, q_norm is expected")?;
+            q_id = model.add_node(Node::new(vec![Edge::new(q_id, q_port)], q_norm.to_layer()))?;
+            q_port = 0;
+            let k_norm = self.k_norm.context("in gemma3, k_norm is expected")?;
+            k_id = model.add_node(Node::new(vec![Edge::new(k_id, k_port)], k_norm.to_layer()))?;
+            k_port = 0;
+            let rope = positional.context("in gemma3, rope is expected")?;
+            q_id = model.add_node(Node::new(
+                vec![Edge::new(q_id, q_port)],
+                // we need to build the cache
+                Layer::Positional(Positional::new_from_variant(rope.variant.clone())),
+            ))?;
+            k_id = model.add_node(Node::new(
+                vec![Edge::new(k_id, k_port)],
+                Layer::Positional(
+                    // vector k doesn't need a cache since it's always of full sequence length
+                    Positional::new_from_variant(rope.variant.clone()).with_no_cache(),
+                ),
+            ))?;
+        }
         // * first one is [num_heads, seq_len] (Q @ K^T - all heads concatenated)
         // * second one is [num_heads, seq_len, head_dim] (V)
-        // TODO : change for GQA
-        let mha_id = model.add_consecutive_layer(Layer::Mha(mha), Some(last_node_id))?;
+        let mha_id = model.add_node(Node::new(
+            vec![
+                Edge::new(q_id, q_port),
+                Edge::new(k_id, k_port),
+                Edge::new(v_id, v_port),
+            ],
+            Layer::Mha(mha),
+        ))?;
         last_node_id = model.add_consecutive_layer(Layer::MatMul(out), Some(mha_id))?;
         last_node_id = match self.post_norm {
             Some(norm) => model.add_consecutive_layer(norm.to_layer(), Some(last_node_id))?,
@@ -115,11 +142,21 @@ impl Attention<f32> {
             ],
             Layer::Add(add::Add::new()),
         ))?;
-        last_node_id = self.feedforward.write_to_model(model, last_node_id)?;
-        last_node_id = match self.post_ffw_norm {
+        let pre_ffn_residual_id = last_node_id;
+        last_node_id =
+            model.add_consecutive_layer(self.pre_ffn_norm.to_layer(), Some(last_node_id))?;
+        last_node_id = self.feedforward.write_to_model(c, model, last_node_id)?;
+        last_node_id = match self.post_ffn_norm {
             Some(norm) => model.add_consecutive_layer(norm.to_layer(), Some(last_node_id))?,
             None => last_node_id,
         };
+        last_node_id = model.add_node(Node::new(
+            vec![
+                Edge::new(pre_ffn_residual_id, 0),
+                Edge::new(last_node_id, 0),
+            ],
+            Layer::Add(add::Add::new()),
+        ))?;
         Ok(last_node_id)
     }
     // Replaces from_var_builder and from_tensor_loader
@@ -143,14 +180,14 @@ impl Attention<f32> {
         let num_heads = c.num_heads;
         let num_groups = c.num_groups();
 
-        let pre_norm = RMSNorm::from_loader(&loader.pp("attn_"), c)?;
+        let pre_norm = RMSNorm::from_loader(&loader.pp("attn_"), c, false)?;
         assert_eq!(
             pre_norm.alpha.as_ref().unwrap().shape().as_ref(),
             &[c.embedding_size]
         );
 
         let q_tensor = loader.get_tensor("attn_q.weight")?.transpose();
-        let q_norm = RMSNorm::from_loader(&loader.pp("attn_q_"), c)?;
+        let q_norm = RMSNorm::from_loader(&loader.pp("attn_q_"), c, true)?;
         assert_eq!(
             q_tensor.shape().as_ref(),
             &[c.hidden_size, num_heads * head_size],
@@ -162,11 +199,12 @@ impl Attention<f32> {
         );
         assert_eq!(
             q_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.head_size]
+            // HACK: stacking
+            &[c.head_size * c.num_heads]
         );
 
         let k_tensor = loader.get_tensor("attn_k.weight")?.transpose();
-        let k_norm = RMSNorm::from_loader(&loader.pp("attn_k_"), c)?;
+        let k_norm = RMSNorm::from_loader(&loader.pp("attn_k_"), c, true)?;
         assert_eq!(
             k_tensor.shape().as_ref(),
             &[hidden_size, num_groups * head_size]
@@ -174,7 +212,8 @@ impl Attention<f32> {
         // head_dim = num_groups * head_size
         assert_eq!(
             k_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.head_size]
+            // HACK: stacking
+            &[c.head_size * c.num_heads]
         );
 
         let v_tensor = loader.get_tensor("attn_v.weight")?.transpose();
@@ -183,10 +222,26 @@ impl Attention<f32> {
             &[hidden_size, num_groups * head_size]
         );
 
+        // HACK: since we don't have proper GQA for now, we fake the "one" group by stacking multiple times
+        // the K and V tensors on themselves, as many times as there are heads. In Gemma3 270M there are only
+        // 4 heads so it's ok for now. This means when we split inside MHA per head, then each head will have
+        // the same K and V tensors, effectively enforcing a single group.
+        // TODO: remove this once we have proper GQA
+        ensure!(num_groups == 1, "GQA is not supported yet");
+        ensure!(
+            num_heads == 4,
+            "GQA is not supported yet so stacking is expensive"
+        );
+
+        // println!("LLM LOADER: k_tensor shape: {:?}", k_tensor.shape());
+        // println!("LLM LOADER: v_tensor shape: {:?}", v_tensor.shape());
+        let k_tensor = expand(k_tensor, num_heads);
+        let v_tensor = expand(v_tensor, num_heads);
+
         let out = loader.get_tensor("attn_output.weight")?.transpose();
         assert_eq!(out.shape().as_ref(), &[num_heads * head_size, hidden_size]);
 
-        let post_attn_norm = RMSNorm::from_loader(&loader.pp("post_attention_"), c)?;
+        let post_attn_norm = RMSNorm::from_loader(&loader.pp("post_attention_"), c, false)?;
         assert_eq!(
             post_attn_norm.alpha.as_ref().unwrap().shape().as_ref(),
             &[c.hidden_size]
@@ -194,12 +249,17 @@ impl Attention<f32> {
 
         let ff = FeedForward::from_loader(loader, c)?;
         let scope_loader = loader.pp("post_ffw_");
-        let post_ffw_norm = RMSNorm::from_loader(&scope_loader, c)?;
+        let post_ffn_norm = RMSNorm::from_loader(&scope_loader, c, false)?;
         assert_eq!(
-            post_ffw_norm.alpha.as_ref().unwrap().shape().as_ref(),
+            post_ffn_norm.alpha.as_ref().unwrap().shape().as_ref(),
             &[c.hidden_size]
         );
+        let ffn_norm_loader = loader.pp("ffn_");
 
+        let pre_ffn_norm = c
+            .variant
+            .norm_type()
+            .from_loader(&ffn_norm_loader, c, false)?;
         Ok(Self {
             pre_norm: Norm::RMSNorm(pre_norm),
             q: q_tensor,
@@ -213,8 +273,9 @@ impl Attention<f32> {
             out,
             out_bias: None,
             post_norm: None,
+            pre_ffn_norm,
             feedforward: ff,
-            post_ffw_norm: Some(Norm::RMSNorm(post_ffw_norm)),
+            post_ffn_norm: Some(Norm::RMSNorm(post_ffn_norm)),
         })
     }
 
@@ -272,9 +333,15 @@ impl Attention<f32> {
             "out_bias must have shape [hidden_size]"
         );
 
+        let ffn_norm_loader = loader.pp("ffn_");
+
+        let pre_ffn_norm = c
+            .variant
+            .norm_type()
+            .from_loader(&ffn_norm_loader, c, false)?;
+
         // Use new FeedForward::from_loader
         let ff = FeedForward::from_loader(loader, c)?;
-
         Ok(Self {
             out,
             out_bias: Some(out_bias),
@@ -287,9 +354,10 @@ impl Attention<f32> {
             k_norm: None,
             v,
             v_bias: Some(v_bias),
+            pre_ffn_norm,
             feedforward: ff,
             post_norm: None,
-            post_ffw_norm: None,
+            post_ffn_norm: None,
         })
     }
     pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
@@ -375,6 +443,7 @@ impl Attention<f32> {
             out_bias.shape()
         );
 
+        let pre_ffn_norm = LayerNorm::from_json(&l.pp("ffn_"), c)?;
         let feedforward =
             FeedForward::from_json(l, c).context("Failed to load FeedForward in from_json")?;
 
@@ -391,141 +460,9 @@ impl Attention<f32> {
             post_norm: None,
             out,
             out_bias: Some(out_bias),
+            pre_ffn_norm: Norm::LayerNorm(pre_ffn_norm),
             feedforward,
-            post_ffw_norm: None,
-        })
-    }
-}
-
-impl FeedForward<f32> {
-    pub fn write_to_model(
-        self,
-        model: &mut Model<f32>,
-        input_node_id: NodeId,
-    ) -> anyhow::Result<NodeId> {
-        let layernorm = self.pre_norm.to_layer();
-        let up = MatMul::new_constant(self.up, self.up_bias)?;
-
-        // let down = MatMul::new_constant(self.down, self.down_bias);
-        let down = MatMul::new_constant(self.down, self.down_bias)?;
-        let add = add::Add::new();
-        let norm_node_id = model.add_consecutive_layer(layernorm, Some(input_node_id))?;
-        let up_node_id = model.add_consecutive_layer(Layer::MatMul(up), Some(norm_node_id))?;
-        let activation_node_id = if let Some(gate) = self.gate {
-            // in this case, the input is processed though another linear layer (i.e., gate_linear),
-            // which is then processed by the activation function and combined with the output of `up` linear
-            // component. Combining the output of activation function with `up` is already done inside the
-            // activation layer being instantiated
-            let gate_node_id =
-                model.add_consecutive_layer(Layer::MatMul(gate), Some(norm_node_id))?;
-            let geglu = Activation::new_geglu();
-            // build input wires for GeGlu
-            let geglu_inputs = {
-                let mut inputs = vec![Edge::default(); 2];
-                inputs[GeGlu::<f32>::GELU_INPUT_INDEX] = Edge::new(gate_node_id, 0); // output of gate is fed to Gelu
-                inputs[GeGlu::<f32>::LINEAR_INPUT_INDEX] = Edge::new(up_node_id, 0);
-                inputs
-            };
-            model.add_node(Node::new(geglu_inputs, geglu.into()))
-        } else {
-            // if there is no `self.gate`, then we just feed output of `up` linear component to the activation layer
-            model.add_consecutive_layer(Layer::Activation(Activation::new_gelu()), Some(up_node_id))
-        }?;
-        let last_node_id =
-            model.add_consecutive_layer(Layer::MatMul(down), Some(activation_node_id))?;
-        let last_node_id = model.add_node(Node::new(
-            vec![Edge::new(input_node_id, 0), Edge::new(last_node_id, 0)],
-            Layer::Add(add),
-        ))?;
-        Ok(last_node_id)
-    }
-    // Replaces from_var_builder and from_tensor_loader
-    // 'loader' is expected to be the block-level loader (e.g., scoped to "blk.N.")
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        // Create a sub-scope for the feed-forward network's LayerNorm
-        let ffn_norm_loader = loader.pp("ffn_");
-
-        let pre_norm = match c.variant.norm_type() {
-            NormType::RMSNorm => Norm::RMSNorm(RMSNorm::from_loader(&ffn_norm_loader, c)?),
-            NormType::LayerNorm => Norm::LayerNorm(LayerNorm::from_loader(&ffn_norm_loader, c)?),
-        };
-
-        let gate = match &c.variant {
-            LLMVariant::GPT2 => None,
-            LLMVariant::Gemma3 => {
-                let gate = loader.get_tensor("ffn_gate.weight")?.transpose();
-                ensure!(
-                    gate.shape()[0] == c.hidden_size,
-                    "gate have shape {:?} but in features should be equal to hidden_size: {}",
-                    gate.shape(),
-                    c.hidden_size
-                );
-                Some(MatMul::new_constant(gate, None)?)
-            }
-        };
-
-        let up = loader.get_tensor("ffn_up.weight")?.transpose();
-        let up_bias = if !c.variant.has_biases() {
-            None
-        } else {
-            Some(loader.get_tensor("ffn_up.bias")?)
-        };
-        let down = loader.get_tensor("ffn_down.weight")?.transpose();
-        let down_bias = if !c.variant.has_biases() {
-            None
-        } else {
-            Some(loader.get_tensor("ffn_down.bias")?)
-        };
-        ensure!(
-            up.shape()[0] == c.hidden_size,
-            "up have shape {:?} but in features should be equal to hidden_size: {}",
-            up.shape(),
-            c.hidden_size
-        );
-        ensure!(
-            down.shape()[1] == c.embedding_size,
-            "down have shape {:?} but out features should be equal to embedding_size: {}",
-            down.shape(),
-            c.embedding_size
-        );
-        Ok(Self {
-            pre_norm,
-            gate,
-            up,
-            up_bias,
-            down,
-            down_bias,
-        })
-    }
-
-    pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        if let LLMVariant::Gemma3 = c.variant {
-            bail!("Gemma3 is not supported yet for custom JSON format");
-        }
-        let pre_norm = LayerNorm::from_json(&l.pp("ffn_"), c)?;
-        let up = l.get_tensor("ffn_up.weight")?;
-        let up_bias = l.get_tensor("ffn_up.bias")?;
-        let down = l.get_tensor("ffn_down.weight")?;
-        let down_bias = l.get_tensor("ffn_down.bias")?;
-        ensure!(
-            up.shape()[0] == c.hidden_size,
-            "up have shape {:?} but in features should be equal to hidden_size: {}",
-            up.shape(),
-            c.hidden_size
-        );
-        ensure!(
-            down.shape()[1] == c.embedding_size,
-            "down have shape {:?} but out features should be equal to embedding_size: {}",
-            down.shape(),
-            c.embedding_size
-        );
-        Ok(Self {
-            pre_norm: Norm::LayerNorm(pre_norm),
-            gate: None,
-            up,
-            up_bias: Some(up_bias),
-            down,
-            down_bias: Some(down_bias),
+            post_ffn_norm: None,
         })
     }
 }
@@ -544,10 +481,22 @@ impl NormType {
         &self,
         loader: &FileTensorLoader,
         c: &LLMConfig,
+        stack: bool,
     ) -> anyhow::Result<Norm<f32>> {
         Ok(match self {
             NormType::LayerNorm => Norm::LayerNorm(LayerNorm::from_loader(loader, c)?),
-            NormType::RMSNorm => Norm::RMSNorm(RMSNorm::from_loader(loader, c)?),
+            NormType::RMSNorm => Norm::RMSNorm(RMSNorm::from_loader(loader, c, stack)?),
         })
     }
+}
+pub(crate) fn expand<N: Number>(t: Tensor<N>, num_heads: usize) -> Tensor<N> {
+    let (it, _) = t.slice_on_dim(0);
+    let data = it
+        .flat_map(|t| std::iter::repeat_n(t, num_heads).flatten())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut shape = t.shape().clone();
+    let new_dim = shape.dim(-1) * num_heads;
+    shape.set_dim(-1, new_dim);
+    Tensor::new(shape, data)
 }

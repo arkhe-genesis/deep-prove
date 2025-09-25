@@ -273,7 +273,10 @@ impl TensorLoader<BufReader<File>> {
 
 #[cfg(test)]
 pub mod tests {
-    use candle_core::{CpuStorage, Device, Storage, quantized::gguf_file::Content};
+    use candle_core::{
+        CpuStorage, Device, Storage,
+        quantized::gguf_file::{Content, Value},
+    };
     use gguf_rs::get_gguf_container;
     use std::{fs::File, ops::Deref};
 
@@ -467,7 +470,24 @@ pub mod tests {
             println!("{path}");
             println!("metadata:");
             for key in meta_keys {
-                println!("\t- {key}");
+                match loader.raw_metadata(&key).unwrap() {
+                    Value::String(s) => println!(
+                        "\t- {key} (string): {}",
+                        &s.chars().take(10).collect::<String>()
+                    ),
+                    Value::F32(f) => println!("\t- {key} (f32): {f}"),
+                    Value::F64(f) => println!("\t- {key} (f64): {f}"),
+                    Value::Bool(b) => println!("\t- {key} (bool): {b}"),
+                    Value::I8(i) => println!("\t- {key} (i8): {i}"),
+                    Value::I16(i) => println!("\t- {key} (i16): {i}"),
+                    Value::I32(i) => println!("\t- {key} (i32): {i}"),
+                    Value::I64(i) => println!("\t- {key} (i64): {i}"),
+                    Value::U8(u) => println!("\t- {key} (u8): {u}"),
+                    Value::U16(u) => println!("\t- {key} (u16): {u}"),
+                    Value::U32(u) => println!("\t- {key} (u32): {u}"),
+                    Value::U64(u) => println!("\t- {key} (u64): {u}"),
+                    Value::Array(v) => println!("\t- {key}: {:?}", v.len()),
+                }
             }
             println!("tensor_infos:");
             for key in tensor_keys {

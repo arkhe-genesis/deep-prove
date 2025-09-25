@@ -365,23 +365,45 @@ impl QuantizeOp for Activation<f32> {
                     "Expected 2 input scaling factors for activation layer used in GLU, found {}",
                     input_scaling.len(),
                 );
-                let q_op = layer.quantize_op::<S>(data, node_id, input_scaling, num_outputs)?;
+
+                let QuantizeOutput {
+                    quantized_op,
+                    output_scalings,
+                    ..
+                } = layer.quantize_op::<S>(data, node_id, input_scaling, num_outputs)?;
                 ensure!(
-                    q_op.output_scalings.len() == 1,
+                    output_scalings.len() == 1,
                     "Expected 1 output scaling factor for activation layer used in GLU, found {}",
-                    q_op.output_scalings.len(),
+                    output_scalings.len(),
                 );
                 let activation_out_scaling = S::scaling_factor_for_intermediate_data(
                     data,
                     node_id,
                     ACTIVATION_OUT_ID.to_string().into(),
                 );
-                let multiplier =
-                    activation_out_scaling.m(&input_scaling[1], &q_op.output_scalings[0]);
-                let intermediate_bit_size = 2 * *quantization::BIT_LEN; // we are multiplying 2 items with `quantization::BIT_LEN` bits
+                let multiplier = activation_out_scaling.m(&input_scaling[1], &output_scalings[0]);
+                let intermediate_bit_size = match quantized_op {
+                    ActivationLayer::Relu(_) => 2 * *quantization::BIT_LEN, /* we are multiplying 2 items with `quantization::BIT_LEN` bits, */
+                    ActivationLayer::Gelu(ref g) => {
+                        let quant_data_gelu = g.quant_data.unwrap();
+                        quant_data_gelu
+                            .table_data
+                            .table()
+                            .map(|(_, output)| {
+                                if output.abs() != 0 {
+                                    ceil_log2(output.unsigned_abs() as usize)
+                                } else {
+                                    0
+                                }
+                            })
+                            .max()
+                            .unwrap()
+                            + *quantization::BIT_LEN
+                    }
+                };
                 let requant = Requant::from_multiplier(multiplier, intermediate_bit_size);
                 Ok(
-                    QuantizeOutput::new(Activation::GLU(q_op.quantized_op), q_op.output_scalings)
+                    QuantizeOutput::new(Activation::GLU(quantized_op), output_scalings)
                         .with_requant(requant),
                 )
             }

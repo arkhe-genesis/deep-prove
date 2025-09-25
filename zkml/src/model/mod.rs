@@ -496,7 +496,10 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
                     &mut tracker,
                     store,
                 )
-                .context(format!("Error occurred at node ID: {node_id}"))?;
+                .context(format!(
+                    "Error occurred at node ID: {node_id}: {}",
+                    node.describe()
+                ))?;
             padded_input_shapes.extend(
                 node_output
                     .outputs
@@ -633,7 +636,7 @@ pub(crate) mod test {
     use super::Model;
     use crate::{Element, default_transcript, tensor::Tensor};
 
-    type F = GoldilocksExt2;
+    pub(crate) type F = GoldilocksExt2;
     const SELECTOR_DENSE: usize = 0;
     const SELECTOR_RELU: usize = 1;
     const SELECTOR_POOLING: usize = 2;

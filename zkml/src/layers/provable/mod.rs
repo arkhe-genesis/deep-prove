@@ -1,3 +1,4 @@
+use crate::VectorTranscript;
 use anyhow::{Result, anyhow, bail, ensure};
 use derive_more::{From, Into};
 use ff_ext::ExtensionField;
@@ -5,7 +6,7 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::mle::IntoMLE;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
 };
 use tenstore::{GenStore, TensorKey};
@@ -13,7 +14,6 @@ use transcript::Transcript;
 
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
-    VectorTranscript,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -23,7 +23,7 @@ use crate::{
         transformer::{logits::ArgmaxData, mha::MhaData},
     },
     lookup::context::LookupWitnessGen,
-    model::trace::StepData,
+    model::{trace::StepData, transform::ModelTransform},
     number::Number,
     padding::{PaddingMode, ShapeInfo},
     tensor::ConvFFTData,
@@ -174,7 +174,7 @@ pub enum ProvingData<E: ExtensionField> {
     /// Variant for extra data used in proving that we compute during evalaution of quantised convolution.
     Convolution(ConvFFTData),
     /// Variant for extra data used to prove [Softmax][`crate::layers::transformer::softmax::Softmax`] that we compute anyway during quantised evaluation.
-    Softmax(SoftmaxData<E>),
+    Softmax(SoftmaxData),
     /// Variant for extra data used to prove Mha layer, computed during quantised evaluation
     Mha(MhaData<E>),
     /// Variant used for extra data used to prove [LayerNorm][`crate::layers::transformer::layernorm::LayerNorm`]
@@ -255,7 +255,7 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
         }
     }
 
-    pub fn try_softmax_data(&self) -> Option<&SoftmaxData<E>> {
+    pub fn try_softmax_data(&self) -> Option<&SoftmaxData> {
         match self.proving_data {
             ProvingData::Softmax(ref softmax_data) => Some(softmax_data),
             _ => None,
@@ -387,8 +387,8 @@ impl<E: ExtensionField> NodeCtx<E> {
     pub(crate) fn bind_outputs_to_node<'a, I: Iterator<Item = (NodeId, &'a Self)>>(
         nodes: I,
         num_outputs: usize,
-    ) -> anyhow::Result<HashMap<NodeId, Vec<usize>>> {
-        let mut out_nodes = HashMap::new();
+    ) -> anyhow::Result<BTreeMap<NodeId, Vec<usize>>> {
+        let mut out_nodes = BTreeMap::new();
         let mut outputs = BTreeSet::new(); // set employed to check that we found all outputs
         for (node_id, ctx) in nodes {
             for out in ctx.outputs.iter() {
@@ -472,6 +472,8 @@ pub struct QuantizeOutput<Op> {
     pub(crate) output_scalings: Vec<ScalingFactor>,
     /// The requant layer to be added to the model, if any
     pub(crate) requant_layer: Option<Vec<Requant>>,
+    /// Optional rule to apply after quantisation
+    pub(crate) post_quant_rule: Option<Box<dyn ModelTransform<Element>>>,
 }
 
 impl<Op> QuantizeOutput<Op> {
@@ -480,6 +482,7 @@ impl<Op> QuantizeOutput<Op> {
             quantized_op,
             output_scalings,
             requant_layer: None,
+            post_quant_rule: None,
         }
     }
     pub fn with_requant(self, requant: Requant) -> Self {
@@ -499,11 +502,30 @@ impl<Op> QuantizeOutput<Op> {
             quantized_op: self.quantized_op,
             output_scalings: self.output_scalings,
             requant_layer: Some(requants),
+            post_quant_rule: self.post_quant_rule,
+        }
+    }
+    pub fn with_transform(self, transform: Box<dyn ModelTransform<Element>>) -> Self {
+        assert!(
+            self.post_quant_rule.is_none(),
+            "Post quantization rule already exists"
+        );
+        Self {
+            quantized_op: self.quantized_op,
+            output_scalings: self.output_scalings,
+            requant_layer: self.requant_layer,
+            post_quant_rule: Some(transform),
         }
     }
     pub fn maybe_requants(self, requant: Option<Vec<Requant>>) -> Self {
         match requant {
             Some(requant) => self.with_requants(requant),
+            None => self,
+        }
+    }
+    pub fn maybe_transform(self, transform: Option<Box<dyn ModelTransform<Element>>>) -> Self {
+        match transform {
+            Some(transform) => self.with_transform(transform),
             None => self,
         }
     }
@@ -600,8 +622,11 @@ where
             .iter()
             .map(|out| {
                 // Derive the first randomness
-                let first_randomness =
-                    transcript.read_challenges(out.get_data().len().ilog2() as usize);
+                // let first_randomness = (0..out.get_data().len().ilog2())
+                //    .map(|_| transcript.sample_and_append_challenge(b"initial").elements)
+                //    .collect::<Vec<E>>();
+                let r_i = transcript.read_challenges(out.get_data().len().ilog2() as usize);
+                let first_randomness = r_i;
                 // For the output, we manually evaluate the MLE and check if it's the same as what prover
                 // gave. Note prover could ellude that but it's simpler to avoid that special check right
                 // now.
@@ -771,6 +796,9 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Flatten => {
                 <Flatten as OpInfo>::output_shapes(&Flatten, input_shapes, padding_mode)
             }
+            LayerCtx::AttentionMask(attention_mask_ctx) => {
+                attention_mask_ctx.output_shapes(input_shapes, padding_mode)
+            }
         }
     }
 
@@ -794,6 +822,9 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Requant(requant_ctx) => requant_ctx.num_outputs(num_inputs),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.num_outputs(num_inputs),
             LayerCtx::Flatten => <Flatten as OpInfo>::num_outputs(&Flatten, num_inputs),
+            LayerCtx::AttentionMask(attention_mask_ctx) => {
+                attention_mask_ctx.num_outputs(num_inputs)
+            }
         }
     }
 
@@ -817,6 +848,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Requant(requant_ctx) => requant_ctx.describe(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.describe(),
             LayerCtx::Flatten => Flatten.describe(),
+            LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.describe(),
         }
     }
 
@@ -840,6 +872,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Requant(requant_ctx) => requant_ctx.is_provable(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_provable(),
             LayerCtx::Flatten => Flatten.is_provable(),
+            LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.is_provable(),
         }
     }
 }
@@ -909,6 +942,9 @@ where
             }
             (LayerCtx::Flatten, _) | (LayerCtx::Reshape(_), _) => {
                 unreachable!("Trying to verify a non-provable layer")
+            }
+            (LayerCtx::AttentionMask(attention_mask_ctx), LayerProof::AttentionMask(proof)) => {
+                attention_mask_ctx.verify(proof, last_claims, verifier, shape_step)
             }
             _ => bail!(
                 "Incompatible layer {} and proof {} found",
@@ -984,6 +1020,9 @@ where
             LayerCtx::Logits(logits_ctx) => {
                 compute_model_output_claims::<_, PCS, _, _>(logits_ctx, transcript, outputs)
             }
+            LayerCtx::AttentionMask(attention_mask_ctx) => {
+                compute_model_output_claims::<_, PCS, _, _>(attention_mask_ctx, transcript, outputs)
+            }
         }
     }
 
@@ -1029,6 +1068,7 @@ where
                 inputs,
                 claims,
             ),
+            LayerCtx::AttentionMask(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
         }
     }
 
@@ -1084,6 +1124,9 @@ where
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Pooling(ctx), LayerProof::Pooling(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::AttentionMask(ctx), LayerProof::AttentionMask(p)) => {
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Flatten, _) => Ok(()),

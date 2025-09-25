@@ -58,7 +58,7 @@ use super::{
 pub const REQUANT_LAYER: &str = "REQU";
 
 /// Constant used in fixed point multiplication for normalised [`f32`] values
-const FIXED_POINT_SCALE: usize = 25;
+pub(crate) const FIXED_POINT_SCALE: usize = 25;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Copy, PartialOrd)]
 /// This struct contains the information used in requantisation (i.e. rescaling and clamping)

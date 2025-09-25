@@ -364,7 +364,7 @@ pub struct ConcatMatMul {
     /// It tells what is the maximum bit size we ever expect the output of this layer to be.
     /// NOTE: This is a config item normally but we need this information during quantization.
     /// Best would be to rework quantization trait to include such config items.
-    intermediate_bit_size: usize,
+    pub(crate) intermediate_bit_size: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -454,7 +454,7 @@ impl ConcatMatMul {
 
     /// Return the expected dimension for left input tesnor when performing `ConcatMatMul`;
     /// if the actual dimensions are different, the input tensor will be permuted
-    fn expected_dimension_for_left_input() -> InputMatrixDimensions {
+    pub(crate) fn expected_dimension_for_left_input() -> InputMatrixDimensions {
         // to compute `ConcatMatMul`, we need the following shape for left input:
         // [concat_dimension, output_dimension, mat_mul_dimension]
         InputMatrixDimensions {
@@ -466,7 +466,7 @@ impl ConcatMatMul {
 
     /// Return the expected dimension for right input tesnor when performing `ConcatMatMul`;
     /// if the actual dimensions are different, the input tensor will be permuted
-    fn expected_dimension_for_right_input() -> InputMatrixDimensions {
+    pub(crate) fn expected_dimension_for_right_input() -> InputMatrixDimensions {
         // to compute `ConcatMatMul`, we need the following shape for left input:
         // [concat_dimension, output_dimension, mat_mul_dimension]
         InputMatrixDimensions {

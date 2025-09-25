@@ -64,7 +64,7 @@ pub struct RopeCtx {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rope<N> {
     pub(super) cosine_matrix: Tensor<N>,
-    sine_matrix: Tensor<N>,
+    pub(super) sine_matrix: Tensor<N>,
     pub(super) unpadded_shape: Shape,
 }
 
@@ -108,6 +108,21 @@ impl<N: Number> Rope<N> {
             sine_matrix,
             unpadded_shape: matrix_shape,
         })
+    }
+
+    pub(crate) fn build_from_frequency(
+        base_frequency: f32,
+        head_size: usize,
+        max_content_length: usize,
+    ) -> Result<Self> {
+        // println!(
+        //    "ROPE: from _frequency: base_frequency: {}, head_size: {}, max_content_length: {}",
+        //    base_frequency, head_size, max_content_length
+        //);
+        let angles = (0..head_size / 2)
+            .map(|i| base_frequency.powf((-2.0 * i as f32) / head_size as f32))
+            .collect_vec();
+        Self::build_from_angles(angles, max_content_length)
     }
 
     pub(crate) fn new(cosine_matrix: Tensor<N>, sine_matrix: Tensor<N>) -> Result<Self> {

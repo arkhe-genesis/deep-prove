@@ -19,9 +19,9 @@ pub trait ModelTransform<N: Number>: Debug {
 pub fn apply_transformations<N: Number>(
     mut model: Model<N>,
     transforms: Vec<Box<dyn ModelTransform<N>>>,
-) -> Result<()> {
+) -> Result<Model<N>> {
     for transform in transforms {
         model = transform.apply(model)?;
     }
-    Ok(())
+    Ok(model)
 }

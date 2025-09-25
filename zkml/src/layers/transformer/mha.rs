@@ -3,13 +3,13 @@
 //! ConcatMatMul and Softmax layers as building blocks.
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor, Shape,
+    Claim, Element, Number, Prover, ScalingFactor, Shape,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
     },
     layers::{
-        LayerCtx, LayerProof,
+        AttentionMask, LayerCtx, LayerProof,
         concat_matmul::{
             ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof, InputMatrixDimensions, Permutation,
         },
@@ -18,15 +18,16 @@ use crate::{
             QuantizeOutput, VerifiableCtx,
         },
         reshape::{Reshape, ReshapeCtx},
-        transformer::softmax::{
-            OUTPUT_SCALE_FACTOR, Softmax, SoftmaxCtx, SoftmaxData, SoftmaxProof,
+        transformer::{
+            attention::attention_mask::{AttentionMaskCtx, AttentionMaskProof, MaskProvingData},
+            softmax::{Softmax, SoftmaxCtx, SoftmaxData, SoftmaxProof},
         },
     },
     lookup::context::LookupWitnessGen,
     model::StepData,
-    number::Number,
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
+    tensor::IntoBTensor,
 };
 use anyhow::{anyhow, bail, ensure};
 use ff_ext::{ExtensionField, FieldFrom};
@@ -46,8 +47,9 @@ pub struct MhaData<E: ExtensionField> {
     // Output tensor of Mha before final reshape
     pre_reshaping_out: Tensor<E>,
     softmax_out: Tensor<Element>, // this needs to be an `Element` to call Softmax::lookup_witness
-    softmax_data: SoftmaxData<E>,
-    softmax_in: Tensor<E>,
+    softmax_data: SoftmaxData,
+    softmax_in: Tensor<Element>,
+    mask_in: Tensor<E>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +59,7 @@ pub struct MhaCtx<E: ExtensionField> {
     inputs_reshape: ReshapeCtx,
     final_mul: ConcatMatMulCtx,
     softmax: SoftmaxCtx<E>,
+    mask: AttentionMaskCtx<E>,
     qk: ConcatMatMulCtx,
     final_reshape: ReshapeCtx,
 }
@@ -124,6 +127,7 @@ impl<'a> MhaOutputShaper<'a> {
 pub struct MhaProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     final_mul_proof: ConcatMatMulProof<E>,
     softmax_proof: SoftmaxProof<E, PCS>,
+    mask_proof: AttentionMaskProof<E>,
     qk_proof: ConcatMatMulProof<E>,
 }
 
@@ -146,6 +150,7 @@ pub struct Mha<N> {
     num_heads: usize,
     head_dim: usize,
     qk: ConcatMatMul,
+    mask: AttentionMask<N>,
     softmax: Softmax<N>,
     final_mul: ConcatMatMul,
     final_reshape: Reshape, /* ToDo: can be removed once we will handle unpadding in subsequent linear layer */
@@ -170,7 +175,9 @@ where
             None,
             None, // use the default quantization range
         );
-        let softmax = Softmax::new().with_scale(N::from_f32((1.0 / (head_dim as f32)).sqrt())?);
+        let mask = AttentionMask::<N>::new(context_length, N::MIN);
+        let softmax =
+            Softmax::new(context_length).with_scale(N::from_f32((1.0 / (head_dim as f32)).sqrt())?);
         let final_mul = ConcatMatMul::new_with_permute(
             InputMatrixDimensions::new(0, 2, 1),
             InputMatrixDimensions::new(1, 0, 2),
@@ -181,7 +188,7 @@ where
                 vec![num_heads, context_length, context_length].into(),
                 vec![context_length, num_heads, head_dim].into(),
             ],
-            Some(OUTPUT_SCALE_FACTOR), // here instead the output of softmax can be up
+            None, // here instead the output of softmax can be up
             // to `OUTPUT_SCALE_FACTOR` rather than the usual quantization range
             None,
         );
@@ -193,6 +200,7 @@ where
             num_heads,
             head_dim,
             qk,
+            mask,
             softmax,
             final_mul,
             final_reshape,
@@ -242,9 +250,12 @@ where
         LayerOut<N, E>,
         LayerOut<N, E>,
         LayerOut<N, E>,
+        LayerOut<N, E>,
     )>
     where
         Softmax<N>: Evaluate<N>,
+        AttentionMask<N>: Evaluate<N>,
+        Tensor<N>: IntoBTensor,
     {
         let unpadded_input_shapes = if unpadded_input_shapes.is_empty() {
             // take input shapes from inputs
@@ -278,6 +289,9 @@ where
             .qk
             .evaluate::<E>(&reshaped_inputs.outputs()[..2], &reshaped_input_shapes[..2])?;
 
+        // Apply the mask
+        let mask_out = self.mask.evaluate::<E>(&qk_out.outputs(), &qk_out_shapes)?;
+
         // apply softmax
         let soft_out_shapes = self
             .softmax
@@ -285,7 +299,7 @@ where
 
         let soft_out = self
             .softmax
-            .evaluate::<E>(&qk_out.outputs(), &qk_out_shapes)?;
+            .evaluate::<E>(&mask_out.outputs(), &qk_out_shapes)?;
 
         ensure!(
             soft_out.outputs().len() == 1,
@@ -308,7 +322,7 @@ where
             .final_reshape
             .evaluate(&final_mul_out.outputs(), &out_shapes)?;
 
-        Ok((out, final_mul_out, soft_out, qk_out))
+        Ok((out, final_mul_out, mask_out, soft_out, qk_out))
     }
 }
 
@@ -323,10 +337,11 @@ impl<N: Number> OpInfo for Mha<N> {
 
     fn describe(&self) -> String {
         format!(
-            "MHA({}, {}): \t {} \t {}, \t {}",
+            "MHA({}, {}): \t {} \t {} \t {}, \t {}",
             self.num_heads,
             self.head_dim,
             self.qk.describe(),
+            self.mask.describe(),
             self.softmax.describe(),
             self.final_mul.describe(),
         )
@@ -344,7 +359,7 @@ impl Evaluate<f32> for Mha<f32> {
         inputs: &[&Tensor<f32>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
-        let (out, _, _, _) =
+        let (out, _, _, _, _) =
             self.evaluate_with_intermediate_outputs(inputs, unpadded_input_shapes)?;
 
         Ok(out)
@@ -357,7 +372,7 @@ impl Evaluate<Element> for Mha<Element> {
         inputs: &[&Tensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
-        let (out, final_mul_out, soft_out, qk_out) =
+        let (out, final_mul_out, mask_out, soft_out, qk_out) =
             self.evaluate_with_intermediate_outputs(inputs, unpadded_input_shapes)?;
 
         let LayerOut {
@@ -372,7 +387,8 @@ impl Evaluate<Element> for Mha<Element> {
             pre_reshaping_out: final_mul_out.outputs()[0].to_fields(),
             softmax_data,
             softmax_out: outputs[0].clone(),
-            softmax_in: qk_out.outputs[0].to_fields(),
+            softmax_in: mask_out.outputs[0].clone(),
+            mask_in: qk_out.outputs[0].to_fields(),
         };
         Ok(out.with_proving_data(ProvingData::Mha(data)))
     }
@@ -400,27 +416,52 @@ impl QuantizeOp for Mha<f32> {
             let quantized_domain = Some((-output_domain, output_domain));
             ScalingFactor::from_scale(scale, quantized_domain)
         };
+        let intermediate_bit_size = self.qk.intermediate_bit_size;
 
-        // quantize data for softmax
+        // quantise the mask
         let QuantizeOutput {
-            quantized_op: quantized_softmax,
-            output_scalings,
+            quantized_op: mut quantised_mask,
             ..
         } = self
-            .softmax
+            .mask
             .quantize_op::<S>(data, node_id, &[product_scaling])?;
 
-        ensure!(
-            output_scalings.len() == 1,
-            "Expected 1 output scaling for softmax, found {}",
-            output_scalings.len()
+        // quantize data for softmax
+        let quantised_softmax = self
+            .softmax
+            .quantise(product_scaling, intermediate_bit_size)?;
+        let output_sf = quantised_softmax
+            .quant_info()
+            .map(|info| info.lut.output_sf())
+            .unwrap();
+
+        let output_scalings = ScalingFactor::from_parts(
+            1.0f32,
+            0.0f32,
+            1.0f32 / output_sf,
+            (0, output_sf as Element),
         );
+        let negative_infinity = quantised_softmax
+            .quant_info()
+            .map(|info| info.quantised_negative_infinity())
+            .unwrap();
+
+        quantised_mask.set_negative_infinity(negative_infinity);
 
         // prepare input scaling for final multiplication operation
-        let final_mul_scalings = vec![output_scalings[0], input_scaling[2]];
-        let quantized_out = self
-            .final_mul
-            .quantize_op::<S>(data, node_id, &final_mul_scalings)?;
+        let final_mul_scalings = vec![output_scalings, input_scaling[2]];
+
+        let updated_final_mul = self.final_mul.update_intermediate_bit_size(
+            vec![
+                vec![self.num_heads, self.context_length, self.context_length].into(),
+                vec![self.context_length, self.num_heads, self.head_dim].into(),
+            ],
+            Some(output_sf as usize), // here instead the output of softmax can be up
+            // to `OUTPUT_SCALE_FACTOR` rather than the usual quantization range
+            None,
+        );
+        let quantized_out =
+            updated_final_mul.quantize_op::<S>(data, node_id, &final_mul_scalings)?;
 
         let quantized_mha = Self::QuantizedOp {
             inputs_reshape: self.inputs_reshape,
@@ -428,7 +469,8 @@ impl QuantizeOp for Mha<f32> {
             num_heads: self.num_heads,
             head_dim: self.head_dim,
             qk: self.qk,
-            softmax: quantized_softmax,
+            mask: quantised_mask,
+            softmax: quantised_softmax,
             final_mul: quantized_out.quantized_op,
             final_reshape: self.final_reshape,
         };
@@ -436,6 +478,7 @@ impl QuantizeOp for Mha<f32> {
             quantized_op: quantized_mha,
             output_scalings: quantized_out.output_scalings,
             requant_layer: quantized_out.requant_layer,
+            post_quant_rule: None,
         })
     }
 }
@@ -477,6 +520,12 @@ impl ProveInfo for Mha<Element> {
             unreachable!()
         };
 
+        let (ctx, aux) = self.mask.step_info(id, aux)?;
+
+        let LayerCtx::AttentionMask(mask_ctx) = ctx else {
+            unreachable!()
+        };
+
         let (ctx, mut aux) = self.softmax.step_info(id, aux)?;
 
         let LayerCtx::Softmax(softmax_ctx) = ctx else {
@@ -511,6 +560,7 @@ impl ProveInfo for Mha<Element> {
             inputs_reshape: inputs_reshape_ctx,
             final_mul: final_mul_ctx,
             softmax: softmax_ctx,
+            mask: mask_ctx,
             qk: qk_ctx,
             final_reshape: final_reshape_ctx,
         });
@@ -600,7 +650,7 @@ impl PadOp for Mha<Element> {
         let v_shape = si.shapes.pop().unwrap();
 
         let qk = self.qk.pad_node(si)?;
-
+        let mask = self.mask.pad_node(si)?;
         // softmax takes as input the output of qk, so we can just provide
         // shape info `si`
         let softmax = self.softmax.pad_node(si)?;
@@ -640,6 +690,7 @@ impl PadOp for Mha<Element> {
             num_heads: padded_num_heads,
             head_dim: padded_head_dim,
             qk,
+            mask,
             softmax,
             final_mul,
             final_reshape,
@@ -690,7 +741,25 @@ where
         )?;
 
         let reshaped_inputs = reshaped_inputs.outputs();
+        let reshaped_input_shapes = self
+            .inputs_reshape
+            .output_shapes(&step_data.unpadded_input_shapes, PaddingMode::NoPadding);
 
+        ensure!(
+            reshaped_inputs.len() == 3,
+            "Expected 3 reshaped inputs when proving Mha layer, found {}",
+            reshaped_inputs.len()
+        );
+
+        ensure!(
+            last_claims.len() == 1,
+            "Expected 1 claim about output of Mha layer, found {}",
+            last_claims.len()
+        );
+
+        let qk_out_shapes = self
+            .qk
+            .output_shapes(&reshaped_input_shapes, PaddingMode::NoPadding);
         let mha_data = step_data
             .node_outputs
             .try_mha_data()
@@ -717,6 +786,7 @@ where
             vec![&softmax_out_claim],
             &ctx.softmax,
             &mha_data.softmax_data,
+            mha_data.softmax_in.shape(),
             prover,
         )?;
 
@@ -726,9 +796,21 @@ where
             claims.len()
         );
 
+        let mask_proving_data = MaskProvingData::from_claims_and_input(
+            &[&claims[0]],
+            &mha_data.mask_in,
+            &qk_out_shapes[0],
+            &qk_out_shapes,
+            prover.transcript,
+        )?;
+
+        let (mask_proof, claims) =
+            self.mask
+                .prove_internal(&ctx.mask, vec![&claims[0]], mask_proving_data, prover)?;
+
         let (mut input_claims, qk_proof) = self.qk.prove_step(
             vec![&claims[0]],
-            &mha_data.softmax_in,
+            &mha_data.mask_in,
             &reshaped_inputs[..2],
             prover,
         )?;
@@ -745,6 +827,7 @@ where
         // add proof for this node
         let proof = MhaProof {
             final_mul_proof,
+            mask_proof,
             softmax_proof,
             qk_proof,
         };
@@ -765,8 +848,14 @@ where
             .node_outputs
             .try_mha_data()
             .ok_or(anyhow!("MhaData not found when proving Mha layer"))?;
-        self.softmax
-            .lookup_witness(id, ctx, &mha_data.softmax_out, &mha_data.softmax_data)
+
+        self.softmax.lookup_witness(
+            id,
+            ctx,
+            &mha_data.softmax_in,
+            &mha_data.softmax_out,
+            &mha_data.softmax_data,
+        )
     }
 }
 
@@ -827,9 +916,14 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             &reshaped_inputs.padded_output_shape[..2],
         );
 
-        let softmax_shapes = LayerCtx::<E>::Softmax(self.softmax.clone()).shape_step(
+        let mask_shapes = LayerCtx::<E>::AttentionMask(self.mask.clone()).shape_step(
             &qk_shapes.unpadded_output_shape,
             &qk_shapes.padded_output_shape,
+        );
+
+        let softmax_shapes = LayerCtx::<E>::Softmax(self.softmax.clone()).shape_step(
+            &mask_shapes.unpadded_output_shape,
+            &mask_shapes.padded_output_shape,
         );
 
         let final_mul_shapes = LayerCtx::<E>::ConcatMatMul(self.final_mul.clone()).shape_step(
@@ -867,7 +961,15 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             verifier,
             &softmax_shapes,
         )?;
+        let claims = self
+            .mask
+            .verify(&proof.mask_proof, &[&claims[0]], verifier, &mask_shapes)?;
 
+        ensure!(
+            claims.len() == 1,
+            "Expected 1 input claim for mask when verifying Mha layer, found {} claims",
+            claims.len(),
+        );
         let mut input_claims =
             self.qk
                 .verify(&proof.qk_proof, &[&claims[0]], verifier, &qk_shapes)?;
@@ -963,7 +1065,7 @@ mod test {
     use itertools::Itertools;
 
     use crate::{
-        Element, init_test_logging, init_test_logging_default,
+        Element, init_test_logging,
         layers::{
             Layer,
             matrix_mul::{MatMul, OperandMatrix},
@@ -1293,7 +1395,6 @@ mod test {
 
     #[test]
     fn test_proven_mha() {
-        init_test_logging_default();
         let num_heads = 5;
         let head_dim = 7;
         let seq_len = 10;
@@ -1507,14 +1608,10 @@ mod test {
         let embedded = llm_model
             .embeddings
             .evaluate::<GoldilocksExt2>(&[&input], &[])?;
-        let positioned = llm_model
-            .positional
-            .as_ref()
-            .unwrap()
-            .evaluate::<GoldilocksExt2>(
-                &[embedded.outputs()[0]],
-                &[embedded.outputs()[0].shape().clone()],
-            )?;
+        let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
+            &[embedded.outputs()[0]],
+            &[embedded.outputs()[0].shape().clone()],
+        )?;
 
         let input_shape = positioned.outputs()[0].shape();
 

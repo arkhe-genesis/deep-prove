@@ -737,10 +737,33 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let sumcheck_evals = &proof.sumcheck_evals;
         let input_eval = sumcheck_evals[0];
         let max_eval = sumcheck_evals[1];
-        let expected_output_eval = (subclaim.expected_evaluation
-            - challenge * lt_eval * input_eq_eval * (max_eval - input_eval)
-            - beta_eval * max_eval)
-            * (-num_cols * beta_eval * input_eval).inverse();
+        let expected_output_eval = match (-num_cols * beta_eval * input_eval).try_inverse() {
+            Some(inv) => {
+                (subclaim.expected_evaluation
+                    - challenge * lt_eval * input_eq_eval * (max_eval - input_eval)
+                    - beta_eval * max_eval)
+                    * inv
+            }
+            None => {
+                let output = &verifier.io.output[0];
+                ensure!(
+                    output.shape().is_power_of_two(),
+                    "Output shape in Logits layer is not a power of 2"
+                );
+                let num_row_vars = output.shape().dim(0).ilog2() as usize;
+                let (column_point, row_point) =
+                    Logits::split_claim_point(&sumcheck_point, num_row_vars)?;
+                let row_part = compute_betas_eval(row_point).into_iter().sum::<E>();
+                let column_part = column_point.iter().map(|p| E::ONE - *p).product::<E>();
+                assert!(
+                    (subclaim.expected_evaluation
+                        - challenge * lt_eval * input_eq_eval * (max_eval - input_eval)
+                        - beta_eval * max_eval)
+                        == E::ZERO
+                );
+                row_part * column_part
+            }
+        };
 
         Self::verify_output_evaluation(
             verifier,
@@ -759,16 +782,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         Ok(vec![final_input_claim])
     }
 
-    fn compute_model_output_claims<T: Transcript<E>>(
-        &self,
-        _transcript: &mut T,
-        outputs: &[&Tensor<E>],
-    ) -> Vec<Claim<E>> {
-        // simply return default claims, as the verifier of this layer doesn't need to employ any
-        // claim about the output tensors. Indeed, the claims about the output tensors are computed
-        // by the prover, and are verified directly in `LogitsCtx::verify_output_evaluation` method
-        vec![Claim::default(); outputs.len()]
-    }
+    // The verifier of this layer doesn't need to employ any
+    // claim about the output tensors. Indeed, the claims about the output tensors are computed
+    // by the prover, and are verified directly in `LogitsCtx::verify_output_evaluation` method
+    // HOWEVER, we still need to make the transcript advance since for the prover it always
+    // tries to derive claims from the transcript, for the output tensor if nothing else.
+    // fn compute_model_output_claims<T: Transcript<E>>(
 
     fn write_proof_to_transcript<T: Transcript<E>>(
         &self,
@@ -880,7 +899,10 @@ mod test {
     use super::*;
     use crate::{
         layers::{Layer, provable::Evaluate},
-        model::{Model, test::prove_model},
+        model::{
+            Model,
+            test::{prove_model, prove_model_with},
+        },
         tensor::Tensor,
     };
     use proptest::prelude::*;
@@ -940,6 +962,24 @@ mod test {
         model.route_output(None).unwrap();
 
         prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    #[test]
+    fn test_proven_null_logits_argmax() {
+        let seq_len = 13;
+        let vocab_size = 17;
+        let input_shape = Shape::new(vec![seq_len, vocab_size]);
+        let mut model =
+            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
+
+        let _ = model
+            .add_consecutive_layer(Layer::Logits(Logits::Argmax), None)
+            .unwrap();
+
+        model.route_output(None).unwrap();
+        let inputs = Tensor::zeros(input_shape);
+
+        prove_model_with(model, vec![inputs], &mut GenStore::default()).unwrap();
     }
 
     #[test]

@@ -1,10 +1,11 @@
 pub mod config;
+pub mod ffn;
 pub mod tokenizer;
 pub mod transformer;
 pub use crate::parser::{
     gguf::{self},
     json,
-    llm::transformer::{Attention, FeedForward},
+    llm::{ffn::FeedForward, transformer::Attention},
 };
 use anyhow::bail;
 pub use config::{AttentionType, LLMConfig, LLMVariant};
@@ -81,7 +82,7 @@ impl Token {
 #[derive(Debug, Clone)]
 pub struct LLMModel {
     pub embeddings: Embeddings<f32>,
-    pub positional: Option<Positional<f32>>,
+    pub positional: Positional<f32>,
     pub blocks: Vec<Attention<f32>>,
     /// Final LayerNorm applied after all transformer blocks (ln_f in GPT-2)
     pub final_norm: Norm<f32>,
@@ -92,7 +93,7 @@ pub struct LLMModel {
 impl LLMModel {
     pub fn new(
         embeddings: Embeddings<f32>,
-        positional: Option<Positional<f32>>,
+        positional: Positional<f32>,
         blocks: Vec<Attention<f32>>,
         final_norm: Norm<f32>,
         final_proj: Option<MatMul<f32>>,
@@ -111,19 +112,17 @@ impl LLMModel {
         config: &LLMConfig,
     ) -> anyhow::Result<Self> {
         let embeddings = Embeddings::from_loader(loader)?;
-        let positional = match config.variant {
-            LLMVariant::GPT2 => Some(Positional::from_loader(loader, config)?),
-            LLMVariant::Gemma3 => None,
-        };
+        let positional = Positional::from_loader(loader, config)?;
 
         let num_layers = config.num_block;
         let blocks = (0..num_layers)
             .map(|i| Attention::from_loader(&loader.pp(&format!("blk.{i}.")), config))
             .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
-        let final_norm = config
-            .variant
-            .norm_type()
-            .from_loader(&loader.pp("output_"), config)?;
+        let final_norm =
+            config
+                .variant
+                .norm_type()
+                .from_loader(&loader.pp("output_"), config, false)?;
         let final_proj = match config.variant {
             LLMVariant::GPT2 => {
                 //  there might or not be a bias
@@ -154,7 +153,7 @@ impl LLMModel {
         let final_proj = MatMul::new_constant(proj_weights, proj_bias)?;
         Ok(Self::new(
             embeddings,
-            Some(positional),
+            positional,
             blocks,
             final_norm,
             Some(final_proj),
@@ -173,12 +172,20 @@ impl LLMModel {
 
         let mut last_node_id =
             Some(model.add_consecutive_layer(Layer::Embeddings(self.embeddings), None)?);
-        if let Some(positional) = self.positional {
+        if let LLMVariant::GPT2 = c.variant {
             last_node_id =
-                Some(model.add_consecutive_layer(Layer::Positional(positional), last_node_id)?);
+                Some(model.add_consecutive_layer(
+                    Layer::Positional(self.positional.clone()),
+                    last_node_id,
+                )?);
         }
         for block in self.blocks {
-            last_node_id = Some(block.write_to_model(&mut model, last_node_id, c)?);
+            let pos = if let LLMVariant::Gemma3 = c.variant {
+                Some(self.positional.clone())
+            } else {
+                None
+            };
+            last_node_id = Some(block.write_to_model(&mut model, last_node_id, c, pos)?);
         }
         last_node_id = Some(model.add_consecutive_layer(self.final_norm.to_layer(), last_node_id)?);
         if let Some(final_proj) = self.final_proj {
@@ -204,7 +211,10 @@ mod tests {
         let path = file_cache::from_cache(path).unwrap();
         let loader = gguf::FileTensorLoader::from_path(path).unwrap();
         let config = LLMConfig::from_content(&loader).unwrap();
-        LLMModel::from_loader(&loader, &config).unwrap();
+        let intermediate = LLMModel::from_loader(&loader, &config).unwrap();
+        intermediate
+            .into_provable_model(&config, Shape::from(vec![1]))
+            .unwrap();
     }
 
     #[test]

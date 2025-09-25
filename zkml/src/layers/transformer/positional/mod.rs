@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::parser::llm::transformer::expand;
 use anyhow::{Ok, bail, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -98,7 +99,7 @@ impl PositionalCache {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Positional<N> {
-    cache: Arc<Mutex<PositionalCache>>,
+    cache: Option<Arc<Mutex<PositionalCache>>>,
     pub(crate) variant: PositionalVariant<N>,
 }
 
@@ -118,12 +119,17 @@ impl<N: Number> Positional<N> {
     }
 
     pub(crate) fn reset_cache(&self) {
-        self.cache.lock().unwrap().reset();
+        if let Some(cache) = &self.cache {
+            cache.lock().unwrap().reset();
+        }
     }
 
-    fn new_from_variant(variant: PositionalVariant<N>) -> Self {
+    pub(crate) fn new_from_variant(variant: PositionalVariant<N>) -> Self {
         let cache = Arc::new(Mutex::new(PositionalCache::new()));
-        Self { cache, variant }
+        Self {
+            cache: Some(cache),
+            variant,
+        }
     }
 
     pub fn new_absolute(matrix: Tensor<N>) -> Self {
@@ -136,6 +142,16 @@ impl<N: Number> Positional<N> {
         )))
     }
 
+    pub fn new_rope_from_frequency(
+        base_frequency: f32,
+        head_size: usize,
+        max_content_length: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::new_from_variant(PositionalVariant::Rope(
+            Rope::build_from_frequency(base_frequency, head_size, max_content_length)?,
+        )))
+    }
+
     pub fn new_rope_from_matrices(
         cosine_matrix: Tensor<N>,
         sine_matrix: Tensor<N>,
@@ -144,6 +160,14 @@ impl<N: Number> Positional<N> {
             cosine_matrix,
             sine_matrix,
         )?)))
+    }
+
+    /// Disable caching for `self` positional layer
+    pub fn with_no_cache(self) -> Self {
+        Self {
+            cache: None,
+            ..self
+        }
     }
 
     // Sample from the transcript `t` `num_coordinates` random coordinates to be employed
@@ -303,13 +327,20 @@ where
             unpadded_input_shapes.len(),
         );
 
+        // default cache to be provided in case the layer was not initialized with a cache
+        let new_cache = Arc::new(Mutex::new(PositionalCache::new()));
+
         match &self.variant {
-            PositionalVariant::Absolute(absolute) => {
-                absolute.evaluate(inputs[0], &unpadded_input_shapes[0], &self.cache)
-            }
-            PositionalVariant::Rope(rope) => {
-                rope.evaluate(inputs[0], &unpadded_input_shapes[0], &self.cache)
-            }
+            PositionalVariant::Absolute(absolute) => absolute.evaluate(
+                inputs[0],
+                &unpadded_input_shapes[0],
+                self.cache.as_ref().unwrap_or(&new_cache),
+            ),
+            PositionalVariant::Rope(rope) => rope.evaluate(
+                inputs[0],
+                &unpadded_input_shapes[0],
+                self.cache.as_ref().unwrap_or(&new_cache),
+            ),
         }
     }
 }
@@ -323,6 +354,7 @@ fn output_shapes(
         PaddingMode::NoPadding => pos_matrix_unpadded_shape.clone(),
         PaddingMode::Padding => pos_matrix_unpadded_shape.next_power_of_two(),
     };
+
     input_shapes.iter().for_each(|s| {
         assert!(s.is_matrix());
         assert!(s[0] <= pos_shape[0]);
@@ -391,8 +423,10 @@ impl QuantizeOp for Positional<f32> {
             "Expected 1 input scaling factor for positional layer, found {}",
             input_scaling.len()
         );
-        // re-initialize the cache for quantized model
-        let new_cache = Arc::new(Mutex::new(PositionalCache::new()));
+        // re-initialize the cache for quantized node, if the original node has a cache enabled
+        let new_cache = self
+            .cache
+            .map(|_| Arc::new(Mutex::new(PositionalCache::new())));
 
         let quantized_op = match self.variant {
             PositionalVariant::Absolute(abs) => {
@@ -404,6 +438,7 @@ impl QuantizeOp for Positional<f32> {
                     },
                     output_scalings: quantized_abs.output_scalings,
                     requant_layer: quantized_abs.requant_layer,
+                    post_quant_rule: None,
                 }
             }
             PositionalVariant::Rope(rope) => {
@@ -415,6 +450,7 @@ impl QuantizeOp for Positional<f32> {
                     },
                     output_scalings: quantized_rope.output_scalings,
                     requant_layer: quantized_rope.requant_layer,
+                    post_quant_rule: None,
                 }
             }
         };
@@ -428,7 +464,9 @@ impl PadOp for Positional<Element> {
     where
         Self: Sized,
     {
-        let cache = self.cache;
+        let cache = self
+            .cache
+            .map(|_| Arc::new(Mutex::new(PositionalCache::new())));
         let padded_variant = match self.variant {
             PositionalVariant::Absolute(pos) => PositionalVariant::Absolute(pos.pad_node(si)?),
             PositionalVariant::Rope(rope) => PositionalVariant::Rope(rope.pad_node(si)?),
@@ -446,7 +484,22 @@ impl PadOp for Positional<Element> {
 impl Positional<f32> {
     pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         match c.variant {
-            LLMVariant::Gemma3 => bail!("Gemma3 is not supported yet"),
+            LLMVariant::Gemma3 => {
+                let freq_base = loader
+                    .metadata::<f32>("gemma3.rope.freq_base")
+                    .ok_or(anyhow::anyhow!("gemma3.rope.freq_base not found"))?;
+                let head_size = c.head_size;
+                let max_content_length = c.max_sequence_length();
+                let p = Self::new_rope_from_frequency(freq_base, head_size, max_content_length)?;
+                let PositionalVariant::Rope(mut rope) = p.variant else {
+                    bail!("Expected Rope variant for gemma3");
+                };
+                rope.cosine_matrix = expand(rope.cosine_matrix, c.num_heads);
+                rope.sine_matrix = expand(rope.sine_matrix, c.num_heads);
+                rope.unpadded_shape
+                    .set_dim(-1, rope.unpadded_shape.dim(-1) * c.num_heads);
+                Ok(Positional::new_from_variant(PositionalVariant::Rope(rope)))
+            }
             LLMVariant::GPT2 => {
                 let position_embd = loader.get_tensor("position_embd.weight")?;
                 let shape = position_embd.shape();

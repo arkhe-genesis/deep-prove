@@ -366,6 +366,11 @@ where
         let v_bias = self.v_bias.clone().map(|bias| bias.to_btensor::<1>());
         let v_out_shape = Shape::new(vec![shape[0], self.v.shape()[1]]);
 
+        // println!("QKV Info");
+        // println!("QKV Q: {:?}", q.shape());
+        // println!("QKV K: {:?}", k.shape());
+        // println!("QKV V: {:?}", v.shape());
+        // println!("QKV Input: {:?}", input.shape());
         let q = input.clone().matmul(q);
         let q = if let Some(qb) = q_bias {
             q.add(qb.unsqueeze())

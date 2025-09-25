@@ -134,6 +134,7 @@ impl Absolute<f32> {
             quantized_op: quantized_pos,
             output_scalings: quantized_add.output_scalings,
             requant_layer: quantized_add.requant_layer,
+            post_quant_rule: None,
         })
     }
 }

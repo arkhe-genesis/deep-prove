@@ -346,7 +346,9 @@ where
             assert_eq!(
                 trace.outputs().unwrap()[0].get_data()[i - 1],
                 trace.inputs().unwrap()[0].get_data()[i],
-                "Failed for {i}"
+                "Failed for {i}, input: {:?}, output: {:?}",
+                trace.inputs().unwrap()[0],
+                trace.outputs().unwrap()[0]
             );
         }
         Ok(trace)
@@ -578,7 +580,7 @@ mod test {
         init_test_logging,
         parser::{
             file_cache,
-            gguf::tests::GPT2_Q8_0,
+            gguf::tests::{GEMMA3_Q8, GPT2_Q8_0},
             llm::{HFTokenizer, Token},
         },
         testing::Pcs,
@@ -681,6 +683,100 @@ mod test {
             .collect::<Vec<_>>();
         // let output = detokenize(&tokenizer, &output);
         // println!("{}", output);
+        Ok(())
+    }
+
+    #[test]
+    fn test_llm_gemma3() -> anyhow::Result<()> {
+        init_test_logging("debug");
+        let model_path = file_cache::from_cache(GEMMA3_Q8)?;
+        let driver = Driver::load_external_model(&model_path)?.with_max_context(6);
+
+        let driver = driver.into_runnable_llm()?;
+        println!("LLM DRIVER: config: {:?}", driver.config);
+
+        let sentence = "The sky is";
+        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let user_tokens = tokenizer.tokenize(sentence);
+        let trace = driver.run::<GoldilocksExt2>(
+            user_tokens,
+            Some(LLMTokenizerObserver {
+                input: sentence.to_string(),
+                tokenizer: &tokenizer,
+            }),
+        )?;
+        let output = trace
+            .outputs()
+            .unwrap()
+            .last()
+            .unwrap()
+            .get_data()
+            .iter()
+            .map(|t| Token::from(t.to_usize()))
+            .collect::<Vec<_>>();
+        let output = tokenizer.detokenize(&output);
+        println!("detokenized output: {output}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Test requires large machine to run"]
+    fn test_prove_llm_gemma3() -> anyhow::Result<()> {
+        init_test_logging("debug");
+        const MAX_CONTEXT: usize = 8;
+        let model_path = file_cache::from_cache(GEMMA3_Q8)?;
+        let cache_filename = {
+            let mut hasher = blake3::Hasher::new();
+            hasher
+                .update_mmap(&model_path)
+                .context("hashing model file")?;
+            let hash = hasher.finalize();
+            format!("cache-{GEMMA3_Q8}-{hash}.bin")
+        };
+
+        // Generate or load the prover & verifier contexts
+        let (mut driver, ctx): (_, LLMContext<GoldilocksExt2, Pcs<GoldilocksExt2>>) =
+            file_cache::deserialize_or_create_with(&cache_filename, || {
+                let driver = Driver::load_external_model(&model_path)?
+                    .with_max_context(MAX_CONTEXT)
+                    .into_provable_llm()?;
+
+                let ctx = driver
+                    .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+                    .with_max_context(MAX_CONTEXT);
+
+                Ok((driver, ctx))
+            })?;
+
+        println!("LLM DRIVER: config: {:?}", driver.config);
+        // Generate the trace
+        let sentence = "The sky is";
+        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let user_tokens = tokenizer.tokenize(sentence);
+
+        driver = driver.pad_model()?;
+
+        let trace = driver.run::<GoldilocksExt2>(
+            user_tokens.clone(),
+            Some(LLMTokenizerObserver {
+                input: sentence.to_string(),
+                tokenizer: &tokenizer,
+            }),
+        )?;
+
+        // Prove the trace
+        let proof = driver.prove(&ctx, trace)?;
+
+        // Serialize the proof
+        let proof_bytes =
+            bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
+        info!(
+            "Proof size: {}",
+            humansize::format_size(proof_bytes.len(), humansize::BINARY)
+        );
+
+        // Verify the proof
+        ctx.verify(proof, user_tokens)?;
         Ok(())
     }
 }

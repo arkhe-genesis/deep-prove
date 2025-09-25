@@ -173,6 +173,12 @@ impl LLMConfig {
     pub fn model_json(&self, l: &json::FileTensorLoader) -> anyhow::Result<LLMModel> {
         self.variant.model_json(l, self)
     }
+    pub fn max_sequence_length(&self) -> usize {
+        match self.variant {
+            LLMVariant::GPT2 => self.context_length,
+            LLMVariant::Gemma3 => 2048,
+        }
+    }
 }
 
 impl LLMVariant {
@@ -291,7 +297,7 @@ impl LLMVariant {
     pub fn model(&self, l: &FileTensorLoader, config: &LLMConfig) -> anyhow::Result<LLMModel> {
         match self {
             Self::GPT2 => Ok(LLMModel::from_loader(l, config)?),
-            Self::Gemma3 => bail!("Gemma3 is not supported yet"),
+            Self::Gemma3 => Ok(LLMModel::from_loader(l, config)?),
         }
     }
 }

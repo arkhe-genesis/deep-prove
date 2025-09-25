@@ -25,7 +25,7 @@ pub mod parser;
 pub mod quantization;
 pub mod shape;
 pub mod tensor;
-use crate::number::Number;
+pub use crate::number::Number;
 use std::cmp::Ordering;
 
 // Re-exports
@@ -66,6 +66,10 @@ impl<E> Claim<E> {
     pub fn mle_num_vars(&self) -> usize {
         self.point.len()
     }
+
+    pub fn point(&self) -> &[E] {
+        &self.point
+    }
 }
 
 impl<E: ExtensionField> From<PointAndEval<E>> for Claim<E> {
@@ -101,6 +105,10 @@ impl<E: ExtensionField> Claim<E> {
                 .cloned()
                 .collect_vec(),
         }
+    }
+
+    pub fn evaluation(&self) -> E {
+        self.eval
     }
 }
 
@@ -154,17 +162,9 @@ pub trait VectorTranscript<E: ExtensionField> {
     fn read_challenges(&mut self, n: usize) -> Vec<E>;
 }
 
-#[cfg(not(test))]
 impl<T: Transcript<E>, E: ExtensionField> VectorTranscript<E> for T {
     fn read_challenges(&mut self, n: usize) -> Vec<E> {
         (0..n).map(|_| self.read_challenge().elements).collect_vec()
-    }
-}
-
-#[cfg(test)]
-impl<T: Transcript<E>, E: ExtensionField> VectorTranscript<E> for T {
-    fn read_challenges(&mut self, n: usize) -> Vec<E> {
-        (0..n).map(|_| E::ONE).collect_vec()
     }
 }
 

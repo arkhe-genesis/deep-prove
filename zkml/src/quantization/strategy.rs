@@ -1,6 +1,6 @@
 use crate::{
     layers::provable::{Node, NodeId, QuantizeOp, TrackedDataId},
-    model::{Model, ToIterator},
+    model::{Model, ToIterator, transform::apply_transformations},
     number::Number,
     quantization::metadata::{MetadataBuilder, ModelMetadata},
     rng_from_env_or_random,
@@ -395,16 +395,25 @@ fn quantize_model<S: ScalingStrategy>(
     let mut md = MetadataBuilder::new(input_scaling);
     // 2. Create the requant layers from the inferred data
     let mut requant_layers = vec![];
+    // 3. Apply the post quantisation transforms if there are any
+    let mut transforms = vec![];
     let nodes = model
         .into_forward_iterator()
         .map(|(node_id, node)| {
             let input_scaling = md.compute_input_scaling(&node.inputs)?;
+            tracing::debug!(
+                "Quantising node {}, with node ID {node_id}",
+                node.operation.short_name()
+            );
             let quantized_out = node
                 .operation
                 .quantize_op::<S>(&data, node_id, &input_scaling)?;
             md.set_layers_scaling(node_id, quantized_out.output_scalings, input_scaling);
             if let Some(requant) = quantized_out.requant_layer {
                 requant_layers.push((node_id, requant));
+            }
+            if let Some(transform) = quantized_out.post_quant_rule {
+                transforms.push(transform);
             }
             let quantized_node =
                 Node::new_with_outputs(node.inputs, quantized_out.quantized_op, node.outputs);
@@ -427,6 +436,8 @@ fn quantize_model<S: ScalingStrategy>(
             md.set_layers_scaling(node_id, vec![scaling_factor], vec![scaling_factor]);
         }
     }
+    // Apply any model transformations
+    model = apply_transformations(model, transforms)?;
     let out_nodes = model.output_nodes();
     let md = md.build(out_nodes)?;
     info!("Quantized model with {} layers", model.nodes.len());

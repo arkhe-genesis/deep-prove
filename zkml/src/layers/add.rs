@@ -21,7 +21,7 @@ use crate::{
             Evaluate, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
         },
-        requant::Requant,
+        requant::{FIXED_POINT_SCALE, Requant},
     },
     model::StepData,
     number::Number,
@@ -42,7 +42,7 @@ pub struct Add<N> {
     /// The operand is the right side of the Add operation.
     /// shape is the unpadded shape of the operand
     operand: Option<(Tensor<N>, Shape)>,
-    quant_info: Option<QuantInfo>,
+    quant_info: Option<AddQuantInfo>,
 }
 
 impl<N: Number> Default for Add<N> {
@@ -56,7 +56,7 @@ impl<N: Number> Default for Add<N> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddCtx {
     node_id: NodeId,
-    quant_info: QuantInfo,
+    quant_info: AddQuantInfo,
     is_static_operand: bool,
 }
 
@@ -297,131 +297,108 @@ impl OpInfo for AddCtx {
     }
 }
 
+#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
 /// Quantization info for the add layer.
 /// When we perform quantised addition between two tensors A and B we need both tensors to be quantised with the same
-/// [`ScalingFactor`]. Often this is not the case and so we use [`QuantInfo`] to calculate a suitable common [`ScaleFactor`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct QuantInfo {
-    /// This is the value we must multiply the left input by
+/// [`ScalingFactor`]. Often this is not the case and so we use [`AddQuantInfo`] to calculate a suitable common [`ScalingFactor`].
+pub struct AddQuantInfo {
     left_multiplier: Element,
-    /// This is the value we must multiply the right input by
     right_multiplier: Element,
-    /// This is the common scale factor that the output of the addition will have
-    common_scale: f32,
-    /// Lets us know if we need a requantisation step after the addition
-    require_requant: bool,
+    right_shift: usize,
+    intermediate_bit_size: usize,
 }
 
-impl QuantInfo {
-    /// Calculates the relevant quantisation info to perform [`Add`]. We have to rescale both inputs to the same scaling factor, and then work out if we have to requantise afterwards.
+impl AddQuantInfo {
     pub fn new(
         left_scaling: &ScalingFactor,
         right_scaling: &ScalingFactor,
         output_scaling: &ScalingFactor,
     ) -> Self {
-        // The common scale factor needs to be worked out here from `left_scaling`, `right_scaling` and `output_scaling`
-        // To do this we take the absolute value of the base 2 logarithm of each (they should all be values in the interval [0,1), thus having negative base 2 logarithm)
-        let left_log = left_scaling.scale().log2().abs();
-        let right_log = right_scaling.scale().log2().abs();
-        let output_log = output_scaling.scale().log2().abs();
+        let left_rescale = left_scaling.scale() / output_scaling.scale();
+        let right_rescale = right_scaling.scale() / output_scaling.scale();
 
-        // We make a closure that we can use once we work out which of the left and right inputs has higher precision. This closure takes both (once it knows which is high precision and which is low)
-        // and calculates what we have to multiply the left input by, the right input by, the common scale factor after multiplying by both of these and also whether a requant step is required after the addition.
-        let minimum_precision_diff = *crate::quantization::BIT_LEN as f32;
-        let scale_comparison = |h_precision: ScalingFactor,
-                                l_precision: ScalingFactor|
-         -> (Element, Element, f32, bool) {
-            let high_log = h_precision.scale().log2().abs();
-            let low_log = l_precision.scale().log2().abs();
-            match high_log.compare(&output_log) {
+        let left_log = left_rescale.log2();
+        let right_log = right_rescale.log2();
+
+        let left_int = left_log.trunc();
+        let right_int = right_log.trunc();
+
+        let left_fract = left_log.fract();
+        let right_fract = right_log.fract();
+
+        // TO work out the overall shift we would need to apply to both inputs we subtract FIXED_POINT_SCALE from both
+        let left_input_shift = left_int - FIXED_POINT_SCALE as f32;
+        let right_input_shift = right_int - FIXED_POINT_SCALE as f32;
+
+        let (mut final_right_shift, mut left_multiplier, mut right_multiplier) =
+            match left_input_shift.compare(&right_input_shift) {
                 Ordering::Less => {
-                    // In this case the common scaling factor should be output_scaling as long as it is suitably more precise
-                    // The rationale is that if we have `s3*y = s1*x1 + s2*x2` with `s1 = 2^-a`, `s2 = 2^-b` and `s3 = 2^-c` in this we have `c > a` and `c > b`.
-                    // Since we want to work out `y = s1/s3 * x1 + s2/s3 * x2` then `s1/s3 = 2^-a/2^-c = 2^(c-a)`, similaraly `s2/s3 = 2^(c-b)`.
-                    // What we are doing is checking that both `2^(c-a)` and `2^(c-b)` are bigger than `2^minimum_precision_diff` so that calling `(s1/s3).round()` and `(s2/s3).round()` retains a reasonable level of precision.
-                    let (common_scale, require_requant) =
-                        if output_log - high_log >= minimum_precision_diff {
-                            // In this case the output scale factor is small enough such that `1/output_scale.scale()` is at least 2^minimum_precision_diff * (1 / h_precision.scale())`
-                            // so we can scale up our inputs and don't have to requantise afterwards.
-                            let common_scale = output_scaling.scale();
-                            (common_scale, false)
-                        } else {
-                            // The output scaling factor wasn't suitably large so we take the ceiling of high_log and add `minimum_precision_diff`, this way we retain a reasonable
-                            // amount of accuracy.
-                            let ceiling_round = high_log.ceil() as usize;
-                            let common_scale =
-                                2.0f32.powf(-(ceiling_round as f32 + minimum_precision_diff));
-                            (common_scale, true)
-                        };
-
-                    let left_rescale =
-                        (left_scaling.scale() / common_scale).round_ties_even() as Element;
-                    let right_rescale =
-                        (right_scaling.scale() / common_scale).round_ties_even() as Element;
-                    (left_rescale, right_rescale, common_scale, require_requant)
+                    // The left input has a "smaller" shift than the right input, so we work out what we need to subtract from the right input to make it equal to the left input
+                    let shift_diff = right_input_shift - left_input_shift;
+                    // shift_diff will always be positive here so the right multiplier is 2^shift_diff * 2^right_fract
+                    let right_multiplier = (2.0f32.powf(right_fract)
+                        * ((1u64 << (FIXED_POINT_SCALE + shift_diff.trunc().abs() as usize))
+                            as f32))
+                        .round_ties_even() as Element;
+                    let left_multiplier = (2.0f32.powf(left_fract)
+                        * (1u64 << FIXED_POINT_SCALE) as f32)
+                        .round_ties_even() as Element;
+                    (
+                        left_input_shift.trunc().abs() as usize,
+                        left_multiplier,
+                        right_multiplier,
+                    )
                 }
                 Ordering::Equal => {
-                    // In this case the output scale factor is small enough such that `1/output_scale.scale()` is at least 2^minimum_precision_diff * (1 / h_precision.scale())`
-                    // so we can scale up our inputs and don't have to requantise afterwards.
-                    let (common_scale, require_requant) =
-                        if output_log - low_log >= minimum_precision_diff {
-                            let common_scale = output_scaling.scale();
-                            (common_scale, false)
-                        } else {
-                            // The output scaling factor wasn't suitably large so we take the ceiling of high_log and add 8
-                            let ceiling_round = high_log.ceil() as usize;
-                            let common_scale =
-                                2.0f32.powf(-(ceiling_round as f32 + minimum_precision_diff));
-                            (common_scale, true)
-                        };
-
-                    let left_rescale =
-                        (left_scaling.scale() / common_scale).round_ties_even() as Element;
-                    let right_rescale =
-                        (right_scaling.scale() / common_scale).round_ties_even() as Element;
-                    (left_rescale, right_rescale, common_scale, require_requant)
+                    // No shift diff here so both multipliers are just 2^fract * 2^FIXED_POINT_SCALE
+                    let right_multiplier = (2.0f32.powf(right_fract)
+                        * (1u64 << FIXED_POINT_SCALE) as f32)
+                        .round_ties_even() as Element;
+                    let left_multiplier = (2.0f32.powf(left_fract)
+                        * (1u64 << FIXED_POINT_SCALE) as f32)
+                        .round_ties_even() as Element;
+                    (
+                        left_input_shift.trunc().abs() as usize,
+                        left_multiplier,
+                        right_multiplier,
+                    )
                 }
                 Ordering::Greater => {
-                    // In this case the common scaling factor should be high_log as long as it is suitably more precise than low_log
-                    let (common_scale, require_requant) = if high_log - low_log >= 8.0f32 {
-                        let common_scale = h_precision.scale();
-                        (common_scale, true)
-                    } else {
-                        // The high scaling factor wasn't suitably large so we take the ceiling of high_log and add 8
-                        let ceiling_round = high_log.ceil() as usize;
-                        let common_scale = 2.0f32.powf(-(ceiling_round as f32 + 8.0f32));
-                        (common_scale, true)
-                    };
-
-                    let left_rescale =
-                        (left_scaling.scale() / common_scale).round_ties_even() as Element;
-                    let right_rescale =
-                        (right_scaling.scale() / common_scale).round_ties_even() as Element;
-                    (left_rescale, right_rescale, common_scale, require_requant)
+                    // The right input has a "smaller" shift than the left input, so we work out what we need to subtract from the left input to make it equal to the right input
+                    let shift_diff = left_input_shift - right_input_shift;
+                    // shift_diff will always be positive here so the left multiplier is 2^shift_diff * 2^left_fract
+                    let left_multiplier = (2.0f32.powf(left_fract)
+                        * ((1u64 << (FIXED_POINT_SCALE + shift_diff.trunc().abs() as usize))
+                            as f32))
+                        .round_ties_even() as Element;
+                    let right_multiplier = (2.0f32.powf(right_fract)
+                        * (1u64 << FIXED_POINT_SCALE) as f32)
+                        .round_ties_even() as Element;
+                    (
+                        right_input_shift.trunc().abs() as usize,
+                        left_multiplier,
+                        right_multiplier,
+                    )
                 }
-            }
-        };
-        let (left_multiplier, right_multiplier, common_scale, require_requant): (
-            Element,
-            Element,
-            f32,
-            bool,
-        ) = match left_log.compare(&right_log) {
-            Ordering::Less | Ordering::Equal => {
-                // left input has lower or equal precision, now we work out if the output_scaling is higher or lower precision
-                scale_comparison(*right_scaling, *left_scaling)
-            }
-            Ordering::Greater => {
-                // right input has lower precision
-                scale_comparison(*left_scaling, *right_scaling)
-            }
-        };
+            };
+
+        // Now we need to make sure we can actually perform the requantisation, if not we sacrifice some accuracy to make it possible
+        let max_multiplier = std::cmp::max(left_multiplier, right_multiplier);
+        let max_mult_bit_size = ceil_log2(max_multiplier as usize);
+
+        let mut total_bit_size = max_mult_bit_size + *quantization::BIT_LEN + 1; // +1 for the addition of left and right
+        while total_bit_size >= 63 {
+            total_bit_size -= 1;
+            final_right_shift -= 1;
+            left_multiplier >>= 1;
+            right_multiplier >>= 1;
+        }
 
         Self {
             left_multiplier,
             right_multiplier,
-            common_scale,
-            require_requant,
+            right_shift: final_right_shift,
+            intermediate_bit_size: total_bit_size,
         }
     }
     /// The value to scalar multiply the left input by
@@ -433,37 +410,18 @@ impl QuantInfo {
         self.right_multiplier
     }
 
-    /// If the output scale factor was a suitable amount more precise than either of the inputs we do not have to
-    /// requantise afterwards (this almost never happens).
-    pub fn requires_requant(&self) -> bool {
-        self.require_requant
-    }
-    /// Returns the common scale factor used in the addition
-    pub fn common_scale(&self) -> f32 {
-        self.common_scale
-    }
-    /// The absolute value of intermedaite size before addition is bounded above by `self.common_scale.log2().abs().ceil()`, so we add 2 extra to this.
-    /// The first because we need an additional bit for the sign and the second because of the actual addition.
     pub fn intermediate_bit_size(&self) -> usize {
-        // self.common_scale.log2().abs().ceil() as usize + 2
-        *quantization::BIT_LEN
-            + ceil_log2(std::cmp::max(self.left_multiplier, self.right_multiplier) as usize)
-            + 1
+        self.intermediate_bit_size
+    }
+
+    pub fn right_shift(&self) -> usize {
+        self.right_shift
     }
 }
 
-/// Normally, scaling add is done by scaling both inputs, so requant should happen _before_ the add.
-/// y = (s1 * x1 + s2 * x2) / s3 where s1 is the left input scaling factor, s2 is the right input scaling factor,
-/// and s3 is the output scaling factor.
-///
-/// If s3 is suitably small (i.e. it retains more bits of precision) then the values s1 / s3 and s2 / s3 are precise enough
-/// that we can perform `y = (s1 / s3).round() * x1 + (s2 / s3).round() * x2` and not have to requantise afterwards.
-///
-/// If this isn't the case we pick some intermediate `common_scale` and obtain
-/// `y_int = (s1 / common_scale).round() * x1 + (s2 / common_scale).round() * x2`.
-/// Then we perform a requantisation step afterwards to calculate `y = (common_scale / s3).round() * y_int`.
-///
-/// Currently we require `s3` to be at least 8 bits more precise than `s1` or `s2` in order to not requantise.
+/// In the Add layer quantisation we need to make sure both inputs have the same scale factor in order to add them.
+/// To achieve this we calculate the fixed point multiplier for the left and right inputs so that they have the same scaling factor and can be added together.
+/// Then we add a requantisation step after the addition that performs only the right shift part of the fixed point multiplication.
 impl Add<f32> {
     pub fn quantize(
         self,
@@ -475,37 +433,30 @@ impl Add<f32> {
             Some((ref t, _)) => ScalingFactor::from_tensor(t, None),
             None => input_scaling[1],
         };
-        let quant_info = QuantInfo::new(&left_scaling, &right_scaling, &output_scaling);
+        let add_quant_info = AddQuantInfo::new(&left_scaling, &right_scaling, &output_scaling);
+
         let quantized_model = Add::<Element> {
             operand: self
                 .operand
                 .map(|(t, s)| (t.to_quantized(&right_scaling), s)),
-            quant_info: Some(quant_info.clone()),
+            quant_info: Some(add_quant_info),
         };
-        // we need to decide if we need a requant layer or not, and if so, what the scaling factor should be
-        // if not, we just return the quantized model
-        if !quant_info.requires_requant() {
-            return Ok(QuantizeOutput::new(quantized_model, vec![output_scaling]));
-        }
-        // We don't need the quantised domain here as the Requant layer works everything out from scale factors and intermediate bit size.
-        let add_scale = ScalingFactor::from_scale(quant_info.common_scale(), None);
-        let requant = requant_from_add(
-            add_scale,
-            output_scaling,
-            quant_info.intermediate_bit_size(),
-        );
+
+        let requant = requant_from_add(add_quant_info);
         Ok(QuantizeOutput::new(quantized_model, vec![output_scaling]).with_requant(requant))
     }
 }
 
-/// Function used to instantiate a new [`Requant`] from the scaling factors of all tensors involved in an addition layer.
-pub fn requant_from_add(
-    add_scale: ScalingFactor,
-    output_scale: ScalingFactor,
-    intermediate_bit_size: usize,
-) -> Requant {
-    let m = add_scale.scale() / output_scale.scale();
-    Requant::from_multiplier(m, intermediate_bit_size)
+/// Function used to instantiate a new [`Requant`] from the [`AddQuantInfo`] calculated during quantization of the Add layer.
+/// This [`Requant`] will perform just the right shift part of the fixed point multiplication.
+pub fn requant_from_add(add_quant_info: AddQuantInfo) -> Requant {
+    Requant {
+        right_shift: add_quant_info.right_shift(),
+        fixed_point_multiplier: 1,
+        fp_scale: 0,
+        multiplier: 1.0f32,
+        intermediate_bit_size: add_quant_info.intermediate_bit_size(),
+    }
 }
 
 impl QuantizeOp for Add<f32> {
@@ -536,7 +487,7 @@ impl ProveInfo for Add<Element> {
             bail!("Add layer is not quantized");
         };
         let mut ctx = AddCtx {
-            quant_info: quant_info.clone(),
+            quant_info: *quant_info,
             is_static_operand: false,
             node_id: id,
         };
@@ -687,27 +638,40 @@ mod test {
         let add = Add::<f32>::new();
         let t1 = Tensor::<f32>::random(&vec![2, 2].into());
         let t2 = Tensor::<f32>::random(&vec![2, 2].into());
-        let t3 = t1.add(&t2);
         let s1 = ScalingFactor::from_tensor(&t1, None);
         let s2 = ScalingFactor::from_tensor(&t2, None);
-        let s3 = ScalingFactor::from_tensor(&t3, None);
         let qt1 = t1.to_quantized(&s1); // x1_q = round(x1 / s1)
         let qt2 = t2.to_quantized(&s2);
+        let dequant_t1 = qt1.dequantize(&s1);
+        let dequant_t2 = qt2.dequantize(&s2);
+        let t3 = dequant_t1.add(&dequant_t2);
+        let s3 = ScalingFactor::from_tensor(&t3, None);
+
         let qadd = add.quantize(&[s1, s2], s3).unwrap().quantized_op;
         let qadd_result = qadd
             .evaluate::<GoldilocksExt2>(&[&qt1, &qt2], &[vec![2, 2].into(), vec![2, 2].into()])
             .unwrap();
 
-        let scale = qadd.quant_info.as_ref().unwrap().common_scale() / s3.scale();
-        let result_scaled = Tensor::<Element>::new(
+        let quant_info = qadd.quant_info.as_ref().unwrap();
+
+        let computed_result = Tensor::<f32>::new(
             qadd_result.outputs()[0].shape().clone(),
             qadd_result.outputs()[0]
                 .get_data()
                 .iter()
-                .map(|x| (*x as f32 * scale).round_ties_even() as Element)
+                .map(|x| {
+                    let unclamped = *x >> quant_info.right_shift();
+
+                    if unclamped >= *quantization::MAX {
+                        *quantization::MAX as f32 * s3.scale()
+                    } else if unclamped <= *quantization::MIN {
+                        *quantization::MIN as f32 * s3.scale()
+                    } else {
+                        unclamped as f32 * s3.scale()
+                    }
+                })
                 .collect::<Vec<_>>(),
         );
-        let computed_result = result_scaled.dequantize(&s3);
 
         let close_to_float = is_close_with_tolerance(
             computed_result.get_data(),
@@ -802,11 +766,11 @@ mod test {
 
             let expected = input.scalar_mul(&left_multiplier).add(&operand.scalar_mul(&right_multiplier));
 
-            let quant_info = QuantInfo {
+            let quant_info = AddQuantInfo {
                 left_multiplier,
                 right_multiplier,
-                common_scale: 1.0,
-                require_requant: false
+                right_shift: 1,
+                intermediate_bit_size: 13,
             };
 
             let computed = if is_two_layers {
