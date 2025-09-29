@@ -65,7 +65,7 @@ pub fn unfuse_tensors(
     };
     let num_elements = data.len();
     ensure!(
-        num_elements % chunk_len == 0,
+        num_elements.is_multiple_of(chunk_len),
         "Total elements {num_elements} is not divisible by chunk_len {chunk_len} for unfusing"
     );
     let tensors: Vec<Vec<f32>> = data

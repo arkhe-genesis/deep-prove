@@ -141,7 +141,7 @@ impl<E: ExtensionField> LogUpLayer<E> {
     /// Gets the Densemultlinear extensions for this [`LogUpLayer`] in the order
     /// numerator low part, numerator high part, denominator low part, denominator high part.
     /// In the initial lookup case it is just the two denominator MLEs.
-    pub fn get_mles(&self) -> Vec<ArcMultilinearExtension<E>> {
+    pub fn get_mles(&self) -> Vec<ArcMultilinearExtension<'_, E>> {
         let num_vars = self.num_vars();
         let half_layer_size = 1 << num_vars;
         match self {
@@ -182,7 +182,7 @@ impl<E: ExtensionField> LogUpLayer<E> {
     /// Gets the Densemultlinear extensions for this [`LogUpLayer`] in the order
     /// numerator low part, numerator high part, denominator low part, denominator high part.
     /// In the initial lookup case it is just the two denominator MLEs.
-    pub fn new_get_mles(&self) -> Vec<MultilinearExtension<E>> {
+    pub fn new_get_mles(&self) -> Vec<MultilinearExtension<'_, E>> {
         let num_vars = self.num_vars();
         let half_layer_size = 1 << num_vars;
         match self {

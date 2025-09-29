@@ -158,7 +158,7 @@ impl<N: Number> QKV<N> {
             );
         }
         ensure!(
-            hidden_size % num_heads == 0,
+            hidden_size.is_multiple_of(num_heads),
             "Expected number of heads to be a divisor of hidden size, but it's not: hidden_size = {hidden_size}, num_heads = {num_heads}"
         );
         let head_dim = hidden_size / num_heads;
@@ -171,7 +171,7 @@ impl<N: Number> QKV<N> {
                 v.shape()
             );
             ensure!(
-                k.shape().dim(1) % head_dim == 0,
+                k.shape().dim(1).is_multiple_of(head_dim),
                 "Expected number of groups to be a multiple of head dim, but it's not: head_dim = {head_dim}, num_groups = {num_groups} but k has shape {:?}",
                 k.shape()
             );

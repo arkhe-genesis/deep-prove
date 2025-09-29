@@ -220,7 +220,7 @@ impl<N: Number> AttentionMask<N> {
     /// since we never want to prove a single token inference with caching enabled.
     /// We always prove the full sequence length, without caching.
     /// However, the evaluation needs to support both cases.
-    fn make_lt_poly<E: ExtensionField>(&self, seq_len: usize) -> MultilinearExtension<E> {
+    fn make_lt_poly<E: ExtensionField>(&self, seq_len: usize) -> MultilinearExtension<'_, E> {
         let evals = (0..seq_len)
             .flat_map(|token| {
                 (0..seq_len).map(move |other| {

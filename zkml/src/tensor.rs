@@ -760,7 +760,7 @@ impl<F: Field> Tensor<F> {
     /// Clone this [Tensor] and convert into a [MultilinearExtension].
     ///
     /// see [Tensor::into_mle].
-    pub fn to_mle<E: ExtensionField>(&self) -> MultilinearExtension<E> {
+    pub fn to_mle<E: ExtensionField>(&self) -> MultilinearExtension<'_, E> {
         self.data.clone().into_mle()
     }
 
@@ -2045,7 +2045,7 @@ impl<T: Default> Tensor<T> {
             pos += 1;
         }
         ensure!(
-            pos % max_stride == 0,
+            pos.is_multiple_of(max_stride),
             "The part going beyond must be a multiple of the stride"
         );
         // how many times have we added a "big" chunk to the recipient, and therefore by how much to increase the new shape

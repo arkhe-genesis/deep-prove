@@ -650,7 +650,7 @@ mod tests {
             Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
 
         // build angles for rotational matrix
-        assert!(embedding_size % 2 == 0);
+        assert!(embedding_size.is_multiple_of(2));
         let angles = random_angles(embedding_size / 2);
 
         let _ = model

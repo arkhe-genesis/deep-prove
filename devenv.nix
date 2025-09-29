@@ -30,7 +30,7 @@
   languages.rust = {
     enable = true;
     channel = "nightly";
-    version = "2025-05-22";
+    version = "2025-08-08";
   };
   languages.python = {
     enable = true;
