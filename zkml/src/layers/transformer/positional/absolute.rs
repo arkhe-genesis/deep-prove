@@ -305,7 +305,10 @@ impl AbsoluteCtx {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Debug;
+    use std::{
+        fmt::Debug,
+        sync::{Arc, Mutex},
+    };
 
     use rstest::rstest;
 
@@ -316,13 +319,13 @@ mod tests {
         layers::{
             Layer,
             provable::{Evaluate, PadOp},
-            transformer::positional::Positional,
+            transformer::positional::{Positional, PositionalCache, absolute::Absolute},
         },
         model::{Model, test::prove_model},
         number::Number,
-        padding::PaddingMode,
+        padding::{PaddingMode, ShapeData, ShapeInfo},
         quantization::{AbsoluteMax, ScalingFactor},
-        tensor::is_close_with_tolerance,
+        tensor::{TensorSlice, is_close_with_tolerance},
     };
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
@@ -396,10 +399,6 @@ mod tests {
 
         #[test]
         fn test_absolute_f32(input in input::<f32>()) {
-            use crate::layers::transformer::positional::absolute::Absolute;
-            use crate::layers::transformer::positional::PositionalCache;
-            use std::sync::{Arc, Mutex};
-
             let Input { seq_len, embedding_size, input, pos, .. } = input.clone();
             let layer = Absolute::<f32>::new(pos.clone());
 
@@ -424,11 +423,6 @@ mod tests {
 
         #[test]
         fn test_absolute_element(input in input::<f32>()) {
-            use crate::layers::transformer::positional::absolute::Absolute;
-            use crate::layers::transformer::positional::PositionalCache;
-            use crate::tensor::TensorSlice;
-            use std::sync::{Arc, Mutex};
-
             let Input { seq_len, embedding_size, input, pos, .. } = input.clone();
             let layer = Absolute::<f32>::new(pos.clone());
             let input_sf = ScalingFactor::from_tensor(&input, None);
@@ -461,9 +455,6 @@ mod tests {
 
         #[test]
         fn test_absolute_padding_prop(input in input::<Element>()) {
-            use crate::layers::transformer::positional::absolute::Absolute;
-            use crate::padding::{ShapeData, ShapeInfo};
-
             let Input { seq_len, embedding_size, pos: positional_matrix, .. } = input.clone();
 
             let layer = Absolute::<Element>::new(positional_matrix.clone());
@@ -488,10 +479,6 @@ mod tests {
 
         #[test]
         fn test_absolute_proving_prop(input in input::<f32>()) {
-            use crate::layers::Layer;
-            use crate::layers::transformer::positional::Positional;
-            use crate::padding::PaddingMode;
-
             let Input { seq_len, embedding_size, pos: positional_matrix, .. } = input.clone();
             prop_assume!(seq_len >= 2 && embedding_size >= 2);
 

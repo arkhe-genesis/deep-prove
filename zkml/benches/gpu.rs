@@ -761,13 +761,13 @@ mod positional_absolute_layer {
                     0usize.into(),
                     &[input_scaling],
                 )
-                .expect("Quantize Positional")
+                .expect("quantize positional absolute should succeed")
                 .quantized_op
             })
             .bench_refs(|layer| {
                 layer
                     .evaluate::<GoldilocksExt2>(&[&input], input_shape)
-                    .expect("Positional should succeed");
+                    .expect("Positional absolute should succeed");
             });
     }
     #[divan::bench(args = default_sizes())]
@@ -784,7 +784,83 @@ mod positional_absolute_layer {
             .bench_refs(|layer| {
                 layer
                     .evaluate::<GoldilocksExt2>(&[&input], input_shape)
-                    .expect("Positional should succeed");
+                    .expect("Positional absolute should succeed");
+            });
+    }
+}
+
+#[divan::bench_group]
+mod positional_rope_layer {
+    use core::slice;
+    use ff_ext::GoldilocksExt2;
+    use std::f32::consts::PI;
+    use zkml::{
+        ScalingFactor, Shape, Tensor,
+        layers::{
+            provable::{Evaluate, QuantizeOp},
+            transformer::positional::Positional,
+        },
+        quantization::AbsoluteMax,
+    };
+
+    use crate::{Args, default_sizes};
+
+    #[divan::bench(args = default_sizes())]
+    fn element(bencher: divan::Bencher, args: Args) {
+        let size: usize = 1 << args.pow2;
+        let context = size * 2;
+        if size < 2 || !size.is_multiple_of(2) {
+            return;
+        }
+
+        let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
+        let input = input_f32.to_quantized(&input_scaling);
+        let input_shape = slice::from_ref(input.shape());
+
+        let num_angles = size / 2;
+        let angles: Vec<f32> = (0..num_angles)
+            .map(|i| ((i as f32) + 1.0) * (PI / (num_angles as f32 + 1.0)))
+            .collect();
+
+        bencher
+            .with_inputs(|| {
+                QuantizeOp::quantize_op::<AbsoluteMax>(
+                    Positional::<f32>::new_rope(angles.clone(), context).expect("new_rope"),
+                    &(),
+                    0usize.into(),
+                    &[input_scaling],
+                )
+                .expect("quantize positional rope should succeed")
+                .quantized_op
+            })
+            .bench_refs(|layer| {
+                layer
+                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .expect("Positional rope should succeed");
+            });
+    }
+    #[divan::bench(args = default_sizes())]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size: usize = 1 << args.pow2;
+        let context = size * 2;
+        if size < 2 || !size.is_multiple_of(2) {
+            return;
+        }
+
+        let num_angles = size / 2;
+        let angles: Vec<f32> = (0..num_angles)
+            .map(|i| ((i as f32) + 1.0) * (PI / (num_angles as f32 + 1.0)))
+            .collect();
+
+        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = slice::from_ref(input.shape());
+        bencher
+            .with_inputs(|| Positional::<f32>::new_rope(angles.clone(), context).expect("new_rope"))
+            .bench_refs(|layer| {
+                layer
+                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .expect("Positional rope should succeed");
             });
     }
 }
