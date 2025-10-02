@@ -57,8 +57,7 @@ pub fn from_proto(proto: &ModelProto) -> Result<Model<f32>> {
     from_inference_model(model)
 }
 
-#[cfg(test)]
-fn from_path(path: &str) -> Result<Model<f32>> {
+pub fn from_path(path: &str) -> Result<Model<f32>> {
     let model = tract_onnx::onnx().model_for_path(path)?;
     from_inference_model(model)
 }
