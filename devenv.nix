@@ -8,6 +8,7 @@
     pkgs.git pkgs.git-lfs pkgs.openssl pkgs.cmake
     # Rust crates build deps
     pkgs.openssl pkgs.llvmPackages.libclang.lib pkgs.protobuf
+    pkgs.cargo-nextest
   ];
 
   env = {

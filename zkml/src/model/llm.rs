@@ -590,7 +590,7 @@ mod test {
     use ff_ext::GoldilocksExt2;
 
     #[test]
-    fn test_llm_driver_prove() -> anyhow::Result<()> {
+    fn test_llm_driver_prove_gpt2() -> anyhow::Result<()> {
         const MAX_CONTEXT: usize = 10;
         init_test_logging("debug");
 
@@ -687,7 +687,7 @@ mod test {
     }
 
     #[test]
-    fn test_llm_gemma3() -> anyhow::Result<()> {
+    fn test_llm_driver_prove_gemma3() -> anyhow::Result<()> {
         init_test_logging("debug");
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
         let driver = Driver::load_external_model(&model_path)?.with_max_context(6);

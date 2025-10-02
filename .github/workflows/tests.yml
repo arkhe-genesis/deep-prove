@@ -9,6 +9,12 @@ on:
     branches:
       - master
   pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+      - ready_for_review
 
 concurrency:
   group: tests-${{ github.ref }}
@@ -59,12 +65,19 @@ jobs:
 
       - name: Run cargo check
         shell: devenv shell bash -- -e {0}
-        run: cargo check -p zkml --all --tests --benches
+        run: cargo check --all --tests --benches
         env:
           RUSTFLAGS: "-W warnings"
 
-      - name: Run cargo test
-        run: devenv test
+      - name: Run light tests
+        if: github.event.pull_request.draft == true
+        shell: devenv shell bash -- -e {0}
+        run: cargo nextest run -- --skip test_llm_driver_prove_
+
+      - name: Run all tests
+        if: github.event.pull_request.draft == false
+        shell: devenv shell bash -- -e {0}
+        run: cargo nextest run
 
 
   linting:
