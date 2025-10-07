@@ -440,7 +440,7 @@ mod concat_matmul_layer {
         },
     };
 
-    use crate::{Args, default_sizes, sizes};
+    use crate::{Args, sizes};
 
     // XXX: beyond this point benchmarks for elements are too slow, see matmul
     // benches for measurements.
@@ -473,7 +473,11 @@ mod concat_matmul_layer {
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    // NOTE Upper limit set to 2^12 as 2^13 would make a tensor with 2GiB size
+    // that fails to allocate in Vulkan (the limit is `2GiB - 31`, determined
+    // from `Max Storage Buffer Binding Size` limit determined by wgpu)
+    const F32_SIZES: Range<i32> = 7..13;
+    #[divan::bench(args = sizes(F32_SIZES))]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let left_perm = InputMatrixDimensions::new(1, 2, 0);
