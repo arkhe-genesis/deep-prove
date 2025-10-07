@@ -122,13 +122,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        environment: [devnet, testnet, mainnet]
+        environment: [ mainnet]
         image:  ${{ fromJSON(needs.changes.outputs.images-to-build) }}
         include:
-          - environment: devnet
-            aws_account_id: ${{ vars.ZKMR_DEVNET_AWS_ACCOUNT_ID }}
-          - environment: testnet
-            aws_account_id: ${{ vars.ZKMR_TESTNET_AWS_ACCOUNT_ID }}
           - environment: mainnet
             aws_account_id: ${{ vars.ZKMR_MAINNET_AWS_ACCOUNT_ID }}
     steps:
