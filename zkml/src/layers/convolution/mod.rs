@@ -17,7 +17,7 @@ use crate::{
     parser::{check_filter, safe_conv2d_shape},
     quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
     shape::filter_size,
-    tensor::{ConvData, ConvFFTData, Tensor, fft},
+    tensor::{ConvData, ConvFFTData, KeyedTensor, Tensor, TensorKey, fft},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
@@ -54,19 +54,16 @@ mod test;
 
 pub(crate) use proof::{ConvCtx, ConvProof};
 
-const FILTER_POLY_ID: &str = "ConvFilter";
-const BIAS_POLY_ID: &str = "ConvBias";
-
 /// The filter weights, a 4D tensor of the shape `(feature_maps, channels_out,
 /// kernel_height, kernel_width)` whose shape depends on the current life stage
 /// of the filter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum FilterTensor<T> {
     /// The stage-2, pow2-padded, filter tensor.
-    RawFilter(Tensor<T>),
+    RawFilter(KeyedTensor<T>),
     /// The FFT-ized tensor, built from the above and the padded input shape.
     FftFilter {
-        tensor: Tensor<T>,
+        tensor: KeyedTensor<T>,
 
         /// The originally padded shape of the filter, before it will have been
         /// converted in the shape adapted to the given inputs.
@@ -85,7 +82,8 @@ impl<T: Clone + Copy + Default> FilterTensor<T> {
         };
 
         // The ephemeral stage-2 filter tensor.
-        tensor.pad_to_shape(tensor.shape().next_power_of_two());
+        let padded_shape = tensor.shape().next_power_of_two();
+        tensor.pad_to_shape(padded_shape);
 
         let pre_fft_shape = tensor.shape().clone();
         assert!(
@@ -109,7 +107,8 @@ impl<T: Clone + Copy + Default> FilterTensor<T> {
         let n_w = (padded_input_shape[1] - pre_fft_shape[2] + 1).next_power_of_two();
         let new_shape = Shape::new(vec![pre_fft_shape[0], pre_fft_shape[1], n_w, n_w]);
 
-        let tensor = Tensor::new_unchecked(new_shape, tensor.data().to_vec());
+        let tensor =
+            tensor.clone_and_map_tensor(|t| Tensor::new_unchecked(new_shape, t.data().to_vec()));
 
         *self = FilterTensor::FftFilter {
             tensor,
@@ -147,7 +146,7 @@ struct Filter<T> {
 }
 impl<T> Filter<T> {
     /// Create a new filter, in its raw form, from the given [`Tensor`].
-    fn new(tensor: Tensor<T>) -> Self {
+    fn new(tensor: KeyedTensor<T>) -> Self {
         Self {
             original_shape: tensor.shape().clone(),
             tensor: FilterTensor::RawFilter(tensor),
@@ -180,6 +179,13 @@ impl<T> Filter<T> {
         match &self.tensor {
             FilterTensor::RawFilter(tensor) => tensor.shape(),
             FilterTensor::FftFilter { pre_fft_shape, .. } => pre_fft_shape,
+        }
+    }
+
+    fn tensor_key(&self) -> TensorKey {
+        match &self.tensor {
+            FilterTensor::RawFilter(tensor) => tensor.key.clone(),
+            FilterTensor::FftFilter { tensor, .. } => tensor.key.clone(),
         }
     }
 }
@@ -375,10 +381,10 @@ pub struct Convolution<T> {
     /// The convolution bias.
     ///
     /// This must have the same size as `feature_maps`.
-    bias: Tensor<T>,
+    bias: KeyedTensor<T>,
 }
 impl<T> Convolution<T> {
-    pub fn new(filter: Tensor<T>, bias: Tensor<T>) -> Self {
+    pub fn new(filter: KeyedTensor<T>, bias: KeyedTensor<T>) -> Self {
         assert_eq!(bias.rank(), 1);
         assert_eq!(filter.dim(0), bias.shape()[0]);
         assert_eq!(filter.rank(), 4);
@@ -433,12 +439,17 @@ impl<T> Convolution<T> {
             filter_size: self.fft_filter_size(),
             unpadded_filter_shape: self.filter.original_shape.clone(),
             padded_filter_shape: self.filter.pre_fft_shape().clone(),
+            filter_key: self.filter.tensor_key(),
+            bias_key: self.bias.key(),
         }
     }
 }
 impl<T: Number> Convolution<T> {
-    pub(crate) fn new_without_bias(filter: Tensor<T>) -> Self {
-        let bias = Tensor::zeros(Shape::new(vec![filter.dim(0)]));
+    pub(crate) fn new_without_bias(filter: KeyedTensor<T>) -> Self {
+        let bias = KeyedTensor::new(
+            format!("{}_bias", filter.key),
+            Tensor::zeros(Shape::new(vec![filter.dim(0)])),
+        );
         Self::new(filter, bias)
     }
 }
@@ -489,7 +500,7 @@ impl Evaluate<f32> for Convolution<f32> {
         };
 
         let weight = tensor.clone().to_btensor::<4>();
-        let bias = self.bias.clone().to_btensor::<1>();
+        let bias = self.bias.tensor().to_btensor::<1>();
 
         let res = conv2d(
             input,
@@ -521,8 +532,11 @@ impl Convolution<f32> {
     fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Convolution<Element> {
         let tensor = self.filter.as_pre_fft_tensor();
         let quantized_filter = tensor.to_quantized(s);
-        let bias = self.bias.to_quantized(bias_s);
-        Convolution::<Element>::new(quantized_filter, bias)
+        let bias = self.bias.quantize(bias_s);
+        Convolution::<Element>::new(
+            KeyedTensor::new(self.filter.tensor_key(), quantized_filter),
+            bias,
+        )
     }
 
     fn max_abs_weight(&self) -> f32 {
@@ -637,8 +651,8 @@ impl Convolution<Element> {
     /// filter data is not padded, this is performed during fft computation at layer
     /// evaluation.
     pub(crate) fn prepare_for_fft(&mut self, unpadded_input_shape: &Shape) {
-        self.bias
-            .pad_to_shape(self.bias.shape().next_power_of_two());
+        let padded_bias_shape = self.bias.shape().next_power_of_two();
+        self.bias.pad_to_shape(padded_bias_shape);
 
         self.filter
             .prepare_for_fft(&unpadded_input_shape.next_power_of_two());
@@ -1100,8 +1114,8 @@ impl Convolution<Element> {
         // Add common polynomial commitment claims to the commitment prover
         let common_claims = {
             let mut claims = HashMap::new();
-            claims.insert(FILTER_POLY_ID.to_string(), filter_claim);
-            claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+            claims.insert(self.filter.tensor_key(), filter_claim);
+            claims.insert(self.bias.key.clone(), bias_claim);
             claims
         };
         prover.add_common_claims(id, common_claims);
@@ -1210,8 +1224,8 @@ impl ProveInfo for Convolution<Element> {
         let bias_poly = self.bias.pad_next_power_of_two().into_data();
         aux.model_polys = {
             let mut model_polys = HashMap::new();
-            model_polys.insert(FILTER_POLY_ID.to_string(), filter_poly);
-            model_polys.insert(BIAS_POLY_ID.to_string(), bias_poly);
+            model_polys.insert(self.filter.tensor_key(), filter_poly);
+            model_polys.insert(self.bias.key(), bias_poly);
             Some(model_polys)
         };
         Ok((conv_info, aux))

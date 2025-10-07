@@ -264,7 +264,7 @@ pub(crate) fn pad_dense(mut d: Dense<Element>, si: &mut ShapeInfo) -> Result<Den
         d.matrix
             .reshape_to_fit_inplace_2d(vec![nrows, ncols].into());
     }
-    d.bias = d.bias.map(|b| b.pad_1d(nrows));
+    d.bias = d.bias.map(|b| b.map_tensor(|t| t.pad_1d(nrows)));
     sd.input_shape_padded = vec![nrows].into();
     Ok(d)
 }
@@ -299,7 +299,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
     let (left_shape, mut right_shape) = match (&mut mat.left_matrix, &mut mat.right_matrix) {
         (OperandMatrix::Weight(m), OperandMatrix::Input) => {
             let nrows = pad_minimum(m.tensor.nrows_2d());
-            let ncols = padded_input_shapes[0][0];
+            let ncols = pad_minimum(m.tensor.ncols_2d());
             m.tensor
                 .reshape_to_fit_inplace_2d(vec![nrows, ncols].into());
             (
@@ -308,7 +308,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
             )
         }
         (OperandMatrix::Input, OperandMatrix::Weight(m)) => {
-            let nrows = padded_input_shapes[0][1];
+            let nrows = pad_minimum(m.tensor.nrows_2d());
             let ncols = pad_minimum(m.tensor.ncols_2d());
             let padded_matrix_shape = vec![nrows, ncols].into();
             // check if there is garbage pad: this is the only case we support in matrix mul where there
@@ -348,9 +348,8 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
         input_shape_padded: vec![left_shape[0], right_shape[1]].into(),
         ignore_garbage_pad: None,
     }];
-    if let Some(mut bias) = mat.bias {
+    if let Some(bias) = &mut mat.bias {
         bias.pad_to_shape(right_shape.slice(1..));
-        mat.bias = Some(bias);
     }
     Ok(mat)
 }
@@ -400,21 +399,23 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
     let padded_head_dim = pad_minimum(head_dim);
     let padded_num_heads = pad_minimum(qkv.num_heads);
     [&mut qkv.q, &mut qkv.k, &mut qkv.v].into_iter().try_for_each(|weight_mat| {
-        ensure!(weight_mat.nrows_2d() <= sd.input_shape_padded.dim(1),
+        let weight_tensor = weight_mat;
+        let nrows = weight_tensor.nrows_2d();
+        ensure!(nrows <= sd.input_shape_padded.dim(1),
             "Weight matrices in QKV layer has more rows than the number of columns of padded input shapes: Expected at most {} rows, found {}",
-            sd.input_shape_padded.dim(1), weight_mat.nrows_2d(),
+            sd.input_shape_padded.dim(1), nrows,
         );
 
-        weight_mat.reshape(Shape::new(vec![
-            weight_mat.nrows_2d(),
+        weight_tensor.reshape(Shape::new(vec![
+            nrows,
             qkv.num_heads,
             head_dim,
         ]));
         let nrows = pad_minimum(sd.input_shape_padded.dim(1));
-        weight_mat.pad_to_shape(
+        weight_tensor.pad_to_shape(
             vec![nrows, padded_num_heads, padded_head_dim].into()
         );
-        weight_mat.reshape(Shape::new(vec![
+        weight_tensor.reshape(Shape::new(vec![
             nrows,
             padded_num_heads*padded_head_dim,
         ]));

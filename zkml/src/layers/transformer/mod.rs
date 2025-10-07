@@ -55,7 +55,7 @@ pub(crate) mod manual_attention {
             llm::{Attention, FeedForward, LLMConfig, transformer::Norm},
         },
         rng_from_env_or_random,
-        tensor::is_close,
+        tensor::{KeyedTensor, TensorKey, is_close},
     };
 
     use super::{layernorm, mha, qkv};
@@ -74,17 +74,13 @@ pub(crate) mod manual_attention {
                 // Dense::new(ffn.up, ffn.up_bias);
                 // but since we are multiplying this matrix FOR EACH TOKEN in the sequence,
                 // this becomes a matrix multiplication in practice.
-                let weight = OperandMatrix::new_weight_matrix(ffn.up);
-                let left = OperandMatrix::Input;
-                MatMul::new(left, weight).expect("failed to create MatMul")
+                MatMul::new_constant(ffn.up, ffn.up_bias).expect("failed to create MatMul")
             };
             let activation = GELU::new();
             let down = {
                 // normally we would do this
                 // Dense::new(ffn.down, ffn.down_bias);
-                let weight = OperandMatrix::new_weight_matrix(ffn.down);
-                let left = OperandMatrix::Input;
-                MatMul::new(left, weight).expect("failed to create MatMul")
+                MatMul::new_constant(ffn.down, ffn.down_bias).expect("failed to create MatMul")
             };
             let add = add::Add::new();
 
@@ -126,8 +122,9 @@ pub(crate) mod manual_attention {
     impl<N: Number> FlatFFN<N> {
         pub fn random(hidden_size: usize, up_size: usize) -> Self {
             let up = {
-                let weight = OperandMatrix::new_weight_matrix(Tensor::random(
-                    &vec![up_size, hidden_size].into(),
+                let weight = OperandMatrix::new_weight_matrix(KeyedTensor::new(
+                    "ffn_up_weight",
+                    Tensor::random(&vec![up_size, hidden_size].into()),
                 ));
                 let left = OperandMatrix::Input;
                 MatMul::new(left, weight).expect("failed to create MatMul")
@@ -135,8 +132,9 @@ pub(crate) mod manual_attention {
             let activation = GELU::new();
             let down = {
                 // Dense::random(vec![up_size, hidden_size]);
-                let weight = OperandMatrix::new_weight_matrix(Tensor::random(
-                    &vec![hidden_size, up_size].into(),
+                let weight = OperandMatrix::new_weight_matrix(KeyedTensor::new(
+                    "ffn_down_weight",
+                    Tensor::random(&vec![hidden_size, up_size].into()),
                 ));
                 let left = OperandMatrix::Input;
                 MatMul::new(left, weight).expect("failed to create MatMul")
@@ -291,25 +289,43 @@ pub(crate) mod manual_attention {
         N: Number,
         ConcatMatMul: Evaluate<N>,
     {
-        pub fn random(emb_size: usize, num_heads: usize) -> anyhow::Result<Self> {
+        pub fn random(
+            emb_size: usize,
+            num_heads: usize,
+            layer_name: Option<TensorKey>,
+        ) -> anyhow::Result<Self> {
             // Note in LLM, it's always the case that hidden_size = emb_size so we can apply residual
             let hidden_size = emb_size;
             let head_size = hidden_size / num_heads;
             let context_length = 1024;
-            let qkv = qkv::QKV::random(num_heads, emb_size, hidden_size, true)?;
+            let layer_name = layer_name.unwrap_or("attention".to_string().into());
+            let qkv = qkv::QKV::random(
+                num_heads,
+                emb_size,
+                hidden_size,
+                true,
+                Some(format!("{layer_name}_qkv").into()),
+            )?;
             let mha = mha::Mha::new(context_length, num_heads, head_size)?;
-            let layernorm = layernorm::LayerNorm::random(emb_size);
+            let layernorm = layernorm::LayerNorm::random(
+                emb_size,
+                Some(format!("{layer_name}_layernorm").into()),
+            );
             // let out = Dense::random(vec![hidden_size, hidden_size]);
             let out = {
-                let weight = OperandMatrix::new_weight_matrix(Tensor::random(
-                    &vec![hidden_size, hidden_size].into(),
+                let weight = OperandMatrix::new_weight_matrix(KeyedTensor::new(
+                    "attention_out_weight",
+                    Tensor::random(&vec![hidden_size, hidden_size].into()),
                 ));
                 let left = OperandMatrix::Input;
                 MatMul::new(left, weight).expect("failed to create MatMul")
             };
 
             let ffn = FlatFFN::random(hidden_size, hidden_size);
-            let pre_ffn_norm = layernorm::LayerNorm::random(hidden_size);
+            let pre_ffn_norm = layernorm::LayerNorm::random(
+                hidden_size,
+                Some(format!("{layer_name}_preffn_norm").into()),
+            );
             Ok(Self {
                 out,
                 hidden_size,
@@ -329,7 +345,7 @@ pub(crate) mod manual_attention {
     fn test_flat_attention_random() {
         let emb_size = 10;
         let num_heads = 2;
-        let mut att = FlatAttention::random(emb_size, num_heads).unwrap();
+        let mut att = FlatAttention::random(emb_size, num_heads, None).unwrap();
         let input = Tensor::<f32>::random(&vec![1, emb_size].into());
         let output = att.forward(&input, None).unwrap();
         println!("output shape: {:?}", output.shape());

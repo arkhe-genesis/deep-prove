@@ -1,8 +1,15 @@
 //! Module containing code for the model commitment prover
 
-use super::{CommitmentProverCtx, ModelOpeningProof, PolyId};
+use super::{CommitmentProverCtx, ModelOpeningProof};
 use crate::{
-    Claim, commit::compute_betas_eval, layers::provable::NodeId, lookup::context::TableType,
+    Claim,
+    commit::{
+        compute_betas_eval,
+        mmcs_context::{build_sumcheck_expression, table_poly_id},
+    },
+    layers::provable::NodeId,
+    lookup::context::TableType,
+    tensor::TensorKey,
 };
 
 use std::{
@@ -15,6 +22,7 @@ use anyhow::{Result, anyhow};
 
 use either::Either;
 use ff_ext::ExtensionField;
+use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     mle::{IntoMLE, MultilinearExtension, Point},
@@ -79,7 +87,10 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     /// A map storing all the claims for tensors fixed by the model.
-    model_claims: HashMap<(NodeId, String), Claim<E>>,
+    /// The `NodeId` is only employed to sort the claims related to the same
+    /// static tensor, assuming that only one claim for a static tensor is
+    /// produced in each node
+    model_claims: HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
     /// The list of claims about the witness
     witness_claims: BTreeMap<NodeId, BatchCommitmentClaim<E>>,
     _phantom: PhantomData<PCS>,
@@ -110,20 +121,20 @@ where
             .insert(node_id, BatchCommitmentClaim::<E>::new(claim));
     }
 
-    pub fn add_common_claims(&mut self, node_id: NodeId, claims: HashMap<PolyId, Claim<E>>) {
-        claims.into_iter().for_each(|(poly_id, claim)| {
-            self.model_claims.insert((node_id, poly_id), claim);
+    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, Vec<(NodeId, Claim<E>)>>) {
+        claims.into_iter().for_each(|(poly_id, claims)| {
+            let poly_claims = self.model_claims.entry(poly_id).or_default();
+            claims
+                .into_iter()
+                .for_each(|(node_id, claim)| assert!(poly_claims.insert(node_id, claim).is_none()));
         });
     }
 
-    pub fn add_table_claim(
-        &mut self,
-        table_node_id: NodeId,
-        table_type: &TableType,
-        claim: Claim<E>,
-    ) {
-        self.model_claims
-            .insert((table_node_id, table_type.name()), claim);
+    pub fn add_table_claim(&mut self, table_id: NodeId, table_type: &TableType, claim: Claim<E>) {
+        self.model_claims.insert(
+            table_poly_id(table_type.name()),
+            BTreeMap::from([(table_id, claim)]),
+        );
     }
 
     /// Using a provided mapping from [`NodeId`] to [`PolynomialCommitmentScheme::CommitmentWithWitness`] construct
@@ -192,33 +203,52 @@ where
     }
 
     fn model_polys_sumcheck<T: Transcript<E>>(
-        model_claims: &mut HashMap<(NodeId, PolyId), Claim<E>>,
+        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
         commit_ctx: &CommitmentProverCtx<E, PCS>,
         transcript: &mut T,
     ) -> Result<ModelSumcheckProof<E>> {
         // Here we iterate over the model_comms_map so that we can construct the EQ polys and claimed evalautions for each of the committed model polys.
-        // In addition we also return `polys_per_var` which is a vector which stores how many polys there are for each number of variables.
-        let eq_polys_vec = commit_ctx.model_comms_map.values().rev().try_fold(
-            Vec::new(),
-            |mut acc, claim_keys| {
-                let eqs = claim_keys
-                    .iter()
-                    .map(|key| {
-                        let Claim { point, eval } = model_claims.remove(key).ok_or(anyhow!(
-                            "No Claim found for mode poly NodeId {}, PolyId {}",
-                            key.0,
-                            key.1
-                        ))?;
-                        let eq_poly = compute_betas_eval(&point).into_mle();
-                        // Append the evaluations to the transcript
-                        transcript.append_field_element_ext(&eval);
-                        Ok(eq_poly)
-                    })
-                    .collect::<Result<Vec<MultilinearExtension<E>>, anyhow::Error>>()?;
-                acc.extend(eqs);
-                Result::<Vec<MultilinearExtension<E>>, anyhow::Error>::Ok(acc)
-            },
-        )?;
+        // In addition we also compute the `num_claims_per_poly` vector, whose i-th entry specifies how many claims
+        // are found in `model_claims` for the i-th model polynomial employed in the sumcheck.
+        let (eq_polys_vec, num_claims_per_poly) =
+            commit_ctx.model_comms_map.values().rev().try_fold(
+                (Vec::new(), Vec::new()),
+                |(mut eq_polys, mut num_claims_per_poly), claim_keys| {
+                    let (eqs, num_claims) = claim_keys.iter().try_fold(
+                        (vec![], vec![]),
+                        |(mut eq_polys, mut num_claims_per_poly), key| {
+                            let claims = model_claims
+                                .remove(key)
+                                .ok_or(anyhow!("No Claims found for mode poly {key}"))?;
+                            let num_claims = claims.len();
+                            let eqs = claims
+                                .into_values()
+                                .map(|claim| {
+                                    let Claim { point, eval } = claim;
+                                    // Append the evaluations to the transcript
+                                    transcript.append_field_element_ext(&eval);
+                                    compute_betas_eval(&point).into_mle()
+                                })
+                                .collect_vec();
+                            eq_polys.extend(eqs);
+                            num_claims_per_poly.push(num_claims);
+                            anyhow::Result::<(Vec<MultilinearExtension<E>>, Vec<usize>)>::Ok((
+                                eq_polys,
+                                num_claims_per_poly,
+                            ))
+                        },
+                    )?;
+                    eq_polys.extend(eqs);
+                    num_claims_per_poly.extend(num_claims);
+                    Result::<(Vec<MultilinearExtension<E>>, Vec<usize>), anyhow::Error>::Ok((
+                        eq_polys,
+                        num_claims_per_poly,
+                    ))
+                },
+            )?;
+
+        let total_polys = num_claims_per_poly.len();
+        let sumcheck_expression = build_sumcheck_expression(num_claims_per_poly);
 
         // The unwrap here is safe as this function should only be called after checking that `model_commitment` is Some.
         let model_polys =
@@ -239,10 +269,8 @@ where
             commit_ctx.max_model_num_vars,
             either_polys,
         );
-        let virtual_poly = expr_builder.to_virtual_polys(
-            slice::from_ref(&commit_ctx.sumcheck_expression),
-            &[challenge],
-        );
+        let virtual_poly =
+            expr_builder.to_virtual_polys(slice::from_ref(&sumcheck_expression), &[challenge]);
         let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, transcript);
         let all_evals = state.get_mle_flatten_final_evaluations();
         let point = state.collect_raw_challenges();
@@ -259,8 +287,10 @@ where
                 (claims_acc, skip + poly_count)
             },
         );
-        // all_evals is exactly twice as long as just the model poly evals because we have one eq poly eval for each model poly
-        let sumcheck_evals = all_evals[..all_evals.len() / 2].to_vec();
+        // all_evals contains the model poly evals and the eq poly evals; we want to include in the proof
+        // only the model poly evals, which are the first `total_polys` evaluations, according to how the
+        // sumcheck expression is built
+        let sumcheck_evals = all_evals[..total_polys].to_vec();
 
         Ok(ModelSumcheckProof {
             model_claim,

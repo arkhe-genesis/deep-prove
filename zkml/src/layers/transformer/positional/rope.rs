@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Ok, Result, ensure};
 use either::Either;
@@ -34,7 +37,7 @@ use crate::{
     model::StepData,
     number::Number,
     quantization::{self, Fieldizer, TensorFielder},
-    tensor::{IntoBTensor, TensorSlice, is_close_with_tolerance},
+    tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorSlice, is_close_with_tolerance},
     util::from_mle_list_dimensions,
 };
 
@@ -58,20 +61,23 @@ pub struct RopeCtx {
     node_id: NodeId,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
+    cosine_key: TensorKey,
+    sine_key: TensorKey,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rope<N> {
-    pub(super) cosine_matrix: Tensor<N>,
-    pub(super) sine_matrix: Tensor<N>,
+    pub(super) cosine_matrix: KeyedTensor<N>,
+    pub(super) sine_matrix: KeyedTensor<N>,
     pub(super) unpadded_shape: Shape,
 }
 
-const COSINE_POLY_ID: &str = "CosineMatrix";
-const SINE_POLY_ID: &str = "SineMatrix";
-
 impl<N: Number> Rope<N> {
-    pub(crate) fn build_from_angles(angles: Vec<f32>, max_content_length: usize) -> Result<Self> {
+    pub(crate) fn build_from_angles(
+        angles: Vec<f32>,
+        base_id: TensorKey,
+        max_content_length: usize,
+    ) -> Result<Self> {
         // build the rotational vectors
         let matrix_shape = Shape::new(vec![max_content_length, angles.len() * 2]);
         let mut cosine_data = Vec::with_capacity(matrix_shape.numel());
@@ -85,8 +91,14 @@ impl<N: Number> Rope<N> {
                 Ok(())
             })?;
         }
-        let cosine_matrix = Tensor::new(matrix_shape.clone(), cosine_data);
-        let sine_matrix = Tensor::new(matrix_shape.clone(), sine_data);
+        let cosine_matrix = KeyedTensor::new(
+            format!("{}_cosine", base_id),
+            Tensor::new(matrix_shape.clone(), cosine_data),
+        );
+        let sine_matrix = KeyedTensor::new(
+            format!("{}_sine", base_id),
+            Tensor::new(matrix_shape.clone(), sine_data),
+        );
         Ok(Self {
             cosine_matrix,
             sine_matrix,
@@ -96,6 +108,7 @@ impl<N: Number> Rope<N> {
 
     pub(crate) fn build_from_frequency(
         base_frequency: f32,
+        base_frequency_id: TensorKey,
         head_size: usize,
         max_content_length: usize,
     ) -> Result<Self> {
@@ -106,10 +119,10 @@ impl<N: Number> Rope<N> {
         let angles = (0..head_size / 2)
             .map(|i| base_frequency.powf((-2.0 * i as f32) / head_size as f32))
             .collect_vec();
-        Self::build_from_angles(angles, max_content_length)
+        Self::build_from_angles(angles, base_frequency_id, max_content_length)
     }
 
-    pub(crate) fn new(cosine_matrix: Tensor<N>, sine_matrix: Tensor<N>) -> Result<Self> {
+    pub(crate) fn new(cosine_matrix: KeyedTensor<N>, sine_matrix: KeyedTensor<N>) -> Result<Self> {
         ensure!(
             cosine_matrix.shape() == sine_matrix.shape(),
             "Shapes of provided cosine and sine matrices are different: cosine_shape {:?} vs sine shape {:?}",
@@ -164,8 +177,8 @@ impl<N: Number> Rope<N> {
         // Finally concatenate out_even and out_odd along pair axis to reconstruct y.
         let past_length = positional_cache.lock().unwrap().seq_len;
         let input_bt = input.to_btensor::<2>();
-        let cosine_matrix_bt = self.cosine_matrix.to_btensor::<2>();
-        let sine_matrix_bt = self.sine_matrix.to_btensor::<2>();
+        let cosine_matrix_bt = self.cosine_matrix.tensor().to_btensor::<2>();
+        let sine_matrix_bt = self.sine_matrix.tensor().to_btensor::<2>();
         let cosine_slice_bt = cosine_matrix_bt.slice([
             past_length..(past_length + input.shape()[0]),
             0..input.shape()[1],
@@ -258,8 +271,8 @@ impl<N: Number> Rope<N> {
         let input = &step_data.node_inputs[0];
         let input = input.hydrate(store.clone())?;
         let input_shape = input.shape().clone();
-        let cosine_matrix_slice = TensorSlice::from(&self.cosine_matrix);
-        let sine_matrix_slice = TensorSlice::from(&self.sine_matrix);
+        let cosine_matrix_slice = TensorSlice::from(self.cosine_matrix.deref());
+        let sine_matrix_slice = TensorSlice::from(self.sine_matrix.deref());
         let sub_cos_matrix = cosine_matrix_slice
             .slice_over_first_dim(0, input.shape()[0])
             .to_fields();
@@ -360,8 +373,8 @@ impl<N: Number> Rope<N> {
         };
 
         let commons_claims = [
-            (COSINE_POLY_ID.to_string(), cosine_claim),
-            (SINE_POLY_ID.to_string(), sine_claim),
+            (self.cosine_matrix.key(), cosine_claim),
+            (self.sine_matrix.key(), sine_claim),
         ]
         .into_iter()
         .collect();
@@ -425,8 +438,8 @@ impl Rope<f32> {
         let requant = Requant::from_multiplier(multiplier, output_bit_size);
 
         let quantized_rope = Rope {
-            cosine_matrix: self.cosine_matrix.to_quantized(&matrix_scale),
-            sine_matrix: self.sine_matrix.to_quantized(&matrix_scale),
+            cosine_matrix: self.cosine_matrix.quantize(&matrix_scale),
+            sine_matrix: self.sine_matrix.quantize(&matrix_scale),
             unpadded_shape: self.unpadded_shape,
         };
 
@@ -439,8 +452,8 @@ impl PadOp for Rope<Element> {
     where
         Self: Sized,
     {
-        self.cosine_matrix = self.cosine_matrix.pad_next_power_of_two();
-        self.sine_matrix = self.sine_matrix.pad_next_power_of_two();
+        self.cosine_matrix = self.cosine_matrix.map_tensor(|t| t.pad_next_power_of_two());
+        self.sine_matrix = self.sine_matrix.map_tensor(|t| t.pad_next_power_of_two());
 
         Ok(self)
     }
@@ -466,10 +479,10 @@ impl Rope<Element> {
         aux.model_polys = Some(
             [
                 (
-                    COSINE_POLY_ID.to_string(),
+                    self.cosine_matrix.key(),
                     matrix_to_evals(&self.cosine_matrix),
                 ),
-                (SINE_POLY_ID.to_string(), matrix_to_evals(&self.sine_matrix)),
+                (self.sine_matrix.key(), matrix_to_evals(&self.sine_matrix)),
             ]
             .into_iter()
             .collect(),
@@ -479,6 +492,8 @@ impl Rope<Element> {
             unpadded_shape: self.unpadded_shape.clone(),
             node_id: id,
             num_vars_positional_matrix: num_vars,
+            cosine_key: self.cosine_matrix.key(),
+            sine_key: self.sine_matrix.key(),
         };
 
         Ok((ctx, aux))
@@ -601,8 +616,8 @@ impl RopeCtx {
         verifier.add_common_claims(
             self.node_id,
             [
-                (COSINE_POLY_ID.to_string(), cosine_matrix_claim),
-                (SINE_POLY_ID.to_string(), sine_matrix_claim),
+                (self.cosine_key.clone(), cosine_matrix_claim),
+                (self.sine_key.clone(), sine_matrix_claim),
             ]
             .into_iter()
             .collect(),
@@ -682,7 +697,12 @@ mod tests {
             let angles = random_angles(num_angles);
             let max_context_length = rng.gen_range(2..1024);
             println!("Testing for {num_angles} angles and context length {max_context_length}");
-            let rope = Rope::<f32>::build_from_angles(angles, max_context_length).unwrap();
+            let rope = Rope::<f32>::build_from_angles(
+                angles,
+                "rope_angles".to_string().into(),
+                max_context_length,
+            )
+            .unwrap();
             println!(
                 "Max cos: {}, Max sin: {}",
                 rope.cosine_matrix.max_value(),
@@ -715,7 +735,10 @@ mod tests {
 
         let _ = model
             .add_consecutive_layer(
-                Layer::Positional(Positional::new_rope(angles, context_length).unwrap()),
+                Layer::Positional(
+                    Positional::new_rope(angles, "rope_angles".to_string().into(), context_length)
+                        .unwrap(),
+                ),
                 None,
             )
             .unwrap();
@@ -769,7 +792,7 @@ mod tests {
         fn test_rope_f32(inp in rope_input::<f32>()) {
             let Input { seq_len, embedding_size, context_length, input, angles } = inp.clone();
             prop_assume!(embedding_size % 2 == 0 && embedding_size >= 2);
-            let layer = Rope::<f32>::build_from_angles(angles.clone(), context_length).expect("build rope");
+            let layer = Rope::<f32>::build_from_angles(angles.clone(), "rope_angles".to_string().into(), context_length).expect("build rope");
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
 
             let out = layer
@@ -799,7 +822,7 @@ mod tests {
             let Input { seq_len, embedding_size, context_length, input, angles } = inp.clone();
             prop_assume!(embedding_size % 2 == 0 && embedding_size >= 2);
 
-            let layer = Rope::<f32>::build_from_angles(angles.clone(), context_length).expect("build rope");
+            let layer = Rope::<f32>::build_from_angles(angles.clone(), "rope_angles".to_string().into(), context_length).expect("build rope");
             let input_sf = ScalingFactor::from_tensor(&input, None);
             let q = layer.quantize::<AbsoluteMax>(&(), 0.into(), input_sf).expect("quantize rope");
             let layer_q = q.quantized_op;
@@ -818,7 +841,7 @@ mod tests {
             let Input { seq_len, embedding_size, context_length, input: _, angles } = inp.clone();
             prop_assume!(embedding_size % 2 == 0 && embedding_size >= 2);
 
-            let layer = Rope::<Element>::build_from_angles(angles.clone(), context_length).expect("build rope element");
+            let layer = Rope::<Element>::build_from_angles(angles.clone(), "rope_angles".to_string().into(), context_length).expect("build rope element");
             let mut si = ShapeInfo::from(vec![ShapeData::new(vec![seq_len, embedding_size].into())].as_slice());
             let padded = PadOp::pad_node(layer, &mut si).expect("pad rope");
             let padded_shape = padded.cosine_matrix.shape();
@@ -844,7 +867,7 @@ mod tests {
             let input_shape = vec![seq_len, embedding_size];
             let mut model = Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
 
-            model.add_consecutive_layer(Layer::Positional(Positional::new_rope(angles, context_length).expect("rope")), None).expect("rope layer");
+            model.add_consecutive_layer(Layer::Positional(Positional::new_rope(angles, "rope_angles".to_string().into(), context_length).expect("rope")), None).expect("rope layer");
             model.route_output(None).expect("route output");
             let _ = prove_model(model, &mut GenStore::default()).expect("prove model");
         }

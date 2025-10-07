@@ -12,13 +12,15 @@ use sumcheck::{
 };
 use transcript::Transcript;
 
-use crate::{Claim, Element, Tensor, number::Number, quantization::TensorFielder};
+use crate::{
+    Claim, Element, Tensor, number::Number, quantization::TensorFielder, tensor::KeyedTensor,
+};
 
 /// A matrix vector multiplication proving logic where the matrix is NOT committed to, i.e.
 /// the verifier will have to evaluate himself the matrix at a random point.
 /// NOTE: this can be changed down the line to provide flexibility but right now we don't need it.
 pub struct MatVec<T> {
-    matrix: Tensor<T>,
+    matrix: KeyedTensor<T>,
 }
 pub struct MatVecProof<E: ExtensionField> {
     sumcheck: IOPProof<E>,
@@ -36,7 +38,7 @@ impl<E: ExtensionField> MatVecProof<E> {
     }
 }
 impl<T: Number> MatVec<T> {
-    pub fn new(matrix: Tensor<T>) -> Self {
+    pub fn new(matrix: KeyedTensor<T>) -> Self {
         Self { matrix }
     }
 
@@ -95,7 +97,7 @@ impl MatVec<Element> {
 
         debug_assert!(
             {
-                let output = self.matrix.clone().to_fields().matvec(input);
+                let output = self.matrix.tensor().to_fields().matvec(input);
                 let claimed_sum = output
                     .get_data()
                     .to_vec()
@@ -166,8 +168,10 @@ mod test {
     type F = GoldilocksExt2;
     #[test]
     fn test_matvec_prove_verify() {
-        let matrix =
-            Tensor::<Element>::random_seed(&vec![2, 3].into(), None).pad_next_power_of_two();
+        let matrix = KeyedTensor::new(
+            "matvec_mat",
+            Tensor::<Element>::random_seed(&vec![2, 3].into(), None).pad_next_power_of_two(),
+        );
         let input = Tensor::<Element>::random_seed(&vec![3].into(), None).pad_next_power_of_two();
         let matvec = MatVec::new(matrix);
         let output = matvec.op(&input);

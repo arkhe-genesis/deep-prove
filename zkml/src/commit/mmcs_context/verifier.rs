@@ -1,7 +1,16 @@
 //! Module containing code to verify a [`ModelOpeningProof`].
 
-use super::{CommitmentVerifierCtx, ModelOpeningProof, PolyId};
-use crate::{Claim, commit::identity_eval, layers::provable::NodeId, lookup::context::TableType};
+use super::{CommitmentVerifierCtx, ModelOpeningProof};
+use crate::{
+    Claim,
+    commit::{
+        identity_eval,
+        mmcs_context::{build_sumcheck_expression, table_poly_id},
+    },
+    layers::provable::NodeId,
+    lookup::context::TableType,
+    tensor::TensorKey,
+};
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -65,7 +74,10 @@ where
 
 pub struct CommitmentVerifier<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// A map storing all the claims for tensors fixed by the model.
-    model_claims: HashMap<(NodeId, String), Claim<E>>,
+    /// The `NodeId` is only employed to sort the claims related to the same
+    /// static tensor, assuming that only one claim for a static tensor is
+    /// produced in each node
+    model_claims: HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
     /// The list of claims about the witness
     witness_claims: BTreeMap<NodeId, VerifierClaim<E, PCS>>,
 }
@@ -87,9 +99,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
             .insert(node_id, VerifierClaim::new(commitment, claim));
     }
 
-    pub fn add_common_claims(&mut self, node_id: NodeId, claims: HashMap<PolyId, Claim<E>>) {
-        claims.into_iter().for_each(|(poly_id, claim)| {
-            self.model_claims.insert((node_id, poly_id), claim);
+    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, HashMap<NodeId, Claim<E>>>) {
+        claims.into_iter().for_each(|(poly_id, claims)| {
+            let poly_claims = self.model_claims.entry(poly_id).or_default();
+            claims
+                .into_iter()
+                .for_each(|(node_id, claim)| assert!(poly_claims.insert(node_id, claim).is_none()))
         });
     }
 
@@ -99,8 +114,10 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
         table_type: &TableType,
         claim: Claim<E>,
     ) {
-        self.model_claims
-            .insert((table_node_id, table_type.name()), claim);
+        self.model_claims.insert(
+            table_poly_id(table_type.name()),
+            BTreeMap::from([(table_node_id, claim)]),
+        );
     }
 
     pub fn verify<T: Transcript<E>>(
@@ -147,47 +164,58 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
     }
 
     fn verify_model_sumcheck<T: Transcript<E>>(
-        model_claims: &mut HashMap<(NodeId, PolyId), Claim<E>>,
+        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
         sumcheck_proof: IOPProof<E>,
         sumcheck_evals: Vec<E>,
         commit_ctx: &CommitmentVerifierCtx<E, PCS>,
         transcript: &mut T,
     ) -> Result<Vec<(Point<E>, Vec<E>)>> {
-        // First we order our model claims, splitting into `polys_per_var` which is how many polys there are for each number of variables
-        // `eq_points_vec` which is the points that the original claims relate to, there should be one of these for each poly and they are ordered in the same
-        // way that the model polys are. Finally there is `evals_vec` which is the evaluation of each model poly at the corresponding point in `eq_points_vec`.
-        let (eq_points_vec, evals_vec): (Vec<Point<E>>, Vec<E>) =
+        // First we order our model claims, splitting into `polys_per_var` which is how many polys there are for each number of variables.
+        // Then, we compute `eq_points_vec` and `evals_vec`, which are the points and the evaluations, respectively, that the original claims
+        // relate to, ordered in the same way that the model polys are.
+        // Finally we compute also the `num_claims_per_poly` vector, whose i-th entry specifies how many claims
+        // are found in `model_claims` for the i-th model polynomial employed in the sumcheck.
+        let (eq_points_vec, evals_vec, num_claims_per_poly) =
             commit_ctx.model_comms_map.iter().rev().try_fold(
-                (vec![], vec![]),
-                |(mut eq_points_acc, mut evals), (&nv, claim_keys)| {
+                (vec![], vec![], vec![]),
+                |(mut eq_points_acc, mut evals, mut num_claims_per_poly), (&nv, claim_keys)| {
                     // If the claim is about a polynomial with fewer variables than the maximum number of variables then
                     // we have to multiply the evalaution by 2^variables_diff.
                     let mult = E::from_canonical_u64(1 << (commit_ctx.max_model_num_vars - nv));
-                    let (eq_points, inner_evals): (Vec<Vec<E>>, Vec<E>) =
-                        claim_keys.iter().try_fold(
-                            (vec![], vec![]),
-                            |(mut point_acc, mut inner_evals_acc), key| {
-                                let Claim { point, eval } =
-                                    model_claims.remove(key).ok_or(anyhow!(
-                                        "No Claim found for mode poly NodeId {}, PolyId {}",
-                                        key.0,
-                                        key.1
-                                    ))?;
+                    let (eq_points, inner_evals, num_claims) = claim_keys.iter().try_fold(
+                        (vec![], vec![], vec![]),
+                        |(mut point_acc, mut inner_evals_acc, mut num_claims_per_poly), key| {
+                            let claims = model_claims
+                                .remove(key)
+                                .ok_or(anyhow!("No Claim found for mode poly {key}"))?;
+                            num_claims_per_poly.push(claims.len());
+                            claims.into_iter().for_each(|(_, claim)| {
+                                let Claim { point, eval } = claim;
                                 // Append all of the evaluations in the correct order to the transcript
                                 transcript.append_field_element_ext(&eval);
                                 point_acc.push(point);
                                 inner_evals_acc.push(eval * mult);
-                                Result::<(Vec<Point<E>>, Vec<E>), anyhow::Error>::Ok((
-                                    point_acc,
-                                    inner_evals_acc,
-                                ))
-                            },
-                        )?;
+                            });
+
+                            Result::<(Vec<Point<E>>, Vec<E>, Vec<usize>), anyhow::Error>::Ok((
+                                point_acc,
+                                inner_evals_acc,
+                                num_claims_per_poly,
+                            ))
+                        },
+                    )?;
                     eq_points_acc.extend(eq_points);
                     evals.extend(inner_evals);
-                    Result::<(Vec<Point<E>>, Vec<E>), anyhow::Error>::Ok((eq_points_acc, evals))
+                    num_claims_per_poly.extend(num_claims);
+                    Result::<(Vec<Point<E>>, Vec<E>, Vec<usize>), anyhow::Error>::Ok((
+                        eq_points_acc,
+                        evals,
+                        num_claims_per_poly,
+                    ))
                 },
             )?;
+
+        let sumcheck_expression = build_sumcheck_expression(num_claims_per_poly);
 
         let challenge = transcript
             .sample_and_append_challenge(b"model_batching")
@@ -227,7 +255,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
             &[],
             &[],
             &[challenge],
-            &commit_ctx.sumcheck_expression,
+            &sumcheck_expression,
         )
         .right()
         .ok_or(anyhow!(

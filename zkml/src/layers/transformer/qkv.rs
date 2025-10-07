@@ -38,7 +38,7 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
-    tensor::IntoBTensor,
+    tensor::{IntoBTensor, KeyedTensor, TensorKey},
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
 };
@@ -53,12 +53,12 @@ pub const QKV_LAYER: &str = "_QKV";
 /// the full K and V matrices as if they were computed using the whole input tensor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QKV<N> {
-    pub(crate) q: Tensor<N>,
-    pub(crate) q_bias: Option<Tensor<N>>,
-    pub(crate) k: Tensor<N>,
-    pub(crate) k_bias: Option<Tensor<N>>,
-    pub(crate) v: Tensor<N>,
-    pub(crate) v_bias: Option<Tensor<N>>,
+    pub(crate) q: KeyedTensor<N>,
+    pub(crate) q_bias: Option<KeyedTensor<N>>,
+    pub(crate) k: KeyedTensor<N>,
+    pub(crate) k_bias: Option<KeyedTensor<N>>,
+    pub(crate) v: KeyedTensor<N>,
+    pub(crate) v_bias: Option<KeyedTensor<N>>,
     weights_unpadded_shape: Shape, // same shape for Q, K and V
     /// The cache that gets updated at each pass.
     /// interior mutability for the cache to avoid borrowing issues.
@@ -72,11 +72,14 @@ pub struct QKV<N> {
 pub struct QKVCtx {
     node_id: NodeId,
     unpadded_shape: Shape, // same shape for Q, K and V
-    q_bias_present: bool,
-    k_bias_present: bool,
-    v_bias_present: bool,
     num_heads: usize,
     head_dim: usize,
+    q_weight_key: TensorKey,
+    k_weight_key: TensorKey,
+    v_weight_key: TensorKey,
+    q_bias_key: Option<TensorKey>,
+    k_bias_key: Option<TensorKey>,
+    v_bias_key: Option<TensorKey>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,12 +125,12 @@ fn padded_weight_shape(unpadded_shape: &Shape, num_heads: usize, head_dim: usize
 impl<N: Number> QKV<N> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        q: Tensor<N>,
-        q_bias: Option<Tensor<N>>,
-        k: Tensor<N>,
-        k_bias: Option<Tensor<N>>,
-        v: Tensor<N>,
-        v_bias: Option<Tensor<N>>,
+        q: KeyedTensor<N>,
+        q_bias: Option<KeyedTensor<N>>,
+        k: KeyedTensor<N>,
+        k_bias: Option<KeyedTensor<N>>,
+        v: KeyedTensor<N>,
+        v_bias: Option<KeyedTensor<N>>,
         num_heads: usize,
         // for MHA, num_groups = num_heads
         num_groups: usize,
@@ -356,14 +359,23 @@ where
         // The subsequent times, it's just to run with the newly generated token, so there is only one here.
         let input = inputs[0].clone().to_btensor::<2>();
         let unpadded_seq_len = unpadded_input_shapes[0].dim(0);
-        let q = self.q.clone().to_btensor::<2>();
-        let q_bias = self.q_bias.clone().map(|bias| bias.to_btensor::<1>());
+        let q = self.q.tensor().to_btensor::<2>();
+        let q_bias = self
+            .q_bias
+            .as_ref()
+            .map(|bias| bias.tensor().to_btensor::<1>());
         let q_out_shape = Shape::new(vec![shape[0], self.q.shape()[1]]);
-        let k = self.k.clone().to_btensor::<2>();
-        let k_bias = self.k_bias.clone().map(|bias| bias.to_btensor::<1>());
+        let k = self.k.tensor().to_btensor::<2>();
+        let k_bias = self
+            .k_bias
+            .as_ref()
+            .map(|bias| bias.tensor().to_btensor::<1>());
         let k_out_shape = Shape::new(vec![shape[0], self.k.shape()[1]]);
-        let v = self.v.clone().to_btensor::<2>();
-        let v_bias = self.v_bias.clone().map(|bias| bias.to_btensor::<1>());
+        let v = self.v.tensor().to_btensor::<2>();
+        let v_bias = self
+            .v_bias
+            .as_ref()
+            .map(|bias| bias.tensor().to_btensor::<1>());
         let v_out_shape = Shape::new(vec![shape[0], self.v.shape()[1]]);
 
         // println!("QKV Info");
@@ -443,11 +455,14 @@ impl QKV<f32> {
                 (self.v, self.v_bias),
             ])
             .map(|(output_scaling, (tensor, bias))| {
-                let (model_scaling, bias_scaling) =
-                    model_scaling_factor_from_tensor_and_bias(&input_scaling[0], &tensor, &bias);
+                let (model_scaling, bias_scaling) = model_scaling_factor_from_tensor_and_bias(
+                    &input_scaling[0],
+                    &tensor,
+                    &bias.as_ref().map(|b| b.tensor()),
+                );
                 let input_scaling = &input_scaling[0];
-                let quantized_matrix = tensor.to_quantized(&model_scaling);
-                let quantized_bias = bias.map(|bias| bias.to_quantized(&bias_scaling));
+                let quantized_matrix = tensor.quantize(&model_scaling);
+                let quantized_bias = bias.map(|bias| bias.quantize(&bias_scaling));
                 let intermediate_bitsize = quantized_matrix.matmul_output_bitsize(None, None);
                 let requant = Requant::from_scaling_factors(
                     *input_scaling,
@@ -523,13 +538,6 @@ impl Evaluate<Element> for QKV<Element> {
     }
 }
 
-const WEIGHT_Q_POLY_ID: &str = "WeightQ";
-const WEIGHT_K_POLY_ID: &str = "WeightK";
-const WEIGHT_V_POLY_ID: &str = "WeightV";
-const BIAS_Q_POLY_ID: &str = "BiasQ";
-const BIAS_K_POLY_ID: &str = "BiasK";
-const BIAS_V_POLY_ID: &str = "BiasV";
-
 impl ProveInfo for QKV<Element> {
     fn step_info<E: ExtensionField>(
         &self,
@@ -554,25 +562,25 @@ impl ProveInfo for QKV<Element> {
         );
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         let mut array = vec![
-            (WEIGHT_Q_POLY_ID, &self.q),
-            (WEIGHT_K_POLY_ID, &self.k),
-            (WEIGHT_V_POLY_ID, &self.v),
+            (self.q.key(), &self.q),
+            (self.k.key(), &self.k),
+            (self.v.key(), &self.v),
         ];
         if let Some(ref q_bias) = self.q_bias {
-            array.push((BIAS_Q_POLY_ID, q_bias));
+            array.push((q_bias.key(), q_bias));
         }
         if let Some(ref k_bias) = self.k_bias {
-            array.push((BIAS_K_POLY_ID, k_bias));
+            array.push((k_bias.key(), k_bias));
         }
         if let Some(ref v_bias) = self.v_bias {
-            array.push((BIAS_V_POLY_ID, v_bias));
+            array.push((v_bias.key(), v_bias));
         }
         aux.model_polys = Some(
             array
                 .into_iter()
                 .map(|(poly_id, matrix)| {
                     let evals = matrix.pad_next_power_of_two().into_data();
-                    (poly_id.to_string(), evals)
+                    (poly_id, evals)
                 })
                 .collect(),
         );
@@ -582,9 +590,12 @@ impl ProveInfo for QKV<Element> {
             unpadded_shape: self.weights_unpadded_shape.clone(),
             num_heads: self.num_heads,
             head_dim: self.head_dim,
-            q_bias_present: self.q_bias.is_some(),
-            k_bias_present: self.k_bias.is_some(),
-            v_bias_present: self.v_bias.is_some(),
+            q_weight_key: self.q.key(),
+            k_weight_key: self.k.key(),
+            v_weight_key: self.v.key(),
+            q_bias_key: self.q_bias.as_ref().map(|q| q.key()),
+            k_bias_key: self.k_bias.as_ref().map(|k| k.key()),
+            v_bias_key: self.v_bias.as_ref().map(|v| v.key()),
         };
 
         Ok((LayerCtx::QKV(ctx), aux))
@@ -613,7 +624,7 @@ where
     fn prove<T: Transcript<E>>(
         &self,
         node_id: NodeId,
-        _ctx: &Self::Ctx,
+        ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
@@ -771,16 +782,16 @@ where
             .map(Some)
             .chain(bias_claims)
             .zip([
-                WEIGHT_Q_POLY_ID,
-                WEIGHT_K_POLY_ID,
-                WEIGHT_V_POLY_ID,
-                BIAS_Q_POLY_ID,
-                BIAS_K_POLY_ID,
-                BIAS_V_POLY_ID,
+                Some(&ctx.q_weight_key),
+                Some(&ctx.k_weight_key),
+                Some(&ctx.v_weight_key),
+                ctx.q_bias_key.as_ref(),
+                ctx.k_bias_key.as_ref(),
+                ctx.v_bias_key.as_ref(),
             ])
             // filter the bias claims that are not present
-            .filter(|(claim, _)| claim.is_some())
-            .map(|(claim, id)| (id.to_string(), claim.unwrap()))
+            .filter(|(claim, id)| claim.is_some() && id.is_some())
+            .map(|(claim, id)| (id.unwrap().clone(), claim.unwrap()))
             .collect();
 
         prover.add_common_claims(node_id, common_claims);
@@ -888,9 +899,9 @@ where
         );
 
         let bias_presents = [
-            self.q_bias_present,
-            self.k_bias_present,
-            self.v_bias_present,
+            self.q_bias_key.is_some(),
+            self.k_bias_key.is_some(),
+            self.v_bias_key.is_some(),
         ];
         // compute claims for the bias vector, subtracting the `pre_bias_evals` found in the proof from the output claims
         let bias_claims = last_claims
@@ -962,16 +973,16 @@ where
             .map(Some)
             .chain(bias_claims)
             .zip([
-                WEIGHT_Q_POLY_ID,
-                WEIGHT_K_POLY_ID,
-                WEIGHT_V_POLY_ID,
-                BIAS_Q_POLY_ID,
-                BIAS_K_POLY_ID,
-                BIAS_V_POLY_ID,
+                Some(&self.q_weight_key),
+                Some(&self.k_weight_key),
+                Some(&self.v_weight_key),
+                self.q_bias_key.as_ref(),
+                self.k_bias_key.as_ref(),
+                self.v_bias_key.as_ref(),
             ])
             // there may not be any bias claims
-            .filter(|(claim, _)| claim.is_some())
-            .map(|(claim, id)| (id.to_string(), claim.unwrap()))
+            .filter(|(claim, id)| claim.is_some() && id.is_some())
+            .map(|(claim, id)| (id.unwrap().clone(), claim.unwrap()))
             .collect();
 
         verifier.add_common_claims(self.node_id, common_claims);
@@ -1143,22 +1154,42 @@ mod tests {
             emb_size: usize,
             hidden_size: usize,
             bias: bool,
+            layer_name: Option<TensorKey>,
         ) -> Result<Self> {
-            let q = Tensor::<N>::random(&vec![emb_size, hidden_size].into());
+            let layer_name = layer_name.unwrap_or("QKV".to_string().into());
+            let q = KeyedTensor::new(
+                format!("{layer_name}_weight_q"),
+                Tensor::<N>::random(&vec![emb_size, hidden_size].into()),
+            );
             let q_bias = if bias {
-                Some(Tensor::<N>::random(&vec![hidden_size].into()))
+                Some(KeyedTensor::new(
+                    format!("{layer_name}_bias_q"),
+                    Tensor::<N>::random(&vec![hidden_size].into()),
+                ))
             } else {
                 None
             };
-            let k = Tensor::<N>::random(&vec![emb_size, hidden_size].into());
+            let k = KeyedTensor::new(
+                format!("{layer_name}_weight_k"),
+                Tensor::<N>::random(&vec![emb_size, hidden_size].into()),
+            );
             let k_bias = if bias {
-                Some(Tensor::<N>::random(&vec![hidden_size].into()))
+                Some(KeyedTensor::new(
+                    format!("{layer_name}_bias_k"),
+                    Tensor::<N>::random(&vec![hidden_size].into()),
+                ))
             } else {
                 None
             };
-            let v = Tensor::<N>::random(&vec![emb_size, hidden_size].into());
+            let v = KeyedTensor::new(
+                format!("{layer_name}_weight_v"),
+                Tensor::<N>::random(&vec![emb_size, hidden_size].into()),
+            );
             let v_bias = if bias {
-                Some(Tensor::<N>::random(&vec![hidden_size].into()))
+                Some(KeyedTensor::new(
+                    format!("{layer_name}_bias_v"),
+                    Tensor::<N>::random(&vec![hidden_size].into()),
+                ))
             } else {
                 None
             };
@@ -1173,23 +1204,7 @@ mod tests {
         let emb_size = 2;
         let hidden_size = 4;
         let num_heads = 2;
-        let q = Tensor::<Element>::random(&vec![emb_size, hidden_size].into());
-        let q_bias = Tensor::random(&vec![hidden_size].into());
-        let k = Tensor::random(&vec![emb_size, hidden_size].into());
-        let k_bias = Tensor::random(&vec![hidden_size].into());
-        let v = Tensor::random(&vec![emb_size, hidden_size].into());
-        let v_bias = Tensor::random(&vec![hidden_size].into());
-        let qkv = QKV::new(
-            q.clone(),
-            Some(q_bias.clone()),
-            k.clone(),
-            Some(k_bias.clone()),
-            v.clone(),
-            Some(v_bias.clone()),
-            num_heads,
-            num_heads,
-        )
-        .unwrap();
+        let qkv = QKV::random(num_heads, emb_size, hidden_size, true, None).unwrap();
         let input = Tensor::<Element>::random(&vec![1, emb_size].into());
         let output = qkv
             .evaluate::<GoldilocksExt2>(&[&input], &[vec![1, emb_size].into()])
@@ -1198,9 +1213,9 @@ mod tests {
         assert_eq!(output.len(), 3);
         assert_eq!(*output[0].shape(), Shape::from(vec![1, hidden_size]));
         assert_eq!(*output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
-        let mut out_k = input.matmul(&k).add_dim2(&k_bias);
+        let mut out_k = input.matmul(&qkv.k).add_dim2(qkv.k_bias.as_ref().unwrap());
         assert_eq!(output[1].get_data(), out_k.get_data());
-        let mut out_v = input.matmul(&v).add_dim2(&v_bias);
+        let mut out_v = input.matmul(&qkv.v).add_dim2(qkv.v_bias.as_ref().unwrap());
         assert_eq!(*output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
         assert_eq!(output[2].get_data(), out_v.get_data());
         // second token
@@ -1216,11 +1231,21 @@ mod tests {
         assert_eq!(*output[0].shape(), Shape::from(vec![1, hidden_size]));
         assert_eq!(*output[1].shape(), Shape::from(vec![seq_len, hidden_size]));
         assert_eq!(*output[2].shape(), Shape::from(vec![seq_len, hidden_size]));
-        let out_q = new_token_emb.matmul(&q).add_dim2(&q_bias);
+        let out_q = new_token_emb
+            .matmul(&qkv.q)
+            .add_dim2(qkv.q_bias.as_ref().unwrap());
         assert_eq!(output[0].get_data(), out_q.get_data());
-        out_k.concat(new_token_emb.matmul(&k).add_dim2(&k_bias));
+        out_k.concat(
+            new_token_emb
+                .matmul(&qkv.k)
+                .add_dim2(qkv.k_bias.as_ref().unwrap()),
+        );
         assert_eq!(output[1].get_data(), out_k.get_data());
-        out_v.concat(new_token_emb.matmul(&v).add_dim2(&v_bias));
+        out_v.concat(
+            new_token_emb
+                .matmul(&qkv.v)
+                .add_dim2(qkv.v_bias.as_ref().unwrap()),
+        );
         assert_eq!(output[2].get_data(), out_v.get_data());
 
         qkv.cache.lock().unwrap().reset();
@@ -1293,7 +1318,8 @@ mod tests {
         let weight_shape = Shape::new(vec![embedding_size, hidden_size]);
         let bias_shape = Shape::new(vec![hidden_size]);
 
-        let layer = QKV::<Element>::random(num_heads, embedding_size, hidden_size, true).unwrap();
+        let layer =
+            QKV::<Element>::random(num_heads, embedding_size, hidden_size, true, None).unwrap();
         let mut si = vec![ShapeData::new(unpadded_input_shape.clone())]
             .as_slice()
             .into();
@@ -1468,7 +1494,8 @@ mod tests {
         let weight_shape = Shape::new(vec![embedding_size, hidden_size]);
         let bias_shape = Shape::new(vec![hidden_size]);
 
-        let layer = QKV::<Element>::random(num_heads, embedding_size, hidden_size, true).unwrap();
+        let layer =
+            QKV::<Element>::random(num_heads, embedding_size, hidden_size, true, None).unwrap();
         let mut si = vec![ShapeData::new(unpadded_input_shape.clone())]
             .as_slice()
             .into();
@@ -1521,7 +1548,8 @@ mod tests {
             let _qkv_node_id = model
                 .add_consecutive_layer(
                     Layer::QKV(
-                        QKV::random(num_heads, embedding_size, hidden_size, with_bias).unwrap(),
+                        QKV::random(num_heads, embedding_size, hidden_size, with_bias, None)
+                            .unwrap(),
                     ),
                     None,
                 )
@@ -1585,12 +1613,12 @@ mod tests {
     }
 
     struct Input<T> {
-        q: Tensor<T>,
-        q_bias: Tensor<T>,
-        k: Tensor<T>,
-        k_bias: Tensor<T>,
-        v: Tensor<T>,
-        v_bias: Tensor<T>,
+        q: KeyedTensor<T>,
+        q_bias: KeyedTensor<T>,
+        k: KeyedTensor<T>,
+        k_bias: KeyedTensor<T>,
+        v: KeyedTensor<T>,
+        v_bias: KeyedTensor<T>,
         num_heads: usize,
         input: Tensor<T>,
     }
@@ -1621,12 +1649,12 @@ mod tests {
                 let input = Tensor::<T>::any(Shape::new(vec![dim_input, dim_x]));
                 (q, q_bias, k, k_bias, v, v_bias, Just(num_heads), input).prop_map(
                     |(q, q_bias, k, k_bias, v, v_bias, num_heads, input)| Input {
-                        q,
-                        q_bias,
-                        k,
-                        k_bias,
-                        v,
-                        v_bias,
+                        q: KeyedTensor::new("q_weight", q),
+                        q_bias: KeyedTensor::new("q_bias", q_bias),
+                        k: KeyedTensor::new("k_weight", k),
+                        k_bias: KeyedTensor::new("k_bias", k_bias),
+                        v: KeyedTensor::new("v_weight", v),
+                        v_bias: KeyedTensor::new("v_bias", v_bias),
                         num_heads,
                         input,
                     },

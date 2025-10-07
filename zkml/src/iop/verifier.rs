@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     Claim, Element,
-    commit::mmcs_context::{CommitmentVerifier, PolyId},
+    commit::mmcs_context::CommitmentVerifier,
     iop::{
         ChallengeStorage,
         context::{ShapeStep, VerifierContext},
@@ -14,7 +14,7 @@ use crate::{
     },
     lookup::{context::LookupContext, logup_gkr::verifier::verify_logup_proof_multiple_sizes},
     model::ToIterator,
-    tensor::Tensor,
+    tensor::{Tensor, TensorKey},
     try_unzip,
 };
 use anyhow::{Context as _, anyhow, ensure};
@@ -350,8 +350,17 @@ where
         proof.verify_proof(self.transcript, claims)
     }
 
-    pub(crate) fn add_common_claims(&mut self, node_id: NodeId, claims: HashMap<PolyId, Claim<E>>) {
-        self.commit_verifier.add_common_claims(node_id, claims)
+    pub(crate) fn add_common_claims(
+        &mut self,
+        node_id: NodeId,
+        claims: HashMap<TensorKey, Claim<E>>,
+    ) {
+        self.commit_verifier.add_common_claims(
+            claims
+                .into_iter()
+                .map(|(poly_id, claim)| (poly_id, HashMap::from([(node_id, claim)])))
+                .collect(),
+        )
     }
 }
 

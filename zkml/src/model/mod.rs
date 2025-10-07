@@ -607,7 +607,7 @@ pub(crate) mod test {
             activation::Activation,
             convolution::{ConvCtx, Convolution},
             dense::Dense,
-            matrix_mul::{MatMul, OperandMatrix},
+            matrix_mul::{Config, MatMul, OperandMatrix},
             pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
             provable::{Edge, Node, OpInfo, evaluate_layer},
             requant::Requant,
@@ -616,6 +616,7 @@ pub(crate) mod test {
         padding::{PaddingMode, pad_model},
         quantization::{self, InferenceObserver},
         rng_from_env_or_random,
+        tensor::KeyedTensor,
         testing::{Pcs, random_bool_vector, random_vector},
         util::from_mle_list_dimensions,
         verify,
@@ -668,6 +669,7 @@ pub(crate) mod test {
                     last_row = nrows;
                     let dense = Dense::random(
                         vec![nrows.next_power_of_two(), ncols.next_power_of_two()].into(),
+                        Some(format!("dense_{selector}").into()),
                     );
                     // Figure out the requant information such that output is still within range
                     let (min_output_range, max_output_range) =
@@ -774,6 +776,7 @@ pub(crate) mod test {
             model.add_consecutive_layer(
                 Layer::Dense(Dense::random(
                     vec![nrows.next_power_of_two(), ncols.next_power_of_two()].into(),
+                    None,
                 )),
                 last_node_id,
             )?;
@@ -800,8 +803,8 @@ pub(crate) mod test {
     fn test_conv_maxpool() {
         let input_shape: Shape = vec![3usize, 32, 32].into();
         let shape1: Shape = vec![6, 3, 5, 5].into();
-        let filter = Tensor::random(&shape1);
-        let bias1 = Tensor::random(&vec![shape1[0]].into());
+        let filter = KeyedTensor::new("conv_filter", Tensor::random(&shape1));
+        let bias1 = KeyedTensor::new("conv_bias", Tensor::random(&vec![shape1[0]].into()));
 
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::Padding);
@@ -835,6 +838,7 @@ pub(crate) mod test {
     fn test_model_manual_run() {
         let dense1 = Dense::<Element>::random(
             vec![10usize.next_power_of_two(), 11usize.next_power_of_two()].into(),
+            Some("dense_1".to_string().into()),
         );
         let dense2 = Dense::<Element>::random(
             vec![
@@ -842,6 +846,7 @@ pub(crate) mod test {
                 dense1.ncols().next_power_of_two(),
             ]
             .into(),
+            Some("dense_2".to_string().into()),
         );
         let input_shape = vec![dense1.ncols()].into();
         let input = Tensor::<Element>::random(&input_shape);
@@ -915,7 +920,7 @@ pub(crate) mod test {
             .map(|(id, d)| (*id, d.matrix.to_2d_mle::<F>()))
             .collect_vec();
         assert_eq!(dense_layers.len(), 1);
-        let point1 = random_bool_vector(dense_layers[0].1.matrix.nrows_2d().ilog2() as usize);
+        let point1 = random_bool_vector(dense_layers[0].1.nrows().ilog2() as usize);
         let computed_eval1 = trace
             .get_step(&dense_layers[0].0)
             .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
@@ -968,9 +973,12 @@ pub(crate) mod test {
     fn test_single_matvec_prover() {
         let mut store = GenStore::default();
         let w1 = random_vector_quant(1024 * 1024);
-        let conv1 = Tensor::new(vec![1024, 1024].into(), w1.clone());
+        let conv1 = KeyedTensor::new(
+            "matvec_weight",
+            Tensor::new(vec![1024, 1024].into(), w1.clone()),
+        );
         let w2 = random_vector_quant(1024);
-        let conv2 = Tensor::new(vec![1024].into(), w2.clone());
+        let conv2 = KeyedTensor::new("matvec_bias", Tensor::new(vec![1024].into(), w2.clone()));
         let input_shape = vec![1024].into();
 
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::Padding);
@@ -997,7 +1005,7 @@ pub(crate) mod test {
         // layer matrix shape
         let m_shape: Shape = vec![100, 200].into();
         let m = random_vector_quant(m_shape[0] * m_shape[1]);
-        let tensor_m = Tensor::new(m_shape, m);
+        let tensor_m = KeyedTensor::new("matmul_weight", Tensor::new(m_shape, m));
         let input_shape: Shape = vec![5, tensor_m.nrows_2d()].into();
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::Padding);
@@ -1041,14 +1049,17 @@ pub(crate) mod test {
         let in_dimensions: Vec<Vec<usize>> =
             vec![vec![k_x, n_x, n_x], vec![16, 29, 29], vec![4, 26, 26]];
 
-        let conv1 = Tensor::random(&vec![k_w, k_x, n_w, n_w].into());
+        let conv1 = KeyedTensor::new(
+            "conv_filter",
+            Tensor::random(&vec![k_w, k_x, n_w, n_w].into()),
+        );
         let input_shape = vec![k_x, n_x, n_x].into();
 
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::Padding);
         let input = Tensor::random(&model.input_shapes()[0]);
-        let conv_layer =
-            Convolution::new(conv1.clone(), Tensor::random(&vec![conv1.dim(0)].into()))
-                .prepared_for_fft(&in_dimensions[0].clone().into());
+        let bias = KeyedTensor::new("conv_bias", Tensor::random(&vec![conv1.dim(0)].into()));
+        let conv_layer = Convolution::new(conv1.clone(), bias.clone())
+            .prepared_for_fft(&in_dimensions[0].clone().into());
         let conv_layer_id = model
             .add_consecutive_layer(Layer::Convolution(conv_layer.clone()), None)
             .unwrap();
@@ -1064,6 +1075,8 @@ pub(crate) mod test {
                 filter_size: 1024,
                 unpadded_filter_shape: Shape::new(vec![16, 2, 4, 4]),
                 padded_filter_shape: Shape::new(vec![16, 2, 4, 4]),
+                filter_key: conv1.key(),
+                bias_key: bias.key(),
             },
         );
 
@@ -1099,7 +1112,10 @@ pub(crate) mod test {
         // generate random dense matrix
         let ncols = input_shape[0];
         let nrows = 42;
-        let dense = Dense::random(vec![nrows, ncols].into());
+        let dense = Dense::random(
+            vec![nrows, ncols].into(),
+            Some("dense_1".to_string().into()),
+        );
         let dense_out_shape =
             &dense.output_shapes(&model.unpadded_input_shapes(), PaddingMode::NoPadding)[0];
         let input_node = model
@@ -1116,7 +1132,10 @@ pub(crate) mod test {
         // add another dense layer as output
         let nrows = 37;
         let ncols = dense_out_shape[0]; // it's a vector, so it has only one dimension
-        let dense = Dense::random(vec![nrows, ncols].into());
+        let dense = Dense::random(
+            vec![nrows, ncols].into(),
+            Some("dense_2".to_string().into()),
+        );
         let output_node = model
             .add_consecutive_layer(Layer::Dense(dense), Some(relu_node))
             .unwrap();
@@ -1330,7 +1349,10 @@ pub(crate) mod test {
         // generate random dense matrix
         let ncols = FIRST_INPUT_SIZE;
         let nrows = 42;
-        let dense = Dense::random(vec![nrows, ncols].into());
+        let dense = Dense::random(
+            vec![nrows, ncols].into(),
+            Some("dense_1".to_string().into()),
+        );
         let first_dense_out_shape = &dense.output_shapes(
             &[model.unpadded_input_shapes()[0].clone()],
             PaddingMode::NoPadding,
@@ -1347,7 +1369,10 @@ pub(crate) mod test {
         // add second input dense layer
         let ncols = SECOND_INPUT_SIZE;
         let nrows = 47;
-        let dense = Dense::random(vec![nrows, ncols].into());
+        let dense = Dense::random(
+            vec![nrows, ncols].into(),
+            Some("dense_2".to_string().into()),
+        );
         let second_dense_out_shape = &dense.output_shapes(
             &[model.unpadded_input_shapes()[1].clone()],
             PaddingMode::NoPadding,
@@ -1372,13 +1397,19 @@ pub(crate) mod test {
         // add other dense nodes
         let nrows = 52;
         let ncols = second_dense_out_shape[0]; // it's a vector, so it has only one dimension
-        let dense = Dense::random(vec![nrows, ncols].into());
+        let dense = Dense::random(
+            vec![nrows, ncols].into(),
+            Some("dense_out_1".to_string().into()),
+        );
         let first_output_node = model
             .add_consecutive_layer(Layer::Dense(dense), Some(second_relu_node))
             .unwrap();
         let nrows = 17;
         let ncols = first_dense_out_shape[0];
-        let dense = Dense::random(vec![nrows, ncols].into());
+        let dense = Dense::random(
+            vec![nrows, ncols].into(),
+            Some("dense_out_2".to_string().into()),
+        );
         let second_output_node = model
             .add_consecutive_layer(Layer::Dense(dense), Some(first_relu_node))
             .unwrap();
@@ -1469,7 +1500,10 @@ pub(crate) mod test {
         let first_out_layer = Layer::MatMul(
             MatMul::new(
                 OperandMatrix::Input,
-                OperandMatrix::new_weight_matrix(Tensor::random(&vec![13, 9].into())),
+                OperandMatrix::new_weight_matrix(KeyedTensor::new(
+                    "first_out_weight",
+                    Tensor::random(&vec![13, 9].into()),
+                )),
             )
             .unwrap(),
         );
@@ -1477,7 +1511,10 @@ pub(crate) mod test {
         let second_out_layer = Layer::MatMul(
             MatMul::new(
                 OperandMatrix::Input,
-                OperandMatrix::new_weight_matrix(Tensor::random(&vec![13, 13].into())),
+                OperandMatrix::new_weight_matrix(KeyedTensor::new(
+                    "second_out_weight",
+                    Tensor::random(&vec![13, 13].into()),
+                )),
             )
             .unwrap(),
         );
@@ -1510,6 +1547,40 @@ pub(crate) mod test {
                 },
             ]))
             .unwrap();
+
+        prove_model(model, &mut Default::default()).unwrap();
+    }
+
+    #[test]
+    fn test_model_with_duplicated_static_tensors() {
+        // build a model with 2 MatMul layers sharing the same tensor
+        let input_shape = vec![17, 14].into();
+        let weight_shape = vec![14, 17].into();
+        let bias_shape = vec![17].into();
+        let matmul_weight = KeyedTensor::new("matmul_weight", Tensor::random(&weight_shape));
+        let bias = KeyedTensor::new("matmul_bias", Tensor::random(&bias_shape));
+        let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
+        let first_layer_id = model
+            .add_consecutive_layer(
+                Layer::MatMul(MatMul::new_constant(matmul_weight.clone(), Some(bias)).unwrap()),
+                None,
+            )
+            .unwrap();
+        let _ = model
+            .add_consecutive_layer(
+                Layer::MatMul(
+                    MatMul::new_with_config(
+                        OperandMatrix::Input,
+                        OperandMatrix::new_weight_matrix(matmul_weight),
+                        None,
+                        Config::TransposeB,
+                    )
+                    .unwrap(),
+                ),
+                Some(first_layer_id),
+            )
+            .unwrap();
+        model.route_output(None).unwrap();
 
         prove_model(model, &mut Default::default()).unwrap();
     }

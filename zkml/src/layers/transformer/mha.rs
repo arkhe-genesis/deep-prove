@@ -1083,6 +1083,7 @@ mod test {
             llm::LLMConfig,
         },
         quantization::{self, Fieldizer},
+        tensor::KeyedTensor,
         testing::random_field_vector,
         to_bit_sequence_le,
     };
@@ -1430,7 +1431,9 @@ mod test {
         // we pad in QKV node
         let qkv_node_id = model
             .add_consecutive_layer(
-                Layer::QKV(QKV::random(num_heads, embedding_size, hidden_size, true).unwrap()),
+                Layer::QKV(
+                    QKV::random(num_heads, embedding_size, hidden_size, true, None).unwrap(),
+                ),
                 None,
             )
             .unwrap();
@@ -1447,8 +1450,9 @@ mod test {
 
         let matmul = MatMul::new(
             OperandMatrix::Input,
-            OperandMatrix::new_weight_matrix(Tensor::random(
-                &vec![hidden_size, matmul_size].into(),
+            OperandMatrix::new_weight_matrix(KeyedTensor::new(
+                "matmul_weight",
+                Tensor::random(&vec![hidden_size, matmul_size].into()),
             )),
         )
         .unwrap();
@@ -1671,7 +1675,9 @@ mod test {
 
         let qkv_node_id = model
             .add_consecutive_layer(
-                Layer::QKV(QKV::random(num_heads, embedding_size, hidden_size, true).unwrap()),
+                Layer::QKV(
+                    QKV::random(num_heads, embedding_size, hidden_size, true, None).unwrap(),
+                ),
                 None,
             )
             .unwrap();

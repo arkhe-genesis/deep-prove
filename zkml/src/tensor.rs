@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::{Ordering, PartialEq, min},
     fmt::{self, Debug},
-    ops::Range,
+    ops::{Deref, DerefMut, Range},
 };
 use tenstore::{GenStore, GenericStore, StoreError, StoreKey};
 
@@ -37,6 +37,105 @@ use crate::{
     quantization::{Fieldizer, IntoElement},
     to_bit_sequence_le,
 };
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    derive_more::From,
+    derive_more::Into,
+    derive_more::Display,
+)]
+#[display("{_0}")]
+pub struct TensorKey(String);
+
+impl From<&str> for TensorKey {
+    fn from(value: &str) -> Self {
+        value.to_string().into()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyedTensor<T> {
+    pub(crate) key: TensorKey,
+    pub(crate) tensor: Tensor<T>,
+}
+
+impl<T> KeyedTensor<T> {
+    pub fn new<K: Into<TensorKey>>(key: K, tensor: Tensor<T>) -> Self {
+        Self {
+            key: key.into(),
+            tensor,
+        }
+    }
+
+    pub fn key(&self) -> TensorKey {
+        self.key.clone()
+    }
+
+    pub fn into_tensor(self) -> Tensor<T> {
+        self.tensor
+    }
+
+    pub fn tensor(&self) -> Tensor<T>
+    where
+        T: Clone,
+    {
+        self.tensor.clone()
+    }
+
+    pub fn map_tensor<U>(self, f: impl FnOnce(Tensor<T>) -> Tensor<U>) -> KeyedTensor<U> {
+        self.try_map_tensor(|t| Ok(f(t))).unwrap()
+    }
+
+    pub fn try_map_tensor<U>(
+        self,
+        f: impl FnOnce(Tensor<T>) -> anyhow::Result<Tensor<U>>,
+    ) -> anyhow::Result<KeyedTensor<U>> {
+        Ok(KeyedTensor {
+            key: self.key,
+            tensor: f(self.tensor)?,
+        })
+    }
+
+    pub fn clone_and_map_tensor<U>(
+        &self,
+        f: impl FnOnce(&Tensor<T>) -> Tensor<U>,
+    ) -> KeyedTensor<U> {
+        KeyedTensor {
+            key: self.key.clone(),
+            tensor: f(&self.tensor),
+        }
+    }
+}
+
+impl<T> Deref for KeyedTensor<T> {
+    type Target = Tensor<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tensor
+    }
+}
+
+impl<T> DerefMut for KeyedTensor<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tensor
+    }
+}
+
+impl KeyedTensor<f32> {
+    pub fn quantize(self, s: &ScalingFactor) -> KeyedTensor<Element> {
+        let quantized_tensor = self.tensor.to_quantized(s);
+        KeyedTensor {
+            key: self.key,
+            tensor: quantized_tensor,
+        }
+    }
+}
 
 /// Chunk size tuned to allow for the compiler's auto vectorisation.
 ///

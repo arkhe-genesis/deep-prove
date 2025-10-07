@@ -1,11 +1,10 @@
 use crate::{
     Element, Shape,
-    commit::mmcs_context::{
-        CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext, PolyId,
-    },
+    commit::mmcs_context::{CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext},
     layers::provable::{Node, NodeCtx, NodeId, OpInfo},
     lookup::context::{LookupContext, TableType},
     model::{Model, ModelCtx, ToIterator},
+    tensor::TensorKey,
     to_base,
 };
 use anyhow::{Ok, anyhow, ensure};
@@ -101,7 +100,7 @@ impl Model<Element> {
         };
 
         let (step_infos, commitment_ctx, lookup) = {
-            let mut model_polys = Vec::<(NodeId, HashMap<PolyId, MultilinearExtension<E>>)>::new();
+            let mut model_polys = HashMap::<TensorKey, MultilinearExtension<E>>::new();
             let mut step_infos = BTreeMap::new();
             let mut shapes: HashMap<NodeId, Vec<Shape>> = HashMap::new();
             debug!("Context : layer info generation ...");
@@ -288,7 +287,7 @@ impl ShapeStep {
 pub struct ContextAux {
     pub tables: BTreeSet<TableType>,
     pub last_output_shape: Vec<Shape>,
-    pub model_polys: Option<HashMap<PolyId, Vec<Element>>>,
+    pub model_polys: Option<HashMap<TensorKey, Vec<Element>>>,
     /// This field is only used in macro layers like MHA
     pub max_poly_len: usize,
 }
@@ -335,7 +334,7 @@ fn compute_node_input_shapes(
 
 fn compute_node_shape<E: ExtensionField>(
     mut ctx_aux: ContextAux,
-    model_polys: &mut Vec<(NodeId, HashMap<PolyId, MultilinearExtension<E>>)>,
+    model_polys: &mut HashMap<TensorKey, MultilinearExtension<E>>,
     step_infos: &mut BTreeMap<NodeId, NodeCtx<E>>,
     shapes: &mut HashMap<NodeId, Vec<Shape>>,
     input_shapes: &[Shape],
@@ -356,25 +355,28 @@ fn compute_node_shape<E: ExtensionField>(
     let (info, mut new_aux) = node.step_info(id, ctx_aux)?;
     // Retrieve any model polynomials that need to be committed
     if new_aux.model_polys.is_some() {
-        model_polys.push((
-            id,
-            new_aux
-                .model_polys
-                .as_mut()
-                .unwrap()
-                .drain()
-                .map(|(poly_id, evals)| {
-                    let num_vars = ceil_log2(evals.len());
-                    (
-                        poly_id,
-                        MultilinearExtension::<E>::from_evaluations_vec(
-                            num_vars,
-                            to_base::<E, _>(evals),
-                        ),
-                    )
-                })
-                .collect::<HashMap<PolyId, MultilinearExtension<'_, E>>>(),
-        ));
+        new_aux
+            .model_polys
+            .as_mut()
+            .unwrap()
+            .drain()
+            .try_for_each(|(poly_id, evals)| {
+                let num_vars = ceil_log2(evals.len());
+                let mle = MultilinearExtension::<E>::from_evaluations_vec(
+                    num_vars,
+                    to_base::<E, _>(evals),
+                );
+                if let Some(expected_mle) = model_polys.get(&poly_id) {
+                    // check that the same poly was stored for `poly_id`
+                    debug_assert!(
+                        expected_mle == &mle,
+                        "Found different MLE for polynomial {poly_id}"
+                    );
+                } else {
+                    model_polys.insert(poly_id, mle);
+                }
+                Ok(())
+            })?;
     }
     step_infos.insert(
         id,

@@ -9,11 +9,11 @@ use crate::{
         gguf::FileTensorLoader,
         llm::{LLMVariant, NodeId},
     },
+    tensor::KeyedTensor,
 };
 use anyhow::{bail, ensure};
 
 use crate::{
-    Tensor,
     layers::Layer,
     model::Model,
     parser::{json, llm::LLMConfig},
@@ -22,10 +22,10 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct FeedForward<N: Number> {
     pub gate: Option<MatMul<N>>, // used only for a Gated Linear Unit (GLU)
-    pub up: Tensor<N>,
-    pub up_bias: Option<Tensor<N>>,
-    pub down: Tensor<N>,
-    pub down_bias: Option<Tensor<N>>,
+    pub up: KeyedTensor<N>,
+    pub up_bias: Option<KeyedTensor<N>>,
+    pub down: KeyedTensor<N>,
+    pub down_bias: Option<KeyedTensor<N>>,
 }
 
 impl FeedForward<f32> {
@@ -70,7 +70,9 @@ impl FeedForward<f32> {
         let gate = match &c.variant {
             LLMVariant::GPT2 => None,
             LLMVariant::Gemma3 => {
-                let gate = loader.get_tensor("ffn_gate.weight")?.transpose();
+                let gate = loader
+                    .get_tensor("ffn_gate.weight")?
+                    .map_tensor(|t| t.transpose());
                 ensure!(
                     gate.shape()[0] == c.hidden_size,
                     "gate have shape {:?} but in features should be equal to hidden_size: {}",
@@ -81,13 +83,17 @@ impl FeedForward<f32> {
             }
         };
 
-        let up = loader.get_tensor("ffn_up.weight")?.transpose();
+        let up = loader
+            .get_tensor("ffn_up.weight")?
+            .map_tensor(|t| t.transpose());
         let up_bias = if c.variant.has_biases() {
             Some(loader.get_tensor("ffn_up.bias")?)
         } else {
             None
         };
-        let down = loader.get_tensor("ffn_down.weight")?.transpose();
+        let down = loader
+            .get_tensor("ffn_down.weight")?
+            .map_tensor(|t| t.transpose());
         let down_bias = if !c.variant.has_biases() {
             None
         } else {

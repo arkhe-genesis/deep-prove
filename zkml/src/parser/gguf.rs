@@ -10,9 +10,12 @@ use std::{
 use anyhow::{Context, bail, ensure};
 use candle_core::{CpuStorage, Device, Storage, quantized::gguf_file::Content};
 
-use crate::{Shape, Tensor};
+use crate::{
+    Shape, Tensor,
+    tensor::{KeyedTensor, TensorKey},
+};
 
-fn dequantize(qtensor: Arc<QTensor>) -> anyhow::Result<Tensor<f32>> {
+fn dequantize(qtensor: &QTensor) -> anyhow::Result<Tensor<f32>> {
     let shape = Shape::new(qtensor.shape().dims().to_vec());
 
     let dequantized_candle_tensor = qtensor
@@ -203,15 +206,15 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     ///
     /// # Errors
     /// Returns an error if the reader lock cannot be acquired or if `Content::tensor` fails to load the `QTensor`.
-    pub(crate) fn get_qtensor(&self, name: &str) -> anyhow::Result<Arc<QTensor>> {
+    pub(crate) fn get_qtensor(&self, name: &str) -> anyhow::Result<(TensorKey, Arc<QTensor>)> {
         let full_name = format!("{}{}", self.current_prefix, name);
         let mut reader_guard = self.reader.lock().map_err(|e| {
             anyhow::anyhow!("Failed to acquire reader lock for tensor '{full_name}': {e}")
         })?;
         self.content
             .tensor(&mut *reader_guard, &full_name, &self.device)
-            .map(Arc::new)
             .map_err(|e| anyhow::anyhow!("Failed to load QTensor '{full_name}' from GGUF: {e}"))
+            .map(|qtensor| (full_name.into(), Arc::new(qtensor)))
     }
 
     /// Retrieves and dequantizes a tensor by its name relative to the current scope.
@@ -225,9 +228,10 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     ///
     /// # Errors
     /// Returns an error if `get_qtensor` fails or if the subsequent dequantization fails.
-    pub fn get_tensor(&self, name: &str) -> anyhow::Result<crate::Tensor<f32>> {
-        let qtensor = self.get_qtensor(name)?;
-        dequantize(qtensor)
+    pub fn get_tensor(&self, name: &str) -> anyhow::Result<KeyedTensor<f32>> {
+        let (key, qtensor) = self.get_qtensor(name)?;
+        let tensor = dequantize(qtensor.as_ref())?;
+        Ok(KeyedTensor::new(key, tensor))
     }
 
     pub fn metadata<T>(&self, key: &str) -> Option<T>
@@ -394,7 +398,7 @@ pub mod tests {
         let loader = FileTensorLoader::from_path(model_path)?;
 
         // Test loading a tensor from the root scope
-        let embedding_tensor = loader.get_tensor("token_embd.weight")?;
+        let embedding_tensor = loader.get_tensor("token_embd.weight")?.into_tensor();
         // Expected shape for gpt2 token_embd.weight: [vocab_size, embedding_length] = [50257, 768]
         assert_eq!(
             *embedding_tensor.shape(),
@@ -404,7 +408,7 @@ pub mod tests {
 
         // Test sub-scoping with a trailing dot (VarBuilder style)
         let blk0_loader = loader.pp("blk.0.");
-        let attn_norm_weight = blk0_loader.get_tensor("attn_norm.weight")?;
+        let attn_norm_weight = blk0_loader.get_tensor("attn_norm.weight")?.into_tensor();
         // Expected shape for blk.0.attn_norm.weight: [embedding_length] = [768]
         assert_eq!(
             *attn_norm_weight.shape(),
@@ -412,7 +416,7 @@ pub mod tests {
             "Shape mismatch for blk.0.attn_norm.weight"
         );
 
-        let qkv_weight = blk0_loader.get_tensor("attn_qkv.weight")?;
+        let qkv_weight = blk0_loader.get_tensor("attn_qkv.weight")?.into_tensor();
         // Expected shape for blk.0.attn_qkv.weight: [3 * embedding_length, embedding_length] = [2304, 768]
         assert_eq!(
             *qkv_weight.shape(),
@@ -423,7 +427,7 @@ pub mod tests {
         // Test sub-scoping with custom prefix as requested ("attn_", "ffn_")
         // Current prefix of blk0_loader is "blk.0."
         let blk0_attn_loader = blk0_loader.pp("attn_"); // New prefix: "blk.0.attn_"
-        let attn_norm_weight_v2 = blk0_attn_loader.get_tensor("norm.weight")?; // Full name: "blk.0.attn_norm.weight"
+        let attn_norm_weight_v2 = blk0_attn_loader.get_tensor("norm.weight")?.into_tensor(); // Full name: "blk.0.attn_norm.weight"
         assert_eq!(
             *attn_norm_weight_v2.shape(),
             vec![768usize].into(),
@@ -431,7 +435,7 @@ pub mod tests {
         );
 
         let blk0_ffn_loader = blk0_loader.pp("ffn_"); // New prefix: "blk.0.ffn_"
-        let ffn_norm_weight = blk0_ffn_loader.get_tensor("norm.weight")?; // Full name: "blk.0.ffn_norm.weight"
+        let ffn_norm_weight = blk0_ffn_loader.get_tensor("norm.weight")?.into_tensor(); // Full name: "blk.0.ffn_norm.weight"
         // Expected shape for blk.0.ffn_norm.weight: [embedding_length] = [768]
         assert_eq!(
             *ffn_norm_weight.shape(),

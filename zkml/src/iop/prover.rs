@@ -1,11 +1,7 @@
 use super::{ChallengeStorage, Proof, TableProof};
 use crate::{
     Claim, Element, Tensor, VectorTranscript,
-    commit::{
-        compute_betas_eval,
-        mmcs_context::{self, PolyId},
-        same_poly,
-    },
+    commit::{compute_betas_eval, mmcs_context, same_poly},
     iop::context::ProverContext,
     layers::{
         LayerProof,
@@ -16,7 +12,7 @@ use crate::{
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
     model::{InferenceStep, InferenceTrace, ToIterator},
-    tensor::get_root_of_unity,
+    tensor::{TensorKey, get_root_of_unity},
 };
 use anyhow::{Context as _, anyhow};
 use either::Either;
@@ -154,8 +150,17 @@ where
         }
     }
 
-    pub(crate) fn add_common_claims(&mut self, node_id: NodeId, claims: HashMap<PolyId, Claim<E>>) {
-        self.commit_prover.add_common_claims(node_id, claims)
+    pub(crate) fn add_common_claims(
+        &mut self,
+        node_id: NodeId,
+        claims: HashMap<TensorKey, Claim<E>>,
+    ) {
+        self.commit_prover.add_common_claims(
+            claims
+                .into_iter()
+                .map(|(poly_id, claim)| (poly_id, vec![(node_id, claim)]))
+                .collect(),
+        )
     }
 
     pub(crate) fn add_table_claim(&mut self, table_type: &TableType, claim: Claim<E>) {

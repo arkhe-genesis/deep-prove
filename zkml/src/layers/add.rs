@@ -27,10 +27,10 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{self, Fieldizer},
+    tensor::{KeyedTensor, TensorKey},
 };
 
 use super::provable::LayerOut;
-const OPERAND_POLY_ID: u64 = 0xff;
 
 /// The short name used to identify the Add layer.
 pub const ADD_LAYER: &str = "_ADD";
@@ -41,7 +41,7 @@ pub const ADD_LAYER: &str = "_ADD";
 pub struct Add<N> {
     /// The operand is the right side of the Add operation.
     /// shape is the unpadded shape of the operand
-    operand: Option<(Tensor<N>, Shape)>,
+    operand: Option<(KeyedTensor<N>, Shape)>,
     quant_info: Option<AddQuantInfo>,
 }
 
@@ -57,7 +57,7 @@ impl<N: Number> Default for Add<N> {
 pub struct AddCtx {
     node_id: NodeId,
     quant_info: AddQuantInfo,
-    is_static_operand: bool,
+    operand_key: Option<TensorKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,7 @@ impl<N: Number> Add<N> {
             quant_info: None,
         }
     }
-    pub fn new_with(operand: Tensor<N>, unpadded_shape: Shape) -> Self {
+    pub fn new_with(operand: KeyedTensor<N>, unpadded_shape: Shape) -> Self {
         Self {
             operand: Some((operand, unpadded_shape)),
             quant_info: None,
@@ -112,8 +112,8 @@ impl Add<Element> {
             .into_mle()
             .evaluate(&last_claim.point);
         let mut output_claims = vec![Claim::new(last_claim.point.clone(), left_eval)];
-        let right_eval = match self.operand {
-            Some((_, _)) => {
+        let right_eval = match &self.operand {
+            Some((operand, _)) => {
                 // out = x1 * s1 + x2 * s2
                 // so x1 = (out - x2 * s2) / s1
                 let a: E = self.quant_info.as_ref().unwrap().left_scale().to_field();
@@ -123,7 +123,7 @@ impl Add<Element> {
                     right_side / self.quant_info.as_ref().unwrap().right_scale().to_field();
                 let mut claims = HashMap::new();
                 claims.insert(
-                    OPERAND_POLY_ID.to_string(),
+                    operand.key(),
                     Claim::new(last_claim.point.clone(), right_eval),
                 );
                 // this claim gets verified by the PCS openings since it's a static one
@@ -436,9 +436,7 @@ impl Add<f32> {
         let add_quant_info = AddQuantInfo::new(&left_scaling, &right_scaling, &output_scaling);
 
         let quantized_model = Add::<Element> {
-            operand: self
-                .operand
-                .map(|(t, s)| (t.to_quantized(&right_scaling), s)),
+            operand: self.operand.map(|(t, s)| (t.quantize(&right_scaling), s)),
             quant_info: Some(add_quant_info),
         };
 
@@ -488,14 +486,14 @@ impl ProveInfo for Add<Element> {
         };
         let mut ctx = AddCtx {
             quant_info: *quant_info,
-            is_static_operand: false,
+            operand_key: None,
             node_id: id,
         };
         if let Some((ref op, _)) = self.operand {
             let mut model_polys = HashMap::new();
-            model_polys.insert(OPERAND_POLY_ID.to_string(), op.get_data().to_vec());
+            model_polys.insert(op.key(), op.get_data().to_vec());
             aux.model_polys = Some(model_polys);
-            ctx.is_static_operand = true;
+            ctx.operand_key = Some(op.key());
         };
         Ok((LayerCtx::Add(ctx), aux))
     }
@@ -508,7 +506,7 @@ impl PadOp for Add<Element> {
     {
         if let Some((op, og_shape)) = self.operand {
             ensure!(si.shapes.len() == 1, "Add layer expects 1 input shape");
-            let op = op.pad_next_power_of_two();
+            let op = op.map_tensor(|t| t.pad_next_power_of_two());
             let padded_shape = op.shape().clone();
             self.operand = Some((op, og_shape.clone()));
             ShapeData::new(og_shape.clone());
@@ -591,11 +589,11 @@ where
             scaled_left + scaled_right == last_claim.eval,
             "Add layer verification failed"
         );
-        if self.is_static_operand {
+        if let Some(key) = &self.operand_key {
             // in this case we need to verify the opening for the operand via PCS
             let mut claims = HashMap::new();
             claims.insert(
-                OPERAND_POLY_ID.to_string(),
+                key.clone(),
                 Claim::new(last_claim.point.clone(), proof.right_eval),
             );
             verifier.add_common_claims(self.node_id, claims);
@@ -713,7 +711,7 @@ mod test {
         for _ in 0..25 {
             let mut model =
                 Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
-            let operand = Tensor::<f32>::random(&input_shape);
+            let operand = KeyedTensor::new("add_operand", Tensor::<f32>::random(&input_shape));
             let add = Add::new_with(operand, input_shape.clone());
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
             model.route_output(None).unwrap();
@@ -789,7 +787,7 @@ mod test {
     }
 
     struct Input<T> {
-        operand: Tensor<T>,
+        operand: KeyedTensor<T>,
         unpadded_shape: Shape,
         input: Tensor<T>,
         is_two_layers: bool,
@@ -812,7 +810,7 @@ mod test {
             let unpadded_shape = Just(shape);
             (operand, unpadded_shape, input, any::<bool>()).prop_map(
                 |(operand, unpadded_shape, input, is_two_layers)| Input {
-                    operand,
+                    operand: KeyedTensor::new("add_operand", operand),
                     unpadded_shape,
                     input,
                     is_two_layers,

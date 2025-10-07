@@ -11,6 +11,7 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
+    tensor::{KeyedTensor, TensorKey},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Result, ensure};
@@ -45,8 +46,8 @@ pub const DENSE_LAYER: &str = "DENS";
 /// Description of the layer
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dense<T> {
-    pub matrix: Tensor<T>,
-    pub bias: Option<Tensor<T>>,
+    pub matrix: KeyedTensor<T>,
+    pub bias: Option<KeyedTensor<T>>,
     // set to matrix shape if the matrix is not padded
     pub unpadded_matrix_shape: Shape,
 }
@@ -57,7 +58,8 @@ pub struct DenseCtx {
     pub node_id: NodeId,
     pub unpadded_matrix_shape: Shape,
     pub padded_matrix_shape: Shape,
-    pub is_bias_present: bool,
+    matrix_key: TensorKey,
+    bias_key: Option<TensorKey>,
 }
 
 /// Proof of the layer.
@@ -87,10 +89,10 @@ fn output_shape(input_shape: &Shape, matrix_shape: &Shape) -> Shape {
 }
 
 impl<T: Number> Dense<T> {
-    pub fn new(matrix: Tensor<T>, bias: Tensor<T>) -> Self {
+    pub fn new(matrix: KeyedTensor<T>, bias: KeyedTensor<T>) -> Self {
         Self::new_with(matrix, Some(bias))
     }
-    pub fn new_with(matrix: Tensor<T>, bias: Option<Tensor<T>>) -> Self {
+    pub fn new_with(matrix: KeyedTensor<T>, bias: Option<KeyedTensor<T>>) -> Self {
         if let Some(ref bbias) = bias {
             assert_eq!(matrix.nrows_2d(), bbias.shape()[0]);
         }
@@ -109,8 +111,10 @@ impl<T: Number> Dense<T> {
     }
 
     pub fn pad_next_power_of_two(self) -> Self {
-        let matrix = self.matrix.pad_next_power_of_two();
-        let bias = self.bias.map(|b| b.pad_1d(matrix.nrows_2d()));
+        let matrix = self.matrix.map_tensor(|t| t.pad_next_power_of_two());
+        let bias = self
+            .bias
+            .map(|b| b.map_tensor(|t| t.pad_1d(matrix.nrows_2d())));
         Self {
             matrix,
             bias,
@@ -124,22 +128,6 @@ impl<T: Number> Dense<T> {
             PaddingMode::Padding => self.unpadded_matrix_shape.next_power_of_two(),
         };
         output_shape(input_shape, &matrix_shape)
-    }
-
-    pub fn describe(&self) -> String {
-        format!(
-            "Dense: ({}x{}) + bias ({})",
-            self.matrix.nrows_2d(),
-            self.matrix.ncols_2d(),
-            !self
-                .bias
-                .as_ref()
-                .map(|a| a
-                    .get_data()
-                    .iter()
-                    .all(|x| x.compare(&T::default()) == Ordering::Equal))
-                .unwrap_or(true)
-        )
     }
 
     fn num_outputs(num_inputs: usize) -> usize {
@@ -164,9 +152,17 @@ impl<N: Number> OpInfo for Dense<N> {
 
     fn describe(&self) -> String {
         format!(
-            "Dense: ({},{})",
-            self.matrix.nrows_2d(),
-            self.matrix.ncols_2d(),
+            "Dense: ({}x{}) + bias ({})",
+            self.nrows(),
+            self.ncols(),
+            !self
+                .bias
+                .as_ref()
+                .map(|a| a
+                    .get_data()
+                    .iter()
+                    .all(|x| x.compare(&N::default()) == Ordering::Equal))
+                .unwrap_or(true)
         )
     }
 
@@ -186,7 +182,7 @@ impl Evaluate<Element> for Dense<Element> {
             "Found more than 1 input when evaluating dense layer"
         );
 
-        let matrix = self.matrix.clone().to_btensor::<2>();
+        let matrix = self.matrix.tensor().to_btensor::<2>();
         let input = inputs[0].to_flatten().to_btensor::<1>();
         let bias = self.bias.as_ref().map(|b| b.to_flatten().to_btensor::<1>());
 
@@ -219,7 +215,7 @@ impl Evaluate<f32> for Dense<f32> {
         );
         let input = inputs[0];
 
-        let matrix = self.matrix.clone().to_btensor::<2>();
+        let matrix = self.matrix.tensor().to_btensor::<2>();
         let input = input.to_flatten().to_btensor::<1>();
         let bias = self.bias.as_ref().map(|b| b.to_flatten().to_btensor::<1>());
         let res = linear(input, matrix.transpose(), bias);
@@ -232,9 +228,6 @@ impl Evaluate<f32> for Dense<f32> {
     }
 }
 
-const WEIGHT_POLY_ID: &str = "DenseWeight";
-const BIAS_POLY_ID: &str = "DenseBias";
-
 impl ProveInfo for Dense<Element> {
     fn step_info<E: ExtensionField>(
         &self,
@@ -244,13 +237,14 @@ impl ProveInfo for Dense<Element> {
         // construct dimension of the polynomial given to the sumcheck
         aux.last_output_shape
             .iter_mut()
-            .for_each(|shape| *shape = Shape::new(vec![self.matrix.nrows_2d()]));
+            .for_each(|shape| *shape = Shape::new(vec![self.nrows()]));
 
         let dense_info = LayerCtx::Dense(DenseCtx {
             node_id: id,
             unpadded_matrix_shape: self.unpadded_matrix_shape.clone(),
             padded_matrix_shape: self.matrix.shape().clone(),
-            is_bias_present: self.bias.is_some(),
+            matrix_key: self.matrix.key(),
+            bias_key: self.bias.as_ref().map(|b| b.key()),
         });
 
         let weights_evals = self.matrix.pad_next_power_of_two().into_data();
@@ -261,9 +255,12 @@ impl ProveInfo for Dense<Element> {
 
         aux.model_polys = {
             let mut model_polys = HashMap::new();
-            model_polys.insert(WEIGHT_POLY_ID.to_string(), weights_evals);
-            if let Some(evals) = bias_evals {
-                model_polys.insert(BIAS_POLY_ID.to_string(), evals);
+            model_polys.insert(self.matrix.key(), weights_evals);
+            if let Some(bias) = &self.bias {
+                model_polys.insert(
+                    bias.key(),
+                    bias_evals.expect("No bias evals found in Dense Layer"),
+                );
             }
             Some(model_polys)
         };
@@ -287,8 +284,11 @@ impl Dense<f32> {
         input_scaling: &[ScalingFactor],
         output_scaling: ScalingFactor,
     ) -> anyhow::Result<QuantizeOutput<Dense<Element>>> {
-        let (model_scaling, bias_scaling) =
-            model_scaling_factor_from_tensor_and_bias(&input_scaling[0], &self.matrix, &self.bias);
+        let (model_scaling, bias_scaling) = model_scaling_factor_from_tensor_and_bias(
+            &input_scaling[0],
+            &self.matrix,
+            &self.bias.as_ref().map(|b| b.tensor()),
+        );
         ensure!(
             input_scaling.len() == 1,
             "Number of input scaling factor for dense layer different from 1"
@@ -418,8 +418,8 @@ impl Dense<f32> {
     /// Quantize the parameters of the dense layer. It uses a custom scaling factor `bias_s` for
     /// the bias, if provided, otherwise the same scaling factor of the weights (i.e., `s`) is used
     pub fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Dense<Element> {
-        let matrix = self.matrix.to_quantized(s);
-        let bias = self.bias.map(|b| b.to_quantized(bias_s));
+        let matrix = self.matrix.quantize(s);
+        let bias = self.bias.map(|b| b.quantize(bias_s));
         Dense::<Element> {
             matrix,
             bias,
@@ -427,7 +427,7 @@ impl Dense<f32> {
         }
     }
 
-    pub fn new_from_weights(weights: Tensor<f32>, bias: Option<Tensor<f32>>) -> Self {
+    pub fn new_from_weights(weights: KeyedTensor<f32>, bias: Option<KeyedTensor<f32>>) -> Self {
         let unpadded_matrix_shape = weights.shape().clone();
         Self {
             matrix: weights,
@@ -497,7 +497,7 @@ impl Dense<Element> {
         PCS::ProverParam: Send + Sync,
     {
         let matrix = &self.matrix;
-        let (nrows, ncols) = (matrix.nrows_2d(), matrix.ncols_2d());
+        let (nrows, ncols) = (self.nrows(), self.ncols());
         assert_eq!(
             nrows,
             output.get_data().len(),
@@ -565,9 +565,12 @@ impl Dense<Element> {
         // Add common commitment claims to be proven
         let common_claims = {
             let mut claims = HashMap::new();
-            claims.insert(WEIGHT_POLY_ID.to_string(), weights_claim);
-            if let Some(bias_claim) = bias_claim {
-                claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+            claims.insert(self.matrix.key(), weights_claim);
+            if let Some(bias) = &self.bias {
+                claims.insert(
+                    bias.key(),
+                    bias_claim.expect("No bias claim found when proving Dense Layer"),
+                );
             }
             claims
         };
@@ -610,7 +613,7 @@ impl DenseCtx {
         proof: &DenseProof<E>,
     ) -> anyhow::Result<Claim<E>> {
         ensure!(
-            self.is_bias_present == proof.bias_eval.is_some(),
+            self.bias_key.is_some() == proof.bias_eval.is_some(),
             "bias eval is missing while expected"
         );
         // Subtract the bias evaluation from the previous claim to remove the bias
@@ -652,10 +655,10 @@ impl DenseCtx {
         // add the common commitment claims to be verified
         let common_claims = {
             let mut claims = HashMap::new();
-            claims.insert(WEIGHT_POLY_ID.to_string(), weights_claim);
+            claims.insert(self.matrix_key.clone(), weights_claim);
             if let Some(ref be) = proof.bias_eval {
                 let bias_claim = Claim::new(last_claim.point.clone(), *be);
-                claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+                claims.insert(self.bias_key.clone().unwrap(), bias_claim);
             }
             claims
         };
@@ -701,10 +704,9 @@ impl<E: ExtensionField> DenseProof<E> {
 
 #[cfg(test)]
 mod test {
-    use std::{fmt::Debug, ops::Range};
-
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
+    use std::{fmt::Debug, ops::Range};
 
     use crate::{
         layers::{Layer, provable::evaluate_layer},
@@ -714,12 +716,22 @@ mod test {
     use super::*;
 
     impl<T: Number> Dense<T> {
-        pub fn random(shape: Shape) -> Self {
+        /// Require a `layer_name` in case there is the need to use different tensor
+        /// keys form the default ones
+        pub fn random(shape: Shape, layer_name: Option<TensorKey>) -> Self {
             assert_eq!(shape.len(), 2);
             let (nrows, ncols) = (shape[0], shape[1]);
-            let matrix = Tensor::<T>::random(&vec![nrows, ncols].into());
+            let layer_name = layer_name.unwrap_or("dense".to_string().into());
+            let matrix = KeyedTensor::new(
+                format!("{layer_name}_weight"),
+                Tensor::<T>::random(&vec![nrows, ncols].into()),
+            );
+
             // let bias = Tensor::random(vec![nrows]);
-            let bias = Tensor::<T>::random(&vec![nrows].into());
+            let bias = KeyedTensor::new(
+                format!("{layer_name}_bias"),
+                Tensor::<T>::random(&vec![nrows].into()),
+            );
             Self::new(matrix, bias)
         }
     }
@@ -727,14 +739,20 @@ mod test {
     #[test]
     fn test_dense_pad_next_power_of_two() {
         // Create a Dense layer with non-power-of-two dimensions
-        let matrix = Tensor::<Element>::matrix_from_coeffs(vec![
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-            vec![7, 8, 9],
-        ])
-        .unwrap();
+        let matrix = KeyedTensor::new(
+            "dense_weight",
+            Tensor::<Element>::matrix_from_coeffs(vec![
+                vec![1, 2, 3],
+                vec![4, 5, 6],
+                vec![7, 8, 9],
+            ])
+            .unwrap(),
+        );
 
-        let bias = Tensor::<Element>::new(vec![3].into(), vec![10, 11, 12]);
+        let bias = KeyedTensor::new(
+            "dense_bias",
+            Tensor::<Element>::new(vec![3].into(), vec![10, 11, 12]),
+        );
 
         let dense = Dense::new(matrix, bias);
 
@@ -751,36 +769,44 @@ mod test {
         assert_eq!(bias_dims[0], 4); // Next power of 2 after 3
 
         // Check original values are preserved
-        assert_eq!(padded.matrix.get_data()[0], 1);
-        assert_eq!(padded.matrix.get_data()[1], 2);
-        assert_eq!(padded.matrix.get_data()[2], 3);
-        assert_eq!(padded.matrix.get_data()[4], 4);
-        assert_eq!(padded.matrix.get_data()[8], 7);
+        let padded_matrix = padded.matrix;
+        assert_eq!(padded_matrix.get_data()[0], 1);
+        assert_eq!(padded_matrix.get_data()[1], 2);
+        assert_eq!(padded_matrix.get_data()[2], 3);
+        assert_eq!(padded_matrix.get_data()[4], 4);
+        assert_eq!(padded_matrix.get_data()[8], 7);
 
         // Check added values are zeros
-        assert_eq!(padded.matrix.get_data()[3], 0);
-        assert_eq!(padded.matrix.get_data()[7], 0);
-        assert_eq!(padded.matrix.get_data()[15], 0);
+        assert_eq!(padded_matrix.get_data()[3], 0);
+        assert_eq!(padded_matrix.get_data()[7], 0);
+        assert_eq!(padded_matrix.get_data()[15], 0);
 
         // Check bias values
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[0], 10);
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[1], 11);
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[2], 12);
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[3], 0); // Padding
+        let padded_bias = padded.bias.as_ref().unwrap();
+        assert_eq!(padded_bias.get_data()[0], 10);
+        assert_eq!(padded_bias.get_data()[1], 11);
+        assert_eq!(padded_bias.get_data()[2], 12);
+        assert_eq!(padded_bias.get_data()[3], 0); // Padding
     }
 
     #[test]
     fn test_dense_pad_already_power_of_two() {
         // Create a Dense layer with power-of-two dimensions
-        let matrix = Tensor::<Element>::matrix_from_coeffs(vec![
-            vec![1, 2, 3, 4],
-            vec![5, 6, 7, 8],
-            vec![9, 10, 11, 12],
-            vec![13, 14, 15, 16],
-        ])
-        .unwrap();
+        let matrix = KeyedTensor::new(
+            "dense_weight",
+            Tensor::<Element>::matrix_from_coeffs(vec![
+                vec![1, 2, 3, 4],
+                vec![5, 6, 7, 8],
+                vec![9, 10, 11, 12],
+                vec![13, 14, 15, 16],
+            ])
+            .unwrap(),
+        );
 
-        let bias = Tensor::<Element>::new(vec![4].into(), vec![20, 21, 22, 23]);
+        let bias = KeyedTensor::new(
+            "dense_bias",
+            Tensor::<Element>::new(vec![4].into(), vec![20, 21, 22, 23]),
+        );
 
         let dense = Dense::new(matrix, bias);
 
@@ -812,14 +838,20 @@ mod test {
     #[test]
     fn test_dense_pad_mixed_dimensions() {
         // Create a Dense layer with one power-of-two dimension and one non-power-of-two
-        let matrix = Tensor::<Element>::matrix_from_coeffs(vec![
-            vec![1, 2, 3, 4],
-            vec![5, 6, 7, 8],
-            vec![9, 10, 11, 12],
-        ])
-        .unwrap();
+        let matrix = KeyedTensor::new(
+            "dense_weight",
+            Tensor::<Element>::matrix_from_coeffs(vec![
+                vec![1, 2, 3, 4],
+                vec![5, 6, 7, 8],
+                vec![9, 10, 11, 12],
+            ])
+            .unwrap(),
+        );
 
-        let bias = Tensor::<Element>::new(vec![3].into(), vec![20, 21, 22]);
+        let bias = KeyedTensor::new(
+            "dense_bias",
+            Tensor::<Element>::new(vec![3].into(), vec![20, 21, 22]),
+        );
 
         let dense = Dense::new(matrix, bias);
 
@@ -836,16 +868,18 @@ mod test {
         assert_eq!(bias_dims[0], 4); // Next power of 2 after 3
 
         // Check original values are preserved and padding is zeros
-        assert_eq!(padded.matrix.get_data()[0], 1);
-        assert_eq!(padded.matrix.get_data()[4], 5);
-        assert_eq!(padded.matrix.get_data()[8], 9);
-        assert_eq!(padded.matrix.get_data()[12], 0); // Padding
+        let padded_matrix = padded.matrix;
+        assert_eq!(padded_matrix.get_data()[0], 1);
+        assert_eq!(padded_matrix.get_data()[4], 5);
+        assert_eq!(padded_matrix.get_data()[8], 9);
+        assert_eq!(padded_matrix.get_data()[12], 0); // Padding
 
         // Check bias values
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[0], 20);
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[1], 21);
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[2], 22);
-        assert_eq!(padded.bias.as_ref().unwrap().get_data()[3], 0); // Padding
+        let padded_bias = padded.bias.as_ref().unwrap();
+        assert_eq!(padded_bias.get_data()[0], 20);
+        assert_eq!(padded_bias.get_data()[1], 21);
+        assert_eq!(padded_bias.get_data()[2], 22);
+        assert_eq!(padded_bias.get_data()[3], 0); // Padding
     }
 
     #[test]
@@ -860,10 +894,15 @@ mod test {
             .collect();
 
         // Create a Dense layer
-        let matrix =
-            Tensor::<Element>::matrix_from_coeffs(vec![vec![1, 2, 3], vec![4, 5, 6]]).unwrap();
+        let matrix = KeyedTensor::new(
+            "dense_weight",
+            Tensor::<Element>::matrix_from_coeffs(vec![vec![1, 2, 3], vec![4, 5, 6]]).unwrap(),
+        );
 
-        let bias = Tensor::<Element>::new(vec![2].into(), vec![10, 11]);
+        let bias = KeyedTensor::new(
+            "dense_bias",
+            Tensor::<Element>::new(vec![2].into(), vec![10, 11]),
+        );
 
         let dense = Dense::new(matrix, bias);
 
@@ -894,13 +933,11 @@ mod test {
     fn test_dense_proving_with_bias() {
         let [a, b] = [10, 20];
         let first_input_shape = vec![a];
-        let matrix = Tensor::<f32>::random(&vec![b, a].into());
-        let bias = Tensor::<f32>::random(&vec![b].into());
 
         let mut model =
             Model::new_from_input_shapes(vec![first_input_shape.into()], PaddingMode::NoPadding);
 
-        let dense = Dense::<f32>::new(matrix, bias);
+        let dense = Dense::<f32>::random(vec![b, a].into(), None);
 
         let _ = model
             .add_consecutive_layer(Layer::Dense(dense), None)
@@ -942,8 +979,8 @@ mod test {
     }
 
     struct Input<T> {
-        matrix: Tensor<T>,
-        bias: Tensor<T>,
+        matrix: KeyedTensor<T>,
+        bias: KeyedTensor<T>,
         input: Tensor<T>,
     }
 
@@ -959,8 +996,8 @@ mod test {
             let bias = Tensor::<T>::any(Shape::new(vec![dim]));
             let input = Tensor::<T>::any(Shape::new(vec![dim]));
             (matrix, bias, input).prop_map(|(matrix, bias, input)| Input {
-                matrix,
-                bias,
+                matrix: KeyedTensor::new("dense_weight", matrix),
+                bias: KeyedTensor::new("dense_bias", bias),
                 input,
             })
         })

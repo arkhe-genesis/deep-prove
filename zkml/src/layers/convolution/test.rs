@@ -6,7 +6,7 @@ use crate::{
         pooling::{Maxpool2D, Pooling, maxpool2d_shape},
         provable::evaluate_layer,
     },
-    tensor::check_tensor_consistency,
+    tensor::{KeyedTensor, check_tensor_consistency},
 };
 use ff_ext::GoldilocksExt2;
 use proptest::prelude::*;
@@ -56,7 +56,10 @@ fn test_conv() {
 
                     let bias = Tensor::<Element>::zeros(Shape::new(vec![feature_maps]));
                     let input = Tensor::new(padded_input_shape.clone(), vec![3; input_size]);
-                    let mut filter = Filter::new(Tensor::random(&filter_shape));
+                    let mut filter = Filter::new(KeyedTensor::new(
+                        "conv_filter",
+                        Tensor::random(&filter_shape),
+                    ));
 
                     let expected = input.conv2d(filter.as_pre_fft_tensor(), &bias, 1);
                     let expected = expected.squeeze(0);
@@ -108,8 +111,8 @@ fn test_conv2d_shape() {
 fn test_conv_unpadded_to_padded() {
     let input_shape: Shape = vec![1, 23, 23].into();
     let conv_shape_og: Shape = vec![7, 1, 3, 3].into();
-    let weight = Tensor::random(&conv_shape_og);
-    let bias: Tensor<Element> = Tensor::zeros(vec![conv_shape_og[0]].into());
+    let weight = KeyedTensor::new("conv_filter", Tensor::random(&conv_shape_og));
+    let bias = KeyedTensor::new("conv_bias", Tensor::zeros(vec![conv_shape_og[0]].into()));
     let input = Tensor::random(&input_shape);
     let output = input.conv2d(&weight, &bias, 1);
     // now try to pad the input and conv and use the fft one
@@ -151,8 +154,8 @@ fn test_conv_padding_garbage() {
     let conv_shape_og: Shape = vec![7, 1, 3, 3].into();
 
     // weight of the filter
-    let w1 = Tensor::random(&conv_shape_og);
-    let bias1: Tensor<Element> = Tensor::zeros(vec![conv_shape_og[0]].into());
+    let w1 = KeyedTensor::new("conv_filter", Tensor::random(&conv_shape_og));
+    let bias1 = KeyedTensor::new("conv_bias", Tensor::zeros(vec![conv_shape_og[0]].into()));
     // creation of the padded and fft'd convolution
     let fft_conv = Convolution::new(w1.clone(), bias1.clone()).prepared_for_fft(&input_shape);
     let input = Tensor::random(&input_shape);
@@ -188,11 +191,14 @@ fn test_conv_padding_garbage() {
     let nrows = 10;
     let dense_shape = vec![nrows, ncols];
     let dense = Dense::new(
-        Tensor::new(
-            dense_shape.clone().into(),
-            vec![1; dense_shape.iter().product()],
+        KeyedTensor::new(
+            "dense_weight",
+            Tensor::new(
+                dense_shape.clone().into(),
+                vec![1; dense_shape.iter().product()],
+            ),
         ),
-        Tensor::zeros(vec![dense_shape[0]].into()),
+        KeyedTensor::new("dense_bias", Tensor::zeros(vec![dense_shape[0]].into())),
     );
     // create the padded version:
     // take the "conv2d"input shape
@@ -203,13 +209,17 @@ fn test_conv_padding_garbage() {
         flat_fft_output.shape()[0].next_power_of_two(),
     ];
     let mut padded_dense = dense.clone();
-    padded_dense.matrix = padded_dense.matrix.pad_matrix_to_ignore_garbage(
-        &conv_input_shape,
-        &conv_input_shape_padded,
-        &dense_shape_padded.into(),
-    );
+    padded_dense.matrix = padded_dense.matrix.map_tensor(|t| {
+        t.pad_matrix_to_ignore_garbage(
+            &conv_input_shape,
+            &conv_input_shape_padded,
+            &dense_shape_padded.into(),
+        )
+    });
     let padded_nrows = padded_dense.nrows();
-    padded_dense.bias = padded_dense.bias.map(|b| b.pad_1d(padded_nrows));
+    padded_dense.bias = padded_dense
+        .bias
+        .map(|b| b.map_tensor(|t| t.pad_1d(padded_nrows)));
     let no_garbage_fft_output =
         evaluate_layer::<GoldilocksExt2, _, _>(&padded_dense, &[&flat_fft_output], None)
             .unwrap()
@@ -240,8 +250,11 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
 
     let mut input_shape_og: Shape = vec![k_x, 256, 256].into();
     let mut input_shape_padded: Shape = input_shape_og.next_power_of_two();
-    let filter = Tensor::random(&vec![k_w, k_x, n_w, n_w].into());
-    let bias = Tensor::random(&vec![k_w].into());
+    let filter = KeyedTensor::new(
+        "conv_filter",
+        Tensor::random(&vec![k_w, k_x, n_w, n_w].into()),
+    );
+    let bias = KeyedTensor::new("conv_bias", Tensor::random(&vec![k_w].into()));
     let input = Tensor::random(&input_shape_og);
 
     let output = input.conv2d(&filter, &bias, 1);
@@ -273,8 +286,11 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     input_shape_padded = maxpool2d_shape(&input_shape_padded);
 
     // again another conv
-    let filter = Tensor::random(&vec![k_w, k_x, n_w, n_w].into());
-    let bias = Tensor::random(&vec![k_w].into());
+    let filter = KeyedTensor::new(
+        "conv2_filter",
+        Tensor::random(&vec![k_w, k_x, n_w, n_w].into()),
+    );
+    let bias = KeyedTensor::new("conv2_bias", Tensor::random(&vec![k_w].into()));
     println!("2AND CONV: filter.shape() : {:?}", filter.shape());
     println!("2AND CONV: bias.shape() : {:?}", bias.shape());
     println!("2AND CONV: input.shape() : {:?}", output.shape());
@@ -323,7 +339,10 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     }
     let conv_shape_og = ignore_garbage_pad.0.clone();
     let conv_shape_pad = ignore_garbage_pad.1.clone();
-    let dense = Dense::new(weight.clone(), bias.clone());
+    let dense = Dense::new(
+        KeyedTensor::new("dense_weight", weight.clone()),
+        KeyedTensor::new("dense_bias", bias.clone()),
+    );
     let dense_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&output], None)
         .unwrap()
         .outputs()[0]
@@ -335,7 +354,10 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
         &vec![new_rows, new_cols].into(),
     );
     let fft_bias = bias.clone().pad_1d(new_rows);
-    let fft_dense = Dense::new(fft_weight.clone(), fft_bias.clone());
+    let fft_dense = Dense::new(
+        KeyedTensor::new("fft_dense_weight", fft_weight.clone()),
+        KeyedTensor::new("fft_dense_bias", fft_bias.clone()),
+    );
     println!("-- new_rows : {new_rows}, new_cols : {new_cols}");
     println!("weight.shape() : {:?}", weight.shape());
     println!("bias.shape() : {:?}", bias.shape());
@@ -363,15 +385,21 @@ fn convolution_test_simple_element() {
     let channels = 1;
     let filter_size = 2;
     let size = 4;
-    let kernels = Tensor::<Element>::new(
-        Shape::new(vec![1, channels, filter_size, filter_size]),
-        vec![2, 3, 5, 7],
+    let kernels = KeyedTensor::new(
+        "conv_filter",
+        Tensor::<Element>::new(
+            Shape::new(vec![1, channels, filter_size, filter_size]),
+            vec![2, 3, 5, 7],
+        ),
     );
     let input = Tensor::<Element>::new(
         Shape::new(vec![channels, size, size]),
         vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4],
     );
-    let bias = Tensor::<Element>::new(Shape::new(vec![1]), vec![1]);
+    let bias = KeyedTensor::new(
+        "conv_bias",
+        Tensor::<Element>::new(Shape::new(vec![1]), vec![1]),
+    );
 
     let expected = input.conv2d(&kernels, &bias, 1);
     // Remove the leading dimension, the fft only supports 3d tensors.
@@ -396,10 +424,12 @@ fn convolution_test_random_element() {
     let channels = 1;
     let size = 8;
     let filter_size = 4;
-    let kernels =
-        Tensor::<Element>::random(&Shape::new(vec![1, channels, filter_size, filter_size]));
+    let kernels = KeyedTensor::new(
+        "conv_filter",
+        Tensor::<Element>::random(&Shape::new(vec![1, channels, filter_size, filter_size])),
+    );
     let input = Tensor::<Element>::random(&Shape::new(vec![channels, size, size]));
-    let bias = Tensor::<Element>::random(&Shape::new(vec![1]));
+    let bias = KeyedTensor::new("conv_bias", Tensor::<Element>::random(&Shape::new(vec![1])));
 
     let expected = input.conv2d(&kernels, &bias, 1);
     // Remove the leading dimension, the fft only supports 3d tensors.
@@ -420,9 +450,9 @@ fn convolution_test_random_element() {
 }
 
 struct Input<T> {
-    kernels: Tensor<T>,
+    kernels: KeyedTensor<T>,
     input: Tensor<T>,
-    bias: Tensor<T>,
+    bias: KeyedTensor<T>,
 }
 
 impl<T> Debug for Input<T> {
@@ -456,9 +486,9 @@ fn input_fft<T: Number>(
             let input = Tensor::<T>::any(Shape::new(vec![1 << channels, 1 << size, 1 << size]));
             let bias = Tensor::<T>::any(Shape::new(vec![1]));
             (kernels, input, bias).prop_map(|(kernels, input, bias)| Input {
-                kernels,
+                kernels: KeyedTensor::new("fft_conv_filter", kernels),
                 input,
-                bias,
+                bias: KeyedTensor::new("fft_conv_bias", bias),
             })
         })
 }
@@ -479,9 +509,9 @@ fn input_conv2d<T: Number>(
         ]));
         let bias = Tensor::<T>::any(Shape::new(vec![1 << batches]));
         (kernels, input, bias).prop_map(|(kernels, input, bias)| Input {
-            kernels,
+            kernels: KeyedTensor::new("conv_filter", kernels),
             input,
-            bias,
+            bias: KeyedTensor::new("conv_bias", bias),
         })
     })
 }

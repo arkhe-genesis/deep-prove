@@ -1115,6 +1115,7 @@ mod tests {
     use crate::{
         layers::{Layer, matrix_mul::MatMul},
         model::{Model, test::prove_model},
+        tensor::KeyedTensor,
     };
 
     use super::*;
@@ -1128,8 +1129,14 @@ mod tests {
         let mut model =
             Model::new_from_input_shapes(vec![first_input_shape.into()], PaddingMode::NoPadding);
 
-        let mat = Tensor::<f32>::random(&matrix_shape);
-        let bias = Tensor::<f32>::random(&vec![d].into());
+        let mat = KeyedTensor::new(
+            "requant_matmul_weight",
+            Tensor::<f32>::random(&matrix_shape),
+        );
+        let bias = KeyedTensor::new(
+            "requant_matmul_bias",
+            Tensor::<f32>::random(&vec![d].into()),
+        );
         let matmul = MatMul::new_constant(mat, Some(bias)).unwrap();
         let _ = model
             .add_consecutive_layer(Layer::MatMul(matmul), None)

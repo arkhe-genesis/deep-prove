@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use anyhow::{Context, ensure};
 use serde::Deserialize;
 
-use crate::{Shape, Tensor};
+use crate::{Shape, Tensor, tensor::KeyedTensor};
 
 /// Generic helper function to unfuse a tensor's data into multiple chunks.
 /// Expects the input tensor `fused_tensor` (crate::Tensor<f32>) to contain flat data.
@@ -97,16 +97,22 @@ impl FileTensorLoader {
         new
     }
 
-    fn resolve_key(&self, key: &str) -> Option<&JsonTensor> {
-        let full_key = format!("{}{}", self.prefix, key);
-        self.content.tensors.get(&full_key)
+    fn full_key(&self, key: &str) -> String {
+        format!("{}{}", self.prefix, key)
     }
 
-    pub fn get_tensor(&self, key: &str) -> anyhow::Result<Tensor<f32>> {
+    fn resolve_key(&self, key: &str) -> Option<&JsonTensor> {
+        self.content.tensors.get(&self.full_key(key))
+    }
+
+    pub fn get_tensor(&self, key: &str) -> anyhow::Result<KeyedTensor<f32>> {
         let tensor = self
             .resolve_key(key)
             .ok_or_else(|| anyhow::anyhow!("tensor not found: {key}"))?;
-        Ok(Tensor::new(tensor.shape.clone(), tensor.data.clone()))
+        Ok(KeyedTensor::new(
+            self.full_key(key),
+            Tensor::new(tensor.shape.clone(), tensor.data.clone()),
+        ))
     }
 
     pub fn get_metadata(&self, key: &str) -> Option<&serde_json::Value> {

@@ -1,4 +1,7 @@
-use crate::parser::{gguf, json};
+use crate::{
+    parser::{gguf, json},
+    tensor::{KeyedTensor, TensorKey},
+};
 use std::iter::once;
 
 use crate::{
@@ -64,6 +67,7 @@ pub struct EmbeddingsCtx {
     id: NodeId,
     vocab_size: usize,
     emb_size: usize,
+    embedding_key: TensorKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +82,7 @@ pub struct EmbeddingsProof<E: ExtensionField> {
 }
 
 impl<N: Number> Embeddings<N> {
-    pub fn new(emb: Tensor<N>) -> anyhow::Result<Self> {
+    pub fn new(emb: KeyedTensor<N>) -> anyhow::Result<Self> {
         let emb_size = emb.shape()[1];
         let vocab_size = emb.shape()[0];
         // left side is one hot input tensor, and right side
@@ -91,6 +95,13 @@ impl<N: Number> Embeddings<N> {
             emb_size,
             vocab_size,
         })
+    }
+
+    fn embedding_matrix_key(&self) -> TensorKey {
+        let OperandMatrix::Weight(embedding_matrix) = &self.mat.right_matrix else {
+            unreachable!()
+        };
+        embedding_matrix.tensor.key()
     }
 
     pub(crate) fn embedding_matrix(&self) -> &Tensor<N> {
@@ -220,7 +231,7 @@ impl Evaluate<f32> for Embeddings<f32> {
         let emb = &w.tensor;
         let emb_size = emb.shape()[1];
 
-        let weights = emb.clone().to_btensor::<2>();
+        let weights = emb.tensor().to_btensor::<2>();
         let indices = input.clone().to_btensor::<1>().int();
 
         let res = Backend::float_select(
@@ -262,7 +273,7 @@ impl Evaluate<Element> for Embeddings<Element> {
         let emb = &w.tensor;
         let emb_size = emb.shape()[1];
 
-        let weights = emb.clone().to_btensor::<2>();
+        let weights = emb.tensor().to_btensor::<2>();
         let indices = input.clone().to_btensor::<1>();
 
         let res = Backend::int_select(weights.into_primitive(), 0, indices.into_primitive());
@@ -306,8 +317,6 @@ impl PadOp for Embeddings<Element> {
     }
 }
 
-const EMBEDDING_POLY_ID: &str = "EmbeddingMat";
-
 impl ProveInfo for Embeddings<Element> {
     fn step_info<E: ExtensionField>(
         &self,
@@ -317,7 +326,7 @@ impl ProveInfo for Embeddings<Element> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         aux.model_polys = Some(
             once((
-                EMBEDDING_POLY_ID.to_string(),
+                self.embedding_matrix_key(),
                 self.embedding_matrix()
                     .pad_next_power_of_two()
                     .data()
@@ -330,6 +339,7 @@ impl ProveInfo for Embeddings<Element> {
                 id,
                 vocab_size: self.vocab_size,
                 emb_size: self.emb_size,
+                embedding_key: self.embedding_matrix_key(),
             }),
             aux,
         ))
@@ -486,7 +496,7 @@ where
 
         prover.add_common_claims(
             node_id,
-            once((EMBEDDING_POLY_ID.to_string(), embedding_claim)).collect(),
+            once((self.embedding_matrix_key(), embedding_claim)).collect(),
         );
 
         prover.push_proof(
@@ -551,7 +561,7 @@ where
 
         verifier.add_common_claims(
             self.id,
-            once((EMBEDDING_POLY_ID.to_string(), embedding_mat_claim)).collect(),
+            once((self.embedding_key.clone(), embedding_mat_claim)).collect(),
         );
 
         // SUMCHECK verification part
@@ -693,7 +703,8 @@ mod tests {
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
 
         let embeddings_value = Tensor::random(&Shape::new(vec![vocab_size, emb_size]));
-        let embeddings = Embeddings::new(embeddings_value.clone())?;
+        let embeddings =
+            Embeddings::new(KeyedTensor::new("embeddings_mat", embeddings_value.clone()))?;
         let _ = model
             .add_consecutive_layer(Layer::Embeddings(embeddings), None)
             .unwrap();
@@ -763,7 +774,7 @@ mod tests {
         );
 
         let emb = Tensor::<Element>::random(&vec![vocab_size, 10].into());
-        let embeddings = Embeddings::new(emb.clone())?;
+        let embeddings = Embeddings::new(KeyedTensor::new("embeddings_mat", emb.clone()))?;
         let input = Tensor::new(vec![seq_len].into(), indices_elem.clone());
         let out = embeddings
             .evaluate::<GoldilocksExt2>(&[&input], &[vec![indices_elem.len(), 1].into()])?;
@@ -791,7 +802,7 @@ mod tests {
         };
         let table = (0..vocab_size).flat_map(emb_vector).collect::<Vec<_>>();
         let emb_tensor = Tensor::new(vec![vocab_size, emb_size].into(), table);
-        let embeddings = Embeddings::new(emb_tensor)?;
+        let embeddings = Embeddings::new(KeyedTensor::new("embeddings_mat", emb_tensor))?;
 
         // generate random indices
         let input_data = generate_unique_random_indices(seq_len, vocab_size)
@@ -836,7 +847,12 @@ mod tests {
             let out_shape = Shape::new(vec![seq_len, emb_size]);
             let expected = Tensor::new(out_shape, new_emb);
 
-            let layer = Embeddings::<f32>::new(emb).unwrap();
+            let layer = Embeddings::<f32>::new(
+                KeyedTensor::new(
+                    "embeddings_mat",
+                    emb
+                )
+            ).unwrap();
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
 
             prop_assert_eq!(&expected, &computed.outputs[0]);
@@ -873,7 +889,12 @@ mod tests {
             let out_shape = Shape::new(vec![seq_len, emb_size]);
             let expected = Tensor::new(out_shape, new_emb);
 
-            let layer = Embeddings::<Element>::new(emb).unwrap();
+            let layer = Embeddings::<Element>::new(
+                KeyedTensor::new(
+                    "embeddings_mat",
+                    emb
+                )
+            ).unwrap();
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
 
             prop_assert_eq!(&expected, &computed.outputs[0]);

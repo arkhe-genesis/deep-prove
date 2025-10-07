@@ -59,6 +59,7 @@ use crate::{
     },
     quantization::{self, Fieldizer},
     shape::Shape,
+    tensor::{KeyedTensor, TensorKey},
     to_base,
 };
 
@@ -74,8 +75,6 @@ pub(crate) const RMSNORM_SCALE_FACTOR: usize = 1 << LOG_RMSNORM_SCALE_FACTOR;
 /// The scale factor of the outputs of the inverse square root lookup tables lookup
 pub(crate) const RMSNORM_OUTPUT_SCALE_FACTOR: usize = 1 << 10;
 
-const ALPHA_POLY_ID: &str = "RMSNormAlpha";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Struct storing all information needed to perform RMSNorm. The `alpha` field
 /// is normally learned parameters that are applied elementwise. The `eps` field is used for normalisation when calculating
@@ -83,7 +82,7 @@ const ALPHA_POLY_ID: &str = "RMSNormAlpha";
 pub struct RMSNorm<N> {
     /// Each element of the normalisation dimension is multiplied elementwise by this, we use
     /// an [`Option`] because it may be the case the weights are all 1 and then we don't want to apply this tensor.
-    pub alpha: Option<Tensor<N>>,
+    pub alpha: Option<KeyedTensor<N>>,
     /// Normalisation factor
     pub eps: f32,
     /// The size of the dimension we normalise over
@@ -150,7 +149,7 @@ impl RMSTableData {
 
 impl<N: Number> RMSNorm<N> {
     /// Create a new [`RMSNorm`] layer with the given `alpha` and `eps` values.
-    pub fn new(alpha: Option<Tensor<N>>, eps: f32, dim_size: Option<usize>) -> Result<Self> {
+    pub fn new(alpha: Option<KeyedTensor<N>>, eps: f32, dim_size: Option<usize>) -> Result<Self> {
         if alpha.is_none() && dim_size.is_none() {
             return Err(anyhow::anyhow!("Must provide either alpha or dim_size"));
         }
@@ -234,15 +233,17 @@ impl<N: Number> RMSNorm<N> {
         };
 
         let quant_alpha = self.alpha.as_ref().map(|alpha| {
-            let new_data = alpha
-                .iter()
-                .map(|v| {
-                    let vf32 = v.to_f32()?;
-                    Ok(model_scaling.quantize(&vf32))
-                })
-                .collect::<Result<Vec<Element>, anyhow::Error>>()
-                .expect("Converting an f32 to f32 and quantising should never fail");
-            Tensor::<Element>::new(alpha.shape().clone(), new_data)
+            alpha.clone_and_map_tensor(|alpha| {
+                let new_data = alpha
+                    .iter()
+                    .map(|v| {
+                        let vf32 = v.to_f32()?;
+                        Ok(model_scaling.quantize(&vf32))
+                    })
+                    .collect::<Result<Vec<Element>, anyhow::Error>>()
+                    .expect("Converting an f32 to f32 and quantising should never fail");
+                Tensor::<Element>::new(alpha.shape().clone(), new_data)
+            })
         });
 
         // To calculate the intermediate bit size we have that the output is `self.alpha * input  * lookup_output`
@@ -281,15 +282,17 @@ impl RMSNorm<f32> {
     ) -> anyhow::Result<Self> {
         let mut alpha = loader.get_tensor("norm.weight")?;
         if matches!(c.variant, LLMVariant::Gemma3) && stack {
-            let (it, _) = alpha.slice_on_dim(0);
-            let data = it
-                .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut shape = alpha.shape().clone();
-            let new_dim = shape.dim(-1) * c.num_heads;
-            shape.set_dim(-1, new_dim);
-            alpha = Tensor::new(shape, data);
+            alpha = alpha.map_tensor(|alpha| {
+                let (it, _) = alpha.slice_on_dim(0);
+                let data = it
+                    .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut shape = alpha.shape().clone();
+                let new_dim = shape.dim(-1) * c.num_heads;
+                shape.set_dim(-1, new_dim);
+                Tensor::new(shape, data)
+            });
         }
         // we can have any checks on the shape alpha here since it depends of the context
         // a RMSNorm after  Q doesn't have the same shape as a RMSNorm after K or inside FeedForward etc
@@ -341,6 +344,7 @@ impl Evaluate<f32> for RMSNorm<f32> {
         let alpha = self
             .alpha
             .clone()
+            .map(|alpha| alpha.tensor())
             .unwrap_or(Tensor::<f32>::one(Shape::new(vec![embedding_size])))
             .to_btensor::<1>();
 
@@ -475,7 +479,7 @@ impl PadOp for RMSNorm<Element> {
             quant_info,
         } = self;
 
-        let padded_alpha = alpha.map(|a| a.pad_next_power_of_two());
+        let padded_alpha = alpha.map(|a| a.map_tensor(|a| a.pad_next_power_of_two()));
 
         Ok(RMSNorm::<Element> {
             alpha: padded_alpha,
@@ -504,6 +508,7 @@ pub struct RMSNormCtx<E: ExtensionField> {
     lookup_ctx: LayerLookupContext,
     /// The sumcheck expression for verifying the lookup input and layer output are correctly calculated
     sumcheck_expression: Vec<Expression<E>>,
+    alpha_key: Option<TensorKey>,
 }
 
 impl<E: ExtensionField> OpInfo for RMSNormCtx<E> {
@@ -585,7 +590,7 @@ impl ProveInfo for RMSNorm<Element> {
             if let Some(alpha) = self.alpha.as_ref() {
                 aux.model_polys = {
                     let mut model_polys = HashMap::new();
-                    model_polys.insert(ALPHA_POLY_ID.to_string(), alpha.data().to_vec());
+                    model_polys.insert(self.alpha.as_ref().unwrap().key(), alpha.data().to_vec());
                     Some(model_polys)
                 };
             }
@@ -610,6 +615,7 @@ impl ProveInfo for RMSNorm<Element> {
                     top_chunk_scalar_log: *top_chunk_scalar_log,
                     lookup_ctx,
                     sumcheck_expression: vec![expr],
+                    alpha_key: self.alpha.as_ref().map(|a| a.key()),
                 }),
                 aux,
             ))
@@ -884,7 +890,7 @@ impl RMSNorm<Element> {
                 let point = io_point.iter().take(diff).copied().collect::<Vec<E>>();
                 let mut claims = HashMap::new();
                 claims.insert(
-                    ALPHA_POLY_ID.to_string(),
+                    self.alpha.as_ref().unwrap().key(),
                     Claim::<E>::new(point.clone(), io_evaluations[2]),
                 );
                 claims
@@ -1122,12 +1128,16 @@ where
             vec![first_commit, second_commit],
         );
 
-        if io_evaluations.len() == 3 {
+        if let Some(key) = &self.alpha_key {
+            ensure!(
+                io_evaluations.len() == 3,
+                "Evaluation for alpha MLE not found in RMSNorm proof"
+            );
             let common_claims = {
                 let point = io_point.iter().take(diff).copied().collect::<Vec<E>>();
                 let mut claims = HashMap::new();
                 claims.insert(
-                    ALPHA_POLY_ID.to_string(),
+                    key.clone(),
                     Claim::<E>::new(point.clone(), io_evaluations[2]),
                 );
                 claims
@@ -1161,8 +1171,12 @@ mod tests {
     use super::*;
 
     impl<N: Number> RMSNorm<N> {
-        pub fn random(size: usize) -> Self {
-            let alpha = Tensor::<N>::random(&vec![size].into());
+        pub fn random(size: usize, layer_name: Option<TensorKey>) -> Self {
+            let layer_name = layer_name.unwrap_or("rmsnorm".to_string().into());
+            let alpha = KeyedTensor::new(
+                format!("alpha_{layer_name}"),
+                Tensor::<N>::random(&vec![size].into()),
+            );
             let eps = 1e-5;
             Self::new(Some(alpha), eps, Some(size)).unwrap()
         }
@@ -1177,7 +1191,7 @@ mod tests {
 
     #[test]
     fn test_rmsnorm() {
-        let rmsnorm = RMSNorm::random(1024);
+        let rmsnorm = RMSNorm::random(1024, None);
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
         let output = rmsnorm.evaluate::<E>(&[&input], &[]).unwrap();
         assert_eq!(output.outputs[0].shape().clone(), vec![1, 1024].into());
@@ -1186,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_quantise_rmsnorm() {
-        let rmsnorm = RMSNorm::random(100);
+        let rmsnorm = RMSNorm::random(100, None);
         // Make a random float input tensor and derive the input ScalingFactor
         let input_tensor = Tensor::<f32>::random(&vec![2, 100].into());
         let input_scaling = ScalingFactor::from_tensor(&input_tensor, None);
@@ -1226,7 +1240,7 @@ mod tests {
     #[test]
     fn test_rmsnorm_proving() {
         init_test_logging_default();
-        let rmsnorm = RMSNorm::random(100);
+        let rmsnorm = RMSNorm::random(100, None);
 
         let mut model =
             Model::new_from_input_shapes(vec![vec![15, 100].into()], PaddingMode::NoPadding);

@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::parser::llm::transformer::expand;
+use crate::{
+    parser::llm::transformer::expand,
+    tensor::{KeyedTensor, TensorKey},
+};
 use anyhow::{Ok, bail, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -132,29 +135,39 @@ impl<N: Number> Positional<N> {
         }
     }
 
-    pub fn new_absolute(matrix: Tensor<N>) -> Self {
+    pub fn new_absolute(matrix: KeyedTensor<N>) -> Self {
         Self::new_from_variant(PositionalVariant::Absolute(Absolute::new(matrix)))
     }
 
-    pub fn new_rope(angles: Vec<f32>, max_content_length: usize) -> anyhow::Result<Self> {
+    pub fn new_rope(
+        angles: Vec<f32>,
+        base_frequency_id: TensorKey,
+        max_content_length: usize,
+    ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(
-            Rope::build_from_angles(angles, max_content_length)?,
+            Rope::build_from_angles(angles, base_frequency_id, max_content_length)?,
         )))
     }
 
     pub fn new_rope_from_frequency(
         base_frequency: f32,
+        base_frequency_id: TensorKey,
         head_size: usize,
         max_content_length: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(
-            Rope::build_from_frequency(base_frequency, head_size, max_content_length)?,
+            Rope::build_from_frequency(
+                base_frequency,
+                base_frequency_id,
+                head_size,
+                max_content_length,
+            )?,
         )))
     }
 
     pub fn new_rope_from_matrices(
-        cosine_matrix: Tensor<N>,
-        sine_matrix: Tensor<N>,
+        cosine_matrix: KeyedTensor<N>,
+        sine_matrix: KeyedTensor<N>,
     ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(Rope::new(
             cosine_matrix,
@@ -485,17 +498,23 @@ impl Positional<f32> {
     pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         match c.variant {
             LLMVariant::Gemma3 => {
+                let base_freq_id = "gemma3.rope.freq_base";
                 let freq_base = loader
-                    .metadata::<f32>("gemma3.rope.freq_base")
+                    .metadata::<f32>(base_freq_id)
                     .ok_or(anyhow::anyhow!("gemma3.rope.freq_base not found"))?;
                 let head_size = c.head_size;
                 let max_content_length = c.max_sequence_length();
-                let p = Self::new_rope_from_frequency(freq_base, head_size, max_content_length)?;
+                let p = Self::new_rope_from_frequency(
+                    freq_base,
+                    base_freq_id.to_string().into(),
+                    head_size,
+                    max_content_length,
+                )?;
                 let PositionalVariant::Rope(mut rope) = p.variant else {
                     bail!("Expected Rope variant for gemma3");
                 };
-                rope.cosine_matrix = expand(rope.cosine_matrix, c.num_heads);
-                rope.sine_matrix = expand(rope.sine_matrix, c.num_heads);
+                rope.cosine_matrix = rope.cosine_matrix.map_tensor(|t| expand(t, c.num_heads));
+                rope.sine_matrix = rope.sine_matrix.map_tensor(|t| expand(t, c.num_heads));
                 rope.unpadded_shape
                     .set_dim(-1, rope.unpadded_shape.dim(-1) * c.num_heads);
                 Ok(Positional::new_from_variant(PositionalVariant::Rope(rope)))
@@ -725,6 +744,7 @@ mod tests {
             transformer::positional::{Positional, PositionalVariant},
         },
         padding::{ShapeData, ShapeInfo},
+        tensor::KeyedTensor,
     };
 
     #[test]
@@ -734,7 +754,10 @@ mod tests {
         let embedding_size = 45;
         let input_shape = vec![seq_len, embedding_size];
         let matrix_shape = vec![context_length, embedding_size];
-        let positional_matrix = Tensor::<Element>::random(&matrix_shape.into());
+        let positional_matrix = KeyedTensor::new(
+            "absolute_positional_mat",
+            Tensor::<Element>::random(&matrix_shape.into()),
+        );
         let pos = Positional::new_absolute(positional_matrix.clone());
 
         let mut si = ShapeInfo::from(vec![ShapeData::new(input_shape.into())].as_slice());

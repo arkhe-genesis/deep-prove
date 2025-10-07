@@ -9,6 +9,7 @@ use crate::{
     },
     model::Model,
     padding::PaddingMode,
+    tensor::KeyedTensor,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::HashMap, iter::Peekable};
@@ -413,7 +414,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
             let in_features = weight_size_flattened / out_features;
             weight.reshape(Shape::new(vec![in_features, out_features]));
             // Transpose to get [out_features, in_features] for subsequent logic.
-            weight = weight.transpose();
+            weight = weight.map_tensor(|t| t.transpose());
         } else if weight_shape[0] == out_features {
             // Layout is likely [out_features, ...in_features].
             let in_features = weight_shape[1..].iter().product::<usize>();
@@ -451,7 +452,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
 
     let mut weight_shape = weight.shape();
     if weight_shape[1] != input_shape[0] {
-        weight = weight.transpose();
+        weight = weight.map_tensor(|t| t.transpose());
         weight_shape = weight.shape();
     }
     ensure_onnx!(
@@ -472,7 +473,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         weight.shape_mut().insert(0, 1);
     } else {
         if weight_shape[1] != input_shape[0] {
-            weight = weight.transpose();
+            weight = weight.map_tensor(|t| t.transpose());
             weight_shape = weight.shape();
         }
         ensure_onnx!(
@@ -531,32 +532,33 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
             }
         }
     };
-    let mut bias_tensor = match bias_node_id {
-        Some(bias) => {
+    let bias_tensor = bias_node_id
+        .map(|bias| {
             let bias_node = model.node(bias);
-            extract_const_tensor(bias_node)?
-        }
-        // we always require a bias tensor in current proving logic
-        None => crate::Tensor::zeros(vec![weight.shape()[0]].into()),
-    };
-    ensure_onnx!(
-        bias_tensor.rank() == 1 || bias_tensor.rank() == 2,
-        "Bias tensor must be 1D or 2D with batch: {:?}",
-        bias_tensor.shape()
-    );
-    if bias_tensor.rank() == 2 {
-        ensure_onnx!(
-            bias_tensor.shape()[0] == 1,
-            "Bias tensor must be 1D with batch: {:?}",
-            bias_tensor.shape()
-        );
-        bias_tensor.reshape(bias_tensor.shape().slice(1..));
-    }
-    ensure_onnx!(
-        bias_tensor.shape()[0] == weight.shape()[0],
-        "Bias tensor must have same size as filter's rows"
-    );
-    let dense = crate::layers::dense::Dense::new(weight, bias_tensor);
+            let mut bias_tensor = extract_const_tensor(bias_node)?;
+            let bias_shape = bias_tensor.shape().clone();
+            ensure_onnx!(
+                bias_shape.rank() == 1 || bias_shape.rank() == 2,
+                "Bias tensor must be 1D or 2D with batch: {:?}",
+                bias_shape
+            );
+            if bias_shape.rank() == 2 {
+                ensure_onnx!(
+                    bias_shape[0] == 1,
+                    "Bias tensor must be 1D with batch: {:?}",
+                    bias_shape
+                );
+                bias_tensor.reshape(bias_shape.slice(1..));
+            }
+            ensure_onnx!(
+                bias_tensor.shape()[0] == weight.shape()[0],
+                "Bias tensor must have same size as filter's rows"
+            );
+            Ok(bias_tensor)
+        })
+        .transpose()?;
+
+    let dense = crate::layers::dense::Dense::new_with(weight, bias_tensor);
     let provable_node = crate::layers::provable::Node::new(
         vec![Edge::new(input_link.node.into(), input_link.slot)],
         Layer::Dense(dense),
@@ -605,14 +607,17 @@ fn is_const(node: &OnnxNode) -> bool {
     downcast_to::<Const>(node).is_ok()
 }
 
-fn extract_const_tensor(node: &OnnxNode) -> Result<crate::Tensor<f32>> {
+fn extract_const_tensor(node: &OnnxNode) -> Result<KeyedTensor<f32>> {
     let tensor = downcast_to::<Const>(node)?;
     let slice = tensor.0.as_slice::<f32>()?;
     ensure_onnx!(node.outputs.len() == 1, "constant output shape len == 1");
     let Some(shape) = node.outputs[0].fact.shape.as_concrete() else {
         return err(format!("Filter shape {} is not concrete", node.name));
     };
-    Ok(crate::Tensor::new(shape.to_vec().into(), slice.to_vec()))
+    Ok(KeyedTensor::new(
+        format!("{}-{}", node.name, node.id),
+        crate::Tensor::new(shape.to_vec().into(), slice.to_vec()),
+    ))
 }
 
 fn get_node_output_shape(node: &OnnxNode, output_idx: usize) -> Result<Shape> {

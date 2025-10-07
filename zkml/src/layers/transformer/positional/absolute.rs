@@ -1,5 +1,6 @@
 use std::{
     iter::once,
+    ops::Deref,
     sync::{Arc, Mutex},
 };
 
@@ -27,7 +28,7 @@ use crate::{
     model::StepData,
     number::Number,
     quantization::TensorFielder,
-    tensor::{IntoBTensor, TensorSlice},
+    tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorSlice},
 };
 
 /// Data structure containing the proof data for the absolute variant of positional encoding layer
@@ -49,11 +50,12 @@ pub struct AbsoluteCtx {
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
     node_id: NodeId,
+    positional_key: TensorKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Absolute<N> {
-    pub(crate) positional: Tensor<N>,
+    pub(crate) positional: KeyedTensor<N>,
     pub(super) unpadded_shape: Shape,
     add_layer: Add<N>,
 }
@@ -64,7 +66,7 @@ impl<N: Number> Absolute<N> {
         num_vars.0 + num_vars.1
     }
 
-    pub(super) fn new(matrix: Tensor<N>) -> Self {
+    pub(super) fn new(matrix: KeyedTensor<N>) -> Self {
         let unpadded_shape = matrix.shape().clone();
         Self {
             positional: matrix,
@@ -85,7 +87,7 @@ impl<N: Number> Absolute<N> {
         N: burn::tensor::Element,
     {
         let past_length = positional_cache.lock().unwrap().seq_len;
-        let pos_bt = self.positional.clone().to_btensor::<2>();
+        let pos_bt = self.positional.tensor().to_btensor::<2>();
         let sub_bt = pos_bt.slice([
             past_length..past_length + input.shape()[0],
             0..input.shape()[1],
@@ -125,7 +127,7 @@ impl Absolute<f32> {
                 .quantize_op::<S>(data, node_id, &[input_scaling, pos_scaling])?;
 
         let quantized_pos = Absolute {
-            positional: self.positional.to_quantized(&pos_scaling),
+            positional: self.positional.quantize(&pos_scaling),
             unpadded_shape: self.unpadded_shape,
             add_layer: quantized_add.quantized_op,
         };
@@ -144,12 +146,10 @@ impl PadOp for Absolute<Element> {
     where
         Self: Sized,
     {
-        self.positional = self.positional.pad_next_power_of_two();
+        self.positional = self.positional.map_tensor(|t| t.pad_next_power_of_two());
         Ok(self)
     }
 }
-
-const POSITIONAL_POLY_ID: &str = "PositionalMatrix";
 
 impl Absolute<Element> {
     pub(super) fn step_info<E: ExtensionField>(
@@ -168,7 +168,7 @@ impl Absolute<Element> {
                 .unwrap_or_default()
                 .into_iter()
                 .chain(once((
-                    POSITIONAL_POLY_ID.to_string(),
+                    self.positional.key(),
                     self.positional.pad_next_power_of_two().into_data(),
                 )))
                 .collect(),
@@ -179,6 +179,7 @@ impl Absolute<Element> {
             unpadded_shape: self.unpadded_shape.clone(),
             num_vars_positional_matrix: self.num_vars(),
             node_id: id,
+            positional_key: self.positional.key(),
         };
 
         Ok((ctx, aux))
@@ -203,7 +204,7 @@ impl Absolute<Element> {
         let input = &step_data.node_inputs[0];
 
         // derive sub-matrix to be added to input. ToDo: place it in proving data
-        let matrix_slice = TensorSlice::from(&self.positional);
+        let matrix_slice = TensorSlice::from(self.positional.deref());
         let input = input.hydrate(store.clone())?;
         let sub_pos = matrix_slice
             .slice_over_first_dim(0, input.shape()[0])
@@ -235,7 +236,7 @@ impl Absolute<Element> {
 
         prover.add_common_claims(
             node_id,
-            [(POSITIONAL_POLY_ID.to_string(), positional_matrix_claim)]
+            [(self.positional.key(), positional_matrix_claim)]
                 .into_iter()
                 .collect(),
         );
@@ -294,7 +295,7 @@ impl AbsoluteCtx {
 
         verifier.add_common_claims(
             self.node_id,
-            [(POSITIONAL_POLY_ID.to_string(), positional_matrix_claim)]
+            [(self.positional_key.clone(), positional_matrix_claim)]
                 .into_iter()
                 .collect(),
         );
@@ -307,6 +308,7 @@ impl AbsoluteCtx {
 mod tests {
     use std::{
         fmt::Debug,
+        ops::Deref,
         sync::{Arc, Mutex},
     };
 
@@ -325,7 +327,7 @@ mod tests {
         number::Number,
         padding::{PaddingMode, ShapeData, ShapeInfo},
         quantization::{AbsoluteMax, ScalingFactor},
-        tensor::{TensorSlice, is_close_with_tolerance},
+        tensor::{KeyedTensor, TensorSlice, is_close_with_tolerance},
     };
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
@@ -345,7 +347,10 @@ mod tests {
 
         // build positional matrix
         let matrix_shape = vec![context_length, embedding_size];
-        let positional_matrix = Tensor::random(&matrix_shape.into());
+        let positional_matrix = KeyedTensor::new(
+            "absolute_positional_mat",
+            Tensor::random(&matrix_shape.into()),
+        );
 
         let _ = model
             .add_consecutive_layer(
@@ -365,7 +370,7 @@ mod tests {
         embedding_size: usize,
         context_length: usize,
         input: Tensor<T>,
-        pos: Tensor<T>,
+        pos: KeyedTensor<T>,
     }
 
     impl<T: Debug> Debug for Input<T> {
@@ -382,7 +387,10 @@ mod tests {
         (1..32usize, 1..64usize).prop_flat_map(|(seq_len, embedding_size)| {
             (seq_len..=64usize).prop_map(move |context_length| {
                 let input = Tensor::<T>::random(&vec![seq_len, embedding_size].into());
-                let pos = Tensor::<T>::random(&vec![context_length, embedding_size].into());
+                let pos = KeyedTensor::new(
+                    "absolute_positional_mat",
+                    Tensor::<T>::random(&vec![context_length, embedding_size].into()),
+                );
                 Input {
                     seq_len,
                     embedding_size,
@@ -433,7 +441,7 @@ mod tests {
             let input_q = input.to_quantized(&input_sf);
 
             let (pos_q, add_q, unpadded) = (layer_q.positional.clone(), &layer_q.add_layer, layer_q.unpadded_shape.clone());
-            let sub_slice = TensorSlice::from(&pos_q).slice_over_first_dim(0, seq_len);
+            let sub_slice = TensorSlice::from(pos_q.deref()).slice_over_first_dim(0, seq_len);
             let sub_pos_q = Tensor::new(sub_slice.get_shape(), sub_slice.get_data().to_vec());
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));

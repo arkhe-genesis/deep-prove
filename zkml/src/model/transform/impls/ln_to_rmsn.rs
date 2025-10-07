@@ -16,6 +16,7 @@ use crate::{
     },
     model::{Model, transform::ModelTransform},
     shape::Shape,
+    tensor::KeyedTensor,
 };
 use anyhow::{Result, anyhow, bail, ensure};
 
@@ -249,20 +250,27 @@ fn modify_matmul(mat_mul: &MatMul<f32>) -> Result<MatMul<f32>> {
             "Found MatMul with constant left matrix, this is not supported"
         )),
         (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-            let new_mat = if let Some(Config::TransposeB) = mat_mul.config {
-                mean_subtracted_matrix(&mat.tensor.transpose())
-            } else {
-                mean_subtracted_matrix(&mat.tensor)
-            };
+            let new_mat = mat.tensor.clone_and_map_tensor(|t| {
+                if let Some(Config::TransposeB) = mat_mul.config {
+                    mean_subtracted_matrix(&t.transpose())
+                } else {
+                    mean_subtracted_matrix(t)
+                }
+            });
 
             let weight_matrix = OperandMatrix::new_weight_matrix(new_mat);
             // Now we subtract the bias mean from each element of the bias
             let new_bias = mat_mul.bias.as_ref().map(|old_bias| {
-                let bias_shape = old_bias.shape();
-                let bias_sum = old_bias.iter().sum::<f32>();
-                let bias_mean = bias_sum / bias_shape.dim(0) as f32;
-                let new_bias_data = old_bias.iter().map(|x| x - bias_mean).collect::<Vec<f32>>();
-                Tensor::new(bias_shape.clone(), new_bias_data)
+                old_bias.clone_and_map_tensor(|bias_tensor| {
+                    let bias_shape = bias_tensor.shape();
+                    let bias_sum = bias_tensor.iter().sum::<f32>();
+                    let bias_mean = bias_sum / bias_shape.dim(0) as f32;
+                    let new_bias_data = bias_tensor
+                        .iter()
+                        .map(|x| x - bias_mean)
+                        .collect::<Vec<f32>>();
+                    Tensor::new(bias_shape.clone(), new_bias_data)
+                })
             });
 
             // No config now because we have transposed the matrix,
@@ -289,7 +297,7 @@ fn modify_positional(positional_layer: &Positional<f32>) -> Result<Positional<f3
     match &positional_layer.variant {
         PositionalVariant::Absolute(absolute) => {
             let Absolute::<f32> { positional, .. } = absolute;
-            let new_mat = mean_subtracted_matrix(positional);
+            let new_mat = positional.clone_and_map_tensor(mean_subtracted_matrix);
             Ok(Positional::new_absolute(new_mat))
         }
         PositionalVariant::Rope(_) => unimplemented!(
@@ -321,7 +329,7 @@ fn mean_subtracted_matrix(matrix: &Tensor<f32>) -> Tensor<f32> {
 fn modify_subsequent_linear_layer(
     node: &Node<f32>,
     weights: &Tensor<f32>,
-    bias: &Tensor<f32>,
+    bias: &KeyedTensor<f32>,
 ) -> Result<Node<f32>> {
     match &node.operation {
         Layer::<f32>::MatMul(mat_mul) => {
@@ -348,7 +356,7 @@ fn modify_subsequent_linear_layer(
 fn rescale_matmul(
     mat_mul: &MatMul<f32>,
     scales: &Tensor<f32>,
-    bias: &Tensor<f32>,
+    bias: &KeyedTensor<f32>,
 ) -> Result<MatMul<f32>> {
     // The matmul should have the right matrix as the constant one
     match (&mat_mul.left_matrix, &mat_mul.right_matrix) {
@@ -363,25 +371,31 @@ fn rescale_matmul(
             let inner_mat = if let Some(Config::TransposeB) = mat_mul.config {
                 mat.tensor.transpose()
             } else {
-                mat.tensor.clone()
+                mat.tensor.tensor()
             };
             // We transform the bias so it is a `1 x bias_size` matrix
-            let mut matrix_bias = bias.clone();
-            matrix_bias.reshape(Shape::new(vec![1, bias.shape().dim(0)]));
-            let new_bias_shape = Shape::new(vec![inner_mat.ncols_2d()]);
-            let mut new_bias = matrix_bias.matmul(&inner_mat);
-            new_bias.reshape(new_bias_shape);
+            let new_bias = bias.clone_and_map_tensor(|bias| {
+                let mut matrix_bias = bias.clone();
+                matrix_bias.reshape(Shape::new(vec![1, bias.shape().dim(0)]));
+                let new_bias_shape = Shape::new(vec![inner_mat.ncols_2d()]);
+                let mut new_bias = matrix_bias.matmul(&inner_mat);
+                new_bias.reshape(new_bias_shape);
+                new_bias
+            });
 
             let new_mat_data = inner_mat
                 .slice_last_dim()
                 .zip(scales.iter())
                 .flat_map(|(row, scale)| row.iter().map(|x| x * scale).collect::<Vec<f32>>())
                 .collect::<Vec<f32>>();
-            let new_mat = Tensor::new(inner_mat.shape().clone(), new_mat_data);
+            let new_mat = KeyedTensor::new(
+                mat.tensor.key.clone(),
+                Tensor::new(inner_mat.shape().clone(), new_mat_data),
+            );
             let new_bias = mat_mul
                 .bias
                 .as_ref()
-                .map(|old_bias| old_bias.add(&new_bias))
+                .map(|old_bias| old_bias.clone_and_map_tensor(|bias| bias.add(&new_bias)))
                 .unwrap_or(new_bias);
 
             let weight_matrix = OperandMatrix::new_weight_matrix(new_mat);
@@ -396,7 +410,11 @@ fn rescale_matmul(
 }
 
 /// Function to rescale a QKV layer that comes after a LayerNorm
-fn rescale_qkv_layer(qkv: &QKV<f32>, scales: &Tensor<f32>, bias: &Tensor<f32>) -> Result<QKV<f32>> {
+fn rescale_qkv_layer(
+    qkv: &QKV<f32>,
+    scales: &Tensor<f32>,
+    bias: &KeyedTensor<f32>,
+) -> Result<QKV<f32>> {
     let QKV {
         q,
         q_bias,
@@ -410,26 +428,31 @@ fn rescale_qkv_layer(qkv: &QKV<f32>, scales: &Tensor<f32>, bias: &Tensor<f32>) -
     } = qkv;
 
     // We transform the bias so it is a `1 x bias_size` matrix
-    let mut matrix_bias = bias.clone();
+    let mut matrix_bias = bias.tensor();
 
     matrix_bias.reshape(Shape::new(vec![1, bias.shape().dim(0)]));
 
     let mut weights_and_biases = vec![];
     for (old_matrix, old_bias) in [(q, q_bias), (k, k_bias), (v, v_bias)] {
-        let new_bias_shape = Shape::new(vec![old_matrix.ncols_2d()]);
-        let mut new_bias = matrix_bias.matmul(old_matrix);
+        let matrix_tensor = old_matrix;
+        let new_bias_shape = Shape::new(vec![matrix_tensor.ncols_2d()]);
+        let mut new_bias = matrix_bias.matmul(matrix_tensor);
         new_bias.reshape(new_bias_shape);
+        let new_bias = KeyedTensor::new(bias.key.clone(), new_bias);
 
-        let new_mat_data = old_matrix
+        let new_mat_data = matrix_tensor
             .slice_last_dim()
             .zip(scales.iter())
             .flat_map(|(row, scale)| row.iter().map(|x| x * scale).collect::<Vec<f32>>())
             .collect::<Vec<f32>>();
-        let new_mat = Tensor::new(old_matrix.shape().clone(), new_mat_data);
+        let new_mat = KeyedTensor::new(
+            old_matrix.key.clone(),
+            Tensor::new(old_matrix.shape().clone(), new_mat_data),
+        );
         // If QKV does not have any bias, then we just take the one given
         let new_bias = old_bias
             .as_ref()
-            .map(|bias| bias.add(&new_bias))
+            .map(|bias| bias.clone_and_map_tensor(|bias| bias.add(&new_bias)))
             .unwrap_or(new_bias);
         weights_and_biases.push((new_mat, new_bias));
     }

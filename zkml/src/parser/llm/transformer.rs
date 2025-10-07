@@ -13,6 +13,7 @@ use crate::{
         json::unfuse_crate_tensors,
         llm::{AttentionType, LLMVariant, NodeId},
     },
+    tensor::KeyedTensor,
 };
 use anyhow::{Context, bail, ensure};
 use candle_core::Device;
@@ -42,18 +43,18 @@ pub enum Norm<N: Number> {
 #[derive(Debug, Clone)]
 pub struct Attention<N: Number> {
     pub pre_norm: Norm<N>,
-    pub q: Tensor<N>,
-    pub q_bias: Option<Tensor<N>>,
+    pub q: KeyedTensor<N>,
+    pub q_bias: Option<KeyedTensor<N>>,
     pub q_norm: Option<Norm<N>>,
 
-    pub k: Tensor<N>,
-    pub k_bias: Option<Tensor<N>>,
+    pub k: KeyedTensor<N>,
+    pub k_bias: Option<KeyedTensor<N>>,
     pub k_norm: Option<Norm<N>>,
 
-    pub v: Tensor<N>,
-    pub v_bias: Option<Tensor<N>>,
-    pub out: Tensor<N>,
-    pub out_bias: Option<Tensor<N>>,
+    pub v: KeyedTensor<N>,
+    pub v_bias: Option<KeyedTensor<N>>,
+    pub out: KeyedTensor<N>,
+    pub out_bias: Option<KeyedTensor<N>>,
     pub post_norm: Option<Norm<N>>,
     pub pre_ffn_norm: Norm<N>,
     pub feedforward: FeedForward<N>,
@@ -186,7 +187,9 @@ impl Attention<f32> {
             &[c.embedding_size]
         );
 
-        let q_tensor = loader.get_tensor("attn_q.weight")?.transpose();
+        let q_tensor = loader
+            .get_tensor("attn_q.weight")?
+            .map_tensor(|t| Tensor::transpose(&t));
         let q_norm = RMSNorm::from_loader(&loader.pp("attn_q_"), c, true)?;
         assert_eq!(
             q_tensor.shape().as_ref(),
@@ -203,7 +206,9 @@ impl Attention<f32> {
             &[c.head_size * c.num_heads]
         );
 
-        let k_tensor = loader.get_tensor("attn_k.weight")?.transpose();
+        let k_tensor = loader
+            .get_tensor("attn_k.weight")?
+            .map_tensor(|t| Tensor::transpose(&t));
         let k_norm = RMSNorm::from_loader(&loader.pp("attn_k_"), c, true)?;
         assert_eq!(
             k_tensor.shape().as_ref(),
@@ -216,7 +221,9 @@ impl Attention<f32> {
             &[c.head_size * c.num_heads]
         );
 
-        let v_tensor = loader.get_tensor("attn_v.weight")?.transpose();
+        let v_tensor = loader
+            .get_tensor("attn_v.weight")?
+            .map_tensor(|t| Tensor::transpose(&t));
         assert_eq!(
             v_tensor.shape().as_ref(),
             &[hidden_size, num_groups * head_size]
@@ -235,10 +242,12 @@ impl Attention<f32> {
 
         // println!("LLM LOADER: k_tensor shape: {:?}", k_tensor.shape());
         // println!("LLM LOADER: v_tensor shape: {:?}", v_tensor.shape());
-        let k_tensor = expand(k_tensor, num_heads);
-        let v_tensor = expand(v_tensor, num_heads);
+        let k_tensor = k_tensor.map_tensor(|t| expand(t, num_heads));
+        let v_tensor = v_tensor.map_tensor(|t| expand(t, num_heads));
 
-        let out = loader.get_tensor("attn_output.weight")?.transpose();
+        let out = loader
+            .get_tensor("attn_output.weight")?
+            .map_tensor(|t| Tensor::transpose(&t));
         assert_eq!(out.shape().as_ref(), &[num_heads * head_size, hidden_size]);
 
         let post_attn_norm = RMSNorm::from_loader(&loader.pp("post_attention_"), c, false)?;
@@ -286,34 +295,52 @@ impl Attention<f32> {
             embedding_size == hidden_size,
             "embedding_size must be equal to hidden_size"
         );
-        let qkv_weight_qtensor = loader.get_qtensor("attn_qkv.weight")?;
+        let (qkv_key, qkv_weight_qtensor) = loader.get_qtensor("attn_qkv.weight")?;
         let qkv_weight_candle = qkv_weight_qtensor.dequantize(&Device::Cpu)?;
         let mut unfused_weights =
             unfuse_tensors(qkv_weight_candle, embedding_size * embedding_size)?;
         ensure!(unfused_weights.len() == 3, "qkv_weight must have 3 chunks");
-        let q = crate::Tensor::new(
-            vec![embedding_size, hidden_size].into(),
-            unfused_weights.remove(0),
-        )
-        .transpose();
-        let k = crate::Tensor::new(
-            vec![embedding_size, hidden_size].into(),
-            unfused_weights.remove(0),
-        )
-        .transpose();
-        let v = crate::Tensor::new(
-            vec![embedding_size, hidden_size].into(),
-            unfused_weights.remove(0),
-        )
-        .transpose();
+        let q = KeyedTensor::new(
+            format!("{qkv_key}.q"),
+            crate::Tensor::new(
+                vec![embedding_size, hidden_size].into(),
+                unfused_weights.remove(0),
+            )
+            .transpose(),
+        );
+        let k = KeyedTensor::new(
+            format!("{qkv_key}.k"),
+            crate::Tensor::new(
+                vec![embedding_size, hidden_size].into(),
+                unfused_weights.remove(0),
+            )
+            .transpose(),
+        );
+        let v = KeyedTensor::new(
+            format!("{qkv_key}.v"),
+            crate::Tensor::new(
+                vec![embedding_size, hidden_size].into(),
+                unfused_weights.remove(0),
+            )
+            .transpose(),
+        );
 
-        let qkv_bias_qtensor = loader.get_qtensor("attn_qkv.bias")?;
+        let (qkv_bias_key, qkv_bias_qtensor) = loader.get_qtensor("attn_qkv.bias")?;
         let qkv_bias_candle = qkv_bias_qtensor.dequantize(&Device::Cpu)?;
         let mut unfused_biases = unfuse_tensors(qkv_bias_candle, embedding_size)?;
         ensure!(unfused_biases.len() == 3, "qkv_bias must have 3 chunks");
-        let q_bias = crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0));
-        let k_bias = crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0));
-        let v_bias = crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0));
+        let q_bias = KeyedTensor::new(
+            format!("{qkv_bias_key}.q"),
+            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
+        );
+        let k_bias = KeyedTensor::new(
+            format!("{qkv_bias_key}.k"),
+            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
+        );
+        let v_bias = KeyedTensor::new(
+            format!("{qkv_bias_key}.v"),
+            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
+        );
 
         let attn_norm_loader = loader.pp("attn_");
         // Use new LayerNorm::from_loader
@@ -322,7 +349,9 @@ impl Attention<f32> {
         // attn_output.weight is stored as [out_features, in_features] in GGUF (same as PyTorch)
         // Our MatMul layer expects the right-hand constant to be in the orientation [in_features, out_features],
         // so we transpose it once here after loading.
-        let out = loader.get_tensor("attn_output.weight")?.transpose();
+        let out = loader
+            .get_tensor("attn_output.weight")?
+            .map_tensor(|t| t.transpose());
         let out_bias = loader.get_tensor("attn_output.bias")?;
         ensure!(
             out.shape().as_ref() == &[embedding_size, embedding_size],
@@ -382,20 +411,29 @@ impl Attention<f32> {
         // So, each chunk has hidden_size * hidden_size elements.
         let weight_chunk_elements = hidden_size * hidden_size;
         let mut unfused_weights_data =
-            unfuse_crate_tensors(fused_qkv_weight.clone(), weight_chunk_elements, 3)
+            unfuse_crate_tensors(fused_qkv_weight.tensor(), weight_chunk_elements, 3)
                 .context("Failed to unfuse QKV weights in from_json")?;
 
-        let q_weight = Tensor::new(
-            vec![c.embedding_size, hidden_size].into(),
-            unfused_weights_data.remove(0),
+        let q_weight = KeyedTensor::new(
+            format!("{}.q", fused_qkv_weight.key),
+            Tensor::new(
+                vec![c.embedding_size, hidden_size].into(),
+                unfused_weights_data.remove(0),
+            ),
         );
-        let k_weight = Tensor::new(
-            vec![c.embedding_size, hidden_size].into(),
-            unfused_weights_data.remove(0),
+        let k_weight = KeyedTensor::new(
+            format!("{}.k", fused_qkv_weight.key),
+            Tensor::new(
+                vec![c.embedding_size, hidden_size].into(),
+                unfused_weights_data.remove(0),
+            ),
         );
-        let v_weight = Tensor::new(
-            vec![c.embedding_size, hidden_size].into(),
-            unfused_weights_data.remove(0),
+        let v_weight = KeyedTensor::new(
+            format!("{}.v", fused_qkv_weight.key),
+            Tensor::new(
+                vec![c.embedding_size, hidden_size].into(),
+                unfused_weights_data.remove(0),
+            ),
         );
         trace!("fused qkv: {fused_qkv_weight:?}");
         trace!("qkv full tensor {unfused_weights_data:?}");
@@ -406,12 +444,23 @@ impl Attention<f32> {
         // Each individual q, k, v bias vector should be [hidden_size].
         // So, each chunk has hidden_size elements.
         let bias_chunk_elements = hidden_size;
-        let mut unfused_biases_data = unfuse_crate_tensors(fused_qkv_bias, bias_chunk_elements, 3)
-            .context("Failed to unfuse QKV biases in from_json")?;
+        let fused_qvk_bias_key = fused_qkv_bias.key.clone();
+        let mut unfused_biases_data =
+            unfuse_crate_tensors(fused_qkv_bias.into_tensor(), bias_chunk_elements, 3)
+                .context("Failed to unfuse QKV biases in from_json")?;
 
-        let q_bias_vec = Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0));
-        let k_bias_vec = Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0));
-        let v_bias_vec = Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0));
+        let q_bias_vec = KeyedTensor::new(
+            format!("{fused_qvk_bias_key}.q"),
+            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0)),
+        );
+        let k_bias_vec = KeyedTensor::new(
+            format!("{fused_qvk_bias_key}.k"),
+            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0)),
+        );
+        let v_bias_vec = KeyedTensor::new(
+            format!("{fused_qvk_bias_key}.v"),
+            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0)),
+        );
 
         // These are the individual Q, K, V matrices and biases now.
         // The QKV struct or logic that consumes these will handle them.

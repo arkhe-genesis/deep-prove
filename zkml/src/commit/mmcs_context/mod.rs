@@ -4,7 +4,7 @@ use std::{
     fmt::Debug,
 };
 
-use crate::{layers::provable::NodeId, lookup::context::TableType};
+use crate::{layers::provable::NodeId, lookup::context::TableType, tensor::TensorKey};
 use anyhow::{Context, Result, anyhow};
 use either::Either;
 use ff_ext::ExtensionField;
@@ -25,8 +25,6 @@ pub use prover::CommitmentProver;
 mod verifier;
 pub use verifier::CommitmentVerifier;
 
-pub type PolyId = String;
-
 #[derive(Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 /// Struct that contains all the data needed for proving/verifying commitments relating to a model.
@@ -44,11 +42,9 @@ where
     /// the model has no weights/table commitments.
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
-    model_comms_map: BTreeMap<usize, Vec<(NodeId, PolyId)>>,
+    model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
-    /// This is the [`Expression`] used in the sumcheck so that everything is evaluated at the same point
-    sumcheck_expression: Expression<E>,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
 }
@@ -65,10 +61,47 @@ where
             .field("verifier_params", &self.verifier_params)
             .field("model_comms_map", &self.model_comms_map)
             .field("table_node_id", &self.table_node_id)
-            .field("sumcheck_expression", &self.sumcheck_expression)
             .field("max_model_num_vars", &self.max_model_num_vars)
             .finish()
     }
+}
+
+/// Compute the `TensorKey` employed to identify the constant polynomials
+/// associated to the lookup tables
+fn table_poly_id(table_name: String) -> TensorKey {
+    format!("table_{table_name}").into()
+}
+
+/// Build the sumcheck expression for model static polynomails. It requires as input a vector where
+/// the i-th entry specifies the number of claims for the i-th model polynomial employed in the
+/// sumcheck
+fn build_sumcheck_expression<E: ExtensionField>(num_claims_per_poly: Vec<usize>) -> Expression<E> {
+    let total_polys = num_claims_per_poly.len();
+    // basically, for each pair of (poly, claim), we need to add a term to the sumcheck of the
+    // type `challenge*poly*eq_poly(claim.point)`. Given that there might be more than one
+    // input claim for each model polynomial, we need to make sure to use the same `poly`
+    // for all the terms referring to the same polynomial; instead, the `eq_poly` will be different
+    // in each term (even for terms related to the same model polynomial), since it depends on
+    // `claim.point`
+    num_claims_per_poly
+        .into_iter()
+        .enumerate()
+        .fold(
+            (Expression::Constant(Either::Right(E::ZERO)), 0),
+            |(expr, total_num_terms), (i, num_claims)| {
+                // total_num_terms keeps track of how many terms we added so far
+                (
+                    (0..num_claims).fold(expr, |inner_expr, j| {
+                        inner_expr
+                            + Expression::Challenge(0, total_num_terms + j, E::ONE, E::ZERO)
+                                * Expression::WitIn(i as u16)
+                                * Expression::WitIn((total_num_terms + j + total_polys) as u16)
+                    }),
+                    total_num_terms + num_claims,
+                )
+            },
+        )
+        .0
 }
 
 impl<E, PCS> GlobalCommitmentContext<E, PCS>
@@ -80,18 +113,15 @@ where
     /// Make a new [`GlobalCommitmentContext`]
     pub fn new(
         witness_poly_size: usize,
-        polys: Vec<(NodeId, HashMap<PolyId, MultilinearExtension<E>>)>,
+        polys: HashMap<TensorKey, MultilinearExtension<E>>,
         lookup_ctx: &[TableType],
         max_node_id: NodeId,
     ) -> Result<GlobalCommitmentContext<E, PCS>> {
         // Find the maximum size so we can generate params
         let max_poly_size = polys
             .iter()
-            .fold(witness_poly_size, |mut acc, (_, poly_vec)| {
-                poly_vec
-                    .iter()
-                    .for_each(|(_, poly)| acc = acc.max(1 << poly.num_vars()));
-                acc
+            .fold(witness_poly_size, |acc, (_, poly)| {
+                acc.max(1 << poly.num_vars())
             })
             .next_power_of_two();
 
@@ -117,27 +147,20 @@ where
             let m = Metrics::new();
             let map = polys
                 .into_iter()
-                .flat_map(|(node_id, hash_map)| {
-                    hash_map
-                        .into_iter()
-                        .map(|(k, v)| (v.num_vars(), (node_id, k, v)))
-                        .collect::<Vec<(usize, (NodeId, String, MultilinearExtension<E>))>>()
-                })
+                .map(|(poly_id, poly)| (poly.num_vars(), (poly_id, poly)))
                 .chain(lookup_ctx.iter().filter_map(|table_type| {
                     table_type
                         .committed_columns()
-                        .map(|mle| (mle.num_vars(), (table_node_id, table_type.name(), mle)))
+                        .map(|mle| (mle.num_vars(), (table_poly_id(table_type.name()), mle)))
                 }))
                 .fold(
                     BTreeMap::new(),
-                    |mut map_acc, (num_vars, (node_id, name, mle))| {
-                        let (ids, polys): &mut (
-                            Vec<(NodeId, PolyId)>,
-                            Vec<MultilinearExtension<E>>,
-                        ) = map_acc
-                            .entry(num_vars)
-                            .or_insert_with(|| (Vec::new(), Vec::new()));
-                        ids.push((node_id, name));
+                    |mut map_acc, (num_vars, (poly_id, mle))| {
+                        let (ids, polys): &mut (Vec<TensorKey>, Vec<MultilinearExtension<E>>) =
+                            map_acc
+                                .entry(num_vars)
+                                .or_insert_with(|| (Vec::new(), Vec::new()));
+                        ids.push(poly_id);
                         polys.push(mle);
                         map_acc
                     },
@@ -183,17 +206,6 @@ where
         } else {
             (None, BTreeMap::new())
         };
-        // Work out how many polynomials we have in total so that we can pre-make the sumcheck expression
-        let total_polys = model_comms_map
-            .values()
-            .map(|polys| polys.len())
-            .sum::<usize>();
-        let sumcheck_expression =
-            (0..total_polys).fold(Expression::Constant(Either::Right(E::ZERO)), |acc, j| {
-                acc + Expression::Challenge(0, j, E::ONE, E::ZERO)
-                    * Expression::WitIn(j as u16)
-                    * Expression::WitIn((j + total_polys) as u16)
-            });
 
         let max_model_num_vars = model_comms_map.keys().max().copied().unwrap_or(0usize);
         Ok(GlobalCommitmentContext {
@@ -202,7 +214,6 @@ where
             model_commitment,
             model_comms_map,
             table_node_id,
-            sumcheck_expression,
             max_model_num_vars,
         })
     }
@@ -220,7 +231,6 @@ where
             model_commitment,
             model_comms_map,
             table_node_id,
-            sumcheck_expression,
             max_model_num_vars,
             ..
         } = self;
@@ -232,7 +242,6 @@ where
                 .as_ref()
                 .map(|commit_with_wit| PCS::get_pure_commitment(commit_with_wit)),
             table_node_id,
-            sumcheck_expression: sumcheck_expression.clone(),
             max_model_num_vars,
         };
 
@@ -241,7 +250,6 @@ where
             model_comms_map,
             model_commitment,
             table_node_id,
-            sumcheck_expression,
             max_model_num_vars,
         };
 
@@ -264,11 +272,9 @@ where
     /// The batch commitment for the model
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
-    model_comms_map: BTreeMap<usize, Vec<(NodeId, PolyId)>>,
+    model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
-    /// This is the [`Expression`] used in the sumcheck so that everything is evaluated at the same point
-    sumcheck_expression: Expression<E>,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
 }
@@ -284,7 +290,6 @@ where
             .field("prover_params", &self.prover_params)
             .field("model_comms_map", &self.model_comms_map)
             .field("table_node_id", &self.table_node_id)
-            .field("sumcheck_expression", &self.sumcheck_expression)
             .field("max_model_num_vars", &self.max_model_num_vars)
             .finish()
     }
@@ -336,11 +341,9 @@ where
     /// The batch commitment for the model
     model_commitment: Option<PCS::Commitment>,
     /// Map that stores the position of each individual polynomial in the batch commitment
-    model_comms_map: BTreeMap<usize, Vec<(NodeId, PolyId)>>,
+    model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
-    /// This is the [`Expression`] used in the sumcheck so that everything is evaluated at the same point
-    sumcheck_expression: Expression<E>,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
 }
@@ -355,7 +358,6 @@ where
             .field("verifier_params", &self.verifier_params)
             .field("model_comms_map", &self.model_comms_map)
             .field("table_node_id", &self.table_node_id)
-            .field("sumcheck_expression", &self.sumcheck_expression)
             .field("max_model_num_vars", &self.max_model_num_vars)
             .finish()
     }

@@ -1,6 +1,5 @@
 use super::{
-    BIAS_POLY_ID, Convolution, FILTER_POLY_ID, IS_PROVABLE, conv2d_shape, new_clearing_tensor,
-    padded_conv2d_shape, to_bits,
+    Convolution, IS_PROVABLE, conv2d_shape, new_clearing_tensor, padded_conv2d_shape, to_bits,
 };
 use crate::{
     Claim, Element, Shape, VectorTranscript,
@@ -11,7 +10,7 @@ use crate::{
         provable::{NodeId, OpInfo},
     },
     padding::PaddingMode,
-    tensor::get_root_of_unity,
+    tensor::{TensorKey, get_root_of_unity},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
@@ -70,6 +69,8 @@ pub struct ConvCtx {
     pub filter_size: usize,
     pub unpadded_filter_shape: Shape,
     pub padded_filter_shape: Shape,
+    pub filter_key: TensorKey,
+    pub bias_key: TensorKey,
 }
 
 impl OpInfo for ConvCtx {
@@ -383,8 +384,8 @@ impl ConvCtx {
         // Add the common commitment claims to be verified
         let common_claims = {
             let mut claims = HashMap::new();
-            claims.insert(FILTER_POLY_ID.to_string(), filter_claim);
-            claims.insert(BIAS_POLY_ID.to_string(), bias_claim);
+            claims.insert(self.filter_key.clone(), filter_claim);
+            claims.insert(self.bias_key.clone(), bias_claim);
             claims
         };
         verifier.add_common_claims(self.node_id, common_claims);
