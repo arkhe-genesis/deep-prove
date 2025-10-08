@@ -8,7 +8,7 @@ pub use crate::parser::{
     llm::{ffn::FeedForward, transformer::Attention},
 };
 use anyhow::bail;
-pub use config::{AttentionType, LLMConfig, LLMVariant};
+pub use config::{LLMConfig, LLMVariant};
 use serde::{Deserialize, Serialize};
 pub use tokenizer::{HFTokenizer, LLMTokenizer};
 
@@ -118,6 +118,11 @@ impl LLMModel {
         let blocks = (0..num_layers)
             .map(|i| Attention::from_loader(&loader.pp(&format!("blk.{i}.")), config))
             .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
+        let blocks = blocks
+            .into_iter()
+            .zip(config.attention_config.spans())
+            .map(|(attention, span)| attention.with_span(span))
+            .collect();
         let final_norm =
             config
                 .variant

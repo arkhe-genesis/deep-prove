@@ -5,13 +5,14 @@ use crate::{
         matrix_mul::MatMul,
         provable::{Edge, Node},
         transformer::{
-            layernorm::LayerNorm, mha::Mha, positional::Positional, qkv::QKV, rmsnorm::RMSNorm,
+            attention::attention_mask::AttentionSpan, layernorm::LayerNorm, mha::Mha,
+            positional::Positional, qkv::QKV, rmsnorm::RMSNorm,
         },
     },
     parser::{
         gguf::FileTensorLoader,
         json::unfuse_crate_tensors,
-        llm::{AttentionType, LLMVariant, NodeId},
+        llm::{LLMVariant, NodeId},
     },
     tensor::KeyedTensor,
 };
@@ -59,6 +60,7 @@ pub struct Attention<N: Number> {
     pub pre_ffn_norm: Norm<N>,
     pub feedforward: FeedForward<N>,
     pub post_ffn_norm: Option<Norm<N>>,
+    pub span: AttentionSpan,
 }
 
 impl Attention<f32> {
@@ -69,10 +71,7 @@ impl Attention<f32> {
         c: &LLMConfig,
         positional: Option<Positional<f32>>,
     ) -> anyhow::Result<NodeId> {
-        let num_groups = match c.attention_type {
-            AttentionType::MHA => c.num_heads,
-            AttentionType::GQA(num_groups) => num_groups,
-        };
+        let num_groups = c.num_groups();
         let qkv = QKV::new(
             self.q,
             self.q_bias,
@@ -84,7 +83,8 @@ impl Attention<f32> {
             num_groups,
         )?;
         // TODO : change for GQA if needed by also giving the Q and K norms and the ROPE table
-        let mha = Mha::new(c.context_length, c.num_heads, c.head_size)?;
+        let mha =
+            Mha::new(c.context_length, c.num_heads, c.head_size)?.with_attention_span(self.span)?;
         let out = MatMul::new_constant(self.out, self.out_bias)?;
         // input is [seq_len, emb_size]
         let mut last_node_id =
@@ -173,6 +173,10 @@ impl Attention<f32> {
             LLMVariant::GPT2 => Self::from_loader_gpt2(loader, c),
             LLMVariant::Gemma3 => Self::from_loader_gemma3(loader, c),
         }
+    }
+
+    pub fn with_span(self, span: AttentionSpan) -> Self {
+        Self { span, ..self }
     }
 
     fn from_loader_gemma3(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
@@ -285,6 +289,7 @@ impl Attention<f32> {
             pre_ffn_norm,
             feedforward: ff,
             post_ffn_norm: Some(Norm::RMSNorm(post_ffn_norm)),
+            span: AttentionSpan::Full,
         })
     }
 
@@ -387,6 +392,7 @@ impl Attention<f32> {
             feedforward: ff,
             post_norm: None,
             post_ffn_norm: None,
+            span: AttentionSpan::Full,
         })
     }
     pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
@@ -512,6 +518,7 @@ impl Attention<f32> {
             pre_ffn_norm: Norm::LayerNorm(pre_ffn_norm),
             feedforward,
             post_ffn_norm: None,
+            span: AttentionSpan::Full,
         })
     }
 }

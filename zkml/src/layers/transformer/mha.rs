@@ -19,7 +19,9 @@ use crate::{
         },
         reshape::{Reshape, ReshapeCtx},
         transformer::{
-            attention::attention_mask::{AttentionMaskCtx, AttentionMaskProof, MaskProvingData},
+            attention::attention_mask::{
+                AttentionMaskCtx, AttentionMaskProof, AttentionSpan, MaskProvingData,
+            },
             softmax::{Softmax, SoftmaxCtx, SoftmaxData, SoftmaxProof},
         },
     },
@@ -204,6 +206,13 @@ where
             softmax,
             final_mul,
             final_reshape,
+        })
+    }
+
+    pub fn with_attention_span(self, span: AttentionSpan) -> anyhow::Result<Self> {
+        Ok(Self {
+            mask: self.mask.with_span(span)?,
+            ..self
         })
     }
 

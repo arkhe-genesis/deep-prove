@@ -1,7 +1,10 @@
-use crate::parser::{
-    gguf::FileTensorLoader,
-    json,
-    llm::{LLMModel, Token, transformer::NormType},
+use crate::{
+    layers::transformer::attention::attention_mask::AttentionSpan,
+    parser::{
+        gguf::FileTensorLoader,
+        json,
+        llm::{LLMModel, Token, transformer::NormType},
+    },
 };
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -39,7 +42,7 @@ pub struct LLMConfig {
     /// The token that signals the end of the sequence.
     pub eos_token: Token,
     /// The type of attention that is used in the model. Support for MHA and GQA for now.
-    pub attention_type: AttentionType,
+    pub attention_config: AttentionConfig,
     /// The specific config for the variant.
     pub variant: LLMVariant,
 }
@@ -56,9 +59,17 @@ pub enum LLMVariant {
     Gemma3,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionConfig {
+    // A vector, one for each attention layer. Easier to directly store all of them
+    // rather than indicating which ones are global and which ones are local.
+    span: Vec<AttentionSpan>,
+    head: AttentionHeadType,
+}
+
 /// The type of attention that is used in the model. Support for MHA and GQA for now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AttentionType {
+pub enum AttentionHeadType {
     /// Multi-Head Attention
     MHA,
     /// Grouped-Query Attention (GQA) with a specific number of groups.
@@ -92,20 +103,8 @@ impl LLMConfig {
             .to_vec()
             .context("tokens metadata not found")?
             .len();
-        let attention_type = match variant {
-            LLMVariant::GPT2 => AttentionType::MHA,
-            LLMVariant::Gemma3 => {
-                // safe unwrap because we know that the key is present in Gemma3
-                let num_groups = l
-                    .metadata::<usize>(variant.attention_num_groups_key().unwrap())
-                    .context(format!(
-                        "not found: {}",
-                        variant.attention_num_groups_key().unwrap()
-                    ))?;
-                AttentionType::GQA(num_groups)
-            }
-        };
 
+        let attention_config = AttentionConfig::from_loader(l, &variant)?;
         let head_size = match variant {
             LLMVariant::GPT2 => hidden_size / num_heads,
             LLMVariant::Gemma3 => l
@@ -125,7 +124,7 @@ impl LLMConfig {
             norm_epsilon,
             num_block,
             vocab_size,
-            attention_type,
+            attention_config,
             eos_token,
             variant,
         })
@@ -139,6 +138,7 @@ impl LLMConfig {
         let num_blocks = l.metadata_to_u32("num_hidden_layers")? as usize;
         let context_length = l.metadata_to_u32("max_seq_len")? as usize;
         let norm_epsilon = l.metadata_to_f32("norm_epsilon")?;
+        let attention_config = AttentionConfig::from_json(l, &variant)?;
         // TODO: fix that, currently it's only used for debugging purposes the JSON format
         // and it doesn't export the vocab size.
         let vocab_size = 3;
@@ -152,7 +152,7 @@ impl LLMConfig {
             norm_epsilon,
             vocab_size,
             // Hardcode for now since the JSON structure only comes from the gpt2 python script
-            attention_type: AttentionType::MHA,
+            attention_config,
             variant,
             // only support for gpt2 for now
             eos_token: 50256usize.into(),
@@ -160,9 +160,9 @@ impl LLMConfig {
     }
 
     pub fn num_groups(&self) -> usize {
-        match self.attention_type {
-            AttentionType::MHA => self.num_heads,
-            AttentionType::GQA(num_groups) => num_groups,
+        match self.attention_config.head {
+            AttentionHeadType::MHA => self.num_heads,
+            AttentionHeadType::GQA(num_groups) => num_groups,
         }
     }
 
@@ -299,5 +299,54 @@ impl LLMVariant {
             Self::GPT2 => Ok(LLMModel::from_loader(l, config)?),
             Self::Gemma3 => Ok(LLMModel::from_loader(l, config)?),
         }
+    }
+}
+
+impl AttentionConfig {
+    pub fn from_loader(loader: &FileTensorLoader, variant: &LLMVariant) -> anyhow::Result<Self> {
+        let num_attentions = loader
+            .metadata::<usize>(variant.num_block_key())
+            .context("num_block_key not found")?;
+        let span = match variant {
+            LLMVariant::GPT2 => vec![AttentionSpan::Full; num_attentions],
+            // a ratio of 5:1 local vs global attention span
+            LLMVariant::Gemma3 => (1..=num_attentions)
+                .map(|i| match i % 6 {
+                    0 => AttentionSpan::Full,
+                    _ => AttentionSpan::Local(1024),
+                })
+                .collect(),
+        };
+        let head = match variant {
+            LLMVariant::GPT2 => AttentionHeadType::MHA,
+            LLMVariant::Gemma3 => {
+                // safe unwrap because we know that the key is present in Gemma3
+                let num_groups = loader
+                    .metadata::<usize>(variant.attention_num_groups_key().unwrap())
+                    .context(format!(
+                        "not found: {}",
+                        variant.attention_num_groups_key().unwrap()
+                    ))?;
+                AttentionHeadType::GQA(num_groups)
+            }
+        };
+        Ok(Self { span, head })
+    }
+    pub fn from_json(l: &json::FileTensorLoader, variant: &LLMVariant) -> anyhow::Result<Self> {
+        if let LLMVariant::Gemma3 = variant {
+            bail!("Gemma3 is not supported yet for custom JSON format");
+        }
+        let num_attentions = l
+            .get_metadata("num_attention_heads")
+            .map(|v| v.as_u64().unwrap() as usize)
+            .context("num_attention_heads not found")?;
+        Ok(Self {
+            span: (0..num_attentions).map(|_| AttentionSpan::Full).collect(),
+            head: AttentionHeadType::MHA,
+        })
+    }
+
+    pub fn spans(&self) -> impl Iterator<Item = AttentionSpan> + use<'_> {
+        self.span.iter().cloned()
     }
 }

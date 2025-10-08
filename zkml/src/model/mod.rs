@@ -42,12 +42,12 @@ where
 {
     /// Returns an iterator over the nodes in the model, in arbitrary order.
     /// It is more efficient then `ForwardIterator` and `BackwardIterator`, so it
-    /// can be used to iterate over the nodes when the order does not matter
+    /// can be used to iterate over the nodes when the order does not matter.
     pub fn to_unstable_iterator(&self) -> impl Iterator<Item = (&NodeId, &Node<N>)> {
         self.nodes.iter()
     }
 
-    /// Utility method to pad the inputs shapes to the next power of two
+    /// Utility method to pad the inputs shapes to the next power of two.
     fn compute_padded_input_shapes(unpadded_input_shapes: &[Shape]) -> Vec<Shape> {
         unpadded_input_shapes
             .iter()
@@ -56,7 +56,7 @@ where
     }
 
     /// Instantiate a model with the given input shape: the `padding` input specifies whether
-    /// the provided inputs shapes should be padded or not
+    /// the provided inputs shapes should be padded or not.
     pub fn new_from_input_shapes(unpadded_input_shapes: Vec<Shape>, padding: PaddingMode) -> Self {
         let input_shapes = match padding {
             PaddingMode::NoPadding => unpadded_input_shapes.clone(),
