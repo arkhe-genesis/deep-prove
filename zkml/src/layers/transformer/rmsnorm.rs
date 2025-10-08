@@ -34,7 +34,7 @@ use crate::{
         verifier::Verifier,
     },
     layers::{
-        LayerCtx, LayerProof, NodeId, Requant,
+        LayerCtx, LayerProof, NodeID, Requant,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
@@ -233,7 +233,7 @@ impl<N: Number> RMSNorm<N> {
         };
 
         let quant_alpha = self.alpha.as_ref().map(|alpha| {
-            alpha.clone_and_map_tensor(|alpha| {
+            alpha.new_map_tensor(|alpha| {
                 let new_data = alpha
                     .iter()
                     .map(|v| {
@@ -429,7 +429,7 @@ impl QuantizeOp for RMSNorm<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
         // First check we have one input_scaling
@@ -493,7 +493,7 @@ impl PadOp for RMSNorm<Element> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "E: ExtensionField + DeserializeOwned")]
 pub struct RMSNormCtx<E: ExtensionField> {
-    node_id: NodeId,
+    node_id: NodeID,
     /// The result of calling [`f32::to_bits`] on the epsilon used for normalisation purposes
     eps: u32,
     /// The number of bits that get range checked (so we can know how many instances there are in the range lookup)
@@ -563,7 +563,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> RMSNormProof<E, PCS>
 impl ProveInfo for RMSNorm<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         if let Some(quant_info) = self.quant_info() {
@@ -705,7 +705,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -730,7 +730,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -753,7 +753,7 @@ type ProveOut<E, PCS> = (Vec<Claim<E>>, RMSNormProof<E, PCS>);
 impl RMSNorm<Element> {
     pub(crate) fn prove_step<E, T, PCS>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         last_claims: Vec<&Claim<E>>,
         ctx: &RMSNormCtx<E>,
         input_poly: MultilinearExtension<E>,
@@ -911,7 +911,7 @@ impl RMSNorm<Element> {
     /// Internal method for generating the lookup witness for a [`RMSNorm`] step.
     fn lookup_witness<E, PCS>(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         input_tensor: Tensor<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>>
@@ -1249,7 +1249,7 @@ mod tests {
             .add_consecutive_layer(Layer::RMSNorm(rmsnorm), None)
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
     }
@@ -1266,7 +1266,7 @@ mod tests {
             .add_consecutive_layer(Layer::RMSNorm(rmsnorm), None)
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
     }

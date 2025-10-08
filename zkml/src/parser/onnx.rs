@@ -1,13 +1,14 @@
 use crate::{
     Shape,
+    graph::{PortLink, Target},
     layers::{
         Layer,
         activation::Activation,
         convolution::Convolution,
         pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
-        provable::{Edge, Node as ProvableNode, NodeId, OpInfo},
+        provable::OpInfo,
     },
-    model::Model,
+    model::{Model, NodeID},
     padding::PaddingMode,
     tensor::KeyedTensor,
 };
@@ -34,7 +35,6 @@ use tract_onnx::{
 
 type OnnxModel = Graph<TypedFact, Box<dyn TypedOp + 'static>>;
 type OnnxNode = Node<TypedFact, Box<dyn TypedOp + 'static>>;
-type CustomNode = crate::layers::provable::Node<f32>;
 
 macro_rules! ensure_onnx {
         // Match with format args
@@ -79,7 +79,7 @@ fn from_inference_model(model: InferenceModel) -> Result<Model<f32>> {
     let input_node = onnx_model.node(inference_order[0]);
     let input_source = downcast_to::<TypedSource>(input_node)?;
     debug!("onnx input_source: {:?}", input_source.fact.shape.to_tvec());
-    let mut input_shape = input_source
+    let mut model_input_shape = input_source
         .fact
         .shape
         .to_tvec()
@@ -87,46 +87,36 @@ fn from_inference_model(model: InferenceModel) -> Result<Model<f32>> {
         .map(|x| tdim_to_usize(&x))
         .collect::<Result<Shape, _>>()?;
     // remove batch dimension if it's 1 as we dont support batching yet
-    if input_shape[0] == 1 {
-        input_shape.remove(0);
+    if model_input_shape[0] == 1 {
+        model_input_shape.remove(0);
     }
 
-    let mut pmodel = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
+    let mut pmodel =
+        Model::new_from_input_shapes(vec![model_input_shape.clone()], PaddingMode::NoPadding);
     let mut it = inference_order[1..].iter().peekable();
-    let mut first_node = true;
-    let mut last_node_id = 0;
     let parser = ParserFactory::init();
-    while let Some((id, zkml_node)) = parser
-        .parse_node(onnx_model, &mut it, first_node)
+    while let Some(id) = parser
+        .parse_node(onnx_model, &mut pmodel, &mut it)
         .transpose()?
     {
-        let desc = zkml_node.operation.describe();
-        pmodel
-            .add_node_with_id(id, zkml_node)
-            .context(format!("adding node {desc}:"))?;
-        first_node = false;
-        last_node_id = id.into();
+        debug!("parsed node id: {:?}", id);
     }
-    let outputs = onnx_model
-        .output_outlets()?
-        .iter()
-        .map(|outlet| Edge::new(outlet.node.into(), outlet.slot))
-        .collect::<Vec<_>>();
-    assert!(
-        outputs
-            .iter()
-            .any(|edge| *edge.node.unwrap() == last_node_id)
-    );
-    pmodel.route_output(Some(outputs))?;
+    for (i, outlet) in onnx_model.output_outlets()?.iter().enumerate() {
+        // NOTE: we dont use the automatic labelling or manual set_output because we want to make
+        // sure we take exactly the source port as described here. The set_output method automatically
+        // derives the source_port.
+        pmodel.add_raw_edge(outlet.node, Target::Output, (outlet.slot, i))?;
+    }
     Ok(pmodel)
 }
 
 type LoadFn<'a, I> = fn(
-    model: &OnnxModel,
-    node_id: NodeId,
+    onnx: &OnnxModel,
+    model: &mut Model<f32>,
+    node_id: NodeID,
     node: &OnnxNode,
     iter: &mut Peekable<I>,
-) -> Result<(NodeId, CustomNode)>;
+) -> Result<NodeID>;
 
 struct ParserFactory<'a, I: Iterator<Item = &'a usize> + Sized>(
     HashMap<&'static str, LoadFn<'a, I>>,
@@ -148,58 +138,52 @@ impl<'a, I: Iterator<Item = &'a usize> + Sized> ParserFactory<'a, I> {
 
     fn parse_node(
         &self,
-        model: &OnnxModel,
+        onnx: &OnnxModel,
+        model: &mut Model<f32>,
         iter: &mut Peekable<I>,
-        first_node: bool,
-    ) -> Option<Result<(NodeId, CustomNode)>> {
+    ) -> Option<Result<NodeID>> {
         let curr_node_id = iter.next()?;
-        let curr_node = model.node(*curr_node_id);
+        let curr_node = onnx.node(*curr_node_id);
         debug!(
             "curr_node id {}: {:?} : {:?} <- inputs: {:?}",
             curr_node_id, curr_node.name, curr_node.name, curr_node.inputs
         );
         #[allow(unused_variables)]
         let op_name = &curr_node.name;
-        if let Some(layer_name) = self
+        let Some(layer_name) = self
             .0
             .keys()
             .find(|&&layer_name| op_name.contains(layer_name))
-        {
-            debug!("current node {:?}", curr_node.op);
-            let parser = self.0.get(layer_name).unwrap();
+        else {
+            return Some(err(format!("Unknown node type: {op_name}: {curr_node:?}")));
+        };
+        debug!("current node {:?}", curr_node.op);
+        let parser = self.0.get(layer_name).unwrap();
 
-            Some(parser(model, (*curr_node_id).into(), curr_node, iter).map(
-                |(node_id, mut node)| {
-                    if first_node {
-                        // if the node is the first one, we need to add the
-                        // input edge as an input to the node
-                        node.inputs = node
-                            .inputs
-                            .into_iter()
-                            .map(|x| Edge::new_at_edge(x.index))
-                            .collect();
-                    }
-                    debug!(
-                        "parsed node id: {:?} : {:?} <- inputs: {:?}",
-                        curr_node_id,
-                        node.operation.describe(),
-                        node.inputs
-                    );
-                    (node_id, node)
-                },
-            ))
-        } else {
-            Some(err(format!("Unknown node type: {op_name}: {curr_node:?}")))
+        match parser(onnx, model, (*curr_node_id).into(), curr_node, iter) {
+            Ok(node_id) => {
+                debug!(
+                    "parsed node id: {:?} : {:?}",
+                    curr_node_id,
+                    model.graph.node(&node_id).unwrap().describe(),
+                );
+                Some(Ok(node_id))
+            }
+            Err(e) => Some(err(format!(
+                "Unknown node type: {op_name}: {curr_node:?}: {:?}",
+                e
+            ))),
         }
     }
 }
 
 fn load_reshape<'a, I: Iterator<Item = &'a usize> + Sized>(
-    _model: &OnnxModel,
-    node_id: NodeId,
+    _onnx: &OnnxModel,
+    model: &mut Model<f32>,
+    node_id: NodeID,
     node: &OnnxNode,
     _iter: &mut Peekable<I>,
-) -> Result<(NodeId, CustomNode)> {
+) -> Result<NodeID> {
     ensure_onnx!(
         node.inputs.len() == 1,
         "Reshape {} must have 1 input",
@@ -232,37 +216,35 @@ fn load_reshape<'a, I: Iterator<Item = &'a usize> + Sized>(
         "Reshape {} is not a flattening operation: only supported operation is flattening WIP",
         node.name
     );
-    let provable_node = ProvableNode::new(
-        vec![Edge::new(node.inputs[0].node.into(), node.inputs[0].slot)],
-        Layer::Flatten(crate::layers::flatten::Flatten),
-    );
-    Ok((node_id, provable_node))
+    model.add_layer_with_id(node_id, Layer::Flatten(crate::layers::flatten::Flatten))?;
+    model.add_maybe_input(node.inputs[0].node, node_id, (node.inputs[0].slot, 0))?;
+    Ok(node_id)
 }
 
 fn load_flatten<'a, I: Iterator<Item = &'a usize> + Sized>(
-    _model: &OnnxModel,
-    node_id: NodeId,
+    _onnx: &OnnxModel,
+    model: &mut Model<f32>,
+    node_id: NodeID,
     node: &OnnxNode,
     _iter: &mut Peekable<I>,
-) -> Result<(NodeId, CustomNode)> {
+) -> Result<NodeID> {
     ensure_onnx!(
         node.inputs.len() == 1,
         "Flatten {} must have 1 input",
         node.name
     );
-    let node = ProvableNode::new(
-        vec![Edge::new(node.inputs[0].node.into(), node.inputs[0].slot)],
-        Layer::Flatten(crate::layers::flatten::Flatten),
-    );
-    Ok((node_id, node))
+    model.add_layer_with_id(node_id, Layer::Flatten(crate::layers::flatten::Flatten))?;
+    model.add_maybe_input(node.inputs[0].node, node_id, (node.inputs[0].slot, 0))?;
+    Ok(node_id)
 }
 
 fn load_maxpool<'a, I: Iterator<Item = &'a usize> + Sized>(
-    _model: &OnnxModel,
-    node_id: NodeId,
+    _onnx: &OnnxModel,
+    model: &mut Model<f32>,
+    node_id: NodeID,
     node: &OnnxNode,
     _iter: &mut Peekable<I>,
-) -> Result<(NodeId, CustomNode)> {
+) -> Result<NodeID> {
     ensure_onnx!(
         node.inputs.len() == 1,
         "MaxPool {} must have 1 input",
@@ -311,19 +293,18 @@ fn load_maxpool<'a, I: Iterator<Item = &'a usize> + Sized>(
         ensure_onnx!(dil.iter().all(|&x| x == 1), "Dilations must be 1");
     }
     let zkml_maxpool = Layer::Pooling(Pooling::Maxpool2D(Maxpool2D::default()));
-    let node = ProvableNode::new(
-        vec![Edge::new(node.inputs[0].node.into(), node.inputs[0].slot)],
-        zkml_maxpool,
-    );
-    Ok((node_id, node))
+    model.add_layer_with_id(node_id, zkml_maxpool)?;
+    model.add_maybe_input(node.inputs[0].node, node_id, (node.inputs[0].slot, 0))?;
+    Ok(node_id)
 }
 
 fn load_relu<'a, I: Iterator<Item = &'a usize> + Sized>(
-    model: &OnnxModel,
-    node_id: NodeId,
+    onnx: &OnnxModel,
+    model: &mut Model<f32>,
+    node_id: NodeID,
     node: &OnnxNode,
     _iter: &mut Peekable<I>,
-) -> Result<(NodeId, CustomNode)> {
+) -> Result<NodeID> {
     // find the input node that corresponds to the const input of Relu - since tract_onnx transforms
     // a relu operation into Max(input, Const(0))
     // the input node would be the other one.
@@ -332,30 +313,33 @@ fn load_relu<'a, I: Iterator<Item = &'a usize> + Sized>(
         "Relu {} must have 2 inputs",
         node.name
     );
-    let real_input_id = match model.node(node.inputs[1].node).op_as::<Const>() {
+    let real_input_id = match onnx.node(node.inputs[1].node).op_as::<Const>() {
         Some(_) => node.inputs[0],
         None => {
             ensure_onnx!(
-                model.node(node.inputs[0].node).op_as::<Const>().is_some(),
+                onnx.node(node.inputs[0].node).op_as::<Const>().is_some(),
                 "Relu {} has no constant input",
                 node.name
             );
             node.inputs[1]
         }
     };
-    let provable_node = crate::layers::provable::Node::new(
-        vec![Edge::new(real_input_id.node.into(), real_input_id.slot)],
-        Layer::Activation(Activation::new_relu()),
-    );
-    Ok((node_id, provable_node))
+    model.add_layer_with_id(node_id, Layer::Activation(Activation::new_relu()))?;
+    model.add_maybe_input(
+        real_input_id.node,
+        node_id,
+        PortLink::new(real_input_id.slot, 0),
+    )?;
+    Ok(node_id)
 }
 
 fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
-    model: &OnnxModel,
-    node_id: NodeId,
+    onnx: &OnnxModel,
+    model: &mut Model<f32>,
+    node_id: NodeID,
     node: &OnnxNode,
     iter: &mut Peekable<I>,
-) -> Result<(NodeId, CustomNode)> {
+) -> Result<NodeID> {
     let _matrix =
         downcast_to::<EinSum>(node).context(format!("Gemm {} is not a EinSum node", node.name))?;
     // TODO: we only support matvec for now for onnx models
@@ -369,11 +353,11 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         .inputs
         .iter()
         .rev()
-        .find(|&x| is_const(model.node(x.node)))
+        .find(|&x| is_const(onnx.node(x.node)))
     else {
         return err(format!("Gemm {} has no constant input", node.name));
     };
-    let mut weight = extract_const_tensor(model.node(weight_link.node))?;
+    let mut weight = extract_const_tensor(onnx.node(weight_link.node))?;
     let weight_shape = weight.shape().clone();
     if weight_shape.len() > 2 {
         let input_flattened = weight_shape[1..].iter().product::<usize>();
@@ -394,7 +378,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     };
 
     // check if the weight matrix needs to be transposed
-    let input_node = model.node(input_link.node);
+    let input_node = onnx.node(input_link.node);
     let raw_input_shape = get_node_output_shape(input_node, input_link.slot)?;
     let input_size_flattened = raw_input_shape.iter().product::<usize>();
     let mut input_shape = vec![input_size_flattened];
@@ -491,7 +475,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         // no next node, no bias
         None => (node_id, None),
         Some(&&next_node_id) => {
-            let next_node = model.node(next_node_id);
+            let next_node = onnx.node(next_node_id);
             // if there's a bias, the next op is a TypedBinOp( Add ) node
             match downcast_to::<TypedBinOp>(next_node) {
                 // safety net
@@ -534,7 +518,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     };
     let bias_tensor = bias_node_id
         .map(|bias| {
-            let bias_node = model.node(bias);
+            let bias_node = onnx.node(bias);
             let mut bias_tensor = extract_const_tensor(bias_node)?;
             let bias_shape = bias_tensor.shape().clone();
             ensure_onnx!(
@@ -559,21 +543,22 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         .transpose()?;
 
     let dense = crate::layers::dense::Dense::new_with(weight, bias_tensor);
-    let provable_node = crate::layers::provable::Node::new(
-        vec![Edge::new(input_link.node.into(), input_link.slot)],
-        Layer::Dense(dense),
-    );
+    // we put the bias id if present so next layers refer to it and not the gemm node
+    model.add_layer_with_id(edge_id, Layer::Dense(dense))?;
+    model.add_maybe_input(input_link.node, edge_id, (input_link.slot, 0))?;
+
     // here since the bias addition is the _last_ operation, the next layers are gonna refer
     // to the id of the add node and not the gemm node.
-    Ok((edge_id, provable_node))
+    Ok(edge_id)
 }
 
 fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
-    model: &OnnxModel,
-    node_id: NodeId,
+    onnx: &OnnxModel,
+    model: &mut Model<f32>,
+    node_id: NodeID,
     node: &OnnxNode,
     _iter: &mut Peekable<I>,
-) -> Result<(NodeId, CustomNode)> {
+) -> Result<NodeID> {
     let conv_node = downcast_to::<Conv>(node)?;
     // TODO: once we support different padding and strides, extract the data in this function
     check_conv2d_attributes(conv_node)?;
@@ -587,8 +572,8 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
     let input_link = node.inputs[0];
     let filter_link = node.inputs[1];
     let bias_link = node.inputs[2];
-    let filter_node = model.node(filter_link.node);
-    let bias_node = model.node(bias_link.node);
+    let filter_node = onnx.node(filter_link.node);
+    let bias_node = onnx.node(bias_link.node);
     let filter_const = extract_const_tensor(filter_node)?;
     let bias_const = extract_const_tensor(bias_node)?;
     let conv = if bias_const.shape().is_empty() {
@@ -596,11 +581,10 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
     } else {
         Convolution::new(filter_const, bias_const)
     };
-    let provable_node = crate::layers::provable::Node::new(
-        vec![Edge::new(input_link.node.into(), input_link.slot)],
-        Layer::Convolution(conv),
-    );
-    Ok((node_id, provable_node))
+    model.add_layer_with_id(node_id, Layer::Convolution(conv))?;
+
+    model.add_maybe_input(input_link.node, node_id, (input_link.slot, 0))?;
+    Ok(node_id)
 }
 
 fn is_const(node: &OnnxNode) -> bool {

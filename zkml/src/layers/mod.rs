@@ -15,7 +15,7 @@ pub mod requant;
 pub mod reshape;
 pub mod transformer;
 
-use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
+use std::{fmt::Debug, marker::PhantomData};
 
 use anyhow::{Context as _, Result, bail};
 use ff_ext::ExtensionField;
@@ -23,11 +23,11 @@ use flatten::Flatten;
 use mpcs::PolynomialCommitmentScheme;
 use pooling::{PoolingCtx, PoolingProof};
 use provable::{
-    Evaluate, LayerOut, Node, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData,
-    QuantizeOp, QuantizeOutput,
+    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
+    QuantizeOutput,
 };
 use requant::RequantCtx;
-use tenstore::{GenStore, GenericStore, StoreError, TensorKey};
+use tenstore::{GenStore, StoreError};
 use transcript::Transcript;
 use transformer::{
     layernorm::LayerNormData, logits::ArgmaxData, mha::MhaData, softmax::SoftmaxData,
@@ -62,10 +62,10 @@ use crate::{
         },
     },
     lookup::context::LookupWitnessGen,
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     padding::{PaddingMode, ShapeInfo},
-    quantization::{Fieldizer, InferenceTracker, ModelMetadata, ScalingFactor},
+    quantization::{Fieldizer, ModelMetadata, ScalingFactor},
     tensor::{ConvFFTData, DryTensor},
 };
 use activation::ActivationCtx;
@@ -279,6 +279,13 @@ pub(crate) struct NodeOut<T, E: ExtensionField> {
     pub(crate) proving_data: ProvingData<E>,
 }
 impl<T, E: ExtensionField> NodeOut<T, E> {
+    pub(crate) fn new(outputs: Vec<DryTensor<T>>, proving_data: ProvingData<E>) -> Self {
+        Self {
+            _t: PhantomData,
+            outputs,
+            proving_data,
+        }
+    }
     pub(crate) fn into_fields<U>(self, store: GenStore) -> anyhow::Result<NodeOut<U, E>>
     where
         T: Serialize + for<'a> Deserialize<'a>,
@@ -347,7 +354,7 @@ impl<E: ExtensionField> NodeOut<Element, E> {
         &self,
         md: &ModelMetadata,
         store: GenStore,
-        node_id: NodeId,
+        node_id: NodeID,
     ) -> Result<NodeOut<f32, E>, StoreError> {
         Ok(NodeOut {
             _t: PhantomData,
@@ -360,108 +367,6 @@ impl<E: ExtensionField> NodeOut<Element, E> {
                 })
                 .collect::<Result<Vec<_>, StoreError>>()?,
             proving_data: self.proving_data.clone(),
-        })
-    }
-}
-
-impl<N> Node<N>
-where
-    N: Number + Serialize + for<'a> Deserialize<'a>,
-{
-    pub fn describe(&self) -> String {
-        self.operation.describe()
-    }
-
-    pub fn is_provable(&self) -> bool {
-        self.operation.is_provable()
-    }
-
-    pub(crate) fn run<E: ExtensionField>(
-        &self,
-        my_id: NodeId,
-        inputs: &[TensorKey<N>],
-        unpadded_input_shapes: &[Shape],
-        padded_input_shapes: &HashMap<TensorKey<N>, Shape>,
-        tracker: &mut Option<&mut InferenceTracker>,
-        store: &mut GenStore,
-    ) -> Result<NodeOut<N, E>>
-    where
-        N: Number,
-        Layer<N>: Evaluate<N>,
-    {
-        let input_tensors = inputs
-            .iter()
-            .map(|key| {
-                let data = store
-                    .fetch(key)
-                    .with_context(|| format!("fetching tensor data for tensor {key}"))
-                    .unwrap();
-                Ok(Tensor::new(padded_input_shapes[key].clone(), data))
-            })
-            .collect::<anyhow::Result<Vec<Tensor<N>>>>()?;
-        let input_tensors_ref = input_tensors.iter().collect::<Vec<_>>();
-        let unpadded_output_shapes = self
-            .operation
-            .output_shapes(unpadded_input_shapes, PaddingMode::NoPadding);
-        let layer_out = self
-            .operation
-            .evaluate(&input_tensors_ref, unpadded_input_shapes)?;
-        assert!(unpadded_output_shapes.len() == layer_out.outputs.len());
-
-        let outputs = layer_out
-            .outputs
-            .iter()
-            .enumerate()
-            .map(|(i, tensor)| {
-                let key = provable::Edge::tkey_for_output::<N>(Some(my_id), i);
-                store
-                    .store(&key, tensor.data_vec())
-                    .with_context(|| format!("storing outputs for tensor {key}"))
-                    .unwrap();
-                Ok(DryTensor::new(key, tensor.shape().clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // add output tensors to tracker, if any
-        if let Some(tracker) = tracker.as_mut() {
-            for (i, out) in layer_out.outputs.iter().enumerate() {
-                tracker.track(my_id, i, out.to_f32()?);
-            }
-            // track intermediate data, if any
-            if let Some(tracked_data) = layer_out.tracked_layer_data {
-                for (data_id, data) in tracked_data {
-                    tracker.track_intermediate_data(my_id, data_id, data.to_f32()?);
-                }
-            }
-        }
-
-        let node_out = NodeOut {
-            _t: PhantomData,
-            outputs,
-            proving_data: layer_out.proving_data,
-        };
-
-        Ok(node_out)
-    }
-
-    pub(crate) fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)>
-    where
-        Layer<N>: ProveInfo,
-    {
-        self.operation.step_info::<E>(id, aux)
-    }
-}
-
-impl Node<Element> {
-    pub(crate) fn pad_node(self, si: &mut ShapeInfo) -> Result<Self> {
-        Ok(Self {
-            inputs: self.inputs,
-            outputs: self.outputs,
-            operation: self.operation.pad_node(si)?,
         })
     }
 }
@@ -652,7 +557,7 @@ impl Evaluate<Element> for Layer<Element> {
 impl ProveInfo for Layer<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         match self {
@@ -722,7 +627,7 @@ where
 
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
-        node_id: provable::NodeId,
+        node_id: NodeID,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&crate::Claim<E>>,
         step_data: &StepData<E, E>,
@@ -796,7 +701,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: provable::NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -849,7 +754,7 @@ impl QuantizeOp for Layer<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: provable::NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         Ok(match self {

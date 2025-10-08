@@ -29,12 +29,12 @@ use crate::{
     layers::{
         LayerCtx, LayerProof,
         provable::{
-            Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp,
-            QuantizeOutput, VerifiableCtx,
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+            VerifiableCtx,
         },
         requant::Requant,
     },
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
@@ -70,7 +70,7 @@ pub struct QKV<N> {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QKVCtx {
-    node_id: NodeId,
+    node_id: NodeID,
     unpadded_shape: Shape, // same shape for Q, K and V
     num_heads: usize,
     head_dim: usize,
@@ -425,7 +425,7 @@ impl QuantizeOp for QKV<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len());
@@ -541,7 +541,7 @@ impl Evaluate<Element> for QKV<Element> {
 impl ProveInfo for QKV<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         ensure!(
@@ -623,7 +623,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -1555,7 +1555,7 @@ mod tests {
                 )
                 .unwrap();
 
-            model.route_output(None).unwrap();
+            model.automatic_output_labelling().unwrap();
             model.describe();
             prove_model(model, &mut GenStore::default()).unwrap();
         }

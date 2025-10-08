@@ -1,6 +1,6 @@
 use crate::{
-    layers::provable::{Node, NodeId, QuantizeOp, TrackedDataId},
-    model::{Model, ToIterator, transform::apply_transformations},
+    layers::provable::{QuantizeOp, TrackedDataId},
+    model::{Model, NodeID, transform::apply_transformations},
     number::Number,
     quantization::metadata::{MetadataBuilder, ModelMetadata},
     rng_from_env_or_random,
@@ -35,13 +35,13 @@ pub trait ScalingStrategy: std::fmt::Debug {
     /// the auxiliary data provided.
     fn scaling_factors_for_node(
         data: &Self::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         num_outputs: usize,
     ) -> Vec<ScalingFactor>;
 
     fn scaling_factor_for_intermediate_data(
         data: &Self::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         data_id: TrackedDataId,
     ) -> ScalingFactor;
 
@@ -98,7 +98,7 @@ impl ScalingStrategy for InferenceObserver {
         // let tracking_mode = InferenceTrackingMode::NSigmas(3);
         let mut tracker = InferenceTracker::new(tracking_mode);
         let input_shapes = model.input_shapes();
-        let input_not_padded_shapes = model.unpadded_input_shapes();
+        let unpadded_input_shapes = model.unpadded_input_shapes();
         let inputs = if self.inputs.is_empty() {
             let mut rng = rng_from_env_or_random();
             warn!("No representative inputs provided, generating random ones");
@@ -148,7 +148,7 @@ impl ScalingStrategy for InferenceObserver {
         }
         info!("InferenceObserver: {} total samples observed", nsamples);
         // 2. get the scaling factor of the input
-        let num_model_inputs = input_not_padded_shapes.len();
+        let num_model_inputs = unpadded_input_shapes.len();
         let input_scaling = (0..num_model_inputs)
             .map(|i| {
                 let (input_min, input_max) = tracker.scaling_range(INPUT_TRACKING_ID.into(), i);
@@ -160,7 +160,7 @@ impl ScalingStrategy for InferenceObserver {
 
     fn scaling_factors_for_node(
         tracker: &InferenceTracker,
-        node_id: NodeId,
+        node_id: NodeID,
         num_outputs: usize,
     ) -> Vec<ScalingFactor> {
         (0..num_outputs)
@@ -173,7 +173,7 @@ impl ScalingStrategy for InferenceObserver {
 
     fn scaling_factor_for_intermediate_data(
         tracker: &InferenceTracker,
-        node_id: NodeId,
+        node_id: NodeID,
         data_id: TrackedDataId,
     ) -> ScalingFactor {
         tracker.scaling_factor_for_intermediate_data(node_id, data_id)
@@ -187,10 +187,10 @@ pub struct InferenceTracker {
     mode: InferenceTrackingMode,
     /// Streaming estimator of the selected statistics for each output of each
     /// node.
-    accumulators: HashMap<(NodeId, usize), InferenceTrackingAccumulator>,
+    accumulators: HashMap<(NodeID, usize), InferenceTrackingAccumulator>,
     /// Streaming estimator of the selected statistics for given intermediate data of
     /// each node, if any
-    intermediate_data_trackers: HashMap<(NodeId, TrackedDataId), InferenceTrackingAccumulator>,
+    intermediate_data_trackers: HashMap<(NodeID, TrackedDataId), InferenceTrackingAccumulator>,
 }
 /// Selects the statistic to use to generate the scaling range.
 enum InferenceTrackingMode {
@@ -265,7 +265,7 @@ impl InferenceTracker {
             intermediate_data_trackers: HashMap::new(),
         }
     }
-    pub(crate) fn track(&mut self, node_id: NodeId, output_index: usize, output: Tensor<f32>) {
+    pub(crate) fn track(&mut self, node_id: NodeID, output_index: usize, output: Tensor<f32>) {
         let accumulator = self
             .accumulators
             .entry((node_id, output_index))
@@ -277,7 +277,7 @@ impl InferenceTracker {
 
     pub(crate) fn track_intermediate_data(
         &mut self,
-        node_id: NodeId,
+        node_id: NodeID,
         data_id: TrackedDataId,
         data: Tensor<f32>,
     ) {
@@ -290,7 +290,7 @@ impl InferenceTracker {
         }
     }
 
-    pub(crate) fn scaling_range(&self, node_id: NodeId, output_index: usize) -> (f32, f32) {
+    pub(crate) fn scaling_range(&self, node_id: NodeID, output_index: usize) -> (f32, f32) {
         self.accumulators
             .get(&(node_id, output_index))
             .unwrap()
@@ -299,7 +299,7 @@ impl InferenceTracker {
 
     pub(crate) fn scaling_factor_for_intermediate_data(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         data_id: TrackedDataId,
     ) -> ScalingFactor {
         let (min, max) = self
@@ -370,7 +370,7 @@ impl ScalingStrategy for AbsoluteMax {
 
     fn scaling_factors_for_node(
         _data: &Self::AuxData,
-        _node_id: NodeId,
+        _node_id: NodeID,
         num_outputs: usize,
     ) -> Vec<ScalingFactor> {
         vec![ScalingFactor::default(); num_outputs]
@@ -378,7 +378,7 @@ impl ScalingStrategy for AbsoluteMax {
 
     fn scaling_factor_for_intermediate_data(
         _data: &Self::AuxData,
-        _node_id: NodeId,
+        _node_id: NodeID,
         _data_id: TrackedDataId,
     ) -> ScalingFactor {
         ScalingFactor::default()
@@ -397,32 +397,36 @@ fn quantize_model<S: ScalingStrategy>(
     let mut requant_layers = vec![];
     // 3. Apply the post quantisation transforms if there are any
     let mut transforms = vec![];
-    let nodes = model
-        .into_forward_iterator()
-        .map(|(node_id, node)| {
-            let input_scaling = md.compute_input_scaling(&node.inputs)?;
+    let quantized_graph = model
+        .graph
+        // we create the quantized graph going in the inference order
+        // sometimes some layer may need to know some parts of the previously visited nodes
+        // XXX: is it true?
+        .try_into_map_forward(|node_id, node, edges| {
+            let input_scalings = md.map_to_input_scaling(
+                // take all the incoming edges to this node and fetch the relevant scaling factors
+                edges
+                    .iter()
+                    .filter(|edge| edge.is_incoming_to(&node_id))
+                    .copied(),
+            )?;
             tracing::debug!(
                 "Quantising node {}, with node ID {node_id}",
-                node.operation.short_name()
+                node.short_name()
             );
-            let quantized_out = node
-                .operation
-                .quantize_op::<S>(&data, node_id, &input_scaling)?;
-            md.set_layers_scaling(node_id, quantized_out.output_scalings, input_scaling);
+            let quantized_out = node.quantize_op::<S>(&data, node_id, &input_scalings)?;
+            md.set_layers_scaling(node_id, quantized_out.output_scalings, input_scalings);
             if let Some(requant) = quantized_out.requant_layer {
                 requant_layers.push((node_id, requant));
             }
             if let Some(transform) = quantized_out.post_quant_rule {
                 transforms.push(transform);
             }
-            let quantized_node =
-                Node::new_with_outputs(node.inputs, quantized_out.quantized_op, node.outputs);
-            Ok((node_id, quantized_node))
-        })
-        .collect::<Result<_>>()?;
-    let mut model = Model::new_from_shapes(input_not_padded_shapes, input_shapes, nodes);
+            Ok(quantized_out.quantized_op)
+        })?;
+    let mut model = Model::new_from_shapes(input_not_padded_shapes, input_shapes, quantized_graph);
     for (input_node_id, requant) in requant_layers {
-        let requant_ids = model.add_requant_nodes(requant, input_node_id)?;
+        let requant_ids = model.add_requant_layer(requant, input_node_id)?;
         // add scaling factor to `md` for requant layers: the scaling factors of the inputs correspond to
         // the scaling factors of the outputs of the previous node
         let input_scaling = md.get_output_layer_scaling(&input_node_id).ok_or(anyhow!(
@@ -438,8 +442,8 @@ fn quantize_model<S: ScalingStrategy>(
     }
     // Apply any model transformations
     model = apply_transformations(model, transforms)?;
-    let out_nodes = model.output_nodes();
+    let out_nodes = model.graph.output_nodes();
     let md = md.build(out_nodes)?;
-    info!("Quantized model with {} layers", model.nodes.len());
+    info!("Quantized model with {} layers", model.graph.node_count());
     Ok((model, md))
 }

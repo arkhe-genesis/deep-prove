@@ -6,9 +6,8 @@ use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Element,
-    layers::provable::{Edge, Node, NodeId},
-    model::Model,
+    graph::{Edge, Ports, Source},
+    model::{Model, NodeID},
 };
 
 use super::ScalingFactor;
@@ -17,8 +16,8 @@ use super::ScalingFactor;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
     pub input: Vec<ScalingFactor>,
-    pub(crate) input_layers_scaling: HashMap<NodeId, Vec<ScalingFactor>>,
-    pub(crate) output_layers_scaling: HashMap<NodeId, Vec<ScalingFactor>>,
+    pub(crate) input_layers_scaling: HashMap<NodeID, Vec<ScalingFactor>>,
+    pub(crate) output_layers_scaling: HashMap<NodeID, Vec<ScalingFactor>>,
     pub(crate) output: Vec<ScalingFactor>,
     pub float_model: Option<Model<f32>>,
 }
@@ -28,13 +27,13 @@ impl ModelMetadata {
         self.output.clone()
     }
 
-    pub fn layer_output_scaling_factor(&self, node_id: NodeId) -> &[ScalingFactor] {
+    pub fn layer_output_scaling_factor(&self, node_id: NodeID) -> &[ScalingFactor] {
         self.output_layers_scaling
             .get(&node_id)
             .unwrap_or_else(|| panic!("Node {node_id} not found"))
     }
 
-    pub fn layer_input_scaling_factor(&self, node_id: NodeId) -> &[ScalingFactor] {
+    pub fn layer_input_scaling_factor(&self, node_id: NodeID) -> &[ScalingFactor] {
         self.input_layers_scaling
             .get(&node_id)
             .unwrap_or_else(|| panic!("Node {node_id} not found"))
@@ -43,8 +42,8 @@ impl ModelMetadata {
 
 pub(crate) struct MetadataBuilder {
     pub(crate) input_scaling: Vec<ScalingFactor>,
-    output_layers_scaling: HashMap<NodeId, Vec<ScalingFactor>>,
-    input_layers_scaling: HashMap<NodeId, Vec<ScalingFactor>>,
+    output_layers_scaling: HashMap<NodeID, Vec<ScalingFactor>>,
+    input_layers_scaling: HashMap<NodeID, Vec<ScalingFactor>>,
 }
 
 impl MetadataBuilder {
@@ -58,7 +57,7 @@ impl MetadataBuilder {
 
     pub fn set_layers_scaling(
         &mut self,
-        node_id: NodeId,
+        node_id: NodeID,
         output_scaling: Vec<ScalingFactor>,
         input_scaling: Vec<ScalingFactor>,
     ) {
@@ -66,63 +65,73 @@ impl MetadataBuilder {
         self.input_layers_scaling.insert(node_id, input_scaling);
     }
 
-    pub(crate) fn compute_input_scaling(&self, node_inputs: &[Edge]) -> Result<Vec<ScalingFactor>> {
-        node_inputs.iter().map(|edge| {
-                if let Some(n) = &edge.node {
-                    let scalings = self.get_output_layer_scaling(n).ok_or(
-                        anyhow!("Scaling factors for node {n} not found")
-                    )?;
-                    ensure!(edge.index < scalings.len(),
-                        "Getting scaling factor {} for node {n}, but there are only {} scaling factors",
-                        edge.index,
-                        scalings.len(),
-                    );
-                    Ok(scalings[edge.index])
-                } else {
-                    ensure!(edge.index < self.input_scaling.len(),
-                        "Getting scaling factor {} for model inputs, but there are only {} scaling factors",
-                        edge.index,
-                        self.input_scaling.len(),
-                    );
-                    Ok(self.input_scaling[edge.index])
+    /// Take all incoming edges and map the input scaling factors corresponding to each source port
+    pub(crate) fn map_to_input_scaling<'a, I: Iterator<Item = &'a Edge<NodeID, ()>>>(
+        &self,
+        mut node_inputs: I,
+    ) -> Result<Vec<ScalingFactor>> {
+        Ok(node_inputs.try_fold(BTreeMap::new(), |mut acc, edge| {
+            for port in edge.ports().iter() {
+                match edge.source() {
+                    Source::Node(n) => {
+                        let scalings = self.get_output_layer_scaling(n).ok_or(
+                            anyhow!("Scaling factors for node {n} not found")
+                        )?;
+                        ensure!(*port.source_port < scalings.len(),
+                            "Getting scaling factor {} for node {n}, but there are only {} scaling factors",
+                            *port.source_port,
+                            scalings.len(),
+                        );
+                        acc.insert(*port.target_port, scalings[*port.source_port]);
+                    }
+                    Source::Input => {
+                        ensure!(*port.source_port < self.input_scaling.len(),
+                            "Getting scaling factor {} for model inputs, but there are only {} scaling factors",
+                            *port.source_port,
+                            self.input_scaling.len(),
+                        );
+                        acc.insert(*port.target_port, self.input_scaling[*port.source_port]);
+                    }
                 }
-            }).collect()
+            }
+            Ok(acc)
+        })?
+        .into_values().collect())
     }
 
-    pub(crate) fn get_output_layer_scaling(&self, node_id: &NodeId) -> Option<&[ScalingFactor]> {
+    pub(crate) fn get_output_layer_scaling(&self, node_id: &NodeID) -> Option<&[ScalingFactor]> {
         self.output_layers_scaling
             .get(node_id)
             .map(|s| s.as_slice())
     }
 
-    pub fn build(self, output_nodes: Vec<(NodeId, &Node<Element>)>) -> Result<ModelMetadata> {
+    pub fn build<'a, I: Iterator<Item = (&'a NodeID, &'a Ports)>>(
+        self,
+        output_nodes: I,
+    ) -> Result<ModelMetadata> {
         let mut output_scalings = BTreeMap::new();
-        for (id, node) in output_nodes.into_iter() {
+        for (id, ports) in output_nodes.into_iter() {
             let scalings = self
-                .get_output_layer_scaling(&id)
+                .get_output_layer_scaling(id)
                 .ok_or(anyhow!("Scaling factors not found for node {id}"))?;
             ensure!(
-                scalings.len() == node.outputs.len(),
+                scalings.len() >= ports.iter().count(),
                 "Number of scalings factors found for node {id} ({}) is different from
                 the expected number of outputs of the node ({})",
                 scalings.len(),
-                node.outputs.len(),
+                ports.iter().count(),
             );
-            node.outputs.iter().enumerate().try_for_each(|(i, out)| {
-                if let Some(out_index) = out.edges.iter().find_map(|edge| {
-                    if edge.node.is_none() {
-                        Some(edge.index)
-                    } else {
-                        None
-                    }
-                }) {
-                    ensure!(
-                        output_scalings.insert(out_index, scalings[i]).is_none(),
-                        "Scaling factor for output {out_index} found twice"
-                    );
-                }
-                Ok(())
-            })?;
+            for port in ports.iter() {
+                ensure!(
+                    output_scalings
+                        // we register the model output at target_port to have the scaling
+                        // from the output of the node located at the source_port
+                        .insert(port.target_port, scalings[*port.source_port])
+                        .is_none(),
+                    "Scaling factor for output {} found twice",
+                    port.target_port
+                );
+            }
         }
         // check that all scaling factors have been found
         ensure!(
@@ -130,8 +139,8 @@ impl MetadataBuilder {
             "No output scaling factors found"
         );
         ensure!(
-            *output_scalings.first_key_value().unwrap().0 == 0
-                && *output_scalings.last_key_value().unwrap().0 == output_scalings.len() - 1,
+            **output_scalings.first_key_value().unwrap().0 == 0
+                && **output_scalings.last_key_value().unwrap().0 == output_scalings.len() - 1,
             "Not all output scaling factors found"
         );
 

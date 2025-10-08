@@ -1,14 +1,18 @@
+use crate::{Claim, Tensor, VectorTranscript};
+use multilinear_extensions::mle::IntoMLE;
 use std::collections::HashMap;
 
 use crate::{
     commit::mmcs_context::ModelOpeningProof,
     iop::{context::VerifierContext, prover::MergeClaimsProof},
-    layers::{LayerProof, provable::NodeId},
+    layers::LayerProof,
     lookup::logup_gkr::structs::LogUpBatchProof,
+    model::NodeID,
 };
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+pub mod claim;
 pub mod context;
 pub mod prover;
 pub mod verifier;
@@ -24,9 +28,9 @@ where
     E::BaseField: Serialize + DeserializeOwned,
 {
     /// The successive sumchecks proofs. From output layer to input.
-    steps: HashMap<NodeId, LayerProof<E, PCS>>,
+    steps: HashMap<NodeID, LayerProof<E, PCS>>,
     /// Proofs to merge output claims of a node, if any
-    merge_claim_proofs: HashMap<NodeId, MergeClaimsProof<E>>,
+    merge_claim_proofs: HashMap<NodeID, MergeClaimsProof<E>>,
     /// The proofs for any lookup tables used
     table_proofs: Vec<TableProof<E, PCS>>,
     /// the commitment proofs related to the weights
@@ -105,6 +109,32 @@ where
             .get(name)
             .map(|challenges| (self.constant_challenge, *challenges))
     }
+}
+
+/// Computes the initial claims from the outputs of the model, since we prove in reverse
+pub(crate) fn model_output_claims<'a, I, E: ExtensionField, T: Transcript<E>>(
+    transcript: &mut T,
+    outputs: I,
+) -> Vec<Claim<E>>
+where
+    I: IntoIterator<Item = &'a Tensor<E>>,
+{
+    outputs
+        .into_iter()
+        .map(|out| {
+            // Derive the first randomness
+            let r_i = transcript.read_challenges(out.get_data().len().ilog2() as usize);
+            // For the output, we manually evaluate the MLE and check if it's the same as what prover
+            // gave. Note prover could ellude that but it's simpler to avoid that special check right
+            // now.
+            let output_mle = out.get_data().to_vec().into_mle();
+            let computed_sum = output_mle.evaluate(&r_i);
+            Claim {
+                point: r_i,
+                eval: computed_sum,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

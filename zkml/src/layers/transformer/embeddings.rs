@@ -43,11 +43,9 @@ use crate::{
     layers::{
         LayerCtx,
         matrix_mul::{MatMul, OperandMatrix},
-        provable::{
-            Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx,
-        },
+        provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
     },
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     padding::{PaddingMode, ShapeInfo},
 };
@@ -64,7 +62,7 @@ pub struct Embeddings<N> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsCtx {
-    id: NodeId,
+    id: NodeID,
     vocab_size: usize,
     emb_size: usize,
     embedding_key: TensorKey,
@@ -320,7 +318,7 @@ impl PadOp for Embeddings<Element> {
 impl ProveInfo for Embeddings<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
@@ -373,7 +371,7 @@ impl QuantizeOp for Embeddings<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let quantized_mat = self.mat.quantize_op::<S>(data, node_id, input_scaling)?;
@@ -399,7 +397,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -708,7 +706,7 @@ mod tests {
         let _ = model
             .add_consecutive_layer(Layer::Embeddings(embeddings), None)
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model_with(model, vec![input], &mut GenStore::default())?;
 

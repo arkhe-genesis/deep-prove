@@ -41,7 +41,7 @@ use crate::{
         verifier::Verifier,
     },
     layers::{
-        LayerCtx, LayerProof, NodeId, Requant,
+        LayerCtx, LayerProof, Requant,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
             QuantizeOutput, VerifiableCtx,
@@ -53,7 +53,7 @@ use crate::{
         },
         logup_gkr::verifier::verify_logup_proof_multiple_sizes,
     },
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     padding::PaddingMode,
     parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
@@ -342,7 +342,7 @@ impl LayerNorm<f32> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "E: ExtensionField + DeserializeOwned")]
 pub struct LayerNormCtx<E: ExtensionField> {
-    node_id: NodeId,
+    node_id: NodeID,
     /// The result of calling [`f32::to_bits`] on the epsilon used for normalisation purposes
     eps: u32,
     /// The number of bits that get range checked (so we can know how many instances there are in the range lookup)
@@ -643,7 +643,7 @@ impl QuantizeOp for LayerNorm<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
         // First check we have one input_scaling
@@ -708,7 +708,7 @@ impl QuantizeOp for LayerNorm<f32> {
 impl ProveInfo for LayerNorm<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         if let Some(quant_info) = self.quant_info() {
@@ -887,7 +887,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -926,7 +926,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -951,7 +951,7 @@ type ProveOut<E, PCS> = (Vec<Claim<E>>, LayerNormProof<E, PCS>);
 impl LayerNorm<Element> {
     pub(crate) fn prove_step<E, T, PCS>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         last_claims: Vec<&Claim<E>>,
         ctx: &LayerNormCtx<E>,
         input_poly: MultilinearExtension<E>,
@@ -1116,7 +1116,7 @@ impl LayerNorm<Element> {
     /// Internal method for generating the [`LogUpWitness`] for a [`LayerNorm`] step.
     fn lookup_witness<E, PCS>(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         layernorm_data: &LayerNormData,
     ) -> Result<LookupWitnessGen<E, PCS>>
@@ -1495,7 +1495,7 @@ mod tests {
             .add_consecutive_layer(Layer::LayerNorm(layernorm), None)
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
     }

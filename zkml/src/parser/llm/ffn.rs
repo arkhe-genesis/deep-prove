@@ -3,12 +3,9 @@ use crate::{
     layers::{
         activation::{Activation, GeGlu},
         matrix_mul::MatMul,
-        provable::{Edge, Node},
     },
-    parser::{
-        gguf::FileTensorLoader,
-        llm::{LLMVariant, NodeId},
-    },
+    model::NodeID,
+    parser::{gguf::FileTensorLoader, llm::LLMVariant},
     tensor::KeyedTensor,
 };
 use anyhow::{bail, ensure};
@@ -33,8 +30,8 @@ impl FeedForward<f32> {
         self,
         _config: &LLMConfig,
         model: &mut Model<f32>,
-        input_node_id: NodeId,
-    ) -> anyhow::Result<NodeId> {
+        input_node_id: NodeID,
+    ) -> anyhow::Result<NodeID> {
         let up = MatMul::new_constant(self.up, self.up_bias)?;
 
         // let down = MatMul::new_constant(self.down, self.down_bias);
@@ -48,18 +45,18 @@ impl FeedForward<f32> {
             let gate_node_id =
                 model.add_consecutive_layer(Layer::MatMul(gate), Some(input_node_id))?;
             let geglu = Activation::new_geglu();
+            let geglu_id = model.add_layer(geglu.into())?;
             // build input wires for GeGlu
-            let geglu_inputs = {
-                let mut inputs = vec![Edge::default(); 2];
-                inputs[GeGlu::<f32>::GELU_INPUT_INDEX] = Edge::new(gate_node_id, 0); // output of gate is fed to Gelu
-                inputs[GeGlu::<f32>::LINEAR_INPUT_INDEX] = Edge::new(up_node_id, 0);
-                inputs
-            };
-            model.add_node(Node::new(geglu_inputs, geglu.into()))
+            model.add_edge(gate_node_id, geglu_id, (0, GeGlu::<f32>::GELU_INPUT_INDEX))?;
+            model.add_edge(up_node_id, geglu_id, (0, GeGlu::<f32>::LINEAR_INPUT_INDEX))?;
+            geglu_id
         } else {
             // if there is no `self.gate`, then we just feed output of `up` linear component to the activation layer
-            model.add_consecutive_layer(Layer::Activation(Activation::new_gelu()), Some(up_node_id))
-        }?;
+            model.add_consecutive_layer(
+                Layer::Activation(Activation::new_gelu()),
+                Some(up_node_id),
+            )?
+        };
         let last_node_id =
             model.add_consecutive_layer(Layer::MatMul(down), Some(activation_node_id))?;
         Ok(last_node_id)

@@ -102,10 +102,7 @@ impl<T> KeyedTensor<T> {
         })
     }
 
-    pub fn clone_and_map_tensor<U>(
-        &self,
-        f: impl FnOnce(&Tensor<T>) -> Tensor<U>,
-    ) -> KeyedTensor<U> {
+    pub fn new_map_tensor<U>(&self, f: impl FnOnce(&Tensor<T>) -> Tensor<U>) -> KeyedTensor<U> {
         KeyedTensor {
             key: self.key.clone(),
             tensor: f(&self.tensor),

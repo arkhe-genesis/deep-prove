@@ -30,11 +30,11 @@ use crate::{
     layers::{
         LayerProof,
         add::Add,
-        provable::{Evaluate, LayerOut, NodeId, PadOp, QuantizeOutput},
+        provable::{Evaluate, LayerOut, PadOp, QuantizeOutput},
         requant::Requant,
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     quantization::{self, Fieldizer, TensorFielder},
     tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorSlice, is_close_with_tolerance},
@@ -58,7 +58,7 @@ pub struct RopeProof<E: ExtensionField> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RopeCtx {
-    node_id: NodeId,
+    node_id: NodeID,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
     cosine_key: TensorKey,
@@ -257,7 +257,7 @@ impl<N: Number> Rope<N> {
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     >(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         output_claim: &Claim<E>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
@@ -394,7 +394,7 @@ impl Rope<f32> {
     pub(super) fn quantize<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: ScalingFactor,
     ) -> anyhow::Result<QuantizeOutput<Rope<Element>>> {
         // compute scaling factor for cosine and sine matrices
@@ -462,7 +462,7 @@ impl PadOp for Rope<Element> {
 impl Rope<Element> {
     pub(super) fn step_info(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> anyhow::Result<(RopeCtx, ContextAux)> {
         // this closure retains only values in odd columns, relying on the fact that `self.cosine_matrix`
@@ -743,7 +743,7 @@ mod tests {
             )
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         let _ = prove_model(model, &mut GenStore::default()).unwrap();
     }
@@ -868,7 +868,7 @@ mod tests {
             let mut model = Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
 
             model.add_consecutive_layer(Layer::Positional(Positional::new_rope(angles, "rope_angles".to_string().into(), context_length).expect("rope")), None).expect("rope layer");
-            model.route_output(None).expect("route output");
+            model.automatic_output_labelling().expect("route output");
             let _ = prove_model(model, &mut GenStore::default()).expect("prove model");
         }
     }

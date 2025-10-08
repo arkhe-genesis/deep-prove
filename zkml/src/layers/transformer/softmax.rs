@@ -14,8 +14,8 @@ use crate::{
     layers::{
         LayerCtx, LayerProof,
         provable::{
-            Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData,
-            QuantizeOp, QuantizeOutput, VerifiableCtx,
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
+            QuantizeOutput, VerifiableCtx,
         },
         requant::FIXED_POINT_SCALE,
     },
@@ -29,7 +29,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::{StepData, transform::impls::softmax_mask::SoftmaxMaskTransform},
+    model::{NodeID, StepData, transform::impls::softmax_mask::SoftmaxMaskTransform},
     number::Number,
     padding::PaddingMode,
     quantization::{self, Fieldizer, ScalingFactor},
@@ -787,7 +787,7 @@ impl Softmax<Element> {
         T: transcript::Transcript<E>,
     >(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         last_claims: Vec<&Claim<E>>,
         ctx: &SoftmaxCtx<E>,
         softmax_data: &SoftmaxData,
@@ -1020,7 +1020,7 @@ impl Softmax<Element> {
 
     pub(crate) fn lookup_witness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         input: &Tensor<Element>,
         output: &Tensor<Element>,
@@ -1276,7 +1276,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -1298,7 +1298,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -1328,7 +1328,7 @@ impl QuantizeOp for Softmax<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         _data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
@@ -1373,7 +1373,7 @@ impl QuantizeOp for Softmax<f32> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "E: ExtensionField + DeserializeOwned")]
 pub struct SoftmaxCtx<E: ExtensionField> {
-    node_id: NodeId,
+    node_id: NodeID,
     /// This is the quantisation data for the [`Softmax`] op
     quant_info: QuantisedSoftmaxData,
     /// The data about the lookups that are performed in this layer
@@ -1510,7 +1510,7 @@ impl<E: ExtensionField> OpInfo for SoftmaxCtx<E> {
 impl ProveInfo for Softmax<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         if let Some(&quant_info) = self.quant_info() {
@@ -2074,7 +2074,7 @@ mod tests {
             .add_consecutive_layer(Layer::Softmax(softmax), Some(mask_id))
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
     }

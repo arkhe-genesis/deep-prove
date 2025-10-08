@@ -1,8 +1,7 @@
 use super::{
     LayerCtx,
     provable::{
-        Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp,
-        QuantizeOutput,
+        Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
     },
 };
 use crate::{
@@ -11,7 +10,7 @@ use crate::{
     commit::{compute_betas_eval, identity_eval},
     iop::{context::ContextAux, prover::BatchFFTProof},
     layers::{LayerProof, hadamard, provable::ProvingData, requant::Requant},
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     padding::{PaddingMode, ShapeInfo},
     parser::{check_filter, safe_conv2d_shape},
@@ -107,8 +106,7 @@ impl<T: Clone + Copy + Default> FilterTensor<T> {
         let n_w = (padded_input_shape[1] - pre_fft_shape[2] + 1).next_power_of_two();
         let new_shape = Shape::new(vec![pre_fft_shape[0], pre_fft_shape[1], n_w, n_w]);
 
-        let tensor =
-            tensor.clone_and_map_tensor(|t| Tensor::new_unchecked(new_shape, t.data().to_vec()));
+        let tensor = tensor.new_map_tensor(|t| Tensor::new_unchecked(new_shape, t.data().to_vec()));
 
         *self = FilterTensor::FftFilter {
             tensor,
@@ -429,7 +427,7 @@ impl<T> Convolution<T> {
     }
 
     /// Returns this layers [ConvCtx].
-    pub(crate) fn conv_context(&self, node_id: NodeId) -> ConvCtx {
+    pub(crate) fn conv_context(&self, node_id: NodeID) -> ConvCtx {
         ConvCtx {
             node_id,
             kw: self.kw(),
@@ -797,7 +795,7 @@ impl Convolution<Element> {
         output: &Tensor<E>,
         unpadded_output_shape: &Shape,
         proving_data: &ConvData<E>,
-        id: NodeId,
+        id: NodeID,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,
@@ -1208,7 +1206,7 @@ struct BatchFFTWeightsProof<E: ExtensionField> {
 impl ProveInfo for Convolution<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let (tensor, _) = self.filter.as_fft_tensor();
@@ -1273,7 +1271,7 @@ impl QuantizeOp for Convolution<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len());
@@ -1351,7 +1349,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        id: NodeId,
+        id: NodeID,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,

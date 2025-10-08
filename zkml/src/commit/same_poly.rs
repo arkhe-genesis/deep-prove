@@ -71,10 +71,10 @@ where
     }
     pub fn add_claim(&mut self, claim: Claim<E>) -> anyhow::Result<()> {
         ensure!(
-            claim.point.len() == self.poly.num_vars(),
+            claim.point().len() == self.poly.num_vars(),
             format!(
                 "Invalid claim length: input.len() = {} vs poly.num_vars = {} ",
-                claim.point.len(),
+                claim.point().len(),
                 self.poly.num_vars()
             )
         );
@@ -87,7 +87,7 @@ where
         let beta_evals = self
             .claims
             .into_par_iter()
-            .map(|c_i| compute_betas_eval(&c_i.point).into_mle())
+            .map(|c_i| compute_betas_eval(c_i.point()).into_mle())
             .collect::<Vec<_>>();
         let num_vars = self.poly.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
@@ -136,9 +136,9 @@ where
 
     pub fn add_claim(&mut self, claim: Claim<E>) -> anyhow::Result<()> {
         ensure!(
-            claim.point.len() == self.ctx.vp_info.max_num_variables,
+            claim.point().len() == self.ctx.vp_info.max_num_variables,
             "invalid input len wrt to poly in ctx, claim point length: {}, expected point length: {}",
-            claim.point.len(),
+            claim.point().len(),
             self.ctx.vp_info.max_num_variables
         );
         self.claims.push(claim);

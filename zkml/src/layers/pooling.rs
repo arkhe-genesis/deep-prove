@@ -46,8 +46,9 @@ use sumcheck::structs::IOPProverState;
 
 use super::{
     LayerCtx,
-    provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
+    provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
 };
+use crate::model::NodeID;
 /// Short name used to identify the pooling layer.
 pub const POOLING_LAYER: &str = "POOL";
 
@@ -61,7 +62,7 @@ pub enum Pooling {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PoolingCtx {
     pub poolinfo: Maxpool2D,
-    pub node_id: NodeId,
+    pub node_id: NodeID,
     pub lookup_ctx: LayerLookupContext,
 }
 
@@ -215,7 +216,7 @@ impl Evaluate<f32> for Pooling {
 impl ProveInfo for Pooling {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let info = match self {
@@ -267,7 +268,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -287,7 +288,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -434,7 +435,7 @@ impl Pooling {
         // input to the dense layer
         input: &Tensor<E>,
         info: &PoolingCtx,
-        id: NodeId,
+        id: NodeID,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,

@@ -1,15 +1,12 @@
-use crate::VectorTranscript;
-use anyhow::{Result, anyhow, bail, ensure};
+use crate::model::NodeID;
+use anyhow::{Result, bail, ensure};
 use derive_more::{From, Into};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::mle::IntoMLE;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    fmt::Debug,
-};
-use tenstore::{GenStore, TensorKey};
+use std::{collections::HashMap, fmt::Debug};
+use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{
@@ -30,141 +27,11 @@ use crate::{
 };
 
 use super::{
-    Layer, LayerCtx, LayerProof,
+    LayerCtx, LayerProof,
     flatten::Flatten,
     requant::Requant,
     transformer::{layernorm::LayerNormData, softmax::SoftmaxData},
 };
-
-#[derive(
-    Copy,
-    Clone,
-    From,
-    Into,
-    Hash,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    PartialOrd,
-    Ord,
-    derive_more::Debug,
-    derive_more::Display,
-    derive_more::Deref,
-)]
-#[debug("node #{_0}")]
-#[display("#{_0}")]
-pub struct NodeId(pub(crate) usize);
-
-/// Represents a link between an input/output wire of a node with an
-/// input/output wire of another node.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Edge {
-    // Reference to the node linked to this wire, will be `None` if the wire is
-    // an input or output of the model
-    pub(crate) node: Option<NodeId>,
-    // The index of the wire of `node` which is linked to this wire
-    pub(crate) index: usize,
-}
-impl Edge {
-    pub(crate) fn tensor_key_as_input<T>(&self) -> TensorKey<T> {
-        Self::tkey_for_input::<T>(self.node, self.index)
-    }
-
-    pub fn tkey_for_input<T>(n: Option<NodeId>, idx: usize) -> TensorKey<T> {
-        TensorKey::from_str(format!(
-            "{}-{}",
-            n.map(|x| x.to_string()).unwrap_or("INPUT".into()),
-            idx
-        ))
-    }
-
-    pub fn tkey_for_output<T>(n: Option<NodeId>, idx: usize) -> TensorKey<T> {
-        TensorKey::from_str(format!(
-            "{}-{}",
-            n.map(|x| x.to_string()).unwrap_or("OUTPUT".into()),
-            idx
-        ))
-    }
-}
-
-impl Edge {
-    pub fn new(source: NodeId, index: usize) -> Self {
-        Self {
-            node: Some(source),
-            index,
-        }
-    }
-
-    /// Edge when the node is an input or an output of the model
-    pub fn new_at_edge(index: usize) -> Self {
-        Self { node: None, index }
-    }
-}
-
-/// Represents all the edges that are connected to a node's output wire
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OutputWire {
-    // needs to be a vector because the output of a node can be used as input to multiple nodes
-    pub(crate) edges: Vec<Edge>,
-}
-
-/// Represents a node in a model
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Node<N> {
-    pub(crate) inputs: Vec<Edge>,
-    /// Vector of outgoing wires. The index in this vector means that the corresponding OutputWire
-    /// is linking the i-th output of this node to the designated output node.
-    pub(crate) outputs: Vec<OutputWire>,
-    pub(crate) operation: Layer<N>,
-}
-
-pub trait NodeEdges {
-    // Get input edges for a node
-    fn inputs(&self) -> &[Edge];
-    // Get output edges of a node
-    fn outputs(&self) -> &[OutputWire];
-}
-
-impl<N> NodeEdges for Node<N> {
-    fn inputs(&self) -> &[Edge] {
-        &self.inputs
-    }
-
-    fn outputs(&self) -> &[OutputWire] {
-        &self.outputs
-    }
-}
-
-impl<E: ExtensionField> NodeEdges for NodeCtx<E> {
-    fn inputs(&self) -> &[Edge] {
-        &self.inputs
-    }
-
-    fn outputs(&self) -> &[OutputWire] {
-        &self.outputs
-    }
-}
-
-impl<N: Number> Node<N> {
-    // Create a new node, from the set of inputs edges and the operation performed by the node
-    pub fn new(inputs: Vec<Edge>, operation: Layer<N>) -> Self {
-        let num_outputs = operation.num_outputs(inputs.len());
-        Self::new_with_outputs(inputs, operation, vec![Default::default(); num_outputs])
-    }
-
-    pub(crate) fn new_with_outputs(
-        inputs: Vec<Edge>,
-        operation: Layer<N>,
-        outputs: Vec<OutputWire>,
-    ) -> Self {
-        Self {
-            inputs,
-            outputs,
-            operation,
-        }
-    }
-}
 
 /// Enum if the output of evaluating a layer returns extra data needed during proving.
 /// This should only be implemented for quantised layers.
@@ -291,136 +158,6 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
     }
 }
 
-/// Represents the proving context for a given node, altogether with the input
-/// and output edges of the node
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct NodeCtx<E: ExtensionField> {
-    pub(crate) inputs: Vec<Edge>,
-    pub(crate) outputs: Vec<OutputWire>,
-    pub(crate) ctx: LayerCtx<E>,
-}
-
-impl<E: ExtensionField> NodeCtx<E> {
-    /// Get the claims corresponding to the output edges of a node.
-    /// Requires the input claims for the nodes of the model using the
-    /// outputs of the current node, and the claims of the output
-    /// tensors of the model
-    pub(crate) fn claims_for_node<'a, 'b>(
-        &self,
-        claims_by_node: &'a HashMap<NodeId, Vec<Claim<E>>>,
-        output_claims: &'b [Claim<E>],
-    ) -> Result<Vec<Vec<&'a Claim<E>>>>
-    where
-        'b: 'a,
-    {
-        self.outputs.iter().map(|out| {
-            // For now, we support in proving only one edge per output wire,
-            // as if an output is used as input in different nodes, we need
-            // to batch claims about the same polynomial. ToDo: batch claims
-            // TODO : revise that assumption
-            //assert_eq!(out.edges.len(), 1);
-            out.edges.iter().map(|edge| {
-                anyhow::Ok(if let Some(id) = &edge.node {
-                let claims_for_node = claims_by_node.get(id).ok_or(
-                    anyhow!("No claims found for layer {id}")
-                )?;
-                ensure!(edge.index < claims_for_node.len(),
-                    "Not enough claims found for node {}: required claim for input {}, but {} claims found",
-                    id,
-                    edge.index,
-                    claims_for_node.len()
-                );
-                &claims_for_node[edge.index]
-            } else {
-                // it's an output node, so we use directly the claim for the corresponding output
-                ensure!(edge.index < output_claims.len(),
-                 "Required claim for output {} of the model, but only {} output claims found",
-                 edge.index,
-                 output_claims.len(),
-                );
-                &output_claims[edge.index]
-            })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-        }).collect()
-    }
-
-    /// Get the claims corresponding to the input tensors of the model.
-    /// Requires as inputs the contexts for all the nodes in the model
-    /// and the set of claims for the input tensors of all the nodes of
-    /// the model
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn input_claims<'a, I: Iterator<Item = (NodeId, &'a Self)>>(
-        nodes: I,
-        claims_by_node: &HashMap<NodeId, Vec<Claim<E>>>,
-    ) -> Result<Vec<(NodeId, Vec<(usize, &Claim<E>)>)>> {
-        let mut claims = Vec::new();
-        let mut input_edges = BTreeSet::new();
-        for (node_id, ctx) in nodes {
-            let mut node_claims = Vec::new();
-            for (i, edge) in ctx.inputs.iter().enumerate() {
-                if edge.node.is_none() {
-                    let claims_for_node = claims_by_node
-                        .get(&node_id)
-                        .ok_or(anyhow!("Claim not found for node {node_id}"))?;
-                    node_claims.push((edge.index, &claims_for_node[i]));
-                    input_edges.insert(edge.index);
-                }
-            }
-            if !node_claims.is_empty() {
-                claims.push((node_id, node_claims));
-            }
-        }
-        ensure!(
-            !claims.is_empty(),
-            "No input claims found for the set of nodes provided"
-        );
-        ensure!(
-            *input_edges.first().unwrap() == 0
-                && *input_edges.last().unwrap() == input_edges.len() - 1,
-            "Not all input claims were found"
-        );
-        Ok(claims)
-    }
-
-    pub(crate) fn bind_outputs_to_node<'a, I: Iterator<Item = (NodeId, &'a Self)>>(
-        nodes: I,
-        num_outputs: usize,
-    ) -> anyhow::Result<BTreeMap<NodeId, Vec<usize>>> {
-        let mut out_nodes = BTreeMap::new();
-        let mut outputs = BTreeSet::new(); // set employed to check that we found all outputs
-        for (node_id, ctx) in nodes {
-            for out in ctx.outputs.iter() {
-                let out_indexes = out
-                    .edges
-                    .iter()
-                    .filter(|edge| edge.node.is_none())
-                    .map(|edge| {
-                        ensure!(
-                            outputs.insert(edge.index),
-                            "Output index {} found twice in the nodes of the model",
-                            edge.index
-                        );
-                        Ok(edge.index)
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                if !out_indexes.is_empty() {
-                    out_nodes.insert(node_id, out_indexes);
-                }
-            }
-            if outputs.len() == num_outputs {
-                // we already found all the outputs, so we can stop here
-                break;
-            }
-        }
-
-        ensure!(outputs.len() == num_outputs);
-
-        Ok(out_nodes)
-    }
-}
-
 pub trait OpInfo {
     /// Returns the shapes of the outputs (in the same order)
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape>;
@@ -459,7 +196,7 @@ pub trait ProveInfo {
     /// Compute the proving context for the operation
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)>;
 }
@@ -538,7 +275,7 @@ pub trait QuantizeOp {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>>;
 }
@@ -568,7 +305,7 @@ where
     /// Produces a proof of correct execution for this operation.
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
-        _node_id: NodeId,
+        _node_id: NodeID,
         _ctx: &'b Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
@@ -586,7 +323,7 @@ where
     /// Generate witness for a node where a lookup table is employed in proving
     fn gen_lookup_witness(
         &self,
-        _id: NodeId,
+        _id: NodeID,
         _ctx: &ProverContext<E, PCS>,
         _step_data: &StepData<Element, E>,
         _store: &mut GenStore,
@@ -613,33 +350,6 @@ where
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>>;
 
-    fn compute_model_output_claims<T: Transcript<E>>(
-        &self,
-        transcript: &mut T,
-        outputs: &[&Tensor<E>],
-    ) -> Vec<Claim<E>> {
-        outputs
-            .iter()
-            .map(|out| {
-                // Derive the first randomness
-                // let first_randomness = (0..out.get_data().len().ilog2())
-                //    .map(|_| transcript.sample_and_append_challenge(b"initial").elements)
-                //    .collect::<Vec<E>>();
-                let r_i = transcript.read_challenges(out.get_data().len().ilog2() as usize);
-                let first_randomness = r_i;
-                // For the output, we manually evaluate the MLE and check if it's the same as what prover
-                // gave. Note prover could ellude that but it's simpler to avoid that special check right
-                // now.
-                let output_mle = out.get_data().to_vec().into_mle();
-                let computed_sum = output_mle.evaluate(&first_randomness);
-
-                Claim {
-                    point: first_randomness,
-                    eval: computed_sum,
-                }
-            })
-            .collect()
-    }
     /// Verify the claim about the input of the model. Sometimes
     /// the input needs to be processed in a certain way before being evaluated.
     /// For example, Embeddings use one hot encoding of the input before
@@ -692,19 +402,6 @@ where
     A: AsRef<Tensor<E>>,
 {
     <V as VerifiableCtx<E, PCS>>::verify_input_claim(ctx, inputs, claims)
-}
-
-pub(crate) fn compute_model_output_claims<
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-    T: Transcript<E>,
-    V: VerifiableCtx<E, PCS>,
->(
-    ctx: &V,
-    transcript: &mut T,
-    outputs: &[&Tensor<E>],
-) -> Vec<Claim<E>> {
-    <V as VerifiableCtx<E, PCS>>::compute_model_output_claims(ctx, transcript, outputs)
 }
 
 pub(crate) fn write_proof_to_transcript<
@@ -951,78 +648,6 @@ where
                 self.describe(),
                 proof.variant_name()
             ),
-        }
-    }
-
-    fn compute_model_output_claims<T: Transcript<E>>(
-        &self,
-        transcript: &mut T,
-        outputs: &[&Tensor<E>],
-    ) -> Vec<Claim<E>> {
-        match self {
-            LayerCtx::Dense(dense_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(dense_ctx, transcript, outputs)
-            }
-            LayerCtx::MatMul(mat_mul_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(mat_mul_ctx, transcript, outputs)
-            }
-            LayerCtx::Convolution(conv_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(conv_ctx, transcript, outputs)
-            }
-            LayerCtx::Activation(activation_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(activation_ctx, transcript, outputs)
-            }
-            LayerCtx::Requant(requant_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(requant_ctx, transcript, outputs)
-            }
-            LayerCtx::Pooling(pooling_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(pooling_ctx, transcript, outputs)
-            }
-            LayerCtx::QKV(qkvctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(qkvctx, transcript, outputs)
-            }
-            LayerCtx::Mha(mha_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(mha_ctx, transcript, outputs)
-            }
-            LayerCtx::ConcatMatMul(concat_mat_mul_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(concat_mat_mul_ctx, transcript, outputs)
-            }
-            LayerCtx::LayerNorm(layernorm_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(layernorm_ctx, transcript, outputs)
-            }
-            LayerCtx::RMSNorm(rmsnorm_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(rmsnorm_ctx, transcript, outputs)
-            }
-            LayerCtx::Flatten => compute_model_output_claims::<_, PCS, _, _>(
-                &NonProvableVerifierCtx(&Flatten),
-                transcript,
-                outputs,
-            ),
-            LayerCtx::Softmax(softmax_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(softmax_ctx, transcript, outputs)
-            }
-            LayerCtx::Add(ctx) => compute_model_output_claims::<_, PCS, _, _>(
-                &NonProvableVerifierCtx(ctx),
-                transcript,
-                outputs,
-            ),
-            LayerCtx::Reshape(reshape_ctx) => compute_model_output_claims::<_, PCS, _, _>(
-                &NonProvableVerifierCtx(reshape_ctx),
-                transcript,
-                outputs,
-            ),
-            LayerCtx::Embeddings(embeddings_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(embeddings_ctx, transcript, outputs)
-            }
-            LayerCtx::Positional(positional_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(positional_ctx, transcript, outputs)
-            }
-            LayerCtx::Logits(logits_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(logits_ctx, transcript, outputs)
-            }
-            LayerCtx::AttentionMask(attention_mask_ctx) => {
-                compute_model_output_claims::<_, PCS, _, _>(attention_mask_ctx, transcript, outputs)
-            }
         }
     }
 

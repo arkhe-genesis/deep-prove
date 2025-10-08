@@ -3,16 +3,16 @@ use crate::{
     layers::{
         add,
         matrix_mul::MatMul,
-        provable::{Edge, Node},
         transformer::{
             attention::attention_mask::AttentionSpan, layernorm::LayerNorm, mha::Mha,
             positional::Positional, qkv::QKV, rmsnorm::RMSNorm,
         },
     },
+    model::NodeID,
     parser::{
         gguf::FileTensorLoader,
         json::unfuse_crate_tensors,
-        llm::{LLMVariant, NodeId},
+        llm::{LLMVariant, config::AttentionHeadType},
     },
     tensor::KeyedTensor,
 };
@@ -67,11 +67,14 @@ impl Attention<f32> {
     pub fn write_to_model(
         self,
         model: &mut Model<f32>,
-        input_node_id: Option<NodeId>,
+        input_node_id: Option<NodeID>,
         c: &LLMConfig,
         positional: Option<Positional<f32>>,
-    ) -> anyhow::Result<NodeId> {
-        let num_groups = c.num_groups();
+    ) -> anyhow::Result<NodeID> {
+        let num_groups = match c.attention_config.head {
+            AttentionHeadType::MHA => c.num_heads,
+            AttentionHeadType::GQA(num_groups) => num_groups,
+        };
         let qkv = QKV::new(
             self.q,
             self.q_bias,
@@ -92,57 +95,69 @@ impl Attention<f32> {
         // shape goes to [seq_len, hidden_size] for each, Q K and V
         last_node_id = model.add_consecutive_layer(Layer::QKV(qkv), Some(last_node_id))?;
         // QKV outputs three tensors, but we may need to apply a norm on the second and third one
-        let (mut q_id, mut q_port): (NodeId, usize) = (last_node_id, 0);
-        let (mut k_id, mut k_port): (NodeId, usize) = (last_node_id, 1);
-        let (v_id, v_port): (NodeId, usize) = (last_node_id, 2);
+        let (mut q_id, mut q_port): (NodeID, usize) = (last_node_id, 0);
+        let (mut k_id, mut k_port): (NodeID, usize) = (last_node_id, 1);
+        let (v_id, v_port): (NodeID, usize) = (last_node_id, 2);
+
+        let mha_id = model.add_layer(Layer::Mha(mha))?;
         if let LLMVariant::Gemma3 = c.variant {
             let q_norm = self.q_norm.context("in gemma3, q_norm is expected")?;
-            q_id = model.add_node(Node::new(vec![Edge::new(q_id, q_port)], q_norm.to_layer()))?;
-            q_port = 0;
+            (q_id, q_port) = {
+                let q_norm_id = model.add_layer(q_norm.to_layer())?;
+                model.add_edge(q_id, q_norm_id, (q_port, 0))?;
+                (q_norm_id, 0)
+            };
             let k_norm = self.k_norm.context("in gemma3, k_norm is expected")?;
-            k_id = model.add_node(Node::new(vec![Edge::new(k_id, k_port)], k_norm.to_layer()))?;
-            k_port = 0;
+            (k_id, k_port) = {
+                let k_norm_id = model.add_layer(k_norm.to_layer())?;
+                model.add_edge(k_id, k_norm_id, (k_port, 0))?;
+                (k_norm_id, 0)
+            };
             let rope = positional.context("in gemma3, rope is expected")?;
-            q_id = model.add_node(Node::new(
-                vec![Edge::new(q_id, q_port)],
-                // we need to build the cache
-                Layer::Positional(Positional::new_from_variant(rope.variant.clone())),
-            ))?;
-            k_id = model.add_node(Node::new(
-                vec![Edge::new(k_id, k_port)],
-                Layer::Positional(
-                    // vector k doesn't need a cache since it's always of full sequence length
+            (q_id, q_port) = {
+                // we need to build the cache for the Q tensor
+                let rope_id = model.add_layer(Layer::Positional(Positional::new_from_variant(
+                    rope.variant.clone(),
+                )))?;
+                model.add_edge(q_id, rope_id, (q_port, 0))?;
+                (rope_id, 0)
+            };
+            (k_id, k_port) = {
+                // vector k doesn't need a cache since it's always of full sequence length
+                let rope_id = model.add_layer(Layer::Positional(
                     Positional::new_from_variant(rope.variant.clone()).with_no_cache(),
-                ),
-            ))?;
+                ))?;
+                model.add_edge(k_id, rope_id, (k_port, 0))?;
+                (rope_id, 0)
+            };
+            // in Gemma3, there are distinct edges between QKV and MHA, because Q and K are suffixed with
+            // norm and rope.
+            // * first one is [num_heads, seq_len] (Q @ K^T - all heads concatenated)
+            // * second one is [num_heads, seq_len, head_dim] (V)
+            model.add_edge(q_id, mha_id, (q_port, 0))?;
+            model.add_edge(k_id, mha_id, (k_port, 1))?;
+            model.add_edge(v_id, mha_id, (v_port, 2))?;
+        } else if let LLMVariant::GPT2 = c.variant {
+            // in GPT2, there is only one edge between QKV and MHA, and QKV outputs three tensors
+            model.add_edge(q_id, mha_id, vec![(q_port, 0), (k_port, 1), (v_port, 2)])?;
         }
-        // * first one is [num_heads, seq_len] (Q @ K^T - all heads concatenated)
-        // * second one is [num_heads, seq_len, head_dim] (V)
-        let mha_id = model.add_node(Node::new(
-            vec![
-                Edge::new(q_id, q_port),
-                Edge::new(k_id, k_port),
-                Edge::new(v_id, v_port),
-            ],
-            Layer::Mha(mha),
-        ))?;
+
         last_node_id = model.add_consecutive_layer(Layer::MatMul(out), Some(mha_id))?;
         last_node_id = match self.post_norm {
             Some(norm) => model.add_consecutive_layer(norm.to_layer(), Some(last_node_id))?,
             None => last_node_id,
         };
-        last_node_id = model.add_node(Node::new(
-            vec![
-                Edge {
-                    // here we dont know if the input is the input to the model or an input coming from previous layers
-                    // so if there is no layer before this attention, we take the input of the model
-                    node: input_node_id,
-                    index: 0,
-                },
-                Edge::new(last_node_id, 0),
-            ],
-            Layer::Add(add::Add::new()),
-        ))?;
+        last_node_id = {
+            let add_id = model.add_layer(Layer::Add(add::Add::new()))?;
+            match input_node_id {
+                Some(id) => model.add_edge(id, add_id, (0, 0))?,
+                // in this case, this is the input to the model
+                None => model.set_input(add_id, 0)?,
+            };
+            model.add_edge(last_node_id, add_id, (0, 1))?;
+            add_id
+        };
+
         let pre_ffn_residual_id = last_node_id;
         last_node_id =
             model.add_consecutive_layer(self.pre_ffn_norm.to_layer(), Some(last_node_id))?;
@@ -151,13 +166,12 @@ impl Attention<f32> {
             Some(norm) => model.add_consecutive_layer(norm.to_layer(), Some(last_node_id))?,
             None => last_node_id,
         };
-        last_node_id = model.add_node(Node::new(
-            vec![
-                Edge::new(pre_ffn_residual_id, 0),
-                Edge::new(last_node_id, 0),
-            ],
-            Layer::Add(add::Add::new()),
-        ))?;
+        last_node_id = {
+            let add_id = model.add_layer(Layer::Add(add::Add::new()))?;
+            model.add_edge(pre_ffn_residual_id, add_id, (0, 0))?;
+            model.add_edge(last_node_id, add_id, (0, 1))?;
+            add_id
+        };
         Ok(last_node_id)
     }
     // Replaces from_var_builder and from_tensor_loader

@@ -11,12 +11,12 @@ use crate::{
     layers::{
         LayerCtx, LayerProof,
         provable::{
-            Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp,
-            QuantizeOutput, VerifiableCtx,
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+            VerifiableCtx,
         },
         transformer::mha::eval_zeroifier_mle,
     },
-    model::StepData,
+    model::{NodeID, StepData},
     padding::{PaddingMode, ShapeInfo},
     quantization::Fieldizer,
     tensor::IntoBTensor,
@@ -495,7 +495,7 @@ impl QuantizeOp for AttentionMask<f32> {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         _data: &S::AuxData,
-        _node_id: NodeId,
+        _node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
         // Ensure we have some scaling factors
@@ -527,7 +527,7 @@ impl QuantizeOp for AttentionMask<f32> {
 impl ProveInfo for AttentionMask<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         // We need the previous output shapes to compute the sumcheck expressions
@@ -587,7 +587,7 @@ fn build_sumcheck_expression<E: ExtensionField>(
 pub struct AttentionMaskCtx<E: ExtensionField> {
     pub op: AttentionMask<Element>,
     pub sumcheck_expression: Vec<Expression<E>>,
-    pub node_id: NodeId,
+    pub node_id: NodeID,
 }
 
 impl<E: ExtensionField> AttentionMaskCtx<E> {
@@ -595,7 +595,7 @@ impl<E: ExtensionField> AttentionMaskCtx<E> {
     pub fn new(
         op: AttentionMask<Element>,
         sumcheck_expression: Vec<Expression<E>>,
-        node_id: NodeId,
+        node_id: NodeID,
     ) -> Self {
         AttentionMaskCtx {
             op,
@@ -643,7 +643,7 @@ where
 
     fn prove<'a, 'b, 'c, 'd, T: transcript::Transcript<E>>(
         &'a self,
-        node_id: NodeId,
+        node_id: NodeID,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -1297,7 +1297,7 @@ mod tests {
             model
                 .add_consecutive_layer(Layer::AttentionMask(mask), None)
                 .unwrap();
-            model.route_output(None).unwrap();
+            model.automatic_output_labelling().unwrap();
             let model = padding::pad_model(model)?;
             let input = Tensor::random(&input_shape);
             let padded_input = input.pad_next_power_of_two();
@@ -1411,7 +1411,7 @@ mod tests {
             .add_consecutive_layer(Layer::AttentionMask(mask), Some(id))
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
         Ok(())

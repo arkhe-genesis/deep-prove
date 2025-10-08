@@ -12,8 +12,7 @@ use crate::{
     layers::{
         LayerCtx, LayerProof,
         provable::{
-            NodeId, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp, QuantizeOutput,
-            VerifiableCtx,
+            PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp, QuantizeOutput, VerifiableCtx,
         },
         transformer::mha::eval_zeroifier_mle,
     },
@@ -25,7 +24,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::StepData,
+    model::{NodeID, StepData},
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{IntoElement, TensorFielder},
     to_bit_sequence_le,
@@ -65,7 +64,7 @@ pub struct ArgmaxData<E> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogitsCtx {
     lookup_ctx: LayerLookupContext,
-    node_id: NodeId,
+    node_id: NodeID,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -301,7 +300,7 @@ impl OpInfo for Logits {
 impl ProveInfo for Logits {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         ensure!(
@@ -330,7 +329,7 @@ impl QuantizeOp for Logits {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         // no need to quantize, we just propagate the scaling factors
@@ -383,7 +382,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -541,7 +540,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -959,7 +958,7 @@ mod test {
             .add_consecutive_layer(Layer::Logits(Logits::Argmax), None)
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         prove_model(model, &mut GenStore::default()).unwrap();
     }
@@ -976,7 +975,7 @@ mod test {
             .add_consecutive_layer(Layer::Logits(Logits::Argmax), None)
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         let inputs = Tensor::zeros(input_shape);
 
         prove_model_with(model, vec![inputs], &mut GenStore::default()).unwrap();

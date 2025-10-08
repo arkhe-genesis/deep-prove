@@ -63,8 +63,8 @@ pub enum LLMVariant {
 pub struct AttentionConfig {
     // A vector, one for each attention layer. Easier to directly store all of them
     // rather than indicating which ones are global and which ones are local.
-    span: Vec<AttentionSpan>,
-    head: AttentionHeadType,
+    pub span: Vec<AttentionSpan>,
+    pub head: AttentionHeadType,
 }
 
 /// The type of attention that is used in the model. Support for MHA and GQA for now.

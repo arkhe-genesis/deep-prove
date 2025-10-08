@@ -1,37 +1,49 @@
-use std::collections::{BTreeMap, HashMap};
+use crate::{
+    graph::{PortID, Ports, Source, Target},
+    layers::{NodeOut, provable::ProvingData},
+};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::{GenStore, GenericStore, StoreError};
+use tenstore::{GenStore, GenericStore};
 use trace::Trace;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::{
     Shape, Tensor,
+    graph::{Direction, Edge, GenericNodeID, Graph, IntoVecUsize, PortLink},
     layers::{
         Layer,
-        provable::{Edge, Evaluate, Node, NodeCtx, NodeId, OpInfo},
+        provable::{Evaluate, OpInfo},
         requant::Requant,
     },
     number::Number,
     padding::PaddingMode,
     quantization::InferenceTracker,
     tensor::DryTensor,
-    try_unzip,
 };
 
-pub(crate) mod iterator;
+mod context;
 pub mod llm;
 pub(crate) mod trace;
 pub mod transform;
-pub use iterator::ToIterator;
+pub use context::ModelCtx;
 pub use trace::{InferenceStep, InferenceTrace, StepData};
+
+pub type NodeID = crate::graph::DefaultNodeID;
+pub type ModelEdge = Edge<NodeID, ()>;
+
+/// Graph of layers. We store no weights on the edges.
+/// TODO?: maybe make a graph wrapper that deals with empty weights
+pub type ModelGraph<N> = Graph<Layer<N>, (), NodeID>;
 
 /// Represents a model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model<N> {
-    pub(crate) nodes: HashMap<NodeId, Node<N>>,
+    pub(crate) graph: ModelGraph<N>,
+    // pub(crate) nodes: HashMap<NodeID, Node<N>>,
     pub(crate) input_shapes: Vec<Shape>,
     pub(crate) unpadded_input_shapes: Vec<Shape>,
 }
@@ -42,9 +54,9 @@ where
 {
     /// Returns an iterator over the nodes in the model, in arbitrary order.
     /// It is more efficient then `ForwardIterator` and `BackwardIterator`, so it
-    /// can be used to iterate over the nodes when the order does not matter.
-    pub fn to_unstable_iterator(&self) -> impl Iterator<Item = (&NodeId, &Node<N>)> {
-        self.nodes.iter()
+    /// can be used to iterate over the nodes when the order does not matter
+    pub fn to_unstable_iterator(&self) -> impl Iterator<Item = (&NodeID, &Layer<N>)> {
+        self.graph.nodes()
     }
 
     /// Utility method to pad the inputs shapes to the next power of two.
@@ -63,7 +75,7 @@ where
             PaddingMode::Padding => Self::compute_padded_input_shapes(&unpadded_input_shapes),
         };
         Self {
-            nodes: HashMap::new(),
+            graph: ModelGraph::new(),
             input_shapes,
             unpadded_input_shapes,
         }
@@ -72,10 +84,10 @@ where
     pub(crate) fn new(
         unpadded_input_shapes: Vec<Shape>,
         padding: PaddingMode,
-        nodes: HashMap<NodeId, Node<N>>,
+        nodes: ModelGraph<N>,
     ) -> Self {
         let mut model = Self::new_from_input_shapes(unpadded_input_shapes, padding);
-        model.nodes = nodes;
+        model.graph = nodes;
 
         model
     }
@@ -88,12 +100,12 @@ where
     pub fn new_from_shapes(
         unpadded_input_shapes: Vec<Shape>,
         actual_input_shapes: Vec<Shape>,
-        nodes: HashMap<NodeId, Node<N>>,
+        nodes: ModelGraph<N>,
     ) -> Self {
         Self {
             unpadded_input_shapes,
             input_shapes: actual_input_shapes,
-            nodes,
+            graph: nodes,
         }
     }
 
@@ -139,8 +151,8 @@ where
 
     /// iterates over all layers and resets their internal state if any
     pub fn reset(&self) {
-        for (_, node) in self.nodes.iter() {
-            node.operation.reset();
+        for (_, node) in self.graph.nodes() {
+            node.reset();
         }
     }
 
@@ -165,253 +177,270 @@ where
         info!("Model description:");
         info!("Unpadded input shapes: {:?}", self.unpadded_input_shapes);
         info!("Padded input shapes: {:?}", self.padded_input_shapes());
-        for (idx, layer) in self.to_forward_iterator() {
-            info!("\t- {}: {}", idx, layer.operation.describe());
-            info!("\t\t- {}: {:?}", idx, layer.inputs);
-            info!("\t\t- {}: {:?}", idx, layer.outputs);
+        for (id, layer) in self.graph.forward_iter() {
+            let edges = self
+                .graph
+                .node_neighbors(&id, Direction::Any)
+                .map(|(_, edge)| edge)
+                .collect::<Vec<_>>();
+            info!("\t- {}: {}", id, layer.describe());
+            info!("\t\t- edges: {:?}", edges);
+        }
+        info!("Input nodes:");
+        for (idx, offset) in self.graph.input_nodes() {
+            info!("\t- {}:{:?}", idx, offset);
         }
         info!("Output nodes:");
-        for (idx, node) in self.output_nodes() {
-            info!("\t- {}:{:?}", idx, node.outputs);
+        for (idx, offset) in self.graph.output_nodes() {
+            info!("\t- {}:{:?}", idx, offset);
         }
     }
 
     /// Add re-quantization nodes to the model after the node with id `input_node_id`
     /// It creates as many requant layers as there are output wires of the input node
-    pub(crate) fn add_requant_nodes(
+    pub(crate) fn add_requant_layer(
         &mut self,
         requants: Vec<Requant>,
-        input_node_id: NodeId,
-    ) -> anyhow::Result<Vec<NodeId>> {
-        let input_node = self
-            .nodes
-            .get(&input_node_id)
-            .ok_or(anyhow!("Node {input_node_id} not found in the model"))?;
-        let num_outputs = input_node.outputs.len();
-        // we want to create new requant nodes for each output of the input node. That means we need to
-        // create one output edge from input_node to new requant_node and need to copy the associated output wire
-        let requant_nodes = input_node
-            .outputs
-            .iter()
-            .enumerate()
-            .zip(requants.into_iter())
-            .map(|((i, wire), requant)| {
-                let in_edge = Edge::new(input_node_id, i);
-                // let input_edges = wire
-                //     .edges
-                //     .iter()
-                //     .map(|_| Edge::new(input_node_id, i))
-                //     .collect();
-                // OUTPUT EDGES: We simply copy the output wires of input_node since they are the same.
-                // NOTE here we enforce that one requant  == one output wire. Later we might want to revisit that assumption if needed.
-                let output_wires = wire.clone();
-                Ok(Node::new_with_outputs(
-                    vec![in_edge],
-                    Layer::Requant(requant),
-                    vec![output_wires],
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        debug!(
-            "Requant insertion: from input node {}: inputs: {:?}, outputs: {:?}",
-            input_node_id,
-            self.nodes.get(&input_node_id).unwrap().inputs,
-            self.nodes.get(&input_node_id).unwrap().outputs
+        input_node_id: NodeID,
+    ) -> anyhow::Result<Vec<NodeID>> {
+        ensure!(
+            self.graph.node(&input_node_id).is_some(),
+            "Node {input_node_id} not found in the model"
         );
-        // remove edges from outputs of `input_node` - BEFORE adding the requant nodes to the model, since
-        // that action will append to the input_node.outputs.
-        // safe unwrap because already did it before - redo it here for borrowing safety reasons
-        self.nodes.get_mut(&input_node_id).unwrap().outputs = vec![Default::default(); num_outputs];
-        let requant_ids = requant_nodes
-            .into_iter()
-            .map(|node| self.add_node(node))
-            .collect::<Result<Vec<_>>>()?;
-        debug!(
-            "Requant insertion: requant nodes: {:?}",
-            requant_ids
-                .iter()
-                .map(|id| {
-                    let requant_node = self.nodes.get(id).unwrap();
-                    format!(
-                        "id: {:?}, inputs: {:?}, outputs: {:?}",
-                        id, requant_node.inputs, requant_node.outputs
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
+        // here we collect port links from the source port, since we add one requant _per source port_ only
+        let source_edge_per_requant = self
+            .graph
+            .neighbors(&input_node_id, Direction::Outgoing)
+            .fold(BTreeMap::new(), |mut acc, (_, edge)| {
+                for port in edge.ports().iter() {
+                    #[allow(clippy::clone_on_copy)]
+                    acc.entry(port.source_port.clone())
+                        .or_insert(Vec::new())
+                        .push((edge.target().clone(), port.target_port.clone()));
+                }
+                acc
+            });
+        // enforce one requant per source port
+        ensure!(
+            source_edge_per_requant.len() == requants.len(),
+            "Unexpected number of requants: expected {}, found {}",
+            source_edge_per_requant.len(),
+            requants.len()
         );
-        // route inputs of the nodes using outputs of `input_node_id` to the newly inserted
-        // requant node
-        for requant_id in requant_ids.iter() {
-            let requant_node = self.nodes.get(requant_id).ok_or(anyhow!(
-                "Requant node {requant_id} just inserted not found in the model"
-            ))?;
-            for (i, wire) in requant_node.outputs.clone().iter().enumerate() {
-                // change inputs of each node using this output wire
-                wire.edges.iter().filter(|edge| edge.node.is_some()).try_for_each(|edge|{
-                    let node_id = edge.node.unwrap();
-                    let node = self.nodes.get_mut(&node_id).ok_or(
-                        anyhow!("Node {node_id}, which should use an output of requant node {requant_id}, not found in model")
-                    )?;
-                    ensure!(edge.index < node.inputs.len(),
-                        "Node {node_id} has {} inputs, so cannot access input {}",
-                        node.inputs.len(),
-                        edge.index,
-                    );
-                    // check that this input was indeed referring to an output of input_node_id
-                    let input_edge = &mut node.inputs[edge.index];
-                    ensure!(input_edge.node.ok_or(
-                        anyhow!("{} input of node {node_id} should not be an input of the model", edge.index)
-                    )? == input_node_id,
-                        "{} input of node {node_id} should be {input_node_id}", edge.index
-                    );
-                    // replace `input_node_id` with `requant_id`
-                    input_edge.node = Some(*requant_id);
-                    input_edge.index = i;
-                    Ok(())
-                })?;
-            }
+        // we can already delete the outgoing edges from the input node now that we have collected all info necessary
+        // to do the link with requants layers
+        let edges_to_remove = self
+            .graph
+            .neighbors(&input_node_id, Direction::Outgoing)
+            .map(|(edge_id, _)| *edge_id)
+            .collect::<Vec<_>>();
+        for edge_id in edges_to_remove {
+            self.graph.remove_edge(&edge_id)?;
         }
-        Ok(requant_ids)
+
+        let requant_nodes = source_edge_per_requant
+            .into_iter()
+            .zip(requants.into_iter())
+            .map(|((source_port, targets), requant)| {
+                // we take the next node id and add + 1. We can't let the graph generate the id since it might
+                // generate an id that already exists in the graph since we can generate the graph
+                // we specific node ids that might not be consecutive.
+                // TODO: maybe make the graph choose it for us?
+                let last_node_id = *self.graph.nodes().last().unwrap().0;
+                let requant_node_id = NodeID::from(*last_node_id + 1);
+                // first add the requant node to be able to reference it later when modifying the edges of the model
+                self.graph
+                    .add_node_with_id(requant_node_id, Layer::Requant(requant))?;
+                // we create this new port link as the edge from input node -> requant
+                // Given there is only **one** portlink on **one** edge between input_node_id and this requant, we always
+                // set target_port to 0, e.g. first slot.
+                self.graph
+                    .add_edge(input_node_id, requant_node_id, (*source_port, 0), None)?;
+                // we create this new port link as the edge from requant -> output
+                // here we wanna take exactly the same as the currently existing ones, as if requant took the place
+                // of the input node. Since source port can be connected to multiple target ports and we can only
+                // insert a node _once_ then we index by edge_id first.
+                let portlinks_by_edge_id =
+                    targets
+                        .into_iter()
+                        .fold(HashMap::new(), |mut acc, (target, target_port)| {
+                            acc.entry(target).or_insert(Vec::new()).push(*target_port);
+                            acc
+                        });
+                for (target, target_ports) in portlinks_by_edge_id.into_iter() {
+                    // add all the port links from requant -> successor
+                    // NOTE: we enuemrate here since a source_port could be 1 but requant port starts at 0. In the end
+                    // it doesn't matter which port we put on the requant, as long as the target port is the same as in the
+                    // original graph and they're used in the same order.
+                    let links = target_ports
+                        .iter()
+                        // Requant should always have one output port since it comes from a single source port on the node
+                        .map(|target_port| (0, *target_port))
+                        .collect::<Vec<_>>();
+                    let edge =
+                        Edge::new(Source::Node(requant_node_id), target.clone(), links, None);
+                    self.graph.add_edges_raw(vec![edge])?;
+                }
+                Ok(requant_node_id)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(requant_nodes)
+    }
+
+    pub fn num_outputs(&self, node_id: &NodeID) -> anyhow::Result<usize> {
+        let Some(node) = self.graph.node(node_id) else {
+            anyhow::bail!("Node {node_id} not found in model");
+        };
+        // how many targetports are attached to this node, e.g. how many inputs
+        // does it receive
+        let input_ports = self
+            .graph
+            .neighbors(node_id, Direction::Incoming)
+            .flat_map(|(_, edge)| edge.ports().iter())
+            .fold(HashSet::new(), |mut acc, port| {
+                acc.insert(port.target_port);
+                acc
+            })
+            .len();
+        Ok(node.num_outputs(input_ports))
     }
 
     /// Corner-case method to add a node whose inputs correspond to the outputs of a node already inserted in the model
-    /// The `NodeId` of the already inserted node is the `previous_node_id` input; if no id is provided, it is assumed
+    /// The `NodeID` of the already inserted node is the `previous_node_id` input; if no id is provided, it is assumed
     /// that the inputs of the node correspond to the inputs of the model
     pub fn add_consecutive_layer(
         &mut self,
         layer: Layer<N>,
-        previous_node_id: Option<NodeId>,
-    ) -> anyhow::Result<NodeId> {
+        previous_node_id: Option<NodeID>,
+    ) -> anyhow::Result<NodeID> {
+        // We need to correctly connect the outputs of the previous node to the inputs of the new node
+        // For this we need to know how many outputs the previous node has
+        // To know this, we need to count how many target ports are attached to the previous node, so the number
+        // of inputs the previous node receives, and then call the `num_outputs` methods with that number.
         let num_outputs = if let Some(id) = &previous_node_id {
-            let previous_node = self
-                .nodes
-                .get(id)
-                .ok_or(anyhow!("Node {id} not found in model"))?;
-            previous_node.outputs.len()
+            self.num_outputs(id)?
         } else {
-            // correspond to inputs of the model
-            self.input_shapes.len()
+            // look at the number of port links from inputs
+            self.input_shapes().len()
         };
 
-        let new_node = Node::new(
-            (0..num_outputs)
-                .map(|i| Edge {
-                    node: previous_node_id,
-                    index: i,
-                })
-                .collect(),
-            layer,
-        );
-        self.add_node(new_node)
+        let new_node_id = self.graph.add_node(layer)?;
+        match previous_node_id {
+            Some(id) => {
+                // map i-th port of previous node to i-th port of new node
+                let links = (0..num_outputs)
+                    .map(|i| PortLink::new(i, i))
+                    .collect::<Vec<_>>();
+                self.graph.add_edge(id, new_node_id, links, ())?;
+            }
+            None => {
+                self.graph.set_input(new_node_id, 0..num_outputs, ())?;
+            }
+        };
+        Ok(new_node_id)
     }
-
-    /// Add the node provided as input to the model. The id of the added node is
-    /// computed inside this method and returned as output
-    pub fn add_node(&mut self, node: Node<N>) -> anyhow::Result<NodeId> {
-        let node_id: NodeId = (0..self.nodes.len() + 1)
-            .find(|i| !self.nodes.contains_key(&NodeId::from(*i)))
-            .ok_or(anyhow!("No valid node id found for new node"))?
-            .into();
-        self.add_node_with_id(node_id, node)?;
-        Ok(node_id)
+    pub fn add_layer(&mut self, layer: Layer<N>) -> anyhow::Result<NodeID> {
+        self.graph.add_node(layer)
     }
 
     /// Add the node provided as input to the model, binding it to the `node id`
     /// provided as input
-    pub fn add_node_with_id(&mut self, node_id: NodeId, node: Node<N>) -> anyhow::Result<()> {
-        // iterate over the inputs of the node and add the edges to the outputs of
-        // corresponding nodes already in the model
-        for (i, input_edge) in node.inputs.iter().enumerate() {
-            if let Some(input_node_id) = &input_edge.node {
-                let input_node = self.nodes.get_mut(input_node_id).ok_or(anyhow!(
-                    "Node {input_node_id} for input {i} of new node not found in model",
-                ))?;
-                ensure!(
-                    input_edge.index < input_node.outputs.len(),
-                    "Specified output number {} for node {}, which has only {} outputs",
-                    input_edge.index,
-                    input_node_id,
-                    input_node.outputs.len(),
-                );
-                input_node.outputs[input_edge.index].edges.push(Edge {
-                    node: Some(node_id),
-                    index: i,
-                });
-            }
-        }
-
-        self.nodes.insert(node_id, node);
-
-        Ok(())
+    pub fn add_layer_with_id(&mut self, node_id: NodeID, layer: Layer<N>) -> anyhow::Result<()> {
+        self.graph.add_node_with_id(node_id, layer)
     }
 
-    // Label the edges provided as input as the output edges of the model. If no edge is provided,
-    // then the method assumes there is a node without routed output edges, and the outputs of
+    pub fn set_input<I: IntoVecUsize>(
+        &mut self,
+        node_id: NodeID,
+        input_index: I,
+    ) -> anyhow::Result<()> {
+        self.graph.set_input(node_id, input_index, ()).map(|_| ())
+    }
+
+    pub fn set_output<I: IntoVecUsize>(
+        &mut self,
+        node_id: NodeID,
+        output_index: I,
+    ) -> anyhow::Result<()> {
+        self.graph.set_output(node_id, output_index, ()).map(|_| ())
+    }
+
+    pub fn add_edge<P: Into<Ports>>(
+        &mut self,
+        source: NodeID,
+        target: NodeID,
+        ports: P,
+    ) -> anyhow::Result<()> {
+        self.graph.add_edge(source, target, ports, ()).map(|_| ())
+    }
+
+    pub fn add_raw_edge<S: Into<Source<NodeID>>, T: Into<Target<NodeID>>, P: Into<Ports>>(
+        &mut self,
+        source: S,
+        target: T,
+        ports: P,
+    ) -> anyhow::Result<()> {
+        let portlinks = ports.into();
+        // a bit of weirdness when you don't have weights, you still need to specify the type of the weight
+        let edge = Edge::new(source, target, portlinks, Option::<()>::None);
+        self.graph.add_edges_raw(vec![edge]).map(|_| ())
+    }
+
+    /// Shortcut method for onnx to add an edge where the source can be either an input or another node.
+    /// onnx doesn't differentiate between the two, e.g. an input also has an ID so we first check
+    /// inside the model if the provided source is an input or a node.
+    /// TODO/XXX: make that part of graph?
+    pub fn add_maybe_input<S: Into<NodeID>, P: Into<Ports>>(
+        &mut self,
+        source: S,
+        target: NodeID,
+        ports: P,
+    ) -> anyhow::Result<()> {
+        let source_id = source.into();
+        let input = match self.graph.node(&source_id).is_some() {
+            false => Source::Input,
+            true => source_id.into(),
+        };
+        self.add_raw_edge(input, target, ports)
+    }
+
+    // This method assumes there is a node without routed output edges, and the outputs of
     // this node will be labelled as the output edges of the model
-    pub fn route_output(&mut self, output_edges: Option<Vec<Edge>>) -> Result<()> {
-        if let Some(output_edges) = output_edges {
-            for (out_index, edge) in output_edges.iter().enumerate() {
-                let out_node_id = edge
-                    .node
-                    .ok_or(anyhow!("Provided output edge with no input node"))?;
-                let out_node = self
-                    .nodes
-                    .get_mut(&out_node_id)
-                    .ok_or(anyhow!("Node {out_node_id} not found"))?;
-                ensure!(
-                    edge.index < out_node.outputs.len(),
-                    "Specified output {} for node {out_node_id}, but only {} outputs found",
-                    edge.index,
-                    out_node.outputs.len()
-                );
-                out_node.outputs[edge.index].edges.push(Edge {
-                    node: None,
-                    index: out_index,
-                })
-            }
-        } else {
-            // find the node with no output edges, which will be considered the output node
-            let out_node = self.nodes.iter_mut().find(|(_id, node)| {
-                node.outputs
-                    .iter()
-                    .all(|out| out.clone() == Default::default())
-            });
-            ensure!(out_node.is_some(), "No output node found for model");
-            let node = out_node.unwrap().1;
-            node.outputs.iter_mut().enumerate().for_each(|(i, out)| {
-                out.edges = vec![Edge {
-                    node: None,
-                    index: i,
-                }]
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Return the set of output nodes, that are nodes where at least one output
-    /// tensor is an output of the model
-    pub(crate) fn output_nodes(&self) -> Vec<(NodeId, &Node<N>)> {
-        self.nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                if node
-                    .outputs
-                    .iter()
-                    .all(|wire| wire.edges.iter().any(|edge| edge.node.is_none()))
-                {
-                    Some((*id, node))
+    pub fn automatic_output_labelling(&mut self) -> Result<()> {
+        // find the nodes with no output edges, which will be considered the output nodes
+        let out_nodes = self
+            .graph
+            .nodes()
+            .filter_map(|(id, _node)| {
+                if self.graph.neighbors(id, Direction::Outgoing).count() == 0 {
+                    Some(*id)
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        ensure!(!out_nodes.is_empty(), "No output node found for model");
+        // for each node, we collect how many outputs it will produce and set corresponding output edges
+        let mut output_offset_index = 0;
+        for node_id in out_nodes {
+            let num_outputs = self.num_outputs(&node_id)?;
+            self.graph.set_output(
+                node_id,
+                output_offset_index..(output_offset_index + num_outputs),
+                (),
+            )?;
+            output_offset_index += num_outputs;
+        }
+        Ok(())
     }
 
-    /// Returns the order the [NodeIds](NodeId) will be visited in a forward pass
-    pub fn eval_order(&self) -> Vec<NodeId> {
-        self.to_forward_iterator().map(|(id, _)| id).collect()
+    pub fn output_nodes(&self) -> impl Iterator<Item = (&NodeID, &Ports)> + use<'_, N> {
+        self.graph.output_nodes()
+    }
+
+    /// Returns the order the [NodeIDs](NodeID) will be visited in a forward pass
+    pub fn eval_order(&self) -> impl Iterator<Item = NodeID> + use<'_, N> {
+        self.graph.forward_iter().map(|(id, _)| id)
     }
 }
 
@@ -435,133 +464,157 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
         E::BaseField: Serialize + DeserializeOwned,
         Layer<N>: Evaluate<N>,
     {
-        let mut padded_input_shapes = HashMap::new();
-        // Store the inputs in the store
-        store
-            .store_many(
-                inputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, tensor)| {
-                        let key = crate::layers::provable::Edge::tkey_for_input::<N>(None, i);
-                        padded_input_shapes.insert(key.clone(), tensor.shape().clone());
-                        Ok((key, tensor.data_vec()))
-                    })
-                    .collect::<Result<Vec<_>, StoreError>>()?
-                    .as_slice(),
-            )
-            .context("creating root inputs")?;
-
+        // Collect all the shapes indexed by the tensor key, across the whole inference
+        let mut input_shape_register = HashMap::new();
+        // collect all input dry tensors
+        let mut input_dry_tensors = BTreeMap::new();
+        // collect all (Source::Input, source_port) to generate the tensor keys and therefore the dry tensors
+        // NOTE: This is currently sufficient because we create keys only from (source, source_port) since
+        // that defines uniquely a tensor in the model.
+        let source_ports =
+            self.graph
+                .input_nodes()
+                .fold(HashSet::new(), |mut acc, (_id, ports)| {
+                    // we want to create one key per input so we make sure we don't have duplicates using the hashmap.
+                    // duplicates can occur if an input is used in multiple target ports/node.
+                    for port in ports.iter() {
+                        acc.insert(port.source_port);
+                    }
+                    acc
+                });
+        // now for each source port, we collect all the input tensors and store them in the store and the trace
+        // TODO: iterator-ize this loop - borrow checker is unhappy currently
+        for source_port in source_ports.into_iter() {
+            let input_shape = inputs[*source_port].shape().clone();
+            // re-create artificially the edge to derive its tensor keys, one key per source port
+            // NOTE: see `to_tensor_keys` for more info but basically:
+            // * we use DefaultNodeID(0) since that is the _target node id_ and it's not used to derive the tensor key
+            // * 0 as target port is ok since it's not used to derive the tensor key
+            let edge = Edge::<NodeID, ()>::input(NodeID::from(0), (*source_port, 0), None);
+            // unwrap is safe since there is at least one key since we gave one port link
+            let tensor_key = edge.to_tensor_keys().into_iter().next().unwrap().1;
+            // save the key => shape relation
+            input_shape_register.insert(tensor_key.clone(), input_shape.clone());
+            // save the tensor to the store
+            store.store(&tensor_key, inputs[*source_port].data_vec())?;
+            // save the input dry tensors to store in the trace
+            input_dry_tensors.insert(
+                source_port,
+                DryTensor::new(tensor_key.clone(), input_shape.clone()),
+            );
+        }
+        let input_dry_tensors = input_dry_tensors.into_values().collect::<Vec<_>>();
         let mut trace = Trace {
             store: store.clone(),
             steps: HashMap::new(),
-            input: inputs
-                .iter()
-                .enumerate()
-                .map(|(i, tensor)| {
-                    let key = crate::layers::provable::Edge::tkey_for_input::<N>(None, i);
-                    DryTensor::new(key, tensor.shape().clone())
-                })
-                .collect(),
+            input: input_dry_tensors,
             output: vec![],
         };
-        let iter = self.to_forward_iterator();
+        let iter = self.graph.forward_iter();
 
         for (node_id, node) in iter {
-            let (inputs, unpadded_input_shapes): (Vec<_>, Vec<_>) =
-                try_unzip(node.inputs.iter().map(|edge| {
-                    Ok(if let Some(n) = &edge.node {
-                        let Some(step) = trace.get_step(n) else {
-                            anyhow::bail!("Node {n} not found in trace");
+            // need to collect all the inputs keys and shapes to run the next node
+            let (unpadded_input_shapes, input_keys): (Vec<_>, Vec<_>) = self
+                .graph
+                .neighbors(&node_id, Direction::Incoming)
+                .try_fold(BTreeMap::new(), |mut acc, (_id, edge)| {
+                    let keys = edge.to_tensor_keys();
+                    // if it is an edge between nodes,fetch the input shape from the trace
+                    let shapes_array = if let Some(source_id) = edge.source_id() {
+                        let Some(step) = trace.get_step(source_id) else {
+                            anyhow::bail!("Node {source_id} not found in trace as predecessors of node {node_id}");
                         };
-
-                        let out_shape = step.step_data.unpadded_output_shapes[edge.index].clone();
-                        (edge.tensor_key_as_input::<N>(), out_shape)
+                        &step.step_data.unpadded_output_shapes
                     } else {
-                        (
-                            edge.tensor_key_as_input::<N>(),
-                            unpadded_input_shapes
-                                .as_ref()
-                                .unwrap_or(&self.unpadded_input_shapes())[edge.index]
-                                .clone(),
-                        )
-                    })
-                }))?;
-            let node_output = node
-                .run(
+                        // otherwise fetch the input shape from the model or arg
+                        &unpadded_input_shapes
+                            .as_ref()
+                            .unwrap_or(&self.unpadded_input_shapes())
+                            .clone()
+                    };
+                    for link in edge.ports().iter() {
+                        // get the associated key from this link
+                        let key = keys.get(link).ok_or(anyhow!("Key for link {link:?} not found"))?.clone();
+                        // then associate it with the shape (note we take the output port of the predecessor)
+                        let shape = shapes_array[*link.source_port].clone();
+                        // we collect all that and sort it by the target_port, since this is what defines the natural
+                        // order of the inputs expected by the layer
+                        acc.insert(link.target_port, (shape,key));
+                    }
+                    Ok(acc)
+                })?.into_values().unzip();
+            // now we can run the node
+            let (mut output_per_port, proving_data) = self
+                .run_layer(
                     node_id,
-                    inputs.as_slice(),
+                    input_keys.as_slice(),
                     &unpadded_input_shapes,
-                    &padded_input_shapes,
+                    &input_shape_register,
                     &mut tracker,
                     store,
                 )
-                .context(format!(
-                    "Error occurred at node ID: {node_id}: {}",
-                    node.describe()
-                ))?;
-            padded_input_shapes.extend(
-                node_output
-                    .outputs
-                    .iter()
-                    .map(|t| (t.key().to_owned(), t.shape().to_owned())),
-            );
+                .context(format!("Error occurred at node ID: {node_id}"))?;
+            // even if the outputs are supposedly already sorted by the layers, better be safe.
+            output_per_port.sort_by_key(|(source_port, _)| *source_port);
+            // update the shape register with the shapes of the outputs of the node so next node can load its input from the input shape register
+            input_shape_register.extend(output_per_port.iter().map(|(_, dry_tensor)| {
+                (dry_tensor.key().to_owned(), dry_tensor.shape().to_owned())
+            }));
+            // Record the step into the trace
             let new_step = StepData {
-                node_inputs: inputs
+                node_inputs: input_keys
                     .iter()
-                    .map(|k| DryTensor::new(k.clone(), padded_input_shapes[k].clone()))
+                    .map(|k| DryTensor::new(k.clone(), input_shape_register[k].clone()))
                     .collect(),
-                node_outputs: node_output,
+                node_outputs: NodeOut::new(
+                    output_per_port
+                        .into_iter()
+                        .map(|(_, dry_tensor)| dry_tensor)
+                        .collect(),
+                    proving_data,
+                ),
                 unpadded_output_shapes: node
-                    .operation
                     .output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding),
                 unpadded_input_shapes,
             };
             trace.new_step(
                 node_id,
                 InferenceStep {
-                    op: &node.operation,
+                    op: node,
                     step_data: new_step,
                 },
             );
         }
 
         // compute the output tensor from the outputs of the output nodes
-        let output_nodes = self.output_nodes();
-        let mut outputs = BTreeMap::new();
-        for (id, out_node) in output_nodes {
+        let output_nodes = self.graph.output_nodes();
+        let mut outputs = BTreeMap::<usize, DryTensor<N>>::new();
+        for (id, ports) in output_nodes {
             let node_outputs = trace
-                .get_step(&id)
+                .get_step(id)
                 .ok_or(anyhow!("Output node {id} not found in trace"))?
                 .outputs();
             ensure!(
-                node_outputs.len() == out_node.outputs.len(),
-                "Number of outputs found in trace ({}) for node {id} is different from number of expected outputs ({})",
+                node_outputs.len() >= ports.len(),
+                "Number of outputs found in trace ({}) for node {id} is smaller from number of expected outputs ({})",
                 node_outputs.len(),
-                out_node.outputs.len()
+                ports.len()
             );
-            for (i, wire) in out_node.outputs.iter().enumerate() {
-                if let Some(out_index) = wire.edges.iter().find_map(|edge| {
-                    if edge.node.is_none() {
-                        Some(edge.index)
-                    } else {
-                        None
-                    }
-                }) {
-                    // if this output wire is an output of the model, insert in the collection of the
-                    // model outputs, paired with the index among the outputs of the model
-                    ensure!(
-                        outputs.insert(out_index, node_outputs[i].clone()).is_none(),
-                        "Trying to insert twice an output value for the same index {out_index}"
-                    );
-                }
+            for link in ports.iter() {
+                // if this output wire is an output of the model, insert in the collection of the
+                // model outputs, paired with the index among the outputs of the model
+                ensure!(
+                    outputs
+                        .insert(
+                            link.target_port.into(),
+                            node_outputs[*link.source_port].clone()
+                        )
+                        .is_none(),
+                    "Trying to insert twice an output value for the same index {}",
+                    link.target_port
+                );
             }
         }
-        // check that all outputs have been found
-        ensure!(
-            !outputs.is_empty(),
-            "No outputs found for the model: {outputs:?}"
-        );
         ensure!(
             *outputs.first_key_value().unwrap().0 == 0
                 && *outputs.last_key_value().unwrap().0 == outputs.len() - 1
@@ -588,13 +641,125 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
     {
         self.run_with_tracker(input, unpadded_input_shapes, None, store)
     }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn run_layer<E: ExtensionField>(
+        &self,
+        node_id: NodeID,
+        // inputs are assumed to be sorted by source port, e.g. in the order defined by the ports
+        inputs: &[TensorKey<N>],
+        unpadded_input_shapes: &[Shape],
+        input_shape_register: &HashMap<TensorKey<N>, Shape>,
+        tracker: &mut Option<&mut InferenceTracker>,
+        store: &mut GenStore,
+        // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
+    ) -> Result<(Vec<(PortID, DryTensor<N>)>, ProvingData<E>)>
+    where
+        N: Number,
+        Layer<N>: Evaluate<N>,
+    {
+        let input_tensors = inputs
+            .iter()
+            .map(|key| {
+                let data = store
+                    .fetch(key)
+                    .with_context(|| format!("fetching tensor data for tensor {key}"))
+                    .unwrap();
+                Ok(Tensor::new(input_shape_register[key].clone(), data))
+            })
+            .collect::<anyhow::Result<Vec<Tensor<N>>>>()?;
+        let input_tensors_ref = input_tensors.iter().collect::<Vec<_>>();
+        let layer = &self.graph[node_id];
+        let expected_num_outputs = layer.num_outputs(input_tensors.len());
+
+        // run the layer
+        let layer_out = layer.evaluate(&input_tensors_ref, unpadded_input_shapes)?;
+        assert!(expected_num_outputs == layer_out.outputs.len());
+
+        // the keys under which to save the output tensor of this layer. We save one tensor
+        // per source port so we index the output edges by the source port of the current node
+        let output_keys = self.graph.neighbors(&node_id, Direction::Outgoing).fold(
+            BTreeMap::new(),
+            |mut acc, (_id, edge)| {
+                // NOTE: it's ok to overwrite previous keys since they're from the same source port.
+                // currently `to_tensor_keys` returns a unique key per source port, so it's safe to overwrite
+                // in the case one source port is connected to multiple target port.
+                for (link, key) in edge.to_tensor_keys() {
+                    acc.insert(link.source_port, key);
+                }
+                acc
+            },
+        );
+        ensure!(
+            output_keys.len() >= expected_num_outputs,
+            "Number of output keys ({}) does not match expected number of outputs ({}) for node {node_id}: {},\n: input shapes are {:?}.
+            Check the output nodes are not set up correctly, one output port per output of the node.",
+            output_keys.len(),
+            self.graph.node(&node_id).unwrap().describe(),
+            expected_num_outputs,
+            unpadded_input_shapes
+        );
+        // store each output to the store and return the corresponding dry tensor
+        let outputs = output_keys
+            .iter()
+            .map(|(source_port, key)| {
+                let tensor = &layer_out.outputs[*source_port];
+                store
+                    .store(key, tensor.data_vec())
+                    .with_context(|| format!("storing outputs for tensor {key}"))?;
+                Ok((
+                    *source_port,
+                    DryTensor::new(key.clone(), tensor.shape().clone()),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // add output tensors to tracker, if any
+        if let Some(tracker) = tracker.as_mut() {
+            for (source_port, _) in output_keys.iter() {
+                tracker.track(
+                    node_id,
+                    **source_port,
+                    layer_out.outputs[*source_port].to_f32()?,
+                );
+            }
+            // track intermediate data, if any
+            if let Some(tracked_data) = layer_out.tracked_layer_data {
+                for (data_id, data) in tracked_data {
+                    tracker.track_intermediate_data(node_id, data_id, data.to_f32()?);
+                }
+            }
+        }
+
+        Ok((outputs, layer_out.proving_data))
+    }
 }
 
-/// Collection of the proving contexts of all the nodes in the model
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ModelCtx<E: ExtensionField> {
-    pub(crate) nodes: BTreeMap<NodeId, NodeCtx<E>>,
+use tenstore::TensorKey;
+trait ToTensorKeys<N> {
+    /// Returns a list of pairs containing the key and the corresponding source port.
+    /// Since every tensor key is associated with a node id and a source port, this enables to
+    /// precisely map which tensor key corresponds to which output port of a node.
+    fn to_tensor_keys(&self) -> HashMap<PortLink, TensorKey<N>>;
+}
+
+impl<N, I: GenericNodeID, W> ToTensorKeys<N> for Edge<I, W> {
+    /// Uniquely identifies any tensor by a key. Currently the key is set to be
+    /// unique "per source" since we only want to save _one_ tensor per source port.
+    /// So there is one key per source port, e.g. one key per output tensor of the source node of this edge.
+    /// NOTE: ideally we would be able to save one tensor under aliases so we could uniquely identify
+    /// any tensor by the tuple (source, source_port, target, target_port). Since a tensor
+    /// can be used in multiple target_port we don't want to save it multiple times tho. But using
+    /// this tuple we can quickly identify exactly where the tensor is in the graph.
+    fn to_tensor_keys(&self) -> HashMap<PortLink, TensorKey<N>> {
+        self.ports().iter().fold(HashMap::new(), |mut acc, link| {
+            acc.insert(
+                link.clone(),
+                TensorKey::from_str(format!("Source[{}({})]", self.source(), link.source_port)),
+            );
+            acc
+        })
+    }
 }
 
 #[cfg(test)]
@@ -609,7 +774,7 @@ pub(crate) mod test {
             dense::Dense,
             matrix_mul::{Config, MatMul, OperandMatrix},
             pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
-            provable::{Edge, Node, OpInfo, evaluate_layer},
+            provable::{OpInfo, evaluate_layer},
             requant::Requant,
         },
         number::Number,
@@ -637,7 +802,7 @@ pub(crate) mod test {
     use super::Model;
     use crate::{Element, default_transcript, tensor::Tensor};
 
-    pub(crate) type F = GoldilocksExt2;
+    pub type F = GoldilocksExt2;
     const SELECTOR_DENSE: usize = 0;
     const SELECTOR_RELU: usize = 1;
     const SELECTOR_POOLING: usize = 2;
@@ -721,7 +886,7 @@ pub(crate) mod test {
                     panic!("random selection shouldn't be in that case");
                 }
             }
-            model.route_output(None).unwrap();
+            model.automatic_output_labelling().unwrap();
             let inputs = model.input_shapes().iter().map(Tensor::random).collect();
             Ok((model, inputs))
         }
@@ -781,7 +946,7 @@ pub(crate) mod test {
                 last_node_id,
             )?;
 
-            model.route_output(None)?;
+            model.automatic_output_labelling()?;
 
             Ok((model, inputs))
         }
@@ -822,7 +987,7 @@ pub(crate) mod test {
                 Some(conv_layer),
             )
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         // TODO: have a "builder" for the model that automatically tracks the shape after each layer such that
         // we can just do model.prepare_input(&input).
@@ -867,7 +1032,7 @@ pub(crate) mod test {
         let second_id = model
             .add_consecutive_layer(Layer::Dense(dense2.clone()), Some(first_id))
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         let mut store = GenStore::default();
         let trace = model.run::<F>(&[input], None, &mut store).unwrap();
@@ -910,7 +1075,7 @@ pub(crate) mod test {
         let mut store = trace.store.clone();
         let dense_layers = model
             .to_unstable_iterator()
-            .flat_map(|(id, l)| match l.operation {
+            .flat_map(|(id, l)| match l {
                 Layer::Dense(ref dense) => Some((*id, dense.clone())),
                 _ => None,
             })
@@ -986,7 +1151,7 @@ pub(crate) mod test {
         model
             .add_consecutive_layer(Layer::Dense(Dense::new(conv1, conv2)), None)
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         let trace = model.run::<F>(&[input], None, &mut store).unwrap();
         let mut tr: BasicTranscript<F> = BasicTranscript::new(b"m2vec");
@@ -1018,7 +1183,7 @@ pub(crate) mod test {
         model
             .add_consecutive_layer(Layer::MatMul(padded_layer), None)
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
 
         let input = random_vector_quant(input_shape[0] * input_shape[1]);
@@ -1080,7 +1245,7 @@ pub(crate) mod test {
             },
         );
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         let mut store = GenStore::default();
         let trace = model.run::<F>(&[input], None, &mut store).unwrap();
@@ -1139,9 +1304,9 @@ pub(crate) mod test {
         let output_node = model
             .add_consecutive_layer(Layer::Dense(dense), Some(relu_node))
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
-        assert_eq!(model.output_nodes()[0].0, output_node);
+        assert_eq!(*model.output_nodes().next().unwrap().0, output_node);
 
         model
     }
@@ -1286,25 +1451,20 @@ pub(crate) mod test {
         let mut model =
             Model::<Element>::new_from_input_shapes(input_shapes.clone(), PaddingMode::NoPadding);
         let relu1 = model
-            .add_node(Node::new(
-                vec![Edge::new_at_edge(0), Edge::new_at_edge(1)],
-                Layer::Activation(Activation::new_relu()),
-            ))
+            .add_layer(Layer::Activation(Activation::new_relu()))
             .unwrap();
+        model.set_input(relu1, vec![0, 1]).unwrap();
         // here we take the first two outputs of relu1
         let relu2 = model
-            .add_node(Node::new(
-                vec![Edge::new(relu1, 0), Edge::new(relu1, 1)],
-                Layer::Activation(Activation::new_relu()),
-            ))
+            .add_layer(Layer::Activation(Activation::new_relu()))
             .unwrap();
+        model.add_edge(relu1, relu2, vec![(0, 0), (1, 1)]).unwrap();
         // here we only want to take the first output of relu1
         let relu3 = model
-            .add_node(Node::new(
-                vec![Edge::new(relu1, 0)],
-                Layer::Activation(Activation::new_relu()),
-            ))
+            .add_layer(Layer::Activation(Activation::new_relu()))
             .unwrap();
+        model.add_edge(relu1, relu3, vec![(0, 0)]).unwrap();
+
         let input_tensor = vec![
             Tensor::random(&input_shapes[0]),
             Tensor::random(&input_shapes[1]),
@@ -1312,24 +1472,10 @@ pub(crate) mod test {
         let test_sf = ScalingFactor::from_scale(1.0, None);
         // 2 requants, one for each outgoing output wire (one for relu2 and one for relu3)
         let requants = vec![Requant::from_scaling_factors(test_sf, test_sf, test_sf, 10); 2];
-        let requants_ids = model.add_requant_nodes(requants, relu1).unwrap();
+        let requants_ids = model.add_requant_layer(requants, relu1).unwrap();
         assert_eq!(requants_ids.len(), 2);
-        model
-            .route_output(Some(vec![
-                Edge {
-                    node: Some(relu2),
-                    index: 0,
-                },
-                Edge {
-                    node: Some(relu2),
-                    index: 1,
-                },
-                Edge {
-                    node: Some(relu3),
-                    index: 0,
-                },
-            ]))
-            .unwrap();
+        model.set_output(relu2, vec![0, 1]).unwrap();
+        model.set_output(relu3, vec![2]).unwrap();
         model
             .run::<GoldilocksExt2>(&input_tensor, None, &mut Default::default())
             .unwrap();
@@ -1357,15 +1503,9 @@ pub(crate) mod test {
             &[model.unpadded_input_shapes()[0].clone()],
             PaddingMode::NoPadding,
         )[0];
-        let first_input_dense = model
-            .add_node(Node::new(
-                vec![Edge {
-                    node: None,
-                    index: 0,
-                }],
-                Layer::Dense(dense),
-            ))
-            .unwrap();
+        let first_input_dense = model.add_layer(Layer::Dense(dense)).unwrap();
+        // set that it will consume the first input
+        model.set_input(first_input_dense, 0).unwrap();
         // add second input dense layer
         let ncols = SECOND_INPUT_SIZE;
         let nrows = 47;
@@ -1377,15 +1517,9 @@ pub(crate) mod test {
             &[model.unpadded_input_shapes()[1].clone()],
             PaddingMode::NoPadding,
         )[0];
-        let second_input_dense = model
-            .add_node(Node::new(
-                vec![Edge {
-                    node: None,
-                    index: 1,
-                }],
-                Layer::Dense(dense),
-            ))
-            .unwrap();
+        let second_input_dense = model.add_layer(Layer::Dense(dense)).unwrap();
+        model.set_input(second_input_dense, vec![1]).unwrap();
+
         // add Relu nodes
         let relu = Activation::new_relu();
         let first_relu_node = model
@@ -1414,24 +1548,10 @@ pub(crate) mod test {
             .add_consecutive_layer(Layer::Dense(dense), Some(first_relu_node))
             .unwrap();
 
-        model
-            .route_output(Some(vec![
-                Edge {
-                    node: Some(first_output_node),
-                    index: 0,
-                },
-                Edge {
-                    node: Some(second_output_node),
-                    index: 0,
-                },
-            ]))
-            .unwrap();
+        // this set automatically first_output(0) => output(0) and second_output(0) => output(1)
+        model.automatic_output_labelling().unwrap();
 
-        let out_node_ids = model
-            .output_nodes()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect_vec();
+        let out_node_ids = model.graph.output_nodes().map(|(id, _)| *id).collect_vec();
 
         assert_eq!(out_node_ids.len(), 2);
         assert!(out_node_ids.contains(&first_output_node));
@@ -1450,40 +1570,36 @@ pub(crate) mod test {
 
         // Add an input MatMul layer multiplying second with third input
         let first_input_node = model
-            .add_node(Node::new(
-                vec![Edge::new_at_edge(2), Edge::new_at_edge(1)],
-                Layer::MatMul(MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap()),
+            .add_layer(Layer::MatMul(
+                MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap(),
             ))
             .unwrap();
+        model.set_input(first_input_node, vec![2, 1]).unwrap();
 
         // Add another input MatMul layer multiplying second with first input
         let second_input_node = model
-            .add_node(Node::new(
-                vec![Edge::new_at_edge(0), Edge::new_at_edge(1)],
-                Layer::MatMul(MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap()),
+            .add_layer(Layer::MatMul(
+                MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap(),
             ))
             .unwrap();
+        model.set_input(second_input_node, vec![0, 1]).unwrap();
 
         // multiply the previous nodes
-        let _ = model
-            .add_node(Node::new(
-                vec![
-                    Edge::new(first_input_node, 0),
-                    Edge::new(second_input_node, 0),
-                ],
-                Layer::MatMul(
-                    MatMul::new_with_config(
-                        OperandMatrix::Input,
-                        OperandMatrix::Input,
-                        None,
-                        crate::layers::matrix_mul::Config::TransposeB,
-                    )
-                    .unwrap(),
-                ),
+        let third = model
+            .add_layer(Layer::MatMul(
+                MatMul::new_with_config(
+                    OperandMatrix::Input,
+                    OperandMatrix::Input,
+                    None,
+                    crate::layers::matrix_mul::Config::TransposeB,
+                )
+                .unwrap(),
             ))
             .unwrap();
-
-        model.route_output(None).unwrap();
+        model.add_edge(first_input_node, third, (0, 0)).unwrap();
+        // same shorter notation
+        model.add_edge(second_input_node, third, (0, 1)).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         prove_model(model, &mut Default::default()).unwrap();
     }
@@ -1521,32 +1637,15 @@ pub(crate) mod test {
 
         let input_node_id = model.add_consecutive_layer(input_layer, None).unwrap();
 
-        let first_out_node_id = model
-            .add_node(Node::new(
-                vec![Edge::new(input_node_id, 0)],
-                first_out_layer,
-            ))
+        let _first_out_node_id = model
+            .add_consecutive_layer(first_out_layer, Some(input_node_id))
             .unwrap();
 
-        let second_out_node_id = model
-            .add_node(Node::new(
-                vec![Edge::new(input_node_id, 0)],
-                second_out_layer,
-            ))
+        let _second_out_node_id = model
+            .add_consecutive_layer(second_out_layer, Some(input_node_id))
             .unwrap();
 
-        model
-            .route_output(Some(vec![
-                Edge {
-                    node: Some(first_out_node_id),
-                    index: 0,
-                },
-                Edge {
-                    node: Some(second_out_node_id),
-                    index: 0,
-                },
-            ]))
-            .unwrap();
+        model.automatic_output_labelling().unwrap();
 
         prove_model(model, &mut Default::default()).unwrap();
     }
@@ -1580,7 +1679,7 @@ pub(crate) mod test {
                 Some(first_layer_id),
             )
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         prove_model(model, &mut Default::default()).unwrap();
     }

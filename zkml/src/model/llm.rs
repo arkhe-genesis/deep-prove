@@ -380,17 +380,6 @@ impl Driver<Element> {
         })
     }
 
-    /// Get the size of the maximum polynomial employed when proving the LLM inference for the given `input_len`.
-    /// This size determines which context to be used to run the proving among all the possible proving contexts
-    /// for the given model
-    pub fn get_max_poly_size_for_input<E: ExtensionField>(
-        &self,
-        input_len: usize,
-    ) -> anyhow::Result<usize> {
-        self.model
-            .compute_max_poly_size::<E>(&[vec![input_len.next_power_of_two()].into()])
-    }
-
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
     /// It returns a `HashMap` which associates a given context to the maximum polynomial size supported
     /// by that context. The proper context to be used for a given input size `input_len` is found in the
@@ -435,7 +424,7 @@ impl Driver<Element> {
     {
         debug!(
             "Generating context for model with {} layers",
-            self.model.nodes.len()
+            self.model.graph.graph_order()
         );
         let (prover_ctx, verifier_ctx) = self.model.generate_contexts()?;
         Ok(LLMContext {

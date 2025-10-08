@@ -31,6 +31,7 @@ use std::cmp::Ordering;
 // Re-exports
 pub use iop::{
     Proof, ProverContext,
+    claim::Claim,
     prover::Prover,
     verifier::{IO, verify},
 };
@@ -51,27 +52,6 @@ pub(crate) mod util;
 /// 16 + log(c) = 64 => c = 2^48 columns in a dense layer
 pub type Element = i64;
 
-/// Claim type to accumulate in this protocol, for a certain polynomial, known in the context.
-/// f(point) = eval
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct Claim<E> {
-    point: Vec<E>,
-    eval: E,
-}
-
-impl<E> Claim<E> {
-    pub fn new(point: Vec<E>, eval: E) -> Self {
-        Self { point, eval }
-    }
-    pub fn mle_num_vars(&self) -> usize {
-        self.point.len()
-    }
-
-    pub fn point(&self) -> &[E] {
-        &self.point
-    }
-}
-
 impl<E: ExtensionField> From<PointAndEval<E>> for Claim<E> {
     fn from(value: PointAndEval<E>) -> Self {
         Claim {
@@ -87,28 +67,6 @@ impl<E: ExtensionField> From<&PointAndEval<E>> for Claim<E> {
             point: value.point.clone(),
             eval: value.eval,
         }
-    }
-}
-
-impl<E: ExtensionField> Claim<E> {
-    /// Pad the point to the new size given
-    /// This is necessary for passing from output of padded lookups to next dense layer proving for example.
-    /// NOTE: you can use it to pad or reduce size
-    pub fn pad(&self, new_num_vars: usize) -> Claim<E> {
-        Self {
-            eval: self.eval,
-            point: self
-                .point
-                .iter()
-                .chain(std::iter::repeat(&E::ZERO))
-                .take(new_num_vars)
-                .cloned()
-                .collect_vec(),
-        }
-    }
-
-    pub fn evaluation(&self) -> E {
-        self.eval
     }
 }
 

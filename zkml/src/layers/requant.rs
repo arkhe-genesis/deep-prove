@@ -52,8 +52,9 @@ use transcript::Transcript;
 
 use super::{
     LayerCtx,
-    provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
+    provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
 };
+use crate::model::NodeID;
 /// Constant used to identify the requantisation layer
 pub const REQUANT_LAYER: &str = "REQU";
 
@@ -87,7 +88,7 @@ pub struct Requant {
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct RequantCtx<E: ExtensionField> {
     pub requant: Requant,
-    pub node_id: NodeId,
+    pub node_id: NodeID,
     pub num_vars: usize,
     pub lookup_ctx: LayerLookupContext,
     pub sumcheck_expression: Expression<E>,
@@ -193,7 +194,7 @@ impl Evaluate<Element> for Requant {
 impl ProveInfo for Requant {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         aux.tables.insert(TableType::Range);
@@ -455,7 +456,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
@@ -469,7 +470,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -831,7 +832,7 @@ impl Requant {
         prover: &mut Prover<E, T, PCS>,
         last_claim: &Claim<E>,
         ctx: &RequantCtx<E>,
-        id: NodeId,
+        id: NodeID,
     ) -> anyhow::Result<Claim<E>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -1141,7 +1142,7 @@ mod tests {
         let _ = model
             .add_consecutive_layer(Layer::MatMul(matmul), None)
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
     }

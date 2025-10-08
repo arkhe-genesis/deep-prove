@@ -5,10 +5,8 @@ use crate::{
     Claim, Element, Shape, VectorTranscript,
     commit::identity_eval,
     iop::{context::ShapeStep, verifier::Verifier},
-    layers::{
-        hadamard,
-        provable::{NodeId, OpInfo},
-    },
+    layers::{hadamard, provable::OpInfo},
+    model::NodeID,
     padding::PaddingMode,
     tensor::{TensorKey, get_root_of_unity},
     util::from_mle_list_dimensions,
@@ -61,7 +59,7 @@ fn phi_eval<E: ExtensionField>(
 /// Info about the convolution layer derived during the setup phase
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConvCtx {
-    pub node_id: NodeId,
+    pub node_id: NodeID,
     pub kw: usize,
     pub kx: usize,
     pub real_nw: usize,

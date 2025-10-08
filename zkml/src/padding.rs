@@ -1,5 +1,7 @@
+use crate::{graph::Source, layers::provable::PadOp};
+use anyhow::Context;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -16,14 +18,14 @@ use crate::{
         flatten::Flatten,
         matrix_mul::{MatMul, OperandMatrix},
         pooling::Pooling,
-        provable::{Node, NodeId, OpInfo},
+        provable::OpInfo,
         reshape::Reshape,
         transformer::{
             mha::pad_matrix_to_ignore_mha_garbage,
             qkv::{CacheQKV, QKV},
         },
     },
-    model::{Model, ToIterator},
+    model::{Model, NodeID},
     parser::safe_maxpool2d_shape,
 };
 
@@ -145,46 +147,50 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
             })
             .collect(),
     };
-    let mut shape_infos: HashMap<NodeId, ShapeInfo> = HashMap::new();
     let unpadded_input_shapes = model.unpadded_input_shapes();
-    debug!("Padding model with {} inputs", unpadded_input_shapes.len());
-    let nodes = model
-        .into_forward_iterator()
-        .map(|(node_id, node)| -> Result<(NodeId, Node<Element>)> {
-            let shapes = node
-                .inputs
-                .iter()
-                .map(|edge| {
-                    if let Some(n) = edge.node {
-                        let si = shape_infos
-                            .get(&n)
-                            .ok_or(anyhow!("Shapes for node {n} not found"))?;
-                        ensure!(
-                            edge.index < si.shapes.len(),
-                            "Shape for input {} requested, but node {n} has only {} inputs",
-                            edge.index,
-                            si.shapes.len(),
-                        );
-                        Ok(si.shapes[edge.index].clone())
-                    } else {
-                        ensure!(
-                            edge.index < input_si.shapes.len(),
-                            "Shape for input {} requested, but model has only {} inputs",
-                            edge.index,
-                            input_si.shapes.len(),
-                        );
-                        Ok(input_si.shapes[edge.index].clone())
+    debug!(
+        "Padding model with {} inputs: shapes {:?}",
+        unpadded_input_shapes.len(),
+        unpadded_input_shapes
+    );
+    // compute all shape infos to be able to pad the model afterwards.
+    let mut shape_infos = HashMap::<NodeID, ShapeInfo>::new();
+    let padded_graph = model.graph.try_into_map_forward(|node_id, layer, edges| {
+        let all_shapes = edges
+            .iter()
+            .filter(|edge| edge.is_incoming_to(&node_id))
+            .try_fold(BTreeMap::new(), |mut acc, edge| {
+                for link in edge.ports().iter() {
+                    match edge.source() {
+                        Source::Node(source_id) => {
+                            let shape_from_source = shape_infos
+                                .get(source_id)
+                                .map(|si: &ShapeInfo| si.shapes[*link.source_port].clone())
+                                .ok_or(anyhow!("Shapes for node {source_id} not found"))?;
+                            // we want to sort the input in the order the layer expects them , so we sort by the target_port
+                            acc.insert(*link.target_port, shape_from_source);
+                        }
+                        Source::Input => {
+                            acc.insert(
+                                *link.target_port,
+                                input_si.shapes[*link.source_port].clone(),
+                            );
+                        }
                     }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut si = ShapeInfo { shapes };
-            let node = node.pad_node(&mut si)?;
-            shape_infos.insert(node_id, si);
-            Ok((node_id, node))
-        })
-        .collect::<Result<_>>()?;
-    model = Model::<Element>::new(unpadded_input_shapes, PaddingMode::Padding, nodes);
-    debug!("Padded model with {} layers", model.nodes.len());
+                }
+                anyhow::Ok(acc)
+            })?;
+        let all_shapes = all_shapes.into_values().collect();
+        let mut si = ShapeInfo { shapes: all_shapes };
+        let desc = layer.describe();
+        let padded_layer = layer
+            .pad_node(&mut si)
+            .context(format!("error padding layer {:?}: {}", node_id, desc))?;
+        shape_infos.insert(node_id, si);
+        Ok(padded_layer)
+    })?;
+    model = Model::<Element>::new(unpadded_input_shapes, PaddingMode::Padding, padded_graph);
+    debug!("Padded model with {} layers", model.graph.graph_order());
     Ok(model)
 }
 

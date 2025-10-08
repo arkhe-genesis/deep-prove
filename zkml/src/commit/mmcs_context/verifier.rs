@@ -7,8 +7,8 @@ use crate::{
         identity_eval,
         mmcs_context::{build_sumcheck_expression, table_poly_id},
     },
-    layers::provable::NodeId,
     lookup::context::TableType,
+    model::NodeID,
     tensor::TensorKey,
 };
 
@@ -74,12 +74,12 @@ where
 
 pub struct CommitmentVerifier<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// A map storing all the claims for tensors fixed by the model.
-    /// The `NodeId` is only employed to sort the claims related to the same
+    /// The `NodeID` is only employed to sort the claims related to the same
     /// static tensor, assuming that only one claim for a static tensor is
     /// produced in each node
-    model_claims: HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
+    model_claims: HashMap<TensorKey, BTreeMap<NodeID, Claim<E>>>,
     /// The list of claims about the witness
-    witness_claims: BTreeMap<NodeId, VerifierClaim<E, PCS>>,
+    witness_claims: BTreeMap<NodeID, VerifierClaim<E, PCS>>,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E, PCS> {
@@ -91,7 +91,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
     }
     pub fn add_witness_claim(
         &mut self,
-        node_id: NodeId,
+        node_id: NodeID,
         commitment: PCS::Commitment,
         claim: Vec<(Point<E>, Vec<E>)>,
     ) {
@@ -99,7 +99,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
             .insert(node_id, VerifierClaim::new(commitment, claim));
     }
 
-    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, HashMap<NodeId, Claim<E>>>) {
+    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, HashMap<NodeID, Claim<E>>>) {
         claims.into_iter().for_each(|(poly_id, claims)| {
             let poly_claims = self.model_claims.entry(poly_id).or_default();
             claims
@@ -110,7 +110,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
 
     pub fn add_table_claim(
         &mut self,
-        table_node_id: NodeId,
+        table_node_id: NodeID,
         table_type: &TableType,
         claim: Claim<E>,
     ) {
@@ -164,7 +164,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
     }
 
     fn verify_model_sumcheck<T: Transcript<E>>(
-        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
+        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeID, Claim<E>>>,
         sumcheck_proof: IOPProof<E>,
         sumcheck_evals: Vec<E>,
         commit_ctx: &CommitmentVerifierCtx<E, PCS>,

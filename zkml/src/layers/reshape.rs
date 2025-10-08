@@ -5,8 +5,9 @@ use crate::{
     iop::context::ContextAux,
     layers::{
         LayerCtx,
-        provable::{NodeId, PadOp, ProveInfo, QuantizeOp, QuantizeOutput},
+        provable::{PadOp, ProveInfo, QuantizeOp, QuantizeOutput},
     },
+    model::NodeID,
     padding::{PaddingMode, pad_reshape_layer},
 };
 use anyhow::ensure;
@@ -202,7 +203,7 @@ impl QuantizeOp for Reshape {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         _data: &S::AuxData,
-        _node_id: super::provable::NodeId,
+        _node_id: crate::model::NodeID,
         input_scaling: &[crate::ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         Ok(QuantizeOutput::new(self, input_scaling.to_vec()))
@@ -228,7 +229,7 @@ fn range_end<R: RangeBounds<usize>>(range: &R) -> Option<usize> {
 impl ProveInfo for Reshape {
     fn step_info<E: ExtensionField>(
         &self,
-        _id: NodeId,
+        _id: NodeID,
         mut aux: ContextAux,
     ) -> anyhow::Result<(super::LayerCtx<E>, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);

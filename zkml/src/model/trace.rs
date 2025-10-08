@@ -7,7 +7,8 @@ use tenstore::{GenStore, StoreError};
 
 use crate::{
     Element, IO, Shape, Tensor,
-    layers::{Layer, NodeOut, provable::NodeId},
+    layers::{Layer, NodeOut},
+    model::NodeID,
     quantization::{Fieldizer, ModelMetadata},
     tensor::DryTensor,
 };
@@ -15,7 +16,7 @@ use crate::{
 #[derive(Default, Clone)]
 pub struct Trace<'a, E: ExtensionField, N, D> {
     pub(crate) store: GenStore,
-    pub(crate) steps: HashMap<NodeId, InferenceStep<'a, E, N, D>>,
+    pub(crate) steps: HashMap<NodeID, InferenceStep<'a, E, N, D>>,
     // TODO: convert to TensorKey
     pub(crate) input: Vec<DryTensor<D>>,
     pub(crate) output: Vec<DryTensor<D>>,
@@ -30,12 +31,12 @@ where
     D: Serialize + for<'b> Deserialize<'b>,
 {
     /// Get the trace data for node `node_id`, if any
-    pub(crate) fn get_step(&self, node_id: &NodeId) -> Option<&InferenceStep<'a, E, N, D>> {
+    pub(crate) fn get_step(&self, node_id: &NodeID) -> Option<&InferenceStep<'a, E, N, D>> {
         self.steps.get(node_id)
     }
 
     /// Insert the trace data `step` about node `node_id` in the trace
-    pub(crate) fn new_step(&mut self, node_id: NodeId, step: InferenceStep<'a, E, N, D>) {
+    pub(crate) fn new_step(&mut self, node_id: NodeID, step: InferenceStep<'a, E, N, D>) {
         self.steps.insert(node_id, step);
     }
 
@@ -224,7 +225,7 @@ impl<'a, E: ExtensionField, N> InferenceStep<'a, E, N, Element> {
         &self,
         md: &ModelMetadata,
         store: GenStore,
-        node_id: NodeId,
+        node_id: NodeID,
     ) -> Result<InferenceStep<'a, E, N, f32>, StoreError> {
         Ok(InferenceStep {
             op: self.op,
@@ -237,9 +238,12 @@ impl<'a, E: ExtensionField, N> InferenceStep<'a, E, N, Element> {
 /// for each node in the model
 #[derive(Clone)]
 pub struct StepData<D, E: ExtensionField> {
+    /// Ordered by input port (e.g. target_port of the incoming edges)
     pub(crate) node_inputs: Vec<DryTensor<D>>,
     pub(crate) node_outputs: NodeOut<D, E>,
+    /// Ordered by output port (e.g. source_port of the outgoing edges)
     pub(crate) unpadded_output_shapes: Vec<Shape>,
+    /// Ordered by input port (e.g. target_port of the incoming edges)
     pub(crate) unpadded_input_shapes: Vec<Shape>,
 }
 impl<D: Serialize + for<'a> Deserialize<'a>, E: ExtensionField> StepData<D, E> {
@@ -287,7 +291,7 @@ impl<E: ExtensionField> StepData<Element, E> {
         &self,
         md: &ModelMetadata,
         store: GenStore,
-        node_id: NodeId,
+        node_id: NodeID,
     ) -> Result<StepData<f32, E>, StoreError> {
         Ok(StepData {
             node_inputs: self

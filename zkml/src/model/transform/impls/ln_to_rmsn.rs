@@ -1,20 +1,20 @@
 //! Definition of the [`RewriteRule`] to replace [`LayerNorm`] with [`RMSNorm`]
 use crate::{
     Tensor,
+    graph::{Direction, Source},
     layers::{
         Layer,
         add::ADD_LAYER,
         matrix_mul::{Config, MATMUL_LAYER, MatMul, OperandMatrix},
-        provable::{Node, NodeId},
         transformer::{
             embeddings::Embeddings,
-            layernorm::{LAYERNORM_LAYER, LayerNorm},
+            layernorm::LayerNorm,
             positional::{POSITIONAL_LAYER, Positional, PositionalVariant, absolute::Absolute},
             qkv::QKV,
             rmsnorm::RMSNorm,
         },
     },
-    model::{Model, transform::ModelTransform},
+    model::{Model, NodeID, transform::ModelTransform},
     shape::Shape,
     tensor::KeyedTensor,
 };
@@ -26,212 +26,170 @@ pub struct LayerNormToRMSNorm;
 
 impl ModelTransform<f32> for LayerNormToRMSNorm {
     fn apply(&self, mut model: Model<f32>) -> Result<Model<f32>> {
-        let eval_order = model.eval_order();
-
         // Iterate over the nodes in `eval_order`
-        for node_id in eval_order {
-            let node_short_name = model
-                .nodes
-                .get(&node_id)
-                .expect("Node should exist")
-                .operation
-                .short_name();
+        // NOTE: collecting here because then inside the loop we're mutating the graph
+        for node_id in model.eval_order().collect::<Vec<_>>().into_iter() {
+            let node = &model.graph[&node_id];
 
             // If the node isn't a LayerNorm, do nothing
-            if node_short_name != LAYERNORM_LAYER {
+            let Layer::<f32>::LayerNorm(ref layer_norm) = node else {
                 continue;
-            }
-
-            // Apply the transformation
-            let Node {
-                inputs,
-                outputs,
-                operation,
-            } = model
-                .nodes
-                .remove(&node_id)
-                .expect("Already checked LayerNorm exists");
-            let Layer::<f32>::LayerNorm(layer_norm) = operation else {
-                unreachable!("Already checked this to be LayerNorm operation")
             };
-            let LayerNorm {
-                gamma, beta, eps, ..
-            } = layer_norm;
 
+            let LayerNorm { gamma, eps, .. } = layer_norm;
+
+            let mut old_layer_norm = None;
             // Create the new RMSNorm node
-            let rms_norm = RMSNorm::<f32>::new(None, eps, Some(gamma.shape()[0]))?;
+            let rms_norm = Layer::RMSNorm(RMSNorm::<f32>::new(None, *eps, Some(gamma.shape()[0]))?);
 
-            // Modify the input and output nodes as required
-            for input_edge in inputs.iter() {
-                let input_node_id_opt = &input_edge.node;
-                if let Some(input_node_id) = input_node_id_opt {
-                    let input_node = model
-                        .nodes
-                        .get(input_node_id)
-                        .expect("Input node should exist in the model");
-                    let input_op_name = input_node.operation.short_name();
+            // at this point we dont need the immutable reference - everything below is mutable so we take back ownership
+            // of the layer norm without copying by swapping it with the new RMSNorm and then later can change the associated
+            // nodes
+            model.graph.replace_node::<Layer<f32>, _>(&node_id, |ln| {
+                old_layer_norm = Some(ln);
+                rms_norm
+            })?;
 
-                    match input_op_name {
-                        ADD_LAYER => {
-                            add_was_previous_layer(&mut model, *input_node_id)?;
-                        }
-                        POSITIONAL_LAYER => {
-                            positional_was_previous_layer(&mut model, *input_node_id)?;
-                        }
-                        layer_name => bail!("Unexpected layer type: {layer_name}"),
-                    }
-                } else {
-                    // LayerNorm should have an input node so we return an error if it doesn't
-                    bail!("Expected input node for LayerNorm, found None");
-                }
-            }
+            let Layer::<f32>::LayerNorm(LayerNorm { gamma, beta, .. }) = old_layer_norm.unwrap()
+            else {
+                unreachable!("Expected LayerNorm node");
+            };
 
             // Now we must modify the layers following LayerNorm
             // We should have a single output to the LayerNorm so we check that here
+            let mut output_edges = model
+                .graph
+                .node_neighbors(&node_id, Direction::Outgoing)
+                .map(|(_, edge)| edge)
+                .collect::<Vec<_>>();
             ensure!(
-                outputs.len() == 1,
+                output_edges.len() == 1,
                 "Expected LayerNorm to have 1 output, found {}",
-                outputs.len()
+                output_edges.len()
             );
 
-            let output_wire = &outputs[0];
+            let output_edge = output_edges.remove(0);
             // there should only be a single edge here as well
             ensure!(
-                output_wire.edges.len() == 1,
+                output_edge.ports().len() == 1,
                 "Expected LayerNorm to have 1 output edge, found {}",
-                output_wire.edges.len()
+                output_edge.ports().len()
             );
 
-            let output_edge = &output_wire.edges[0];
-            // the output edge should have a NodeId so we use that get the next node
-            let output_node_id_opt = &output_edge.node;
-            if let Some(output_node_id) = output_node_id_opt {
-                let output_node = model
-                    .nodes
-                    .get_mut(output_node_id)
-                    .expect("Output node should exist in the model");
-                *output_node = modify_subsequent_linear_layer(output_node, &gamma, &beta)?;
-            } else {
-                // The output edge should always have a node
-                bail!("Expected output node for LayerNorm, found None");
+            // the output edge should have a NodeID so we use that get the next node
+            // safe unwrap since it's guaranteed to be a node because we used node_neighbors
+            #[allow(clippy::clone_on_copy)]
+            let output_node_id = output_edge.target_id().unwrap().clone();
+            let output_node = model
+                .graph
+                .node_mut(&output_node_id)
+                .expect("Output node should exist in the model");
+            modify_subsequent_linear_layer(output_node, &gamma, &beta)?;
+
+            let input_node_ids = model
+                .graph
+                .neighbors(&node_id, Direction::Incoming)
+                .map(|(_, edge)| {
+                    let Source::Node(input_node_id) = edge.source() else {
+                        bail!("Expected input edge");
+                    };
+                    #[allow(clippy::clone_on_copy)]
+                    Ok(input_node_id.clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            // Modify the input and output nodes as required
+            for input_node_id in input_node_ids.into_iter() {
+                let input_node = &model.graph[input_node_id];
+                let input_op_name = input_node.short_name();
+                match input_op_name {
+                    ADD_LAYER => {
+                        add_was_previous_layer(&mut model, input_node_id)?;
+                    }
+                    POSITIONAL_LAYER => {
+                        positional_was_previous_layer(&mut model, input_node_id)?;
+                    }
+                    _ => bail!("Unexpected layer type: {input_op_name}"),
+                }
             }
-
-            // Now insert the RMSNorm that replaces the LayerNorm
-            let rms_node = Node {
-                inputs,
-                outputs,
-                operation: Layer::RMSNorm(rms_norm),
-            };
-
-            model.nodes.insert(node_id, rms_node);
         }
-
         Ok(model)
     }
 }
 
 /// Function used when the layer prior to [`LayerNorm`] was an Add. Checks the inputs of the Add to ensure they are
 /// either Add, [`Positional`] or [`MatMul`] and that there is at least one [`MatMul`].
-fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) -> Result<()> {
-    let input_id_opts = model
-        .nodes
-        .get(&input_node_id)
-        .expect("Input node should exist in the model")
-        .inputs
-        .iter()
-        .map(|edge| edge.node)
-        .collect::<Vec<Option<NodeId>>>();
+fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeID) -> Result<()> {
+    let input_ids = model
+        .graph
+        .node_neighbors(&input_node_id, Direction::Incoming)
+        // safe since node_neighbors only returns edges between nodes
+        .map(|(_, edge)| *edge.source_id().unwrap())
+        .collect::<Vec<_>>();
 
-    let mut seen_a_matmul = false;
-    input_id_opts.into_iter().try_for_each(|opt_id| {
-        match opt_id {
-            Some(input_node_id) => {
-                let add_input_node = model
-                    .nodes
-                    .get_mut(&input_node_id)
-                    .expect("Add input node should exist in the model");
-
-                let add_input_op_name = add_input_node.operation.short_name();
-                match add_input_op_name {
-                    MATMUL_LAYER => {
-                        // Found a LayerNorm node with an Add layer as input, which has a linear layer as input
-                        *add_input_node = modify_matrix_subtract_mean(add_input_node).unwrap();
-                        seen_a_matmul = true;
-                        Ok(())
-                    }
-                    ADD_LAYER | POSITIONAL_LAYER => Ok(()),
-
-                    _ => bail!("Expected MatMul or Add layer, found {add_input_op_name}"),
+    let seen_a_matmul = input_ids
+        .into_iter()
+        .try_fold(false, |seen_a_matmul, input_id| {
+            // safe unwrap since it's guaranteed to be a node because we used node_neighbors
+            let input_node = model.graph.node_mut(&input_id).unwrap();
+            let add_input_op_name = input_node.short_name();
+            match add_input_op_name {
+                MATMUL_LAYER => {
+                    // Found a LayerNorm node with an Add layer as input, which has a linear layer as input
+                    modify_matrix_subtract_mean(input_node)?;
+                    Ok(true)
                 }
+                ADD_LAYER | POSITIONAL_LAYER => Ok(seen_a_matmul),
+                _ => bail!("Expected MatMul or Add layer, found {add_input_op_name}"),
             }
-            None => bail!("Expected input node for Add layer, found None"),
-        }
-    })?;
-
-    if !seen_a_matmul {
-        bail!(
-            "Expected to find a MatMul layer as input to the Add layer before LayerNorm, found none"
-        );
-    }
+        })?;
+    ensure!(
+        seen_a_matmul,
+        "Expected to find a MatMul layer as input to the Add {} layer before LayerNorm, found none",
+        input_node_id
+    );
     Ok(())
 }
 
 /// Function used when the layer prior to [`LayerNorm`] was a [`Positional`]. Checks the [`Positional`] has a singular input
 /// which is an [`Embeddings`]. Then it modifies both the [`Positional`] and [`Embeddings`] layers so each row has mean 0.
-fn positional_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) -> Result<()> {
+fn positional_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeID) -> Result<()> {
     let positional_node = model
-        .nodes
-        .get_mut(&input_node_id)
+        .graph
+        .node_mut(&input_node_id)
         .expect("Input node should exist in the model");
     // If we have a positional layer we have to modify it and the preceding embeddings layer
-    *positional_node = modify_matrix_subtract_mean(positional_node)?;
+    modify_matrix_subtract_mean(positional_node)?;
 
-    // Now we need to modify the preceding embeddings layer
-    let positional_inputs = &positional_node.inputs;
+    let positional_inputs = model
+        .graph
+        .node_neighbors(&input_node_id, Direction::Incoming)
+        .collect::<Vec<_>>();
     // We check that this has length 1
     ensure!(
         positional_inputs.len() == 1,
         "Expected positional layer to have 1 input"
     );
     // Now we need to modify the preceding embeddings layer
-    let embeddings_node_id_opt = positional_inputs[0].node;
-    if let Some(embeddings_node_id) = embeddings_node_id_opt {
-        let embeddings_node = model
-            .nodes
-            .get_mut(&embeddings_node_id)
-            .expect("Embeddings node should exist in the model");
-        *embeddings_node = modify_matrix_subtract_mean(embeddings_node)?;
-    } else {
-        // The positional layer should always have an input node
-        bail!("Expected input node for positional layer, found None");
-    }
+    // safe unwrap since it's guaranteed to be a node because we used node_neighbors
+    #[allow(clippy::clone_on_copy)]
+    let embeddings_node_id = positional_inputs[0].1.source_id().unwrap().clone();
+    let embeddings_node = model
+        .graph
+        .node_mut(&embeddings_node_id)
+        .expect("Embeddings node should exist in the model");
+    modify_matrix_subtract_mean(embeddings_node)?;
     Ok(())
 }
 
 /// This function is used to modify a [`MatMul`], [`Positional`] or [`Embeddings`] layer so that the rows of the output
 /// of the layer will always have mean 0. This is done by right multiplying their respective matrices by a "mean subtraction" matrix,
 /// a square matrix with `(row_size - 1) / row_size` along the diagonal and `-1 / row_size` everywhere else.
-fn modify_matrix_subtract_mean(node: &Node<f32>) -> Result<Node<f32>> {
-    match &node.operation {
-        Layer::<f32>::MatMul(mat_mul) => modify_matmul(mat_mul).map(|new_mat_mul| Node {
-            inputs: node.inputs.clone(),
-            outputs: node.outputs.clone(),
-            operation: Layer::MatMul(new_mat_mul),
-        }),
-        Layer::<f32>::Positional(positional) => {
-            modify_positional(positional).map(|new_positional| Node {
-                inputs: node.inputs.clone(),
-                outputs: node.outputs.clone(),
-                operation: Layer::Positional(new_positional),
-            })
-        }
-        Layer::<f32>::Embeddings(embeddings) => {
-            modify_embeddings(embeddings).map(|new_embeddings| Node {
-                inputs: node.inputs.clone(),
-                outputs: node.outputs.clone(),
-                operation: Layer::Embeddings(new_embeddings),
-            })
-        }
+fn modify_matrix_subtract_mean(node: &mut Layer<f32>) -> Result<()> {
+    match node {
+        Layer::<f32>::MatMul(mat_mul) => modify_matmul(mat_mul),
+        Layer::<f32>::Positional(positional) => modify_positional(positional),
+        Layer::<f32>::Embeddings(embeddings) => modify_embeddings(embeddings),
         other => bail!(
             "Expected MatMul, Positional or Embeddings operation, found {}",
             other.short_name()
@@ -240,7 +198,7 @@ fn modify_matrix_subtract_mean(node: &Node<f32>) -> Result<Node<f32>> {
 }
 
 /// Modify the constant matrix in a [`MatMul`] layer so that the output has rows with mean 0.
-fn modify_matmul(mat_mul: &MatMul<f32>) -> Result<MatMul<f32>> {
+fn modify_matmul(mat_mul: &mut MatMul<f32>) -> Result<()> {
     match (&mat_mul.left_matrix, &mat_mul.right_matrix) {
         (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => Err(anyhow!(
             "Found layer with 2 constant matrices, which is useless as the
@@ -250,8 +208,8 @@ fn modify_matmul(mat_mul: &MatMul<f32>) -> Result<MatMul<f32>> {
             "Found MatMul with constant left matrix, this is not supported"
         )),
         (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-            let new_mat = mat.tensor.clone_and_map_tensor(|t| {
-                if let Some(Config::TransposeB) = mat_mul.config {
+            let new_mat = mat.tensor.new_map_tensor(|t| {
+                if let Some(Config::TransposeB) = &mat_mul.config {
                     mean_subtracted_matrix(&t.transpose())
                 } else {
                     mean_subtracted_matrix(t)
@@ -261,7 +219,7 @@ fn modify_matmul(mat_mul: &MatMul<f32>) -> Result<MatMul<f32>> {
             let weight_matrix = OperandMatrix::new_weight_matrix(new_mat);
             // Now we subtract the bias mean from each element of the bias
             let new_bias = mat_mul.bias.as_ref().map(|old_bias| {
-                old_bias.clone_and_map_tensor(|bias_tensor| {
+                old_bias.new_map_tensor(|bias_tensor| {
                     let bias_shape = bias_tensor.shape();
                     let bias_sum = bias_tensor.iter().sum::<f32>();
                     let bias_mean = bias_sum / bias_shape.dim(0) as f32;
@@ -274,7 +232,8 @@ fn modify_matmul(mat_mul: &MatMul<f32>) -> Result<MatMul<f32>> {
             });
 
             // No config now because we have transposed the matrix,
-            MatMul::new_internal(OperandMatrix::Input, weight_matrix, new_bias, None)
+            *mat_mul = MatMul::new_internal(OperandMatrix::Input, weight_matrix, new_bias, None)?;
+            Ok(())
         }
         (OperandMatrix::Input, OperandMatrix::Input) => Err(anyhow::anyhow!(
             "Found MatMul with 2 input matrices, this is not supported"
@@ -282,28 +241,27 @@ fn modify_matmul(mat_mul: &MatMul<f32>) -> Result<MatMul<f32>> {
     }
 }
 /// Modify the embeddings in an [`Embeddings`] layer so that the output has rows with mean 0.
-fn modify_embeddings(embeddings: &Embeddings<f32>) -> Result<Embeddings<f32>> {
+fn modify_embeddings(embeddings: &mut Embeddings<f32>) -> Result<()> {
     // The embedding is just a wrapper around a MatMul with extra info so we call modify_matmul
-    let modified_matmul = modify_matmul(&embeddings.mat)?;
-    Ok(Embeddings {
-        mat: modified_matmul,
-        ..embeddings.clone()
-    })
+    modify_matmul(&mut embeddings.mat)
 }
 
 /// Modify the positional encodings in a [`Positional`] layer so that the output has rows with mean 0.
-fn modify_positional(positional_layer: &Positional<f32>) -> Result<Positional<f32>> {
+fn modify_positional(positional_layer: &mut Positional<f32>) -> Result<()> {
     // Match on the type of positional encoding, we expect `Learned` here
-    match &positional_layer.variant {
+    *positional_layer = match &positional_layer.variant {
         PositionalVariant::Absolute(absolute) => {
             let Absolute::<f32> { positional, .. } = absolute;
-            let new_mat = positional.clone_and_map_tensor(mean_subtracted_matrix);
-            Ok(Positional::new_absolute(new_mat))
+            let new_mat = positional.new_map_tensor(mean_subtracted_matrix);
+            Positional::new_absolute(new_mat)
         }
-        PositionalVariant::Rope(_) => unimplemented!(
-            "Transformation not implemented for Rope, expected to be applicable only with Absolute positional encoding"
-        ),
-    }
+        PositionalVariant::Rope(_) => {
+            bail!(
+                "Transformation not implemented for Rope, expected to be applicable only with Absolute positional encoding"
+            );
+        }
+    };
+    Ok(())
 }
 
 /// This function calculates the mean subtraction matrix so that all the output rows have mean 0.
@@ -327,29 +285,19 @@ fn mean_subtracted_matrix(matrix: &Tensor<f32>) -> Tensor<f32> {
 
 /// This function is used to modify a [`MatMul`] or [`QKV`] layer to absorb the weights and biases from the preceding [`LayerNorm`].
 fn modify_subsequent_linear_layer(
-    node: &Node<f32>,
+    node: &mut Layer<f32>,
     weights: &Tensor<f32>,
     bias: &KeyedTensor<f32>,
-) -> Result<Node<f32>> {
-    match &node.operation {
-        Layer::<f32>::MatMul(mat_mul) => {
-            rescale_matmul(mat_mul, weights, bias).map(|new_mat_mul| Node {
-                inputs: node.inputs.clone(),
-                outputs: node.outputs.clone(),
-                operation: Layer::MatMul(new_mat_mul),
-            })
-        }
-        Layer::<f32>::QKV(qkv) => rescale_qkv_layer(qkv, weights, bias).map(|new_qkv| Node {
-            inputs: node.inputs.clone(),
-            outputs: node.outputs.clone(),
-            operation: Layer::QKV(new_qkv),
-        }),
-
-        other => Err(anyhow!(
+) -> Result<()> {
+    *node = match &node {
+        Layer::<f32>::MatMul(mat_mul) => Layer::MatMul(rescale_matmul(mat_mul, weights, bias)?),
+        Layer::<f32>::QKV(qkv) => Layer::QKV(rescale_qkv_layer(qkv, weights, bias)?),
+        other => bail!(
             "Expected MatMul or QKV operation, found {}",
             other.short_name()
-        )),
-    }
+        ),
+    };
+    Ok(())
 }
 
 /// Function that rescales the weight matrix and modifies the bias of a [`MatMul`] layer.
@@ -374,7 +322,7 @@ fn rescale_matmul(
                 mat.tensor.tensor()
             };
             // We transform the bias so it is a `1 x bias_size` matrix
-            let new_bias = bias.clone_and_map_tensor(|bias| {
+            let new_bias = bias.new_map_tensor(|bias| {
                 let mut matrix_bias = bias.clone();
                 matrix_bias.reshape(Shape::new(vec![1, bias.shape().dim(0)]));
                 let new_bias_shape = Shape::new(vec![inner_mat.ncols_2d()]);
@@ -395,7 +343,7 @@ fn rescale_matmul(
             let new_bias = mat_mul
                 .bias
                 .as_ref()
-                .map(|old_bias| old_bias.clone_and_map_tensor(|bias| bias.add(&new_bias)))
+                .map(|old_bias| old_bias.new_map_tensor(|bias| bias.add(&new_bias)))
                 .unwrap_or(new_bias);
 
             let weight_matrix = OperandMatrix::new_weight_matrix(new_mat);
@@ -452,7 +400,7 @@ fn rescale_qkv_layer(
         // If QKV does not have any bias, then we just take the one given
         let new_bias = old_bias
             .as_ref()
-            .map(|bias| bias.clone_and_map_tensor(|bias| bias.add(&new_bias)))
+            .map(|bias| bias.new_map_tensor(|bias| bias.add(&new_bias)))
             .unwrap_or(new_bias);
         weights_and_biases.push((new_mat, new_bias));
     }
@@ -479,10 +427,7 @@ mod tests {
 
     use crate::{
         init_test_logging,
-        model::{
-            ToIterator,
-            llm::{Driver, LLMTokenizerObserver},
-        },
+        model::llm::{Driver, LLMTokenizerObserver},
         parser::{
             file_cache,
             gguf::tests::GPT2_Q8_0,
@@ -538,6 +483,7 @@ mod tests {
         let driver = Driver::load_external_model(&model_path)?.with_max_context(10);
         // Extract the model
         let Driver { model, .. } = driver;
+        model.describe();
         // Make a tester input for the model so we can compare the pre and post transformation outputs
         let sentence = "The sky is";
         let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
@@ -560,10 +506,11 @@ mod tests {
         // Get the final node of the Model, we will compare the inputs to this node before and after the transformation (we compare the inputs because the outputs of this layer are tokens
         // and it may be the case that we would get the same tokens out but the actual logits are different)
         let last_model_node_id = model
-            .to_backward_iterator()
+            .graph
+            .backward_iter()
             .take(1)
             .map(|(id, _)| id)
-            .collect::<Vec<NodeId>>()[0];
+            .collect::<Vec<NodeID>>()[0];
         // Extract the input to the Logits layer before applying the transformation.
         let pre_transform_final_step = trace.get_step(&last_model_node_id).unwrap();
         let pre_transform_inputs = pre_transform_final_step

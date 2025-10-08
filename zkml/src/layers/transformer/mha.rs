@@ -14,7 +14,7 @@ use crate::{
             ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof, InputMatrixDimensions, Permutation,
         },
         provable::{
-            Evaluate, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
+            Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
             QuantizeOutput, VerifiableCtx,
         },
         reshape::{Reshape, ReshapeCtx},
@@ -26,7 +26,7 @@ use crate::{
         },
     },
     lookup::context::LookupWitnessGen,
-    model::StepData,
+    model::{NodeID, StepData},
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
     tensor::IntoBTensor,
@@ -57,7 +57,7 @@ pub struct MhaData<E: ExtensionField> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "E: ExtensionField + DeserializeOwned")]
 pub struct MhaCtx<E: ExtensionField> {
-    node_id: NodeId,
+    node_id: NodeID,
     inputs_reshape: ReshapeCtx,
     final_mul: ConcatMatMulCtx,
     softmax: SoftmaxCtx<E>,
@@ -220,7 +220,7 @@ where
     // It uses a collision-resistant hash function to pseudo-randomly select an ephemeral id
     // The id is ephemeral in the sense that it will not correspond to an actual node in the
     // model
-    fn compute_ephemeral_node_id(node_id: NodeId, domain_separator: &str) -> NodeId {
+    fn compute_ephemeral_node_id(node_id: NodeID, domain_separator: &str) -> NodeID {
         let bytes = (*node_id)
             .to_le_bytes()
             .into_iter()
@@ -235,15 +235,15 @@ where
         usize::from_be_bytes(byte_array).into()
     }
 
-    fn qk_node_id(node_id: NodeId) -> NodeId {
+    fn qk_node_id(node_id: NodeID) -> NodeID {
         Self::compute_ephemeral_node_id(node_id, "qk")
     }
     #[allow(dead_code)]
-    fn softmax_node_id(node_id: NodeId) -> NodeId {
+    fn softmax_node_id(node_id: NodeID) -> NodeID {
         Self::compute_ephemeral_node_id(node_id, "softmax")
     }
 
-    fn final_mul_node_id(node_id: NodeId) -> NodeId {
+    fn final_mul_node_id(node_id: NodeID) -> NodeID {
         Self::compute_ephemeral_node_id(node_id, "final_mul")
     }
 
@@ -409,7 +409,7 @@ impl QuantizeOp for Mha<f32> {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: crate::layers::provable::NodeId,
+        node_id: crate::model::NodeID,
         input_scaling: &[crate::ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
@@ -495,7 +495,7 @@ impl QuantizeOp for Mha<f32> {
 impl ProveInfo for Mha<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let (ctx, mut reshaped_aux) = self.inputs_reshape.step_info(
@@ -717,7 +717,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -848,7 +848,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &crate::ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         _store: &mut GenStore,
@@ -1081,7 +1081,7 @@ mod test {
             transformer::{manual_attention::GPT2Output, qkv::QKV},
         },
         model::{
-            Model, ToIterator,
+            Model,
             test::{prove_model, prove_quantized_model, quantize_model},
         },
         padding::pad_model,
@@ -1418,7 +1418,7 @@ mod test {
         let mha = Mha::new(seq_len, num_heads, head_dim).unwrap();
 
         _ = model.add_consecutive_layer(Layer::Mha(mha), None).unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         _ = prove_model(model, &mut GenStore::default()).unwrap();
     }
@@ -1470,7 +1470,7 @@ mod test {
             .add_consecutive_layer(Layer::MatMul(matmul), Some(mha_node_id))
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         // sample input for the model, and compute expected output
         let input = vec![Tensor::random(&input_shape)];
@@ -1488,8 +1488,8 @@ mod test {
         assert_eq!(outputs.len(), 1);
 
         let expected_output = outputs[0].clone();
-        for node in quantized_model.nodes.values() {
-            if let Layer::QKV(ref qkv) = node.operation {
+        for (_, node) in quantized_model.graph.nodes() {
+            if let Layer::QKV(ref qkv) = node {
                 qkv.reset_cache();
             }
         }
@@ -1653,7 +1653,7 @@ mod test {
             .add_consecutive_layer(Layer::Mha(mha), Some(qkv_node_id))
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         let inputs = vec![positioned.outputs()[0].clone()];
         let (quantized_model, inputs) = quantize_model(
@@ -1698,14 +1698,15 @@ mod test {
             .unwrap();
         println!("qkv id: {qkv_node_id}");
         println!("mha id: {_mha_id}");
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         let inputs = vec![Tensor::random(&input_shape)];
 
         let (quantized_model, inputs) =
             quantize_model(model, inputs, None, &mut GenStore::default()).unwrap();
         quantized_model
-            .to_forward_iterator()
+            .graph
+            .forward_iter()
             .for_each(|(node_id, node)| {
                 println!("node with id {node_id}, node name: {}", node.describe())
             });

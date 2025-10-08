@@ -47,11 +47,9 @@ use sumcheck::{
 use tenstore::GenStore;
 use transcript::Transcript;
 
-use crate::{quantization::BIT_LEN, tensor::Tensor};
+use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx};
+use crate::{model::NodeID, quantization::BIT_LEN, tensor::Tensor};
 
-use super::provable::{
-    Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx,
-};
 /// The short name used to identify an activation layer.
 pub const ACTIVATION_LAYER: &str = "ACTI";
 
@@ -88,7 +86,7 @@ pub struct ActivationCtx<E: ExtensionField + Serialize + DeserializeOwned> {
     pub op: Activation<Element>,
     pub lookup_context: LayerLookupContext,
     pub sumcheck_expression: Vec<Expression<E>>,
-    pub node_id: NodeId,
+    pub node_id: NodeID,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,7 +181,7 @@ impl ActivationLayer<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
         num_outputs: usize,
     ) -> anyhow::Result<QuantizeOutput<ActivationLayer<Element>>> {
@@ -213,7 +211,7 @@ impl ActivationLayer<Element> {
 
     fn lookup_witness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         activation_input: &Tensor<Element>,
         activation_output: &Tensor<Element>,
@@ -349,7 +347,7 @@ impl QuantizeOp for Activation<f32> {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[crate::ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len());
@@ -445,7 +443,7 @@ impl Evaluate<Element> for Activation<Element> {
 impl ProveInfo for Activation<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let lookup_context = match self.activation_type() {
@@ -527,7 +525,7 @@ where
 
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
-        id: NodeId,
+        id: NodeID,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -544,7 +542,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -640,7 +638,7 @@ impl Activation<Element> {
         last_claim: &Claim<E>,
         step: &ActivationCtx<E>,
         inputs: &[DryTensor<E>],
-        node_id: NodeId,
+        node_id: NodeID,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
@@ -1060,7 +1058,7 @@ mod test {
         let input_shape = vec![3, 100].into();
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
         model.add_consecutive_layer(Layer::Activation(Activation::new_gelu()), None)?;
-        model.route_output(None)?;
+        model.automatic_output_labelling()?;
         prove_model(model, &mut Default::default()).unwrap();
         Ok(())
     }
@@ -1073,7 +1071,7 @@ mod test {
             PaddingMode::NoPadding,
         );
         model.add_consecutive_layer(Activation::new_geglu().into(), None)?;
-        model.route_output(None)?;
+        model.automatic_output_labelling()?;
         prove_model(model, &mut Default::default()).unwrap();
         Ok(())
     }

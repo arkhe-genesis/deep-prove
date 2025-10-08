@@ -3,6 +3,7 @@ use serde::de::DeserializeOwned;
 use std::{cmp::Ordering, collections::HashMap};
 use tenstore::GenStore;
 
+use crate::model::NodeID;
 use anyhow::{Context, bail, ensure};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
@@ -18,7 +19,7 @@ use crate::{
     layers::{
         LayerCtx, LayerProof,
         provable::{
-            Evaluate, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+            Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
         },
         requant::{FIXED_POINT_SCALE, Requant},
@@ -55,7 +56,7 @@ impl<N: Number> Default for Add<N> {
 /// NOTE: In LLM, we assume the same scaling info regardless of the sequence length.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddCtx {
-    node_id: NodeId,
+    node_id: NodeID,
     quant_info: AddQuantInfo,
     operand_key: Option<TensorKey>,
 }
@@ -84,7 +85,7 @@ impl<N: Number> Add<N> {
 impl Add<Element> {
     pub(crate) fn prove_step<A: AsRef<Tensor<E>>, E: ExtensionField, T: Transcript<E>, PCS>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         last_claims: Vec<&Claim<E>>,
         inputs: &[A],
         prover: &mut Prover<E, T, PCS>,
@@ -463,7 +464,7 @@ impl QuantizeOp for Add<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let mut output_scalings = S::scaling_factors_for_node(data, node_id, 1);
@@ -478,7 +479,7 @@ impl QuantizeOp for Add<f32> {
 impl ProveInfo for Add<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let Some(ref quant_info) = self.quant_info else {
@@ -533,7 +534,7 @@ where
 
     fn prove<T>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -699,7 +700,7 @@ mod test {
 
             let add = Add::new();
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
-            model.route_output(None).unwrap();
+            model.automatic_output_labelling().unwrap();
             model.describe();
             prove_model(model, &mut GenStore::default()).unwrap();
         }
@@ -714,7 +715,7 @@ mod test {
             let operand = KeyedTensor::new("add_operand", Tensor::<f32>::random(&input_shape));
             let add = Add::new_with(operand, input_shape.clone());
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
-            model.route_output(None).unwrap();
+            model.automatic_output_labelling().unwrap();
             model.describe();
             prove_model(model, &mut GenStore::default()).unwrap();
         }

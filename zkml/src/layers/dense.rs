@@ -37,9 +37,10 @@ use transcript::Transcript;
 use crate::{Element, tensor::Tensor};
 
 use super::provable::{
-    Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
     VerifiableCtx,
 };
+use crate::model::NodeID;
 /// The short name used to identify a dense layer
 pub const DENSE_LAYER: &str = "DENS";
 
@@ -55,7 +56,7 @@ pub struct Dense<T> {
 /// Information stored in the context (setup phase) for this layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DenseCtx {
-    pub node_id: NodeId,
+    pub node_id: NodeID,
     pub unpadded_matrix_shape: Shape,
     pub padded_matrix_shape: Shape,
     matrix_key: TensorKey,
@@ -181,6 +182,12 @@ impl Evaluate<Element> for Dense<Element> {
             inputs.len() == 1,
             "Found more than 1 input when evaluating dense layer"
         );
+        ensure!(
+            inputs[0].shape().product() == self.matrix.shape().dim(1),
+            "incompatible dense evaluation shapes: input {:?} vs matrix {:?}",
+            inputs[0].shape(),
+            self.matrix.shape()
+        );
 
         let matrix = self.matrix.tensor().to_btensor::<2>();
         let input = inputs[0].to_flatten().to_btensor::<1>();
@@ -231,7 +238,7 @@ impl Evaluate<f32> for Dense<f32> {
 impl ProveInfo for Dense<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         // construct dimension of the polynomial given to the sumcheck
@@ -313,7 +320,7 @@ impl QuantizeOp for Dense<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len());
@@ -340,7 +347,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        id: NodeId,
+        id: NodeID,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -486,7 +493,7 @@ impl Dense<Element> {
         input: &Tensor<E>,
         output: &Tensor<E>,
         _info: &DenseCtx,
-        id: NodeId,
+        id: NodeID,
     ) -> anyhow::Result<Claim<E>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -942,7 +949,7 @@ mod test {
         let _ = model
             .add_consecutive_layer(Layer::Dense(dense), None)
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         prove_model(model, &mut GenStore::default()).unwrap();
     }

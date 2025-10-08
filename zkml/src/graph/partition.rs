@@ -1,55 +1,113 @@
+use crate::{Deserialize, Serialize, graph::PortID};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     hash::Hash,
 };
 
-use anyhow::{Context, bail, ensure};
-use petgraph::{Direction, visit::EdgeRef};
+use anyhow::{bail, ensure};
+
+use crate::graph::{DefaultNodeID, GenericNodeID};
 
 use super::{
-    Colored, Edge, Graph, GraphNode, NodeIdx, RunnableGraph, executor::Executor,
-    scheduler::GraphScheduler,
+    executor::Executor,
+    graph::Direction,
+    scheduler::{Colored, ExecGraph, ExecNode, GraphScheduler},
 };
 
-/// A partition of graph contains the subgraph whose nodes all share the same color.
-/// The idea is that one worker on a network will receive multiple partitions and will execute them
-/// one by one. Each time receiving inputs to drive a new partition to completion and each time outputting
-/// outputs to send to other workers/partitions such that the whole graph can be executed to completion.
+/// A partition represents a subgraph of nodes that share the same color and can be executed together.
+///
+/// Partitions are the fundamental unit of distributed execution. Each partition contains:
+/// - A subgraph of nodes with the same color
+/// - Information about parent and child partitions for coordination
+/// - Input data (for source partitions) or dependency information
+///
+/// The partitioning scheme enables distributed execution where different workers
+/// can execute different partitions concurrently, with coordination happening
+/// through partition outputs and inputs.
+///
+/// # Type Parameters
+///
+/// * `N` - The executable node type implementing [`ExecNode`]
+/// * `C` - The color type used for partitioning
+/// * `NodeID` - The node identifier type (defaults to [`DefaultNodeID`])
+///
+/// # Examples
+///
+/// ```rust
+/// # use zkml::graph::partition::Partition;
+/// # use zkml::graph::{Graph, scheduler::ExecGraph};
+/// # use std::collections::BTreeSet;
+/// // Partitions are typically created through graph partitioning
+/// // See ExecGraph::partition_by_color for examples
+/// ```
 #[derive(Debug, Clone)]
-pub struct Partition<N: GraphNode, C> {
-    /// The color of the partition.
+pub struct Partition<N: ExecNode, C, NodeID = DefaultNodeID> {
+    /// The color identifier for this partition - all nodes in the partition share this color
     color: C,
-    /// A partition is still a colored graph. The option is only to allow consuming the graph
-    /// inside the partition scheduler without cloning.
-    graph: Option<RunnableGraph<N, C>>,
-    /// When a partition is done, its output needs to be sent to a parent partition if any.
+    /// The executable subgraph for this partition
+    ///
+    /// Uses Option to allow consuming the graph during execution without cloning.
+    /// The graph contains only nodes with the same color as this partition.
+    graph: Option<ExecGraph<N, C, NodeID>>,
+    /// The color of the parent partition that should receive this partition's output
+    ///
+    /// `None` if this partition produces the final output of the entire computation.
     parent_partition: Option<C>,
-    /// The "parent partition" when it receives all the outputs of its children partitions, it must
-    /// give them in the right order to the scheduler. Since child partitions outputs may come at any time,
-    /// this field is used to determine the ordering. The C is the color of the child partition - since the
-    /// partition is made in such a way that no partitions of the same color are connected to each other
-    /// (that wouldn't be a partition anymore).
+    /// Set of child partition colors whose outputs this partition depends on
+    ///
+    /// When this partition executes, it must wait for outputs from all child partitions.
+    /// The ordering is maintained through the BTreeSet to ensure deterministic execution.
     child_partition: BTreeSet<C>,
-
-    /// A partition have a list of inputs if they're a "source" partition, i.e. a partition which contains
-    /// nodes that have no predecessors. If not, the vector is simply empty.
+    /// Input data for source partitions
+    ///
+    /// Source partitions (those with no child partitions) receive external input data.
+    /// Non-source partitions have empty inputs and wait for child partition outputs.
     inputs: Vec<N::IO>,
 }
 
-impl<N: GraphNode, C> Partition<N, C>
+impl<NodeID, N: ExecNode, C> Partition<N, C, NodeID>
 where
     C: Ord + Clone,
+    NodeID: GenericNodeID,
+    <N as ExecNode>::IO: Clone,
 {
+    /// Creates a new partition with the specified parameters.
+    ///
+    /// # Parameters
+    ///
+    /// * `color` - The color identifier for this partition
+    /// * `graph` - The executable subgraph containing nodes of this color
+    /// * `child_partition` - Set of child partition colors this partition depends on
+    /// * `inputs` - Input data (only for source partitions)
+    /// * `parent_partition` - Color of parent partition (None for final output)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The graph doesn't have exactly one output node
+    /// - The parent partition color is the same as this partition's color
+    /// - The child partitions contain this partition's color
+    /// - Input/output constraints are violated (source partitions need inputs, others don't)
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::partition::Partition;
+    /// # use zkml::graph::{Graph, scheduler::ExecGraph};
+    /// # use std::collections::BTreeSet;
+    /// // Partitions are typically created through the partitioning process
+    /// // rather than manually constructed
+    /// ```
     pub fn new(
         color: C,
-        graph: RunnableGraph<N, C>,
+        graph: ExecGraph<N, C, NodeID>,
         child_partition: BTreeSet<C>,
         inputs: Vec<N::IO>,
         parent_partition: Option<C>,
     ) -> anyhow::Result<Self> {
         ensure!(
-            graph.output_nodes().len() == 1,
+            graph.output_nodes().count() == 1,
             "graph should have exactly one output node"
         );
         if let Some(ref parent_color) = parent_partition {
@@ -79,60 +137,163 @@ where
             parent_partition,
         })
     }
+    /// Returns true if this is a source partition (has external inputs).
+    ///
+    /// Source partitions are those that receive external input data and have no
+    /// child partitions to wait for. They can begin execution immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::partition::Partition;
+    /// # use zkml::graph::{Graph, scheduler::ExecGraph};
+    /// # use std::collections::BTreeSet;
+    /// // For a partition with inputs
+    /// // assert!(partition.is_source_partition());
+    ///
+    /// // For a partition without inputs (waits for child outputs)
+    /// // assert!(!partition.is_source_partition());
+    /// ```
     pub fn is_source_partition(&self) -> bool {
         !self.inputs.is_empty()
     }
 }
 
-/// The output of a partition that must be given to a parent partition.
+/// Represents the output produced by a partition after execution.
+///
+/// Partition outputs are used to coordinate execution between partitions in a
+/// distributed setting. Each output contains the result data and routing information
+/// to determine where the output should be sent next.
+///
+/// # Type Parameters
+///
+/// * `N` - The executable node type implementing [`ExecNode`]
+/// * `C` - The color type used for partition identification
+///
+/// # Examples
+///
+/// ```rust
+/// # use zkml::graph::partition::PartitionOutput;
+/// // Outputs are typically created by the partition scheduler
+/// // during execution, not constructed manually
+/// ```
 #[derive(Debug, Clone)]
-pub struct PartitionOutput<N: GraphNode, C> {
-    /// The color of the partition that generated this output.
+pub struct PartitionOutput<N: ExecNode, C> {
+    /// The color of the partition that produced this output
     from: C,
-    /// The color of the partition that must receive this output.
-    /// If None, it means the output is a final output of the graph.
+    /// The color of the partition that should receive this output
+    ///
+    /// `None` indicates this is a final output of the entire computation
     to: Option<C>,
-    /// The output of the partition. Given we are forcing the graph to be partitioned such that there
-    /// is only maximum one edge between each pair of partition, there is only one output possible for each partition.
-    /// However, note that a partition can have multiple _inputs_ if connected to multiple children partitions.
+    /// The actual output data produced by the partition
+    ///
+    /// Due to the partitioning constraint of at most one edge between partition pairs,
+    /// each partition produces exactly one output. However, partitions can have
+    /// multiple inputs from different child partitions.
     output: N::IO,
 }
 
-impl<N: GraphNode, C> PartitionOutput<N, C> {
+impl<N: ExecNode, C> PartitionOutput<N, C> {
+    /// Returns true if this output represents the final result of the computation.
+    ///
+    /// Final outputs have no destination partition (`to` is `None`) and represent
+    /// the completed result that should be returned to the caller.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::partition::PartitionOutput;
+    /// // For a final output
+    /// // assert!(output.is_final_output());
+    ///
+    /// // For an intermediate output
+    /// // assert!(!output.is_final_output());
+    /// ```
     pub fn is_final_output(&self) -> bool {
         self.to.is_none()
     }
 }
 
-/// A scheduler that is able to run multiple disjoint partitions of the same graph.
-/// This is useful for distributed execution where a node can execute some tasks at the beginning,
-/// and then get some other tasks later from the graph that are disconnected from the first tasks.
-/// For example, it allows multiple round trips during the distributed execution of the graph.
-pub struct PartitionScheduler<N: GraphNode, C, E: Executor<N, C>> {
-    /// The different partitions of the graph who share the same color
-    /// There is always only one partition that is "active" at a time.
-    /// Indeed, if we could run multiple partitions at the same time, then we wouldn't need
-    /// to have two partitions in the first place, because they could be aggregated into one
-    /// single graph with all nodes sharing the same color.
+/// A scheduler for executing multiple partitions of a graph in sequence.
+///
+/// The partition scheduler manages the execution of a series of partitions that belong
+/// to the same color/worker. It handles:
+/// - Sequential execution of partitions (only one active at a time)
+/// - Coordination with child partitions through input/output passing
+/// - State management for pending outputs from child partitions
+///
+/// This scheduler is designed for distributed execution scenarios where a single
+/// worker may need to execute multiple disconnected partitions over time, with
+/// coordination happening between different workers through partition outputs.
+///
+/// # Type Parameters
+///
+/// * `N` - The executable node type implementing [`ExecNode`]
+/// * `C` - The color type used for partition identification
+/// * `E` - The executor type for running individual partitions
+///
+/// # Examples
+///
+/// ```rust
+/// # use zkml::graph::partition::PartitionScheduler;
+/// # use zkml::graph::executor::SequentialExecutor;
+/// // Schedulers are typically created with partitions from graph partitioning
+/// // See the test cases for complete usage examples
+/// ```
+pub struct PartitionScheduler<N: ExecNode, C, E: Executor<N, C>> {
+    /// Queue of partitions to be executed in order
+    ///
+    /// Only one partition is active at a time. If multiple partitions could run
+    /// simultaneously, they would be merged into a single partition during the
+    /// partitioning process.
     partitions: Vec<Partition<N, C>>,
-    /// The config of the executor to run each partition individually.
-    /// NOTE: it's a design decision to have an executor inside the scheduler since a partition
-    /// is meant to be fully self-contained and executable. There is no need to expose to the API
-    /// the internal nodes of the partition, as the graph scheduler would do. An outside executor
-    /// is still necessary to run all the partitions of the graph to completion.
+    /// Configuration for the executor used to run each partition
+    ///
+    /// The executor is embedded in the scheduler because partitions are designed
+    /// to be self-contained execution units. This encapsulation hides the internal
+    /// node structure from external APIs.
     executor_config: E::Config,
-    /// The child outputs that are pending to be received.
+    /// Buffer for outputs received from child partitions
+    ///
+    /// Maps child partition colors to their output data. The scheduler waits
+    /// for all required child outputs before executing the next partition.
     pending_child_outputs: HashMap<C, N::IO>,
-    /// The context of the executor to run each partition individually.
+    /// Execution context shared across all partition executions
     context: N::Context,
 }
 
 impl<N, C, E> PartitionScheduler<N, C, E>
 where
-    N: GraphNode + Clone,
+    N: ExecNode + Clone,
     C: PartialEq + Eq + Clone + Hash + Ord + Debug,
     E: Executor<N, C>,
+    <N as ExecNode>::IO: Clone + for<'a> Deserialize<'a> + Serialize + Debug,
 {
+    /// Creates a new partition scheduler with the given partitions and configuration.
+    ///
+    /// # Parameters
+    ///
+    /// * `partitions` - Vector of partitions to execute in order
+    /// * `context` - Execution context for running partition nodes
+    /// * `executor_config` - Configuration for the partition executor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The partitions vector is empty
+    /// - Any partition doesn't have a graph
+    /// - Any partition doesn't have exactly one output node
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::partition::PartitionScheduler;
+    /// # use zkml::graph::executor::SequentialExecutor;
+    /// // Typically created with partitions from graph.partition_by_color()
+    /// // let scheduler = PartitionScheduler::<MyNode, usize, SequentialExecutor>::new(
+    /// //     partitions, context, executor_config
+    /// // ).unwrap();
+    /// ```
     pub fn new(
         partitions: Vec<Partition<N, C>>,
         context: N::Context,
@@ -146,7 +307,7 @@ where
         ensure!(
             partitions
                 .iter()
-                .all(|p| p.graph.as_ref().unwrap().output_nodes().len() == 1),
+                .all(|p| p.graph.as_ref().unwrap().output_nodes().count() == 1),
             "All partitions must have exactly one output node"
         );
         Ok(Self {
@@ -156,12 +317,38 @@ where
             context,
         })
     }
-    /// if the current partition has no inputs, it means it is a "source" partition, i.e. a partition which contains
-    /// only links to other child partitions. In this case, there is nothing to run until we fetch the outputs of the
-    /// child partitions.
-    /// if the current partition has inputs, it means it is a "sink" partition, i.e. a partition which contains
-    /// actual graph input data. In this case, we need to run the partition and return the ready nodes.
-    /// If the output is None, that means it needs to wait for other partitions to send their outputs.
+    /// Attempts to execute the next partition in the queue.
+    ///
+    /// This method checks if the next partition is ready to run and executes it if possible.
+    /// The readiness depends on the partition type:
+    ///
+    /// - **Source partitions**: Have input data and can run immediately
+    /// - **Non-source partitions**: Must wait for all child partition outputs
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(output))` - Partition executed successfully, returns its output
+    /// - `Ok(None)` - Partition not ready (waiting for child outputs) or no partitions left
+    /// - `Err(_)` - Execution error
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::partition::PartitionScheduler;
+    /// # use zkml::graph::executor::SequentialExecutor;
+    /// // let mut scheduler = PartitionScheduler::new(partitions, context, config).unwrap();
+    /// //
+    /// // while !scheduler.is_done() {
+    /// //     if let Some(output) = scheduler.try_run_partition().unwrap() {
+    /// //         // Handle partition output
+    /// //         if output.is_final_output() {
+    /// //             println!("Final result: {:?}", output.output);
+    /// //         } else {
+    /// //             // Send to next partition/worker
+    /// //         }
+    /// //     }
+    /// // }
+    /// ```
     pub fn try_run_partition(&mut self) -> anyhow::Result<Option<PartitionOutput<N, C>>> {
         if self.partitions.is_empty() {
             return Ok(None);
@@ -216,6 +403,36 @@ where
         }
     }
 
+    /// Provides output from a child partition to this scheduler.
+    ///
+    /// When a child partition completes execution, its output must be provided
+    /// to parent partitions that depend on it. This method stores the output
+    /// until all required child outputs are available.
+    ///
+    /// # Parameters
+    ///
+    /// * `output` - The output from a completed child partition
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output is from an unexpected child partition
+    /// (not in the current partition's child set).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::partition::{PartitionScheduler, PartitionOutput};
+    /// # use zkml::graph::executor::SequentialExecutor;
+    /// // let mut scheduler = PartitionScheduler::new(partitions, context, config).unwrap();
+    /// // let child_output = PartitionOutput { /* ... */ };
+    /// //
+    /// // scheduler.set_child_partition_output(child_output).unwrap();
+    /// //
+    /// // // Now try to run the partition that was waiting for this output
+    /// // if let Some(result) = scheduler.try_run_partition().unwrap() {
+    /// //     // Partition executed with the child output
+    /// // }
+    /// ```
     pub fn set_child_partition_output(
         &mut self,
         output: PartitionOutput<N, C>,
@@ -239,49 +456,131 @@ where
         Ok(())
     }
 
+    /// Returns true if all partitions have been executed.
+    ///
+    /// A scheduler is done when its partition queue is empty, meaning all
+    /// partitions assigned to this scheduler have completed execution.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::partition::PartitionScheduler;
+    /// # use zkml::graph::executor::SequentialExecutor;
+    /// // let mut scheduler = PartitionScheduler::new(partitions, context, config).unwrap();
+    /// //
+    /// // while !scheduler.is_done() {
+    /// //     // Execute partitions...
+    /// // }
+    /// // println!("All partitions completed!");
+    /// ```
     pub fn is_done(&self) -> bool {
         self.partitions.is_empty()
     }
 }
 
-impl<N, C> RunnableGraph<N, C>
+impl<NodeID, N, C> ExecGraph<N, C, NodeID>
 where
     C: PartialEq + Eq + Clone + Hash + Ord + Debug,
-    N: GraphNode + Clone + Debug,
+    N: ExecNode + Clone + Debug,
     N::IO: Clone,
+    NodeID: GenericNodeID,
+    <N as ExecNode>::IO: Clone + Debug,
 {
+    /// Partitions the graph by node colors for distributed execution.
+    ///
+    /// This method splits the graph into independent partitions where each partition
+    /// contains only nodes of the same color. The resulting partitions can be
+    /// executed on different machines or workers.
+    ///
+    /// # Parameters
+    ///
+    /// * `inputs` - External input data for the graph
+    ///
+    /// # Returns
+    ///
+    /// A map from colors to vectors of partitions. Multiple partitions with the
+    /// same color can exist if they are disconnected subgraphs.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::{Graph, scheduler::ExecGraph};
+    /// # use std::collections::HashMap;
+    /// // let graph: ExecGraph<MyNode, usize> = create_colored_graph();
+    /// // let inputs = vec![input_data1, input_data2];
+    /// //
+    /// // let partitions = graph.partition_by_color(inputs).unwrap();
+    /// //
+    /// // // Execute partitions on different workers
+    /// // for (color, color_partitions) in partitions {
+    /// //     // Send color_partitions to worker responsible for this color
+    /// // }
+    /// ```
+    #[allow(clippy::type_complexity)]
     pub fn partition_by_color(
         &self,
         inputs: Vec<N::IO>,
-    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C>>>> {
+    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C, NodeID>>>> {
         self.partition_by(|node| node.color(), inputs)
     }
-    /// Extract color-connected subgraphs.
-    /// Returns, for each partition, a fresh Graph containing just that partition.
+    /// Partitions the graph using a custom color extraction function.
+    ///
+    /// This is the general partitioning method that allows custom logic for
+    /// determining node colors. It performs a depth-first search to find
+    /// connected components of the same color and creates partitions from them.
+    ///
+    /// # Parameters
+    ///
+    /// * `node_color` - Function to extract the color from a colored node
+    /// * `inputs` - External input data for the graph
+    ///
+    /// # Returns
+    ///
+    /// A map from colors to vectors of partitions, where each partition is
+    /// a connected subgraph of nodes with the same color.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Performs DFS from each unvisited node to find color-connected components
+    /// 2. Creates subgraphs for each component
+    /// 3. Establishes parent-child relationships between partitions
+    /// 4. Sets up input/output edges for coordination
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use zkml::graph::{Graph, scheduler::ExecGraph};
+    /// # use std::collections::HashMap;
+    /// // Custom color extraction (e.g., based on node properties)
+    /// // let partitions = graph.partition_by(
+    /// //     |node| &node.custom_color_field(),
+    /// //     inputs
+    /// // ).unwrap();
+    /// ```
+    #[allow(clippy::type_complexity)]
     pub fn partition_by(
         &self,
         node_color: impl Fn(&Colored<N, C>) -> &C,
         inputs: Vec<N::IO>,
-    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C>>>> {
+    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C, NodeID>>>> {
         let mut visited = HashSet::new();
         // for each color, we keep a list of its partitions:
         // first element is the vector graphs for all partitions
         // second element is the associated mapping original_graph_index => new_partition_index
-        let mut map = BTreeMap::<C, Vec<(RunnableGraph<N, C>, HashMap<NodeIdx, NodeIdx>)>>::new();
+        let mut map = BTreeMap::<C, Vec<ExecGraph<N, C, NodeID>>>::new();
 
         // We start itearting from the input nodes of the original graph, so we create the partitions "in order",
         // starting from the lower partitions to the higher ones as this is the order of the execution of the graph.
         let indices = self
-            .input_nodes
-            .keys()
-            .cloned()
-            .chain(self.graph.node_indices())
+            .input_nodes()
+            .map(|(node_id, _)| node_id)
+            .chain(self.nodes().map(|(node_id, _)| node_id))
             .collect::<BTreeSet<_>>();
         for node in indices.into_iter() {
             if visited.contains(&node) {
                 continue;
             }
-            let color = node_color(&self.graph[node]);
+            let color = node_color(&self[node]);
 
             // Try to reach all nodes from this given node using DFS and
             // only keep the ones having the same color
@@ -293,73 +592,77 @@ where
                     continue;
                 }
                 partition.push(n);
-                for (_, neighbor, _) in self.neighbors(n) {
+                for (_, edge) in self.node_neighbors(n, Direction::Any) {
                     // there is a directly connected node sharing the same color, so it's part
                     // of the same partition.
-                    if node_color(&self.graph[neighbor]) == color {
-                        stack.push(neighbor);
+                    // unwrap is safe since we filtered out the edges that are not between nodes
+                    let other_end = edge.other_end(n).unwrap();
+                    if node_color(&self[other_end]) == color {
+                        stack.push(other_end);
                     }
                 }
             }
 
             // Build a new Graph from this partition
-            let mut sub = Graph::new();
-            let mut local_map = HashMap::new();
+            let mut sub = ExecGraph::<N, C, NodeID>::new();
             // add all nodes to the graph
-            for &n in &partition {
+            for &node_id in &partition {
                 // we put empty edges for now since not all nodes in the partition have been added to the graph,
                 // we don't know yet their new index in the partition and therefore can't create all edges yet.
-                let new_idx = sub.add_node(self.graph[n].clone(), vec![]);
-                local_map.insert(n, new_idx);
+                let node = self[node_id].clone();
+                sub.add_node_with_id(node_id.clone(), node)?;
             }
-            // add all edges inside the partition
-            for &n in &partition {
+            // add all edges inside the partition - excluding for now the input and output edges
+            for &node_id in &partition {
                 // we only add incoming edges - since eventually we go over all nodes of the graph, then we should
                 // have covered all the edges
-                for edge in self.graph.edges_directed(n, Direction::Incoming) {
-                    let source_idx = edge.source();
+                for (_, edge) in self.node_neighbors(node_id, Direction::Incoming) {
+                    // unwrap is safe since we filtered out the edges that are not between nodes
+                    let source_id = edge.source_id().unwrap();
                     // if the source is in the same partition, then we add the edge
-                    if local_map.contains_key(&source_idx) {
-                        let new_source_idx = local_map[&source_idx];
-                        let new_target_idx = local_map[&n];
-                        sub.add_edge(new_target_idx, Edge::Pred(new_source_idx, None));
+                    if let Some(_source_node) = sub.node(source_id) {
+                        sub.add_edges_raw(vec![edge.clone()])?;
                     }
                 }
             }
 
-            map.entry(color.clone()).or_default().push((sub, local_map));
+            map.entry(color.clone()).or_default().push(sub);
         }
 
-        let graph_root = self.output_nodes();
+        let mut graph_root = self.output_nodes().collect::<Vec<_>>();
         ensure!(
             graph_root.len() == 1,
             "graph should have exactly one output node"
         );
-        let graph_root = graph_root.first().unwrap();
+        let (graph_root, _) = graph_root.remove(0);
         // At this point all the subgraphs have been built, but there some information missing:
         //  - the links between the subgraphs, we need to extract which color partition depends on which other color partition.
         //  - and then from it create the input edge on sink partitions: one node in each "parent" partition must now become an
         //    input node in that partition to receive the output of the children partitions. The order is important here.
-        //  - adapting the inputs of source partitions such that their indices match (now that elements in the input vector could be
-        //    dispatched to different partitions))
         //  - Finding and setting the parent partition for each partition.
         map.into_iter()
+            // all partitions sharing this color
             .map(|(color, partitions)| {
+                // the partitions as graphs
                 let mut final_partitions = Vec::with_capacity(partitions.len());
-                for (mut subgraph, map) in partitions.into_iter() {
+                for mut subgraph in partitions.into_iter() {
                     let mut child_partition_colors = BTreeSet::new();
-                    let mut flattened_partition_inputs = Vec::new();
+                    let mut flattened_partition_inputs = Vec::<N::IO>::new();
                     // the input nodes in the new partition that should receive input data
                     // we need to take the _same_ order of the inputs - given graph has a HashMap we take the ordering of the graph
                     // TODO: maybe just turn the graph hashmap into a btreemap directly ?
                     let partition_input_nodes = self
-                        .graph
-                        .node_indices()
+                        .input_nodes()
                         // check they're in the current partition
-                        .filter(|idx| map.contains_key(idx))
-                        // check they're registered as input nodes on the original graph
-                        .filter_map(|idx| self.input_nodes.get(&idx).map(|indices| (idx, indices)))
-                        .collect::<BTreeMap<_, _>>();
+                        .filter(|(idx, _)| subgraph.node(idx).is_some())
+                        .fold(
+                            BTreeMap::<&NodeID, Vec<PortID>>::new(),
+                            |mut acc, (idx, ports)| {
+                                #[allow(clippy::clone_on_copy)]
+                                acc.entry(idx).or_default().extend(ports.iter().map(|port| port.source_port.clone()));
+                                acc
+                            },
+                        );
                     // 2 cases: either
                     // 1. we are in a source partition, and we need to adjust the graph input data edges (maybe this partition only has one input
                     // while the original graph had 3, the rest of the input nodes are in different partitions, so we need to adjust the indices of
@@ -368,84 +671,89 @@ where
                     if partition_input_nodes.is_empty() {
                         // we are in a parent partition, so we need to manually add the input edges
                         let mut source_nodes: Vec<_> = subgraph
-                            .graph
-                            .node_indices()
-                            .filter(|idx| {
-                                subgraph
-                                    .graph
-                                    .edges_directed(*idx, Direction::Incoming)
-                                    .count()
-                                    == 0
-                            })
+                            .nodes()
+                            .filter_map(|(idx, _)|
+                                // only take the nodes that have no incoming edges - that should
+                                match subgraph.node_neighbors(idx, Direction::Incoming).next() {
+                                    Some(_) => None,
+                                    // clone needed here since we're adding new edges right after depending
+                                    // on these IDs so we can't hold references only.
+                                    None => Some(idx.clone()),
+                                }
+                            )
                             .collect();
                         ensure!(
                             source_nodes.len() == 1,
                             "INVALID GRAPH: a parent partition should have exactly one source node"
                         );
                         let source_node = source_nodes.remove(0);
-                        let og_source_node = map
-                            .iter()
-                            .find(|(_, v)| **v == source_node)
-                            .map(|(k, _)| *k)
-                            .context("graph_map should contain all nodes")?;
-                        // now search the incoming edges of the source node in the original graph. For each edge, we add that info to the new partition
-                        for edge in self
-                            .graph
-                            .edges_directed(og_source_node, Direction::Incoming)
-                            .enumerate()
+                        // now search the incoming edges of the source node in the original graph.
+                        // For each edge, we add that info to the new partition
+                        let edges = self
+                            .node_neighbors(&source_node, Direction::Incoming)
+                            .collect::<Vec<_>>();
+
+                        // we put the _position_ of the edge in the subgraph as _input_ of the subgraph
+                        // i.e. n-th child output should be the n-th input of source_node
+                        subgraph.set_input(source_node.clone(), (0..edges.len()).collect::<Vec<_>>(), None)?;
+                        for (_, edge) in edges.into_iter()
                         {
-                            // we put the _position_ of the edge in the subgraph
-                            subgraph.add_edge(source_node, Edge::Input(edge.0));
                             // and we keep track of the order of the colors
-                            let og_edge_color = self.graph[edge.1.source()].color().clone();
-                            child_partition_colors.insert(og_edge_color);
+                            // unwrap is safe since we filtered out the edges that are not between nodes
+                            let edge_color = self[edge.source_id().unwrap()].color().clone();
+                            child_partition_colors.insert(edge_color);
                         }
                     } else {
                         // we are in a source partition, so we need to adjust the input data indices
-                        for (og_node_idx, input_indices) in partition_input_nodes.into_iter() {
+                        for (node_id, input_indices) in partition_input_nodes.into_iter() {
                             let offset = flattened_partition_inputs.len();
-                            let new_idx = map
-                                .get(&og_node_idx)
-                                .context("graph_map should contain all nodes")?;
                             // we also need to add the edges to the subgraph  - all inputs for this partition are concatenated together
                             // TODO: remove the clone and use default values instead?
                             flattened_partition_inputs
                                 .extend(input_indices.iter().map(|idx| inputs[*idx].clone()));
-                            for i in 0..input_indices.len() {
-                                subgraph.add_edge(*new_idx, Edge::Input(offset + i));
-                            }
+                            let offsets = (0..input_indices.len()).map(|i| offset + i).collect::<Vec<_>>();
+                            subgraph.set_input(node_id.clone(), offsets, None)?;
                         }
                     }
 
                     // now we want to find the parent partition for this partition such that its output can be sent to it.
-                    let og_partition_root = *subgraph
-                        .output_nodes()
-                        .first()
-                        .context("graph should have at least one output node")?;
-                    let partition_root = map
-                        .iter()
-                        .find(|(_, v)| **v == og_partition_root)
-                        .map(|(k, _)| *k)
-                        .context("graph_map should contain all nodes")?;
-                    let parent_node = self
-                        .graph
-                        .edges_directed(partition_root, Direction::Outgoing)
-                        .next()
-                        .map(|e| e.target());
+                    // we have to first find the root of the partition, and then set it as an output
+                    let mut partition_root = subgraph.nodes()
+                        .filter_map(|(node_id, _)| {
+                            if subgraph.node_neighbors(node_id, Direction::Outgoing).count() == 0 {
+                                Some(node_id.clone())
+                            } else {
+                                None
+                            }
+                        }).collect::<Vec<_>>();
+                    ensure!(
+                        partition_root.len() == 1,
+                        "graph should have exactly one output node: found {} roots on partition of color {color:?}: {:?} {:?}",
+                        partition_root.len(),
+                        subgraph.nodes().collect::<Vec<_>>(),
+                        subgraph.edges,
+                    );
+                    let partition_root = partition_root.remove(0);
+                    subgraph.set_output(partition_root.clone(), 0, None)?;
 
-                    let parent_partition = if *graph_root != partition_root {
-                        ensure!(
-                            parent_node.is_some(),
-                            "any non root partition should have one parent partition"
-                        );
-                        let parent_node = parent_node.as_ref().unwrap();
-                        let parent_color = self.graph[*parent_node].color().clone();
+                    let parent_node = self
+                        .node_neighbors(&partition_root, Direction::Outgoing)
+                        .next()
+                        // unwrap is safe since we filtered out the edges that are not between nodes
+                        .map(|(_, e)| e.target_id().unwrap());
+
+                    // check if the partition is the root partition
+                    let parent_partition = if graph_root != &partition_root {
+                        let Some(parent_node) = parent_node else {
+                            bail!("any non root partition should have one parent partition");
+                        };
+                        let parent_color = self[parent_node].color().clone();
                         Some(parent_color)
                     } else {
                         None
                     };
 
-                    final_partitions.push(Partition::<N, C>::new(
+                    final_partitions.push(Partition::<N, C, NodeID>::new(
                         color.clone(),
                         subgraph,
                         child_partition_colors,
@@ -458,7 +766,7 @@ where
             .collect::<anyhow::Result<Vec<_>>>()
             .map(|m| {
                 m.into_iter().flatten().fold(
-                    HashMap::<C, Vec<Partition<N, C>>>::new(),
+                    HashMap::<C, Vec<Partition<N, C, NodeID>>>::new(),
                     |mut acc, partition| {
                         acc.entry(partition.color.clone())
                             .or_default()
@@ -473,11 +781,14 @@ where
 #[cfg(test)]
 mod tests {
     use crate::graph::{
-        NodeIdx,
+        Graph, PortLink, Ports,
         executor::{SequentialExecutor, tests::MathAST},
+        scheduler::IntoColor,
     };
 
     use super::*;
+
+    type NodeID = DefaultNodeID;
 
     ///            Pow_1
     ///            Pow_3
@@ -489,51 +800,69 @@ mod tests {
     /// and the inputs indices should be [1,2,5,6,3,4,7,8]
     /// Reason to choose sub and div is to test the non commutativity nature of the tasks, so the partitioning
     /// should dispatch the inputs to the correct partition in the right order and place.
-    fn create_graph() -> (RunnableGraph<MathAST, usize>, NodeIdx) {
+    fn create_graph() -> (ExecGraph<MathAST, usize>, NodeID) {
         let mut graph = Graph::new();
         // first partition
-        let add1 = graph.add_node(
-            Colored::new(MathAST::Add, 0),
-            vec![Edge::Input(0), Edge::Input(1)],
-        );
-        let mul1 = graph.add_node(
-            Colored::new(MathAST::Sub, 0),
-            vec![Edge::Input(4), Edge::Input(5)],
-        );
-        let agg1 = graph.add_node(
-            Colored::new(MathAST::Div, 0),
-            vec![Edge::Pred(add1, None), Edge::Pred(mul1, None)],
-        );
+        let add1 = graph.add_node(MathAST::Add.colored(0)).unwrap();
+        // the most high level way to add edges
+        graph.set_input(add1, vec![0, 1], None).unwrap();
+
+        let sub1 = graph.add_node(MathAST::Sub.colored(0)).unwrap();
+        graph.set_input(sub1, vec![4, 5], None).unwrap();
+
+        let agg1 = graph.add_node(MathAST::Div.colored(0)).unwrap();
+        graph
+            .add_edge(add1, agg1, Ports::consecutive(), None)
+            .unwrap();
+        // (0,1) cause target slot on agg1 0 is already taken ^
+        graph
+            .add_edge(sub1, agg1, PortLink::new(0, 1), None)
+            .unwrap();
+
         // second partition
-        let add2 = graph.add_node(
-            Colored::new(MathAST::Add, 1),
-            vec![Edge::Input(2), Edge::Input(3)],
-        );
-        let mul2 = graph.add_node(
-            Colored::new(MathAST::Sub, 1),
-            vec![Edge::Input(6), Edge::Input(7)],
-        );
-        let agg2 = graph.add_node(
-            Colored::new(MathAST::Div, 1),
-            vec![Edge::Pred(add2, None), Edge::Pred(mul2, None)],
-        );
+        let add2 = graph.add_node(MathAST::Add.colored(1)).unwrap();
+        graph.set_input(add2, vec![2, 3], None).unwrap();
+
+        let sub2 = graph.add_node(MathAST::Sub.colored(1)).unwrap();
+        graph.set_input(sub2, vec![6, 7], None).unwrap();
+
+        let agg2 = graph.add_node(MathAST::Div.colored(1)).unwrap();
+        graph
+            .add_edge(add2, agg2, Ports::consecutive(), None)
+            .unwrap();
+        graph
+            .add_edge(sub2, agg2, PortLink::new(0, 1), None)
+            .unwrap();
+
         // third partition
-        let agg3 = graph.add_node(
-            Colored::new(MathAST::Sub, 2),
-            vec![Edge::Pred(agg1, None), Edge::Pred(agg2, None)],
-        );
-        let agg33 = graph.add_node(Colored::new(MathAST::Pow2, 2), vec![Edge::Pred(agg3, None)]);
-        let pow1 = graph.add_node(
-            Colored::new(MathAST::Pow2, 0),
-            vec![Edge::Pred(agg33, None)],
-        );
+        let agg3 = graph.add_node(MathAST::Sub.colored(2)).unwrap();
+        graph
+            .add_edge(agg1, agg3, Ports::consecutive(), None)
+            .unwrap();
+        graph
+            .add_edge(agg2, agg3, PortLink::new(0, 1), None)
+            .unwrap();
+
+        let agg33 = graph.add_node(MathAST::Pow2.colored(2)).unwrap();
+        graph
+            .add_edge(agg3, agg33, Ports::consecutive(), None)
+            .unwrap();
+
+        let pow1 = graph.add_node(MathAST::Pow2.colored(0)).unwrap();
+        graph
+            .add_edge(agg33, pow1, Ports::consecutive(), None)
+            .unwrap();
+        graph.set_output(pow1, 0, None).unwrap();
         (graph, pow1)
     }
 
     #[test]
     fn test_partition_by_color() {
         let (graph, agg33) = create_graph();
-        assert_eq!(graph.output_nodes(), vec![agg33]);
+        assert_eq!(
+            graph.output_nodes().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec![&agg33]
+        );
         let partitions = graph
             .partition_by_color(vec![1, 2, 3, 4, 5, 6, 7, 8])
             .unwrap();

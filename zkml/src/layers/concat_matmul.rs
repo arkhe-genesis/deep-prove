@@ -10,9 +10,7 @@
 //! Transpose: There is the option to transpose the output of the matmul. This is useful for proving to avoid
 //! having to prove explicitly the transpose operation with a separate layer, as sumcheck based proving can directly
 //! prove the transpose at the same time as the matmul.
-use std::collections::BTreeMap;
-
-use std::borrow::Borrow;
+use std::{borrow::Borrow, collections::BTreeMap};
 
 use anyhow::{Result, ensure};
 use either::Either;
@@ -42,12 +40,10 @@ use crate::{
     },
     layers::{
         LayerCtx, LayerProof,
-        provable::{
-            Evaluate, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, VerifiableCtx,
-        },
+        provable::{Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, VerifiableCtx},
         requant::Requant,
     },
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
     tensor::IntoBTensor,
@@ -369,7 +365,7 @@ pub struct ConcatMatMul {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConcatMatMulCtx {
-    pub(crate) node_id: NodeId,
+    pub(crate) node_id: NodeID,
     permutations: MatrixPermutations,
 }
 
@@ -676,7 +672,7 @@ impl QuantizeOp for ConcatMatMul {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: super::provable::NodeId,
+        node_id: NodeID,
         input_scaling: &[crate::ScalingFactor],
     ) -> anyhow::Result<super::provable::QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len());
@@ -699,7 +695,7 @@ impl QuantizeOp for ConcatMatMul {
 impl ProveInfo for ConcatMatMul {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let num_columns_left = aux.last_output_shape[0][self.permutations.left.mat_mul_dimension];
@@ -742,7 +738,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -925,17 +921,14 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::number::Number;
+    use crate::{init_test_logging, number::Number};
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};
 
     use crate::{
         Tensor,
-        layers::{
-            Layer,
-            provable::{Edge, Node},
-        },
+        layers::Layer,
         model::{Model, test::prove_model},
     };
 
@@ -1049,7 +1042,7 @@ mod test {
         let _id = model
             .add_consecutive_layer(Layer::ConcatMatMul(mat_mul), None)
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         let outputs = prove_model(model, &mut GenStore::default()).unwrap();
 
@@ -1079,7 +1072,7 @@ mod test {
         let _id = model
             .add_consecutive_layer(Layer::ConcatMatMul(mat_mul), None)
             .unwrap();
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
         model.describe();
         let outputs = prove_model(model, &mut GenStore::default()).unwrap();
         assert_eq!(
@@ -1090,6 +1083,7 @@ mod test {
 
     #[test]
     fn test_model_with_chained_concat_matmul() {
+        init_test_logging("debug");
         let input_shape_left = vec![17, 24, 7].into(); // concat dimension is 7, mul dimension is 24
         let input_shape_right = vec![7, 24, 45].into();
 
@@ -1108,12 +1102,8 @@ mod test {
             ConcatMatMul::expected_dimension_for_right_input(),
         );
 
-        let first_node_id = model
-            .add_node(Node::new(
-                vec![Edge::new_at_edge(0), Edge::new_at_edge(1)],
-                Layer::ConcatMatMul(first_matmul),
-            ))
-            .unwrap();
+        let first_node_id = model.add_layer(Layer::ConcatMatMul(first_matmul)).unwrap();
+        model.set_input(first_node_id, vec![0, 1]).unwrap();
 
         // add another concat matmul layer, multiplying the output of `first_node_id` with the additional
         // input tensor of the model
@@ -1124,14 +1114,15 @@ mod test {
                                               * the middle dimension */
         );
 
-        let _second_node_id = model
-            .add_node(Node::new(
-                vec![Edge::new(first_node_id, 0), Edge::new_at_edge(2)],
-                Layer::ConcatMatMul(second_matmul),
-            ))
+        let second_node_id = model.add_layer(Layer::ConcatMatMul(second_matmul)).unwrap();
+        model
+            .add_edge(first_node_id, second_node_id, (0, 0))
             .unwrap();
+        model.set_input(second_node_id, vec![2]).unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
+
+        model.describe();
 
         let outputs = prove_model(model, &mut GenStore::default()).unwrap();
         assert_eq!(

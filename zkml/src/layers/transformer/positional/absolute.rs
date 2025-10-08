@@ -21,11 +21,11 @@ use crate::{
         LayerCtx, LayerProof,
         add::{Add, AddCtx, AddProof},
         provable::{
-            Evaluate, LayerOut, NodeId, PadOp, ProveInfo, QuantizeOp, QuantizeOutput, VerifiableCtx,
+            Evaluate, LayerOut, PadOp, ProveInfo, QuantizeOp, QuantizeOutput, VerifiableCtx,
         },
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     quantization::TensorFielder,
     tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorSlice},
@@ -49,7 +49,7 @@ pub struct AbsoluteCtx {
     add_ctx: AddCtx,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
-    node_id: NodeId,
+    node_id: NodeID,
     positional_key: TensorKey,
 }
 
@@ -115,7 +115,7 @@ impl Absolute<f32> {
     pub(super) fn quantize<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: ScalingFactor,
     ) -> anyhow::Result<QuantizeOutput<Absolute<Element>>> {
         // quantize positional matrix
@@ -154,7 +154,7 @@ impl PadOp for Absolute<Element> {
 impl Absolute<Element> {
     pub(super) fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         aux: ContextAux,
     ) -> anyhow::Result<(AbsoluteCtx, ContextAux)> {
         let (ctx, mut aux) = self.add_layer.step_info(id, aux)?;
@@ -191,7 +191,7 @@ impl Absolute<Element> {
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     >(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         output_claim: &Claim<E>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
@@ -359,7 +359,7 @@ mod tests {
             )
             .unwrap();
 
-        model.route_output(None).unwrap();
+        model.automatic_output_labelling().unwrap();
 
         let _ = prove_model(model, &mut GenStore::default()).unwrap();
     }
@@ -496,7 +496,7 @@ mod tests {
             model
                 .add_consecutive_layer(Layer::Positional(Positional::new_absolute(positional_matrix)), None)
                 .expect("add layer");
-            model.route_output(None).expect("route output");
+            model.automatic_output_labelling().expect("route output");
 
             let _ = prove_model(model, &mut GenStore::default()).expect("prove model");
         }

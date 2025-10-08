@@ -1,23 +1,24 @@
 use super::{ChallengeStorage, Proof, TableProof};
 use crate::{
-    Claim, Element, Tensor, VectorTranscript,
+    Claim, Element, Tensor,
     commit::{compute_betas_eval, mmcs_context, same_poly},
-    iop::context::ProverContext,
+    graph::PortID,
+    iop::{context::ProverContext, model_output_claims},
     layers::{
         LayerProof,
-        provable::{NodeId, OpInfo, ProvableOp},
+        provable::{OpInfo, ProvableOp},
     },
     lookup::{
         context::{LookupWitness, TableType, generate_lookup_witnesses},
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
-    model::{InferenceStep, InferenceTrace, ToIterator},
+    model::{InferenceStep, InferenceTrace, NodeID},
     tensor::{TensorKey, get_root_of_unity},
 };
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::trace;
 
 use itertools::Itertools;
@@ -45,14 +46,14 @@ where
 {
     ctx: &'a ProverContext<E, PCS>,
     // proofs for each layer being filled
-    proofs: HashMap<NodeId, LayerProof<E, PCS>>,
+    proofs: HashMap<NodeID, LayerProof<E, PCS>>,
     table_proofs: Vec<TableProof<E, PCS>>,
-    merge_claim_proofs: HashMap<NodeId, MergeClaimsProof<E>>,
+    merge_claim_proofs: HashMap<NodeID, MergeClaimsProof<E>>,
     pub(crate) transcript: &'b mut T,
     /// Proves commitment openings
     pub(crate) commit_prover: mmcs_context::CommitmentProver<E, PCS>,
     /// The lookup witnesses
-    pub(crate) lookup_witness: HashMap<NodeId, PCS::CommitmentWithWitness>,
+    pub(crate) lookup_witness: HashMap<NodeID, PCS::CommitmentWithWitness>,
     /// Stores all the challenges for the different lookup/table types
     pub(crate) challenge_storage: ChallengeStorage<E>,
 }
@@ -152,7 +153,7 @@ where
 
     pub(crate) fn add_common_claims(
         &mut self,
-        node_id: NodeId,
+        node_id: NodeID,
         claims: HashMap<TensorKey, Claim<E>>,
     ) {
         self.commit_prover.add_common_claims(
@@ -169,17 +170,17 @@ where
             .add_table_claim(table_node_id, table_type, claim);
     }
 
-    pub(crate) fn add_witness_claim(&mut self, node_id: NodeId, claims: Vec<(Point<E>, Vec<E>)>) {
+    pub(crate) fn add_witness_claim(&mut self, node_id: NodeID, claims: Vec<(Point<E>, Vec<E>)>) {
         self.commit_prover.add_witness_claim(node_id, claims);
     }
 
-    pub(crate) fn lookup_witness(&self, id: NodeId) -> anyhow::Result<&PCS::CommitmentWithWitness> {
+    pub(crate) fn lookup_witness(&self, id: NodeID) -> anyhow::Result<&PCS::CommitmentWithWitness> {
         self.lookup_witness
             .get(&id)
             .ok_or(anyhow!("No lookup witness found for node {id}!"))
     }
 
-    pub(crate) fn push_proof(&mut self, node_id: NodeId, proof: LayerProof<E, PCS>) {
+    pub(crate) fn push_proof(&mut self, node_id: NodeID, proof: LayerProof<E, PCS>) {
         self.proofs.insert(node_id, proof);
     }
 
@@ -521,32 +522,13 @@ where
         // For the first step, so before the first sumcheck, we generate it from FS.
         // The dimension is simply the number of variables needed to address all the space of the
         // input vector.
-        let out_claims = trace
-            .outputs()?
-            .into_iter()
-            .map(|out| {
-                let r_i = self
-                    .transcript
-                    .read_challenges(out.get_data().len().ilog2() as usize);
-                // let r_i = (0..out.get_data().len().ilog2())
-                //    .map(|_| {
-                //        self.transcript
-                //            .sample_and_append_challenge(b"initial")
-                //            .elements
-                //    })
-                //    .collect::<Vec<E>>();
-                // println!("SECOND r_i: {:?}", r_i);
-                let y_i = out.get_data().to_vec().into_mle().evaluate(&r_i);
-                Claim {
-                    point: r_i,
-                    eval: y_i,
-                }
-            })
-            .collect_vec();
-
+        let out_claims = model_output_claims(self.transcript, &trace.outputs()?);
         let mut store = trace.store.clone();
-        let mut claims_by_layer: HashMap<NodeId, Vec<Claim<E>>> = HashMap::new();
-        for (node_id, ctx) in self.ctx.steps_info.to_backward_iterator() {
+        // each layer generates claims about its inputs. Each claim is stored at
+        // the right position amongst all the "input ports" of the node, e.g. target_port when
+        // considering incoming edges to this node.
+        let mut claims_produced_by_layers: HashMap<NodeID, Vec<Claim<E>>> = HashMap::new();
+        for (node_id, ctx) in self.ctx.model_ctx.nodes.backward_iter() {
             let InferenceStep {
                 op: node_operation,
                 step_data,
@@ -563,8 +545,12 @@ where
                 .iter()
                 .map(|t| t.hydrate(store.clone()).context("hydrating tensor"))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let claims_for_prove = self.claims_for_prove(
-                ctx.claims_for_node(&claims_by_layer, &out_claims)?,
+            let claims_for_prove = self.flatten_and_merge_claims(
+                self.ctx.model_ctx.claims_for_node(
+                    &node_id,
+                    &claims_produced_by_layers,
+                    &out_claims,
+                )?,
                 &tensors.iter().collect::<Vec<_>>(),
                 node_id,
             )?;
@@ -572,7 +558,7 @@ where
                 node_operation
                     .prove(
                         node_id,
-                        &ctx.ctx,
+                        ctx,
                         claims_for_prove.iter().collect::<Vec<_>>(),
                         step_data,
                         &mut self,
@@ -586,7 +572,7 @@ where
                 // shouldn't change the input values
                 claims_for_prove
             };
-            claims_by_layer.insert(node_id, claims);
+            claims_produced_by_layers.insert(node_id, claims);
         }
         let span = metrics.to_span();
         stream_metrics("Claims", &span);
@@ -625,27 +611,32 @@ where
         Ok(output_proof)
     }
 
-    fn claims_for_prove(
+    /// Flattens all the claims to give to the proving logic of the node. If
+    /// there are claims linked to the same port, the claims will be merged.
+    fn flatten_and_merge_claims(
         &mut self,
-        claims: Vec<Vec<&Claim<E>>>,
+        claims: BTreeMap<PortID, Vec<&Claim<E>>>,
         outputs: &[&Tensor<E>],
-        node_id: NodeId,
+        node_id: NodeID,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         let mut merge_claim_proofs = HashMap::new();
+        ensure!(
+            claims.len() == outputs.len(),
+            "Number of claims and outputs must be the same"
+        );
         let claims = claims
             .into_iter()
-            .zip(outputs)
-            .enumerate()
-            .map(|(i, (mut claims, output))| {
-                anyhow::Ok(if claims.len() == 1 {
+            .map(|(port, mut claims)| {
+                let output = outputs[*port];
+                if claims.len() == 1 {
                     // there is already only one claim, so we return it
-                    claims.pop().unwrap().clone()
+                    Ok(claims.remove(0).clone())
                 } else {
                     // we have to merge the claims
                     let (merged_claim, proof) = self.merge_claims(&claims, output)?;
-                    merge_claim_proofs.insert(i, proof);
-                    merged_claim
-                })
+                    merge_claim_proofs.insert(*port, proof);
+                    Ok(merged_claim)
+                }
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 

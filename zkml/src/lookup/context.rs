@@ -1,6 +1,6 @@
 //! File containing code for lookup witness generation.
 
-use crate::graph::{Edge, executor::SequentialExecutor, scheduler::GraphScheduler};
+use crate::graph::{executor::SequentialExecutor, scheduler::GraphScheduler};
 use anyhow::{Context as CC, anyhow, bail, ensure};
 use std::{
     cmp::Ordering,
@@ -28,11 +28,14 @@ use witness::{InstancePaddingStrategy, RowMajorMatrix};
 use super::logup_gkr::error::LogUpError;
 use crate::{
     Claim, Element,
-    graph::{Colored, Graph, GraphNode},
+    graph::{
+        Graph,
+        scheduler::{Colored, ExecNode},
+    },
     iop::{ChallengeStorage, context::ProverContext},
     layers::{
         activation::{GeluTableData, Relu},
-        provable::{NodeId, ProvableOp},
+        provable::ProvableOp,
         transformer::{
             layernorm::{LAYERNORM_OUTPUT_SCALE_FACTOR, LAYERNORM_SCALE_FACTOR},
             rmsnorm::RMSTableData,
@@ -40,7 +43,7 @@ use crate::{
         },
     },
     lookup::logup_gkr::structs::{LogUpBatchVerifierClaim, LogUpInput},
-    model::{InferenceTrace, ToIterator},
+    model::{InferenceTrace, NodeID},
     quantization::{self, Fieldizer},
     to_base,
 };
@@ -861,7 +864,7 @@ pub struct LookupWitnessGen<E: ExtensionField, PCS: PolynomialCommitmentScheme<E
     ///
     /// These values are later used to compute the GKR's multiplicities.
     element_count: BTreeMap<TableType, HashMap<Element, u64>>,
-    logup_witnesses: HashMap<NodeId, Arc<PCS::CommitmentWithWitness>>,
+    logup_witnesses: HashMap<NodeID, Arc<PCS::CommitmentWithWitness>>,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Clone for LookupWitnessGen<E, PCS> {
@@ -883,7 +886,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWi
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, PCS> {
-    pub fn insert_logup_witness(&mut self, node_id: NodeId, witness: PCS::CommitmentWithWitness) {
+    pub fn insert_logup_witness(&mut self, node_id: NodeID, witness: PCS::CommitmentWithWitness) {
         self.logup_witnesses.insert(node_id, Arc::new(witness));
     }
     pub fn insert_element_count(&mut self, table_type: TableType, elements: HashMap<Element, u64>) {
@@ -948,11 +951,11 @@ where
     E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    Input(NodeId),
+    Input(NodeID),
     Output(LookupWitnessGen<E, PCS>),
 }
 
-impl<'a, 'b, E, PCS> GraphNode for GenerateWitness<'a, 'b, E, PCS>
+impl<'a, 'b, E, PCS> ExecNode for GenerateWitness<'a, 'b, E, PCS>
 where
     E: ExtensionField,
     E::BaseField: Serialize + DeserializeOwned,
@@ -986,7 +989,7 @@ where
 #[derive(Debug)]
 pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     pub challenge_storage: ChallengeStorage<E>,
-    pub logup_witnesses: HashMap<NodeId, PCS::CommitmentWithWitness>,
+    pub logup_witnesses: HashMap<NodeID, PCS::CommitmentWithWitness>,
     pub table_witnesses: Option<PCS::CommitmentWithWitness>,
 }
 
@@ -1038,17 +1041,26 @@ where
     let max_colour = 2;
     let mut graph = Graph::new();
     let (_node_idxs, inputs): (Vec<_>, Vec<_>) = ctx
-        .steps_info
-        .to_forward_iterator()
+        .model_ctx
+        .nodes
+        .forward_iter()
         .enumerate()
         .map(|(idx, (node_id, _))| {
-            let node_idx = graph.add_node(
-                Colored::new(GenerateWitness::default(), idx % max_colour),
-                vec![Edge::Input(idx)],
-            );
+            let node_idx = graph
+                .add_node(
+                    Colored::new(GenerateWitness::default(), idx % max_colour),
+                    // TODO: get rid of that custom logup error. we're not using anywhere the custom error
+                    // types, we can't "act" on them so generic anyhow makes the code simpler and more readable.
+                )
+                .map_err(|e| LogUpError::ParameterError(e.to_string()))?;
+            graph
+                .set_input(node_idx, idx, None)
+                .map_err(|e| LogUpError::ParameterError(e.to_string()))?;
             let input = GenerateWitnessIO::Input(node_id);
-            (node_idx, input)
+            Ok((node_idx, input))
         })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .unzip();
 
     // here for the moment there is not yet a "parent node" so it's a directed graph ... but with no edges.
@@ -1166,7 +1178,7 @@ where
     );
 
     // Write the witness commitments to the transcript
-    for (node_id, _) in ctx.steps_info.to_forward_iterator() {
+    for (node_id, _) in ctx.model_ctx.nodes.forward_iter() {
         if let Some(prover_commit) = witness_gen.logup_witnesses.get(&node_id) {
             let comm = PCS::get_pure_commitment(prover_commit);
             PCS::write_commitment(&comm, transcript)

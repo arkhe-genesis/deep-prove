@@ -17,7 +17,6 @@ use crate::{
     layers::{
         Layer,
         matrix_mul::MatMul,
-        provable::NodeId,
         transformer::{
             embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, positional::Positional,
         },
@@ -200,7 +199,7 @@ impl LLMModel {
                 Some(model.add_consecutive_layer(Layer::MatMul(final_proj), last_node_id)?);
         }
         model.add_consecutive_layer(Layer::Logits(Logits::Argmax), last_node_id)?;
-        model.route_output(None)?;
+        model.automatic_output_labelling()?;
         Ok(model)
     }
 }

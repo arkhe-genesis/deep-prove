@@ -2,16 +2,16 @@ use anyhow::{Result, ensure};
 use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize};
 
+use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProveInfo};
 use crate::{
     Element, Shape, Tensor,
     iop::context::ContextAux,
     layers::LayerCtx,
+    model::NodeID,
     number::Number,
     padding::{PaddingMode, ShapeInfo, reshape},
     tensor::IntoBTensor,
 };
-
-use super::provable::{Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProveInfo};
 
 /// Short name used to identify the flatten layer
 pub const FLATTEN_LAYER: &str = "FLTT";
@@ -111,7 +111,7 @@ impl Flatten {
 impl ProveInfo for Flatten {
     fn step_info<E: ExtensionField>(
         &self,
-        _id: NodeId,
+        _id: NodeID,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         aux.last_output_shape

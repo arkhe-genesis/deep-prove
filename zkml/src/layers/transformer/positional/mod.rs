@@ -26,15 +26,15 @@ use crate::{
         LayerCtx,
         add::Add,
         provable::{
-            Evaluate, LayerOut, NodeId, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp,
-            QuantizeOutput, VerifiableCtx,
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+            VerifiableCtx,
         },
         transformer::positional::{
             absolute::{Absolute, AbsoluteCtx, AbsoluteProof},
             rope::{Rope, RopeCtx, RopeProof},
         },
     },
-    model::StepData,
+    model::{NodeID, StepData},
     number::Number,
     padding::{PaddingMode, ShapeInfo},
     parser::{
@@ -404,7 +404,7 @@ impl<N: Number> OpInfo for Positional<N> {
 impl ProveInfo for Positional<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeId,
+        id: NodeID,
         aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let (ctx, aux) = match &self.variant {
@@ -428,7 +428,7 @@ impl QuantizeOp for Positional<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeId,
+        node_id: NodeID,
         input_scaling: &[ScalingFactor],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
@@ -567,7 +567,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeId,
+        node_id: NodeID,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
