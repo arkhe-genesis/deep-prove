@@ -88,3 +88,7 @@ lto = "fat"
 #[patch."https://github.com/nikkolasg/timed-rs"]
 #timed = { path = "/Users/nalos/prog/timed/timed" }
 #timed-core = { path = "/Users/nalos/prog/timed/timed-core" }
+
+[workspace.metadata.release]
+pre-release-hook = ["sh", "../.github/changelog.sh"]
+publish = false
