@@ -1,11 +1,5 @@
 #![allow(clippy::needless_range_loop)]
-use crate::{
-    ScalingFactor,
-    backend::Backend,
-    number::Number,
-    shape::{Shape, filter_size},
-    to_field,
-};
+use crate::{ScalingFactor, backend::Backend, number::Number, shape::Shape, to_field};
 use anyhow::{Result, bail, ensure};
 use burn::tensor::{BasicOps, Int, Numeric, Tensor as BTensor, TensorData, TensorKind};
 use ceno_p3::{
@@ -259,13 +253,6 @@ pub fn get_root_of_unity<E: ExtensionField>(n: usize) -> E {
 
     rou
 }
-// let u = [u[1],...,u[n*n]]
-// output vec = [u[n*n-1],u[n*n-2],...,u[n*n-n],....,u[0]]
-// Note that y_eval =  f_vec(r) = f_u(1-r)
-pub fn index_u<E: ExtensionField>(u: &[E], n: usize) -> impl Iterator<Item = E> + use<'_, E> {
-    let len = n * n;
-    (0..u.len() / 2).map(move |i| u[len - 1 - i])
-}
 
 /// Returns a permutation to convert a vector from normal order to bit reverse
 /// order.
@@ -404,11 +391,13 @@ where
         output: Vec<Vec<E>>,
         n_x: usize,
     ) -> Self {
+        let n_x_squared = n_x * n_x;
         let output_elems = output
             .iter()
-            .flat_map(|e| {
-                index_u(e.as_slice(), n_x)
-                    .map(|e| e.to_element())
+            .flat_map(|output| {
+                let data = output.as_slice();
+                (0..data.len() / 2)
+                    .map(|i| data[n_x_squared - 1 - i].to_element())
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -760,26 +749,6 @@ impl Tensor<Element> {
             .map(|e| s.dequantize(e))
             .collect::<Vec<_>>();
         Tensor::new(self.shape.clone(), data)
-    }
-
-    /// Recall that weights are not plain text to the "snark". Rather it is FFT(weights).
-    /// Aka there is no need to compute the FFT(input) "in-circuit".
-    /// It is okay to assume the inputs to the prover is already the FFT version and the prover can commit to the FFT values.
-    /// This function computes iFFT of the weights so that we can compute the scaling factors used.
-    pub fn get_real_weights<F: ExtensionField>(&self, og_shape: &Shape) -> Vec<Vec<Vec<Element>>> {
-        let mut real_weights =
-            vec![vec![vec![0 as Element; filter_size(&self.shape)]; self.dim(1)]; self.dim(0)];
-
-        let mut ctr = 0;
-        for i in 0..self.dim(0) {
-            for j in 0..self.dim(1) {
-                for k in 0..filter_size(og_shape) {
-                    real_weights[i][j][k] = self.data[ctr];
-                    ctr += 1;
-                }
-            }
-        }
-        real_weights
     }
 
     /// Converts this [Tensor<Element>] into [MultilinearExtension].
