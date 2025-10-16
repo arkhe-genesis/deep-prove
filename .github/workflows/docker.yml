@@ -174,7 +174,12 @@ jobs:
     name: Push Docker Images to Docker hub
     runs-on: ubuntu-latest
     needs:
+      - changes
       - build
+    strategy:
+      fail-fast: false
+      matrix:
+        image:  ${{ fromJSON(needs.changes.outputs.images-to-build) }}
     steps:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -185,19 +190,30 @@ jobs:
       - name: Download Docker image from artifact
         uses: actions/download-artifact@v4
         with:
-          name: deep-prove-worker-${{ github.sha }}
+          name: ${{ matrix.image }}-${{ github.sha }}
           path: /tmp
 
       - name: Load Docker image
         run: |
-          docker load -i /tmp/deep-prove-worker-${{ github.sha }}.tar
+          IMAGE_NAME="${{ matrix.image }}"
+          docker load -i /tmp/$IMAGE_NAME-${{ github.sha }}.tar
 
       - name: Push to public repo
         run: |
-          if [[ ${{ github.ref_name }} == 'master' ]]; then
-            tag=latest
-          else
-            tag=$(echo ${{ github.ref_name }} | tr "[]/" -)
+          IMAGE_NAME="${{ matrix.image }}"
+          REGISTRY="lagrangelabs"
+          TAG=$(echo ${{ github.ref_name }} | tr "[]/" -)
+          docker tag "$IMAGE_NAME":${{ github.sha }} "$REGISTRY"/"$IMAGE_NAME":${{ github.sha }}
+          docker tag "$IMAGE_NAME":${{ github.sha }} "$REGISTRY"/"$IMAGE_NAME":"$TAG"
+          docker push "$REGISTRY"/"$IMAGE_NAME":${{ github.sha }}
+          docker push "$REGISTRY"/"$IMAGE_NAME":"$TAG"
+
+          if [[ ${{ github.ref }} == 'refs/heads/master' ]]; then
+            docker tag "$IMAGE_NAME":${{ github.sha }} "$REGISTRY"/"$IMAGE_NAME":latest
+            docker push "$REGISTRY"/"$IMAGE_NAME":latest
           fi
-          docker tag deep-prove-worker:${{ github.sha }} lagrangelabs/deep-prove-worker:"$tag"
-          docker push lagrangelabs/deep-prove-worker:"$tag"
+
+          if [[ ${{ github.ref }} == refs/tags/v* ]]; then
+            docker tag "$IMAGE_NAME":${{ github.sha }} "$REGISTRY"/"$IMAGE_NAME":"$TAG"
+            docker push "$REGISTRY"/"$IMAGE_NAME":"$TAG"
+          fi
