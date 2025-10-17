@@ -11253,6 +11253,7 @@ dependencies = [
  "hex",
  "humansize",
  "itertools 0.13.0",
+ "libm",
  "memmap2",
  "mpcs",
  "multilinear_extensions",

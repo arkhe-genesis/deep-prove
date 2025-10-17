@@ -207,15 +207,21 @@ impl ActivationLayer<Element> {
                 .iter()
                 .map(|tensor| WrappedTensor::relu((*tensor).clone()))
                 .collect()),
-            ActivationLayer::Gelu(g) => inputs
-                .iter()
-                .map(|input| {
-                    // TODO gpu int gelu
-                    let input = Tensor::<Element>::try_from((*input).clone())?;
-                    let output = input.try_map(|e| g.apply(e))?;
-                    WrappedTensor::<Element>::try_from(&output)
-                })
-                .collect::<anyhow::Result<Vec<_>>>(),
+            ActivationLayer::Gelu(g) => {
+                let Some(quant_data) = g.quant_data else {
+                    bail!("GELU not quantized");
+                };
+                Ok(inputs
+                    .iter()
+                    .map(|input| {
+                        let input = (*input).clone().mul_scalar(quant_data.multiplier);
+                        let input = input.float().div_scalar(GELU_SCALE_FACTOR as f32);
+                        let output = WrappedTensor::gelu(input);
+                        let output = output.clone().mul_scalar(*quantization::MAX as f32);
+                        output.clone().round().int()
+                    })
+                    .collect::<Vec<_>>())
+            }
         }
     }
 
@@ -976,16 +982,22 @@ impl Evaluate<f32> for GELU<f32> {
 }
 
 /// Compute the GeLU
-///
-/// This formula is based on [1]
-///
-/// [1]: https://docs.pytorch.org/docs/stable/generated/torch.nn.GELU.html
 fn gelu_float(x: &f32) -> f32 {
-    let c = (2.0f32 / std::f32::consts::PI).sqrt();
+    // NOTE: The commented-out formula below is based on [1]
+    //
+    // [1]: https://docs.pytorch.org/docs/stable/generated/torch.nn.GELU.html
+    //
+    // let c = (2.0f32 / std::f32::consts::PI).sqrt();
 
-    let x_cubed = x * x * x;
-    let inner_term = c * (x + 0.044715 * x_cubed);
-    0.5 * x * (1.0 + inner_term.tanh())
+    // let x_cubed = x * x * x;
+    // let inner_term = c * (x + 0.044715 * x_cubed);
+    // 0.5 * x * (1.0 + inner_term.tanh())
+
+    // NOTE This forumla matches burn's GELU implementation.
+    // The difference from PyTorch is that instead of tanh approx. it uses
+    // error function from `libm::erf`
+    let inner_term = libm::erf((x / 2.0_f32.sqrt()) as f64) as f32;
+    0.5 * x * (1.0 + inner_term)
 }
 
 impl GELU<f32> {
@@ -1025,19 +1037,6 @@ impl GELU<f32> {
             quant_data: Some(qd),
             _n: PhantomData,
         })
-    }
-}
-
-impl GELU<Element> {
-    fn apply(&self, input: &Element) -> anyhow::Result<Element> {
-        let Some(ref quant_data) = self.quant_data else {
-            bail!("GELU not quantized");
-        };
-        let scaled = input * quant_data.multiplier;
-        let within_range =
-            quant_data.table_data.min <= scaled && scaled <= quant_data.table_data.max;
-        ensure!(within_range, "Input out of range");
-        Ok(self.quant_data.as_ref().unwrap().table_output(scaled))
     }
 }
 
