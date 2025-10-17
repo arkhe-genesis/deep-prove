@@ -22,6 +22,7 @@ use crate::{
     model::StepData,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
+    tensor::WrappedTensor,
     to_base,
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -150,7 +151,7 @@ impl OpInfo for Requant {
 impl Evaluate<Element> for Requant {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         let max_abs_val: Element = 1 << self.intermediate_bit_size;
@@ -159,32 +160,21 @@ impl Evaluate<Element> for Requant {
 
         let mut result = Vec::with_capacity(inputs.len());
         for input in inputs {
-            let flat = (**input).clone().flatten(0..input.rank()).to_btensor::<1>();
-            let el: Element = flat
-                .clone()
-                .max_abs()
-                .into_data()
-                .as_slice()
-                .map_err(|_| anyhow!("Failed to get max abs on Requant"))?[0];
+            let max_el = (*input).clone().max_abs()?;
             ensure!(
-                el <= max_abs_val,
-                "Could not apply requantisation, tensor had absolute value too large, given value: {el}, max value: {max_abs_val}",
+                max_el < max_abs_val,
+                "Could not apply requantisation, tensor had absolute value too large, given value: {max_el}, max value: {max_abs_val}.",
             );
 
-            let unclamped = flat
+            let unclamped = (*input)
+                .clone()
                 .mul_scalar(self.fixed_point_multiplier)
                 .add_scalar(rounding)
                 .bitwise_right_shift_scalar(shift);
             let clamped = unclamped
                 .clamp_max(*quantization::MAX)
                 .clamp_min(*quantization::MIN);
-
-            let data: Vec<Element> = clamped
-                .to_data()
-                .into_vec()
-                .map_err(|_| anyhow!("Failed to compute Requant"))?;
-
-            result.push(Tensor::new(input.shape().clone(), data));
+            result.push(clamped);
         }
 
         Ok(LayerOut::from_vec(result))
@@ -1188,10 +1178,11 @@ mod tests {
         ) {
             let layer = Requant::from_multiplier(2.0, 8);
             let input_sizes = slice::from_ref(tensor.shape());
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&tensor], input_sizes).unwrap().outputs;
+            let wtensor = tensor.as_wrapped();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&wtensor], input_sizes).unwrap().outputs;
             let expected = requant_reference(&layer, &[&tensor]);
 
-            prop_assert_eq!(&expected, &computed);
+            prop_assert_eq!(&expected, &computed.into_iter().map(|t| t.to_native()).collect::<Vec<_>>());
         }
     }
 }

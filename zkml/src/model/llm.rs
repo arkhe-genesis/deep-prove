@@ -9,6 +9,7 @@ use crate::{
     iop::context::VerifierContext,
     padding::PaddingMode,
     quantization::{InferenceObserver, IntoElement, ScalingStrategy},
+    tensor::TensorTypeParam,
     verify,
 };
 use anyhow::{Context as CC, ensure};
@@ -34,7 +35,7 @@ use crate::{
     },
 };
 
-pub trait Observer<N: Number> {
+pub trait Observer<N: TensorTypeParam> {
     fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>);
 }
 
@@ -42,7 +43,7 @@ pub trait Observer<N: Number> {
 /// to LLM proving. This requires a wrapper on top of the model to drive the
 /// auto regressive loop correctly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Driver<N: Number> {
+pub struct Driver<N> {
     pub(crate) model: Model<N>,
     config: LLMConfig,
     max_context: Option<usize>,
@@ -203,7 +204,7 @@ impl Driver<f32> {
     }
 }
 
-impl<N: Number + Serialize + for<'a> Deserialize<'a>> Driver<N>
+impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Driver<N>
 where
     Layer<N>: Evaluate<N>,
 {
@@ -243,7 +244,7 @@ where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
     {
-        let eos_token: N = self.config.eos_token.as_number();
+        let eos_token: N = self.config.eos_token.as_tensor_type_param();
         let user_len = input.len();
         // -1 because we at least want to generate ONE token
         ensure!(
@@ -252,7 +253,7 @@ where
         );
         let input_tokens = input
             .into_iter()
-            .map(|t| t.as_number::<N>())
+            .map(|t| t.as_tensor_type_param::<N>())
             .collect::<Vec<_>>();
 
         let mut tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone());
@@ -262,7 +263,7 @@ where
             tensor
                 .get_data()
                 .iter()
-                .all(|t| t.to_usize() < self.config.vocab_size),
+                .all(|t| Number::to_usize(t) < self.config.vocab_size),
             "Input tokens must be less than the vocabulary size"
         );
         let mut full_tokens = tensor.get_data().to_vec();
@@ -533,7 +534,7 @@ pub struct LLMTokenizerObserver<'a, T: LLMTokenizer> {
 
 impl<'a, N, T: LLMTokenizer> Observer<N> for LLMTokenizerObserver<'a, T>
 where
-    N: Number + Serialize + for<'b> Deserialize<'b>,
+    N: TensorTypeParam + Serialize + for<'b> Deserialize<'b>,
 {
     fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>) {
         let tensor = trace
@@ -551,7 +552,7 @@ where
         };
 
         // let new_token = tensor.get_data().last().unwrap();
-        let new_token = Token::from(new_token.to_usize());
+        let new_token = Token::from(Number::to_usize(&new_token));
         let new_text = self.tokenizer.detokenize(&[new_token]);
         debug!(
             "seq_len {}: new token: {:?}\n\t-{}", //\n\t-{:?}",

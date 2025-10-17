@@ -55,7 +55,7 @@ pub(crate) mod manual_attention {
             llm::{Attention, FeedForward, LLMConfig, transformer::Norm},
         },
         rng_from_env_or_random,
-        tensor::{KeyedTensor, TensorKey, is_close},
+        tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor, is_close},
     };
 
     use super::{layernorm, mha, qkv};
@@ -97,29 +97,49 @@ pub(crate) mod manual_attention {
             input: &Tensor<f32>,
             output: Option<&GPT2LayerOutput>,
         ) -> anyhow::Result<Tensor<f32>> {
-            let up = self.up.evaluate::<GoldilocksExt2>(&[input], &[])?;
+            let up = self
+                .up
+                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
             if let Some(gpt2_output) = output {
-                assert!(gpt2_output.is_ffn_up_close(up.outputs()));
+                let outputs: Vec<_> = up
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                assert!(gpt2_output.is_ffn_up_close(outputs));
             }
             let act = self
                 .activation
                 .evaluate::<GoldilocksExt2>(&up.outputs(), &[])?;
             if let Some(gpt2_output) = output {
-                assert!(gpt2_output.is_ffn_after_gelu_close(act.outputs()));
+                let outputs: Vec<_> = act
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                assert!(gpt2_output.is_ffn_after_gelu_close(outputs));
             }
             let down = self.down.evaluate::<GoldilocksExt2>(&act.outputs(), &[])?;
             if let Some(gpt2_output) = output {
-                assert!(gpt2_output.is_ffn_after_down_close(down.outputs()));
+                let outputs: Vec<_> = down
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                assert!(gpt2_output.is_ffn_after_down_close(outputs));
             }
             let out = self.add.evaluate::<GoldilocksExt2>(
-                &[input, down.outputs()[0]],
-                &[input.shape().clone(), down.outputs()[0].shape().clone()],
+                &[&input.as_wrapped(), down.outputs()[0]],
+                &[input.shape().clone(), down.outputs()[0].shape().into()],
             )?;
-            Ok(out.outputs()[0].clone())
+            Ok(out.outputs()[0].clone().to_native())
         }
     }
 
-    impl<N: Number> FlatFFN<N> {
+    impl<N: Number + TensorTypeParam> FlatFFN<N> {
         pub fn random(hidden_size: usize, up_size: usize) -> Self {
             let up = {
                 let weight = OperandMatrix::new_weight_matrix(KeyedTensor::new(
@@ -219,18 +239,32 @@ pub(crate) mod manual_attention {
         ) -> anyhow::Result<Tensor<f32>> {
             ensure!(input.rank() == 2);
 
-            let normed = self.layernorm.evaluate::<GoldilocksExt2>(&[input], &[])?;
+            let normed = self
+                .layernorm
+                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
 
             if let Some(gpt2_output) = gpt2_output {
-                ensure!(gpt2_output.is_layernorm_close(normed.outputs()));
+                let outputs: Vec<_> = normed
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                ensure!(gpt2_output.is_layernorm_close(outputs));
             }
             let qkv = self.qkv.evaluate::<GoldilocksExt2>(
                 &normed.outputs(),
-                &[normed.outputs()[0].shape().clone()],
+                &[normed.outputs()[0].shape().into()],
             )?;
 
             if let Some(gpt2_output) = gpt2_output {
-                ensure!(gpt2_output.is_qkv_close(qkv.outputs()));
+                let outputs: Vec<_> = qkv
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                ensure!(gpt2_output.is_qkv_close(outputs));
             }
             let (mha, _, _, softmax_out, _) = self
                 .mha
@@ -238,7 +272,7 @@ pub(crate) mod manual_attention {
 
             if let Some(gpt2_output) = gpt2_output {
                 assert!(
-                    gpt2_output.is_attention_weights_close(softmax_out.outputs()[0]),
+                    gpt2_output.is_attention_weights_close(&softmax_out.outputs()[0].to_native()),
                     "attention_weights_close given {:?} vs computed {:?}",
                     gpt2_output.attn_weights,
                     softmax_out.outputs()[0].get_data()
@@ -246,8 +280,14 @@ pub(crate) mod manual_attention {
             }
 
             if let Some(gpt2_output) = gpt2_output {
+                let outputs: Vec<_> = mha
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
                 ensure!(
-                    gpt2_output.is_attention_mha_output_close(mha.outputs()),
+                    gpt2_output.is_attention_mha_output_close(outputs),
                     "attention_mha_outputcomputed: {:?} vs  expected {:?}",
                     mha.outputs(),
                     gpt2_output.attn_output
@@ -256,37 +296,54 @@ pub(crate) mod manual_attention {
             // now we do the final projection - still [seq_len,hidden_size]
             let projected = self.out.evaluate::<GoldilocksExt2>(&mha.outputs(), &[])?;
             if let Some(gpt2_output) = gpt2_output {
-                ensure!(gpt2_output.is_attention_output_proj_close(projected.outputs()));
+                let outputs: Vec<_> = projected
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                ensure!(gpt2_output.is_attention_output_proj_close(outputs));
             }
 
             // and then residual connection, [1, hidden_size]
             let out = self.add.evaluate::<GoldilocksExt2>(
-                &[input, projected.outputs()[0]],
-                &[
-                    input.shape().clone(),
-                    projected.outputs()[0].shape().clone(),
-                ],
+                &[&input.as_wrapped(), projected.outputs()[0]],
+                &[input.shape().clone(), projected.outputs()[0].shape().into()],
             )?;
 
             if let Some(gpt2_output) = gpt2_output {
-                ensure!(gpt2_output.is_residual_attn_close(out.outputs()));
+                let outputs: Vec<_> = out
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                ensure!(gpt2_output.is_residual_attn_close(outputs));
             }
 
             let normed = self
                 .pre_ffn_norm
-                .evaluate::<GoldilocksExt2>(&[input], &[])?;
+                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
             if let Some(gpt2_output) = gpt2_output {
-                gpt2_output.is_prefnn_layernorm_close(normed.outputs());
+                let outputs: Vec<_> = normed
+                    .outputs()
+                    .into_iter()
+                    .map(WrappedTensor::to_native)
+                    .collect();
+                let outputs = outputs.iter().collect();
+                gpt2_output.is_prefnn_layernorm_close(outputs);
             }
             // and then FFN
-            let ffn_out = self.ffn.evaluate(normed.outputs()[0], gpt2_output)?;
+            let ffn_out = self
+                .ffn
+                .evaluate(&normed.outputs()[0].to_native(), gpt2_output)?;
             Ok(ffn_out)
         }
     }
 
     impl<N> FlatAttention<N>
     where
-        N: Number,
+        N: TensorTypeParam + Number,
         ConcatMatMul: Evaluate<N>,
     {
         pub fn random(

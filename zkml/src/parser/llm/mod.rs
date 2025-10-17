@@ -25,6 +25,7 @@ use crate::{
     number::Number,
     padding::PaddingMode,
     parser::llm::transformer::Norm,
+    tensor::TensorTypeParam,
 };
 
 #[derive(
@@ -75,6 +76,10 @@ impl From<&Token> for u32 {
 impl Token {
     pub fn as_number<N: Number>(&self) -> N {
         N::from_usize(self.0)
+    }
+
+    pub fn as_tensor_type_param<T: TensorTypeParam>(&self) -> T {
+        T::from_usize(self.0)
     }
 }
 

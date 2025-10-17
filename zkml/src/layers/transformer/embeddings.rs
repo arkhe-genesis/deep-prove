@@ -1,6 +1,6 @@
 use crate::{
     parser::{gguf, json},
-    tensor::{KeyedTensor, TensorKey},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
 };
 use std::iter::once;
 
@@ -170,7 +170,7 @@ fn output_shapes(
     vec![shape]
 }
 
-impl<N: Number> OpInfo for Embeddings<N> {
+impl<N: TensorTypeParam> OpInfo for Embeddings<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         assert!(
             input_shapes.len() == 1,
@@ -208,11 +208,11 @@ impl<N: Number> OpInfo for Embeddings<N> {
 impl Evaluate<f32> for Embeddings<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(
-            inputs.iter().all(|x| { x.shape().rank() == 1 }),
+            inputs.iter().all(|x| { x.rank() == 1 }),
             "embeddings only support 1d tensors: {:?}",
             inputs.iter().map(|x| x.shape()).collect::<Vec<_>>()
         );
@@ -224,13 +224,10 @@ impl Evaluate<f32> for Embeddings<f32> {
             bail!("right matrix is not a weight matrix");
         };
         let input = inputs[0];
-        let input_len = input.shape()[0];
-
         let emb = &w.tensor;
-        let emb_size = emb.shape()[1];
 
-        let weights = emb.tensor().to_btensor::<2>();
-        let indices = input.clone().to_btensor::<1>().int();
+        let weights = WrappedTensor::try_from(emb)?;
+        let indices = input.clone().int();
 
         let res = Backend::float_select(
             weights.into_primitive().tensor(),
@@ -238,23 +235,21 @@ impl Evaluate<f32> for Embeddings<f32> {
             indices.into_primitive(),
         );
 
-        let data = burn::tensor::Tensor::<Backend, 2>::new(TensorPrimitive::Float(res))
-            .to_data()
-            .into_vec()
-            .expect("convert tensor to scalar");
-        let out_shape = Shape::new(vec![input_len, emb_size]);
-        Ok(LayerOut::from_vec(vec![Tensor::new(out_shape, data)]))
+        let out = WrappedTensor::Rank2(burn::tensor::Tensor::<Backend, 2>::new(
+            TensorPrimitive::Float(res),
+        ));
+        Ok(LayerOut::from_tensor(out))
     }
 }
 
 impl Evaluate<Element> for Embeddings<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         ensure!(
-            inputs.iter().all(|x| { x.shape().rank() == 1 }),
+            inputs.iter().all(|x| { x.rank() == 1 }),
             "embeddings only support 1d tensors: {:?}",
             inputs.iter().map(|x| x.shape()).collect::<Vec<_>>()
         );
@@ -266,22 +261,17 @@ impl Evaluate<Element> for Embeddings<Element> {
             bail!("right matrix is not a weight matrix");
         };
         let input = inputs[0];
-        let input_len = input.shape()[0];
-
         let emb = &w.tensor;
-        let emb_size = emb.shape()[1];
 
-        let weights = emb.tensor().to_btensor::<2>();
-        let indices = input.clone().to_btensor::<1>();
+        let weights = emb.clone().to_btensor::<2>();
+        let indices = input.clone();
 
         let res = Backend::int_select(weights.into_primitive(), 0, indices.into_primitive());
 
-        let data = burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res)
-            .to_data()
-            .into_vec()
-            .expect("convert tensor to scalar");
-        let out_shape = Shape::new(vec![input_len, emb_size]);
-        Ok(LayerOut::from_vec(vec![Tensor::new(out_shape, data)]))
+        let out = WrappedTensor::Rank2(
+            burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res),
+        );
+        Ok(LayerOut::from_tensor(out))
     }
 }
 
@@ -774,14 +764,16 @@ mod tests {
         let emb = Tensor::<Element>::random(&vec![vocab_size, 10].into());
         let embeddings = Embeddings::new(KeyedTensor::new("embeddings_mat", emb.clone()))?;
         let input = Tensor::new(vec![seq_len].into(), indices_elem.clone());
-        let out = embeddings
-            .evaluate::<GoldilocksExt2>(&[&input], &[vec![indices_elem.len(), 1].into()])?;
+        let out = embeddings.evaluate::<GoldilocksExt2>(
+            &[&input.as_wrapped()],
+            &[vec![indices_elem.len(), 1].into()],
+        )?;
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
-        assert_eq!(*out.outputs()[0].shape(), expected_shape);
+        assert_eq!(Shape::from(out.outputs()[0].shape()), expected_shape);
         let onehot_result = one_hot.matmul(&emb.to_fields());
         assert_eq!(
             onehot_result.get_data(),
-            out.outputs()[0].to_fields().get_data()
+            out.outputs()[0].to_native().to_fields().get_data()
         );
 
         Ok(())
@@ -808,8 +800,9 @@ mod tests {
             .map(|x| Element::from(x as Element))
             .collect::<Vec<_>>();
         let x = Tensor::new(vec![seq_len].into(), input_data.clone());
-        let out = embeddings.evaluate::<GoldilocksExt2>(&[&x], &[vec![seq_len].into()])?;
-        assert_eq!(*out.outputs()[0].shape(), vec![seq_len, emb_size].into());
+        let out =
+            embeddings.evaluate::<GoldilocksExt2>(&[&x.as_wrapped()], &[vec![seq_len].into()])?;
+        assert_eq!(out.outputs()[0].shape(), vec![seq_len, emb_size].into());
         // for each input index, check that the embedding vector is the correct one
         for (idx, table_idx) in input_data.iter().enumerate() {
             let emb = emb_vector(*table_idx as usize);
@@ -851,9 +844,9 @@ mod tests {
                     emb
                 )
             ).unwrap();
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[]).unwrap();
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
 
         #[test]
@@ -893,9 +886,9 @@ mod tests {
                     emb
                 )
             ).unwrap();
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[]).unwrap();
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
     }
 
@@ -910,7 +903,7 @@ mod tests {
         }
     }
 
-    fn any_input<T: Number>(
+    fn any_input<T: TensorTypeParam>(
         vocab_size: Range<usize>,
         emb_size: Range<usize>,
         input_size: Range<usize>,

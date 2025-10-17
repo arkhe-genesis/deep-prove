@@ -21,9 +21,8 @@ use crate::{
     number::Number,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
-    tensor::DryTensor,
+    tensor::{DryTensor, WrappedModuleFn, WrappedTensor},
 };
-use burn::tensor::activation::gelu;
 use either::Either;
 use ff_ext::ExtensionField;
 use witness::RowMajorMatrix;
@@ -160,11 +159,14 @@ impl<N> GeGlu<N> {
 impl ActivationLayer<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<Vec<Tensor<f32>>> {
+    ) -> Result<Vec<WrappedTensor<f32>>> {
         match self {
-            ActivationLayer::Relu(relu) => Ok(inputs.iter().map(|input| relu.op(input)).collect()),
+            ActivationLayer::Relu(_relu) => Ok(inputs
+                .iter()
+                .map(|tensor| WrappedTensor::relu((*tensor).clone()))
+                .collect::<Vec<_>>()),
             ActivationLayer::Gelu(gelu) => inputs
                 .iter()
                 .map(|input| {
@@ -197,14 +199,22 @@ impl ActivationLayer<f32> {
 impl ActivationLayer<Element> {
     fn evaluate(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<Vec<Tensor<Element>>> {
+    ) -> Result<Vec<WrappedTensor<Element>>> {
         match self {
-            ActivationLayer::Relu(relu) => Ok(inputs.iter().map(|input| relu.op(input)).collect()),
+            ActivationLayer::Relu(_relu) => Ok(inputs
+                .iter()
+                .map(|tensor| WrappedTensor::relu((*tensor).clone()))
+                .collect()),
             ActivationLayer::Gelu(g) => inputs
                 .iter()
-                .map(|input| input.try_map(|e| g.apply(e)))
+                .map(|input| {
+                    // TODO gpu int gelu
+                    let input = Tensor::<Element>::try_from((*input).clone())?;
+                    let output = input.try_map(|e| g.apply(e))?;
+                    WrappedTensor::<Element>::try_from(&output)
+                })
                 .collect::<anyhow::Result<Vec<_>>>(),
         }
     }
@@ -307,40 +317,6 @@ impl<N> OpInfo for Activation<N> {
 
 const ACTIVATION_OUT_ID: &str = "ActivationOut";
 
-impl Evaluate<f32> for Activation<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&Tensor<f32>],
-        unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<f32, E>> {
-        match self {
-            Activation::Plain(layer) => layer
-                .evaluate::<E>(inputs, unpadded_input_shapes)
-                .map(|outputs| LayerOut::from_vec(outputs)),
-            Activation::GLU(layer) => {
-                ensure!(
-                    inputs.len() == 2,
-                    "Expected 2 inputs for activation layer used in GLU, found {} inputs instead",
-                    inputs.len(),
-                );
-                let mut activation_outputs =
-                    layer.evaluate::<E>(&[inputs[0]], unpadded_input_shapes)?;
-                // double-check that there is only one output
-                assert_eq!(activation_outputs.len(), 1);
-                let activation_out = activation_outputs.pop().unwrap();
-                Ok(LayerOut::from_vec(
-                    // multiply `activation_out` with `inputs[1]`
-                    vec![activation_out.mul(inputs[1])],
-                )
-                .with_data_to_be_tracked(HashMap::from([(
-                    ACTIVATION_OUT_ID.to_string().into(),
-                    activation_out,
-                )])))
-            }
-        }
-    }
-}
-
 impl QuantizeOp for Activation<f32> {
     type QuantizedOp = Activation<Element>;
 
@@ -409,10 +385,44 @@ impl QuantizeOp for Activation<f32> {
     }
 }
 
+impl Evaluate<f32> for Activation<f32> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&WrappedTensor<f32>],
+        unpadded_input_shapes: &[Shape],
+    ) -> Result<LayerOut<f32, E>> {
+        match self {
+            Activation::Plain(layer) => layer
+                .evaluate::<E>(inputs, unpadded_input_shapes)
+                .map(|outputs| LayerOut::from_vec(outputs)),
+            Activation::GLU(layer) => {
+                ensure!(
+                    inputs.len() == 2,
+                    "Expected 2 inputs for activation layer used in GLU, found {} inputs instead",
+                    inputs.len(),
+                );
+                let mut activation_outputs =
+                    layer.evaluate::<E>(&[inputs[0]], unpadded_input_shapes)?;
+                // double-check that there is only one output
+                assert_eq!(activation_outputs.len(), 1);
+                let activation_out = activation_outputs.pop().unwrap();
+                Ok(LayerOut::from_vec(
+                    // multiply `activation_out` with `inputs[1]`
+                    vec![activation_out.clone().mul(inputs[1].clone())?],
+                )
+                .with_data_to_be_tracked(HashMap::from([(
+                    ACTIVATION_OUT_ID.to_string().into(),
+                    activation_out,
+                )])))
+            }
+        }
+    }
+}
+
 impl Evaluate<Element> for Activation<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         match self {
@@ -431,9 +441,10 @@ impl Evaluate<Element> for Activation<Element> {
                 assert_eq!(activation_outputs.len(), 1);
                 let activation_output = activation_outputs.pop().unwrap();
                 Ok(
-                    LayerOut::from_vec(vec![activation_output.mul(inputs[1])]).with_proving_data(
-                        ProvingData::Activation(ActivationData { activation_output }),
-                    ),
+                    LayerOut::from_vec(vec![activation_output.clone().mul(inputs[1].clone())?])
+                        .with_proving_data(ProvingData::Activation(ActivationData {
+                            activation_output: Tensor::try_from(activation_output)?,
+                        })),
                 )
             }
         }
@@ -953,22 +964,12 @@ impl<N> GELU<N> {
 impl Evaluate<f32> for GELU<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
-        let output_tensors: Vec<Tensor<f32>> = inputs
+        let output_tensors: Vec<WrappedTensor<f32>> = inputs
             .par_iter()
-            .map(|tensor| {
-                let shape = tensor.shape().clone();
-                let mut tensor = (*tensor).clone();
-                tensor.to_1d();
-                let tensor = tensor.to_btensor::<1>();
-
-                let result = gelu(tensor);
-
-                let data = result.to_data().into_vec().expect("Failed to compute GELU");
-                Tensor::new(shape, data)
-            })
+            .map(|tensor| WrappedTensor::gelu((*tensor).clone()))
             .collect();
         Ok(LayerOut::from_vec(output_tensors))
     }
@@ -1042,6 +1043,7 @@ impl GELU<Element> {
 
 #[cfg(test)]
 mod test {
+    use burn::tensor::activation::gelu;
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
 
@@ -1110,7 +1112,8 @@ mod test {
     fn test_activation_gelu_evaluate_f32() -> anyhow::Result<()> {
         let gelu = GELU::<f32>::new();
         let input_data = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
-        let input_tensor = Tensor::new(vec![1, input_data.len()].into(), input_data.clone());
+        let input_tensor =
+            Tensor::new(vec![1, input_data.len()].into(), input_data.clone()).into_wrapped();
 
         let expected_output_data = input_data.iter().map(gelu_float).collect::<Vec<_>>();
 
@@ -1118,7 +1121,7 @@ mod test {
         assert_eq!(layer_out.outputs().len(), 1);
         let output_tensor = &layer_out.outputs()[0];
 
-        assert_eq!(*output_tensor.shape(), vec![1, input_data.len()].into());
+        assert_eq!(output_tensor.shape(), vec![1, input_data.len()].into());
         let actual_output_data = output_tensor.get_data();
 
         actual_output_data

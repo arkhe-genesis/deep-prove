@@ -3,7 +3,7 @@ use core::f32;
 use std::fmt::Debug;
 
 use crate::{
-    Claim, Element, ScalingStrategy, Shape, Tensor,
+    Claim, Element, Number, ScalingStrategy, Shape, Tensor,
     backend::Backend,
     commit::{compute_betas_eval, identity_eval},
     iop::{
@@ -30,14 +30,14 @@ use crate::{
         },
     },
     model::{NodeID, StepData, transform::impls::softmax_mask::SoftmaxMaskTransform},
-    number::Number,
     padding::PaddingMode,
     quantization::{self, Fieldizer, ScalingFactor},
+    tensor::{TensorTypeParam, WrappedTensor},
     to_base,
 };
 
 use anyhow::{Result, anyhow, bail, ensure};
-use burn::tensor::{Int as BInt, Tensor as BTensor, TensorData, activation::softmax};
+use burn::tensor::{Int as BInt, Tensor as BTensor, TensorData};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
@@ -245,7 +245,7 @@ pub struct SoftmaxData {
     shift_tensor: Tensor<Element>,
 }
 
-impl<N: Number> Softmax<N> {
+impl<N: TensorTypeParam> Softmax<N> {
     pub fn new(context_length: usize) -> Self {
         Softmax {
             scalar: N::unit(),
@@ -283,7 +283,7 @@ impl<N: Number> Softmax<N> {
 
         let input_scale_factor = input_scaling.scale();
 
-        let temperature = self.scalar.to_f32()?;
+        let temperature = Number::to_f32(&self.scalar)?;
 
         // This is the multiplier we will use to rescale the input before it is passed to the exp table.
         // It is given by input_scale_factor * temperature * input_sf, where input_sf is the scale factor we calculated above.
@@ -400,7 +400,7 @@ impl<N: Number> Softmax<N> {
             }
         }
         // The case that may cause issues seems to always be when all the values on a row are the same, so we quickly check here what the error for that case would be
-        let temperature = self.scalar.to_f32().unwrap_or(1.0);
+        let temperature = Number::to_f32(&self.scalar).unwrap_or(1.0);
         let all_same_shift = (-(max_context_size.ln()) / (input_scaling.scale() * temperature))
             .round_ties_even() as Element;
         let rescaling_mult = input_scaling.scale() * temperature * input_sf;
@@ -494,7 +494,7 @@ impl Softmax<Element> {
 impl Evaluate<f32> for Softmax<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(
@@ -503,22 +503,19 @@ impl Evaluate<f32> for Softmax<f32> {
         );
         let input = inputs[0];
 
-        // Convert to a 2D burn tensor, rescale and apply softmax.
-        let b_input = input.clone().flatten(0..input.rank() - 1).to_btensor::<2>() * self.scalar;
-        let probabilities = softmax(b_input, 1);
+        // Convert to a 2D tensor, rescale and apply softmax.
+        let b_input = input
+            .clone()
+            .flatten_to_dim_2(0, input.rank() - 2)
+            .mul_scalar(self.scalar);
+        let out = WrappedTensor::softmax(b_input, 1)?;
+        let out = out.reshape(input.shape())?;
 
-        // Extract the output data
-        let output_data: Vec<f32> = probabilities
-            .to_data()
-            .into_vec()
-            .map_err(|e| anyhow!("Could not convert burn Softmax output to f32: {e:?}"))?;
-
-        let output_tensor = Tensor::new(input.shape().clone(), output_data);
-        Ok(LayerOut::from_vec(vec![output_tensor]))
+        Ok(LayerOut::from_tensor(out))
     }
 }
 
-impl<N: Number> OpInfo for Softmax<N> {
+impl<N> OpInfo for Softmax<N> {
     fn output_shapes(
         &self,
         input_shapes: &[Shape],
@@ -543,7 +540,7 @@ impl<N: Number> OpInfo for Softmax<N> {
 impl Evaluate<Element> for Softmax<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we check that we have some quantisation info.
@@ -567,7 +564,7 @@ impl Evaluate<Element> for Softmax<Element> {
         } = self.quant_info().unwrap();
 
         // We expect the input tensor to have rank 2 or 3, if it has rank 2 we will treat it as having shape [1, shape[0], shape[1]]
-        let input_rank = inputs[0].shape().rank();
+        let input_rank = inputs[0].rank();
         ensure!(
             input_rank == 2 || input_rank == 3,
             "Expected input to quantised softmax to have rank 2 or 3, got: {input_rank}",
@@ -575,33 +572,30 @@ impl Evaluate<Element> for Softmax<Element> {
 
         let (input, unpadded_input_shape) = if input_rank == 2 {
             (
-                inputs[0].clone().unsqueeze(0),
+                inputs[0].clone().unsqueeze_dim_3(),
                 unpadded_input_shapes[0].insert(0, 1),
             )
         } else {
             (inputs[0].clone(), unpadded_input_shapes[0].clone())
         };
 
-        let shift_shape = Shape::new(vec![unpadded_input_shape[0], input.shape().dim(1), 1]);
+        let shift_shape = Shape::new(vec![unpadded_input_shape[0], input.shape().dims[1], 1]);
 
         // We work over 2D chunks (skipping any padding chunks)
-        let full_input_size = input.shape().numel();
-        let strides = input.shape().strides();
+        let nshape = Shape::from(input.shape());
+        let full_input_size = nshape.numel();
+        let strides = nshape.strides();
         let rounding: Element = 1 << (*right_shift - 1);
 
         let data_to_take = strides[0] * unpadded_input_shape[0];
         // Now we flatten the input to 2D and take only the data that corresponds to 2D sub-tensors that don't arise from padding.
-        let flat_data = input
-            .iter()
-            .take(data_to_take)
-            .cloned()
-            .collect::<Vec<Element>>();
+        let flat_data: Vec<Element> = input.clone().to_data().iter().take(data_to_take).collect();
         let b_input = BTensor::<Backend, 2, BInt>::from_data(
             TensorData::new(
                 flat_data,
                 vec![
-                    unpadded_input_shape[0] * input.shape().dim(1),
-                    input.shape().dim(2),
+                    unpadded_input_shape[0] * input.shape().dims[1],
+                    input.shape().dims[2],
                 ],
             ),
             &Default::default(),
@@ -632,9 +626,12 @@ impl Evaluate<Element> for Softmax<Element> {
 
         // Make the output tensor
         let output = if input_rank == 2 {
-            Tensor::<Element>::new(inputs[0].shape().clone(), output_data)
+            WrappedTensor::try_from(&Tensor::<Element>::new(
+                inputs[0].shape().into(),
+                output_data,
+            ))?
         } else {
-            Tensor::<Element>::new(input.shape().clone(), output_data)
+            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data))?
         };
 
         Ok(LayerOut {
@@ -1985,14 +1982,14 @@ mod tests {
             // Obtain the quantised output
             let quant_output = quant_softmax
                 .evaluate::<GoldilocksExt2>(
-                    &[&test_qk_quant],
+                    &[&test_qk_quant.as_wrapped()],
                     &[vec![num_tokens, num_tokens].into()],
                 )
                 .unwrap();
             // The result of running the quantised input as floats
             let dequant_output = softmax
                 .evaluate::<GoldilocksExt2>(
-                    &[&test_qk_dequant],
+                    &[&test_qk_dequant.as_wrapped()],
                     &[vec![num_tokens, num_tokens].into()],
                 )
                 .unwrap();
@@ -2046,9 +2043,9 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
         let output = softmax
-            .evaluate::<GoldilocksExt2>(&[&input], &[vec![1, 3, 3].into()])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[vec![1, 3, 3].into()])
             .unwrap();
-        assert_eq!(*output.outputs[0].shape(), vec![1, 3, 3].into());
+        assert_eq!(output.outputs[0].shape(), vec![1_usize, 3, 3].into());
 
         output.outputs[0].get_data().chunks(3).for_each(|chunk| {
             assert!((chunk.iter().sum::<f32>() - 1.0) < f32::EPSILON);
@@ -2107,7 +2104,7 @@ mod tests {
             let SoftmaxInput { n, data } = input;
             let tensor = Tensor::new(vec![1, n, n].into(), data.clone());
             let layer = Softmax::<f32>::new(n);
-            let eval = layer.evaluate::<GoldilocksExt2>(&[&tensor], &[vec![1,n,n].into()]).unwrap();
+            let eval = layer.evaluate::<GoldilocksExt2>(&[&tensor.as_wrapped()], &[vec![1,n,n].into()]).unwrap();
             let got = eval.outputs[0].get_data();
 
             for row in got.chunks(n) { prop_assert!(((row.iter().sum::<f32>() - 1.0).abs()) < 1e-4 * n as f32 + 1e-6); }
@@ -2123,7 +2120,7 @@ mod tests {
             let layer_f = Softmax::<f32>::new(n);
             let layer_q = layer_f.quantise(scaling, *quantization::BIT_LEN).unwrap();
 
-            let out_q = layer_q.evaluate::<GoldilocksExt2>(&[&quant_input], &[vec![1,n,n].into()]).unwrap();
+            let out_q = layer_q.evaluate::<GoldilocksExt2>(&[&quant_input.as_wrapped()], &[vec![1,n,n].into()]).unwrap();
 
             let quant_rows = out_q.outputs[0].get_data();
             let qi = layer_q.quant_info().unwrap();

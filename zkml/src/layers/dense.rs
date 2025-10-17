@@ -8,14 +8,12 @@ use crate::{
     },
     layers::{LayerCtx, LayerProof, requant::Requant},
     model::StepData,
-    number::Number,
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
-    tensor::{KeyedTensor, TensorKey},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedModuleFn},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Result, ensure};
-use burn::tensor::module::linear;
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -34,7 +32,10 @@ use tenstore::GenStore;
 use tracing::warn;
 use transcript::Transcript;
 
-use crate::{Element, tensor::Tensor};
+use crate::{
+    Element,
+    tensor::{Tensor, WrappedTensor},
+};
 
 use super::provable::{
     Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
@@ -89,7 +90,7 @@ fn output_shape(input_shape: &Shape, matrix_shape: &Shape) -> Shape {
     Shape::new(vec![matrix_shape[0]])
 }
 
-impl<T: Number> Dense<T> {
+impl<T: TensorTypeParam> Dense<T> {
     pub fn new(matrix: KeyedTensor<T>, bias: KeyedTensor<T>) -> Self {
         Self::new_with(matrix, Some(bias))
     }
@@ -139,7 +140,7 @@ impl<T: Number> Dense<T> {
 
 const IS_PROVABLE: bool = true;
 
-impl<N: Number> OpInfo for Dense<N> {
+impl<N: TensorTypeParam> OpInfo for Dense<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes
             .iter()
@@ -172,64 +173,30 @@ impl<N: Number> OpInfo for Dense<N> {
     }
 }
 
-impl Evaluate<Element> for Dense<Element> {
+impl<T> Evaluate<T> for Dense<T>
+where
+    T: TensorTypeParam,
+    WrappedTensor<T>: WrappedModuleFn,
+{
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<T>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<Element, E>> {
+    ) -> Result<LayerOut<T, E>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating dense layer"
         );
-        ensure!(
-            inputs[0].shape().product() == self.matrix.shape().dim(1),
-            "incompatible dense evaluation shapes: input {:?} vs matrix {:?}",
-            inputs[0].shape(),
-            self.matrix.shape()
-        );
 
-        let matrix = self.matrix.tensor().to_btensor::<2>();
-        let input = inputs[0].to_flatten().to_btensor::<1>();
-        let bias = self.bias.as_ref().map(|b| b.to_flatten().to_btensor::<1>());
+        let matrix = WrappedTensor::try_from(&self.matrix)?;
+        let input = inputs[0].clone().to_flatten();
+        let bias = self
+            .bias
+            .as_ref()
+            .map(WrappedTensor::try_from)
+            .transpose()?;
 
-        // NOTE: Can not use the [burn::tensor::module::linear] because it
-        // is defined only for floats
-        let input = input.unsqueeze_dim(1);
-        let matmul = matrix.matmul(input);
-        let matmul = matmul.squeeze(1);
-        let res = match bias {
-            Some(b) => matmul.add(b),
-            None => matmul,
-        };
-
-        let data = res.to_data().into_vec().expect("Failed to compute Dense");
-        let shape = Shape::new(vec![data.len()]);
-        let out = Tensor::<Element>::new(shape, data);
-        Ok(LayerOut::from_vec(vec![out]))
-    }
-}
-
-impl Evaluate<f32> for Dense<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<f32, E>> {
-        ensure!(
-            inputs.len() == 1,
-            "Found more than 1 input when evaluating dense layer"
-        );
-        let input = inputs[0];
-
-        let matrix = self.matrix.tensor().to_btensor::<2>();
-        let input = input.to_flatten().to_btensor::<1>();
-        let bias = self.bias.as_ref().map(|b| b.to_flatten().to_btensor::<1>());
-        let res = linear(input, matrix.transpose(), bias);
-
-        let data = res.to_data().into_vec().expect("Failed to compute Dense");
-        let shape = Shape::new(vec![data.len()]);
-        let out = Tensor::<f32>::new(shape, data);
+        let out = WrappedTensor::<T>::linear(input, matrix.transpose(), bias)?;
 
         Ok(LayerOut::from_vec(vec![out]))
     }
@@ -722,7 +689,7 @@ mod test {
 
     use super::*;
 
-    impl<T: Number> Dense<T> {
+    impl<T: TensorTypeParam> Dense<T> {
         /// Require a `layer_name` in case there is the need to use different tensor
         /// keys form the default ones
         pub fn random(shape: Shape, layer_name: Option<TensorKey>) -> Self {
@@ -917,7 +884,7 @@ mod test {
         let padded = dense.clone().pad_next_power_of_two();
 
         // Create input tensor
-        let input_tensor = Tensor::<Element>::new(vec![3].into(), quantized_input);
+        let input_tensor = Tensor::<Element>::new(vec![3].into(), quantized_input).into_wrapped();
 
         // Apply the dense operation on both original and padded
         let output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&input_tensor], None)
@@ -962,9 +929,10 @@ mod test {
             let expected = matrix.matvec(&input).add(&bias);
 
             let dense = Dense::<Element>::new(matrix.clone(), bias.clone());
+            let input = input.into_wrapped();
             let computed = dense.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("Dense evaluation must be successful");
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
 
         #[test]
@@ -974,6 +942,7 @@ mod test {
             let expected = matrix.matvec(&input).add(&bias);
 
             let dense = Dense::<f32>::new(matrix.clone(), bias.clone());
+            let input = input.into_wrapped();
             let computed = dense.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("Dense evaluation must be successful");
 
             for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
@@ -997,7 +966,7 @@ mod test {
         }
     }
 
-    fn any_input<T: Number>(dim: Range<usize>) -> impl Strategy<Value = Input<T>> {
+    fn any_input<T: TensorTypeParam>(dim: Range<usize>) -> impl Strategy<Value = Input<T>> {
         dim.prop_flat_map(|dim| {
             let matrix = Tensor::<T>::any(Shape::new(vec![dim, dim]));
             let bias = Tensor::<T>::any(Shape::new(vec![dim]));

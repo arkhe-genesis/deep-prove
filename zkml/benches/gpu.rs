@@ -23,7 +23,7 @@ mod add_layer {
     use zkml::{
         ScalingFactor, Shape, Tensor,
         layers::{add::Add, provable::Evaluate},
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes};
@@ -44,8 +44,9 @@ mod add_layer {
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let result_scaling = ScalingFactor::from_tensor(&result, None);
 
-        let input = input.to_quantized(&input_scaling);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::try_from(&input.to_quantized(&input_scaling)).unwrap();
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = layer
             .quantize(&[operand_scaling, input_scaling], result_scaling)
@@ -65,8 +66,9 @@ mod add_layer {
         let shape = Shape::new(vec![size, size]);
         let operand = Tensor::<f32>::random(&shape);
 
-        let input = Tensor::<f32>::random(&shape);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&shape);
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Add::<f32>::new_with(
             KeyedTensor::new("add_operand", operand.clone()),
@@ -89,7 +91,7 @@ mod dense_layer {
     use zkml::{
         Element, Shape, Tensor,
         layers::{dense::Dense, provable::Evaluate},
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes};
@@ -100,8 +102,9 @@ mod dense_layer {
         let matrix = Tensor::<Element>::random(&Shape::new(vec![size, size]));
         let bias = Tensor::<Element>::random(&Shape::new(vec![size]));
 
-        let input = Tensor::<Element>::random(&Shape::new(vec![size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&Shape::new(vec![size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Dense::<Element>::new(
             KeyedTensor::new("dense_weight", matrix.clone()),
@@ -121,8 +124,9 @@ mod dense_layer {
         let matrix = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let bias = Tensor::<f32>::random(&Shape::new(vec![size]));
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Dense::<f32>::new(
             KeyedTensor::new("dense_weight", matrix.clone()),
@@ -146,7 +150,7 @@ mod convolution_layer {
     use zkml::{
         Element, Shape, Tensor,
         layers::{convolution::Convolution, provable::Evaluate},
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes, sizes};
@@ -176,14 +180,16 @@ mod convolution_layer {
         let kernels = Tensor::<Element>::random(&Shape::new(vec![BATCHES, CHANNELS, 3, 3]));
         let bias = Tensor::<Element>::random(&Shape::new(vec![BATCHES]));
 
-        let input = Tensor::<Element>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input =
+            WrappedTensor::<Element>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Convolution::<Element>::new(
             KeyedTensor::new("conv_filter", kernels.clone()),
             KeyedTensor::new("conv_bias", bias.clone()),
         )
-        .prepared_for_fft(input.shape());
+        .prepared_for_fft(&Shape::from(input.shape()));
 
         bencher.bench(|| {
             layer
@@ -198,8 +204,9 @@ mod convolution_layer {
         let kernels = Tensor::<f32>::random(&Shape::new(vec![BATCHES, CHANNELS, 3, 3]));
         let bias = Tensor::<f32>::random(&Shape::new(vec![BATCHES]));
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Convolution::<f32>::new(
             KeyedTensor::new("conv_filter", kernels.clone()),
@@ -223,7 +230,7 @@ mod embeddings_layer {
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::embeddings::Embeddings},
         number::Number,
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes};
@@ -240,8 +247,9 @@ mod embeddings_layer {
             Some((0, vocab_size as Element)),
         );
 
-        let input = input.to_quantized(&scaling);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::try_from(&input.to_quantized(&scaling)).unwrap();
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer =
             Embeddings::<Element>::new(KeyedTensor::new("embedding_matrix", emb.clone())).unwrap();
@@ -257,8 +265,9 @@ mod embeddings_layer {
         let size = 1 << args.pow2;
         let emb = Tensor::<f32>::random(&Shape::new(vec![size, size]));
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer =
             Embeddings::<f32>::new(KeyedTensor::new("embeddings_matrix", emb.clone())).unwrap();
@@ -277,8 +286,9 @@ mod flatten_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Shape, Tensor,
+        Element, Shape,
         layers::{flatten::Flatten, provable::Evaluate},
+        tensor::WrappedTensor,
     };
 
     #[derive(Debug, Copy, Clone)]
@@ -299,8 +309,9 @@ mod flatten_layer {
     #[divan::bench(args = args())]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let input = Tensor::<Element>::random(&Shape::new([size].repeat(args.rank)));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&Shape::new([size].repeat(args.rank)));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
         let layer = Flatten;
         bencher.bench(|| {
             layer
@@ -312,8 +323,9 @@ mod flatten_layer {
     #[divan::bench(args = args())]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let input = Tensor::<f32>::random(&Shape::new([size].repeat(args.rank)));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new([size].repeat(args.rank)));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
         let layer = Flatten;
         bencher.bench(|| {
             layer
@@ -329,8 +341,9 @@ mod gelu_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Shape, Tensor,
+        Shape,
         layers::{activation::GELU, provable::Evaluate},
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, default_sizes};
@@ -338,8 +351,9 @@ mod gelu_layer {
     #[divan::bench(args = default_sizes())]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let input = Tensor::<f32>::random(&Shape::new(vec![size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
         let layer = GELU::<f32>::new();
         bencher.bench(|| {
             layer
@@ -356,12 +370,12 @@ mod matmul_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Tensor,
+        Element, Shape, Tensor,
         layers::{
             matrix_mul::{self, MatMul},
             provable::Evaluate,
         },
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes, sizes};
@@ -377,8 +391,8 @@ mod matmul_layer {
     #[divan::bench(args = sizes(ELEMENT_SIZES))]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let left = Tensor::<Element>::random(&vec![size, size].into());
-        let right = Tensor::<Element>::random(&vec![size, size].into());
+        let left = WrappedTensor::<Element>::random(&vec![size, size].into());
+        let right = WrappedTensor::<Element>::random(&vec![size, size].into());
         let bias = KeyedTensor::new("matmul_bias", Tensor::<Element>::random(&vec![size].into()));
         let config = matrix_mul::Config::TransposeB;
 
@@ -393,7 +407,7 @@ mod matmul_layer {
             layer
                 .evaluate::<GoldilocksExt2>(
                     &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
+                    &[Shape::from(left.shape()), Shape::from(right.shape())],
                 )
                 .expect("MatMul should succeed")
         });
@@ -402,8 +416,8 @@ mod matmul_layer {
     #[divan::bench(args = default_sizes())]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let left = Tensor::<f32>::random(&vec![size, size].into());
-        let right = Tensor::<f32>::random(&vec![size, size].into());
+        let left = WrappedTensor::<f32>::random(&vec![size, size].into());
+        let right = WrappedTensor::<f32>::random(&vec![size, size].into());
         let bias = KeyedTensor::new("matmul_bias", Tensor::<f32>::random(&vec![size].into()));
         let config = matrix_mul::Config::TransposeB;
 
@@ -419,7 +433,7 @@ mod matmul_layer {
             layer
                 .evaluate::<GoldilocksExt2>(
                     &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
+                    &[Shape::from(left.shape()), Shape::from(right.shape())],
                 )
                 .expect("MatMul should succeed")
         });
@@ -433,11 +447,12 @@ mod concat_matmul_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Shape, Tensor,
+        Element, Shape,
         layers::{
             concat_matmul::{ConcatMatMul, InputMatrixDimensions, Permutation},
             provable::Evaluate,
         },
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, sizes};
@@ -458,8 +473,8 @@ mod concat_matmul_layer {
 
         // concat dim must match the `left_perm` and `right_perm` config
         let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = Tensor::<Element>::random(&shape);
-        let right = Tensor::<Element>::random(&shape);
+        let left = WrappedTensor::<Element>::random(&shape);
+        let right = WrappedTensor::<Element>::random(&shape);
 
         let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
 
@@ -467,7 +482,7 @@ mod concat_matmul_layer {
             layer
                 .evaluate::<GoldilocksExt2>(
                     &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
+                    &[Shape::from(left.shape()), Shape::from(right.shape())],
                 )
                 .expect("ConcatMatMul should succeed")
         });
@@ -486,15 +501,15 @@ mod concat_matmul_layer {
 
         // concat dim must match the `left_perm` and `right_perm` config
         let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = Tensor::<f32>::random(&shape);
-        let right = Tensor::<f32>::random(&shape);
+        let left = WrappedTensor::<f32>::random(&shape);
+        let right = WrappedTensor::<f32>::random(&shape);
         let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
 
         bencher.bench(|| {
             layer
                 .evaluate::<GoldilocksExt2>(
                     &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
+                    &[Shape::from(left.shape()), Shape::from(right.shape())],
                 )
                 .expect("ConcantMatMul should succeed")
         });
@@ -510,7 +525,7 @@ mod qkv_layer {
     use zkml::{
         Element, Shape, Tensor,
         layers::{provable::Evaluate, transformer::qkv::QKV},
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes, sizes};
@@ -537,8 +552,9 @@ mod qkv_layer {
         let v = KeyedTensor::new("qkv_weight.v", Tensor::random(&vec![size, size].into()));
         let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
 
-        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&Shape::new(vec![size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         bencher
             .with_inputs(|| {
@@ -577,8 +593,9 @@ mod qkv_layer {
         let v = KeyedTensor::new("qkv_weight.v", Tensor::random(&vec![size, size].into()));
         let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = QKV::<f32>::new(
             q,
@@ -606,8 +623,9 @@ mod logits_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Shape, Tensor,
+        Element, Shape,
         layers::{provable::Evaluate, transformer::logits::Logits},
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, default_sizes};
@@ -618,8 +636,9 @@ mod logits_layer {
         let cols = 16384;
         let shape = Shape::new(vec![rows, cols]);
 
-        let input = Tensor::<Element>::random(&shape);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&shape);
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
 
@@ -636,8 +655,9 @@ mod logits_layer {
         let cols = 16384;
         let shape = Shape::new(vec![rows, cols]);
 
-        let input = Tensor::<f32>::random(&shape);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&shape);
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
         bencher.bench(|| {
@@ -664,8 +684,9 @@ mod logits_layer {
     fn element_highrank(bencher: divan::Bencher, args: ArgsHighRank) {
         let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
 
-        let input = Tensor::<Element>::random(&shape);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&shape);
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
 
@@ -680,8 +701,9 @@ mod logits_layer {
     fn f32_highrank(bencher: divan::Bencher, args: ArgsHighRank) {
         let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
 
-        let input = Tensor::<f32>::random(&shape);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&shape);
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
         bencher.bench(|| {
@@ -701,7 +723,7 @@ mod norm_layer {
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::layernorm::LayerNorm},
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::DATA_SIZE_POWS;
@@ -741,6 +763,7 @@ mod norm_layer {
         let input_shape = slice::from_ref(input.shape());
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let input = WrappedTensor::try_from(&input).unwrap();
         let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 
         bencher.bench(|| {
@@ -755,8 +778,9 @@ mod norm_layer {
         let dim0 = 1 << args.dim0_pow2;
         let dim1 = 1 << args.dim1_pow2;
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let gamma = KeyedTensor::new(
             "layernorm_gamma",
@@ -787,7 +811,7 @@ mod positional_absolute_layer {
             transformer::positional::Positional,
         },
         quantization::AbsoluteMax,
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes};
@@ -803,8 +827,9 @@ mod positional_absolute_layer {
         );
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
-        let input = input_f32.to_quantized(&input_scaling);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::try_from(&input_f32.to_quantized(&input_scaling)).unwrap();
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         bencher
             .with_inputs(|| {
@@ -833,8 +858,9 @@ mod positional_absolute_layer {
             Tensor::<f32>::random(&Shape::new(vec![context, size])),
         );
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
         bencher
             .with_inputs(|| Positional::<f32>::new_absolute(pos.clone()))
             .bench_refs(|layer| {
@@ -857,6 +883,7 @@ mod positional_rope_layer {
             transformer::positional::Positional,
         },
         quantization::AbsoluteMax,
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, default_sizes};
@@ -871,8 +898,9 @@ mod positional_rope_layer {
 
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
-        let input = input_f32.to_quantized(&input_scaling);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::try_from(&input_f32.to_quantized(&input_scaling)).unwrap();
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let num_angles = size / 2;
         let angles: Vec<f32> = (0..num_angles)
@@ -914,8 +942,9 @@ mod positional_rope_layer {
             .map(|i| ((i as f32) + 1.0) * (PI / (num_angles as f32 + 1.0)))
             .collect();
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::random(&Shape::new(vec![size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
         bencher
             .with_inputs(|| {
                 Positional::<f32>::new_rope(
@@ -940,8 +969,9 @@ mod permute_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Shape, Tensor,
+        Element, Shape,
         layers::{permute::Permute, provable::Evaluate},
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, sizes};
@@ -954,8 +984,9 @@ mod permute_layer {
         let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size, size]);
 
-        let input = Tensor::<Element>::random(&shape);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&shape);
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Permute::new(vec![2, 1, 0]);
 
@@ -971,8 +1002,9 @@ mod permute_layer {
         let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size, size]);
 
-        let input = Tensor::<f32>::random(&shape);
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&shape);
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Permute::new(vec![2, 1, 0]);
         bencher.bench(|| {
@@ -992,6 +1024,7 @@ mod softmax_layer {
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::softmax::Softmax},
         quantization,
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, default_sizes};
@@ -1004,6 +1037,7 @@ mod softmax_layer {
         let input_shape = slice::from_ref(input.shape());
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let input = WrappedTensor::try_from(&input).unwrap();
         let layer = Softmax::<f32>::new(size)
             .quantise(input_scaling, *quantization::BIT_LEN)
             .expect("Softmax quantise should succeed");
@@ -1019,8 +1053,9 @@ mod softmax_layer {
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Softmax::new(size);
 
@@ -1038,8 +1073,9 @@ mod requant_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Shape, Tensor,
+        Element, Shape,
         layers::{provable::Evaluate, requant::Requant},
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, default_sizes};
@@ -1047,8 +1083,9 @@ mod requant_layer {
     #[divan::bench(args = default_sizes())]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let input = Tensor::<Element>::random(&Shape::new(vec![size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&Shape::new(vec![size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Requant::from_multiplier(2.0, 8);
 
@@ -1066,11 +1103,12 @@ mod pooling_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Shape, Tensor,
+        Element, Shape,
         layers::{
             pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
             provable::Evaluate,
         },
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, default_sizes};
@@ -1079,8 +1117,9 @@ mod pooling_layer {
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
-        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&Shape::new(vec![size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Pooling::Maxpool2D(Maxpool2D {
             kernel_size: MAXPOOL2D_KERNEL_SIZE,
@@ -1098,8 +1137,9 @@ mod pooling_layer {
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
+        let input_shape = Shape::from(input.shape());
+        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Pooling::Maxpool2D(Maxpool2D {
             kernel_size: MAXPOOL2D_KERNEL_SIZE,

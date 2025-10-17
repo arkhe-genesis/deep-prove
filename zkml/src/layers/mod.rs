@@ -34,7 +34,7 @@ use transformer::{
 };
 
 use crate::{
-    Element, ProverContext, ScalingStrategy, Shape, Tensor,
+    Element, ProverContext, ScalingStrategy, Shape,
     iop::context::{ContextAux, ShapeStep},
     layers::{
         activation::{ACTIVATION_LAYER, Activation, ActivationData, ActivationProof},
@@ -63,10 +63,9 @@ use crate::{
     },
     lookup::context::LookupWitnessGen,
     model::{NodeID, StepData},
-    number::Number,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, ModelMetadata, ScalingFactor},
-    tensor::{ConvFFTData, DryTensor},
+    tensor::{ConvFFTData, DryTensor, TensorTypeParam, WrappedTensor},
 };
 use activation::ActivationCtx;
 use convolution::{ConvCtx, ConvProof};
@@ -128,7 +127,7 @@ impl<T> Layer<T> {
     }
 }
 
-impl<T: Number> Layer<T> {
+impl<T: TensorTypeParam> Layer<T> {
     /// Resets the internal state of the layer if any
     pub fn reset(&self) {
         if let Layer::QKV(qkv) = self {
@@ -371,7 +370,7 @@ impl<E: ExtensionField> NodeOut<Element, E> {
     }
 }
 
-impl<N: Number> OpInfo for Layer<N> {
+impl<N: TensorTypeParam> OpInfo for Layer<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         match self {
             Layer::Dense(dense) => dense.output_shapes(input_shapes, padding_mode),
@@ -478,7 +477,7 @@ impl<N: Number> OpInfo for Layer<N> {
 impl Evaluate<f32> for Layer<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         match self {
@@ -512,7 +511,7 @@ impl Evaluate<f32> for Layer<f32> {
 impl Evaluate<Element> for Layer<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         let output = match self {
@@ -940,7 +939,7 @@ where
         }
     }
 }
-impl<T: Number> std::fmt::Display for Layer<T> {
+impl<T: TensorTypeParam> std::fmt::Display for Layer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.describe())
     }

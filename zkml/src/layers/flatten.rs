@@ -4,13 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProveInfo};
 use crate::{
-    Element, Shape, Tensor,
+    Shape,
     iop::context::ContextAux,
     layers::LayerCtx,
     model::NodeID,
-    number::Number,
     padding::{PaddingMode, ShapeInfo, reshape},
-    tensor::IntoBTensor,
+    tensor::{TensorTypeParam, WrappedTensor},
 };
 
 /// Short name used to identify the flatten layer
@@ -44,66 +43,21 @@ impl OpInfo for Flatten {
     }
 }
 
-impl Evaluate<f32> for Flatten {
+impl<T> Evaluate<T> for Flatten
+where
+    T: TensorTypeParam,
+{
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<T>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<f32, E>> {
-        self.evaluate_internal(inputs, _unpadded_input_shapes)
-    }
-}
-
-impl Evaluate<Element> for Flatten {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<Element, E>> {
-        self.evaluate_internal(inputs, _unpadded_input_shapes)
-    }
-}
-
-impl Flatten {
-    fn evaluate_internal<E, N>(
-        &self,
-        inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<N, E>>
-    where
-        E: ExtensionField,
-        N: Number + burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
-    {
+    ) -> Result<LayerOut<T, E>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating reshape layer"
         );
         let input = inputs[0];
-        let rank = input.rank();
-        let res = match rank {
-            1 => {
-                return Ok(LayerOut::from_vec(vec![input.clone()]));
-            }
-            2 => {
-                let input = input.clone().to_btensor::<2>();
-                input.flatten::<1>(0, rank - 1)
-            }
-            3 => {
-                let input = input.clone().to_btensor::<3>();
-                input.flatten::<1>(0, rank - 1)
-            }
-            4 => {
-                let input = input.clone().to_btensor::<4>();
-                input.flatten::<1>(0, rank - 1)
-            }
-            _ => {
-                panic!("Unexpected rank {rank}")
-            }
-        };
-        let data = res.to_data().into_vec().expect("Failed to compute Flatten");
-        let shape = Shape::new(vec![data.len()]);
-        let out = Tensor::<N>::new(shape, data);
+        let out = input.clone().flatten_1d();
         Ok(LayerOut::from_vec(vec![out]))
     }
 }
@@ -136,7 +90,7 @@ mod tests {
     use proptest::prelude::*;
     use std::ops::Range;
 
-    use crate::Shape;
+    use crate::{Element, Shape, Tensor};
 
     use super::*;
 
@@ -146,9 +100,9 @@ mod tests {
             let expected = input.to_flatten();
 
             let layer = Flatten;
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("flatten evaluation must be successful");
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[]).expect("flatten evaluation must be successful");
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
 
         #[test]
@@ -156,13 +110,13 @@ mod tests {
             let expected = input.to_flatten();
 
             let layer = Flatten;
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("flatten evaluation must be successful");
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[]).expect("flatten evaluation must be successful");
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
     }
 
-    fn any_input<T: Number>(
+    fn any_input<T: TensorTypeParam>(
         rank: Range<usize>,
         size: Range<usize>,
     ) -> impl Strategy<Value = Tensor<T>> {

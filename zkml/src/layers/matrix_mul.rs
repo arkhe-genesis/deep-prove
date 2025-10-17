@@ -37,7 +37,7 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
     quantization::{self, bias_scaling_matmul},
-    tensor::{IntoBTensor, KeyedTensor, TensorKey},
+    tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
 };
 
@@ -312,6 +312,75 @@ impl<T> MatMul<T> {
         Ok(out)
     }
 
+    pub fn op_new(&self, inputs: &[&WrappedTensor<T>]) -> Result<WrappedTensor<T>>
+    where
+        T: TensorTypeParam,
+    {
+        let (left, right) = match (&self.left_matrix, &self.right_matrix) {
+            (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => panic!(
+                "Found layer with 2 constant matrices, which is useless as the
+                product can be directly used instead"
+            ),
+            (OperandMatrix::Weight(mat), OperandMatrix::Input) => {
+                let left = WrappedTensor::try_from(&mat.tensor)?;
+
+                let right = (*inputs
+                    .first()
+                    .ok_or(anyhow!("No matrix provided as input to MatMul"))?)
+                .clone();
+
+                (left, right)
+            }
+            (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
+                let left = (*inputs
+                    .first()
+                    .ok_or(anyhow!("No matrix provided as input to MatMul"))?)
+                .clone();
+
+                let right = WrappedTensor::try_from(&mat.tensor)?;
+
+                (left, right)
+            }
+            (OperandMatrix::Input, OperandMatrix::Input) => {
+                ensure!(
+                    inputs.len() == 2,
+                    "Not enough inputs provided to MatMul: expected 2, found {}",
+                    inputs.len()
+                );
+                let left = inputs[0].clone();
+                let right = inputs[1].clone();
+
+                (left, right)
+            }
+        };
+        let right = if let Some(Config::TransposeB) = self.config {
+            right.transpose()
+        } else {
+            right
+        };
+        let left_rows = left.shape().dims[1];
+        let right_cols = right.shape().dims[0];
+        ensure!(
+            left_rows == right_cols,
+            "Incompatible shape found for input matrix: expected {left_rows:?}, found {right_cols:?}",
+        );
+        let matmul = left.matmul(right)?;
+        let out = if let Some(bias) = self.bias.as_ref() {
+            let bias = WrappedTensor::try_from(bias)?;
+            ensure!(
+                matmul.shape().dims[1] == bias.shape().dims[0],
+                "Bias shape {:?} is incompatible with matmul shape {:?}",
+                bias.shape(),
+                matmul.shape()
+            );
+            let bias = bias.unsqueeze_dim_2();
+            matmul.add(bias)?
+        } else {
+            matmul
+        };
+        Ok(out)
+    }
+
     pub fn is_right_transposed(&self) -> bool {
         matches!(self.config, Some(Config::TransposeB))
     }
@@ -446,7 +515,7 @@ fn compute_output_shapes(
 }
 const IS_PROVABLE: bool = true;
 
-impl<N: Number> OpInfo for MatMul<N> {
+impl<N: TensorTypeParam> OpInfo for MatMul<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         let left_matrix_shape = self.left_matrix.get_shape(padding_mode);
         let right_matrix_shape = self.right_matrix.get_shape(padding_mode);
@@ -482,24 +551,13 @@ impl<N: Number> OpInfo for MatMul<N> {
     }
 }
 
-impl Evaluate<f32> for MatMul<f32> {
+impl<T: TensorTypeParam> Evaluate<T> for MatMul<T> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<T>],
         _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<f32, E>> {
-        let output = self.op(inputs.to_vec())?;
-        Ok(LayerOut::from_vec(vec![output]))
-    }
-}
-
-impl Evaluate<Element> for MatMul<Element> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&Tensor<Element>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<Element, E>> {
-        let output = self.op(inputs.to_vec())?;
+    ) -> Result<LayerOut<T, E>> {
+        let output = self.op_new(inputs)?;
         Ok(LayerOut::from_vec(vec![output]))
     }
 }
@@ -1256,10 +1314,9 @@ mod tests {
             provable::Evaluate,
         },
         model::{Model, test::prove_model},
-        number::Number,
         padding::PaddingMode,
         rng_from_env_or_random,
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, TensorTypeParam},
     };
 
     use super::WeightMatrix;
@@ -1503,10 +1560,10 @@ mod tests {
     #[test]
     fn test_matmul() {
         let matmul = MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap();
-        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
+        let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
         let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b], &[]).unwrap();
-        assert_eq!(result.outputs[0].data(), vec![22.0, 28.0, 49.0, 64.0]);
+        assert_eq!(result.outputs[0].get_data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
     #[test]
@@ -1518,10 +1575,12 @@ mod tests {
             Config::TransposeB,
         )
         .unwrap();
-        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).transpose();
+        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
+        let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .into_wrapped()
+            .transpose();
         let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b], &[]).unwrap();
-        assert_eq!(result.outputs[0].data(), vec![22.0, 28.0, 49.0, 64.0]);
+        assert_eq!(result.outputs[0].get_data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
     #[test]
@@ -1662,6 +1721,7 @@ mod tests {
                 right,
                 bias.map(|bias| KeyedTensor::new("matmul_proptest_bias", bias)),
                 config).unwrap();
+            let inputs:Vec<_> = inputs.into_iter().map(|t| t.into_wrapped()).collect();
             let inputs:Vec<_> = inputs.iter().collect();
             let computed = layer.evaluate::<GoldilocksExt2>(&inputs, &[]).expect("matmul evaluation must be successful");
 
@@ -1700,10 +1760,11 @@ mod tests {
                 bias.map(|bias| KeyedTensor::new("matmul_proptest_bias", bias)),
                 config
             ).unwrap();
+            let inputs:Vec<_> = inputs.into_iter().map(|t| t.into_wrapped()).collect();
             let inputs:Vec<_> = inputs.iter().collect();
             let computed = layer.evaluate::<GoldilocksExt2>(&inputs, &[]).expect("matmul evaluation must be successful");
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
     }
 
@@ -1759,7 +1820,7 @@ mod tests {
         }
     }
 
-    fn any_input<T: 'static + Number>(
+    fn any_input<T: 'static + TensorTypeParam>(
         dim_x: Range<usize>,
         dim_y: Range<usize>,
         dim_z: Range<usize>,

@@ -1,6 +1,7 @@
 use crate::{
     graph::{PortID, Ports, Source, Target},
     layers::{NodeOut, provable::ProvingData},
+    tensor::{Conversion, TensorTypeParam, WrappedTensor},
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -19,7 +20,6 @@ use crate::{
         provable::{Evaluate, OpInfo},
         requant::Requant,
     },
-    number::Number,
     padding::PaddingMode,
     quantization::InferenceTracker,
     tensor::DryTensor,
@@ -50,7 +50,7 @@ pub struct Model<N> {
 
 impl<N> Model<N>
 where
-    N: Number,
+    N: TensorTypeParam,
 {
     /// Returns an iterator over the nodes in the model, in arbitrary order.
     /// It is more efficient then `ForwardIterator` and `BackwardIterator`, so it
@@ -451,7 +451,7 @@ impl Model<f32> {
     }
 }
 
-impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
+impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     pub(crate) fn run_with_tracker<E>(
         &self,
         inputs: &[Tensor<N>],
@@ -655,7 +655,7 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
         // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
     ) -> Result<(Vec<(PortID, DryTensor<N>)>, ProvingData<E>)>
     where
-        N: Number,
+        N: TensorTypeParam,
         Layer<N>: Evaluate<N>,
     {
         let input_tensors = inputs
@@ -665,9 +665,9 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
                     .fetch(key)
                     .with_context(|| format!("fetching tensor data for tensor {key}"))
                     .unwrap();
-                Ok(Tensor::new(input_shape_register[key].clone(), data))
+                WrappedTensor::try_from(&Tensor::new(input_shape_register[key].clone(), data))
             })
-            .collect::<anyhow::Result<Vec<Tensor<N>>>>()?;
+            .collect::<anyhow::Result<Vec<WrappedTensor<N>>>>()?;
         let input_tensors_ref = input_tensors.iter().collect::<Vec<_>>();
         let layer = &self.graph[node_id];
         let expected_num_outputs = layer.num_outputs(input_tensors.len());
@@ -705,11 +705,16 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
             .map(|(source_port, key)| {
                 let tensor = &layer_out.outputs[*source_port];
                 store
-                    .store(key, tensor.data_vec())
+                    .store(
+                        key,
+                        &tensor.clone().to_data().into_vec().map_err(|_| {
+                            anyhow::Error::msg("Retrieve tensor data from burn tensor")
+                        })?,
+                    )
                     .with_context(|| format!("storing outputs for tensor {key}"))?;
                 Ok((
                     *source_port,
-                    DryTensor::new(key.clone(), tensor.shape().clone()),
+                    DryTensor::new(key.clone(), Shape::new(tensor.shape().to_vec())),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -720,13 +725,17 @@ impl<N: Number + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 tracker.track(
                     node_id,
                     **source_port,
-                    layer_out.outputs[*source_port].to_f32()?,
+                    Tensor::try_from(layer_out.outputs[*source_port].clone().float())?,
                 );
             }
             // track intermediate data, if any
             if let Some(tracked_data) = layer_out.tracked_layer_data {
                 for (data_id, data) in tracked_data {
-                    tracker.track_intermediate_data(node_id, data_id, data.to_f32()?);
+                    tracker.track_intermediate_data(
+                        node_id,
+                        data_id,
+                        Tensor::try_from(data.float())?,
+                    );
                 }
             }
         }
@@ -777,11 +786,10 @@ pub(crate) mod test {
             provable::{OpInfo, evaluate_layer},
             requant::Requant,
         },
-        number::Number,
         padding::{PaddingMode, pad_model},
         quantization::{self, InferenceObserver},
         rng_from_env_or_random,
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, TensorTypeParam},
         testing::{Pcs, random_bool_vector, random_vector},
         util::from_mle_list_dimensions,
         verify,
@@ -1014,7 +1022,7 @@ pub(crate) mod test {
             Some("dense_2".to_string().into()),
         );
         let input_shape = vec![dense1.ncols()].into();
-        let input = Tensor::<Element>::random(&input_shape);
+        let input = Tensor::<Element>::random(&input_shape).into_wrapped();
         let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &[&input], None)
             .unwrap()
             .outputs()[0]
@@ -1035,6 +1043,7 @@ pub(crate) mod test {
         model.automatic_output_labelling().unwrap();
 
         let mut store = GenStore::default();
+        let input = input.into_native();
         let trace = model.run::<F>(&[input], None, &mut store).unwrap();
         assert_eq!(trace.steps.len(), 2);
         // Verify first step
@@ -1046,7 +1055,7 @@ pub(crate) mod test {
                 .step_data
                 .output_tensor_at(0, &mut store)
                 .unwrap(),
-            output1
+            output1.into_native()
         );
 
         // Verify second step
@@ -1057,7 +1066,7 @@ pub(crate) mod test {
                 .step_data
                 .output_tensor_at(0, &mut store)
                 .unwrap(),
-            final_output.clone()
+            final_output.clone().into_native()
         );
         let (nrow, _) = (dense2.nrows(), dense2.ncols());
         assert_eq!(final_output.get_data().len(), nrow);
@@ -1269,7 +1278,7 @@ pub(crate) mod test {
     type T = BasicTranscript<GoldilocksExt2>;
     type N = Element;
 
-    fn build_test_model<N: Number, const INPUT_SIZE: usize>() -> Model<N> {
+    fn build_test_model<N: TensorTypeParam, const INPUT_SIZE: usize>() -> Model<N> {
         let input_shape: Shape = vec![INPUT_SIZE].into();
         let mut model =
             Model::<N>::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);

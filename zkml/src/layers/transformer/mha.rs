@@ -3,7 +3,7 @@
 //! ConcatMatMul and Softmax layers as building blocks.
 
 use crate::{
-    Claim, Element, Number, Prover, ScalingFactor, Shape,
+    Claim, Element, Number, Prover, ScalingFactor, Shape, Tensor,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -14,7 +14,7 @@ use crate::{
             ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof, InputMatrixDimensions, Permutation,
         },
         provable::{
-            Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
             QuantizeOutput, VerifiableCtx,
         },
         reshape::{Reshape, ReshapeCtx},
@@ -29,7 +29,7 @@ use crate::{
     model::{NodeID, StepData},
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
-    tensor::IntoBTensor,
+    tensor::{TensorTypeParam, WrappedTensor},
 };
 use anyhow::{anyhow, bail, ensure};
 use ff_ext::{ExtensionField, FieldFrom};
@@ -40,7 +40,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tenstore::GenStore;
 use transcript::Transcript;
 
-use crate::{Tensor, layers::provable::LayerOut};
 /// Short name used to identify the MHA layer
 pub const MHA_LAYER: &str = "MHDA";
 
@@ -74,7 +73,7 @@ struct MhaOutputShaper<'a> {
     final_reshape: &'a dyn OpInfo,
 }
 
-impl<'a, N: Number> From<&'a Mha<N>> for MhaOutputShaper<'a> {
+impl<'a, N: TensorTypeParam> From<&'a Mha<N>> for MhaOutputShaper<'a> {
     fn from(value: &'a Mha<N>) -> Self {
         Self {
             inputs_reshape: &value.inputs_reshape,
@@ -160,7 +159,7 @@ pub struct Mha<N> {
 
 impl<N> Mha<N>
 where
-    N: Number,
+    N: TensorTypeParam,
     ConcatMatMul: Evaluate<N>,
 {
     pub fn new(context_length: usize, num_heads: usize, head_dim: usize) -> anyhow::Result<Self> {
@@ -177,7 +176,7 @@ where
             None,
             None, // use the default quantization range
         );
-        let mask = AttentionMask::<N>::new(context_length, N::MIN);
+        let mask = AttentionMask::<N>::new(context_length, <N as Number>::MIN);
         let softmax =
             Softmax::new(context_length).with_scale(N::from_f32((1.0 / (head_dim as f32)).sqrt())?);
         let final_mul = ConcatMatMul::new_with_permute(
@@ -246,13 +245,15 @@ where
     fn final_mul_node_id(node_id: NodeID) -> NodeID {
         Self::compute_ephemeral_node_id(node_id, "final_mul")
     }
+}
 
+impl<N: TensorTypeParam> Mha<N> {
     /// Core method to evaluate the layer; it returns also the intermediate outputs of final_mul, softmax
     /// and qk sub-layers, which might be necessary to build the proving data
     #[allow(clippy::type_complexity)]
     pub(crate) fn evaluate_with_intermediate_outputs<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&WrappedTensor<N>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<(
         LayerOut<N, E>,
@@ -264,13 +265,12 @@ where
     where
         Softmax<N>: Evaluate<N>,
         AttentionMask<N>: Evaluate<N>,
-        Tensor<N>: IntoBTensor,
     {
         let unpadded_input_shapes = if unpadded_input_shapes.is_empty() {
             // take input shapes from inputs
             inputs
                 .iter()
-                .map(|input| input.shape().clone())
+                .map(|input| Shape::from(input.shape().clone()))
                 .collect::<Vec<_>>()
         } else {
             unpadded_input_shapes.to_vec()
@@ -299,16 +299,16 @@ where
             .evaluate::<E>(&reshaped_inputs.outputs()[..2], &reshaped_input_shapes[..2])?;
 
         // Apply the mask
-        let mask_out = self.mask.evaluate::<E>(&qk_out.outputs(), &qk_out_shapes)?;
+        let qk_outputs: Vec<_> = qk_out.outputs();
+        let mask_out = self.mask.evaluate::<E>(&qk_outputs, &qk_out_shapes)?;
 
         // apply softmax
         let soft_out_shapes = self
             .softmax
             .output_shapes(&qk_out_shapes, PaddingMode::NoPadding);
 
-        let soft_out = self
-            .softmax
-            .evaluate::<E>(&mask_out.outputs(), &qk_out_shapes)?;
+        let mask_outputs: Vec<_> = mask_out.outputs();
+        let soft_out = self.softmax.evaluate::<E>(&mask_outputs, &qk_out_shapes)?;
 
         ensure!(
             soft_out.outputs().len() == 1,
@@ -335,7 +335,7 @@ where
     }
 }
 
-impl<N: Number> OpInfo for Mha<N> {
+impl<N: TensorTypeParam> OpInfo for Mha<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         MhaOutputShaper::from(self).output_shapes(input_shapes, padding_mode)
     }
@@ -365,7 +365,7 @@ impl<N: Number> OpInfo for Mha<N> {
 impl Evaluate<f32> for Mha<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let (out, _, _, _, _) =
@@ -378,7 +378,7 @@ impl Evaluate<f32> for Mha<f32> {
 impl Evaluate<Element> for Mha<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         let (out, final_mul_out, mask_out, soft_out, qk_out) =
@@ -393,11 +393,11 @@ impl Evaluate<Element> for Mha<Element> {
             bail!("Softmax data not found while evaluating MhaLayer");
         };
         let data = MhaData {
-            pre_reshaping_out: final_mul_out.outputs()[0].to_fields(),
+            pre_reshaping_out: Tensor::try_from(final_mul_out.outputs()[0].clone())?.to_fields(),
             softmax_data,
-            softmax_out: outputs[0].clone(),
-            softmax_in: mask_out.outputs[0].clone(),
-            mask_in: qk_out.outputs[0].to_fields(),
+            softmax_out: Tensor::try_from(outputs[0].clone())?,
+            softmax_in: Tensor::try_from(mask_out.outputs[0].clone())?,
+            mask_in: Tensor::try_from(qk_out.outputs[0].clone())?.to_fields(),
         };
         Ok(out.with_proving_data(ProvingData::Mha(data)))
     }
@@ -740,7 +740,7 @@ where
         );
 
         // apply reshaping to input and output tensors before employing them in proving logic
-        let reshaped_inputs = self.inputs_reshape.evaluate_layer::<E, E>(
+        let reshaped_inputs = self.inputs_reshape.evaluate_original::<E, E>(
             &input_tensors.iter().collect_vec(),
             input_tensors
                 .iter()
@@ -749,7 +749,6 @@ where
                 .as_slice(),
         )?;
 
-        let reshaped_inputs = reshaped_inputs.outputs();
         let reshaped_input_shapes = self
             .inputs_reshape
             .output_shapes(&step_data.unpadded_input_shapes, PaddingMode::NoPadding);
@@ -777,7 +776,7 @@ where
         let (mut claims, final_mul_proof) = self.final_mul.prove_step(
             last_claims,
             &mha_data.pre_reshaping_out,
-            &[&mha_data.softmax_out.to_fields(), reshaped_inputs[2]],
+            &[&mha_data.softmax_out.to_fields(), &reshaped_inputs[2]],
             prover,
         )?;
 
@@ -1128,16 +1127,18 @@ mod test {
                 .qk;
             let q = Tensor::<Element>::random(&vec![q_len, num_heads, head_dim].into());
             let k = Tensor::<Element>::random(&vec![seq_len, num_heads, head_dim].into());
-            let mut output = mha_qk.evaluate::<GoldilocksExt2>(&[&q, &k], &[]).unwrap();
+            let mut output = mha_qk
+                .evaluate::<GoldilocksExt2>(&[&q.as_wrapped(), &k.as_wrapped()], &[])
+                .unwrap();
             assert_eq!(output.outputs.len(), 1);
             let qk = output.outputs.remove(0);
             // normally [1,seq_len] per head, so with all heads [num_heads, 1, seq_len]
-            assert_eq!(*qk.shape(), vec![num_heads, q_len, seq_len].into());
+            assert_eq!(qk.shape(), vec![num_heads, q_len, seq_len].into());
             let output_shapes = mha_qk.output_shapes(
                 &[q.shape().clone(), k.shape().clone()],
                 PaddingMode::NoPadding,
             );
-            assert_eq!(output_shapes, vec![qk.shape().clone()]);
+            assert_eq!(output_shapes, vec![Shape::from(qk.shape())]);
         }
     }
 
@@ -1167,16 +1168,19 @@ mod test {
                 .unwrap()
                 .final_mul;
             let mut output = mha_mul
-                .evaluate::<GoldilocksExt2>(&[&qk, &v], &[qk.shape().clone(), v.shape().clone()])
+                .evaluate::<GoldilocksExt2>(
+                    &[&qk.as_wrapped(), &v.as_wrapped()],
+                    &[qk.shape().clone(), v.shape().clone()],
+                )
                 .expect("mha_final_mul should not fail");
             assert_eq!(output.outputs.len(), 1);
             let out = output.outputs.remove(0);
-            assert_eq!(*out.shape(), vec![q_len, num_heads, head_dim].into());
+            assert_eq!(out.shape(), vec![q_len, num_heads, head_dim].into());
             let output_shapes = mha_mul.output_shapes(
                 &[qk.shape().clone(), v.shape().clone()],
                 PaddingMode::NoPadding,
             );
-            assert_eq!(output_shapes, vec![out.shape().clone()]);
+            assert_eq!(output_shapes, vec![Shape::from(out.shape())]);
         }
     }
 
@@ -1620,16 +1624,16 @@ mod test {
         );
         let embedded = llm_model
             .embeddings
-            .evaluate::<GoldilocksExt2>(&[&input], &[])?;
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
         let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
             &[embedded.outputs()[0]],
-            &[embedded.outputs()[0].shape().clone()],
+            &[Shape::from(embedded.outputs()[0].shape())],
         )?;
 
         let input_shape = positioned.outputs()[0].shape();
 
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![Shape::from(input_shape)], PaddingMode::NoPadding);
 
         let qkv_node_id = model
             .add_consecutive_layer(
@@ -1655,7 +1659,7 @@ mod test {
 
         model.automatic_output_labelling().unwrap();
 
-        let inputs = vec![positioned.outputs()[0].clone()];
+        let inputs = vec![positioned.outputs()[0].to_native()];
         let (quantized_model, inputs) = quantize_model(
             model,
             inputs.clone(),

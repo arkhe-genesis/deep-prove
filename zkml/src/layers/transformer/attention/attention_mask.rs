@@ -19,7 +19,7 @@ use crate::{
     model::{NodeID, StepData},
     padding::{PaddingMode, ShapeInfo},
     quantization::Fieldizer,
-    tensor::IntoBTensor,
+    tensor::{BShape, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, bail, ensure};
 use ff_ext::ExtensionField;
@@ -71,10 +71,10 @@ pub enum AttentionSpan {
     Local(usize),
 }
 
-impl<N: Number> Default for AttentionMask<N> {
+impl<N: TensorTypeParam> Default for AttentionMask<N> {
     fn default() -> Self {
         AttentionMask {
-            negative_infinity: N::MIN,
+            negative_infinity: <N as Number>::MIN,
             dim_size: Default::default(),
             span: Default::default(),
         }
@@ -91,7 +91,7 @@ pub struct AttentionMaskProof<E: ExtensionField> {
     evaluations: Vec<E>,
 }
 
-impl<N: Number> AttentionMask<N> {
+impl<N: TensorTypeParam> AttentionMask<N> {
     /// Creates a new mask given the unpadded input shape and the value to use for `-inf`
     pub fn new(dim_size: usize, negative_inf: N) -> AttentionMask<N> {
         AttentionMask {
@@ -124,10 +124,11 @@ impl<N: Number> AttentionMask<N> {
 
     /// Apply the mask to an input, this method requires the input has rank between 2 and 4, and that the final two dims are either equal
     /// or the second to last dim is 1.
+    #[cfg(test)]
     fn apply(&self, input: &Tensor<N>, unpadded_input_shape: &Shape) -> Result<Tensor<N>>
     where
         N: burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
+        Tensor<N>: crate::tensor::IntoBTensor,
     {
         // Check the the input has suitable rank
         let num_input_dims = unpadded_input_shape.rank();
@@ -201,7 +202,7 @@ impl<N: Number> AttentionMask<N> {
 
         // Convert the input into a Burn Tensor
         let b_input_data = TensorData::new(input.data().to_vec(), shape.to_vec());
-        let b_input = BTensor::<_, 4, <Tensor<N> as IntoBTensor>::Kind>::from_data(
+        let b_input = BTensor::<_, 4, <Tensor<N> as crate::tensor::IntoBTensor>::Kind>::from_data(
             b_input_data,
             &Default::default(),
         );
@@ -241,6 +242,109 @@ impl<N: Number> AttentionMask<N> {
 
         let num_vars = 2 * ceil_log2(seq_len);
         MultilinearExtension::from_evaluations_vec(num_vars, evals)
+    }
+}
+
+impl<T> AttentionMask<T>
+where
+    T: TensorTypeParam,
+{
+    /// Apply the mask to an input, this method requires the input has rank between 2 and 4, and that the final two dims are either equal
+    /// or the second to last dim is 1.
+    fn apply_new(
+        &self,
+        input: &WrappedTensor<T>,
+        unpadded_input_shape: &Shape,
+    ) -> Result<WrappedTensor<T>> {
+        // Check the the input has suitable rank
+        let num_input_dims = unpadded_input_shape.rank();
+        ensure!(
+            (2..=4).contains(&num_input_dims),
+            "To apply Attention Mask input need to have rank at least 2 and at most 4, got: {num_input_dims}",
+        );
+
+        // Make the mask
+        let shape = if num_input_dims < 4 {
+            let diff = 4 - num_input_dims;
+            BShape::from(
+                Shape::new(vec![1; diff])
+                    .extend(&input.shape().into())
+                    .into_vec(),
+            )
+        } else {
+            input.shape().clone()
+        };
+
+        let unpadded_shape = if num_input_dims < 4 {
+            let diff = 4 - num_input_dims;
+            Shape::new(vec![1; diff]).extend(unpadded_input_shape)
+        } else {
+            unpadded_input_shape.clone()
+        };
+
+        let masked_shape = Shape::new(vec![
+            unpadded_shape.dim(0),
+            unpadded_shape.dim(1),
+            shape.dims[2],
+            shape.dims[3],
+        ]);
+
+        // input of shape [..., num_heads, q_len, seq_len]
+        // if q_len == 1, we're in the caching inference case. Otherwise
+        // we're in the regular square matrix case where q_len == seq_len
+        let caching_case = shape.dims[shape.num_dims() - 2] == 1;
+        let mask = {
+            let diff = shape.num_elements() - masked_shape.numel();
+            let num_heads = masked_shape.slice(..masked_shape.rank() - 2).numel();
+            let seq_len = unpadded_input_shape.dim(-1);
+            let padded_q_len = input.dim(-2)?;
+            let padded_seq_len = input.dim(-1)?;
+            let data = (0..num_heads)
+                .flat_map(|_| {
+                    (0..padded_q_len).flat_map(move |token| {
+                        // if we're in the single token case, then we take the seq_len and assume the current token is the
+                        // seq_len-th token. Otherwise, we're in the regular matrix case and we use this token.
+                        // -1 because "token" is 0-indexed but seq_len is 1-indexed
+                        let qtoken = if caching_case { seq_len - 1 } else { token };
+                        let min = match self.span {
+                            AttentionSpan::Full => 0,
+                            // only look at the most recent n tokens from the current one
+                            AttentionSpan::Local(n) => qtoken.saturating_sub(n),
+                        };
+                        let max = qtoken;
+                        (0..padded_seq_len).map(move |others| {
+                            let within_span = (min..=max).contains(&others);
+                            let keep_clear = within_span;
+                            let should_mask = !keep_clear;
+                            #[allow(clippy::let_and_return)]
+                            should_mask
+                        })
+                    })
+                })
+                .chain(std::iter::repeat_n(false, diff))
+                .collect::<Vec<bool>>();
+
+            BTensor::<_, 4, _>::from_data(
+                TensorData::new(data, shape.to_vec()),
+                &Default::default(),
+            )
+        };
+
+        let output = input
+            .clone()
+            .reshape(shape)?
+            .mask_fill_4d(mask, self.negative_infinity)?;
+
+        // Squeeze back to the same rank as input
+        let output = if input.rank() == 2 {
+            output.squeeze(0)?.squeeze(0)?
+        } else if input.rank() == 3 {
+            output.squeeze(0)?
+        } else {
+            assert_eq!(input.rank(), 4);
+            output
+        };
+        Ok(output)
     }
 }
 
@@ -417,30 +521,24 @@ impl AttentionMask<Element> {
     }
 }
 
-impl Evaluate<f32> for AttentionMask<f32>
-where
-    Tensor<f32>: IntoBTensor,
-{
+impl Evaluate<f32> for AttentionMask<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         inputs
             .iter()
             .zip(unpadded_input_shapes.iter())
-            .map(|(input, unpadded_shape)| self.apply(input, unpadded_shape))
-            .collect::<Result<Vec<Tensor<f32>>>>()
+            .map(|(input, unpadded_shape)| self.apply_new(input, unpadded_shape))
+            .collect::<Result<Vec<WrappedTensor<f32>>>>()
             .map(LayerOut::from_vec)
     }
 }
-impl Evaluate<Element> for AttentionMask<Element>
-where
-    Tensor<Element>: IntoBTensor,
-{
+impl Evaluate<Element> for AttentionMask<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         inputs
@@ -448,14 +546,14 @@ where
             .zip(unpadded_input_shapes.iter())
             .map(|(input, unpadded_shape)| {
                 ensure!(
-                    self.dim_size >= input.shape().dim(-1),
+                    self.dim_size >= input.dim(-1)?,
                     "Attention Mask dimension size does not match the input shape: dim_size: {:?}, unpadded_input_shape.dim(-1): {:?}",
                     self.dim_size,
-                    input.shape().dim(-1)
+                    input.dim(-1)?
                 );
-                self.apply(input, unpadded_shape)
+                self.apply_new(input, unpadded_shape)
             })
-            .collect::<Result<Vec<Tensor<Element>>>>()
+            .collect::<Result<Vec<WrappedTensor<Element>>>>()
             .map(LayerOut::from_vec)
     }
 }
@@ -471,7 +569,7 @@ impl PadOp for AttentionMask<Element> {
     }
 }
 
-impl<N: Number> OpInfo for AttentionMask<N> {
+impl<N: TensorTypeParam> OpInfo for AttentionMask<N> {
     fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes.to_vec()
     }

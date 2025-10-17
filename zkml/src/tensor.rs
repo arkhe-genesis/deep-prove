@@ -1,7 +1,14 @@
 #![allow(clippy::needless_range_loop)]
+
+mod burn_wrapper;
+
+pub use burn_wrapper::{
+    BShape, BTensorKind, Conversion, IntoBTensor, TensorTypeParam, WrappedModuleFn, WrappedTensor,
+};
+
 use crate::{ScalingFactor, backend::Backend, number::Number, shape::Shape, to_field};
 use anyhow::{Result, bail, ensure};
-use burn::tensor::{BasicOps, Int, Numeric, Tensor as BTensor, TensorData, TensorKind};
+use burn::tensor::{Int, Tensor as BTensor};
 use ceno_p3::{
     field::{Field, FieldAlgebra, TwoAdicField},
     goldilocks::Goldilocks,
@@ -1074,15 +1081,6 @@ impl<T: Number> Tensor<T> {
             shape: self.shape.clone(),
         }
     }
-    pub fn pad_1d(mut self, new_len: usize) -> Self {
-        assert!(
-            self.shape.len() == 1,
-            "pad_1d only works for 1d tensors, e.g. vectors"
-        );
-        self.data.resize(new_len, Default::default());
-        self.shape[0] = new_len;
-        self
-    }
 
     /// Flattens the tensor into a 1D.
     pub fn to_1d(&mut self) {
@@ -1458,10 +1456,6 @@ impl<T: Number> Tensor<T> {
         self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
     }
 
-    pub fn random(shape: &Shape) -> Self {
-        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
-    }
-
     pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
         Ok(Self {
             data: self
@@ -1471,20 +1465,6 @@ impl<T: Number> Tensor<T> {
                 .collect::<anyhow::Result<Vec<_>>>()?,
             shape: self.shape.clone(),
         })
-    }
-
-    /// Creates a random matrix with a given number of rows and cols.
-    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
-    /// sync which is not true for basic rng core.
-    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
-        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
-        let size = shape.product();
-        let data = (0..size).map(|_| T::random(&mut rng)).collect();
-        Self {
-            data,
-            shape: shape.clone(),
-        }
     }
 
     // slice on the third dimension.
@@ -1525,6 +1505,48 @@ impl<T: Number> Tensor<T> {
             data,
             shape: shape.clone(),
         })
+    }
+
+    pub fn random(shape: &Shape) -> Self {
+        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
+    }
+
+    /// Creates a random matrix with a given number of rows and cols.
+    /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
+    /// sync which is not true for basic rng core.
+    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
+        let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
+        let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
+        let size = shape.product();
+        let data = (0..size).map(|_| T::random(&mut rng)).collect();
+        Self {
+            data,
+            shape: shape.clone(),
+        }
+    }
+}
+
+impl<T: TensorTypeParam> Tensor<T> {
+    #[cfg(test)]
+    pub fn into_wrapped(self) -> WrappedTensor<T> {
+        WrappedTensor::try_from(&self).unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn as_wrapped(&self) -> WrappedTensor<T> {
+        WrappedTensor::try_from(self).unwrap()
+    }
+}
+
+impl<T: Clone + Default> Tensor<T> {
+    pub fn pad_1d(mut self, new_len: usize) -> Self {
+        assert!(
+            self.shape.len() == 1,
+            "pad_1d only works for 1d tensors, e.g. vectors"
+        );
+        self.data.resize(new_len, Default::default());
+        self.shape[0] = new_len;
+        self
     }
 }
 
@@ -2251,36 +2273,6 @@ pub fn get_broadcasted_shape(shape_a: &Shape, shape_b: &Shape) -> anyhow::Result
                 .collect::<Result<Vec<usize>, anyhow::Error>>()
                 .map(Shape::from)
         }
-    }
-}
-
-pub trait IntoBTensor {
-    type Kind: TensorKind<Backend> + BasicOps<Backend> + Numeric<Backend>;
-
-    fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D, Self::Kind>;
-}
-
-impl IntoBTensor for Tensor<f32> {
-    type Kind = burn::tensor::Float;
-
-    fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D, Self::Kind> {
-        let shape = self.shape().clone();
-        BTensor::from_data(
-            TensorData::new(self.data.clone(), shape),
-            &Default::default(),
-        )
-    }
-}
-
-impl IntoBTensor for Tensor<Element> {
-    type Kind = burn::tensor::Int;
-
-    fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D, Self::Kind> {
-        let shape = self.shape().clone();
-        BTensor::from_data(
-            TensorData::new(self.data.clone(), shape),
-            &Default::default(),
-        )
     }
 }
 

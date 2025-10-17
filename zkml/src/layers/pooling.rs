@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     Claim, Element, Prover, ProverContext, Shape, Tensor,
-    backend::{Backend, Maxpool2dConfig, zkml_max_pool2d_i},
+    backend::Maxpool2dConfig,
     commit::{compute_betas_eval, identity_eval},
     iop::{context::ShapeStep, verifier::Verifier},
     layers::{ContextAux, LayerProof},
@@ -17,10 +17,10 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeInfo, pooling},
     quantization::{Fieldizer, IntoElement},
+    tensor::WrappedTensor,
     to_base,
 };
 use anyhow::{Result, ensure};
-use burn::tensor::{Int, Tensor as BTensor, TensorData, module::max_pool2d};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
@@ -128,7 +128,7 @@ impl OpInfo for Pooling {
 impl Evaluate<Element> for Pooling {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         ensure!(
@@ -142,27 +142,20 @@ impl Evaluate<Element> for Pooling {
                 ensure!(input.rank() >= 2, "The rank must be at least 2D");
 
                 // normalize the shape to 4D by unqueezing
-                let rank_difference = 4 - input.shape().rank();
-                let shape = input.shape().unsqueeze_front(rank_difference);
-
-                let binput = BTensor::<Backend, 4, Int>::from_data(
-                    TensorData::new(input.data().to_vec(), shape),
-                    &Default::default(),
-                );
+                let rank_difference = 4 - input.rank();
+                let binput = input.clone().unsqueeze_dim_4();
 
                 let config = Maxpool2dConfig {
                     kernel_size: maxpool2d.kernel_size,
                     stride: maxpool2d.stride,
                 };
-                let result = zkml_max_pool2d_i(binput, config);
+                let mut result = WrappedTensor::<Element>::max_pool2d(binput, config)?;
 
-                let data = result
-                    .to_data()
-                    .into_vec()
-                    .expect("Failed to compute Poolling");
-                let new_shape = Shape::from(result.shape()).squeeze_front(rank_difference);
+                for _ in 0..rank_difference {
+                    result = result.squeeze(0)?;
+                }
 
-                Ok(LayerOut::from_vec(vec![Tensor::new(new_shape, data)]))
+                Ok(LayerOut::from_vec(vec![result]))
             }
         }
     }
@@ -171,7 +164,7 @@ impl Evaluate<Element> for Pooling {
 impl Evaluate<f32> for Pooling {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         ensure!(
@@ -185,29 +178,27 @@ impl Evaluate<f32> for Pooling {
                 ensure!(input.rank() >= 2, "The rank must be at least 2D");
 
                 // normalize the shape to 4D by unqueezing
-                let rank_difference = 4 - input.shape().rank();
-                let shape = input.shape().unsqueeze_front(rank_difference);
-
-                let binput = BTensor::<Backend, 4>::from_data(
-                    TensorData::new(input.data().to_vec(), shape),
-                    &Default::default(),
-                );
+                let rank_difference = 4 - input.rank();
+                let binput = input.clone().unsqueeze_dim_4();
 
                 let kernel_size = [maxpool2d.kernel_size, maxpool2d.kernel_size];
                 let stride = [maxpool2d.stride, maxpool2d.stride];
                 let padding = [0, 0];
                 let dilation = [1, 1];
 
-                let result = max_pool2d(binput, kernel_size, stride, padding, dilation);
+                let mut result = WrappedTensor::<f32>::max_pool2d(
+                    binput,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                )?;
 
-                let data = result
-                    .to_data()
-                    .into_vec()
-                    .expect("Failed to computed Pooling");
+                for _ in 0..rank_difference {
+                    result = result.squeeze(0)?;
+                }
 
-                let new_shape = Shape::from(result.shape()).squeeze_front(rank_difference);
-
-                Ok(LayerOut::from_vec(vec![Tensor::new(new_shape, data)]))
+                Ok(LayerOut::from_vec(vec![result]))
             }
         }
     }
@@ -846,6 +837,7 @@ mod tests {
     use super::*;
     use crate::util::from_mle_list_dimensions;
 
+    use crate::tensor::TensorTypeParam;
     use ark_std::rand::Rng;
     use ceno_p3::field::FieldAlgebra;
     use ff_ext::{FromUniformBytes, GoldilocksExt2};
@@ -1106,15 +1098,18 @@ mod tests {
     #[test]
     fn test_maxpool_f32_simple() {
         let input = Tensor::new(Shape::new(vec![2, 2]), vec![1.0, 2.0, 3.0, 4.0]);
-        let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
+        let expected = input
+            .clone()
+            .maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
+        let winput = input.as_wrapped();
         let result = Pooling::Maxpool2D(Maxpool2D::default())
-            .evaluate::<GoldilocksExt2>(&[&input], slice::from_ref(input.shape()))
+            .evaluate::<GoldilocksExt2>(&[&winput], slice::from_ref(input.shape()))
             .unwrap();
         assert_eq!(result.outputs.len(), 1);
-        assert_eq!(&expected, &result.outputs[0]);
+        assert_eq!(&expected, &result.outputs[0].to_native());
     }
 
-    fn proptest_input<T: Number>() -> impl Strategy<Value = Tensor<T>> {
+    fn proptest_input<T: TensorTypeParam>() -> impl Strategy<Value = Tensor<T>> {
         (2usize..10).prop_flat_map(|size| Tensor::<T>::any(Shape::new(vec![size, size])))
     }
 
@@ -1122,17 +1117,19 @@ mod tests {
         #[test]
         fn proptest_maxpool_f32(input in proptest_input::<f32>()) {
             let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
-            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&input], slice::from_ref(input.shape())).unwrap();
+            let winput = input.as_wrapped();
+            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput], slice::from_ref(input.shape())).unwrap();
             prop_assert_eq!(result.outputs.len(), 1);
-            prop_assert_eq!(&expected, &result.outputs[0]);
+            prop_assert_eq!(&expected, &result.outputs[0].to_native());
         }
 
         #[test]
         fn proptest_maxpool_element(input in proptest_input::<Element>()) {
             let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
-            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&input], slice::from_ref(input.shape())).unwrap();
+            let winput = input.as_wrapped();
+            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput], slice::from_ref(input.shape())).unwrap();
             prop_assert_eq!(result.outputs.len(), 1);
-            prop_assert_eq!(&expected, &result.outputs[0]);
+            prop_assert_eq!(&expected, &result.outputs[0].to_native());
         }
     }
 }

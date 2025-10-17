@@ -40,13 +40,14 @@ use crate::{
     },
     layers::{
         LayerCtx, LayerProof,
-        provable::{Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, VerifiableCtx},
+        provable::{
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, VerifiableCtx,
+        },
         requant::Requant,
     },
     model::{NodeID, StepData},
-    number::Number,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
-    tensor::IntoBTensor,
+    tensor::{TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
 };
 /// Short name used to identify the concat matmul layer.
@@ -353,7 +354,6 @@ impl MatrixPermutations {
     }
 }
 
-use super::provable::LayerOut;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConcatMatMul {
     permutations: MatrixPermutations,
@@ -589,31 +589,27 @@ impl ConcatMatMul {
 
 impl<N> Evaluate<N> for ConcatMatMul
 where
-    N: Number + burn::tensor::Element,
-    Tensor<N>: IntoBTensor,
+    N: TensorTypeParam,
 {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&WrappedTensor<N>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(inputs.len() == 2, "ConcatMatMul expects 2 inputs");
-        let a = inputs[0];
-        let b = inputs[1];
+        let a = inputs[0].clone();
+        let b = inputs[1].clone();
         let a_shape = a.shape();
         let b_shape = b.shape();
-        self.ensure_shape_consistency(&[a_shape, b_shape])?;
-
-        let a = a.to_btensor::<3>();
-        let b = b.to_btensor::<3>();
+        self.ensure_shape_consistency(&[Shape::from(a_shape), Shape::from(b_shape)])?;
 
         let a = if let Some(permute) = self.permutations.compute_permutation_for_left_input() {
-            a.permute(permute.to_3d_axes())
+            a.permute(&permute.to_3d_axes())?
         } else {
             a
         };
         let b = if let Some(permute) = self.permutations.compute_permutation_for_right_input() {
-            b.permute(permute.to_3d_axes())
+            b.permute(&permute.to_3d_axes())?
         } else {
             b
         };
@@ -622,22 +618,16 @@ where
             .iter_dim(0)
             .zip(b.iter_dim(0))
             .map(|(batch_a, batch_b)| batch_a.matmul(batch_b))
-            .collect();
+            .collect::<Result<_>>()?;
 
-        let cated = burn::tensor::Tensor::cat(muled, 0);
+        let cated = WrappedTensor::cat(muled, 0)?;
 
-        let res = if let Some(transpose) = &self.permutations.permute {
-            cated.permute(transpose.to_3d_axes())
+        let out = if let Some(transpose) = &self.permutations.permute {
+            cated.permute(&transpose.to_3d_axes())?
         } else {
             cated
         };
 
-        let data = res
-            .to_data()
-            .into_vec()
-            .expect("Failed to compute ConcatMatMul");
-        let shape = res.shape().into();
-        let out = Tensor::<N>::new(shape, data);
         Ok(LayerOut::from_vec(vec![out]))
     }
 }
@@ -949,10 +939,10 @@ mod test {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], &[])
+            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()], &[])
             .unwrap();
         assert_eq!(
-            result.outputs[0].data(),
+            &result.outputs[0].get_data(),
             &[7.0, 10.0, 15.0, 22.0, 67.0, 78.0, 91.0, 106.0]
         );
     }
@@ -973,19 +963,19 @@ mod test {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], &[])
+            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()], &[])
             .unwrap();
         let expected = Tensor::new(
             vec![2, 2, 2].into(),
             vec![7.0, 10.0, 15.0, 22.0, 67.0, 78.0, 91.0, 106.0],
         );
         let expected = expected.permute3d(&[1, 0, 2]);
-        assert_eq!(result.outputs[0].data(), expected.data());
+        assert_eq!(result.outputs[0].get_data(), expected.data());
         let expected_shape = concat_matmul.output_shapes(
             &[a.shape().clone(), b.shape().clone()],
             PaddingMode::NoPadding,
         );
-        assert_eq!(*result.outputs[0].shape(), expected_shape[0]);
+        assert_eq!(Shape::from(result.outputs[0].shape()), expected_shape[0]);
     }
 
     #[test]
@@ -1008,7 +998,7 @@ mod test {
         );
 
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a, &b], &[])
+            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()], &[])
             .unwrap();
         let expected = Tensor::new(
             vec![2, 3, 3].into(),
@@ -1017,12 +1007,12 @@ mod test {
                 143.0, 173.0, 173.0, 219.0, 265.0,
             ],
         );
-        assert_eq!(result.outputs[0].data(), expected.data());
+        assert_eq!(result.outputs[0].get_data(), expected.data());
         let expected_shape = concat_matmul.output_shapes(
             &[a.shape().clone(), b.shape().clone()],
             PaddingMode::NoPadding,
         );
-        assert_eq!(*result.outputs[0].shape(), expected_shape[0]);
+        assert_eq!(Shape::from(result.outputs[0].shape()), expected_shape[0]);
     }
 
     #[test]
@@ -1140,11 +1130,11 @@ mod test {
 
             let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
 
-            let expected = layer.evaluate_original::<Element, GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+            let expected = layer.evaluate_original::<Element>(&[&left, &right], &[]).unwrap();
 
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&left.as_wrapped(), &right.as_wrapped()], &[]).unwrap();
 
-            prop_assert_eq!(&expected.outputs[0], &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
 
         fn test_concat_matmul_with_f32(input in any_input::<f32>(1..64, 1..64, 1..64)) {
@@ -1152,11 +1142,11 @@ mod test {
 
             let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
 
-            let expected = layer.evaluate_original::<f32, GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+            let expected = layer.evaluate_original::<f32>(&[&left, &right], &[]).unwrap();
 
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&left, &right], &[]).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&left.as_wrapped(), &right.as_wrapped()], &[]).unwrap();
 
-            for (left, right) in expected.outputs[0].get_data().iter().zip(computed.outputs[0].get_data().iter()) {
+            for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
                 let abs = (left - right).abs();
                 // The differences are in tensor matmul
                 const THRESHOLD: f32 =  1e-3;
@@ -1179,7 +1169,7 @@ mod test {
         }
     }
 
-    fn any_input<T: 'static + Number>(
+    fn any_input<T: 'static + TensorTypeParam>(
         dim_x: Range<usize>,
         dim_y: Range<usize>,
         dim_z: Range<usize>,
@@ -1242,11 +1232,11 @@ mod test {
     }
 
     impl ConcatMatMul {
-        fn evaluate_original<N: Number, E: ExtensionField>(
+        fn evaluate_original<N: Number>(
             &self,
             inputs: &[&Tensor<N>],
             _unpadded_input_shapes: &[Shape],
-        ) -> anyhow::Result<LayerOut<N, E>> {
+        ) -> anyhow::Result<Tensor<N>> {
             ensure!(inputs.len() == 2, "ConcatMatMul expects 2 inputs");
             let a = inputs[0];
             let b = inputs[1];
@@ -1291,7 +1281,7 @@ mod test {
             if let Some(ref transpose) = self.permutations.permute {
                 concat = concat.permute3d(&transpose.0);
             }
-            Ok(LayerOut::from_vec(vec![concat]))
+            Ok(concat)
         }
     }
 }

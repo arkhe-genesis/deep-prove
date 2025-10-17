@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     Claim, Element, Prover, ScalingStrategy, Shape, VectorTranscript,
-    backend::{Conv2dConfig, zkml_conv2d_i},
+    backend::Conv2dConfig,
     commit::{compute_betas_eval, identity_eval},
     iop::{context::ContextAux, prover::BatchFFTProof},
     layers::{LayerProof, hadamard, provable::ProvingData, requant::Requant},
@@ -16,11 +16,14 @@ use crate::{
     parser::{check_filter, safe_conv2d_shape},
     quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
     shape::filter_size,
-    tensor::{ConvData, ConvFFTData, KeyedTensor, Tensor, TensorKey, fft},
+    tensor::{
+        BShape, ConvData, ConvFFTData, KeyedTensor, Tensor, TensorKey, TensorTypeParam,
+        WrappedTensor, fft,
+    },
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
-use burn::tensor::{module::conv2d, ops::ConvOptions};
+use burn::tensor::ops::ConvOptions;
 use core::f32;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -451,7 +454,7 @@ impl<T: Number> Convolution<T> {
         Self::new(filter, bias)
     }
 }
-impl<T: Number> OpInfo for Convolution<T> {
+impl<T: TensorTypeParam> OpInfo for Convolution<T> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes
             .iter()
@@ -471,58 +474,7 @@ impl<T: Number> OpInfo for Convolution<T> {
         IS_PROVABLE
     }
 }
-impl Evaluate<f32> for Convolution<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&Tensor<f32>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<f32, E>> {
-        let tensor = self.filter.as_pre_fft_tensor();
-        ensure!(
-            inputs.len() == 1,
-            "Expected exactly 1 input when evaluating convolution layer, found {}",
-            inputs.len(),
-        );
-        let input = inputs[0];
-        ensure!(
-            input.rank() == 3 || input.rank() == 4,
-            "Input must be rank 3 or 4, got {}",
-            input.rank(),
-        );
 
-        let input = if input.rank() == 3 {
-            // Single batch
-            input.clone().unsqueeze(0).to_btensor::<4>()
-        } else {
-            input.clone().to_btensor::<4>()
-        };
-
-        let weight = tensor.clone().to_btensor::<4>();
-        let bias = self.bias.tensor().to_btensor::<1>();
-
-        let res = conv2d(
-            input,
-            weight,
-            Some(bias),
-            ConvOptions {
-                stride: [1, 1],
-                padding: [0, 0],
-                dilation: [1, 1],
-                groups: 1,
-            },
-        );
-
-        let data = res
-            .to_data()
-            .into_vec()
-            .expect("Failed to compute Convolution");
-
-        Ok(LayerOut::from_vec(vec![Tensor::new(
-            res.shape().into(),
-            data,
-        )]))
-    }
-}
 impl Convolution<f32> {
     /// Quantizes the filter and the bias.
     /// It uses a custom scaling factor `bias_s` for the bias, if provided,
@@ -551,89 +503,7 @@ impl Convolution<f32> {
         tensor.max_abs_output().max(self.bias.max_abs_output())
     }
 }
-impl Evaluate<Element> for Convolution<Element> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&Tensor<Element>],
-        unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<Element, E>> {
-        ensure!(
-            unpadded_input_shapes.len() == 1,
-            "Expected exactly 1 input shape when evaluating convolution layer, got {}",
-            unpadded_input_shapes.len(),
-        );
-        let unpadded_input_shape = &unpadded_input_shapes[0];
-        ensure!(
-            inputs.len() == 1,
-            "Expected exactly 1 input when evaluating convolution layer, got {}",
-            inputs.len(),
-        );
-        let input = inputs[0];
-        ensure!(
-            input.rank() == 3 || input.rank() == 4,
-            "Input must be rank 3 or 4, got {}",
-            input.rank(),
-        );
 
-        let (tensor, _) = self.filter.as_fft_tensor();
-
-        // The filter and bias have been padded and converted to fft. Re-create
-        // the tensors with original shapes.
-        let mut filter = tensor.clone();
-
-        // XXX: workaround for `into_fft_conv` not allocating underlying data,
-        // without this change `copy_to_shape` perform index out-of-bounds.
-        let _ = mem::replace(
-            filter.shape_mut(),
-            self.filter.original_shape.next_power_of_two(),
-        );
-
-        let kernels = filter.reduce_to_shape(&self.filter.original_shape);
-        let bias = self
-            .bias
-            .reduce_to_shape(&Shape::new(vec![self.filter.original_shape[0]]));
-
-        let input = input.reduce_to_shape(unpadded_input_shape);
-        let input = if input.rank() == 4 {
-            input.squeeze(0)
-        } else {
-            input
-        };
-
-        // The output is expected to be padded to the fft shape
-        let n_x = input.dim(1).next_power_of_two();
-        let fft_shape = Shape::new(vec![tensor.dim(0), n_x, n_x]);
-
-        let kernels = kernels.to_btensor::<4>();
-        let bias = bias.to_btensor::<1>();
-        let input = input.to_btensor::<3>();
-        let input = input.unsqueeze_dim(0);
-
-        // Compute the convolution using the traditional convolution hardware accelerated.
-        let config = Conv2dConfig { stride: 1 };
-        let res = zkml_conv2d_i(input, kernels, bias, config);
-
-        let conv_output = res
-            .to_data()
-            .into_vec()
-            .expect("Failed to compute Convolution");
-
-        let shape_out = Shape::from(res.shape());
-        let conv_output = Tensor::new(shape_out, conv_output);
-
-        let mut conv_output = conv_output.squeeze(0); // conv2d always return a 4D tensor
-        conv_output.pad_to_shape(fft_shape);
-
-        Ok(
-            LayerOut::from_vec(vec![conv_output]).with_proving_data(ProvingData::Convolution(
-                ConvFFTData {
-                    input: inputs[0].clone(),
-                    unpadded_input_shape: unpadded_input_shape.clone(),
-                },
-            )),
-        )
-    }
-}
 impl Convolution<Element> {
     /// Ensures filter and bias are of the correct shape to be used with [fft].
     ///
@@ -1191,6 +1061,131 @@ impl Convolution<Element> {
         };
 
         Ok(final_claim)
+    }
+}
+
+impl Evaluate<f32> for Convolution<f32> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&WrappedTensor<f32>],
+        _unpadded_input_shapes: &[Shape],
+    ) -> Result<LayerOut<f32, E>> {
+        let tensor = self.filter.as_pre_fft_tensor();
+        ensure!(
+            inputs.len() == 1,
+            "Expected exactly 1 input when evaluating convolution layer, found {}",
+            inputs.len(),
+        );
+        let input = inputs[0];
+        ensure!(
+            input.rank() == 3 || input.rank() == 4,
+            "Input must be rank 3 or 4, got {}",
+            input.rank(),
+        );
+
+        let input = if input.rank() == 3 {
+            // Single batch
+            input.clone().unsqueeze_dim_4()
+        } else {
+            input.clone()
+        };
+
+        let weight = WrappedTensor::try_from(tensor)?;
+        let bias = WrappedTensor::try_from(&self.bias)?;
+
+        let res = WrappedTensor::<f32>::conv2d(
+            input,
+            weight,
+            Some(bias),
+            ConvOptions {
+                stride: [1, 1],
+                padding: [0, 0],
+                dilation: [1, 1],
+                groups: 1,
+            },
+        )?;
+
+        Ok(LayerOut::from_vec(vec![res]))
+    }
+}
+
+impl Evaluate<Element> for Convolution<Element> {
+    fn evaluate<E: ExtensionField>(
+        &self,
+        inputs: &[&WrappedTensor<Element>],
+        unpadded_input_shapes: &[Shape],
+    ) -> Result<LayerOut<Element, E>> {
+        ensure!(
+            unpadded_input_shapes.len() == 1,
+            "Expected exactly 1 input shape when evaluating convolution layer, got {}",
+            unpadded_input_shapes.len(),
+        );
+        let unpadded_input_shape = BShape::from(unpadded_input_shapes[0].clone().into_vec());
+        ensure!(
+            inputs.len() == 1,
+            "Expected exactly 1 input when evaluating convolution layer, got {}",
+            inputs.len(),
+        );
+        let input = inputs[0];
+        ensure!(
+            input.rank() == 3 || input.rank() == 4,
+            "Input must be rank 3 or 4, got {}",
+            input.rank(),
+        );
+
+        let (tensor, _) = self.filter.as_fft_tensor();
+
+        // The filter and bias have been padded and converted to fft. Re-create
+        // the tensors with original shapes.
+        let mut filter = tensor.clone();
+
+        // XXX: workaround for `into_fft_conv` not allocating underlying data,
+        // without this change `copy_to_shape` perform index out-of-bounds.
+        let _ = mem::replace(
+            filter.shape_mut(),
+            self.filter.original_shape.next_power_of_two(),
+        );
+
+        let kernels = filter.reduce_to_shape(&self.filter.original_shape);
+        let bias = self
+            .bias
+            .reduce_to_shape(&Shape::new(vec![self.filter.original_shape[0]]));
+
+        let input = input.clone().reduce_to_shape(&unpadded_input_shape)?;
+        let input = if input.rank() == 4 {
+            input.squeeze(0)?
+        } else {
+            input
+        };
+
+        // The output is expected to be padded to the fft shape
+        let n_x = input.dim(1)?.next_power_of_two();
+        let fft_shape = Shape::new(vec![tensor.dim(0), n_x, n_x]);
+
+        let kernels = WrappedTensor::try_from(&kernels)?;
+        let bias = WrappedTensor::try_from(&bias)?;
+        let input = input.unsqueeze_dim(0)?;
+
+        // Compute the convolution using the traditional convolution hardware accelerated.
+        let config = Conv2dConfig { stride: 1 };
+        let conv_output = WrappedTensor::<Element>::conv2d(input, kernels, bias, config)?;
+
+        let conv_output = conv_output.squeeze(0)?;
+        // conv2d always return a 4D tensor
+        let padded = {
+            let mut native = Tensor::try_from(conv_output)?;
+            native.pad_to_shape(fft_shape);
+            WrappedTensor::try_from(&native)?
+        };
+
+        Ok(
+            LayerOut::from_vec(vec![padded]).with_proving_data(ProvingData::Convolution(
+                ConvFFTData {
+                    input: Tensor::try_from(inputs[0].clone())?,
+                    unpadded_input_shape: unpadded_input_shape.into(),
+                },
+            )),
+        )
     }
 }
 

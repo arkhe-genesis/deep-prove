@@ -2,8 +2,9 @@ use anyhow::ensure;
 use ff_ext::ExtensionField;
 
 use crate::{
-    Element, Shape, Tensor,
+    Element, Shape,
     layers::provable::{Evaluate, LayerOut},
+    tensor::WrappedTensor,
 };
 
 pub struct Permute {
@@ -24,7 +25,7 @@ impl Permute {
 impl Evaluate<Element> for Permute {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         ensure!(
@@ -35,17 +36,9 @@ impl Evaluate<Element> for Permute {
         let mut output = Vec::with_capacity(inputs.len());
         for input in inputs {
             ensure!(input.rank() == 3, "Permutation only supports 3D tensors");
-            let axes = self
-                .args
-                .iter()
-                .map(|v| *v as isize)
-                .collect::<Vec<_>>()
-                .try_into()
-                .expect("Checked on constructor");
-            let result = input.to_btensor::<3>().permute(axes);
-            let result = result.to_data().to_vec().expect("Permute should succeed");
-            let shape = input.shape().permute(&self.args);
-            output.push(Tensor::new(shape, result));
+            let axes: Vec<isize> = self.args.iter().map(|v| *v as isize).collect::<Vec<_>>();
+            let result = (*input).clone().permute(&axes)?;
+            output.push(result);
         }
 
         Ok(LayerOut::from_vec(output))
@@ -55,7 +48,7 @@ impl Evaluate<Element> for Permute {
 impl Evaluate<f32> for Permute {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(
@@ -66,17 +59,9 @@ impl Evaluate<f32> for Permute {
         let mut output = Vec::with_capacity(inputs.len());
         for input in inputs {
             ensure!(input.rank() == 3, "Permutation only supports 3D tensors");
-            let axes = self
-                .args
-                .iter()
-                .map(|v| *v as isize)
-                .collect::<Vec<_>>()
-                .try_into()
-                .expect("Checked on constructor");
-            let result = input.to_btensor::<3>().permute(axes);
-            let result = result.to_data().to_vec().expect("Permute should succeed");
-            let shape = input.shape().permute(&self.args);
-            output.push(Tensor::new(shape, result));
+            let axes: Vec<isize> = self.args.iter().map(|v| *v as isize).collect::<Vec<_>>();
+            let result = (*input).clone().permute(&axes)?;
+            output.push(result);
         }
 
         Ok(LayerOut::from_vec(output))
@@ -97,8 +82,10 @@ mod test {
     fn test_permute() {
         let input = Tensor::<Element>::random(&vec![2, 3, 4].into());
         let permute = Permute::new(vec![1, 0, 2]);
-        let output = permute.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
-        assert_eq!(*output.outputs()[0].shape(), vec![3, 2, 4].into());
+        let output = permute
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .unwrap();
+        assert_eq!(output.outputs()[0].shape(), vec![3_usize, 2, 4].into());
     }
 
     proptest! {
@@ -117,16 +104,16 @@ mod test {
             for order in &permutations {
                 let expected = element_data.permute3d(order);
                 let layer = Permute::new(order.to_vec());
-                let result = layer.evaluate::<GoldilocksExt2>(&[&element_data], &[]).unwrap();
-                prop_assert_eq!(&expected, result.outputs()[0]);
+                let result = layer.evaluate::<GoldilocksExt2>(&[&element_data.as_wrapped()], &[]).unwrap();
+                prop_assert_eq!(&expected, &result.outputs()[0].to_native());
             }
 
             let float_data = Tensor::<Element>::random(&Shape::new(vec![a, b, c]));
             for order in &permutations {
                 let expected = float_data.permute3d(order);
                 let layer = Permute::new(order.to_vec());
-                let result = layer.evaluate::<GoldilocksExt2>(&[&float_data], &[]).unwrap();
-                prop_assert_eq!(&expected, result.outputs()[0]);
+                let result = layer.evaluate::<GoldilocksExt2>(&[&float_data.as_wrapped()], &[]).unwrap();
+                prop_assert_eq!(&expected, &result.outputs()[0].to_native());
             }
         }
     }

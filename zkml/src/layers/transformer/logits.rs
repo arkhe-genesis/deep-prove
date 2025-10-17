@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
-    backend::Backend,
+    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     iop::{
         ChallengeStorage,
@@ -12,7 +11,8 @@ use crate::{
     layers::{
         LayerCtx, LayerProof,
         provable::{
-            PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp, QuantizeOutput, VerifiableCtx,
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
+            QuantizeOutput, VerifiableCtx,
         },
         transformer::mha::eval_zeroifier_mle,
     },
@@ -27,11 +27,12 @@ use crate::{
     model::{NodeID, StepData},
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{IntoElement, TensorFielder},
+    tensor::{TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
 use anyhow::{anyhow, bail, ensure};
-use burn::tensor::{Int as BInt, Tensor as BTensor, TensorData};
+use burn::tensor::Shape as BShape;
 use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -48,17 +49,17 @@ use tenstore::GenStore;
 use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
-use crate::{
-    Tensor,
-    layers::provable::{Evaluate, LayerOut, OpInfo},
-};
-
 /// The short name used to identify the logits layer.
 pub const LOGITS_LAYER: &str = "LGIT";
 
 #[derive(Clone, Debug)]
 pub struct ArgmaxData<E> {
     max_values: Vec<Tensor<E>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArgmaxDataNew<E: TensorTypeParam> {
+    max_values: Vec<WrappedTensor<E>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,9 +100,9 @@ pub enum Logits {
 impl Logits {
     fn evaluate_with_argmax_data_f32<E: ff_ext::ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
-    ) -> anyhow::Result<(LayerOut<f32, E>, ArgmaxData<f32>)> {
+    ) -> anyhow::Result<(LayerOut<f32, E>, ArgmaxDataNew<f32>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
             "Argmax is for tensors of rank >= 2",
@@ -111,32 +112,14 @@ impl Logits {
                 let (indices, maximums): (Vec<_>, Vec<_>) = inputs
                     .iter()
                     .map(|input| {
-                        let binput = (**input)
-                            .clone()
-                            .flatten(0..input.rank() - 1)
-                            .to_btensor::<2>();
-                        let rows = binput.shape().dims[0];
+                        let binput = (**input).clone().flatten_to_dim_2(0, input.rank() - 2);
                         let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
-                        let indices_vec: Vec<f32> = indices_bt
-                            .to_data()
-                            .into_vec()
-                            .expect("convert indices btensor to vec")
-                            .into_iter()
-                            .map(|i: i64| i as f32)
-                            .collect();
-                        let max_vals: Vec<f32> = max_bt
-                            .to_data()
-                            .into_vec()
-                            .expect("convert max btensor to vec");
-                        (
-                            Tensor::new(Shape::new(vec![rows, 1]), indices_vec),
-                            Tensor::new(Shape::new(vec![rows, 1]), max_vals),
-                        )
+                        (indices_bt.float(), max_bt)
                     })
                     .unzip();
                 Ok((
                     LayerOut::from_vec(indices),
-                    ArgmaxData {
+                    ArgmaxDataNew {
                         max_values: maximums,
                     },
                 ))
@@ -146,51 +129,40 @@ impl Logits {
 
     fn evaluate_with_argmax_data_element<E: ff_ext::ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         unpadded_input_shapes: &[Shape],
-    ) -> anyhow::Result<(LayerOut<Element, E>, ArgmaxData<Element>)> {
+    ) -> anyhow::Result<(LayerOut<Element, E>, ArgmaxDataNew<Element>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
             "Argmax is for tensors of rank >= 2",
         );
         match self {
             Logits::Argmax => {
-                let (indices, maximums): (Vec<_>, Vec<_>) = inputs
-                    .iter()
-                    .zip(unpadded_input_shapes.iter())
-                    .map(|(input, shape)| {
-                        let unpadded_dim_size = shape.dim(shape.rank() - 1);
-                        let (flat_data, rows, last_dim) = input.flatten_leading_dims_view();
-                        let truncated_data = flat_data
-                            .chunks(last_dim)
-                            .flat_map(|chunk| chunk[..unpadded_dim_size].to_vec())
-                            .collect::<Vec<_>>();
-                        let binput: BTensor<Backend, 2, BInt> = BTensor::from_data(
-                            TensorData::new(truncated_data, [rows, unpadded_dim_size]),
-                            &Default::default(),
-                        );
-                        let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
-                        let indices_vec: Vec<Element> = indices_bt
-                            .to_data()
-                            .into_vec()
-                            .expect("convert indices btensor to vec")
-                            .into_iter()
-                            .collect();
-                        let max_vals: Vec<Element> = max_bt
-                            .to_data()
-                            .into_vec()
-                            .expect("convert max btensor to vec")
-                            .into_iter()
-                            .collect();
-                        (
-                            Tensor::new(Shape::new(vec![rows, 1]), indices_vec),
-                            Tensor::new(Shape::new(vec![rows, 1]), max_vals),
-                        )
-                    })
-                    .unzip();
+                let (indices, maximums): (Vec<_>, Vec<_>) = itertools::process_results(
+                    inputs
+                        .iter()
+                        .zip(unpadded_input_shapes.iter())
+                        .map(|(input, shape)| {
+                            let unpadded_dim_size = shape.dim(shape.rank() - 1);
+                            let input_shape = input.shape();
+                            let input_rank = input.rank();
+                            let rows = if input_rank == 2 {
+                                input_shape.dims[0]
+                            } else {
+                                (0..input_rank - 1).map(|d| input_shape.dims[d]).product()
+                            };
+                            let binput = (*input)
+                                .clone()
+                                .flatten_to_dim_2(0, input.rank() - 2)
+                                .reduce_to_shape(&BShape::from(vec![rows, unpadded_dim_size]))?;
+                            let (max_bt, indices_bt) = binput.max_dim_with_indices(1);
+                            anyhow::Ok((indices_bt, max_bt))
+                        }),
+                    |iter| iter.unzip(),
+                )?;
                 Ok((
                     LayerOut::from_vec(indices),
-                    ArgmaxData {
+                    ArgmaxDataNew {
                         max_values: maximums,
                     },
                 ))
@@ -236,7 +208,7 @@ impl Logits {
 impl Evaluate<f32> for Logits {
     fn evaluate<E: ff_ext::ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let (output, _) = self.evaluate_with_argmax_data_f32(inputs, unpadded_input_shapes)?;
@@ -248,7 +220,7 @@ impl Evaluate<f32> for Logits {
 impl Evaluate<Element> for Logits {
     fn evaluate<E: ff_ext::ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         // We check that we have as many unpadded_input_shapes as inputs
@@ -267,8 +239,11 @@ impl Evaluate<Element> for Logits {
             max_values: argmax_data
                 .max_values
                 .into_iter()
-                .map(|m| m.to_fields())
-                .collect(),
+                .map(|m| {
+                    let t: Tensor<E> = Tensor::try_from(m)?.to_fields();
+                    anyhow::Ok(t)
+                })
+                .collect::<anyhow::Result<_>>()?,
         };
 
         Ok(output.with_proving_data(ProvingData::ArgMax(argmax_data)))
@@ -938,8 +913,10 @@ mod test {
         let input = Tensor::new(vec![3, 2].into(), vec![0.0, 1.0, 3.0, 2.0, 4.0, 5.0]);
         let logits = Logits::Argmax;
 
-        let out =
-            logits.evaluate::<GoldilocksExt2>(&[&input], std::slice::from_ref(input.shape()))?;
+        let out = logits.evaluate::<GoldilocksExt2>(
+            &[&input.as_wrapped()],
+            std::slice::from_ref(input.shape()),
+        )?;
         // first slice is [0,1] so argmax here is 1
         // second slice is [3,2] so argmax here is 0
         // the last dimension is [4,5] so argmax here is 1
@@ -994,7 +971,7 @@ mod test {
         }
         let input = Tensor::new(vec![2, 3, 4].into(), data);
         let logits = Logits::Argmax;
-        let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[])?;
+        let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
         let indices = out.outputs()[0].get_data();
         assert_eq!(indices.len(), 6);
         for (r, &idx) in indices.iter().enumerate() {
@@ -1010,7 +987,7 @@ mod test {
             //  Each row has a unique argmax and the output tensor shape is [rows,1].
             let input = Tensor::new(shape.clone().into(), data);
             let logits = Logits::Argmax;
-            let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
+            let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[]).unwrap();
             let indices = out.outputs()[0].get_data();
             prop_assert_eq!(indices.len(), expected.len());
             for (i, idx) in indices.iter().enumerate() { prop_assert!((*idx - expected[i]).abs() < 1e-6); }
@@ -1021,7 +998,7 @@ mod test {
             let data_elem: Vec<Element> = data.into_iter().map(|v| v.round_ties_even() as Element).collect();
             let input = Tensor::new(shape.clone().into(), data_elem);
             let logits = Logits::Argmax;
-            let out = logits.evaluate::<GoldilocksExt2>(&[&input], &[shape.clone().into()]).unwrap();
+            let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[shape.clone().into()]).unwrap();
             let indices = out.outputs()[0].get_data();
             prop_assert_eq!(indices.len(), expected.len());
             for (i, idx) in indices.iter().enumerate() { prop_assert_eq!(*idx as usize, expected[i] as usize); }

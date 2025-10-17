@@ -21,9 +21,8 @@ use crate::{
     },
     lookup::context::LookupWitnessGen,
     model::{trace::StepData, transform::ModelTransform},
-    number::Number,
     padding::{PaddingMode, ShapeInfo},
-    tensor::ConvFFTData,
+    tensor::{ConvFFTData, TensorTypeParam, WrappedTensor},
 };
 
 use super::{
@@ -72,16 +71,15 @@ pub enum ProvingData<E: ExtensionField> {
 )]
 pub struct TrackedDataId(String);
 
-/// Represents the output of the evaluation of a node operation
 #[derive(Clone, Debug)]
-pub struct LayerOut<T, E: ExtensionField> {
-    pub(crate) outputs: Vec<Tensor<T>>,
+pub struct LayerOut<T: TensorTypeParam, E: ExtensionField> {
+    pub(crate) outputs: Vec<WrappedTensor<T>>,
     pub(crate) proving_data: ProvingData<E>,
-    pub(crate) tracked_layer_data: Option<HashMap<TrackedDataId, Tensor<T>>>,
+    pub(crate) tracked_layer_data: Option<HashMap<TrackedDataId, WrappedTensor<T>>>,
 }
 
-impl<T, E: ExtensionField> LayerOut<T, E> {
-    pub(crate) fn from_vec(out: Vec<Tensor<T>>) -> Self {
+impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
+    pub(crate) fn from_vec(out: Vec<WrappedTensor<T>>) -> Self {
         Self {
             outputs: out,
             proving_data: ProvingData::None,
@@ -99,7 +97,10 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
 
     /// Add a set of intermediate data tensors to be tracked for quantization purposes;
     /// Each intermediate tensor is identified by a corresponding `TrackedDataId`
-    pub(crate) fn with_data_to_be_tracked(self, data: HashMap<TrackedDataId, Tensor<T>>) -> Self {
+    pub(crate) fn with_data_to_be_tracked(
+        self,
+        data: HashMap<TrackedDataId, WrappedTensor<T>>,
+    ) -> Self {
         Self {
             outputs: self.outputs,
             proving_data: self.proving_data,
@@ -107,11 +108,11 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
         }
     }
 
-    pub fn outputs(&self) -> Vec<&Tensor<T>> {
+    pub fn outputs(&self) -> Vec<&WrappedTensor<T>> {
         self.outputs.iter().collect()
     }
 
-    pub fn from_tensor(out: Tensor<T>) -> Self {
+    pub fn from_tensor(out: WrappedTensor<T>) -> Self {
         Self::from_vec(vec![out])
     }
 
@@ -149,13 +150,6 @@ impl<T, E: ExtensionField> LayerOut<T, E> {
             _ => None,
         }
     }
-
-    pub fn try_activation_data(&self) -> Option<&ActivationData> {
-        match self.proving_data {
-            ProvingData::Activation(ref data) => Some(data),
-            _ => None,
-        }
-    }
 }
 
 pub trait OpInfo {
@@ -173,20 +167,20 @@ pub trait OpInfo {
     fn is_provable(&self) -> bool;
 }
 
-pub trait Evaluate<T: Number> {
+pub trait Evaluate<T: TensorTypeParam> {
     /// Evaluates the operation given any inputs tensors and constant inputs.
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<T>],
+        inputs: &[&WrappedTensor<T>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<T, E>>;
 }
 
 /// Helper method employed to call `Evaluate::evaluate` when there are no `unpadded_input_shapes`
 /// or when the `E` type cannot be inferred automatically by the compiler
-pub fn evaluate_layer<E: ExtensionField, T: Number, O: Evaluate<T>>(
+pub fn evaluate_layer<E: ExtensionField, T: TensorTypeParam, O: Evaluate<T>>(
     layer: &O,
-    inputs: &[&Tensor<T>],
+    inputs: &[&WrappedTensor<T>],
     unpadded_input_shapes: Option<&[Shape]>,
 ) -> Result<LayerOut<T, E>> {
     layer.evaluate(inputs, unpadded_input_shapes.unwrap_or_default())

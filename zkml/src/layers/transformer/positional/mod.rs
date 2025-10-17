@@ -35,7 +35,6 @@ use crate::{
         },
     },
     model::{NodeID, StepData},
-    number::Number,
     padding::{PaddingMode, ShapeInfo},
     parser::{
         gguf::FileTensorLoader,
@@ -43,7 +42,7 @@ use crate::{
         llm::{LLMConfig, LLMVariant},
     },
     quantization::{Fieldizer, TensorFielder},
-    tensor::{IntoBTensor, TensorSlice},
+    tensor::{TensorSlice, TensorTypeParam, WrappedTensor},
 };
 
 pub(crate) mod absolute;
@@ -113,7 +112,7 @@ pub(crate) enum PositionalVariant<N> {
     Rope(Rope<N>),
 }
 
-impl<N: Number> Positional<N> {
+impl<N: TensorTypeParam> Positional<N> {
     pub fn shape(&self) -> Shape {
         match &self.variant {
             PositionalVariant::Absolute(abs) => abs.positional.shape().clone(),
@@ -314,15 +313,14 @@ impl<N: Number> Positional<N> {
     }
 }
 
-impl<N: Number> Evaluate<N> for Positional<N>
+impl<N> Evaluate<N> for Positional<N>
 where
+    N: TensorTypeParam,
     Add<N>: Evaluate<N>,
-    Tensor<N>: IntoBTensor,
-    N: burn::tensor::Element,
 {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&WrappedTensor<N>],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
@@ -331,7 +329,7 @@ where
             inputs.len()
         );
         ensure!(
-            inputs.iter().all(|x| x.shape().len() == 2),
+            inputs.iter().all(|x| x.rank() == 2),
             "positional embeddings only support 2d tensors"
         );
         ensure!(
@@ -376,7 +374,7 @@ fn output_shapes(
     input_shapes.to_vec()
 }
 
-impl<N: Number> OpInfo for Positional<N> {
+impl<N: TensorTypeParam> OpInfo for Positional<N> {
     fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
         match &self.variant {
             PositionalVariant::Absolute(absolute) => {

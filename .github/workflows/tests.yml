@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: "true"
-          submodules: "recursive"
+          persist-credentials: false
 
       - name: Force-check LFS
         run: git lfs pull
@@ -87,8 +87,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: "recursive"
           clean: "false"
+          persist-credentials: false
 
       - name: Clippy
         shell: devenv shell bash -- -e {0}

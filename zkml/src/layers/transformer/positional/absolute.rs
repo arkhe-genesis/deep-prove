@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, ensure};
+use anyhow::ensure;
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -12,7 +12,7 @@ use tenstore::GenStore;
 use transcript::Transcript;
 
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -26,9 +26,8 @@ use crate::{
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
     model::{NodeID, StepData},
-    number::Number,
     quantization::TensorFielder,
-    tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorSlice},
+    tensor::{KeyedTensor, TensorKey, TensorSlice, TensorTypeParam, WrappedTensor},
 };
 
 /// Data structure containing the proof data for the absolute variant of positional encoding layer
@@ -60,7 +59,7 @@ pub struct Absolute<N> {
     add_layer: Add<N>,
 }
 
-impl<N: Number> Absolute<N> {
+impl<N: TensorTypeParam> Absolute<N> {
     fn num_vars(&self) -> usize {
         let num_vars = self.positional.shape().num_vars_2d();
         num_vars.0 + num_vars.1
@@ -74,39 +73,39 @@ impl<N: Number> Absolute<N> {
             add_layer: Add::new(),
         }
     }
+}
 
+impl<N> Absolute<N> {
     pub(super) fn evaluate<E: ExtensionField>(
         &self,
-        input: &Tensor<N>,
+        input: &WrappedTensor<N>,
         unpadded_input_shape: &Shape,
         positional_cache: &Arc<Mutex<PositionalCache>>,
     ) -> anyhow::Result<LayerOut<N, E>>
     where
+        N: TensorTypeParam,
         Add<N>: Evaluate<N>,
-        Tensor<N>: IntoBTensor,
-        N: burn::tensor::Element,
     {
         let past_length = positional_cache.lock().unwrap().seq_len;
-        let pos_bt = self.positional.tensor().to_btensor::<2>();
+        let pos_bt = WrappedTensor::try_from(&self.positional)?;
         let sub_bt = pos_bt.slice([
-            past_length..past_length + input.shape()[0],
-            0..input.shape()[1],
+            past_length..past_length + input.shape().dims[0],
+            0..input.shape().dims[1],
         ]);
-        let sub_data: Vec<N> = sub_bt
-            .to_data()
-            .into_vec()
-            .expect("convert burn tensor to scalar data");
-        let sub_pos = Tensor::<N>::new(vec![input.shape()[0], input.shape()[1]].into(), sub_data);
         positional_cache
             .lock()
             .unwrap()
             .set_seq_len(past_length + unpadded_input_shape[0])?;
-        let output = self
+        let mut outputs = self
             .add_layer
-            .evaluate::<E>(&[input, &sub_pos], &vec![self.unpadded_shape.clone(); 2])?
-            .outputs
-            .pop()
-            .context("Expected at least 1 output from add in positional encoding layer")?;
+            .evaluate::<E>(&[input, &sub_bt], &vec![self.unpadded_shape.clone(); 2])?
+            .outputs;
+        ensure!(
+            outputs.len() == 1,
+            "Expected 1 output from add in positional encoding layer, got {}",
+            outputs.len()
+        );
+        let output = outputs.pop().unwrap();
         Ok(LayerOut::from_vec(vec![output]))
     }
 }
@@ -324,10 +323,9 @@ mod tests {
             transformer::positional::{Positional, PositionalCache, absolute::Absolute},
         },
         model::{Model, test::prove_model},
-        number::Number,
         padding::{PaddingMode, ShapeData, ShapeInfo},
         quantization::{AbsoluteMax, ScalingFactor},
-        tensor::{KeyedTensor, TensorSlice, is_close_with_tolerance},
+        tensor::{KeyedTensor, TensorSlice, TensorTypeParam, is_close_with_tolerance},
     };
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
@@ -383,7 +381,7 @@ mod tests {
         }
     }
 
-    fn input<T: Number>() -> impl Strategy<Value = Input<T>> {
+    fn input<T: TensorTypeParam>() -> impl Strategy<Value = Input<T>> {
         (1..32usize, 1..64usize).prop_flat_map(|(seq_len, embedding_size)| {
             (seq_len..=64usize).prop_map(move |context_length| {
                 let input = Tensor::<T>::random(&vec![seq_len, embedding_size].into());
@@ -412,7 +410,7 @@ mod tests {
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer
-                .evaluate::<GoldilocksExt2>(&input, &vec![seq_len, embedding_size].into(), &cache)
+                .evaluate::<GoldilocksExt2>(&input.as_wrapped(), &vec![seq_len, embedding_size].into(), &cache)
                 .expect("absolute evaluate should succeed")
                 .outputs
                 .pop()
@@ -425,7 +423,7 @@ mod tests {
                 expected_data.push(in_data[i * embedding_size + j] + pos_data[i * embedding_size + j]);
             }}
             let expected = Tensor::new(vec![seq_len, embedding_size].into(), expected_data);
-            let close = is_close_with_tolerance(out.data(), expected.data(), 1e-6, 1e-5);
+            let close = is_close_with_tolerance(&out.get_data(), expected.data(), 1e-6, 1e-5);
             prop_assert!(close);
         }
 
@@ -446,19 +444,19 @@ mod tests {
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer_q
-                .evaluate::<GoldilocksExt2>(&input_q, &vec![seq_len, embedding_size].into(), &cache)
+                .evaluate::<GoldilocksExt2>(&input_q.as_wrapped(), &vec![seq_len, embedding_size].into(), &cache)
                 .expect("quantized absolute evaluate should succeed")
                 .outputs
                 .pop()
                 .unwrap();
 
             let expected = add_q
-                .evaluate::<GoldilocksExt2>(&[&input_q, &sub_pos_q], &vec![unpadded.clone(); 2])
+                .evaluate::<GoldilocksExt2>(&[&input_q.as_wrapped(), &sub_pos_q.as_wrapped()], &vec![unpadded.clone(); 2])
                 .expect("quantized add evaluate should succeed")
                 .outputs
                 .pop()
                 .unwrap();
-            prop_assert_eq!(out, expected);
+            prop_assert_eq!(out.to_native(), expected.to_native());
         }
 
         #[test]

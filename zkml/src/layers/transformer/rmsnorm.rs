@@ -59,11 +59,9 @@ use crate::{
     },
     quantization::{self, Fieldizer},
     shape::Shape,
-    tensor::{KeyedTensor, TensorKey},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
     to_base,
 };
-
-use burn::{module::Param, nn::RmsNormConfig as BRmsNormConfig};
 
 /// The short name used to identify the RMSNorm layer.
 pub(crate) const RMSNORM_LAYER: &str = "RMSN";
@@ -303,7 +301,7 @@ impl RMSNorm<f32> {
     }
 }
 
-impl<N: Number> OpInfo for RMSNorm<N> {
+impl<N: TensorTypeParam> OpInfo for RMSNorm<N> {
     // https://docs.rs/burn/0.17.0/burn/nn/struct.RmsNorm.html#impl-RmsNorm%3CB%3E
     fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes.to_vec()
@@ -325,7 +323,7 @@ impl<N: Number> OpInfo for RMSNorm<N> {
 impl Evaluate<f32> for RMSNorm<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         assert!(inputs.len() == 1);
@@ -335,39 +333,25 @@ impl Evaluate<f32> for RMSNorm<f32> {
             "RMSNorm input must have shape [seq_len, embedding_size]: found {:?}",
             input.shape(),
         );
-        let embedding_size = input.shape()[1];
-        let device = Default::default();
-        // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
-        // instead of re-implementing everything ourselves.
-        // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/rms.rs.html#71
-        let input = input.to_btensor::<2>();
-        let alpha = self
-            .alpha
-            .clone()
-            .map(|alpha| alpha.tensor())
-            .unwrap_or(Tensor::<f32>::one(Shape::new(vec![embedding_size])))
-            .to_btensor::<1>();
+        let embedding_size = input.shape().dims[1];
+        let alpha = WrappedTensor::try_from(
+            &self
+                .alpha
+                .clone()
+                .map(|alpha| alpha.tensor())
+                .unwrap_or(Tensor::<f32>::one(Shape::new(vec![embedding_size]))),
+        )?;
 
-        let config = BRmsNormConfig::new(embedding_size).with_epsilon(self.eps as f64);
-        let mut norm = config.init(&device);
-        norm.gamma = Param::from_tensor(alpha);
-
-        let output = norm.forward(input);
-        let Ok(data): Result<Vec<f32>, _> = output.to_data().into_vec() else {
-            anyhow::bail!("failed to convert to f32");
-        };
-        let output_shape = Shape::new(output.shape().dims);
-        Ok(LayerOut::from_tensor(Tensor::<f32>::new(
-            output_shape,
-            data,
-        )))
+        let output =
+            WrappedTensor::rms_norm_forward(input.clone(), embedding_size, self.eps as f64, alpha)?;
+        Ok(LayerOut::from_tensor(output))
     }
 }
 
 impl Evaluate<Element> for RMSNorm<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we check to see if there is any quant_info, if not error
@@ -391,11 +375,11 @@ impl Evaluate<Element> for RMSNorm<Element> {
         } = self.quant_info.as_ref().unwrap();
 
         // So we need to take the input data and calculate `multiplier * SUM (xi * xi)`
-        let final_dim = *input.shape().last().ok_or(anyhow!(
+        let final_dim = *input.shape().dims.last().ok_or(anyhow!(
             "Cannot evaluate RMSNorm, input didn't have a shape"
         ))?;
 
-        let output_data = input
+        let output_data = Tensor::try_from(input.clone())?
             .get_data()
             .chunks(final_dim)
             .flat_map(|chunk| {
@@ -418,7 +402,8 @@ impl Evaluate<Element> for RMSNorm<Element> {
             })
             .collect::<Vec<Element>>();
 
-        let output_tensor = Tensor::<Element>::new(input.shape().clone(), output_data);
+        let output_tensor =
+            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data))?;
         Ok(LayerOut::from_tensor(output_tensor))
     }
 }
@@ -1193,8 +1178,11 @@ mod tests {
     fn test_rmsnorm() {
         let rmsnorm = RMSNorm::random(1024, None);
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
-        let output = rmsnorm.evaluate::<E>(&[&input], &[]).unwrap();
-        assert_eq!(output.outputs[0].shape().clone(), vec![1, 1024].into());
+        let output = rmsnorm.evaluate::<E>(&[&input.as_wrapped()], &[]).unwrap();
+        assert_eq!(
+            output.outputs[0].shape().clone(),
+            vec![1_usize, 1024].into()
+        );
         assert_eq!(output.outputs[0].get_data(), vec![0.0; 1024]);
     }
 
@@ -1213,13 +1201,13 @@ mod tests {
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = rmsnorm
-            .evaluate::<E>(&[&dequant_input], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&dequant_input.as_wrapped()], &[vec![2, 100].into()])
             .unwrap()
             .outputs[0]
             .clone();
 
         let quant_output = quant_rmsnorm
-            .evaluate::<E>(&[&quant_tensor], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&quant_tensor.as_wrapped()], &[vec![2, 100].into()])
             .unwrap()
             .outputs[0]
             .clone();
@@ -1228,11 +1216,11 @@ mod tests {
             * model_scaling.scale()
             * (1.0f32 / RMSNORM_OUTPUT_SCALE_FACTOR as f32);
         let output_scaling = ScalingFactor::from_scale(output_scale, None);
-        let quant_output_dequant = quant_output.dequantize(&output_scaling);
+        let quant_output_dequant = quant_output.to_native().dequantize(&output_scaling);
         let a = quant_output_dequant.get_data();
         let b = dequant_output.get_data();
         assert!(
-            is_close_with_tolerance(a, b, 5e-2_f32, 1e-1_f32),
+            is_close_with_tolerance(a, &b, 5e-2_f32, 1e-1_f32),
             "Wasn't close enough to floating point version"
         );
     }

@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use std::{cmp::Ordering, collections::HashMap};
 use tenstore::GenStore;
 
-use crate::model::NodeID;
+use crate::{Number, model::NodeID, tensor::TensorTypeParam};
 use anyhow::{Context, bail, ensure};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
@@ -19,19 +19,16 @@ use crate::{
     layers::{
         LayerCtx, LayerProof,
         provable::{
-            Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
         },
         requant::{FIXED_POINT_SCALE, Requant},
     },
     model::StepData,
-    number::Number,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{self, Fieldizer},
-    tensor::{KeyedTensor, TensorKey},
+    tensor::{KeyedTensor, TensorKey, WrappedTensor},
 };
-
-use super::provable::LayerOut;
 
 /// The short name used to identify the Add layer.
 pub const ADD_LAYER: &str = "_ADD";
@@ -46,7 +43,7 @@ pub struct Add<N> {
     quant_info: Option<AddQuantInfo>,
 }
 
-impl<N: Number> Default for Add<N> {
+impl<N: TensorTypeParam> Default for Add<N> {
     fn default() -> Self {
         Self::new()
     }
@@ -67,7 +64,7 @@ pub struct AddProof<E> {
     right_eval: E,
 }
 
-impl<N: Number> Add<N> {
+impl<N: TensorTypeParam> Add<N> {
     pub fn new() -> Self {
         Self {
             operand: None,
@@ -156,7 +153,7 @@ impl Add<Element> {
 impl Evaluate<f32> for Add<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         let left = inputs[0];
@@ -167,10 +164,10 @@ impl Evaluate<f32> for Add<f32> {
             let right_shape = left.shape();
 
             ensure!(
-                left_shape.product() == right_shape.product(),
+                left_shape.num_elements() == right_shape.num_elements(),
                 "Add layer expects inputs to have the same shape: {left_shape:?} vs {right_shape:?}",
             );
-            right
+            right.clone()
         } else if inputs.len() == 1 {
             let (operand, _) = self
                 .operand
@@ -178,27 +175,24 @@ impl Evaluate<f32> for Add<f32> {
                 .context("Add operand can't be None if there is only one input")?;
             let operand_shape = operand.shape();
             ensure!(
-                shape.product() == operand_shape.product(),
+                shape.num_elements() == operand_shape.product(),
                 "Add layer expects input and operand to have the same shape: {shape:?} vs {operand_shape:?}",
             );
-            operand
+            WrappedTensor::try_from(operand)?
         } else {
             bail!("Add layer expects 1 or 2 inputs, got {}", inputs.len());
         };
 
-        let left = left.clone().to_btensor::<2>();
-        let right = right.clone().to_btensor::<2>();
-        let res = left.add(right);
-        let data = res.to_data().into_vec().expect("convert tensor to scalar");
-        let result = Tensor::<f32>::new(shape.clone(), data);
-        Ok(LayerOut::from_vec(vec![result]))
+        let left = left.clone();
+        let result = left.add(right)?;
+        Ok(LayerOut::from_tensor(result))
     }
 }
 
 impl Evaluate<Element> for Add<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         let quant_info = self
@@ -208,25 +202,22 @@ impl Evaluate<Element> for Add<Element> {
         ensure!(!inputs.is_empty(), "Add layer expects at least 1 input");
         let left_tensor = inputs[0];
         let right_tensor = match self.operand {
-            Some((ref op, _)) => op,
+            Some((ref op, _)) => WrappedTensor::try_from(op)?,
             None => {
                 ensure!(
                     inputs.len() == 2,
                     "Add layer expects 2 inputs if there is no operand"
                 );
-                inputs[1]
+                inputs[1].clone()
             }
         };
-        let left_scaled = left_tensor.scalar_mul(&(quant_info.left_scale()));
-        let shape = left_scaled.shape().clone();
-        let right_scaled = right_tensor.scalar_mul(&(quant_info.right_scale()));
+        let left_scaled = left_tensor.clone().mul_scalar(quant_info.left_scale());
+        let right_scaled = right_tensor.mul_scalar(quant_info.right_scale());
 
-        let left = left_scaled.to_btensor::<2>();
-        let right = right_scaled.to_btensor::<2>();
-        let res = left.add(right);
-        let data = res.to_data().into_vec().expect("convert tensor to scalar");
-        let result = Tensor::<Element>::new(shape.clone(), data);
-        Ok(LayerOut::from_vec(vec![result]))
+        let left = left_scaled;
+        let right = right_scaled;
+        let result = left.add(right)?;
+        Ok(LayerOut::from_tensor(result))
     }
 }
 
@@ -332,7 +323,7 @@ impl AddQuantInfo {
         let right_input_shift = right_int - FIXED_POINT_SCALE as f32;
 
         let (mut final_right_shift, mut left_multiplier, mut right_multiplier) =
-            match left_input_shift.compare(&right_input_shift) {
+            match Number::compare(&left_input_shift, &right_input_shift) {
                 Ordering::Less => {
                     // The left input has a "smaller" shift than the right input, so we work out what we need to subtract from the right input to make it equal to the left input
                     let shift_diff = right_input_shift - left_input_shift;
@@ -648,13 +639,16 @@ mod test {
 
         let qadd = add.quantize(&[s1, s2], s3).unwrap().quantized_op;
         let qadd_result = qadd
-            .evaluate::<GoldilocksExt2>(&[&qt1, &qt2], &[vec![2, 2].into(), vec![2, 2].into()])
+            .evaluate::<GoldilocksExt2>(
+                &[&qt1.as_wrapped(), &qt2.as_wrapped()],
+                &[vec![2, 2].into(), vec![2, 2].into()],
+            )
             .unwrap();
 
         let quant_info = qadd.quant_info.as_ref().unwrap();
 
         let computed_result = Tensor::<f32>::new(
-            qadd_result.outputs()[0].shape().clone(),
+            qadd_result.outputs()[0].shape().to_vec().into(),
             qadd_result.outputs()[0]
                 .get_data()
                 .iter()
@@ -746,13 +740,13 @@ mod test {
             let computed = if is_two_layers {
                 // In case of two layers the operand is used as the 2nd input
                 let add = Add::<f32>::new();
-                add.evaluate::<GoldilocksExt2>(&[&input, &operand], &[]).unwrap()
+                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), &operand.as_wrapped()], &[]).unwrap()
             } else {
                 let add = Add::<f32>::new_with(operand, unpadded_shape);
-                add.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap()
+                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[]).unwrap()
             };
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
 
         #[test]
@@ -776,14 +770,14 @@ mod test {
                 // In case of two layers the operand is used as the 2nd input
                 let mut add = Add::<Element>::new();
                 add.quant_info = Some(quant_info);
-                add.evaluate::<GoldilocksExt2>(&[&input, &operand], &[]).unwrap()
+                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), &operand.as_wrapped()], &[]).unwrap()
             } else {
                 let mut add = Add::<Element>::new_with(operand, unpadded_shape);
                 add.quant_info = Some(quant_info);
-                add.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap()
+                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[]).unwrap()
             };
 
-            prop_assert_eq!(&expected, &computed.outputs[0]);
+            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
     }
 
@@ -800,7 +794,7 @@ mod test {
         }
     }
 
-    fn any_input<T: Number>(
+    fn any_input<T: TensorTypeParam>(
         dim_x: Range<usize>,
         dim_y: Range<usize>,
     ) -> impl Strategy<Value = Input<T>> {

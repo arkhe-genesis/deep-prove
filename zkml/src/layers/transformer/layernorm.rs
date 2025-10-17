@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::{
     commit::identity_eval,
     lookup::logup_gkr::{prover::batch_multiple_sizes_prove, structs::LogUpBatchProof},
-    tensor::{KeyedTensor, TensorKey},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
     to_base,
 };
 use anyhow::{Result, anyhow, ensure};
@@ -59,8 +59,6 @@ use crate::{
     parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
     quantization::{self, Fieldizer},
 };
-
-use burn::{module::Param, nn::LayerNormConfig as BLayerNormConfig};
 
 /// The short name used to identify the LayerNorm layer.
 pub(crate) const LAYERNORM_LAYER: &str = "LNRM";
@@ -385,7 +383,7 @@ impl<E: ExtensionField> OpInfo for LayerNormCtx<E> {
     }
 }
 
-impl<N: Number> OpInfo for LayerNorm<N> {
+impl<N: TensorTypeParam> OpInfo for LayerNorm<N> {
     // https://docs.rs/burn/0.17.0/burn/nn/struct.LayerNorm.html#method.forward
     fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes.to_vec()
@@ -407,7 +405,7 @@ impl<N: Number> OpInfo for LayerNorm<N> {
 impl Evaluate<f32> for LayerNorm<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<f32>],
+        inputs: &[&WrappedTensor<f32>],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         assert_eq!(
@@ -416,41 +414,29 @@ impl Evaluate<f32> for LayerNorm<f32> {
             "Exactly one input must be provided to layer norm. got {}",
             inputs.len(),
         );
-        let input = inputs[0];
+        let input = inputs[0].clone();
 
         ensure!(
             input.rank() == 2,
             "layernorm input must have shape [seq_len, embedding_size]: found {:?}",
             input.shape(),
         );
-        let embedding_size = input.shape()[1];
-        let device = Default::default();
+        let embedding_size = input.shape().dims[1];
         // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
         // instead of re-implementing everything ourselves.
         // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/layer.rs.html#67
-        let input = input.clone().to_btensor::<2>();
-        let gamma = self.gamma.tensor().to_btensor::<1>();
-        let beta = self.beta.tensor().to_btensor::<1>();
-        let config = BLayerNormConfig::new(embedding_size).with_epsilon(self.eps as f64);
-        let mut norm = config.init(&device);
-        norm.gamma = Param::from_tensor(gamma);
-        norm.beta = Param::from_tensor(beta);
-        let output = norm.forward(input);
-        let Ok(data): Result<Vec<f32>, _> = output.to_data().into_vec() else {
-            anyhow::bail!("failed to convert to f32");
-        };
-        let output_shape = Shape::new(output.shape().dims);
-        Ok(LayerOut::from_tensor(Tensor::<f32>::new(
-            output_shape,
-            data,
-        )))
+        let gamma = WrappedTensor::try_from(&self.gamma)?;
+        let beta = WrappedTensor::try_from(&self.beta)?;
+        let output =
+            WrappedTensor::layer_norm(input, embedding_size, self.eps as f64, gamma, beta)?;
+        Ok(LayerOut::from_tensor(output))
     }
 }
 
 impl Evaluate<Element> for LayerNorm<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<Element>],
+        inputs: &[&WrappedTensor<Element>],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we check to see if there is any quant_info, if not error
@@ -464,7 +450,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
             "LayerNorm should have a single input, had: {}",
             inputs.len(),
         );
-        let input = inputs[0];
+        let input = inputs[0].clone();
 
         assert_eq!(self.gamma.rank(), 1, "Gamma must be 1D");
         assert_eq!(self.beta.rank(), 1, "Beta must be 1D");
@@ -480,7 +466,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
             .ok_or(anyhow!("Missing QuantisedLayerNormData"))?;
 
         // So we need to take the input data and calculate `N * multiplier * SUM (xi * xi) - multiplier * (SUM xi) * (SUM xi)`
-        let final_dim = *input.shape().last().ok_or(anyhow!(
+        let final_dim = *input.shape().dims.last().ok_or(anyhow!(
             "Cannot evaluate LayerNorm, input didn't have a shape",
         ))?;
 
@@ -501,19 +487,13 @@ impl Evaluate<Element> for LayerNorm<Element> {
 
         let shape = input.shape();
 
-        let input = input.clone().to_btensor::<2>();
         let sum = input.clone().sum_dim(1);
-        let square_sum = sum.clone() * sum.clone();
-        let sum_square = (input.clone() * input.clone()).sum_dim(1);
+        let square_sum = sum.clone().mul(sum.clone())?;
+        let sum_square = (input.clone().mul(input.clone())?).sum_dim(1);
 
-        // NOTE: can not use mul_scalar here due to tracel-ai/burn#3659
-        //
-        // let full_value = sum_square.mul_scalar(*dim_size as Element * multiplier)
-        //     - square_sum.mul_scalar(*multiplier);
-
-        let multiplier = sum_square.full_like(*multiplier);
-        let full_value = sum_square.mul(multiplier.clone().mul_scalar(*dim_size as Element))
-            - square_sum.mul(multiplier);
+        let full_value = sum_square
+            .mul_scalar(*dim_size as Element * multiplier)
+            .sub(square_sum.mul_scalar(*multiplier))?;
 
         let value = full_value
             .clone()
@@ -533,31 +513,25 @@ impl Evaluate<Element> for LayerNorm<Element> {
             .round()
             .int();
 
-        let gamma = self
-            .gamma
-            .tensor()
-            .to_btensor::<1>()
-            .unsqueeze_dim::<2>(0)
-            .expand([shape.dim(0) as i32, -1]);
+        let gamma = WrappedTensor::try_from(&self.gamma)?
+            .unsqueeze_dim_2()
+            .expand([shape.dims[0] as i32, -1])?;
 
-        let beta = self
-            .beta
-            .tensor()
-            .to_btensor::<1>()
-            .unsqueeze_dim::<2>(0)
-            .expand([shape.dim(0) as i32, -1]);
+        let beta = WrappedTensor::try_from(&self.beta)?
+            .unsqueeze_dim_2()
+            .expand([shape.dims[0] as i32, -1])?;
 
         let denominator = inv_sqrt
             .clone()
-            .unsqueeze::<2>()
-            .expand([-1, final_dim as i32]);
+            .unsqueeze_dim_2()
+            .expand([-1, final_dim as i32])?;
 
         let output = input
             .mul_scalar(*dim_size as Element)
-            .sub(sum)
-            .mul(gamma)
-            .mul(denominator)
-            .add(beta);
+            .sub(sum)?
+            .mul(gamma)?
+            .mul(denominator)?
+            .add(beta)?;
 
         let lookup_output = inv_sqrt
             .to_data()
@@ -573,15 +547,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
             full_value,
         };
 
-        let output_tensor = Tensor::<Element>::new(
-            shape.clone(),
-            output
-                .to_data()
-                .into_vec()
-                .expect("Failed to compute LayerNorm"),
-        );
-        Ok(LayerOut::from_tensor(output_tensor)
-            .with_proving_data(ProvingData::LayerNorm(layernorm_data)))
+        Ok(LayerOut::from_tensor(output).with_proving_data(ProvingData::LayerNorm(layernorm_data)))
     }
 }
 
@@ -1407,7 +1373,7 @@ mod tests {
 
     use super::*;
 
-    impl<N: Number> LayerNorm<N> {
+    impl<N: Number + TensorTypeParam> LayerNorm<N> {
         pub fn random(size: usize, layer_name: Option<TensorKey>) -> Self {
             let layer_name = layer_name.unwrap_or("layernorm".to_string().into());
             let gamma = KeyedTensor::new(
@@ -1442,9 +1408,9 @@ mod tests {
             eps,
             quant_info: None,
         };
-        let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
+        let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]).into_wrapped();
         let output = layernorm.evaluate::<E>(&[&input], &[]).unwrap();
-        assert_eq!(*output.outputs[0].shape(), vec![1, 1024].into());
+        assert_eq!(output.outputs[0].shape(), vec![1_usize, 1024].into());
         assert_eq!(output.outputs[0].get_data(), vec![0.0; 1024]);
     }
 
@@ -1460,7 +1426,7 @@ mod tests {
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = layernorm
-            .evaluate::<E>(&[&dequant_input], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&dequant_input.as_wrapped()], &[vec![2, 100].into()])
             .unwrap()
             .outputs[0]
             .clone();
@@ -1469,16 +1435,16 @@ mod tests {
             layernorm.quantise(input_scaling, input_scaling).unwrap();
 
         let quant_output = quant_layernorm
-            .evaluate::<E>(&[&quant_tensor], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&quant_tensor.as_wrapped()], &[vec![2, 100].into()])
             .unwrap()
             .outputs[0]
             .clone();
 
-        let quant_output_dequant = quant_output.dequantize(&output_scaling);
+        let quant_output_dequant = quant_output.to_native().dequantize(&output_scaling);
         let a = quant_output_dequant.get_data();
         let b = dequant_output.get_data();
         assert!(
-            is_close_with_tolerance(a, b, 5e-2_f32, 1e-1_f32),
+            is_close_with_tolerance(a, &b, 5e-2_f32, 1e-1_f32),
             "Wasn't close enough to floating point version"
         );
     }
@@ -1532,7 +1498,10 @@ mod tests {
         }
     }
 
-    fn input<T: Number>(dim0: Range<usize>, dim1: Range<usize>) -> impl Strategy<Value = Input<T>> {
+    fn input<T: TensorTypeParam>(
+        dim0: Range<usize>,
+        dim1: Range<usize>,
+    ) -> impl Strategy<Value = Input<T>> {
         (dim0, dim1).prop_flat_map(|(dim0, dim1)| {
             let input = Tensor::any(Shape::new(vec![dim0, dim1]));
             let beta = Tensor::any(Shape::new(vec![dim1]));
@@ -1611,8 +1580,14 @@ mod tests {
             &layer.gamma,
             layer.quant_info.as_ref().unwrap(),
         );
-        let result = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
-        assert_eq!(result.outputs()[0].data(), &expected.2, "Output mismatch");
+        let result = layer
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .unwrap();
+        assert_eq!(
+            &result.outputs()[0].get_data(),
+            &expected.2,
+            "Output mismatch"
+        );
 
         let expected_proof_data = result.try_layernorm_data().unwrap();
         assert_eq!(
@@ -1673,8 +1648,14 @@ mod tests {
             &layer.gamma,
             layer.quant_info.as_ref().unwrap(),
         );
-        let result = layer.evaluate::<GoldilocksExt2>(&[&input], &[]).unwrap();
-        assert_eq!(result.outputs()[0].data(), &expected.2, "Output mismatch");
+        let result = layer
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .unwrap();
+        assert_eq!(
+            &result.outputs()[0].get_data(),
+            &expected.2,
+            "Output mismatch"
+        );
 
         let expected_proof_data = result.try_layernorm_data().unwrap();
         assert_eq!(
@@ -1699,8 +1680,8 @@ mod tests {
             let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 
             let expected = evaluate(&input.input, &layer.beta, &layer.gamma, layer.quant_info.as_ref().unwrap());
-            let result = layer.evaluate::<GoldilocksExt2>(&[&input.input], &[]).unwrap();
-            prop_assert_eq!(result.outputs()[0].data(), &expected.2, "Output mismatch. input {:?}", data);
+            let result = layer.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()], &[]).unwrap();
+            prop_assert_eq!(&result.outputs()[0].get_data(), &expected.2, "Output mismatch. input {:?}", data);
 
             let expected_proof_data = result.try_layernorm_data().unwrap();
             prop_assert_eq!(&expected_proof_data.full_value, &expected.1, "Full value mismatch. input {:?}", data);
