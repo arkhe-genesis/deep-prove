@@ -2,19 +2,15 @@
 
 use super::*;
 
-use crate::{
-    Number, Shape, Tensor, backend::Backend, layers::concat_matmul::Permutation,
-    tensor::IntoBTensor,
-};
+use crate::{Shape, Tensor, layers::concat_matmul::Permutation};
 
-use anyhow::{Result, anyhow, bail};
-use burn::tensor::Tensor as BurnTensor;
+use anyhow::{Result, anyhow};
+use burn::prelude::Shape as BShape;
 use itertools::{Itertools, izip};
 
 impl<N> EinSum<N>
 where
-    N: Number + burn::tensor::Element,
-    Tensor<N>: IntoBTensor,
+    N: TensorTypeParam,
 {
     /// Convert the given input [Tensors][Tensor] to 3D [BurnTensors][BurnTensor], applying an optional [Permutation] and reshaping.
     /// Then performs the [`EinSum`] operation using batched matrix multiplications and performs any bias additions.
@@ -31,14 +27,20 @@ where
     /// as defined by the einsum equation or if any tensor operations fail.
     pub(crate) fn evaluate_internal(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&WrappedTensor<N>],
         unpadded_input_shapes: &[Shape],
-    ) -> Result<Vec<Tensor<N>>> {
+    ) -> Result<Vec<WrappedTensor<N>>> {
         // Prepare the input tensors, applying permutations and reshaping as needed
         let mut unpadded_inputs_iter = inputs
             .iter()
             .zip(unpadded_input_shapes.iter())
-            .map(|(input_tens, unpadded_shape)| input_tens.reduce_to_shape(unpadded_shape));
+            .map(|(&input_tens, unpadded_shape)| {
+                input_tens
+                    .clone()
+                    .reduce_to_shape(&BShape::from(unpadded_shape.as_slice()))
+            })
+            .collect::<Result<Vec<WrappedTensor<N>>>>()?
+            .into_iter();
         // The LHS is never a constant tensor, so we take it from the inputs
         let lhs_input = unpadded_inputs_iter
             .next()
@@ -53,7 +55,7 @@ where
                         if let (Some(const_tensor), Some(unpadded_shape)) =
                             (opt_const, unpadded_shape)
                         {
-                            Ok(const_tensor.reduce_to_shape(unpadded_shape))
+                            WrappedTensor::try_from(&const_tensor.reduce_to_shape(unpadded_shape))
                         } else {
                             unpadded_inputs_iter
                                 .next()
@@ -61,19 +63,22 @@ where
                         }
                     }),
             )
-            .collect::<Result<Vec<Tensor<N>>>>()?;
+            .collect::<Result<Vec<WrappedTensor<N>>>>()?;
 
         // If the stack_axes_size is 1 and the lhs has rank 2 then we can make 2D matmuls instead of 3D batched matmuls
         let unpadded_shapes = unpadded_inputs
             .iter()
-            .map(|t| t.shape().clone())
+            .map(|t| {
+                let BShape { dims } = t.shape();
+                Shape::new(dims)
+            })
             .collect::<Vec<_>>();
         let stack_axes_size = self.mapping.axes_sizes(&unpadded_shapes)?[AxisType::Stacked];
         let lhs_rank = unpadded_shapes[0].rank();
         if lhs_rank <= 2 && stack_axes_size == 1 {
-            self.burn_evaluation::<2>(&unpadded_inputs, &unpadded_shapes)
+            self.burn_evaluation::<2>(unpadded_inputs, &unpadded_shapes)
         } else {
-            self.burn_evaluation::<3>(&unpadded_inputs, &unpadded_shapes)
+            self.burn_evaluation::<3>(unpadded_inputs, &unpadded_shapes)
         }
     }
 
@@ -81,9 +86,9 @@ where
     /// The const generic parameter `D` represents the rank of the tensors being processed (either 2 or 3).
     fn burn_evaluation<const D: usize>(
         &self,
-        inputs: &[Tensor<N>],
+        inputs: Vec<WrappedTensor<N>>,
         shapes: &[Shape],
-    ) -> Result<Vec<Tensor<N>>> {
+    ) -> Result<Vec<WrappedTensor<N>>> {
         // Ensure that D is either 2 or 3
         ensure!(
             D == 2 || D == 3,
@@ -93,22 +98,37 @@ where
         self.mapping.check_shapes(shapes)?;
 
         let mut prepped_inputs = izip!(
-            inputs.iter(),
-            shapes.iter(),
+            inputs,
             self.evaluation_info.input_permutations(),
             self.evaluation_info.input_reshapes()
         )
-        .map(
-            |(input, full_shape, permutation, reshape)| match full_shape.rank() {
-                rank if rank == D => to_burn_tensor_same_rank::<D, N>(input, permutation),
-                1 => to_burn_tensor_diff_rank::<1, D, N>(input, permutation, &reshape[3 - D..]),
-                2 => to_burn_tensor_diff_rank::<2, D, N>(input, permutation, &reshape[3 - D..]),
-                3 => to_burn_tensor_diff_rank::<3, D, N>(input, permutation, &reshape[3 - D..]),
-                4 => to_burn_tensor_diff_rank::<4, D, N>(input, permutation, &reshape[3 - D..]),
-                x => bail!("Input tensor rank {x} not supported"),
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+        .map(|(input, permutation, reshape)| {
+            let permuted = if let Some(perm) = permutation {
+                input.permute(&perm.0.iter().map(|&d| d as isize).collect::<Vec<_>>())?
+            } else {
+                input
+            };
+
+            let permuted_shape = permuted.shape();
+
+            let mut skip = 0;
+            let mut reshape_array = [0usize; D];
+
+            reshape_array
+                .iter_mut()
+                .zip(reshape[3 - D..].iter())
+                .for_each(|(new_dim, to_take)| {
+                    *new_dim = permuted_shape
+                        .dims
+                        .iter()
+                        .skip(skip)
+                        .take(*to_take)
+                        .product();
+                    skip += *to_take;
+                });
+            permuted.reshape(BShape::from(reshape_array.as_slice()))
+        })
+        .collect::<Result<Vec<WrappedTensor<N>>>>()?;
 
         // Remove the LHS input from the prepared inputs
         let lhs_burn = prepped_inputs.remove(0);
@@ -117,17 +137,15 @@ where
         let intermediate_results = prepped_inputs
             .into_iter()
             .map(|rhs| lhs_burn.clone().matmul(rhs))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<WrappedTensor<N>>>>()?;
 
         // Now that we have the intermediate outputs as tensors from batched matmuls, we need to reshape them to their intermediate forms
         // and then permute if required
         let intermediate_shapes = self.mapping.intermediate_shapes(shapes)?;
-        let output_shapes = self.mapping.output_shapes(shapes)?;
 
         izip!(
             intermediate_results,
             intermediate_shapes,
-            output_shapes,
             self.evaluation_info.output_permutations(),
             self.biases
                 .iter()
@@ -139,202 +157,40 @@ where
                 })
         )
         .map(
-            |(intermediate, intermediate_shape, output_shape, output_permutation, bias)| {
-                match output_shape.rank() {
-                    rank if rank == D => from_burn_tensor_same_rank::<D, N>(
-                        intermediate,
-                        output_permutation,
-                        bias,
-                        output_shape,
-                        self.padded,
-                    ),
-                    1 => from_burn_tensor_diff_rank::<D, 1, N>(
-                        intermediate,
-                        intermediate_shape.as_slice(),
-                        output_permutation,
-                        bias,
-                        output_shape,
-                        self.padded,
-                    ),
-                    2 => from_burn_tensor_diff_rank::<D, 2, N>(
-                        intermediate,
-                        intermediate_shape.as_slice(),
-                        output_permutation,
-                        bias,
-                        output_shape,
-                        self.padded,
-                    ),
-                    3 => from_burn_tensor_diff_rank::<D, 3, N>(
-                        intermediate,
-                        intermediate_shape.as_slice(),
-                        output_permutation,
-                        bias,
-                        output_shape,
-                        self.padded,
-                    ),
-                    4 => from_burn_tensor_diff_rank::<D, 4, N>(
-                        intermediate,
-                        intermediate_shape.as_slice(),
-                        output_permutation,
-                        bias,
-                        output_shape,
-                        self.padded,
-                    ),
-                    x => bail!("Output tensor rank {x} not supported"),
+            |(intermediate, intermediate_shape, output_permutation, bias)| {
+                // Reshape the burn tensor to the target rank
+                let reshaped = intermediate.reshape(BShape::from(intermediate_shape.as_slice()))?;
+
+                // Apply the output permutation if provided
+                let permuted = if let Some(perm) = output_permutation {
+                    reshaped.permute(&perm.0.iter().map(|d| *d as isize).collect::<Vec<_>>())?
+                } else {
+                    reshaped
+                };
+                // Add the bias if provided
+                let with_bias = if let Some(bias_tensor) = bias {
+                    let wrapped_bias = WrappedTensor::try_from(&bias_tensor)?;
+                    permuted.add(wrapped_bias)?
+                } else {
+                    permuted
+                };
+
+                if self.padded {
+                    let BShape { dims } = with_bias.shape();
+                    let data: Vec<N> = with_bias.to_data().into_vec().map_err(|e| {
+                        anyhow!(
+                            "Could not compute EinSum, failure converting output data to vec: {e:?}"
+                        )
+                    })?;
+                    let tmp_shape = Shape::new(dims);
+                    let with_bias = Tensor::new(tmp_shape, data);
+                    WrappedTensor::try_from(&with_bias.pad_next_power_of_two())
+                } else {
+                    Ok(with_bias)
                 }
             },
         )
         .collect()
-    }
-}
-
-/// Helper function to convert a [Tensor][Tensor] to a [BurnTensor][BurnTensor] of the same rank, applying an optional [Permutation].
-fn to_burn_tensor_same_rank<const D: usize, N>(
-    input_tensor: &Tensor<N>,
-    permutation: Option<&Permutation>,
-) -> Result<BurnTensor<Backend, D, <Tensor<N> as IntoBTensor>::Kind>>
-where
-    N: Number + burn::tensor::Element,
-    Tensor<N>: IntoBTensor,
-{
-    let b_input = input_tensor.to_btensor::<D>();
-    let permuted_input = if let Some(perm) = permutation {
-        let burn_perm: [usize; D] = perm
-            .0
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid permutation length"))?;
-        Ok(b_input.permute(burn_perm))
-    } else {
-        Ok(b_input)
-    };
-    permuted_input
-}
-
-/// Helper function to convert a [Tensor][Tensor] to a [BurnTensor][BurnTensor] of a different rank, applying an optional [Permutation] and reshaping.
-fn to_burn_tensor_diff_rank<const D1: usize, const D2: usize, N>(
-    input_tensor: &Tensor<N>,
-    permutation: Option<&Permutation>,
-    reshape_info: &[usize],
-) -> Result<BurnTensor<Backend, D2, <Tensor<N> as IntoBTensor>::Kind>>
-where
-    N: Number + burn::tensor::Element,
-    Tensor<N>: IntoBTensor,
-{
-    let b_input = input_tensor.to_btensor::<D1>();
-    let permuted_input = if let Some(perm) = permutation {
-        let burn_perm: [usize; D1] = perm
-            .0
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid permutation length"))?;
-        b_input.permute(burn_perm)
-    } else {
-        b_input
-    };
-    let permuted_shape = permuted_input.shape().dims::<D1>();
-    let mut skip = 0;
-    let mut reshape_array = [0usize; D2];
-
-    reshape_array
-        .iter_mut()
-        .zip(reshape_info.iter())
-        .for_each(|(new_dim, to_take)| {
-            *new_dim = permuted_shape.iter().skip(skip).take(*to_take).product();
-            skip += *to_take;
-        });
-
-    Ok(permuted_input.reshape(reshape_array))
-}
-
-/// Helper function to convert a [BurnTensor][BurnTensor] to a [Tensor][Tensor] of the same rank, applying an optional [Permutation] and adding an optional bias.
-fn from_burn_tensor_same_rank<const D: usize, N>(
-    burn_tensor: BurnTensor<Backend, D, <Tensor<N> as IntoBTensor>::Kind>,
-    permutation: Option<&Permutation>,
-    bias: Option<Tensor<N>>,
-    output_shape: Shape,
-    padded: bool,
-) -> Result<Tensor<N>>
-where
-    N: Number + burn::tensor::Element,
-    Tensor<N>: IntoBTensor,
-{
-    // Apply the output permutation if provided
-    let permuted = if let Some(perm) = permutation {
-        let burn_perm: [usize; D] = perm
-            .0
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid permutation length"))?;
-        burn_tensor.permute(burn_perm)
-    } else {
-        burn_tensor
-    };
-    // Add the bias if provided
-    let with_bias = if let Some(bias_tensor) = bias {
-        let b_bias = bias_tensor.to_btensor::<D>();
-        permuted.add(b_bias)
-    } else {
-        permuted
-    };
-
-    let data: Vec<N> = with_bias.into_data().into_vec().map_err(|e| {
-        anyhow!("Could not compute EinSum, failure converting output data to vec: {e:?}")
-    })?;
-
-    if padded {
-        Ok(Tensor::new(output_shape, data).pad_next_power_of_two())
-    } else {
-        Ok(Tensor::new(output_shape, data))
-    }
-}
-
-/// Helper function to convert a [BurnTensor][BurnTensor] to a [Tensor][Tensor] of a different rank, applying an optional [Permutation] and adding an optional bias.
-fn from_burn_tensor_diff_rank<const D1: usize, const D2: usize, N>(
-    burn_tensor: BurnTensor<Backend, D1, <Tensor<N> as IntoBTensor>::Kind>,
-    intermediate_shape: &[usize],
-    permutation: Option<&Permutation>,
-    bias: Option<Tensor<N>>,
-    output_shape: Shape,
-    padded: bool,
-) -> Result<Tensor<N>>
-where
-    N: Number + burn::tensor::Element,
-    Tensor<N>: IntoBTensor,
-{
-    // Reshape the burn tensor to the target rank
-    let reshape_array: [usize; D2] = intermediate_shape
-        .try_into()
-        .map_err(|_| anyhow!("Invalid output shape length"))?;
-    let reshaped = burn_tensor.reshape(reshape_array);
-
-    // Apply the output permutation if provided
-    let permuted = if let Some(perm) = permutation {
-        let burn_perm: [usize; D2] = perm
-            .0
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid permutation length"))?;
-        reshaped.permute(burn_perm)
-    } else {
-        reshaped
-    };
-    // Add the bias if provided
-    let with_bias = if let Some(bias_tensor) = bias {
-        let b_bias = bias_tensor.to_btensor::<D2>();
-        permuted.add(b_bias)
-    } else {
-        permuted
-    };
-
-    let data: Vec<N> = with_bias.into_data().into_vec().map_err(|e| {
-        anyhow!("Could not compute EinSum, failure converting output data to vec: {e:?}")
-    })?;
-
-    if padded {
-        Ok(Tensor::new(output_shape, data).pad_next_power_of_two())
-    } else {
-        Ok(Tensor::new(output_shape, data))
     }
 }
 
@@ -621,9 +477,9 @@ impl EvaluationInformation3D {
 mod tests {
     use ark_std::rand::Rng;
 
-    use crate::{Element, rng_from_env_or_random};
-
     use super::*;
+    use crate::{Element, rng_from_env_or_random, tensor::IntoBTensor};
+    use burn::tensor::Tensor as BurnTensor;
 
     #[test]
     fn test_simple_matmul() {
@@ -633,8 +489,7 @@ mod tests {
 
     fn test_simple_matmul_helper<N>()
     where
-        N: Number + burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
+        N: TensorTypeParam,
     {
         let einsum: EinSum<N> =
             EinSum::new("A(ab)@B(bc)->C(ac)".to_string(), vec![None], vec![None])
@@ -653,7 +508,10 @@ mod tests {
             let a = Tensor::<N>::random(&a_shape);
             let b = Tensor::<N>::random(&b_shape);
             let output = einsum
-                .evaluate_internal(&[&a, &b], &[a_shape.clone(), b_shape.clone()])
+                .evaluate_internal(
+                    &[&a.as_wrapped(), &b.as_wrapped()],
+                    &[a_shape.clone(), b_shape.clone()],
+                )
                 .expect("Failed to evaluate EinSum layer");
 
             let a_burn = a.to_btensor::<2>();
@@ -664,13 +522,12 @@ mod tests {
                 .into_data()
                 .into_vec()
                 .expect("Failed to convert expected output to vec");
-            let expected = Tensor::new(c_shape, burn_data);
-
+            let expected = Tensor::new(c_shape.clone(), burn_data);
+            let output = Tensor::new(c_shape, output[0].clone().get_data());
             assert_eq!(
-                output[0].clone().get_data_into(),
+                output.clone().get_data_into(),
                 expected.clone().get_data_into(),
-                "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {}, Expected: {expected}",
-                output[0]
+                "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {output}, Expected: {expected}",
             );
         }
     }
@@ -683,8 +540,7 @@ mod tests {
 
     fn test_simple_matmul_with_bias_helper<N>()
     where
-        N: Number + burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
+        N: TensorTypeParam,
     {
         let mut rng = rng_from_env_or_random();
 
@@ -708,7 +564,10 @@ mod tests {
             let a = Tensor::<N>::random(&a_shape);
             let b = Tensor::<N>::random(&b_shape);
             let output = einsum
-                .evaluate_internal(&[&a, &b], &[a_shape.clone(), b_shape.clone()])
+                .evaluate_internal(
+                    &[&a.as_wrapped(), &b.as_wrapped()],
+                    &[a_shape.clone(), b_shape.clone()],
+                )
                 .expect("Failed to evaluate EinSum layer");
 
             let a_burn = a.to_btensor::<2>();
@@ -722,13 +581,12 @@ mod tests {
                 .into_data()
                 .into_vec()
                 .expect("Failed to convert expected output to vec");
-            let expected = Tensor::new(c_shape, burn_data);
-
+            let expected = Tensor::new(c_shape.clone(), burn_data);
+            let output = Tensor::new(c_shape, output[0].clone().get_data());
             assert_eq!(
-                output[0].clone().get_data_into(),
+                output.clone().get_data_into(),
                 expected.clone().get_data_into(),
-                "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {}, Expected: {expected}",
-                output[0]
+                "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {output}, Expected: {expected}",
             );
         }
     }
@@ -741,8 +599,7 @@ mod tests {
 
     fn test_simple_batched_matmul_helper<N>()
     where
-        N: Number + burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
+        N: TensorTypeParam,
     {
         let einsum: EinSum<N> =
             EinSum::new("A(xab)@B(xbc)->C(xac)".to_string(), vec![None], vec![None])
@@ -762,7 +619,10 @@ mod tests {
             let a = Tensor::<N>::random(&a_shape);
             let b = Tensor::<N>::random(&b_shape);
             let output = einsum
-                .evaluate_internal(&[&a, &b], &[a_shape.clone(), b_shape.clone()])
+                .evaluate_internal(
+                    &[&a.as_wrapped(), &b.as_wrapped()],
+                    &[a_shape.clone(), b_shape.clone()],
+                )
                 .expect("Failed to evaluate EinSum layer");
 
             let a_burn = a.to_btensor::<3>();
@@ -778,13 +638,12 @@ mod tests {
                 .into_data()
                 .into_vec()
                 .expect("Failed to convert expected output to vec");
-            let expected = Tensor::new(c_shape, burn_data);
-
+            let expected = Tensor::new(c_shape.clone(), burn_data);
+            let output = Tensor::new(c_shape, output[0].clone().get_data());
             assert_eq!(
-                output[0].clone().get_data_into(),
+                output.clone().get_data_into(),
                 expected.clone().get_data_into(),
-                "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {}, Expected: {expected}",
-                output[0]
+                "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {output}, Expected: {expected}",
             );
         }
     }
@@ -797,8 +656,7 @@ mod tests {
 
     fn test_multi_output_batched_matmul_helper<N>()
     where
-        N: Number + burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
+        N: TensorTypeParam,
     {
         let einsum: EinSum<N> = EinSum::new(
             "A(xab)@B(xbc):C(xbe)->D(xac):E(xae)".to_string(),
@@ -825,7 +683,7 @@ mod tests {
             let c = Tensor::<N>::random(&c_shape);
             let outputs = einsum
                 .evaluate_internal(
-                    &[&a, &b, &c],
+                    &[&a.as_wrapped(), &b.as_wrapped(), &c.as_wrapped()],
                     &[a_shape.clone(), b_shape.clone(), c_shape.clone()],
                 )
                 .expect("Failed to evaluate EinSum layer");
@@ -863,7 +721,8 @@ mod tests {
                     .into_vec()
                     .expect("Failed to convert expected output to vec");
 
-                let expected = Tensor::new(shape, burn_data);
+                let expected = Tensor::new(shape.clone(), burn_data);
+                let output = Tensor::new(shape, output.clone().get_data());
                 assert_eq!(
                     output.clone().get_data_into(),
                     expected.clone().get_data_into(),
@@ -881,8 +740,7 @@ mod tests {
 
     fn test_grouped_qkv_helper<N>()
     where
-        N: Number + burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
+        N: TensorTypeParam,
     {
         let mut rng = rng_from_env_or_random();
 
@@ -918,7 +776,7 @@ mod tests {
             .expect("Failed to create EinSum layer");
 
             let output = einsum
-                .evaluate_internal(&[&x], std::slice::from_ref(&x_shape))
+                .evaluate_internal(&[&x.as_wrapped()], std::slice::from_ref(&x_shape))
                 .expect("Failed to evaluate EinSum layer");
 
             // Manually compute the expected output
@@ -955,7 +813,8 @@ mod tests {
                     .into_vec()
                     .expect("Failed to convert expected output to vec");
 
-                let expected = Tensor::new(shape, burn_data);
+                let expected = Tensor::new(shape.clone(), burn_data);
+                let output = Tensor::new(shape, output.clone().get_data());
                 assert_eq!(
                     output.clone().get_data_into(),
                     expected.clone().get_data_into(),
@@ -973,8 +832,7 @@ mod tests {
 
     fn test_grouped_qk_transpose_helper<N>()
     where
-        N: Number + burn::tensor::Element,
-        Tensor<N>: IntoBTensor,
+        N: TensorTypeParam,
     {
         let einsum: EinSum<N> = EinSum::new(
             // Here the Q uses "q" for seq_len while K uses "s", this is so that both single token inference and full sequence can be handled
@@ -1001,7 +859,10 @@ mod tests {
             let q_full = Tensor::<N>::random(&q_full_shape);
             let k = Tensor::<N>::random(&k_shape);
             let output_full = einsum
-                .evaluate_internal(&[&q_full, &k], &[q_full_shape.clone(), k_shape.clone()])
+                .evaluate_internal(
+                    &[&q_full.as_wrapped(), &k.as_wrapped()],
+                    &[q_full_shape.clone(), k_shape.clone()],
+                )
                 .expect("Failed to evaluate EinSum layer");
 
             let k_burn = k.to_btensor::<3>();
@@ -1029,30 +890,31 @@ mod tests {
             };
 
             let expected_full_data = calc_expected_output(q_full);
-            let expected_full = Tensor::new(qkt_full_shape, expected_full_data);
-
+            let expected_full = Tensor::new(qkt_full_shape.clone(), expected_full_data);
+            let output_full = Tensor::new(qkt_full_shape, output_full[0].clone().get_data());
             assert_eq!(
-                output_full[0].clone().get_data_into(),
+                output_full.clone().get_data_into(),
                 expected_full.clone().get_data_into(),
-                "Failed for full sequence shapes Q: {q_full_shape:?}, K: {k_shape:?}, Calculated: {}, Expected: {expected_full}",
-                output_full[0]
+                "Failed for full sequence shapes Q: {q_full_shape:?}, K: {k_shape:?}, Calculated: {output_full}, Expected: {expected_full}",
             );
             // Now we test the single token case where q_len == 1
             let q_single_shape = Shape::new(vec![group_size, heads, q_len, head_dim]);
             let qkt_single_shape = Shape::new(vec![group_size, heads, q_len, seq_len]);
             let q_single = Tensor::<N>::random(&q_single_shape);
             let output_single = einsum
-                .evaluate_internal(&[&q_single, &k], &[q_single_shape.clone(), k_shape.clone()])
+                .evaluate_internal(
+                    &[&q_single.as_wrapped(), &k.as_wrapped()],
+                    &[q_single_shape.clone(), k_shape.clone()],
+                )
                 .expect("Failed to evaluate EinSum layer");
 
             let expected_single_data = calc_expected_output(q_single);
-            let expected_single = Tensor::new(qkt_single_shape, expected_single_data);
-
+            let expected_single = Tensor::new(qkt_single_shape.clone(), expected_single_data);
+            let output_single = Tensor::new(qkt_single_shape, output_single[0].clone().get_data());
             assert_eq!(
-                output_single[0].clone().get_data_into(),
+                output_single.clone().get_data_into(),
                 expected_single.clone().get_data_into(),
-                "Failed for single token shapes Q: {q_single_shape:?}, K: {k_shape:?}, Calculated: {}, Expected: {expected_single}",
-                output_single[0]
+                "Failed for single token shapes Q: {q_single_shape:?}, K: {k_shape:?}, Calculated: {output_single}, Expected: {expected_single}",
             );
         }
     }

@@ -37,7 +37,7 @@ use crate::{
     model::{NodeID, StepData},
     padding::{PaddingMode, ShapeData},
     quantization::{ScalingFactor, ScalingStrategy},
-    tensor::{IntoBTensor, KeyedTensor, TensorKey},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
 };
 
 use anyhow::{Result, anyhow, ensure};
@@ -170,12 +170,11 @@ impl<T> EinSum<T> {
 
 impl<N> Evaluate<N> for EinSum<N>
 where
-    N: Number + burn::tensor::Element,
-    Tensor<N>: IntoBTensor,
+    N: TensorTypeParam,
 {
     fn evaluate<E: ExtensionField>(
         &self,
-        inputs: &[&Tensor<N>],
+        inputs: &[&WrappedTensor<N>],
         unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<N, E>> {
         let outputs = self.evaluate_internal(inputs, unpadded_input_shapes)?;

@@ -1157,14 +1157,13 @@ mod pooling_layer {
 }
 #[divan::bench_group]
 mod einsum_layer {
-    use core::slice;
     use std::ops::Range;
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape, Tensor,
         layers::{einsum::EinSum, provable::Evaluate},
-        tensor::KeyedTensor,
+        tensor::{KeyedTensor, WrappedTensor},
     };
 
     use crate::{Args, default_sizes, sizes};
@@ -1188,8 +1187,7 @@ mod einsum_layer {
         let v = KeyedTensor::new("qkv_weight.v", Tensor::random(&vec![size, size].into()));
         let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
 
-        let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<Element>::random(&Shape::new(vec![size, size]));
 
         let einsum_layer = EinSum::<Element>::new(
             "X(se)@WQ(eh):WK(eh):WV(eh)->Q(sh)+BIAS(h):K(sh)+BIAS(h):V(sh)+BIAS(h)".to_string(),
@@ -1200,7 +1198,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input], &[Shape::new(vec![size, size])])
                 .expect("EinSum should succeed")
         });
     }
@@ -1219,8 +1217,7 @@ mod einsum_layer {
         let v = KeyedTensor::new("qkv_weight.v", Tensor::random(&vec![size, size].into()));
         let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
 
-        let input = Tensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
 
         let einsum_layer = EinSum::<f32>::new(
             "X(se)@WQ(eh):WK(eh):WV(eh)->Q(sh)+BIAS(h):K(sh)+BIAS(h):V(sh)+BIAS(h)".to_string(),
@@ -1231,7 +1228,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input], &[Shape::new(vec![size, size])])
                 .expect("EinSum should succeed")
         });
     }
@@ -1242,18 +1239,15 @@ mod einsum_layer {
 
         // concat dim must match the `left_perm` and `right_perm` config
         let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = Tensor::<Element>::random(&shape);
-        let right = Tensor::<Element>::random(&shape);
+        let left = WrappedTensor::<Element>::random(&shape);
+        let right = WrappedTensor::<Element>::random(&shape);
         let einsum_layer =
             EinSum::<Element>::new("A(kij)@B(jil)->C(ikl)".to_string(), vec![None], vec![None])
                 .unwrap();
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right], &[shape.clone(), shape.clone()])
                 .expect("EinSum should succeed")
         });
     }
@@ -1264,18 +1258,15 @@ mod einsum_layer {
 
         // concat dim must match the `left_perm` and `right_perm` config
         let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = Tensor::<f32>::random(&shape);
-        let right = Tensor::<f32>::random(&shape);
+        let left = WrappedTensor::<f32>::random(&shape);
+        let right = WrappedTensor::<f32>::random(&shape);
         let einsum_layer =
             EinSum::<f32>::new("A(kij)@B(jil)->C(ikl)".to_string(), vec![None], vec![None])
                 .unwrap();
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right], &[shape.clone(), shape.clone()])
                 .expect("EinSum should succeed")
         });
     }
@@ -1283,8 +1274,8 @@ mod einsum_layer {
     #[divan::bench(args = sizes(ELEMENT_SIZES))]
     fn einsum_matmul_element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let left = Tensor::<Element>::random(&vec![size, size].into());
-        let right = Tensor::<Element>::random(&vec![size, size].into());
+        let left = WrappedTensor::<Element>::random(&vec![size, size].into());
+        let right = WrappedTensor::<Element>::random(&vec![size, size].into());
         let bias = KeyedTensor::new("matmul_bias", Tensor::<Element>::random(&vec![size].into()));
 
         let einsum_layer = EinSum::<Element>::new(
@@ -1298,7 +1289,7 @@ mod einsum_layer {
             einsum_layer
                 .evaluate::<GoldilocksExt2>(
                     &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
+                    &[Shape::new(vec![size, size]), Shape::new(vec![size, size])],
                 )
                 .expect("EinSum should succeed")
         });
@@ -1307,8 +1298,8 @@ mod einsum_layer {
     #[divan::bench(args = default_sizes())]
     fn einsum_matmul_f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
-        let left = Tensor::<f32>::random(&vec![size, size].into());
-        let right = Tensor::<f32>::random(&vec![size, size].into());
+        let left = WrappedTensor::<f32>::random(&vec![size, size].into());
+        let right = WrappedTensor::<f32>::random(&vec![size, size].into());
         let bias = KeyedTensor::new("matmul_bias", Tensor::<f32>::random(&vec![size].into()));
 
         let einsum_layer = EinSum::<f32>::new(
@@ -1322,7 +1313,7 @@ mod einsum_layer {
             einsum_layer
                 .evaluate::<GoldilocksExt2>(
                     &[&left, &right],
-                    &[left.shape().clone(), right.shape().clone()],
+                    &[Shape::new(vec![size, size]), Shape::new(vec![size, size])],
                 )
                 .expect("EinSum should succeed")
         });

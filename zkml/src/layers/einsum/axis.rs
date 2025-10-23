@@ -393,7 +393,8 @@ impl AxesMapping {
     /// This method returns these intermediate shapes from the input shapes.
     pub fn intermediate_shapes(&self, input_shapes: &[Shape]) -> Result<Vec<Shape>> {
         let mut stack_dims = vec![];
-        let mut outer_dims = vec![vec![]; self.input_count];
+        let mut lhs_outer_dims = vec![];
+        let mut rhs_outer_dims = vec![vec![]; self.input_count - 1];
 
         ensure!(
             input_shapes.len() == self.input_count,
@@ -403,38 +404,45 @@ impl AxesMapping {
         );
 
         for axis in self.axes() {
-            let (input_id, pos) = axis
-                .inputs()
-                .enumerate()
-                .find_map(|(input_id, dim)| {
-                    if let Dimension::Present(pos) = dim {
-                        Some((input_id, *pos))
-                    } else {
-                        None
+            if let Dimension::Present(pos) = axis.lhs_input {
+                let dim_size = input_shapes[0].get(pos).ok_or(anyhow!(
+                    "Input tensor 0 does not have dimension {} for axis {}",
+                    pos,
+                    axis.repr
+                ))?;
+                match axis.axis_type {
+                    AxisType::Stacked => stack_dims.push(*dim_size),
+                    AxisType::Outer => {
+                        lhs_outer_dims.push(*dim_size);
                     }
-                })
-                .ok_or(anyhow!("No present dimension found for axis {}", axis.repr))?;
-            let dim_size = input_shapes[input_id].get(pos).ok_or(anyhow!(
-                "Input tensor {} does not have dimension {} for axis {}",
-                input_id,
-                pos,
-                axis.repr
-            ))?;
-
-            match axis.axis_type {
-                AxisType::Stacked => stack_dims.push(*dim_size),
-                AxisType::Outer => {
-                    outer_dims[input_id].push(*dim_size);
+                    AxisType::Contracted => {}
                 }
-                AxisType::Contracted => {}
             }
+
+            axis.rhs_inputs
+                .iter()
+                .enumerate()
+                .try_for_each(|(input_id, dim)| match axis.axis_type {
+                    AxisType::Stacked | AxisType::Contracted => Result::<()>::Ok(()),
+                    AxisType::Outer => {
+                        if let Dimension::Present(pos) = dim {
+                            let dim_size = input_shapes[input_id + 1].get(*pos).ok_or(anyhow!(
+                                "Input tensor {} does not have dimension {} for axis {}",
+                                input_id + 1,
+                                pos,
+                                axis.repr
+                            ))?;
+                            rhs_outer_dims[input_id].push(*dim_size);
+                            Ok(())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })?;
         }
 
-        let lhs_outer_dims = &outer_dims[0];
-
-        let intermediate_shapes: Vec<Shape> = outer_dims
+        let intermediate_shapes: Vec<Shape> = rhs_outer_dims
             .iter()
-            .skip(1)
             .map(|rhs_outer_dims| {
                 let mut intermediate_order = vec![];
                 intermediate_order.extend(stack_dims.iter());
