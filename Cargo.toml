@@ -20,7 +20,6 @@ aws-sdk-marketplacemetering = "1.78"
 axum = { version = "0.8" }
 blake3 = { version = "1.4", features = ["serde"] }
 clap = "4"
-compact_str = "0.9"
 criterion = { version = "0.6", features = ["html_reports"] }
 csv = "1.3.1"
 ctr = "0.9"

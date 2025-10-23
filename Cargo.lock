@@ -9051,7 +9051,6 @@ dependencies = [
 name = "tenstore"
 version = "0.2.0"
 dependencies = [
- "compact_str",
  "rmp-serde",
  "serde",
  "tempfile",

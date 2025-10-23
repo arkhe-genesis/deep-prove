@@ -1,8 +1,8 @@
-use crate::{StoreError, StoreKey};
-use compact_str::CompactString;
+use crate::{StorageKey, StoreError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    hash::{DefaultHasher, Hasher},
     io::{BufReader, BufWriter, Read, Write},
     num::NonZero,
     path::{Path, PathBuf},
@@ -15,9 +15,39 @@ use super::GenericStore;
 struct Storage {
     file: PathBuf,
 }
+
 impl Storage {
     fn file_size(&self) -> u64 {
         std::fs::metadata(&self.file).unwrap().len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InternalKey {
+    id: String,
+    kind: &'static str,
+}
+
+impl InternalKey {
+    fn rooted_at(&self, path: &Path) -> PathBuf {
+        // The data is assumed to be trusted, and a CHF is not needed
+        let mut hasher = DefaultHasher::new();
+        hasher.write_usize(self.kind.len());
+        hasher.write(self.kind.as_bytes());
+        hasher.write_usize(self.id.len());
+        hasher.write(self.id.as_bytes());
+        let hash = hasher.finish();
+
+        path.to_path_buf().join(hash.to_string())
+    }
+}
+
+impl<T> From<&StorageKey<T>> for InternalKey {
+    fn from(value: &StorageKey<T>) -> Self {
+        Self {
+            id: value.id().to_string(),
+            kind: std::any::type_name::<T>(),
+        }
     }
 }
 
@@ -28,12 +58,15 @@ pub struct LocalStore<P: AsRef<Path>> {
     ///
     /// This is string-indexed instead of [`StoreKey`]-indexed because data
     /// of multiple type can be stored in the same place.
-    storage: HashMap<CompactString, Storage>,
+    storage: HashMap<InternalKey, Storage>,
+
     /// A LRU cache of the serialized value of the data.
-    cache: LruCache<CompactString, Vec<u8>>,
+    cache: LruCache<InternalKey, Vec<u8>>,
+
     /// The root folder of where to store the file-backing of the data.
     root: P,
 }
+
 impl<P: AsRef<Path>> LocalStore<P> {
     pub fn new(root: P, max_cache_size: usize) -> Result<Self, StoreError> {
         const DEFAULT_CACHE_SIZE: NonZero<usize> = NonZero::new(1024 * 1024).expect("1MiB > 0");
@@ -50,12 +83,13 @@ impl<P: AsRef<Path>> LocalStore<P> {
         })
     }
 }
+
 impl<P: AsRef<Path>> std::fmt::Debug for LocalStore<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (k, s) in self.storage.iter() {
             writeln!(
                 f,
-                "{}{:10} {:12} {}",
+                "{}{:?} {:12} {}",
                 if self.cache.contains(k) { "*" } else { " " },
                 k,
                 s.file_size(),
@@ -65,25 +99,21 @@ impl<P: AsRef<Path>> std::fmt::Debug for LocalStore<P> {
         Ok(())
     }
 }
-impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
-    fn clear(&mut self) {
-        self.storage.clear();
-        self.cache.clear();
-    }
 
-    fn fetch<T: Serialize + for<'a> Deserialize<'a>>(
-        &mut self,
-        k: &StoreKey<T>,
-    ) -> Result<T, StoreError> {
-        let k_str = k.to_key();
-        let backing = self.storage.get(&k_str).cloned();
-        if let Some(s) = backing {
-            let data: T = rmp_serde::from_slice(self.cache.try_get_or_insert(k_str, || {
+impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
+    fn fetch<T>(&mut self, storage_key: &StorageKey<T>) -> Result<T, StoreError>
+    where
+        T: for<'a> Deserialize<'a>,
+    {
+        let key = InternalKey::from(storage_key);
+        let backing = self.storage.get(&key).cloned();
+        if let Some(storage) = backing {
+            let data: T = rmp_serde::from_slice(self.cache.try_get_or_insert(key, || {
                 // This is an over-allocation, as serialization will
                 // typically compress, even if slightly, the content.
-                let mut buffer = Vec::with_capacity(s.file_size() as usize);
+                let mut buffer = Vec::with_capacity(storage.file_size() as usize);
                 let mut reader =
-                    BufReader::new(std::fs::File::open(s.file).map_err(StoreError::from)?);
+                    BufReader::new(std::fs::File::open(storage.file).map_err(StoreError::from)?);
                 reader.read_to_end(&mut buffer).map_err(StoreError::from)?;
 
                 let buffer_len = NonZero::new(buffer.len()).ok_or(StoreError::EmptyStore)?;
@@ -97,16 +127,14 @@ impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
         }
     }
 
-    fn store<T: Serialize + for<'a> Deserialize<'a>>(
-        &mut self,
-        k: &StoreKey<T>,
-        data: &T,
-    ) -> Result<(), StoreError> {
-        let k_str = k.to_key();
+    fn store<T>(&mut self, storage_key: &StorageKey<T>, data: &T) -> Result<(), StoreError>
+    where
+        T: Serialize,
+    {
+        let key = InternalKey::from(storage_key);
 
-        let storage = self.storage.entry(k_str.clone()).or_insert_with(|| {
-            let mut file = self.root.as_ref().to_path_buf();
-            file.push(k.to_key());
+        let storage = self.storage.entry(key.clone()).or_insert_with(|| {
+            let file = key.rooted_at(self.root.as_ref());
             Storage { file }
         });
 
@@ -114,7 +142,7 @@ impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
         let weight = NonZero::new(serialized.len()).ok_or(StoreError::EmptyStore)?;
         BufWriter::new(std::fs::File::create(&storage.file).map_err(StoreError::from)?)
             .write_all(&serialized)?;
-        self.cache.put(k_str, serialized, weight);
+        self.cache.put(key, serialized, weight);
 
         Ok(())
     }

@@ -28,9 +28,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::{Ordering, PartialEq, min},
     fmt::{self, Debug},
+    marker::PhantomData,
     ops::{Deref, DerefMut, Range},
 };
-use tenstore::{GenStore, GenericStore, StoreError, StoreKey};
+use tenstore::{GenStore, GenericStore, StorageKey, StoreError};
 
 use crate::{
     Element,
@@ -57,6 +58,24 @@ pub struct TensorKey(String);
 impl From<&str> for TensorKey {
     fn from(value: &str) -> Self {
         value.to_string().into()
+    }
+}
+
+impl<T> From<&StorageKey<T>> for TensorKey {
+    fn from(value: &StorageKey<T>) -> Self {
+        Self(value.id().to_string())
+    }
+}
+
+impl<T> From<TensorKey> for StorageKey<T> {
+    fn from(value: TensorKey) -> Self {
+        StorageKey::<T>::new(value.0)
+    }
+}
+
+impl<T> From<&TensorKey> for StorageKey<T> {
+    fn from(value: &TensorKey) -> Self {
+        StorageKey::<T>::new(value.0.clone())
     }
 }
 
@@ -426,19 +445,27 @@ where
 /// from a store.
 #[derive(Clone, Debug)]
 pub struct DryTensor<T> {
-    /// A key pointing to the tensor data in a [`GenStore`]
-    k: StoreKey<Vec<T>>,
+    /// A unique key for this tensor.
+    k: TensorKey,
+
     /// The shape of the tensor.
     shape: Shape,
+
+    phantom: PhantomData<T>,
 }
+
 impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
-    pub(crate) fn new(k: StoreKey<Vec<T>>, shape: Shape) -> Self {
-        Self { k, shape }
+    pub(crate) fn new(k: TensorKey, shape: Shape) -> Self {
+        Self {
+            k,
+            shape,
+            phantom: PhantomData,
+        }
     }
 
     /// Return a reference to this dry tensor key.
-    pub(crate) fn key(&self) -> &StoreKey<Vec<T>> {
-        &self.k
+    pub(crate) fn storage_key(&self) -> StorageKey<Vec<T>> {
+        StorageKey::from(&self.k)
     }
 
     /// Return a reference to this dry tensor shape.
@@ -449,37 +476,46 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
     /// Hydrate this dry tensor from `store`, generating a [`Tensor`] from it.
     pub(crate) fn hydrate(&self, mut store: GenStore) -> Result<Tensor<T>, StoreError> {
         store
-            .fetch(&self.k)
+            .fetch(&self.storage_key())
             .map(|data| Tensor::new(self.shape.clone(), data))
     }
 
-    /// Ensure that the tensor under the key `l(self.key)` exist. If it does
-    /// not, allocate it, fill it by applying `f` over `self`, then return its
-    /// dried version.
-    pub(crate) fn dry_cast<S>(
+    /// Ensure that the tensor under the key `self.key` exist.
+    ///
+    /// If it does not, allocate it, fill it by applying `f` over `self`, then
+    /// return its dried version.
+    pub(crate) fn dry_cast<S, F>(
         &self,
         mut store: GenStore,
-        f: impl Fn(&T) -> S,
+        f: F,
     ) -> Result<DryTensor<S>, StoreError>
     where
         S: Serialize + for<'a> Deserialize<'a>,
+        F: Fn(&T) -> S,
     {
-        let new_k = store.cast(&self.k, |xs| xs.iter().map(&f).collect())?;
-        Ok(DryTensor::<S>::new(new_k, self.shape.clone()))
+        store.cast(&StorageKey::<Vec<T>>::from(&self.k), |xs| {
+            xs.iter().map(&f).collect::<Vec<S>>()
+        })?;
+        Ok(DryTensor::<S>::new(self.k.clone(), self.shape.clone()))
     }
 
-    /// Fetch the tensor under the key `l(self.key)`. If it does not exist,
-    /// build it by mapping `f` over `self`, store it, then return its data.
-    pub(crate) fn hydrated_cast<S>(
+    /// Fetch the tensor under the key `self.key`.
+    ///
+    /// If it does not exist, build it by mapping `f` over `self`, store it,
+    /// then return its data.
+    pub(crate) fn hydrated_cast<S, F>(
         &self,
         mut store: GenStore,
-        f: impl Fn(&T) -> S,
+        f: F,
     ) -> Result<Tensor<S>, StoreError>
     where
         S: Serialize + for<'a> Deserialize<'a>,
+        F: Fn(&T) -> S,
     {
         store
-            .cast_and_fetch(&self.k, |xs| xs.iter().map(&f).collect())
+            .cast_and_fetch(&StorageKey::<Vec<T>>::from(&self.k), |xs| {
+                xs.iter().map(&f).collect::<Vec<S>>()
+            })
             .map(|bytes| Tensor::new(self.shape.clone(), bytes.1))
     }
 }

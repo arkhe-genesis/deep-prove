@@ -93,8 +93,9 @@ where
                                 .node_inputs
                                 .into_iter()
                                 .map(|dry| {
-                                    dry.dry_cast(store.clone(), |x| x.to_field())
-                                        .with_context(|| format!("converting `{:?}`", dry.key()))
+                                    dry.dry_cast(store.clone(), |x| x.to_field()).with_context(
+                                        || format!("converting `{:?}`", dry.storage_key()),
+                                    )
                                 })
                                 .collect::<anyhow::Result<Vec<DryTensor<_>>>>()?,
 

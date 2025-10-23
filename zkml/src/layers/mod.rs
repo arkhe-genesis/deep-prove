@@ -306,7 +306,7 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
                 .into_iter()
                 .map(|dry| {
                     dry.dry_cast(store.clone(), |x| x.to_field())
-                        .with_context(|| format!("converting {:?}", dry.key()))
+                        .with_context(|| format!("converting {:?}", dry.storage_key()))
                 })
                 .collect::<anyhow::Result<Vec<DryTensor<U>>>>()?,
             proving_data: self.proving_data,

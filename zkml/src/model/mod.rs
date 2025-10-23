@@ -1,14 +1,14 @@
 use crate::{
     graph::{PortID, Ports, Source, Target},
     layers::{NodeOut, provable::ProvingData},
-    tensor::{Conversion, TensorTypeParam, WrappedTensor},
+    tensor::{Conversion, TensorKey, TensorTypeParam, WrappedTensor},
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::{GenStore, GenericStore};
+use tenstore::{GenStore, GenericStore, StorageKey};
 use trace::Trace;
 use tracing::info;
 
@@ -492,15 +492,15 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
             // * 0 as target port is ok since it's not used to derive the tensor key
             let edge = Edge::<NodeID, ()>::input(NodeID::from(0), (*source_port, 0), None);
             // unwrap is safe since there is at least one key since we gave one port link
-            let tensor_key = edge.to_tensor_keys().into_iter().next().unwrap().1;
+            let storage_key = edge.to_storage_keys().into_iter().next().unwrap().1;
             // save the key => shape relation
-            input_shape_register.insert(tensor_key.clone(), input_shape.clone());
+            input_shape_register.insert(storage_key.clone(), input_shape.clone());
             // save the tensor to the store
-            store.store(&tensor_key, inputs[*source_port].data_vec())?;
+            store.store(&storage_key, inputs[*source_port].data_vec())?;
             // save the input dry tensors to store in the trace
             input_dry_tensors.insert(
                 source_port,
-                DryTensor::new(tensor_key.clone(), input_shape.clone()),
+                DryTensor::new(TensorKey::from(&storage_key), input_shape.clone()),
             );
         }
         let input_dry_tensors = input_dry_tensors.into_values().collect::<Vec<_>>();
@@ -518,7 +518,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 .graph
                 .neighbors(&node_id, Direction::Incoming)
                 .try_fold(BTreeMap::new(), |mut acc, (_id, edge)| {
-                    let keys = edge.to_tensor_keys();
+                    let keys = edge.to_storage_keys();
                     // if it is an edge between nodes,fetch the input shape from the trace
                     let shapes_array = if let Some(source_id) = edge.source_id() {
                         let Some(step) = trace.get_step(source_id) else {
@@ -558,13 +558,16 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
             output_per_port.sort_by_key(|(source_port, _)| *source_port);
             // update the shape register with the shapes of the outputs of the node so next node can load its input from the input shape register
             input_shape_register.extend(output_per_port.iter().map(|(_, dry_tensor)| {
-                (dry_tensor.key().to_owned(), dry_tensor.shape().to_owned())
+                (
+                    dry_tensor.storage_key().to_owned(),
+                    dry_tensor.shape().to_owned(),
+                )
             }));
             // Record the step into the trace
             let new_step = StepData {
                 node_inputs: input_keys
                     .iter()
-                    .map(|k| DryTensor::new(k.clone(), input_shape_register[k].clone()))
+                    .map(|k| DryTensor::new(k.into(), input_shape_register[k].clone()))
                     .collect(),
                 node_outputs: NodeOut::new(
                     output_per_port
@@ -647,9 +650,9 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         &self,
         node_id: NodeID,
         // inputs are assumed to be sorted by source port, e.g. in the order defined by the ports
-        inputs: &[TensorKey<N>],
+        inputs: &[StorageKey<Vec<N>>],
         unpadded_input_shapes: &[Shape],
-        input_shape_register: &HashMap<TensorKey<N>, Shape>,
+        input_shape_register: &HashMap<StorageKey<Vec<N>>, Shape>,
         tracker: &mut Option<&mut InferenceTracker>,
         store: &mut GenStore,
         // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
@@ -684,7 +687,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 // NOTE: it's ok to overwrite previous keys since they're from the same source port.
                 // currently `to_tensor_keys` returns a unique key per source port, so it's safe to overwrite
                 // in the case one source port is connected to multiple target port.
-                for (link, key) in edge.to_tensor_keys() {
+                for (link, key) in edge.to_storage_keys() {
                     acc.insert(link.source_port, key);
                 }
                 acc
@@ -707,14 +710,16 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 store
                     .store(
                         key,
-                        &tensor.clone().to_data().into_vec().map_err(|_| {
-                            anyhow::Error::msg("Retrieve tensor data from burn tensor")
-                        })?,
+                        &tensor
+                            .clone()
+                            .to_data()
+                            .into_vec::<N>()
+                            .map_err(|_| anyhow!("Retrieve tensor data from burn tensor"))?,
                     )
                     .with_context(|| format!("storing outputs for tensor {key}"))?;
                 Ok((
                     *source_port,
-                    DryTensor::new(key.clone(), Shape::new(tensor.shape().to_vec())),
+                    DryTensor::new(key.into(), Shape::new(tensor.shape().to_vec())),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -744,15 +749,14 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     }
 }
 
-use tenstore::TensorKey;
-trait ToTensorKeys<N> {
+trait ToStorageKeys<N> {
     /// Returns a list of pairs containing the key and the corresponding source port.
     /// Since every tensor key is associated with a node id and a source port, this enables to
     /// precisely map which tensor key corresponds to which output port of a node.
-    fn to_tensor_keys(&self) -> HashMap<PortLink, TensorKey<N>>;
+    fn to_storage_keys(&self) -> HashMap<PortLink, StorageKey<Vec<N>>>;
 }
 
-impl<N, I: GenericNodeID, W> ToTensorKeys<N> for Edge<I, W> {
+impl<N, I: GenericNodeID, W> ToStorageKeys<N> for Edge<I, W> {
     /// Uniquely identifies any tensor by a key. Currently the key is set to be
     /// unique "per source" since we only want to save _one_ tensor per source port.
     /// So there is one key per source port, e.g. one key per output tensor of the source node of this edge.
@@ -760,11 +764,11 @@ impl<N, I: GenericNodeID, W> ToTensorKeys<N> for Edge<I, W> {
     /// any tensor by the tuple (source, source_port, target, target_port). Since a tensor
     /// can be used in multiple target_port we don't want to save it multiple times tho. But using
     /// this tuple we can quickly identify exactly where the tensor is in the graph.
-    fn to_tensor_keys(&self) -> HashMap<PortLink, TensorKey<N>> {
+    fn to_storage_keys(&self) -> HashMap<PortLink, StorageKey<Vec<N>>> {
         self.ports().iter().fold(HashMap::new(), |mut acc, link| {
             acc.insert(
                 link.clone(),
-                TensorKey::from_str(format!("Source[{}({})]", self.source(), link.source_port)),
+                StorageKey::new(format!("Source[{}({})]", self.source(), link.source_port)),
             );
             acc
         })

@@ -10,7 +10,6 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
-compact_str.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
 tempfile.workspace = true

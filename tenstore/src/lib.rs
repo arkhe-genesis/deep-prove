@@ -1,5 +1,8 @@
-use compact_str::CompactString;
-use std::{hash::Hash, marker::PhantomData};
+use std::{
+    fmt::{Debug, Display},
+    hash::Hash,
+    marker::PhantomData,
+};
 
 mod error;
 mod genstore;
@@ -7,62 +10,76 @@ mod genstore;
 pub use error::StoreError;
 pub use genstore::{GenStore, GenericStore};
 
-/// A `TensorKey` wraps a `StoreKey`, ensuring is addresses a vector of values.
-pub type TensorKey<T> = StoreKey<Vec<T>>;
-
+/// Identifier for storage data.
 #[derive(Clone)]
-/// Used to unequivocally address a page backing in a [`GenericStore`].
-pub struct StoreKey<T> {
-    /// An ID for this page, unique among pages of a given type.
-    id: CompactString,
-    /// A marker of this page underlying data.
-    t: PhantomData<T>,
+pub struct StorageKey<T> {
+    /// User defined `ID`.
+    id: String,
+
+    /// The type of the data function as a namespace.
+    ///
+    /// This allows the same `id` to be reused for multiple types without
+    /// conflicts.
+    kind: PhantomData<T>,
 }
-impl<T> StoreKey<T> {
+
+impl<T> StorageKey<T> {
+    /// Creates a new [StorageKey<T>].
+    ///
+    /// NOTE: The key itself does not guarantee the store is populated with
+    /// data, since that may be its first use.
+    pub fn new(id: String) -> Self {
+        StorageKey {
+            id,
+            kind: PhantomData,
+        }
+    }
+
     /// Convert this key into one for the same ID, but over another data type.
-    pub fn cast<U>(&self) -> StoreKey<U> {
-        StoreKey {
+    pub fn cast<U>(&self) -> StorageKey<U> {
+        StorageKey {
             id: self.id.clone(),
-            t: PhantomData,
+            kind: PhantomData,
         }
     }
 
-    /// Create a new key for this page, ensuring its uniquenes across data
-    /// types.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str<S: AsRef<str>>(id: S) -> Self {
-        StoreKey {
-            id: id.as_ref().into(),
-            t: PhantomData,
-        }
-    }
-
-    pub(crate) fn to_key(&self) -> CompactString {
-        CompactString::new(format!("{}-{}", self.id, std::any::type_name::<T>()))
+    /// Returns a reference to this key's `id`.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 }
-impl<T> std::fmt::Debug for StoreKey<T> {
+
+impl<T> Debug for StorageKey<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.id)
+        f.debug_struct("StorageKey")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
-// PartialEq/Eq and Hash have to be written manually, because the derive-based
-// versions are not smart enough to recognize that T does not have to be
-// PartialEq/Eq & Hash either.
-impl<T> PartialEq for StoreKey<T> {
+
+impl<T> PartialEq for StorageKey<T> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
-impl<T> Eq for StoreKey<T> {}
-impl<T> Hash for StoreKey<T> {
+
+impl<T> Eq for StorageKey<T> {}
+
+impl<T> Hash for StorageKey<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write(self.to_key().as_bytes());
+        state.write(self.id.as_bytes());
+        state.write(std::any::type_name::<T>().as_bytes());
     }
 }
 
-impl<T> std::fmt::Display for StoreKey<T> {
+impl<T> Display for StorageKey<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}@{}", self.id, std::any::type_name::<T>())
+    }
+}
+
+impl<T> From<StorageKey<T>> for String {
+    fn from(value: StorageKey<T>) -> Self {
+        value.id
     }
 }
