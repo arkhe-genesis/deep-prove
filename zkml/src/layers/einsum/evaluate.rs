@@ -2,7 +2,7 @@
 
 use super::*;
 
-use crate::{Shape, Tensor, layers::concat_matmul::Permutation};
+use crate::{Shape, layers::concat_matmul::Permutation};
 
 use anyhow::{Result, anyhow};
 use burn::prelude::Shape as BShape;
@@ -126,7 +126,7 @@ where
                         .product();
                     skip += *to_take;
                 });
-            permuted.reshape(BShape::from(reshape_array.as_slice()))
+            permuted.reshape(BShape::from(reshape_array))
         })
         .collect::<Result<Vec<WrappedTensor<N>>>>()?;
 
@@ -159,7 +159,7 @@ where
         .map(
             |(intermediate, intermediate_shape, output_permutation, bias)| {
                 // Reshape the burn tensor to the target rank
-                let reshaped = intermediate.reshape(BShape::from(intermediate_shape.as_slice()))?;
+                let reshaped = intermediate.reshape(BShape::from(intermediate_shape.into_vec()))?;
 
                 // Apply the output permutation if provided
                 let permuted = if let Some(perm) = output_permutation {
@@ -175,19 +175,11 @@ where
                     permuted
                 };
 
-                if self.padded {
-                    let BShape { dims } = with_bias.shape();
-                    let data: Vec<N> = with_bias.to_data().into_vec().map_err(|e| {
-                        anyhow!(
-                            "Could not compute EinSum, failure converting output data to vec: {e:?}"
-                        )
-                    })?;
-                    let tmp_shape = Shape::new(dims);
-                    let with_bias = Tensor::new(tmp_shape, data);
-                    WrappedTensor::try_from(&with_bias.pad_next_power_of_two())
+                Ok(if self.padded {
+                    with_bias.pad_next_power_of_two()
                 } else {
-                    Ok(with_bias)
-                }
+                    with_bias
+                })
             },
         )
         .collect()

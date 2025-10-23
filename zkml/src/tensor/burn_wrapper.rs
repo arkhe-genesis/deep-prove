@@ -4,7 +4,7 @@ pub use burn::tensor::{Shape as BShape, TensorKind as BTensorKind};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Number,
+    NextPowerOfTwo, Number,
     backend::{Backend, Conv2dConfig, Maxpool2dConfig, zkml_conv2d_i, zkml_max_pool2d_i},
 };
 use anyhow::{Context, Result, bail};
@@ -487,6 +487,41 @@ where
             Self::Rank2(tensor) => Self::Rank1(tensor.flatten(0, 1)),
             Self::Rank3(tensor) => Self::Rank1(tensor.flatten(0, 2)),
             Self::Rank4(tensor) => Self::Rank1(tensor.flatten(0, 3)),
+        }
+    }
+
+    /// Pads the tensor to the next power-of-two.
+    pub fn pad_next_power_of_two(self) -> Self {
+        let BShape { dims } = self.shape();
+        let shape = BShape {
+            dims: dims.next_power_of_two(),
+        };
+        match self {
+            WrappedTensor::Rank1(tensor) => {
+                #[allow(clippy::single_range_in_vec_init)]
+                let ranges = [0..dims[0]];
+                let out = BTensor::full(shape, T::zero(), &Default::default());
+                let out = out.slice_assign(ranges, tensor);
+                WrappedTensor::Rank1(out)
+            }
+            WrappedTensor::Rank2(tensor) => {
+                let ranges = [0..dims[0], 0..dims[1]];
+                let out = BTensor::full(shape, T::zero(), &Default::default());
+                let out = out.slice_assign(ranges, tensor);
+                WrappedTensor::Rank2(out)
+            }
+            WrappedTensor::Rank3(tensor) => {
+                let ranges = [0..dims[0], 0..dims[1], 0..dims[2]];
+                let out = BTensor::full(shape, T::zero(), &Default::default());
+                let out = out.slice_assign(ranges, tensor);
+                WrappedTensor::Rank3(out)
+            }
+            WrappedTensor::Rank4(tensor) => {
+                let ranges = [0..dims[0], 0..dims[1], 0..dims[2], 0..dims[3]];
+                let out = BTensor::full(shape, T::zero(), &Default::default());
+                let out = out.slice_assign(ranges, tensor);
+                WrappedTensor::Rank4(out)
+            }
         }
     }
 
@@ -1018,5 +1053,88 @@ where
     {
         let tensor: Tensor<T> = Tensor::deserialize(deserializer)?;
         WrappedTensor::try_from(&tensor).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_tensor_next_pow_of_two() {
+        let shape = Shape::new(vec![1, 1, 1, 1]);
+        let tensor = Tensor::new(shape.clone(), vec![1]).into_wrapped();
+        assert_eq!(
+            tensor.clone().pad_next_power_of_two().to_native(),
+            tensor.to_native(),
+            "Tensor should not change if the shape is already power of two",
+        );
+
+        let shape = Shape::new(vec![2, 2]);
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2]).into_wrapped();
+        assert_eq!(
+            tensor.clone().pad_next_power_of_two().to_native(),
+            tensor.to_native(),
+            "Tensor should not change if the shape is already power of two",
+        );
+
+        let shape = Shape::new(vec![4, 4]);
+        let tensor = WrappedTensor::<Element>::random(&shape.clone());
+        assert_eq!(
+            tensor.clone().pad_next_power_of_two().to_native(),
+            tensor.to_native(),
+            "Tensor should not change if the shape is already power of two",
+        );
+
+        let shape = Shape::new(vec![3, 3]);
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 3, 1, 2, 3, 1, 2, 3]).into_wrapped();
+        let new_tensor = tensor.pad_next_power_of_two();
+        assert_eq!(
+            Shape::from(new_tensor.shape()),
+            Shape::new(vec![4, 4]),
+            "Tensor padding to next power of two failed."
+        );
+        assert_eq!(
+            &new_tensor.get_data(),
+            &[1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 0, 0, 0, 0],
+            "Tensor padding to next power of two failed."
+        );
+
+        let shape = Shape::new(vec![3, 2]);
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2, 1, 2]).into_wrapped();
+        let new_tensor = tensor.pad_next_power_of_two();
+        assert_eq!(
+            Shape::from(new_tensor.shape()),
+            Shape::new(vec![4, 2]),
+            "Tensor padding to next power of two failed."
+        );
+        assert_eq!(
+            &new_tensor.get_data(),
+            &[1, 2, 1, 2, 1, 2, 0, 0],
+            "Tensor padding to next power of two failed."
+        );
+
+        let shape = Shape::new(vec![2, 3, 3]);
+        let tensor = Tensor::new(
+            shape.clone(),
+            vec![
+                1, 1, 1, 2, 2, 2, 3, 3, 3, 11, 11, 11, 12, 12, 12, 13, 13, 13,
+            ],
+        )
+        .into_wrapped();
+        let new_tensor = tensor.pad_next_power_of_two();
+        assert_eq!(
+            Shape::from(new_tensor.shape()),
+            Shape::new(vec![2, 4, 4]),
+            "Tensor padding to next power of two failed."
+        );
+        assert_eq!(
+            &new_tensor.get_data(),
+            &[
+                1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 0, 0, 0, 0, 0, 11, 11, 11, 0, 12, 12, 12, 0, 13,
+                13, 13, 0, 0, 0, 0, 0,
+            ],
+            "Tensor padding to next power of two failed."
+        );
     }
 }
