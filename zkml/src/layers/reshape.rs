@@ -238,6 +238,7 @@ impl QuantizeOp for Reshape {
         _data: &S::AuxData,
         _node_id: crate::model::NodeID,
         input_scaling: &[crate::ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         Ok(QuantizeOutput::new(self, input_scaling.to_vec()))
     }

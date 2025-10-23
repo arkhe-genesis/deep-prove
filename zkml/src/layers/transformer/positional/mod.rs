@@ -101,6 +101,8 @@ impl PositionalCache {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Positional<N> {
+    /// The `cache` is used to store the current sequence length during inference with caching.
+    /// It is an [`Option`] because some `PositionalVariant`s do not require caching (RoPE).
     cache: Option<Arc<Mutex<PositionalCache>>>,
     pub(crate) variant: PositionalVariant<N>,
 }
@@ -428,6 +430,7 @@ impl QuantizeOp for Positional<f32> {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
             input_scaling.len() == 1,
@@ -441,7 +444,8 @@ impl QuantizeOp for Positional<f32> {
 
         let quantized_op = match self.variant {
             PositionalVariant::Absolute(abs) => {
-                let quantized_abs = abs.quantize::<S>(data, node_id, input_scaling[0])?;
+                let quantized_abs =
+                    abs.quantize::<S>(data, node_id, input_scaling[0], unpadded_input_shapes)?;
                 QuantizeOutput {
                     quantized_op: Positional {
                         cache: new_cache,

@@ -363,8 +363,11 @@ impl QuantizeOp for Embeddings<f32> {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let quantized_mat = self.mat.quantize_op::<S>(data, node_id, input_scaling)?;
+        let quantized_mat =
+            self.mat
+                .quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
         let qmatmul = quantized_mat.quantized_op;
         let OperandMatrix::Weight(w) = qmatmul.right_matrix else {
             bail!("right matrix is not a weight matrix");

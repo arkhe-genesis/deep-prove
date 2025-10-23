@@ -112,10 +112,6 @@ impl<N: TensorTypeParam> Rope<N> {
         head_size: usize,
         max_content_length: usize,
     ) -> Result<Self> {
-        // println!(
-        //    "ROPE: from _frequency: base_frequency: {}, head_size: {}, max_content_length: {}",
-        //    base_frequency, head_size, max_content_length
-        //);
         let angles = (0..head_size / 2)
             .map(|i| base_frequency.powf((-2.0 * i as f32) / head_size as f32))
             .collect_vec();

@@ -457,6 +457,7 @@ impl QuantizeOp for Add<f32> {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let mut output_scalings = S::scaling_factors_for_node(data, node_id, 1);
         ensure!(

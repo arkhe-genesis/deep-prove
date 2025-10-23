@@ -7,4 +7,5 @@ extend-identifiers = { "Ein" = "Ein", "EinSum" = "EinSum", "NdArray" = "NdArray"
 format = "brief"
 
 [default.extend-words]
+Ein = "Ein"
 arange = "arange"

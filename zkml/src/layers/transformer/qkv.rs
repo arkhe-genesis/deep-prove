@@ -425,6 +425,7 @@ impl QuantizeOp for QKV<f32> {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len());
         let output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);

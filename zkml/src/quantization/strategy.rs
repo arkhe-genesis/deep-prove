@@ -1,11 +1,13 @@
 use crate::{
-    layers::provable::{QuantizeOp, TrackedDataId},
+    Shape,
+    graph::Source,
+    layers::provable::{OpInfo, QuantizeOp, TrackedDataId},
     model::{Model, NodeID, transform::apply_transformations},
     number::Number,
     quantization::metadata::{MetadataBuilder, ModelMetadata},
     rng_from_env_or_random,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{Element, Tensor, quantization};
 use anyhow::{Result, anyhow, ensure};
@@ -397,6 +399,8 @@ fn quantize_model<S: ScalingStrategy>(
     let mut requant_layers = vec![];
     // 3. Apply the post quantisation transforms if there are any
     let mut transforms = vec![];
+
+    let mut shape_map = HashMap::<NodeID, Vec<Shape>>::new();
     let quantized_graph = model
         .graph
         // we create the quantized graph going in the inference order
@@ -410,12 +414,39 @@ fn quantize_model<S: ScalingStrategy>(
                     .filter(|edge| edge.is_incoming_to(&node_id))
                     .copied(),
             )?;
-            tracing::debug!(
-                "Quantising node {}, with node ID {node_id}",
-                node.short_name()
-            );
-            let quantized_out = node.quantize_op::<S>(&data, node_id, &input_scalings)?;
+            let shape_info = edges
+                .iter()
+                .filter(|edge| edge.is_incoming_to(&node_id))
+                .try_fold(BTreeMap::new(), |mut acc, edge| {
+                    for port in edge.ports().iter() {
+                        match edge.source() {
+                            Source::Node(n) => {
+                                let shape = shape_map
+                                    .get(n)
+                                    .map(|shape_vec| shape_vec[port.source_port].clone())
+                                    .ok_or(anyhow!("Shape info for node {n} not found"))?;
+                                acc.insert(port.target_port, shape);
+                            }
+                            Source::Input => {
+                                let shape = input_not_padded_shapes[port.source_port].clone();
+                                acc.insert(port.target_port, shape);
+                            }
+                        }
+                    }
+                    Result::<BTreeMap<_, _>>::Ok(acc)
+                })?
+                .into_values()
+                .collect::<Vec<Shape>>();
+
+            let quantized_out =
+                node.quantize_op::<S>(&data, node_id, &input_scalings, &shape_info)?;
             md.set_layers_scaling(node_id, quantized_out.output_scalings, input_scalings);
+            // Update the current shape info
+            let node_output_shapes = quantized_out
+                .quantized_op
+                .output_shapes(&shape_info, crate::padding::PaddingMode::NoPadding);
+            shape_map.insert(node_id, node_output_shapes);
+
             if let Some(requant) = quantized_out.requant_layer {
                 requant_layers.push((node_id, requant));
             }

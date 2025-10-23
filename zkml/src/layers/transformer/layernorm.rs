@@ -611,6 +611,7 @@ impl QuantizeOp for LayerNorm<f32> {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
         // First check we have one input_scaling
         ensure!(

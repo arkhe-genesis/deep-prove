@@ -271,6 +271,7 @@ pub trait QuantizeOp {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>>;
 }
 
@@ -490,6 +491,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::AttentionMask(attention_mask_ctx) => {
                 attention_mask_ctx.output_shapes(input_shapes, padding_mode)
             }
+            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.output_shapes(input_shapes, padding_mode),
         }
     }
 
@@ -516,6 +518,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::AttentionMask(attention_mask_ctx) => {
                 attention_mask_ctx.num_outputs(num_inputs)
             }
+            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.num_outputs(num_inputs),
         }
     }
 
@@ -540,6 +543,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.describe(),
             LayerCtx::Flatten => Flatten.describe(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.describe(),
+            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.describe(),
         }
     }
 
@@ -564,6 +568,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_provable(),
             LayerCtx::Flatten => Flatten.is_provable(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.is_provable(),
+            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.is_provable(),
         }
     }
 }
@@ -637,6 +642,9 @@ where
             (LayerCtx::AttentionMask(attention_mask_ctx), LayerProof::AttentionMask(proof)) => {
                 attention_mask_ctx.verify(proof, last_claims, verifier, shape_step)
             }
+            (LayerCtx::EinSum(einsum_ctx), LayerProof::EinSum(proof)) => {
+                einsum_ctx.verify(proof, last_claims, verifier, shape_step)
+            }
             _ => bail!(
                 "Incompatible layer {} and proof {} found",
                 self.describe(),
@@ -688,6 +696,7 @@ where
                 claims,
             ),
             LayerCtx::AttentionMask(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
+            LayerCtx::EinSum(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
         }
     }
 
@@ -746,6 +755,9 @@ where
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::AttentionMask(ctx), LayerProof::AttentionMask(p)) => {
+                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::EinSum(ctx), LayerProof::EinSum(p)) => {
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Flatten, _) => Ok(()),

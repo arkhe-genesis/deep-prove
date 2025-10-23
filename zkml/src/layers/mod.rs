@@ -3,6 +3,7 @@ pub mod add;
 pub mod concat_matmul;
 pub mod convolution;
 pub mod dense;
+pub mod einsum;
 pub mod flatten;
 pub mod hadamard;
 pub mod matrix_mul;
@@ -42,6 +43,7 @@ use crate::{
         concat_matmul::{CONCAT_MATMUL_LAYER, ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof},
         convolution::{CONVOLUTION_LAYER, Convolution},
         dense::{DENSE_LAYER, Dense},
+        einsum::{EINSUM_LAYER, EinSum, EinSumContext, EinSumProof},
         flatten::FLATTEN_LAYER,
         matrix_mul::MATMUL_LAYER,
         pooling::{POOLING_LAYER, Pooling},
@@ -86,6 +88,7 @@ pub enum Layer<T> {
     Pooling(Pooling),
     // TODO: so far it's only flattening the input tensor, e.g. new_shape = vec![shape.iter().product()]
     Flatten(Flatten),
+    EinSum(EinSum<T>),
     QKV(QKV<T>),
     Mha(Mha<T>),
     ConcatMatMul(ConcatMatMul),
@@ -121,6 +124,7 @@ impl<T> Layer<T> {
             Layer::Positional(_) => POSITIONAL_LAYER,
             Layer::Logits(_) => LOGITS_LAYER,
             Layer::AttentionMask(_) => ATTENTION_MASK_LAYER,
+            Layer::EinSum(_) => EINSUM_LAYER,
         };
         assert_eq!(r.len(), 4, "layer short name must be 4 chars long: {r}");
         r
@@ -152,6 +156,7 @@ pub enum LayerCtx<E: ExtensionField> {
     Activation(ActivationCtx<E>),
     Requant(RequantCtx<E>),
     Pooling(PoolingCtx),
+    EinSum(EinSumContext<E>),
     QKV(QKVCtx),
     Mha(MhaCtx<E>),
     ConcatMatMul(ConcatMatMulCtx),
@@ -181,6 +186,7 @@ where
     Activation(ActivationProof<E, PCS>),
     Requant(RequantProof<E, PCS>),
     Pooling(PoolingProof<E, PCS>),
+    EinSum(EinSumProof<E>),
     QKV(QKVProof<E>),
     Mha(MhaProof<E, PCS>),
     ConcatMatMul(ConcatMatMulProof<E>),
@@ -205,6 +211,7 @@ impl<T> Layer<T> {
             Layer::Requant(_) => "requant",
             Layer::Pooling(_) => "pooling",
             Layer::Flatten(_) => "flatten",
+            Layer::EinSum(_) => "einsum",
             Layer::QKV(_) => "qkv",
             Layer::Mha(_) => "mha-qk",
             Layer::MatMul(_) => "mat-mul",
@@ -227,6 +234,7 @@ impl<E: ExtensionField> LayerCtx<E> {
         match self {
             Self::Dense(_) => "Dense".to_string(),
             Self::MatMul(_) => "Matrix Multiplication".to_string(),
+            Self::EinSum(_) => "EinSum".to_string(),
             Self::QKV(_) => "QKV".to_string(),
             Self::Mha(_) => "MHA".to_string(),
             Self::ConcatMatMul(_) => "ConcatMatMul".to_string(),
@@ -398,6 +406,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::AttentionMask(attention_mask) => {
                 attention_mask.output_shapes(input_shapes, padding_mode)
             }
+            Layer::EinSum(einsum) => einsum.output_shapes(input_shapes, padding_mode),
         }
     }
 
@@ -422,6 +431,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Pooling(pooling) => pooling.num_outputs(num_inputs),
             Layer::Flatten(reshape) => reshape.num_outputs(num_inputs),
             Layer::AttentionMask(attention_mask) => attention_mask.num_outputs(num_inputs),
+            Layer::EinSum(einsum) => einsum.num_outputs(num_inputs),
         }
     }
 
@@ -446,6 +456,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Pooling(pooling) => pooling.describe(),
             Layer::Flatten(reshape) => reshape.describe(),
             Layer::AttentionMask(attention_mask) => attention_mask.describe(),
+            Layer::EinSum(einsum) => einsum.describe(),
         }
     }
 
@@ -470,6 +481,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Pooling(pooling) => pooling.is_provable(),
             Layer::Flatten(reshape) => reshape.is_provable(),
             Layer::AttentionMask(attention_mask) => attention_mask.is_provable(),
+            Layer::EinSum(einsum) => einsum.is_provable(),
         }
     }
 }
@@ -504,6 +516,7 @@ impl Evaluate<f32> for Layer<f32> {
             Layer::AttentionMask(attention_mask) => {
                 attention_mask.evaluate(inputs, unpadded_input_shapes)
             }
+            Layer::EinSum(einsum) => einsum.evaluate(inputs, unpadded_input_shapes),
         }
     }
 }
@@ -538,6 +551,7 @@ impl Evaluate<Element> for Layer<Element> {
             Layer::AttentionMask(attention_mask) => {
                 attention_mask.evaluate(inputs, unpadded_input_shapes)
             }
+            Layer::EinSum(einsum) => einsum.evaluate(inputs, unpadded_input_shapes),
         };
 
         #[cfg(feature = "capture-layers-quant")]
@@ -579,6 +593,7 @@ impl ProveInfo for Layer<Element> {
             Layer::Pooling(pooling) => pooling.step_info(id, aux),
             Layer::Flatten(reshape) => reshape.step_info(id, aux),
             Layer::AttentionMask(attention_mask) => attention_mask.step_info(id, aux),
+            Layer::EinSum(einsum) => einsum.step_info(id, aux),
         }
     }
 }
@@ -610,6 +625,7 @@ impl PadOp for Layer<Element> {
             Layer::AttentionMask(attention_mask) => {
                 Layer::AttentionMask(attention_mask.pad_node(si)?)
             }
+            Layer::EinSum(einsum) => Layer::EinSum(einsum.pad_node(si)?),
         })
     }
 }
@@ -688,6 +704,9 @@ where
             (Layer::AttentionMask(attention_mask), LayerCtx::AttentionMask(info)) => {
                 attention_mask.prove(node_id, info, last_claims, step_data, prover, store)
             }
+            (Layer::EinSum(einsum), LayerCtx::EinSum(info)) => {
+                einsum.prove(node_id, info, last_claims, step_data, prover, store)
+            }
 
             _ => bail!(
                 "Incompatible layer {} and ctx {} found for node id {}",
@@ -743,6 +762,7 @@ where
             Layer::AttentionMask(attention_mask) => {
                 attention_mask.gen_lookup_witness(id, ctx, step_data, store)
             }
+            Layer::EinSum(einsum) => einsum.gen_lookup_witness(id, ctx, step_data, store),
         }
     }
 }
@@ -755,16 +775,23 @@ impl QuantizeOp for Layer<f32> {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         Ok(match self {
             Layer::Dense(dense) => {
-                let output = dense.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output =
+                    dense.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Dense(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::Convolution(convolution) => {
-                let output = convolution.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = convolution.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(
                     Layer::Convolution(output.quantized_op),
                     output.output_scalings,
@@ -773,25 +800,33 @@ impl QuantizeOp for Layer<f32> {
                 .maybe_transform(output.post_quant_rule)
             }
             Layer::MatMul(mat) => {
-                let output = mat.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output =
+                    mat.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::MatMul(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::QKV(qkv) => {
-                let output = qkv.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output =
+                    qkv.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::QKV(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::Mha(mha) => {
-                let output = mha.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output =
+                    mha.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Mha(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::ConcatMatMul(concat_matmul) => {
-                let output = concat_matmul.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = concat_matmul.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(
                     Layer::ConcatMatMul(output.quantized_op),
                     output.output_scalings,
@@ -800,7 +835,12 @@ impl QuantizeOp for Layer<f32> {
                 .maybe_transform(output.post_quant_rule)
             }
             Layer::LayerNorm(layernorm) => {
-                let output = layernorm.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = layernorm.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(
                     Layer::LayerNorm(output.quantized_op),
                     output.output_scalings,
@@ -809,31 +849,48 @@ impl QuantizeOp for Layer<f32> {
                 .maybe_transform(output.post_quant_rule)
             }
             Layer::RMSNorm(rmsnorm) => {
-                let output = rmsnorm.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = rmsnorm.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(Layer::RMSNorm(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::Softmax(softmax) => {
-                let output = softmax.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = softmax.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(Layer::Softmax(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::Add(add) => {
-                let output = add.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output =
+                    add.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Add(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::Logits(logits) => {
-                let output = logits.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output =
+                    logits.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Logits(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)
                     .maybe_transform(output.post_quant_rule)
             }
             Layer::Positional(positional) => {
-                let output = positional.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = positional.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(
                     Layer::Positional(output.quantized_op),
                     output.output_scalings,
@@ -842,7 +899,12 @@ impl QuantizeOp for Layer<f32> {
                 .maybe_transform(output.post_quant_rule)
             }
             Layer::Embeddings(embeddings) => {
-                let output = embeddings.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = embeddings.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(
                     Layer::Embeddings(output.quantized_op),
                     output.output_scalings,
@@ -851,7 +913,12 @@ impl QuantizeOp for Layer<f32> {
                 .maybe_transform(output.post_quant_rule)
             }
             Layer::Activation(activation) => {
-                let output = activation.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = activation.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(
                     Layer::Activation(output.quantized_op),
                     output.output_scalings,
@@ -871,13 +938,25 @@ impl QuantizeOp for Layer<f32> {
                 QuantizeOutput::new(Layer::Reshape(reshape), input_scaling.to_vec())
             }
             Layer::AttentionMask(attention_mask) => {
-                let output = attention_mask.quantize_op::<S>(data, node_id, input_scaling)?;
+                let output = attention_mask.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                )?;
                 QuantizeOutput::new(
                     Layer::AttentionMask(output.quantized_op),
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)
                 .maybe_transform(output.post_quant_rule)
+            }
+            Layer::EinSum(einsum) => {
+                let output =
+                    einsum.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                QuantizeOutput::new(Layer::EinSum(output.quantized_op), output.output_scalings)
+                    .maybe_requants(output.requant_layer)
+                    .maybe_transform(output.post_quant_rule)
             }
         })
     }
@@ -909,6 +988,7 @@ where
             Self::Pooling(_) => "Pooling".to_string(),
             Self::Dummy => "Dummy".to_string(),
             Self::AttentionMask(_) => "AttentionMask".to_string(),
+            Self::EinSum(_) => "EinSum".to_string(),
         }
     }
 
@@ -936,6 +1016,7 @@ where
                 Some(logup_proof.fractional_outputs())
             }
             LayerProof::AttentionMask(_) => None,
+            LayerProof::EinSum(_) => None,
         }
     }
 }

@@ -306,6 +306,7 @@ impl QuantizeOp for Logits {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         // no need to quantize, we just propagate the scaling factors
         let num_inputs = input_scaling.len();

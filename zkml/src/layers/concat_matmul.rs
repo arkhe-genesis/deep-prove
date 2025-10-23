@@ -54,7 +54,7 @@ use crate::{
 pub const CONCAT_MATMUL_LAYER: &str = "CMML";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Permutation(Vec<usize>);
+pub struct Permutation(pub(crate) Vec<usize>);
 
 impl Permutation {
     pub fn new(perm: Vec<usize>) -> Self {
@@ -664,6 +664,7 @@ impl QuantizeOp for ConcatMatMul {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[crate::ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<super::provable::QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len());
         let output_scale = S::scaling_factors_for_node(data, node_id, num_outputs)[0];

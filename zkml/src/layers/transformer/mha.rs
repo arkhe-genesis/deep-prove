@@ -411,6 +411,7 @@ impl QuantizeOp for Mha<f32> {
         data: &S::AuxData,
         node_id: crate::model::NodeID,
         input_scaling: &[crate::ScalingFactor],
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
             input_scaling.len() == 3,
@@ -427,13 +428,19 @@ impl QuantizeOp for Mha<f32> {
         };
         let intermediate_bit_size = self.qk.intermediate_bit_size;
 
+        let reshaped_inputs = self
+            .inputs_reshape
+            .output_shapes(unpadded_input_shapes, PaddingMode::NoPadding);
+        let updated_shapes = self
+            .qk
+            .output_shapes(&reshaped_inputs[..2], PaddingMode::NoPadding);
         // quantise the mask
         let QuantizeOutput {
             quantized_op: mut quantised_mask,
             ..
         } = self
             .mask
-            .quantize_op::<S>(data, node_id, &[product_scaling])?;
+            .quantize_op::<S>(data, node_id, &[product_scaling], &updated_shapes)?;
 
         // quantize data for softmax
         let quantised_softmax = self
@@ -469,8 +476,13 @@ impl QuantizeOp for Mha<f32> {
             // to `OUTPUT_SCALE_FACTOR` rather than the usual quantization range
             None,
         );
-        let quantized_out =
-            updated_final_mul.quantize_op::<S>(data, node_id, &final_mul_scalings)?;
+        let final_mul_input_shapes = vec![updated_shapes[0].clone(), reshaped_inputs[2].clone()];
+        let quantized_out = updated_final_mul.quantize_op::<S>(
+            data,
+            node_id,
+            &final_mul_scalings,
+            &final_mul_input_shapes,
+        )?;
 
         let quantized_mha = Self::QuantizedOp {
             inputs_reshape: self.inputs_reshape,

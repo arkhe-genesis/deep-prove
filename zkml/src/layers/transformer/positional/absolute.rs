@@ -116,14 +116,18 @@ impl Absolute<f32> {
         data: &S::AuxData,
         node_id: NodeID,
         input_scaling: ScalingFactor,
+        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Absolute<Element>>> {
         // quantize positional matrix
         let max = self.positional.max_abs_output();
         let pos_scaling = ScalingFactor::from_absolute_max(max, None);
 
-        let quantized_add =
-            self.add_layer
-                .quantize_op::<S>(data, node_id, &[input_scaling, pos_scaling])?;
+        let quantized_add = self.add_layer.quantize_op::<S>(
+            data,
+            node_id,
+            &[input_scaling, pos_scaling],
+            unpadded_input_shapes,
+        )?;
 
         let quantized_pos = Absolute {
             positional: self.positional.quantize(&pos_scaling),
@@ -432,8 +436,9 @@ mod tests {
             let Input { seq_len, embedding_size, input, pos, .. } = input.clone();
             let layer = Absolute::<f32>::new(pos.clone());
             let input_sf = ScalingFactor::from_tensor(&input, None);
+            let shape = crate::Shape::new(vec![seq_len, embedding_size]);
             let q = layer
-                .quantize::<AbsoluteMax>(&(), 0.into(), input_sf)
+                .quantize::<AbsoluteMax>(&(), 0.into(), input_sf, &[shape])
                 .expect("quantize absolute should succeed");
             let layer_q = q.quantized_op;
             let input_q = input.to_quantized(&input_sf);

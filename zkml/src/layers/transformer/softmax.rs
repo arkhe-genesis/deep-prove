@@ -1327,6 +1327,7 @@ impl QuantizeOp for Softmax<f32> {
         _data: &S::AuxData,
         node_id: NodeID,
         input_scaling: &[ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
             input_scaling.len() == 1,
