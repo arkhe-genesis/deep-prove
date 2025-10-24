@@ -39,8 +39,7 @@ jobs:
       - name: Sanity check pre
         if: always()
         run: |
-          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
-          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0
+          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
 
       - name: Clean previous outputs
         run: |
@@ -57,6 +56,7 @@ jobs:
       - name: 'Checkout PR branch'
         uses: actions/checkout@v4
         with:
+          lfs: true
           ref: ${{ github.event.pull_request.head.ref }}
 
       - name: 'Find the merge-base commit hash'
@@ -78,12 +78,12 @@ jobs:
           branch_point: ${{ steps.find-branch-point.outputs.branch-point }}
         uses: actions/checkout@v4
         with:
+          lfs: true
           clean: "false"
           ref: "${{ env.branch_point }}"
 
       - name: Force-check LFS base
         run: |
-          git lfs install --local
           git lfs pull
 
       - name: Capture layers outputs on base
@@ -105,11 +105,11 @@ jobs:
       - name: Checkout HEAD
         uses: actions/checkout@v4
         with:
+          lfs: true
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Force-check LFS HEAD
         run: |
-          git lfs install --local
           git lfs pull
 
       - name: Capture layers outputs on HEAD
@@ -133,9 +133,3 @@ jobs:
         run: |
           cd ~
           ./cmp-layers-quant.sh
-
-      - name: Sanity check post
-        if: always()
-        run: |
-          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
-          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0

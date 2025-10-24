@@ -49,13 +49,14 @@ jobs:
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
     runs-on: ['nix']
     steps:
-      - name: Sanity check pre
+      - name: Sanity check
         if: always()
         run: |
-          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
-          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0
+          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
 
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Force-check LFS
         run: |
@@ -84,18 +85,16 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: cargo nextest run
 
-      - name: Sanity check post
-        if: always()
-        run: |
-          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
-          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0
-
-
   linting:
     needs: changes
     runs-on: ['nix']
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
     steps:
+      - name: Sanity check
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+
       - uses: actions/checkout@v4
         with:
           clean: "false"
