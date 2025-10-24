@@ -10,7 +10,6 @@ use burn::{
 use burn_cubecl::{CubeRuntime, tensor::CubeTensor};
 use burn_fusion::{
     Fusion, FusionBackend,
-    client::FusionClient,
     stream::{Operation, OperationStreams},
 };
 use cubecl::{
@@ -321,7 +320,7 @@ impl<B: FusionBackend + ZKMLBackend> ZKMLBackend for Fusion<B> {
         let shape = conv2d_i_out_shape(input.shape().dims(), kernels.shape().dims(), &config);
         let out = input
             .client
-            .tensor_uninitialized(shape.dims.clone(), input.dtype());
+            .tensor_uninitialized(shape.dims.clone().into(), input.dtype());
 
         let description = Conv2dIIR {
             input: input.clone().into_ir(),

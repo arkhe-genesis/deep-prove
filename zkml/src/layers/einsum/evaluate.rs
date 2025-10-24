@@ -864,7 +864,7 @@ mod tests {
                 let expected_burn_vec = q_burn
                     .iter_dim(0)
                     .map(|q_head| {
-                        let q_shaped = q_head.squeeze::<3>(0);
+                        let q_shaped = q_head.squeeze_dim::<3>(0);
                         let intermediate_vec = q_shaped
                             .iter_dim(0)
                             .zip(k_burn.clone().iter_dim(0))

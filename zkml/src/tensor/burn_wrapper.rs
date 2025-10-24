@@ -12,7 +12,7 @@ use burn::{
     module::Param,
     nn::{LayerNormConfig, RmsNormConfig},
     tensor::{
-        BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, RangesArg, Tensor as BTensor,
+        BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, SliceArg, Tensor as BTensor,
         TensorData, activation,
         ops::{ConvOptions, IntTensorOps},
     },
@@ -218,9 +218,9 @@ where
     pub fn squeeze(self, dim: usize) -> Result<Self> {
         let out = match self {
             WrappedTensor::Rank1(_) => bail!("Cannot squeeze 1D tensor"),
-            WrappedTensor::Rank2(tensor) => WrappedTensor::Rank1(tensor.squeeze(dim)),
-            WrappedTensor::Rank3(tensor) => WrappedTensor::Rank2(tensor.squeeze(dim)),
-            WrappedTensor::Rank4(tensor) => WrappedTensor::Rank3(tensor.squeeze(dim)),
+            WrappedTensor::Rank2(tensor) => WrappedTensor::Rank1(tensor.squeeze_dim(dim)),
+            WrappedTensor::Rank3(tensor) => WrappedTensor::Rank2(tensor.squeeze_dim(dim)),
+            WrappedTensor::Rank4(tensor) => WrappedTensor::Rank3(tensor.squeeze_dim(dim)),
         };
         Ok(out)
     }
@@ -363,7 +363,7 @@ where
     }
 
     /// Returns a tensor containing the elements selected from the given ranges.
-    pub fn slice<const R2: usize, R: RangesArg<R2>>(self, ranges: R) -> Self {
+    pub fn slice<const R2: usize, R: SliceArg<R2>>(self, ranges: R) -> Self {
         match self {
             Self::Rank1(tensor) => Self::Rank1(tensor.slice(ranges)),
             Self::Rank2(tensor) => Self::Rank2(tensor.slice(ranges)),
