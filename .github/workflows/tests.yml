@@ -49,13 +49,18 @@ jobs:
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
     runs-on: ['nix']
     steps:
+      - name: Sanity check pre
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
+          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0
+
       - uses: actions/checkout@v4
-        with:
-          lfs: "true"
-          persist-credentials: false
 
       - name: Force-check LFS
-        run: git lfs pull
+        run: |
+          git lfs install --local
+          git lfs pull
 
       - name: Set RNG seed
         run: |
@@ -78,6 +83,12 @@ jobs:
         if: github.event.pull_request.draft == false
         shell: devenv shell bash -- -e {0}
         run: cargo nextest run
+
+      - name: Sanity check post
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
+          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0
 
 
   linting:

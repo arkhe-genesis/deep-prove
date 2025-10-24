@@ -36,6 +36,12 @@ jobs:
     if: needs.changes.outputs.should_run == 'true'
     runs-on: ['nix']
     steps:
+      - name: Sanity check pre
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
+          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0
+
       - name: Clean previous outputs
         run: |
           rm -r ~/layers-quant 2> /dev/null || true
@@ -73,11 +79,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           clean: "false"
-          lfs: 'true'
           ref: "${{ env.branch_point }}"
 
       - name: Force-check LFS base
-        run: git lfs pull
+        run: |
+          git lfs install --local
+          git lfs pull
 
       - name: Capture layers outputs on base
         shell: devenv shell bash -- -e {0}
@@ -98,12 +105,12 @@ jobs:
       - name: Checkout HEAD
         uses: actions/checkout@v4
         with:
-          clean: "false"
-          lfs: 'true'
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Force-check LFS HEAD
-        run: git lfs pull
+        run: |
+          git lfs install --local
+          git lfs pull
 
       - name: Capture layers outputs on HEAD
         shell: devenv shell bash -- -e {0}
@@ -126,3 +133,9 @@ jobs:
         run: |
           cd ~
           ./cmp-layers-quant.sh
+
+      - name: Sanity check post
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "${HOME}/.gitconfig found" || exit 0
+          [ -f /home/gh/.gitconfig ] && echo "/home/gh/.gitconfig found" && exit 1 || exit 0
