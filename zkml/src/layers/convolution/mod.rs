@@ -8,9 +8,10 @@ use crate::{
     Claim, Element, Prover, ScalingStrategy, Shape, VectorTranscript,
     backend::Conv2dConfig,
     commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{context::ContextAux, prover::BatchFFTProof},
     layers::{LayerProof, hadamard, provable::ProvingData, requant::Requant},
-    model::{NodeID, StepData},
+    model::StepData,
     number::Number,
     padding::{PaddingMode, ShapeInfo},
     parser::{check_filter, safe_conv2d_shape},
@@ -430,7 +431,7 @@ impl<T> Convolution<T> {
     }
 
     /// Returns this layers [ConvCtx].
-    pub(crate) fn conv_context(&self, node_id: NodeID) -> ConvCtx {
+    pub(crate) fn conv_context(&self, node_id: NodeId) -> ConvCtx {
         ConvCtx {
             node_id,
             kw: self.kw(),
@@ -665,7 +666,7 @@ impl Convolution<Element> {
         output: &Tensor<E>,
         unpadded_output_shape: &Shape,
         proving_data: &ConvData<E>,
-        id: NodeID,
+        id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,
@@ -1201,7 +1202,7 @@ struct BatchFFTWeightsProof<E: ExtensionField> {
 impl ProveInfo for Convolution<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let (tensor, _) = self.filter.as_fft_tensor();
@@ -1266,7 +1267,7 @@ impl QuantizeOp for Convolution<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -1345,7 +1346,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        id: NodeID,
+        id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,

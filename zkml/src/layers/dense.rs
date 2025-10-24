@@ -1,7 +1,10 @@
-use std::{cmp::Ordering, collections::HashMap};
-
+use super::provable::{
+    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+    VerifiableCtx,
+};
 use crate::{
-    Claim, Prover, ScalingStrategy, Shape,
+    Claim, Element, Prover, ScalingStrategy, Shape,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -10,7 +13,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedModuleFn},
+    tensor::{KeyedTensor, Tensor, TensorKey, TensorTypeParam, WrappedModuleFn, WrappedTensor},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Result, ensure};
@@ -24,6 +27,7 @@ use multilinear_extensions::{
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{cmp::Ordering, collections::HashMap};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -31,17 +35,6 @@ use sumcheck::{
 use tenstore::GenStore;
 use tracing::warn;
 use transcript::Transcript;
-
-use crate::{
-    Element,
-    tensor::{Tensor, WrappedTensor},
-};
-
-use super::provable::{
-    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
-    VerifiableCtx,
-};
-use crate::model::NodeID;
 /// The short name used to identify a dense layer
 pub const DENSE_LAYER: &str = "DENS";
 
@@ -57,7 +50,7 @@ pub struct Dense<T> {
 /// Information stored in the context (setup phase) for this layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DenseCtx {
-    pub node_id: NodeID,
+    pub node_id: NodeId,
     pub unpadded_matrix_shape: Shape,
     pub padded_matrix_shape: Shape,
     matrix_key: TensorKey,
@@ -205,7 +198,7 @@ where
 impl ProveInfo for Dense<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         // construct dimension of the polynomial given to the sumcheck
@@ -287,7 +280,7 @@ impl QuantizeOp for Dense<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -315,7 +308,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -461,7 +454,7 @@ impl Dense<Element> {
         input: &Tensor<E>,
         output: &Tensor<E>,
         _info: &DenseCtx,
-        id: NodeID,
+        id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,

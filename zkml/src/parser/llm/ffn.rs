@@ -1,20 +1,20 @@
 use crate::{
     Number,
+    graph::NodeId,
     layers::{
+        Layer,
         activation::{Activation, GeGlu},
         matrix_mul::MatMul,
     },
-    model::NodeID,
-    parser::{gguf::FileTensorLoader, llm::LLMVariant},
+    model::Model,
+    parser::{
+        gguf::FileTensorLoader,
+        json,
+        llm::{LLMConfig, LLMVariant},
+    },
     tensor::KeyedTensor,
 };
 use anyhow::{bail, ensure};
-
-use crate::{
-    layers::Layer,
-    model::Model,
-    parser::{json, llm::LLMConfig},
-};
 
 #[derive(Debug, Clone)]
 pub struct FeedForward<N: Number> {
@@ -30,8 +30,8 @@ impl FeedForward<f32> {
         self,
         _config: &LLMConfig,
         model: &mut Model<f32>,
-        input_node_id: NodeID,
-    ) -> anyhow::Result<NodeID> {
+        input_node_id: NodeId,
+    ) -> anyhow::Result<NodeId> {
         let up = MatMul::new_constant(self.up, self.up_bias)?;
 
         // let down = MatMul::new_constant(self.down, self.down_bias);
@@ -44,8 +44,8 @@ impl FeedForward<f32> {
             // activation layer being instantiated
             let gate_node_id =
                 model.add_consecutive_layer(Layer::MatMul(gate), Some(input_node_id))?;
-            let geglu = Activation::new_geglu();
-            let geglu_id = model.add_layer(geglu.into())?;
+            let geglu: GeGlu<f32> = Activation::new_geglu();
+            let geglu_id = model.graph.add_inner(geglu.into())?;
             // build input wires for GeGlu
             model.add_edge(gate_node_id, geglu_id, (0, GeGlu::<f32>::GELU_INPUT_INDEX))?;
             model.add_edge(up_node_id, geglu_id, (0, GeGlu::<f32>::LINEAR_INPUT_INDEX))?;

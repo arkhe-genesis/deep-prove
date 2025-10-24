@@ -2,12 +2,12 @@ use std::ops::{Range, RangeBounds};
 
 use crate::{
     NextPowerOfTwo, Shape,
+    graph::NodeId,
     iop::context::ContextAux,
     layers::{
         LayerCtx,
         provable::{Evaluate, LayerOut, OpInfo, PadOp, ProveInfo, QuantizeOp, QuantizeOutput},
     },
-    model::NodeID,
     padding::{PaddingMode, pad_reshape_layer},
     tensor::{TensorTypeParam, WrappedTensor},
 };
@@ -236,7 +236,7 @@ impl QuantizeOp for Reshape {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         _data: &S::AuxData,
-        _node_id: crate::model::NodeID,
+        _node_id: NodeId,
         input_scaling: &[crate::ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -263,7 +263,7 @@ fn range_end<R: RangeBounds<usize>>(range: &R) -> Option<usize> {
 impl ProveInfo for Reshape {
     fn step_info<E: ExtensionField>(
         &self,
-        _id: NodeID,
+        _id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(super::LayerCtx<E>, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);

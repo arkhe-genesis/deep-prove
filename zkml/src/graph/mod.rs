@@ -53,123 +53,6 @@ pub mod scheduler;
 
 // everything directly graph related export as top level
 pub use graph::*;
-// pub use port::*;
-
-/// Utility macro for extracting specific enum variants from vectors.
-///
-/// This macro is particularly useful when working with graph nodes that are represented
-/// as enum variants. It allows safe extraction of all instances of a specific variant
-/// from a vector, returning an error if any element doesn't match the expected variant.
-///
-/// # Examples
-///
-/// ```
-/// use anyhow::anyhow;
-///
-/// macro_rules! try_extract_variant_vec {
-///     ($variant:ident :: $name:ident ( $inner:ident ), $vec:expr) => {{
-///         let mut out: Vec<$inner> = Vec::with_capacity($vec.len());
-///         let mut err_i: usize = usize::MAX;
-///         for (i, e) in $vec.into_iter().enumerate() {
-///             match e {
-///                 $variant::$name(inner) => out.push(inner),
-///                 _ => {
-///                     err_i = i;
-///                     break;
-///                 }
-///             }
-///         }
-///         if err_i != usize::MAX {
-///             Err(anyhow!("Type mismatch at index {}", err_i))
-///         } else {
-///             Ok(out)
-///         }
-///     }};
-///     ($variant:ident :: $name:ident, $vec:expr) => {{
-///         let mut out: Vec<()> = Vec::with_capacity($vec.len());
-///         let mut err_i: usize = usize::MAX;
-///         for (i, e) in $vec.into_iter().enumerate() {
-///             match e {
-///                 $variant::$name => out.push(()),
-///                 _ => {
-///                     err_i = i;
-///                     break;
-///                 }
-///             }
-///         }
-///         if err_i != usize::MAX {
-///             Err(anyhow!("Type mismatch at index {}", err_i))
-///         } else {
-///             Ok(out)
-///         }
-///     }};
-/// }
-///
-/// #[derive(Debug, PartialEq)]
-/// enum Operation {
-///     Add(i32),
-///     Multiply(f64),
-///     Clear,
-/// }
-///
-/// // Extract variants with payload
-/// let ops = vec![Operation::Add(1), Operation::Add(2), Operation::Add(3)];
-/// let values = try_extract_variant_vec!(Operation::Add(i32), ops).unwrap();
-/// assert_eq!(values, vec![1, 2, 3]);
-///
-/// // Extract variants without payload
-/// let ops2 = vec![Operation::Clear, Operation::Clear];
-/// let values2 = try_extract_variant_vec!(Operation::Clear, ops2).unwrap();
-/// assert_eq!(values2, vec![(), ()]);
-///
-/// // Error case - type mismatch
-/// let ops3 = vec![Operation::Add(1), Operation::Multiply(2.0)];
-/// assert!(try_extract_variant_vec!(Operation::Add(i32), ops3).is_err());
-/// ```
-#[allow(unused_macros)]
-#[macro_export]
-macro_rules! try_extract_variant_vec {
-    // case: variant with payload
-    ($variant:ident :: $name:ident ( $inner:ident ), $vec:expr) => {{
-        let mut out: Vec<$inner> = Vec::with_capacity($vec.len());
-        let mut err_i: usize = usize::MAX;
-        for (i, e) in $vec.into_iter().enumerate() {
-            match e {
-                $variant::$name(inner) => out.push(inner),
-                _ => {
-                    println!("Type mismatch {:?}", e);
-                    err_i = i;
-                    break;
-                }
-            }
-        }
-        if err_i != usize::MAX {
-            Err(anyhow::anyhow!("Type mismatch at index {}", err_i))
-        } else {
-            Ok(out)
-        }
-    }};
-    // case: variant without payload
-    ($variant:ident :: $name:ident, $vec:expr) => {{
-        let mut out: Vec<()> = Vec::with_capacity($vec.len());
-        let mut err_i: usize = usize::MAX;
-        for (i, e) in $vec.into_iter().enumerate() {
-            match e {
-                $variant::$name => out.push(()),
-                _ => {
-                    println!("Type mismatch {:?}", e);
-                    err_i = i;
-                    break;
-                }
-            }
-        }
-        if err_i != usize::MAX {
-            Err(anyhow::anyhow!("Type mismatch at index {}", err_i))
-        } else {
-            Ok(out)
-        }
-    }};
-}
 
 #[cfg(test)]
 mod tests {
@@ -179,6 +62,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     pub enum TestOperation {
+        Input,
         Test1,
         Test2,
     }
@@ -188,20 +72,17 @@ mod tests {
         type Context = ();
         fn describe(&self) -> String {
             match self {
-                TestOperation::Test1 => "Test1".to_string(),
-                TestOperation::Test2 => "Test2".to_string(),
+                TestOperation::Input => "Input",
+                TestOperation::Test1 => "Test1",
+                TestOperation::Test2 => "Test2",
             }
+            .to_string()
         }
         fn run(&self, _ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Self::IO> {
             match self {
-                TestOperation::Test1 => {
-                    println!("Test1: {input:?}");
-                    Ok(format!("Test1: {input:?}"))
-                }
-                TestOperation::Test2 => {
-                    println!("Test2: {input:?}");
-                    Ok(format!("Test2: {input:?}"))
-                }
+                TestOperation::Input => Ok(input[0].clone()),
+                TestOperation::Test1 => Ok(format!("Test1: {input:?}")),
+                TestOperation::Test2 => Ok(format!("Test2: {input:?}")),
             }
         }
     }
@@ -229,34 +110,23 @@ mod tests {
     pub fn instantiate(num_colors: usize) -> ExecGraph<TestOperation, usize> {
         let mut graph = Graph::new();
         let mut color = 0;
-        let test1_node = graph.add_node(TestOperation::Test1.colored(color)).unwrap();
-        graph.set_input(test1_node, 0, None).unwrap();
+        let input_node = graph
+            .add_inner(TestOperation::Input.colored(color))
+            .unwrap();
+        let test1_node = graph
+            .add_inner(TestOperation::Test1.colored(color))
+            .unwrap();
+        graph
+            .add_edge(input_node, test1_node, (0, 0), None)
+            .unwrap();
 
         color = (color + 1) % num_colors;
-        let test2_node = graph.add_node(TestOperation::Test2.colored(color)).unwrap();
+        let test2_node = graph
+            .add_inner(TestOperation::Test2.colored(color))
+            .unwrap();
         graph
             .add_edge(test1_node, test2_node, Ports::consecutive(), None)
             .unwrap();
         graph
-    }
-
-    #[test]
-    fn test_try_extract_variant_vec() {
-        #[derive(Debug)]
-        enum MyEnum {
-            Variant1(i32),
-            Variant2(f64),
-        }
-
-        let vec = vec![MyEnum::Variant1(1), MyEnum::Variant1(2)];
-        let out = try_extract_variant_vec!(MyEnum::Variant1(i32), vec).unwrap();
-        assert_eq!(out, vec![1, 2]);
-
-        let vec = vec![MyEnum::Variant2(1.0), MyEnum::Variant2(2.0)];
-        let out = try_extract_variant_vec!(MyEnum::Variant2(f64), vec).unwrap();
-        assert_eq!(out, vec![1.0, 2.0]);
-
-        let vec = vec![MyEnum::Variant1(1), MyEnum::Variant2(2.0)];
-        assert!(try_extract_variant_vec!(MyEnum::Variant1(i32), vec).is_err());
     }
 }

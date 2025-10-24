@@ -1,22 +1,21 @@
 use crate::{
     Element, Shape,
     commit::mmcs_context::{CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext},
-    graph::{Direction, Source},
+    graph::{Node, NodeId, NodeInput, NodeOutput, order_by_in_port},
     layers::{
         Layer, LayerCtx,
         provable::{OpInfo, ProveInfo},
     },
     lookup::context::{LookupContext, TableType},
-    model::{Model, ModelCtx, ModelGraph, NodeID},
+    model::{Model, ModelCtx},
     tensor::TensorKey,
     to_base,
 };
-use anyhow::{Ok, anyhow, ensure};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use tracing::{debug, trace};
 use transcript::Transcript;
 use utils::Metrics;
@@ -96,41 +95,66 @@ impl Model<Element> {
             .iter()
             .fold(0usize, |acc, shapes| acc.max(shapes.product()));
 
-        let mut ctx_aux = Some(ContextAux {
+        // An accumulator used to carry information over while converting the graph
+        let mut ctx_aux = ContextAux {
             tables,
             last_output_shape: input_shapes.to_vec(),
             model_polys: None,
             max_poly_len,
-        });
+        };
 
         // TODO: refactor that management of polys
         let mut model_polys = HashMap::<TensorKey, MultilinearExtension<E>>::new();
-        let mut output_shapes: HashMap<NodeID, Vec<Shape>> = HashMap::new();
+        // The shape register is filled along the traversal of the graph.
+        let mut shapes: HashMap<NodeOutput, Shape> = HashMap::new();
         debug!("Context : layer info generation ...");
-        let mut max_node_id = NodeID::from(0);
         let graph_ctx = self.graph.try_map_forward(|id, node| {
-            let inner_metrics = Metrics::new();
-            // incrementally builds the input shapes when we go through the graph
-            let node_input_shape =
-                compute_node_input_shapes(&self.graph, input_shapes, &output_shapes, id)?;
-            // Needed because of borrow checker...
-            let mut local_aux = ctx_aux.take().unwrap();
-            local_aux.last_output_shape = node_input_shape;
-            let (layer_ctx, new_ctx_aux) =
-                compute_layer_ctx::<E>(local_aux, &mut model_polys, id, node)?;
-            output_shapes.insert(id, new_ctx_aux.last_output_shape.clone());
-            max_poly_len = max_poly_len.max(new_ctx_aux.max_poly_len);
-            max_node_id = max_node_id.max(id);
-            ctx_aux = Some(new_ctx_aux);
-            debug!(
-                "{} node: {id} ({}), max_poly_len: {max_poly_len}",
-                inner_metrics.to_span(),
-                node.describe(),
-            );
-            Ok(layer_ctx)
+            Ok(match node {
+                Node::Inner(layer) => {
+                    let inner_metrics = Metrics::new();
+                    // Collect the shapes of the tensor fed to this layer
+                    ctx_aux.last_output_shape =
+                        order_by_in_port(self.graph.incoming_feeds(id).into_iter().map(|feed| {
+                            (
+                                NodeInput::new(id, feed.target.port),
+                                shapes[&feed.source].clone(),
+                            )
+                        }))
+                        .collect();
+                    let layer_ctx =
+                        compute_layer_ctx::<E>(&mut ctx_aux, &mut model_polys, id, layer)?;
+
+                    // NOTE: `ctx.last_output_shape` **will** have been modified
+                    // by `compute_layer_ctx`, so these shapes are not the one
+                    // that have been computed above.
+                    shapes.extend(
+                        ctx_aux
+                            .last_output_shape
+                            .iter()
+                            .enumerate()
+                            .map(|(i, shape)| (NodeOutput::new(id, i), shape.clone())),
+                    );
+
+                    max_poly_len = max_poly_len.max(ctx_aux.max_poly_len);
+                    debug!(
+                        "{} node: {id} ({}), max_poly_len: {max_poly_len}",
+                        inner_metrics.to_span(),
+                        layer.describe(),
+                    );
+                    Node::Inner(layer_ctx)
+                }
+                Node::Input(i) => {
+                    // Seed the shape register
+                    shapes.insert(
+                        NodeOutput::new(self.graph.input_node_id(*i)?, 0),
+                        input_shapes[*i].clone(),
+                    );
+                    Node::Input(*i)
+                }
+                Node::Output(o) => Node::Output(*o),
+            })
         })?;
-        // Check to see if we use a lookup table alrger than any of the individual polynomials
-        let ctx_aux = ctx_aux.take().unwrap();
+        // Check to see if we use a lookup table larger than any of the individual polynomials
         ctx_aux.tables.iter().for_each(|table_type| {
             let inner_metrics = Metrics::new();
             let multiplicity_vars = table_type.multiplicity_poly_vars();
@@ -152,7 +176,7 @@ impl Model<Element> {
             max_poly_len,
             model_polys,
             &lookup_ctx.tables,
-            max_node_id,
+            graph_ctx.next_node_id(),
         )?;
         debug!("{} commitment generated.", metrics.to_span());
         Ok((ModelCtx::new(graph_ctx), commitment_ctx, lookup_ctx))
@@ -268,92 +292,35 @@ pub struct ContextAux {
     pub max_poly_len: usize,
 }
 
-// compute input shapes for this node
-// TODO: have a shape register struct that can be used in many places of the code
-fn compute_node_input_shapes(
-    graph: &ModelGraph<Element>,
-    model_input_shapes: &[Shape],
-    output_shapes: &HashMap<NodeID, Vec<Shape>>,
-    id: NodeID,
-) -> anyhow::Result<Vec<Shape>> {
-    Ok(graph
-        .neighbors(&id, Direction::Incoming)
-        .try_fold(BTreeMap::new(), |mut acc, (_, edge)| {
-            for port in edge.ports().iter() {
-                match edge.source() {
-                    Source::Node(node_id) => {
-                        let node_shapes = output_shapes.get(node_id).ok_or(anyhow!(
-                            "Node {node_id} not found in set of previous shapes"
-                        ))?;
-                        ensure!(
-                            *port.source_port < node_shapes.len(),
-                            "Input for node {} is coming from output {} of node {},
-                            but this node has only {} outputs",
-                            id,
-                            *port.source_port,
-                            node_id,
-                            node_shapes.len()
-                        );
-                        acc.insert(*port.target_port, node_shapes[*port.source_port].clone());
-                    }
-                    Source::Input => {
-                        ensure!(
-                            *port.source_port < model_input_shapes.len(),
-                            "Input for node {} is the input {} of the model,
-                            but the model has only {} inputs",
-                            id,
-                            *port.source_port,
-                            model_input_shapes.len()
-                        );
-                        acc.insert(
-                            *port.target_port,
-                            model_input_shapes[*port.source_port].clone(),
-                        );
-                    }
-                }
-            }
-            Ok(acc)
-        })?
-        .into_values()
-        .collect())
-}
-
 fn compute_layer_ctx<E: ExtensionField>(
-    ctx_aux: ContextAux,
+    ctx_aux: &mut ContextAux,
     model_polys: &mut HashMap<TensorKey, MultilinearExtension<E>>,
-    id: NodeID,
+    id: NodeId,
     layer: &Layer<Element>,
-) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+) -> anyhow::Result<LayerCtx<E>> {
     trace!(
         "Context : {}-th layer {}info generation ...",
         id,
         layer.describe()
     );
-    let (info, mut new_aux) = layer.step_info(id, ctx_aux)?;
+    let (info, mut new_aux) = layer.step_info(id, ctx_aux.clone())?;
     // Retrieve any model polynomials that need to be committed
     if new_aux.model_polys.is_some() {
-        new_aux
-            .model_polys
-            .as_mut()
-            .unwrap()
-            .drain()
-            .try_for_each(|(poly_id, evals)| {
-                let num_vars = ceil_log2(evals.len());
-                let mle = MultilinearExtension::<E>::from_evaluations_vec(
-                    num_vars,
-                    to_base::<E, _>(evals),
+        for (poly_id, evals) in new_aux.model_polys.as_mut().unwrap().drain() {
+            let num_vars = ceil_log2(evals.len());
+            let mle =
+                MultilinearExtension::<E>::from_evaluations_vec(num_vars, to_base::<E, _>(evals));
+            if let Some(expected_mle) = model_polys.get(&poly_id) {
+                // check that the same poly was stored for `poly_id`
+                debug_assert!(
+                    expected_mle == &mle,
+                    "Found different MLE for polynomial {poly_id}"
                 );
-                if let Some(expected_mle) = model_polys.get(&poly_id) {
-                    // check that the same poly was stored for `poly_id`
-                    debug_assert!(
-                        expected_mle == &mle,
-                        "Found different MLE for polynomial {poly_id}"
-                    );
-                } else {
-                    model_polys.insert(poly_id, mle);
-                }
-                Ok(())
-            })?;
+            } else {
+                model_polys.insert(poly_id, mle);
+            }
+        }
     }
-    Ok((info, new_aux))
+    *ctx_aux = new_aux;
+    Ok(info)
 }

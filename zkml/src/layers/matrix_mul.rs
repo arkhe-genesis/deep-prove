@@ -1,5 +1,27 @@
+use super::{
+    LayerCtx,
+    provable::{
+        Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+        VerifiableCtx,
+    },
+    requant::Requant,
+};
+use crate::{
+    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    graph::NodeId,
+    iop::{
+        context::{ContextAux, ShapeStep},
+        verifier::Verifier,
+    },
+    layers::LayerProof,
+    model::StepData,
+    number::Number,
+    padding::{PaddingMode, ShapeInfo, pad_matmul},
+    quantization::{self, bias_scaling_matmul},
+    tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    util::from_mle_list_dimensions,
+};
 use anyhow::{Context, Result, anyhow, ensure};
-
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -17,29 +39,6 @@ use sumcheck::{
 use tenstore::GenStore;
 use tracing::debug;
 use transcript::Transcript;
-
-use super::{
-    LayerCtx,
-    provable::{
-        Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
-        VerifiableCtx,
-    },
-    requant::Requant,
-};
-use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
-    iop::{
-        context::{ContextAux, ShapeStep},
-        verifier::Verifier,
-    },
-    layers::LayerProof,
-    model::{NodeID, StepData},
-    number::Number,
-    padding::{PaddingMode, ShapeInfo, pad_matmul},
-    quantization::{self, bias_scaling_matmul},
-    tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
-    util::from_mle_list_dimensions,
-};
 
 /// The short name used to identify the matrix multiplication layer
 pub const MATMUL_LAYER: &str = "MMUL";
@@ -139,7 +138,7 @@ pub struct MatMul<T> {
 /// Information stored in the context (setup phase) for this layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MatMulCtx {
-    pub(crate) node_id: NodeID,
+    pub(crate) node_id: NodeId,
     /// Unpadded and padded shapes of the left matrix, if the left matrx is a constant matrix
     pub(crate) left_matrix_shapes: Option<(Shape, Shape)>,
     /// Unpadded and padded shapes of the right matrix, if the right matrx is a constant matrix
@@ -565,7 +564,7 @@ impl<T: TensorTypeParam> Evaluate<T> for MatMul<T> {
 impl ProveInfo for MatMul<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx_aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let (info, ctx_aux) = self.ctx(id, ctx_aux)?;
@@ -670,7 +669,7 @@ impl QuantizeOp for MatMul<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -707,7 +706,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -790,7 +789,7 @@ impl MatMul<Element> {
     /// Prove the layer
     pub fn prove_step<E, T, PCS>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         prover: &mut Prover<E, T, PCS>,
         last_claim: &Claim<E>,
         mut inputs: Vec<Tensor<E>>,
@@ -974,7 +973,7 @@ impl MatMul<Element> {
 
     pub(crate) fn ctx(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut ctx_aux: ContextAux,
     ) -> Result<(MatMulCtx, ContextAux)> {
         let (left_shape, right_shape) = match (&self.left_matrix, &self.right_matrix) {

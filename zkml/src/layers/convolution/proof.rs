@@ -4,9 +4,12 @@ use super::{
 use crate::{
     Claim, Element, Shape, VectorTranscript,
     commit::identity_eval,
+    graph::NodeId,
     iop::{context::ShapeStep, verifier::Verifier},
-    layers::{hadamard, provable::OpInfo},
-    model::NodeID,
+    layers::{
+        hadamard,
+        provable::{OpInfo, VerifiableCtx},
+    },
     padding::PaddingMode,
     tensor::{TensorKey, get_root_of_unity},
     util::from_mle_list_dimensions,
@@ -19,8 +22,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use sumcheck::structs::{IOPProof, IOPVerifierState};
 use transcript::Transcript;
-
-use crate::layers::provable::VerifiableCtx;
 
 fn pow_two_omegas<E: ExtensionField>(n: usize, is_fft: bool) -> Vec<E> {
     let mut pows = vec![E::ZERO; n - 1];
@@ -59,7 +60,7 @@ fn phi_eval<E: ExtensionField>(
 /// Info about the convolution layer derived during the setup phase
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConvCtx {
-    pub node_id: NodeID,
+    pub node_id: NodeId,
     pub kw: usize,
     pub kx: usize,
     pub real_nw: usize,

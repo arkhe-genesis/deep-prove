@@ -1,17 +1,6 @@
-use multilinear_extensions::{mle::IntoMLE, util::ceil_log2};
-use serde::de::DeserializeOwned;
-use std::{cmp::Ordering, collections::HashMap};
-use tenstore::GenStore;
-
-use crate::{Number, model::NodeID, tensor::TensorTypeParam};
-use anyhow::{Context, bail, ensure};
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use serde::{Deserialize, Serialize};
-use transcript::Transcript;
-
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    Claim, Element, Number, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -27,8 +16,16 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{self, Fieldizer},
-    tensor::{KeyedTensor, TensorKey, WrappedTensor},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
 };
+use anyhow::{Context, bail, ensure};
+use ff_ext::ExtensionField;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{mle::IntoMLE, util::ceil_log2};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{cmp::Ordering, collections::HashMap};
+use tenstore::GenStore;
+use transcript::Transcript;
 
 /// The short name used to identify the Add layer.
 pub const ADD_LAYER: &str = "_ADD";
@@ -53,7 +50,7 @@ impl<N: TensorTypeParam> Default for Add<N> {
 /// NOTE: In LLM, we assume the same scaling info regardless of the sequence length.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddCtx {
-    node_id: NodeID,
+    node_id: NodeId,
     quant_info: AddQuantInfo,
     operand_key: Option<TensorKey>,
 }
@@ -82,7 +79,7 @@ impl<N: TensorTypeParam> Add<N> {
 impl Add<Element> {
     pub(crate) fn prove_step<A: AsRef<Tensor<E>>, E: ExtensionField, T: Transcript<E>, PCS>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
         inputs: &[A],
         prover: &mut Prover<E, T, PCS>,
@@ -455,7 +452,7 @@ impl QuantizeOp for Add<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -471,7 +468,7 @@ impl QuantizeOp for Add<f32> {
 impl ProveInfo for Add<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let Some(ref quant_info) = self.quant_info else {
@@ -526,7 +523,7 @@ where
 
     fn prove<T>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,

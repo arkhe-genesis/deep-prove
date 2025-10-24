@@ -62,7 +62,7 @@ impl Input {
     }
 
     pub fn to_elements(self, md: &ModelMetadata) -> Vec<Vec<Element>> {
-        let input_sf = md.input.first().unwrap();
+        let input_sf = md.input_scaling(0);
 
         self.input_data
             .into_iter()

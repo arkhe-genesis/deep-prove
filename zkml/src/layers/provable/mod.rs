@@ -1,16 +1,12 @@
-use crate::model::NodeID;
-use anyhow::{Result, bail, ensure};
-use derive_more::{From, Into};
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::mle::IntoMLE;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, fmt::Debug};
-use tenstore::GenStore;
-use transcript::Transcript;
-
+use super::{
+    LayerCtx, LayerProof,
+    flatten::Flatten,
+    requant::Requant,
+    transformer::{layernorm::LayerNormData, softmax::SoftmaxData},
+};
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -24,13 +20,15 @@ use crate::{
     padding::{PaddingMode, ShapeInfo},
     tensor::{ConvFFTData, TensorTypeParam, WrappedTensor},
 };
-
-use super::{
-    LayerCtx, LayerProof,
-    flatten::Flatten,
-    requant::Requant,
-    transformer::{layernorm::LayerNormData, softmax::SoftmaxData},
-};
+use anyhow::{Result, bail, ensure};
+use derive_more::{From, Into};
+use ff_ext::ExtensionField;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::mle::IntoMLE;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{collections::HashMap, fmt::Debug};
+use tenstore::GenStore;
+use transcript::Transcript;
 
 /// Enum if the output of evaluating a layer returns extra data needed during proving.
 /// This should only be implemented for quantised layers.
@@ -190,7 +188,7 @@ pub trait ProveInfo {
     /// Compute the proving context for the operation
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)>;
 }
@@ -269,7 +267,7 @@ pub trait QuantizeOp {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>>;
@@ -300,7 +298,7 @@ where
     /// Produces a proof of correct execution for this operation.
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
-        _node_id: NodeID,
+        _node_id: NodeId,
         _ctx: &'b Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         _step_data: &StepData<E, E>,
@@ -318,7 +316,7 @@ where
     /// Generate witness for a node where a lookup table is employed in proving
     fn gen_lookup_witness(
         &self,
-        _id: NodeID,
+        _id: NodeId,
         _ctx: &ProverContext<E, PCS>,
         _step_data: &StepData<Element, E>,
         _store: &mut GenStore,

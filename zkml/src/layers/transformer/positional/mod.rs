@@ -1,23 +1,6 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
-
-use crate::{
-    parser::llm::transformer::expand,
-    tensor::{KeyedTensor, TensorKey},
-};
-use anyhow::{Ok, bail, ensure};
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::GenStore;
-use transcript::Transcript;
-
 use crate::{
     Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -34,16 +17,28 @@ use crate::{
             rope::{Rope, RopeCtx, RopeProof},
         },
     },
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{PaddingMode, ShapeInfo},
     parser::{
         gguf::FileTensorLoader,
         json,
-        llm::{LLMConfig, LLMVariant},
+        llm::{LLMConfig, LLMVariant, transformer::expand},
     },
     quantization::{Fieldizer, TensorFielder},
-    tensor::{TensorSlice, TensorTypeParam, WrappedTensor},
+    tensor::{KeyedTensor, TensorKey, TensorSlice, TensorTypeParam, WrappedTensor},
 };
+use anyhow::{Ok, bail, ensure};
+use ff_ext::ExtensionField;
+use itertools::Itertools;
+use mpcs::PolynomialCommitmentScheme;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+use tenstore::GenStore;
+use transcript::Transcript;
 
 pub(crate) mod absolute;
 pub(crate) mod rope;
@@ -404,7 +399,7 @@ impl<N: TensorTypeParam> OpInfo for Positional<N> {
 impl ProveInfo for Positional<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let (ctx, aux) = match &self.variant {
@@ -428,7 +423,7 @@ impl QuantizeOp for Positional<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -569,7 +564,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,

@@ -1,26 +1,7 @@
-use std::{
-    ops::Deref,
-    sync::{Arc, Mutex},
-};
-
-use anyhow::{Ok, Result, ensure};
-use either::Either;
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-use tenstore::GenStore;
-use tracing::warn;
-use transcript::Transcript;
-
 use crate::{
     Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -32,7 +13,7 @@ use crate::{
         requant::Requant,
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
-    model::{NodeID, StepData},
+    model::StepData,
     quantization::{self, Fieldizer, TensorFielder},
     tensor::{
         KeyedTensor, TensorKey, TensorSlice, TensorTypeParam, WrappedTensor,
@@ -40,6 +21,24 @@ use crate::{
     },
     util::from_mle_list_dimensions,
 };
+use anyhow::{Ok, Result, ensure};
+use either::Either;
+use ff_ext::ExtensionField;
+use itertools::Itertools;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
+use tenstore::GenStore;
+use tracing::warn;
+use transcript::Transcript;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
@@ -58,7 +57,7 @@ pub struct RopeProof<E: ExtensionField> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RopeCtx {
-    node_id: NodeID,
+    node_id: NodeId,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
     cosine_key: TensorKey,
@@ -147,7 +146,7 @@ impl<N: TensorTypeParam> Rope<N> {
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     >(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         output_claim: &Claim<E>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,
@@ -390,7 +389,7 @@ impl Rope<f32> {
     pub(super) fn quantize<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: ScalingFactor,
     ) -> anyhow::Result<QuantizeOutput<Rope<Element>>> {
         // compute scaling factor for cosine and sine matrices
@@ -430,7 +429,7 @@ impl Rope<f32> {
         // scaling factor `input_scaling` and an item with scaling factor `matrix_scale`.
         // Therefore, we can use the multiplier `input_scaling*matrix_scale/output_scaling` to requantize
         let multiplier = input_scaling.m(&matrix_scale, output_scaling);
-        let output_bit_size = 2 * *quantization::BIT_LEN + 1; // +1 because we are adding 2 products of items with `quantization::BIT_LEN` bits 
+        let output_bit_size = 2 * *quantization::BIT_LEN + 1; // +1 because we are adding 2 products of items with `quantization::BIT_LEN` bits
         let requant = Requant::from_multiplier(multiplier, output_bit_size);
 
         let quantized_rope = Rope {
@@ -458,7 +457,7 @@ impl PadOp for Rope<Element> {
 impl Rope<Element> {
     pub(super) fn step_info(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(RopeCtx, ContextAux)> {
         // this closure retains only values in odd columns, relying on the fact that `self.cosine_matrix`

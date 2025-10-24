@@ -1,8 +1,7 @@
-use std::collections::HashMap;
-
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{
         ChallengeStorage,
         context::{ContextAux, ShapeStep},
@@ -24,7 +23,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{IntoElement, TensorFielder},
     tensor::{TensorTypeParam, WrappedTensor},
@@ -41,6 +40,7 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{Expression, mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -65,7 +65,7 @@ pub struct ArgmaxDataNew<E: TensorTypeParam> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogitsCtx {
     lookup_ctx: LayerLookupContext,
-    node_id: NodeID,
+    node_id: NodeId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -275,7 +275,7 @@ impl OpInfo for Logits {
 impl ProveInfo for Logits {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         ensure!(
@@ -304,7 +304,7 @@ impl QuantizeOp for Logits {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -358,7 +358,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -516,7 +516,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,

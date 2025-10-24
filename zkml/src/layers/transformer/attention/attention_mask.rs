@@ -1,8 +1,8 @@
 //! Implementation of various types of attention masks for transformer models.
-
 use crate::{
     Claim, Element, Number, ScalingFactor, Shape, Tensor,
     commit::compute_betas_eval,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         prover::Prover,
@@ -16,30 +16,32 @@ use crate::{
         },
         transformer::mha::eval_zeroifier_mle,
     },
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{PaddingMode, ShapeInfo},
     quantization::Fieldizer,
     tensor::{BShape, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, bail, ensure};
+use burn::tensor::{Tensor as BTensor, TensorData};
+use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{Expression, util::ceil_log2};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::util::optimal_sumcheck_threads;
-use tenstore::GenStore;
-use transcript::Transcript;
-
-use burn::tensor::{Tensor as BTensor, TensorData};
-use either::Either;
 use multilinear_extensions::{
+    Expression,
     mle::MultilinearExtension,
+    util::ceil_log2,
     virtual_poly::{VPAuxInfo, eq_eval},
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use p3_field::FieldAlgebra;
-use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
+use tenstore::GenStore;
+use transcript::Transcript;
 
 /// The short name used to identify the attention mask layer
 pub const ATTENTION_MASK_LAYER: &str = "MASK";
@@ -593,7 +595,7 @@ impl QuantizeOp for AttentionMask<f32> {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         _data: &S::AuxData,
-        _node_id: NodeID,
+        _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -626,7 +628,7 @@ impl QuantizeOp for AttentionMask<f32> {
 impl ProveInfo for AttentionMask<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         // We need the previous output shapes to compute the sumcheck expressions
@@ -686,7 +688,7 @@ fn build_sumcheck_expression<E: ExtensionField>(
 pub struct AttentionMaskCtx<E: ExtensionField> {
     pub op: AttentionMask<Element>,
     pub sumcheck_expression: Vec<Expression<E>>,
-    pub node_id: NodeID,
+    pub node_id: NodeId,
 }
 
 impl<E: ExtensionField> AttentionMaskCtx<E> {
@@ -694,7 +696,7 @@ impl<E: ExtensionField> AttentionMaskCtx<E> {
     pub fn new(
         op: AttentionMask<Element>,
         sumcheck_expression: Vec<Expression<E>>,
-        node_id: NodeID,
+        node_id: NodeId,
     ) -> Self {
         AttentionMaskCtx {
             op,
@@ -742,7 +744,7 @@ where
 
     fn prove<'a, 'b, 'c, 'd, T: transcript::Transcript<E>>(
         &'a self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,

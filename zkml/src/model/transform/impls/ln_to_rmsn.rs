@@ -1,7 +1,7 @@
 //! Definition of the [`RewriteRule`] to replace [`LayerNorm`] with [`RMSNorm`]
 use crate::{
     Tensor,
-    graph::{Direction, Source},
+    graph::{Direction, NodeId},
     layers::{
         Layer,
         add::ADD_LAYER,
@@ -14,7 +14,7 @@ use crate::{
             rmsnorm::RMSNorm,
         },
     },
-    model::{Model, NodeID, transform::ModelTransform},
+    model::{Model, transform::ModelTransform},
     shape::Shape,
     tensor::KeyedTensor,
 };
@@ -29,10 +29,10 @@ impl ModelTransform<f32> for LayerNormToRMSNorm {
         // Iterate over the nodes in `eval_order`
         // NOTE: collecting here because then inside the loop we're mutating the graph
         for node_id in model.eval_order().collect::<Vec<_>>().into_iter() {
-            let node = &model.graph[&node_id];
+            let node = &model.graph[node_id];
 
             // If the node isn't a LayerNorm, do nothing
-            let Layer::<f32>::LayerNorm(ref layer_norm) = node else {
+            let Some(Layer::<f32>::LayerNorm(ref layer_norm)) = node.as_inner() else {
                 continue;
             };
 
@@ -42,15 +42,17 @@ impl ModelTransform<f32> for LayerNormToRMSNorm {
             // Create the new RMSNorm node
             let rms_norm = Layer::RMSNorm(RMSNorm::<f32>::new(None, *eps, Some(gamma.shape()[0]))?);
 
-            // at this point we dont need the immutable reference - everything below is mutable so we take back ownership
-            // of the layer norm without copying by swapping it with the new RMSNorm and then later can change the associated
-            // nodes
-            model.graph.replace_node::<Layer<f32>, _>(&node_id, |ln| {
+            // at this point we dont need the immutable reference - everything
+            // below is mutable so we take back ownership of the layer norm
+            // without copying by swapping it with the new RMSNorm and then
+            // later can change the associated nodes
+            model.graph.replace_inner(node_id, |ln| {
                 old_layer_norm = Some(ln);
                 rms_norm
             })?;
 
-            let Layer::<f32>::LayerNorm(LayerNorm { gamma, beta, .. }) = old_layer_norm.unwrap()
+            let Layer::<f32>::LayerNorm(LayerNorm { gamma, beta, .. }) =
+                old_layer_norm.as_mut().unwrap()
             else {
                 unreachable!("Expected LayerNorm node");
             };
@@ -59,7 +61,7 @@ impl ModelTransform<f32> for LayerNormToRMSNorm {
             // We should have a single output to the LayerNorm so we check that here
             let mut output_edges = model
                 .graph
-                .node_neighbors(&node_id, Direction::Outgoing)
+                .neighbors(node_id, Direction::Outgoing)
                 .map(|(_, edge)| edge)
                 .collect::<Vec<_>>();
             ensure!(
@@ -76,31 +78,31 @@ impl ModelTransform<f32> for LayerNormToRMSNorm {
                 output_edge.ports().len()
             );
 
-            // the output edge should have a NodeID so we use that get the next node
+            // the output edge should have a NodeId so we use that get the next node
             // safe unwrap since it's guaranteed to be a node because we used node_neighbors
             #[allow(clippy::clone_on_copy)]
-            let output_node_id = output_edge.target_id().unwrap().clone();
+            let output_node_id = output_edge.target().clone();
             let output_node = model
                 .graph
-                .node_mut(&output_node_id)
-                .expect("Output node should exist in the model");
-            modify_subsequent_linear_layer(output_node, &gamma, &beta)?;
+                .node_mut(output_node_id)
+                .expect("Output node should exist in the model")
+                .as_inner_mut()
+                .unwrap();
+            modify_subsequent_linear_layer(output_node, gamma, beta)?;
 
             let input_node_ids = model
                 .graph
-                .neighbors(&node_id, Direction::Incoming)
-                .map(|(_, edge)| {
-                    let Source::Node(input_node_id) = edge.source() else {
-                        bail!("Expected input edge");
-                    };
-                    #[allow(clippy::clone_on_copy)]
-                    Ok(input_node_id.clone())
-                })
-                .collect::<Result<Vec<_>>>()?;
+                .incomings(node_id)
+                .map(|(_, edge)| edge.source())
+                .filter(|n_id| model.graph.node(*n_id).unwrap().as_inner().is_some())
+                .collect::<Vec<_>>();
 
             // Modify the input and output nodes as required
             for input_node_id in input_node_ids.into_iter() {
-                let input_node = &model.graph[input_node_id];
+                let Some(input_node) = model.graph[input_node_id].as_inner() else {
+                    unreachable!("filtered above")
+                };
+
                 let input_op_name = input_node.short_name();
                 match input_op_name {
                     ADD_LAYER => {
@@ -119,19 +121,21 @@ impl ModelTransform<f32> for LayerNormToRMSNorm {
 
 /// Function used when the layer prior to [`LayerNorm`] was an Add. Checks the inputs of the Add to ensure they are
 /// either Add, [`Positional`] or [`MatMul`] and that there is at least one [`MatMul`].
-fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeID) -> Result<()> {
+fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) -> Result<()> {
     let input_ids = model
         .graph
-        .node_neighbors(&input_node_id, Direction::Incoming)
-        // safe since node_neighbors only returns edges between nodes
-        .map(|(_, edge)| *edge.source_id().unwrap())
+        .incomings(input_node_id)
+        .map(|(_, edge)| edge.source())
+        .filter(|n_id| model.graph[*n_id].as_inner().is_some())
         .collect::<Vec<_>>();
 
     let seen_a_matmul = input_ids
         .into_iter()
         .try_fold(false, |seen_a_matmul, input_id| {
             // safe unwrap since it's guaranteed to be a node because we used node_neighbors
-            let input_node = model.graph.node_mut(&input_id).unwrap();
+            let Some(input_node) = model.graph.node_mut(input_id).unwrap().as_inner_mut() else {
+                unreachable!("filtered above")
+            };
             let add_input_op_name = input_node.short_name();
             match add_input_op_name {
                 MATMUL_LAYER => {
@@ -153,17 +157,19 @@ fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeID) -> Resu
 
 /// Function used when the layer prior to [`LayerNorm`] was a [`Positional`]. Checks the [`Positional`] has a singular input
 /// which is an [`Embeddings`]. Then it modifies both the [`Positional`] and [`Embeddings`] layers so each row has mean 0.
-fn positional_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeID) -> Result<()> {
+fn positional_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) -> Result<()> {
     let positional_node = model
         .graph
-        .node_mut(&input_node_id)
-        .expect("Input node should exist in the model");
+        .node_mut(input_node_id)
+        .expect("Input node should exist in the model")
+        .as_inner_mut()
+        .unwrap();
     // If we have a positional layer we have to modify it and the preceding embeddings layer
     modify_matrix_subtract_mean(positional_node)?;
 
     let positional_inputs = model
         .graph
-        .node_neighbors(&input_node_id, Direction::Incoming)
+        .neighbors(input_node_id, Direction::Incoming)
         .collect::<Vec<_>>();
     // We check that this has length 1
     ensure!(
@@ -172,12 +178,13 @@ fn positional_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeID) 
     );
     // Now we need to modify the preceding embeddings layer
     // safe unwrap since it's guaranteed to be a node because we used node_neighbors
-    #[allow(clippy::clone_on_copy)]
-    let embeddings_node_id = positional_inputs[0].1.source_id().unwrap().clone();
+    let embeddings_node_id = positional_inputs[0].1.source();
     let embeddings_node = model
         .graph
-        .node_mut(&embeddings_node_id)
-        .expect("Embeddings node should exist in the model");
+        .node_mut(embeddings_node_id)
+        .expect("Embeddings node should exist in the model")
+        .as_inner_mut()
+        .unwrap();
     modify_matrix_subtract_mean(embeddings_node)?;
     Ok(())
 }
@@ -508,11 +515,12 @@ mod tests {
         let last_model_node_id = model
             .graph
             .backward_iter()
+            .filter(|(_, n)| n.is_inner())
             .take(1)
             .map(|(id, _)| id)
-            .collect::<Vec<NodeID>>()[0];
+            .collect::<Vec<NodeId>>()[0];
         // Extract the input to the Logits layer before applying the transformation.
-        let pre_transform_final_step = trace.get_step(&last_model_node_id).unwrap();
+        let pre_transform_final_step = trace.get_step(last_model_node_id).unwrap();
         let pre_transform_inputs = pre_transform_final_step
             .step_data
             .input_tensors(&mut store)
@@ -529,7 +537,7 @@ mod tests {
             &mut store,
         )?;
 
-        let post_transform_final_step = new_trace.get_step(&last_model_node_id).unwrap();
+        let post_transform_final_step = new_trace.get_step(last_model_node_id).unwrap();
         let post_transform_inputs = post_transform_final_step
             .step_data
             .input_tensors(&mut store)

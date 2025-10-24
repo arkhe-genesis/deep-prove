@@ -425,7 +425,7 @@ impl Driver<Element> {
     {
         debug!(
             "Generating context for model with {} layers",
-            self.model.graph.graph_order()
+            self.model.graph.node_count()
         );
         let (prover_ctx, verifier_ctx) = self.model.generate_contexts()?;
         Ok(LLMContext {

@@ -1,40 +1,7 @@
-use anyhow::Context;
-use std::collections::HashMap;
-
-use crate::{
-    commit::identity_eval,
-    lookup::logup_gkr::{prover::batch_multiple_sizes_prove, structs::LogUpBatchProof},
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
-    to_base,
-};
-use anyhow::{Result, anyhow, ensure};
-use ark_std::Zero;
-use either::Either;
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    Expression,
-    mle::{IntoMLE, MultilinearExtension},
-    util::{ceil_log2, transpose},
-    utils::eval_by_expr_with_instance,
-    virtual_poly::VPAuxInfo,
-    virtual_polys::VirtualPolynomialsBuilder,
-};
-use witness::{InstancePaddingStrategy, RowMajorMatrix};
-
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-use tenstore::GenStore;
-use tracing::trace;
-use transcript::Transcript;
-
 use crate::{
     Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
-    commit::compute_betas_eval,
+    commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         prover::Prover,
@@ -51,14 +18,43 @@ use crate::{
         context::{
             COLUMN_SEPARATOR, InverseSQRTTableData, LayerLookupContext, LookupWitnessGen, TableType,
         },
-        logup_gkr::verifier::verify_logup_proof_multiple_sizes,
+        logup_gkr::{
+            prover::batch_multiple_sizes_prove, structs::LogUpBatchProof,
+            verifier::verify_logup_proof_multiple_sizes,
+        },
     },
-    model::{NodeID, StepData},
+    model::StepData,
     number::Number,
     padding::PaddingMode,
     parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
     quantization::{self, Fieldizer},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    to_base,
 };
+use anyhow::{Context, Result, anyhow, ensure};
+use ark_std::Zero;
+use either::Either;
+use ff_ext::ExtensionField;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{
+    Expression,
+    mle::{IntoMLE, MultilinearExtension},
+    util::{ceil_log2, transpose},
+    utils::eval_by_expr_with_instance,
+    virtual_poly::VPAuxInfo,
+    virtual_polys::VirtualPolynomialsBuilder,
+};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
+use tenstore::GenStore;
+use tracing::trace;
+use transcript::Transcript;
+use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 /// The short name used to identify the LayerNorm layer.
 pub(crate) const LAYERNORM_LAYER: &str = "LNRM";
@@ -340,7 +336,7 @@ impl LayerNorm<f32> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "E: ExtensionField + DeserializeOwned")]
 pub struct LayerNormCtx<E: ExtensionField> {
-    node_id: NodeID,
+    node_id: NodeId,
     /// The result of calling [`f32::to_bits`] on the epsilon used for normalisation purposes
     eps: u32,
     /// The number of bits that get range checked (so we can know how many instances there are in the range lookup)
@@ -609,7 +605,7 @@ impl QuantizeOp for LayerNorm<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -675,7 +671,7 @@ impl QuantizeOp for LayerNorm<f32> {
 impl ProveInfo for LayerNorm<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         if let Some(quant_info) = self.quant_info() {
@@ -854,7 +850,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -893,7 +889,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -918,7 +914,7 @@ type ProveOut<E, PCS> = (Vec<Claim<E>>, LayerNormProof<E, PCS>);
 impl LayerNorm<Element> {
     pub(crate) fn prove_step<E, T, PCS>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
         ctx: &LayerNormCtx<E>,
         input_poly: MultilinearExtension<E>,
@@ -1083,7 +1079,7 @@ impl LayerNorm<Element> {
     /// Internal method for generating the [`LogUpWitness`] for a [`LayerNorm`] step.
     fn lookup_witness<E, PCS>(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         layernorm_data: &LayerNormData,
     ) -> Result<LookupWitnessGen<E, PCS>>

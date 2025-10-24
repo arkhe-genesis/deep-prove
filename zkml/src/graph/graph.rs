@@ -1,4 +1,3 @@
-use anyhow::{Context, ensure};
 /// ! The graph module implements a directed graph data structure with some additional features listed below.
 ///
 /// - This graph is actually a port graph, meaning that each edge has a list of source and target ports that are
@@ -9,8 +8,8 @@ use anyhow::{Context, ensure};
 /// - It enforces that there is only one edge between two nodes.
 /// - Nodes can be indexed by a custom type. This allows backwards compatibility with other graph implementations
 ///   like `petgraph` or `onnx`.
-use serde::Deserialize;
-use serde::Serialize;
+use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt::Debug,
@@ -20,8 +19,183 @@ use std::{
 };
 
 /// Counter to automatically generate indices for nodes.
-static NODE_INDEX_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static EDGE_INDEX_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// The nodes the graph is built off.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Node<L, I = usize, O = usize> {
+    /// A node encoding the i-th input.
+    Input(I),
+    /// A internal node.
+    Inner(L),
+    /// A node encoding the i-th output.
+    Output(O),
+}
+impl<L, I, O> Node<L, I, O> {
+    pub fn is_input(&self) -> bool {
+        matches!(self, Node::Input(_))
+    }
+
+    /// If this node is an input, returns its payload.
+    pub fn as_input(&self) -> Option<&I> {
+        match self {
+            Node::Input(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn is_inner(&self) -> bool {
+        matches!(self, Node::Inner(_))
+    }
+
+    /// If this node carries an internal payload, returns a reference to it.
+    pub fn as_inner(&self) -> Option<&L> {
+        match self {
+            Node::Inner(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// If this node carries an internal payload, returns a mutable reference to it.
+    pub fn as_inner_mut(&mut self) -> Option<&mut L> {
+        match self {
+            Node::Inner(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// If this node carries an internal payload, consume it into its content.
+    pub fn into_inner(self) -> Option<L> {
+        match self {
+            Node::Inner(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    pub fn is_output(&self) -> bool {
+        matches!(self, Node::Output(_))
+    }
+
+    /// If this node is an output, returns its position in the list of outputs as
+    /// defined by the original model.
+    pub fn as_output(&self) -> Option<&O> {
+        match self {
+            Node::Output(o) => Some(o),
+            _ => None,
+        }
+    }
+}
+
+// Syntactic sugar for graphs using only inner nodes (e.g. partitions).
+impl<L> Node<L, (), ()> {
+    pub fn inner(&self) -> &L {
+        self.as_inner().unwrap()
+    }
+}
+
+#[derive(
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    derive_more::Debug,
+    derive_more::Display,
+    Serialize,
+    Deserialize,
+)]
+#[debug("{node_id}{port}")]
+#[display("{node_id}{port}")]
+/// Uniquely identifies an input port of a given node.
+pub struct NodeInput {
+    /// The referenced node.
+    pub node_id: NodeId,
+    /// The concerned port of the referenced node.
+    pub port: PortId,
+}
+impl NodeInput {
+    pub fn new<N: Into<NodeId>, P: Into<PortId>>(node_id: N, port: P) -> Self {
+        NodeInput {
+            node_id: node_id.into(),
+            port: port.into(),
+        }
+    }
+}
+
+#[derive(
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    derive_more::Display,
+    derive_more::Debug,
+    Serialize,
+    Deserialize,
+)]
+#[debug("{node_id}{port}")]
+#[display("{node_id}{port}")]
+/// Uniquely identifies an output port of a given node.
+pub struct NodeOutput {
+    /// The referenced node.
+    pub node_id: NodeId,
+    /// The concerned port of the referenced node.
+    pub port: PortId,
+}
+impl NodeOutput {
+    pub fn new<N: Into<NodeId>, P: Into<PortId>>(node_id: N, port: P) -> Self {
+        NodeOutput {
+            node_id: node_id.into(),
+            port: port.into(),
+        }
+    }
+}
+
+/// Uniquely identifies a link between an output port of a node and an input
+/// port of another node.
+///
+/// This is used to uniquely identify a feed living on an edge between two
+/// nodes.
+#[derive(derive_more::Debug)]
+#[debug("{source} -> {target}")]
+pub struct Feed {
+    /// The source port of the link between the two nodes.
+    pub source: NodeOutput,
+    /// The source port of the link between the two nodes.
+    pub target: NodeInput,
+}
+
+/// Given an iterator over `T`s linked to a node output, order them by their
+/// port number and strip the [`NodeOutput`] to obtain an iterator of `T`s
+/// implicitly ordered by the port number their were attached to.
+///
+/// This is used to prepare data generated in non-specified order for use in
+/// crypto code that expects vectors implicitly order by port number, typically
+/// in backward graph traversal.
+pub fn order_by_out_port<T, I: Iterator<Item = (NodeOutput, T)>>(i: I) -> impl Iterator<Item = T> {
+    let mut outputs = i
+        .map(|(node_out, x)| (node_out.port, x))
+        .collect::<Vec<_>>();
+    outputs.sort_by_key(|(port, _)| *port);
+    outputs.into_iter().map(|(_, x)| x)
+}
+
+/// Given an iterator over `T`s linked to a node input, order them by their
+/// port number and strip the [`NodeOutput`] to obtain an iterator of `T`s
+/// implicitly ordered by the port number their were attached to.
+///
+/// This is used to prepare data generated in non-specified order for use in
+/// crypto code that expects vectors implicitly order by port number, typically
+/// in forward graph traversal.
+pub fn order_by_in_port<T, I: Iterator<Item = (NodeInput, T)>>(i: I) -> impl Iterator<Item = T> {
+    let mut outputs = i.map(|(node_in, x)| (node_in.port, x)).collect::<Vec<_>>();
+    outputs.sort_by_key(|(port, _)| *port);
+    outputs.into_iter().map(|(_, x)| x)
+}
 
 #[derive(Debug, Clone)]
 pub enum Direction {
@@ -42,40 +216,8 @@ impl Direction {
     }
 }
 
-/// Generic identifier for a node.
-pub trait GenericNodeID:
-    Eq
-    + Hash
-    + Debug
-    + Clone
-    + std::fmt::Display
-    + Ord
-    + PartialOrd
-    + Into<Source<Self>>
-    + Into<Target<Self>>
-    + From<usize>
-    + Into<usize>
-{
-}
-
-impl<T> GenericNodeID for T where
-    T: Eq
-        + Hash
-        + Debug
-        + std::fmt::Display
-        + Clone
-        + Ord
-        + PartialOrd
-        + From<usize>
-        + Into<usize>
-        + Into<Source<Self>>
-        + Into<Target<Self>>
-{
-}
-
 /// Default unique node identifier.
 #[derive(
-    Debug,
     Copy,
     Clone,
     Hash,
@@ -86,12 +228,35 @@ impl<T> GenericNodeID for T where
     derive_more::From,
     derive_more::Into,
     derive_more::Display,
+    derive_more::Debug,
     derive_more::Deref,
     PartialEq,
     Eq,
 )]
-#[display("Node({_0})")]
-pub struct DefaultNodeID(pub usize);
+#[display("N{_0}")]
+#[debug("Node({_0})")]
+pub struct NodeId(pub usize);
+impl NodeId {
+    /// Generate the [`NodeInput`] corresponding to the given port for this node.
+    pub fn input_at<P: Into<PortId>>(&self, port: P) -> NodeInput {
+        NodeInput::new(self.0, port)
+    }
+
+    /// Generate the [`NodeOutput`] corresponding to the given port for this node.
+    pub fn output_at<P: Into<PortId>>(&self, port: P) -> NodeOutput {
+        NodeOutput::new(self.0, port)
+    }
+
+    /// Consider this node as a model input and return its unique [`NodeOutput`].
+    pub fn as_model_input(&self) -> NodeOutput {
+        NodeOutput::new(self.0, 0)
+    }
+
+    /// Consider this node as a model output and return its unique [`NodeInput`].
+    pub fn as_model_output(&self) -> NodeInput {
+        NodeInput::new(self.0, 0)
+    }
+}
 
 /// Unique identifier of an edge. The edge identifier is mostly useful to identify a particular edge and
 /// remove it from the graph efficiently (e.g. without comparing the weights together since it can be expensive).
@@ -110,10 +275,9 @@ pub struct DefaultNodeID(pub usize);
     derive_more::From,
     derive_more::Into,
 )]
-pub struct EdgeID(usize);
+pub struct EdgeId(usize);
 
 #[derive(
-    Debug,
     Clone,
     Serialize,
     Deserialize,
@@ -126,10 +290,12 @@ pub struct EdgeID(usize);
     derive_more::From,
     derive_more::Into,
     derive_more::Display,
+    derive_more::Debug,
     derive_more::Deref,
 )]
-#[display("Port({_0})")]
-pub struct PortID(usize);
+#[display("@{_0}")]
+#[debug("Port({_0})")]
+pub struct PortId(usize);
 
 /// A port link is a link between an input port of a node and an output port of another node.
 #[derive(
@@ -137,15 +303,21 @@ pub struct PortID(usize);
 )]
 #[display("Link({source_port}->{target_port})")]
 pub struct PortLink {
-    pub source_port: PortID,
-    pub target_port: PortID,
+    pub source_port: PortId,
+    pub target_port: PortId,
 }
-
 impl PortLink {
+    pub fn new<I: Into<PortId>, I2: Into<PortId>>(source: I, target: I2) -> Self {
+        Self {
+            source_port: source.into(),
+            target_port: target.into(),
+        }
+    }
+
     pub fn consecutive() -> Self {
         Self {
-            source_port: PortID(0),
-            target_port: PortID(0),
+            source_port: PortId(0),
+            target_port: PortId(0),
         }
     }
 }
@@ -164,18 +336,20 @@ impl PortLink {
     derive_more::Into,
 )]
 pub struct Ports(pub(crate) Vec<PortLink>);
-
 impl Ports {
     pub fn new() -> Self {
         Self::default()
     }
-    /// This returns a port link for two consecutive nodes assuming there is only a single output and input.
+
+    /// This returns a port link for two consecutive nodes assuming there is
+    /// only a single output and input.
     pub fn consecutive() -> Self {
         Self(vec![PortLink {
-            source_port: PortID(0),
-            target_port: PortID(0),
+            source_port: PortId(0),
+            target_port: PortId(0),
         }])
     }
+
     pub fn sorted(self) -> Self {
         let mut ports = self.0;
         ports.sort_by_key(|p| p.source_port);
@@ -183,38 +357,22 @@ impl Ports {
     }
 }
 
-/// Source of an edge is either a node or it is an input offset
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, derive_more::Display)]
-pub enum Source<I> {
-    #[display("Source({_0})")]
-    Node(I),
-    #[display("Input")]
-    Input,
-}
-
-/// Target of an edge is either a node or it is an output offset
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, derive_more::Display)]
-pub enum Target<I> {
-    #[display("Target({_0})")]
-    Node(I),
-    #[display("Output")]
-    Output,
-}
-
 /// An edge is a connection between a source and a target with a list of ports and a weight.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct Edge<I, W> {
-    source: Source<I>,
-    target: Target<I>,
+#[derive(derive_more::Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[debug("{source} -- [{ports:?}] --> {target}")]
+pub struct Edge<W> {
+    source: NodeId,
+    target: NodeId,
     ports: Ports,
-    /// An edge doesn't necessarily have a weight.
-    /// Note only the weight is public since it's the only modifiable field from the user perspective.
-    /// Ports shouldn't be allowed to be modified at will otherwise the invariant of the ports may be violated.
+    /// An edge doesn't necessarily have a weight. Note only the weight is
+    /// public since it's the only modifiable field from the user perspective.
+    /// Ports shouldn't be allowed to be modified at will otherwise the
+    /// invariant of the ports may be violated.
     pub weight: Option<W>,
 }
 
-impl<I: GenericNodeID, W> Edge<I, W> {
-    pub fn new<P: Into<Ports>, S: Into<Source<I>>, T: Into<Target<I>>>(
+impl<W> Edge<W> {
+    pub fn new<P: Into<Ports>, S: Into<NodeId>, T: Into<NodeId>>(
         source: S,
         target: T,
         ports: P,
@@ -228,148 +386,138 @@ impl<I: GenericNodeID, W> Edge<I, W> {
         }
     }
     pub fn between_nodes<P: Into<Ports>>(
-        source: I,
-        target: I,
+        source: NodeId,
+        target: NodeId,
         ports: P,
         weight: Option<W>,
     ) -> Self {
         Self {
-            source: Source::Node(source),
-            target: Target::Node(target),
+            source,
+            target,
             ports: ports.into().sorted(),
             weight,
         }
     }
-    pub fn input<P: Into<Ports>>(node: I, ports: P, weight: Option<W>) -> Self {
-        Self {
-            source: Source::Input,
-            target: Target::Node(node),
-            weight,
-            ports: ports.into().sorted(),
-        }
+    pub fn is_incoming_to(&self, node_id: NodeId) -> bool {
+        self.target == node_id
     }
-    pub fn output<P: Into<Ports>>(node: I, ports: P, weight: Option<W>) -> Self {
-        Self {
-            source: Source::Node(node),
-            target: Target::Output,
-            ports: ports.into().sorted(),
-            weight,
-        }
+    pub fn is_outgoing_from(&self, node_id: NodeId) -> bool {
+        self.source == node_id
     }
-    pub fn is_between_nodes(&self) -> bool {
-        matches!(self.source, Source::Node(_)) && matches!(self.target, Target::Node(_))
+    pub fn source(&self) -> NodeId {
+        self.source
     }
-    pub fn is_input(&self) -> bool {
-        matches!(self.source, Source::Input)
-    }
-    pub fn is_output(&self) -> bool {
-        matches!(self.target, Target::Output)
-    }
-    pub fn is_incoming_to(&self, node_id: &I) -> bool {
-        match self.target {
-            Target::Node(ref target) => target == node_id,
-            Target::Output => false,
-        }
-    }
-    pub fn is_outgoing_from(&self, node_id: &I) -> bool {
-        match self.source {
-            Source::Node(ref source) => source == node_id,
-            Source::Input => false,
-        }
-    }
-    pub fn source(&self) -> &Source<I> {
-        &self.source
-    }
-    pub fn target(&self) -> &Target<I> {
-        &self.target
-    }
-    pub fn source_id(&self) -> Option<&I> {
-        match self.source {
-            Source::Node(ref node) => Some(node),
-            _ => None,
-        }
-    }
-    pub fn target_id(&self) -> Option<&I> {
-        match self.target {
-            Target::Node(ref node) => Some(node),
-            _ => None,
-        }
+    pub fn target(&self) -> NodeId {
+        self.target
     }
     pub fn ports(&self) -> &Ports {
         &self.ports
+    }
+    pub fn feeds(&self) -> impl Iterator<Item = Feed> + use<'_, W> {
+        self.ports.iter().map(|link| Feed {
+            source: NodeOutput {
+                node_id: self.source,
+                port: link.source_port,
+            },
+            target: NodeInput {
+                node_id: self.target,
+                port: link.target_port,
+            },
+        })
     }
 
     /// Tries to find the other end of the edge given a node id.
     /// If the node id is the source, then the target is returned.
     /// If the node id is the target, then the source is returned.
     /// If the node id is not the source or the target, then None is returned.
-    /// If one of the end of the edge is not a node, then None is returned.
-    pub fn other_end(&self, node_id: &I) -> Option<&I> {
-        match (&self.source, &self.target) {
-            (Source::Node(ref source), Target::Node(ref target)) => match node_id {
-                _ if node_id == source => Some(target),
-                _ if node_id == target => Some(source),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-}
-
-impl PortLink {
-    pub fn new<I: Into<PortID>, I2: Into<PortID>>(source: I, target: I2) -> Self {
-        Self {
-            source_port: source.into(),
-            target_port: target.into(),
+    pub fn other_end(&self, node_id: NodeId) -> Option<NodeId> {
+        if self.source == node_id {
+            Some(self.target)
+        } else if self.target == node_id {
+            Some(self.source)
+        } else {
+            None
         }
     }
 }
 
 /// Basic structure that contains a graph and a list of input nodes.
-/// The graph is colored, e.g. each node is associated with a color that corresponds to which machine or thread etc
-/// it should be executed on.
-/// NOTE: need to support the more general case where an output node can be used both as output of the graph
-/// and as input to another node of the graph
-/// NOTE: need to support the strict ordering of inputs when a node expects both inputs from its predecessors AND
-/// input from the graph input data.
+/// The graph is colored, e.g. each node is associated with a color that
+/// corresponds to which machine or thread etc it should be executed on.
+/// NOTE: need to support the strict ordering of inputs when a node expects both
+/// inputs from its predecessors AND input from the graph input data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "NodeID: Serialize, N: Serialize, W: Serialize",
-    deserialize = "NodeID: Eq + Hash + Ord + Deserialize<'de>, N: Deserialize<'de>, W: Deserialize<'de>"
-))]
-pub struct Graph<N, W, NodeID = DefaultNodeID> {
-    /// Nodes indexed by their index - we use a BTreeMap to make the graph iteration deterministic
-    /// and sorted by increasing order of the node id, which is usually equivalent to the order of insertion.
-    nodes: BTreeMap<NodeID, N>,
+pub struct Graph<N, I, O, W> {
+    /// Nodes indexed by their index - we use a BTreeMap to make the graph
+    /// iteration deterministic and sorted by increasing order of the node id,
+    /// which is usually equivalent to the order of insertion.
+    nodes: BTreeMap<NodeId, Node<N, I, O>>,
     /// Contains all the edges in the graph.
-    /// NOTE: currently O(n) to search but once API is stabilized, we can move to a multi key map
-    /// indexed by both the source and the target node to search in O(1).
-    pub(crate) edges: Vec<(EdgeID, Edge<NodeID, W>)>,
+    //
+    /// NOTE: currently O(n) to search but once API is stabilized, we can move
+    /// to a multi key map indexed by both the source and the target node to
+    /// search in O(1).
+    pub(crate) edges: Vec<(EdgeId, Edge<W>)>,
 }
 
-impl<NodeID, N, W> Graph<N, W, NodeID>
+impl<N, I, O, W> Graph<N, I, O, W>
 where
-    NodeID: GenericNodeID,
+    I: PartialEq + std::fmt::Debug,
+    O: PartialEq + std::fmt::Debug,
     W: Clone,
 {
-    /// Add a node to the graph. It will return the index of the added node.
-    /// It will return an error if the next node id to be picked up already exists.
-    /// It can happen if one called `[add_node_with_id]` before with the next node id to be picked up.
-    pub fn add_node(&mut self, node: N) -> anyhow::Result<NodeID> {
-        let node_id = next_node_id();
-        self.add_node_with_id(node_id, node).map(|_| node_id.into())
+    /// Create a new, empty graph.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Add a node to the graph with the given index. It will return an error if the node id already exists.
-    pub fn add_node_with_id<I: Into<NodeID> + Clone>(
+    /// Generate a [`NodeId`] that is not yet used in this graph. No
+    /// sequentiality is guaranteed.
+    ///
+    /// NOTE: made `pub` so that it can be used by the
+    /// [`GlobalCommitmentContext`] to generate a non-colliding table ID.
+    pub fn next_node_id(&self) -> NodeId {
+        self.nodes
+            .keys()
+            .map(|x| **x)
+            .max()
+            .map(|x| x + 1)
+            .unwrap_or(0)
+            .into()
+    }
+
+    /// Add a node to the graph. It will return the index of the added node.
+    fn add_node(&mut self, node: Node<N, I, O>) -> anyhow::Result<NodeId> {
+        let node_id = self.next_node_id();
+        self.add_node_with_id(node_id, node).map(|_| node_id)
+    }
+
+    /// Create an inner node with the provided payload, and return its ID.
+    pub fn add_inner(&mut self, x: N) -> anyhow::Result<NodeId> {
+        self.add_node(Node::Inner(x))
+    }
+
+    /// Create an input node with the provided payload, and return its ID.
+    pub fn add_input(&mut self, i: I) -> anyhow::Result<NodeId> {
+        self.add_node(Node::Input(i))
+    }
+
+    /// Create an output node with the provided payload, and return its ID.
+    pub fn add_output(&mut self, o: O) -> anyhow::Result<NodeId> {
+        self.add_node(Node::Output(o))
+    }
+
+    /// Add a node to the graph with the given ID. Return an error if
+    /// the ID is already assigned.
+    pub fn add_node_with_id<II: Into<NodeId> + Clone>(
         &mut self,
-        nidx: I,
-        node: N,
+        nidx: II,
+        node: Node<N, I, O>,
     ) -> anyhow::Result<()> {
         let id = nidx.into();
-        match self.nodes.insert(id.clone(), node) {
+        match self.nodes.insert(id, node) {
             None => Ok(()),
-            Some(_) => anyhow::bail!("Node with index {id:?} already exists"),
+            Some(_) => anyhow::bail!("{id} already exists"),
         }
     }
 
@@ -382,7 +530,7 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::{Graph, Ports, PortLink};
-    /// let mut graph: Graph<&str, ()> = Graph::new();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// let node1 = graph.add_node("first").unwrap();
     /// let node2 = graph.add_node("second").unwrap();
     ///
@@ -399,11 +547,11 @@ where
     /// ```
     pub fn add_edge<P: Into<Ports>, WO: Into<Option<W>>>(
         &mut self,
-        source: NodeID,
-        target: NodeID,
+        source: NodeId,
+        target: NodeId,
         ports: P,
         weight: WO,
-    ) -> anyhow::Result<EdgeID> {
+    ) -> anyhow::Result<EdgeId> {
         let edge = Edge::new(source, target, ports, weight.into());
         Ok(self.add_edges_raw(vec![edge])?[0])
     }
@@ -419,21 +567,20 @@ where
     /// let node2 = graph.add_node("second").unwrap();
     ///
     /// let edge_id = graph.add_consecutive_edge(node1, node2, Some(())).unwrap();
-    /// assert_eq!(graph.neighbors(&node1, zkml::graph::Direction::Outgoing).count(), 1);
+    /// assert_eq!(graph.neighbors(node1, zkml::graph::Direction::Outgoing).count(), 1);
     /// ```
     pub fn add_consecutive_edge<WO: Into<Option<W>>>(
         &mut self,
-        source: NodeID,
-        target: NodeID,
+        source: NodeId,
+        target: NodeId,
         weight: WO,
-    ) -> anyhow::Result<EdgeID> {
+    ) -> anyhow::Result<EdgeId> {
         self.add_edge(source, target, Ports::consecutive(), weight)
     }
 
     /// Add a consecutive node to the graph.
     /// It adds a new node to the graph and connects it to the previous node with a consecutive edge.
     /// In this case, there is only one port link between the two nodes.
-    /// If no previous node is provided, it adds an input edge to the new node.
     ///
     /// # Examples
     ///
@@ -443,145 +590,51 @@ where
     /// let node1 = graph.add_node("first").unwrap();
     ///
     /// // Add a node connected to an existing node
-    /// let node2 = graph.add_consecutive_node("second", Some(node1), Some(())).unwrap();
-    /// assert_eq!(graph.neighbors(&node1, zkml::graph::Direction::Outgoing).count(), 1);
-    ///
-    /// // Add an input node (no previous connection)
-    /// let input_node = graph.add_consecutive_node("input", None, Some(())).unwrap();
-    /// assert_eq!(graph.input_nodes().count(), 1);
+    /// let node2 = graph.add_consecutive_node("second", node1, Some(())).unwrap();
+    /// assert_eq!(graph.neighbors(node1, zkml::graph::Direction::Outgoing).count(), 1);
     /// ```
     pub fn add_consecutive_node<WO: Into<Option<W>>>(
         &mut self,
-        node: N,
-        previous_node_id: Option<NodeID>,
+        node: Node<N, I, O>,
+        previous_node_id: NodeId,
         weight: WO,
-    ) -> anyhow::Result<NodeID> {
+    ) -> anyhow::Result<NodeId> {
         let new_node_id = self.add_node(node)?;
-        match previous_node_id {
-            Some(id) => self.add_edge(id, new_node_id.clone(), Ports::consecutive(), weight)?,
-            None => {
-                let next_input_offset: usize = self
-                    .edges
-                    .iter()
-                    .filter(|(_, edge)| edge.source == Source::Input)
-                    .flat_map(|(_, edge)| edge.ports.iter().map(|port| port.source_port.0 + 1))
-                    .max()
-                    .unwrap_or(0);
-                self.add_edges_raw(vec![Edge::input(
-                    new_node_id.clone(),
-                    (next_input_offset, 0usize),
-                    weight.into(),
-                )])?[0]
-            }
-        };
+        self.add_edge(previous_node_id, new_node_id, Ports::consecutive(), weight)?;
         Ok(new_node_id)
     }
-    /// Wrapper method around adding an input edge to a node.
-    /// It associates every input offset to the next consecutive available target ports on the target id.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// let node = graph.add_node("node").unwrap();
-    ///
-    /// // Set input at index 0
-    /// let input_id = graph.set_input(node, 0, Some(())).unwrap();
-    /// assert_eq!(graph.input_nodes().count(), 1);
-    /// ```
-    pub fn set_input<I: IntoVecUsize, WO: Into<Option<W>>>(
-        &mut self,
-        node: NodeID,
-        input_index: I,
-        weight: WO,
-    ) -> anyhow::Result<EdgeID> {
-        let target_port_offset: usize = self
-            .edges
-            .iter()
-            .filter(|(_, edge)| edge.target == Target::Node(node.clone()))
-            .flat_map(|(_, edge)| edge.ports.iter().map(|port| port.target_port.0 + 1))
-            .max()
-            .unwrap_or(0);
-        let ports = input_index
-            .into_vec()
-            .into_iter()
-            .enumerate()
-            .map(|(target_port, source_port)| (source_port, target_port + target_port_offset))
-            .collect::<Vec<(usize, usize)>>();
-        let edge = Edge::input(node, ports, weight.into());
-        Ok(self.add_edges_raw(vec![edge])?[0])
-    }
-    /// Wrapper method around adding an output edge from a node.
-    /// It associates every output offset to a consecutive source port on the source id.
-    /// e.g. if target ports were 2,4 then source ports would be 0,1.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// let node = graph.add_node("node").unwrap();
-    ///
-    /// // Set output at index 0
-    /// let output_id = graph.set_output(node, 0, Some(())).unwrap();
-    /// assert_eq!(graph.output_nodes().count(), 1);
-    /// ```
-    pub fn set_output<I: IntoVecUsize, WO: Into<Option<W>>>(
-        &mut self,
-        node: NodeID,
-        output_index: I,
-        weight: WO,
-    ) -> anyhow::Result<EdgeID> {
-        let source_port_offset: usize = self
-            .edges
-            .iter()
-            .filter(|(_, edge)| edge.source == Source::Node(node.clone()))
-            .flat_map(|(_, edge)| edge.ports.iter().map(|port| port.source_port.0 + 1))
-            .max()
-            .unwrap_or(0);
-        let ports = output_index
-            .into_vec()
-            .into_iter()
-            .enumerate()
-            .map(|(source, target)| (source + source_port_offset, target))
-            .collect::<Vec<(usize, usize)>>();
-        let edge = Edge::output(node, ports, weight.into());
-        Ok(self.add_edges_raw(vec![edge])?[0])
-    }
 
-    pub fn add_edges_raw(&mut self, edges: Vec<Edge<NodeID, W>>) -> anyhow::Result<Vec<EdgeID>> {
+    pub fn add_edges_raw(&mut self, edges: Vec<Edge<W>>) -> anyhow::Result<Vec<EdgeId>> {
         let mut edge_ids = Vec::with_capacity(edges.len());
         for new_edge in edges {
+            ensure!(new_edge.source != new_edge.target, "idempotent edge");
             // making sure the source and the targets exists
-            if let Source::Node(ref source_id) = new_edge.source {
-                ensure!(
-                    self.nodes.contains_key(source_id),
-                    "Source node {source_id} not found"
-                );
-            }
-            if let Target::Node(ref target_id) = new_edge.target {
-                ensure!(
-                    self.nodes.contains_key(target_id),
-                    "Target node {target_id} not found"
-                );
-            }
+            ensure!(
+                self.nodes.contains_key(&new_edge.source),
+                "Source node {} not found",
+                new_edge.source
+            );
+            ensure!(
+                self.nodes.contains_key(&new_edge.target),
+                "Target node {} not found",
+                new_edge.target
+            );
+
             // compare with all other edges to see if
             // 1. there are duplicates
             // 2. the ports are consistent, e.g. no target port is used twice on the same node
-            let duplicate = self.edges.iter().any(|(_, current_edge)| {
-                current_edge.source == new_edge.source && current_edge.target == new_edge.target
-            });
             ensure!(
-                !duplicate,
+                !self.edges.iter().any(|(_, current_edge)| {
+                    current_edge.source == new_edge.source && current_edge.target == new_edge.target
+                }),
                 "Edge between {:?} and {:?} already exists",
                 new_edge.source,
                 new_edge.target
             );
             // no need to detect duplicates on already existing edges since it's already checked
             self.check_consistency(
-                &new_edge.target,
-                new_edge.ports.iter().map(|port| &port.target_port),
+                new_edge.target,
+                new_edge.ports.iter().map(|port| port.target_port),
             )?;
             let edge_id = next_edge_id();
             edge_ids.push(edge_id);
@@ -596,31 +649,38 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
+    /// # use zkml::graph::Ports;
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// let node1 = graph.add_node("first").unwrap();
     /// let node2 = graph.add_node("second").unwrap();
-    /// let edge_id = graph.add_edge(node1, node2, zkml::graph::Ports::consecutive(), Some(())).unwrap();
+    /// let edge_id = graph.add_edge(node1, node2, Ports::consecutive(), Some(())).unwrap();
     ///
     /// assert_eq!(graph.edges().count(), 1);
-    /// graph.remove_edge(&edge_id).unwrap();
+    /// graph.remove_edge(edge_id).unwrap();
     /// assert_eq!(graph.edges().count(), 0);
     /// ```
-    pub fn remove_edge(&mut self, edge_id: &EdgeID) -> anyhow::Result<()> {
+    pub fn remove_edge(&mut self, edge_id: EdgeId) -> anyhow::Result<()> {
         let curr_len = self.edges.len();
-        self.edges.retain(|(id, _)| id != edge_id);
+        self.edges.retain(|(id, _)| *id != edge_id);
         if self.edges.len() == curr_len {
             anyhow::bail!("Edge with id {edge_id:?} not found");
         }
         Ok(())
     }
 
-    /// Maps a node to a new node.
-    pub fn replace_node<N2, F>(&mut self, node_id: &NodeID, f: F) -> anyhow::Result<()>
+    /// Transmute an inner node in place, applying `f` to its payload and
+    /// replacing the current one with the result.
+    pub fn replace_inner<F>(&mut self, node_id: NodeId, f: F) -> anyhow::Result<()>
     where
         F: FnOnce(N) -> N,
     {
-        let old_node = self.nodes.remove(node_id).context("Node not found")?;
-        self.nodes.insert(node_id.clone(), f(old_node));
+        let old_node = self
+            .nodes
+            .remove(&node_id)
+            .context("Node not found")?
+            .into_inner()
+            .ok_or_else(|| anyhow::anyhow!("{node_id} is not an inner node"))?;
+        self.nodes.insert(node_id, Node::Inner(f(old_node)));
         Ok(())
     }
 
@@ -630,17 +690,19 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// let node_id = graph.add_node("test").unwrap();
     ///
-    /// assert_eq!(graph.node(&node_id), Some(&"test"));
-    /// assert_eq!(graph.node(&zkml::graph::DefaultNodeID(999)), None);
+    /// assert_eq!(graph.node(node_id), Some(&"test"));
+    /// assert_eq!(graph.node(999.into()), None);
     /// ```
-    pub fn node(&self, node_id: &NodeID) -> Option<&N> {
-        self.nodes.get(node_id)
+    pub fn node(&self, node_id: NodeId) -> Option<&Node<N, I, O>> {
+        self.nodes.get(&node_id)
     }
-    pub fn node_mut(&mut self, node_id: &NodeID) -> Option<&mut N> {
-        self.nodes.get_mut(node_id)
+
+    /// Returns a mutable reference to the node with the given ID, if it exists.
+    pub fn node_mut(&mut self, node_id: NodeId) -> Option<&mut Node<N, I, O>> {
+        self.nodes.get_mut(&node_id)
     }
 
     /// Returns the number of nodes in the graph.
@@ -649,7 +711,7 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// assert_eq!(graph.node_count(), 0);
     ///
     /// let node1 = graph.add_node("first").unwrap();
@@ -665,65 +727,95 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// let node1 = graph.add_node("first").unwrap();
     /// let node2 = graph.add_node("second").unwrap();
     ///
     /// let nodes: Vec<_> = graph.nodes().collect();
     /// assert_eq!(nodes.len(), 2);
     /// ```
-    pub fn nodes(&self) -> impl Iterator<Item = (&NodeID, &N)> + use<'_, NodeID, N, W> {
+    pub fn nodes(&self) -> impl Iterator<Item = (&NodeId, &Node<N, I, O>)> + use<'_, N, I, O, W> {
         self.nodes.iter()
     }
 
-    /// Returns the node ids of the output nodes alongside the associated ports that enforce
-    /// which output is set at which index
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// let node = graph.add_node("node").unwrap();
-    /// graph.set_output(node, 0, Some(())).unwrap();
-    ///
-    /// let outputs: Vec<_> = graph.output_nodes().collect();
-    /// assert_eq!(outputs.len(), 1);
-    /// ```
-    pub fn output_nodes(&self) -> impl Iterator<Item = (&NodeID, &Ports)> + use<'_, NodeID, N, W> {
-        self.edges.iter().filter_map(|(_, edge)| match edge.target {
-            Target::Output => Some((edge.source_id().unwrap(), &edge.ports)),
-            _ => None,
-        })
+    /// Return the topologigl source nodes of this graph, i.e. the nodes without
+    /// any incoming edges.
+    pub fn source_nodes(&self) -> impl Iterator<Item = NodeId> + use<'_, N, I, O, W> {
+        self.nodes
+            .keys()
+            .copied()
+            .filter(|node_id| self.incomings(*node_id).next().is_none())
     }
 
-    /// Returns an iterator over input nodes and their associated ports.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// let node = graph.add_node("node").unwrap();
-    /// graph.set_input(node, 0, Some(())).unwrap();
-    ///
-    /// let inputs: Vec<_> = graph.input_nodes().collect();
-    /// assert_eq!(inputs.len(), 1);
-    /// ```
-    pub fn input_nodes(&self) -> impl Iterator<Item = (&NodeID, &Ports)> + use<'_, NodeID, N, W> {
-        self.edges.iter().filter_map(|(_, edge)| match edge.source {
-            Source::Input => Some((edge.target_id().unwrap(), &edge.ports)),
-            _ => None,
-        })
+    /// Return the topologigl sink nodes of this graph, i.e. the nodes without
+    /// any outgoing edges.
+    pub fn sink_nodes(&self) -> impl Iterator<Item = NodeId> + use<'_, N, I, O, W> {
+        self.nodes
+            .keys()
+            .copied()
+            .filter(|node_id| self.outgoings(*node_id).next().is_none())
     }
 
-    /// Returns an iterator over all edges in the graph as (edge_id, edge) pairs.
+    /// Return whether the provided node is a topological sink of the graph.
+    pub fn is_sink(&self, node_id: NodeId) -> bool {
+        self.outgoings(node_id).next().is_none()
+    }
+
+    /// Return whether the provided node is a topological source of the graph.
+    pub fn is_source(&self, node_id: NodeId) -> bool {
+        self.incomings(node_id).next().is_none()
+    }
+
+    /// Return the ID of and a reference to the first node satisfying the
+    /// provided predicate.
+    pub fn find_node(
+        &self,
+        p: impl Fn(NodeId, &Node<N, I, O>) -> bool,
+    ) -> Option<(&NodeId, &Node<N, I, O>)> {
+        self.nodes.iter().find(|(n_id, n)| p(**n_id, n))
+    }
+
+    /// Returns an iterator, in unspecified order, over this graph input nodes.
+    pub fn input_nodes(&self) -> impl Iterator<Item = (NodeId, &I)> + use<'_, N, I, O, W> {
+        self.nodes()
+            .filter_map(|(n_id, n)| n.as_input().map(|i| (*n_id, i)))
+    }
+
+    /// Returns an iterator, in unspecified order, over this model output nodes.
+    pub fn output_nodes(&self) -> impl Iterator<Item = (NodeId, &O)> + use<'_, N, I, O, W> {
+        self.nodes()
+            .filter_map(|(n_id, n)| n.as_output().map(|i| (*n_id, i)))
+    }
+
+    /// Returns an iterator, in unspecified order, over this graph inner nodes.
+    pub fn inner_nodes(&self) -> impl Iterator<Item = (NodeId, &N)> {
+        self.nodes()
+            .filter_map(|(n_id, n)| n.as_inner().map(|n| (*n_id, n)))
+    }
+
+    /// Return, if it exists, the ID of the input node corresponding to the provided
+    /// input ID.
+    pub fn input_node_id(&self, input_id: I) -> anyhow::Result<NodeId> {
+        self.find_node(|_, n| n.as_input().map(|i| *i == input_id).unwrap_or(false))
+            .map(|(node_id, _)| *node_id)
+            .ok_or_else(|| anyhow::anyhow!("fetching node ID for input {input_id:?}"))
+    }
+
+    /// Return, if it exists, the ID of the output node corresponding to the provided
+    /// output ID.
+    pub fn output_node_id(&self, output_id: O) -> anyhow::Result<NodeId> {
+        self.find_node(|_, n| n.as_output().map(|o| *o == output_id).unwrap_or(false))
+            .map(|(node_id, _)| *node_id)
+            .ok_or_else(|| anyhow::anyhow!("fetching node ID for output {output_id:?}"))
+    }
+
+    /// Returns an iterator over all edges in the graph.
     ///
     /// # Examples
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// let node1 = graph.add_node("first").unwrap();
     /// let node2 = graph.add_node("second").unwrap();
     /// let edge_id = graph.add_edge(node1, node2, zkml::graph::Ports::consecutive(), Some(())).unwrap();
@@ -731,85 +823,23 @@ where
     /// let edges: Vec<_> = graph.edges().collect();
     /// assert_eq!(edges.len(), 1);
     /// ```
-    pub fn edges(
-        &self,
-    ) -> impl Iterator<Item = (&EdgeID, &Edge<NodeID, W>)> + use<'_, NodeID, N, W> {
-        self.edges.iter().map(|(id, edge)| (id, edge))
-    }
-
-    pub fn edge_between<I: Into<Source<NodeID>>, I2: Into<Target<NodeID>>>(
-        &self,
-        source: I,
-        target: I2,
-    ) -> Option<&Edge<NodeID, W>> {
-        let source = source.into();
-        let target = target.into();
-        self.edges
-            .iter()
-            .filter_map(|(_, edge)| {
-                if edge.source == source && edge.target == target {
-                    Some(edge)
-                } else {
-                    None
-                }
-            })
-            .next()
-    }
-
-    /// mut_fn is a function that can be used to mutate the edge. The graph ensures
-    /// that the edge is modified in a consistent way.
-    /// If the modification does not respect the invariant of the ports, it will return an error.
-    /// In such a case, the graph will be left in an inconsistent state and should not be used anymore.
-    pub fn edge_between_mut<I: Into<Source<NodeID>>, I2: Into<Target<NodeID>>>(
-        &mut self,
-        source: I,
-        target: I2,
-        mut mut_fn: impl FnMut(&mut Edge<NodeID, W>) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let source = source.into();
-        let target = target.into();
-        match self
-            .edges
-            .iter_mut()
-            .filter_map(|(id, edge)| {
-                if edge.source == source && edge.target == target {
-                    Some((id, edge))
-                } else {
-                    None
-                }
-            })
-            .next()
-        {
-            Some((id, edge)) => {
-                mut_fn(edge).context(format!(
-                    "Modification of edge between {:?} and {:?} failed: ",
-                    source, target
-                ))?;
-                Some(id)
-            }
-            None => None,
-        }
-        .context(format!(
-            "Edge between {:?} and {:?} not found",
-            source, target
-        ))?;
-        self.check_consistency(&target, vec![])?;
-        Ok(())
+    pub fn edges(&self) -> impl Iterator<Item = &Edge<W>> + use<'_, N, I, O, W> {
+        self.edges.iter().map(|(_id, edge)| edge)
     }
 
     /// Checks that no two target_port is assigned twice amongst all edges that have the same target node.
     /// Checks that all ports are consecutive and fill the range (0..num_ports).
-    fn check_consistency<'a, I: IntoIterator<Item = &'a PortID>>(
-        &'a self,
-        target_node: &'a Target<NodeID>,
-        new_ports: I,
+    fn check_consistency<II: IntoIterator<Item = PortId>>(
+        &self,
+        target_node: NodeId,
+        new_ports: II,
     ) -> anyhow::Result<()> {
         let all_target_ports = self
             .edges
             .iter()
-            .filter(move |(_, current_edge)| &current_edge.target == target_node)
+            .filter(move |(_, current_edge)| current_edge.target == target_node)
             .flat_map(|(_, current_edge)| current_edge.ports.0.iter())
-            .map(|port| &port.target_port)
+            .map(|port| port.target_port)
             .collect::<Vec<_>>();
         let mut set = all_target_ports
             .into_iter()
@@ -825,87 +855,134 @@ where
         );
         let len = set.len();
         ensure!(
-            (0..len).all(|i| set.contains(&PortID(i))),
+            (0..len).all(|i| set.contains(&PortId(i))),
             "Ports are not consecutive: {:?}",
             set
         );
         Ok(())
     }
 
-    pub fn edge<'a>(&'a self, edge_id: &EdgeID) -> Option<&'a Edge<NodeID, W>> {
+    pub fn edge<'a>(&'a self, edge_id: &EdgeId) -> Option<&'a Edge<W>> {
         self.edges
             .iter()
             .find(|(id, _)| id == edge_id)
             .map(|(_, edge)| edge)
     }
 
-    pub fn edge_mut<'a>(&'a mut self, edge_id: &EdgeID) -> Option<&'a mut Edge<NodeID, W>> {
-        self.edges
-            .iter_mut()
-            .find(|(id, _)| id == edge_id)
-            .map(|(_, edge)| edge)
-    }
-
-    /// Returns the edges of a node that starts at `node` and goes in the direction `direction`.
-    pub fn neighbors_mut<'a>(
-        &'a mut self,
-        // Note it's not a reference because otherwise it needs to be captured by the closure
-        // and rust borrow struggles with that
-        node: &'a NodeID,
-        direction: Direction,
-    ) -> impl Iterator<Item = (&'a mut EdgeID, &'a mut Edge<NodeID, W>)> + use<'a, NodeID, N, W>
-    {
-        self.edges
-            .iter_mut()
-            .filter(move |(_, edge)| match direction {
-                Direction::Outgoing => edge.source == node.into(),
-                Direction::Incoming => edge.target == node.into(),
-                Direction::Any => true,
-            })
-            .map(|(id, edge)| (id, edge))
-    }
-
-    /// Returns the edges of a node that starts at `node` and goes in the direction `direction`.
+    /// Returns the edges touching the provided node, in `direction`.
     pub fn neighbors<'a>(
         &'a self,
-        node: &'a NodeID,
+        node_id: NodeId,
         direction: Direction,
-    ) -> impl Iterator<Item = (&'a EdgeID, &'a Edge<NodeID, W>)> + use<'a, N, NodeID, W> {
+    ) -> impl Iterator<Item = (&'a EdgeId, &'a Edge<W>)> + use<'a, N, I, O, W> {
         self.edges
             .iter()
             .filter(move |(_, edge)| match direction {
-                Direction::Outgoing => edge.source == node.into(),
-                Direction::Incoming => edge.target == node.into(),
-                Direction::Any => edge.source == node.into() || edge.target == node.into(),
+                Direction::Outgoing => edge.source == node_id,
+                Direction::Incoming => edge.target == node_id,
+                Direction::Any => edge.source == node_id || edge.target == node_id,
             })
             .map(|(id, edge)| (id, edge))
     }
 
-    /// Returns the edges of a node that starts at `node` and goes in the direction `direction`.
-    /// The edges are filtered to only include edges that are between nodes.
-    pub fn node_neighbors<'a>(
-        &'a self,
-        node: &'a NodeID,
+    /// Returns mutable references to the edges touching the provided node, in `direction`.
+    pub fn neighbors_mut<'a>(
+        &'a mut self,
+        node_id: NodeId,
         direction: Direction,
-    ) -> impl Iterator<Item = (&'a EdgeID, &'a Edge<NodeID, W>)> + use<'a, N, NodeID, W> {
-        self.neighbors(node, direction)
-            .filter(|(_, edge)| edge.is_between_nodes())
+    ) -> impl Iterator<Item = (EdgeId, &'a mut Edge<W>)> + use<'a, N, I, O, W> {
+        self.edges
+            .iter_mut()
+            .filter(move |(_, edge)| match direction {
+                Direction::Outgoing => edge.source == node_id,
+                Direction::Incoming => edge.target == node_id,
+                Direction::Any => edge.source == node_id || edge.target == node_id,
+            })
+            .map(|(id, edge)| (*id, edge))
     }
 
-    /// Number of nodes in the graph
+    /// Return an iterator of references to the edges incoming into the given node.
+    pub fn incomings<'a>(
+        &'a self,
+        node_id: NodeId,
+    ) -> impl Iterator<Item = (&'a EdgeId, &'a Edge<W>)> + use<'a, N, I, O, W> {
+        self.neighbors(node_id, Direction::Incoming)
+    }
+
+    /// Return an iterator of mutable references to the edges incoming into the given node.
+    pub fn incomings_mut<'a>(
+        &'a mut self,
+        node_id: NodeId,
+    ) -> impl Iterator<Item = (EdgeId, &'a mut Edge<W>)> + use<'a, N, I, O, W> {
+        self.neighbors_mut(node_id, Direction::Incoming)
+    }
+
+    /// Return an iterator of references to the edges outgoing from the given node.
+    pub fn outgoings<'a>(
+        &'a self,
+        node_id: NodeId,
+    ) -> impl Iterator<Item = (&'a EdgeId, &'a Edge<W>)> + use<'a, N, I, O, W> {
+        self.neighbors(node_id, Direction::Outgoing)
+    }
+
+    /// Return an iterator of mutable references to the edges outgoing from the given node.
+    pub fn outgoings_mut<'a>(
+        &'a mut self,
+        node_id: NodeId,
+    ) -> impl Iterator<Item = (EdgeId, &'a mut Edge<W>)> + use<'a, N, I, O, W> {
+        self.neighbors_mut(node_id, Direction::Outgoing)
+    }
+
+    /// Return a flattened, ordered list of all the incoming feeds into a given
+    /// node, i.e. the list of port links carried by the incoming edges.
     ///
-    /// # Examples
+    /// These are guaranteed to be ordered by the port with which they are
+    /// connected to the node.
+    pub fn incoming_feeds(&self, n: NodeId) -> Vec<Feed> {
+        let mut incomings = self
+            .incomings(n)
+            .flat_map(|(_, edge)| {
+                edge.ports().iter().map(|link| Feed {
+                    source: edge.source().output_at(link.source_port),
+                    target: edge.target().input_at(link.target_port),
+                })
+            })
+            .collect::<Vec<_>>();
+        incomings.sort_by_key(|feed| feed.target.port);
+        // TODO: check that all are consecutive
+        incomings
+    }
+
+    /// Return a flattened, ordered list of all the outgoing feeds into a given
+    /// node, i.e. the list of port links carried by the outgoing edges.
     ///
-    /// ```rust
-    /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// assert_eq!(graph.graph_order(), 0);
-    ///
-    /// graph.add_node("node").unwrap();
-    /// assert_eq!(graph.graph_order(), 1);
-    /// ```
-    pub fn graph_order(&self) -> usize {
-        self.nodes.len()
+    /// These are guaranteed to be ordered by the port from which they are
+    /// emerging from the node.
+    pub fn outgoing_feeds(&self, n: NodeId) -> Vec<Feed> {
+        let mut outgoings = self
+            .outgoings(n)
+            .flat_map(|(_, edge)| {
+                edge.ports().iter().map(|link| Feed {
+                    source: n.output_at(link.source_port),
+                    target: edge.target().input_at(link.target_port),
+                })
+            })
+            .collect::<Vec<_>>();
+        outgoings.sort_by_key(|feed| feed.source.port);
+        // TODO: check that all are consecutive
+        outgoings
+    }
+
+    /// Returns the edges of a node that starts at `node` and goes in the direction `direction`.
+    /// The edges are filtered to only include edges that are between inner nodes.
+    pub fn node_neighbors<'a>(
+        &'a self,
+        node_id: NodeId,
+        direction: Direction,
+    ) -> impl Iterator<Item = (&'a EdgeId, &'a Edge<W>)> + use<'a, N, I, O, W> {
+        self.neighbors(node_id, direction).filter(|(_, edge)| {
+            self.nodes[&edge.source].is_inner() && self.nodes[&edge.target].is_inner()
+        })
     }
 
     /// Returns an iterator that traverses the graph in topological order (forward direction).
@@ -926,9 +1003,18 @@ where
     /// let order: Vec<_> = graph.forward_iter().map(|(_, data)| *data).collect();
     /// assert_eq!(order, vec!["first", "second", "third"]);
     /// ```
-    pub fn forward_iter(&self) -> impl Iterator<Item = (NodeID, &N)> {
+    pub fn forward_iter(&self) -> impl Iterator<Item = (NodeId, &Node<N, I, O>)> {
         self.dag_order::<true>()
-            .map(|node_id| (node_id.clone(), &self.nodes[&node_id]))
+            .map(|node_id| (node_id, &self.nodes[&node_id]))
+    }
+
+    /// Return an iterator that traverses the graph in topological order
+    /// (forward, inputs to outputs), but only yields inner nodes and ignores
+    /// input and output nodes.
+    pub fn forward_inners(&self) -> impl Iterator<Item = (NodeId, &N)> {
+        self.dag_order::<true>()
+            .map(|node_id| (node_id, &self.nodes[&node_id]))
+            .filter_map(|(n_id, n)| n.as_inner().map(|l| (n_id, l)))
     }
 
     /// Returns an iterator that traverses the graph in reverse topological order (backward direction).
@@ -938,7 +1024,7 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// let node1 = graph.add_node("first").unwrap();
     /// let node2 = graph.add_node("second").unwrap();
     /// let node3 = graph.add_node("third").unwrap();
@@ -949,20 +1035,18 @@ where
     /// let order: Vec<_> = graph.backward_iter().map(|(_, data)| *data).collect();
     /// assert_eq!(order, vec!["third", "second", "first"]);
     /// ```
-    pub fn backward_iter(&self) -> impl Iterator<Item = (NodeID, &N)> {
+    pub fn backward_iter(&self) -> impl Iterator<Item = (NodeId, &Node<N, I, O>)> {
         self.dag_order::<false>()
-            .map(|node_id| (node_id.clone(), &self.nodes[&node_id]))
+            .map(|node_id| (node_id, &self.nodes[&node_id]))
     }
 
-    pub fn try_map_forward<N2>(
+    pub fn try_map_forward<N2, I2, O2>(
         &self,
-        mut f: impl FnMut(NodeID, &N) -> anyhow::Result<N2>,
-    ) -> anyhow::Result<Graph<N2, W, NodeID>> {
+        mut f: impl FnMut(NodeId, &Node<N, I, O>) -> anyhow::Result<Node<N2, I2, O2>>,
+    ) -> anyhow::Result<Graph<N2, I2, O2, W>> {
         let new_nodes = self
             .dag_order::<true>()
-            .map(|node_id| {
-                f(node_id.clone(), &self.nodes[&node_id]).map(|new_node| (node_id, new_node))
-            })
+            .map(|node_id| f(node_id, &self.nodes[&node_id]).map(|new_node| (node_id, new_node)))
             .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
 
         Ok(Graph {
@@ -971,64 +1055,45 @@ where
         })
     }
 
-    pub fn try_into_map_forward<N2>(
+    pub fn try_into_map_forward<N2, I2, O2>(
         mut self,
-        mut f: impl FnMut(NodeID, N, &[&Edge<NodeID, W>]) -> anyhow::Result<N2>,
-    ) -> anyhow::Result<Graph<N2, W, NodeID>> {
+        mut f: impl FnMut(NodeId, Node<N, I, O>, Vec<Feed>) -> anyhow::Result<Node<N2, I2, O2>>,
+    ) -> anyhow::Result<Graph<N2, I2, O2, W>> {
         let new_nodes = self
             .dag_order::<true>()
             .collect::<Vec<_>>()
             .into_iter()
             .map(|node_id| {
                 let old_node = self.nodes.remove(&node_id).unwrap();
-                let edges = self
-                    .neighbors(&node_id, Direction::Any)
-                    .map(|(_, edge)| edge)
-                    .collect::<Vec<_>>();
-                f(node_id.clone(), old_node, &edges).map(|new_node| (node_id, new_node))
+                let incoming_feeds = self.incoming_feeds(node_id);
+                f(node_id, old_node, incoming_feeds).map(|new_node| (node_id, new_node))
             })
             .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         Ok(Graph {
             nodes: new_nodes,
-            edges: self.edges.clone(),
+            edges: self.edges,
         })
     }
 
     fn dag_order<const FORWARD: bool>(
         &self,
-    ) -> impl Iterator<Item = NodeID> + use<'_, N, W, NodeID, FORWARD> {
+    ) -> impl Iterator<Item = NodeId> + use<'_, N, W, I, O, FORWARD> {
         let all_nodes = self
             .nodes()
-            .map(|(node_id, _)| node_id.clone())
+            .map(|(node_id, _)| *node_id)
             .collect::<BTreeSet<_>>();
         (0..self.nodes.len()).scan(all_nodes, |unvisited_nodes, _| {
-            let next_node = unvisited_nodes.iter().find_map(|node_id| {
+            let next_node = unvisited_nodes.iter().find_map(|&node_id| {
                 let is_node_next = if FORWARD {
                     // if the node only has "input" edges, then this is true
                     // otherwise, we check that each predecessor has already been visited
                     self.neighbors(node_id, Direction::Incoming)
-                        .filter(|(_, edge)| edge.is_between_nodes())
-                        .all(|(_, edge)| {
-                            edge.source_id()
-                                .map(|id| !unvisited_nodes.contains(id))
-                                .unwrap_or(false)
-                        })
+                        .all(|(_, edge)| !unvisited_nodes.contains(&edge.source()))
                 } else {
-                    // if the node only has "output" edges, then this is true
-                    // otherwise, we check that each successor has already been visited
                     self.neighbors(node_id, Direction::Outgoing)
-                        .filter(|(_, edge)| edge.is_between_nodes())
-                        .all(|(_, edge)| {
-                            edge.target_id()
-                                .map(|id| !unvisited_nodes.contains(id))
-                                .unwrap_or(false)
-                        })
+                        .all(|(_, edge)| !unvisited_nodes.contains(&edge.target()))
                 };
-                if is_node_next {
-                    Some(node_id.clone())
-                } else {
-                    None
-                }
+                if is_node_next { Some(node_id) } else { None }
             });
             if let Some(ref next_node) = next_node {
                 unvisited_nodes.remove(next_node);
@@ -1037,8 +1102,40 @@ where
         })
     }
 }
+impl<N, O, W> Graph<N, usize, O, W>
+where
+    O: PartialEq + std::fmt::Debug,
+    W: Clone,
+{
+    /// Return a vector matching the i-th input to the ID of the node
+    /// representing it in the graph.
+    pub fn input_node_ids(&self) -> Vec<NodeId> {
+        let input_nodes = self.input_nodes().collect::<Vec<_>>();
+        let mut r = vec![0.into(); input_nodes.len()];
+        for (node_id, i) in input_nodes.into_iter() {
+            r[*i] = node_id;
+        }
+        r
+    }
+}
+impl<N, I, W> Graph<N, I, usize, W>
+where
+    I: PartialEq + std::fmt::Debug,
+    W: Clone,
+{
+    /// Return a vector matching the i-th output to the ID of the node
+    /// representing it in the graph.
+    pub fn output_node_ids(&self) -> Vec<NodeId> {
+        let output_nodes = self.output_nodes().collect::<Vec<_>>();
+        let mut r = vec![0.into(); output_nodes.len()];
+        for (node_id, i) in output_nodes.into_iter() {
+            r[*i] = node_id;
+        }
+        r
+    }
+}
 
-impl<NodeID, N, E> Default for Graph<N, E, NodeID> {
+impl<N, I, O, E> Default for Graph<N, I, O, E> {
     fn default() -> Self {
         Self {
             nodes: Default::default(),
@@ -1047,45 +1144,18 @@ impl<NodeID, N, E> Default for Graph<N, E, NodeID> {
     }
 }
 
-impl<N, W, NodeID> Graph<N, W, NodeID> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-impl<NodeID, N, W> Index<NodeID> for Graph<N, W, NodeID>
-where
-    NodeID: GenericNodeID,
-{
-    type Output = N;
+impl<N, I, O, W> Index<NodeId> for Graph<N, I, O, W> {
+    type Output = Node<N, I, O>;
 
-    fn index(&self, idx: NodeID) -> &Self::Output {
+    fn index(&self, idx: NodeId) -> &Self::Output {
         &self.nodes[&idx]
     }
 }
 
-impl<NodeID, N, W> Index<&NodeID> for Graph<N, W, NodeID>
-where
-    NodeID: GenericNodeID,
-{
-    type Output = N;
-
-    fn index(&self, idx: &NodeID) -> &Self::Output {
-        &self.nodes[idx]
-    }
-}
-
-impl<T> Index<PortID> for Vec<T> {
+impl<T> Index<PortId> for Vec<T> {
     type Output = T;
 
-    fn index(&self, idx: PortID) -> &Self::Output {
-        &self[idx.0]
-    }
-}
-
-impl<T> Index<&PortID> for Vec<T> {
-    type Output = T;
-
-    fn index(&self, idx: &PortID) -> &Self::Output {
+    fn index(&self, idx: PortId) -> &Self::Output {
         &self[idx.0]
     }
 }
@@ -1118,34 +1188,7 @@ impl IntoVecUsize for usize {
     }
 }
 
-impl From<DefaultNodeID> for Source<DefaultNodeID> {
-    fn from(value: DefaultNodeID) -> Self {
-        Source::Node(value)
-    }
-}
-
-impl From<DefaultNodeID> for Target<DefaultNodeID> {
-    fn from(value: DefaultNodeID) -> Self {
-        Target::Node(value)
-    }
-}
-
-impl<I: GenericNodeID> From<&I> for Source<I> {
-    fn from(value: &I) -> Self {
-        Source::Node(value.clone())
-    }
-}
-impl<I: GenericNodeID> From<&I> for Target<I> {
-    fn from(value: &I) -> Self {
-        Target::Node(value.clone())
-    }
-}
-
-fn next_node_id() -> usize {
-    NODE_INDEX_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-fn next_edge_id() -> EdgeID {
+fn next_edge_id() -> EdgeId {
     EDGE_INDEX_COUNTER.fetch_add(1, Ordering::Relaxed).into()
 }
 
@@ -1187,17 +1230,6 @@ impl Index<usize> for Ports {
     }
 }
 
-impl<I: GenericNodeID> From<usize> for Source<I> {
-    fn from(value: usize) -> Self {
-        Source::Node(I::from(value))
-    }
-}
-impl<I: GenericNodeID> From<usize> for Target<I> {
-    fn from(value: usize) -> Self {
-        Target::Node(I::from(value))
-    }
-}
-
 impl From<(usize, usize)> for Ports {
     fn from(value: (usize, usize)) -> Self {
         Ports(vec![PortLink::new(value.0, value.1)])
@@ -1215,8 +1247,8 @@ impl From<Vec<(usize, usize)>> for Ports {
     }
 }
 
-impl From<Vec<(PortID, PortID)>> for Ports {
-    fn from(value: Vec<(PortID, PortID)>) -> Self {
+impl From<Vec<(PortId, PortId)>> for Ports {
+    fn from(value: Vec<(PortId, PortId)>) -> Self {
         Ports(
             value
                 .into_iter()
@@ -1226,8 +1258,8 @@ impl From<Vec<(PortID, PortID)>> for Ports {
     }
 }
 
-impl From<Vec<(&PortID, &PortID)>> for Ports {
-    fn from(value: Vec<(&PortID, &PortID)>) -> Self {
+impl From<Vec<(&PortId, &PortId)>> for Ports {
+    fn from(value: Vec<(&PortId, &PortId)>) -> Self {
         Ports(
             value
                 .into_iter()
@@ -1237,8 +1269,8 @@ impl From<Vec<(&PortID, &PortID)>> for Ports {
     }
 }
 
-impl From<(PortID, PortID)> for Ports {
-    fn from(value: (PortID, PortID)) -> Self {
+impl From<(PortId, PortId)> for Ports {
+    fn from(value: (PortId, PortId)) -> Self {
         Ports(vec![PortLink::new(value.0, value.1)])
     }
 }
@@ -1249,35 +1281,29 @@ impl From<PortLink> for Ports {
     }
 }
 
-// impl<I: Into<PortLink>> From<I> for Vec<PortLink> {
-//    fn from(value: I) -> Self {
-//        vec![value.into()]
-//    }
-//}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    pub struct TestNode(pub usize);
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestWeight(usize);
 
     #[test]
     fn test_graph() {
-        let mut graph: Graph<TestNode, TestWeight> = Graph::new();
-        let node1 = graph.add_node(TestNode(1)).unwrap();
-        let node2 = graph.add_node(TestNode(2)).unwrap();
+        let mut graph: Graph<usize, (), (), TestWeight> = Graph::new();
+        let input0 = graph.add_node(Node::Input(())).unwrap();
+        let node1 = graph.add_node(Node::Inner(1)).unwrap();
+        let node2 = graph.add_node(Node::Inner(2)).unwrap();
+        let output0 = graph.add_node(Node::Output(())).unwrap();
         // try inserting a normal edge
         let first_edge = graph
             .add_edge(node1, node2, Ports::consecutive(), TestWeight(1))
             .unwrap();
-        assert_eq!(graph.neighbors(&node1, Direction::Outgoing).count(), 1);
-        assert_eq!(graph.neighbors(&node2, Direction::Incoming).count(), 1);
+        assert_eq!(graph.neighbors(node1, Direction::Outgoing).count(), 1);
+        assert_eq!(graph.neighbors(node2, Direction::Incoming).count(), 1);
         assert_eq!(
             graph
-                .neighbors(&node1, Direction::Outgoing)
+                .neighbors(node1, Direction::Outgoing)
                 .next()
                 .unwrap()
                 .0,
@@ -1285,21 +1311,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             graph
-                .neighbors(&node2, Direction::Incoming)
+                .neighbors(node2, Direction::Incoming)
                 .next()
                 .unwrap()
                 .0,
             &first_edge
         );
-        assert_eq!(graph.neighbors(&node1, Direction::Any).count(), 1);
-        assert_eq!(graph.neighbors(&node2, Direction::Any).count(), 1);
-        assert_eq!(graph[node1], TestNode(1));
-        assert_eq!(graph[node2], TestNode(2));
+        assert_eq!(graph.neighbors(node1, Direction::Any).count(), 1);
+        assert_eq!(graph.neighbors(node2, Direction::Any).count(), 1);
+        assert_eq!(graph[node1], Node::Inner(1));
+        assert_eq!(graph[node2], Node::Inner(2));
         assert_eq!(
             graph.edge(&first_edge),
             Some(&Edge {
-                source: Source::Node(node1),
-                target: Target::Node(node2),
+                source: node1,
+                target: node2,
                 ports: Ports::consecutive(),
                 weight: Some(TestWeight(1))
             })
@@ -1313,104 +1339,106 @@ pub(crate) mod tests {
         assert_eq!(
             graph.edge(&first_edge),
             Some(&Edge {
-                source: Source::Node(node1),
-                target: Target::Node(node2),
+                source: node1,
+                target: node2,
                 ports: Ports::consecutive(),
                 weight: Some(TestWeight(1))
             })
         );
 
         // try inserting an input edge
-        let input_id = graph.set_input(node1, 0, TestWeight(3)).unwrap();
-        assert_eq!(graph.neighbors(&node1, Direction::Incoming).count(), 1);
+        let input_edge = graph
+            .add_edge(input0, node1, (0, 0), TestWeight(3))
+            .unwrap();
+        assert_eq!(graph.neighbors(node1, Direction::Incoming).count(), 1);
         assert_eq!(
-            graph.neighbors(&node1, Direction::Any).count(),
+            graph.neighbors(node1, Direction::Any).count(),
             2,
             "{:?}",
-            graph.neighbors(&node1, Direction::Any).collect::<Vec<_>>()
+            graph.neighbors(node1, Direction::Any).collect::<Vec<_>>()
         );
         assert_eq!(
             graph
-                .neighbors(&node1, Direction::Incoming)
+                .neighbors(node1, Direction::Incoming)
                 .next()
                 .unwrap()
                 .1,
             &Edge {
-                source: Source::Input,
-                target: Target::Node(node1),
+                source: input0,
+                target: node1,
                 ports: Ports::consecutive(),
                 weight: Some(TestWeight(3))
             },
         );
-        assert_eq!(graph.input_nodes().count(), 1);
 
         // try inserting an output edge
-        let output_id = graph.set_output(node2, 0, TestWeight(3)).unwrap();
-        assert_eq!(graph.neighbors(&node2, Direction::Outgoing).count(), 1);
+        let output_edge = graph
+            .add_edge(node2, output0, (0, 0), TestWeight(3))
+            .unwrap();
+        assert_eq!(graph.neighbors(node2, Direction::Outgoing).count(), 1);
         assert_eq!(
-            graph.neighbors(&node2, Direction::Any).count(),
+            graph.neighbors(node2, Direction::Any).count(),
             2,
             "{:?}",
-            graph.neighbors(&node2, Direction::Any).collect::<Vec<_>>()
+            graph.neighbors(node2, Direction::Any).collect::<Vec<_>>()
         );
         assert_eq!(
             graph
-                .neighbors(&node2, Direction::Outgoing)
+                .neighbors(node2, Direction::Outgoing)
                 .next()
                 .unwrap()
                 .1,
             &Edge {
-                source: Source::Node(node2),
-                target: Target::Output,
+                source: node2,
+                target: output0,
                 ports: Ports::consecutive(),
                 weight: Some(TestWeight(3))
             },
         );
-        assert_eq!(graph.output_nodes().count(), 1);
+
+        assert_eq!(graph.source_nodes().count(), 1);
+        assert_eq!(graph.sink_nodes().count(), 1);
 
         // try removing an edge
-        graph.remove_edge(&first_edge).unwrap();
-        assert_eq!(graph.neighbors(&node1, Direction::Outgoing).count(), 0);
-        assert_eq!(graph.neighbors(&node2, Direction::Incoming).count(), 0);
-        assert_eq!(graph.neighbors(&node1, Direction::Any).count(), 1);
-        assert_eq!(graph.neighbors(&node2, Direction::Any).count(), 1);
+        graph.remove_edge(first_edge).unwrap();
+        assert_eq!(graph.neighbors(node1, Direction::Outgoing).count(), 0);
+        assert_eq!(graph.neighbors(node2, Direction::Incoming).count(), 0);
+        assert_eq!(graph.neighbors(node1, Direction::Any).count(), 1);
+        assert_eq!(graph.neighbors(node2, Direction::Any).count(), 1);
 
         // try removing an input edge
-        graph.remove_edge(&input_id).unwrap();
-        assert_eq!(graph.neighbors(&node1, Direction::Incoming).count(), 0);
+        graph.remove_edge(input_edge).unwrap();
+        assert_eq!(graph.neighbors(node1, Direction::Incoming).count(), 0);
 
         // try removing an output edge
-        graph.remove_edge(&output_id).unwrap();
-        assert_eq!(graph.neighbors(&node2, Direction::Outgoing).count(), 0);
+        graph.remove_edge(output_edge).unwrap();
+        assert_eq!(graph.neighbors(node2, Direction::Outgoing).count(), 0);
 
         // try removing a non-existing edge
-        assert!(graph.remove_edge(&EdgeID(10)).is_err());
+        assert!(graph.remove_edge(10.into()).is_err());
     }
 
     #[test]
     fn test_graph_ports_consecutive() {
         let ports = Ports::consecutive();
         assert_eq!(ports.len(), 1);
-        assert_eq!(ports[0].source_port, PortID(0));
-        assert_eq!(ports[0].target_port, PortID(0));
+        assert_eq!(ports[0].source_port, PortId(0));
+        assert_eq!(ports[0].target_port, PortId(0));
     }
 
     #[test]
     fn test_graph_ports() {
         // For some reason, Rust type inference doesn't work with the default type so we have
         // to explicitly specify the type at declaration time.
-        let mut graph = Graph::<TestNode, TestWeight, DefaultNodeID>::new();
-        let node1 = graph.add_node(TestNode(1)).unwrap();
-        let node2 = graph.add_node(TestNode(2)).unwrap();
+        let mut graph = Graph::<usize, (), (), TestWeight>::new();
+        let node1 = graph.add_node(Node::Inner(1)).unwrap();
+        let node2 = graph.add_node(Node::Inner(2)).unwrap();
         graph
             .add_edge(node1, node2, Ports::consecutive(), TestWeight(1))
             .unwrap();
-        assert_eq!(graph.neighbors(&node1, Direction::Outgoing).count(), 1);
-        assert_eq!(graph.neighbors(&node2, Direction::Incoming).count(), 1);
-        let (_edge_id, edge) = graph
-            .node_neighbors(&node1, Direction::Outgoing)
-            .next()
-            .unwrap();
+        assert_eq!(graph.neighbors(node1, Direction::Outgoing).count(), 1);
+        assert_eq!(graph.neighbors(node2, Direction::Incoming).count(), 1);
+        let (_edge_id, edge) = graph.neighbors(node1, Direction::Outgoing).next().unwrap();
         assert_eq!(edge.ports.len(), 1);
         assert_eq!(edge.ports[0].source_port, 0.into());
         assert_eq!(edge.ports[0].target_port, 0.into());
@@ -1422,15 +1450,12 @@ pub(crate) mod tests {
 
         // try to add a consecutive node
         let node3 = graph
-            .add_consecutive_node(TestNode(3), Some(node2), None)
+            .add_consecutive_node(Node::Inner(3), node2, None)
             .unwrap();
-        let (_edge_id, edge) = graph
-            .node_neighbors(&node2, Direction::Outgoing)
-            .next()
-            .unwrap();
+        let (_edge_id, edge) = graph.neighbors(node2, Direction::Outgoing).next().unwrap();
         assert_eq!(edge.ports.len(), 1);
-        assert_eq!(edge.ports[0].source_port, PortID(0));
-        assert_eq!(edge.ports[0].target_port, PortID(0));
+        assert_eq!(edge.ports[0].source_port, PortId(0));
+        assert_eq!(edge.ports[0].target_port, PortId(0));
 
         println!("node1: {:?}", node1);
         println!("node2: {:?}", node2);
@@ -1444,25 +1469,6 @@ pub(crate) mod tests {
                 vec![PortLink::new(1, 1), PortLink::new(2, 2)],
                 None,
             )
-            .unwrap_err();
-        // however, we can mut the edge - this will succeed as it has all the target ports used and consecutive
-        graph
-            .edge_between_mut(node2, node3, |edge| edge.ports.insert(PortLink::new(1, 1)))
-            .unwrap();
-        let (_edge_id, edge) = graph
-            .node_neighbors(&node2, Direction::Outgoing)
-            .next()
-            .unwrap();
-        assert_eq!(edge.ports.len(), 2, "{:?}", edge.ports);
-        assert_eq!(edge.ports[1].source_port, PortID(1));
-        assert_eq!(edge.ports[1].target_port, PortID(1));
-        // this will fail because we can't add the same edge twice
-        graph
-            .edge_between_mut(node2, node3, |edge| edge.ports.insert(PortLink::new(1, 1)))
-            .unwrap_err();
-        // this wwill fail because we can't add a non consecutive target port
-        graph
-            .edge_between_mut(node2, node3, |edge| edge.ports.insert(PortLink::new(1, 8)))
             .unwrap_err();
     }
 }

@@ -1,71 +1,59 @@
 //! Defines the [`ModelTransform`] that should be applied after quantising a [Softmax][crate::layers::transformer::softmax] layer.
-use anyhow::Context;
-
 use crate::{
     Element,
-    graph::Direction,
+    graph::NodeId,
     layers::{
         Layer,
         transformer::{attention::attention_mask::ATTENTION_MASK_LAYER, softmax::SOFTMAX_LAYER},
     },
-    model::{Model, NodeID, transform::ModelTransform},
+    model::{Model, transform::ModelTransform},
 };
-
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 
 #[derive(Debug, Clone)]
 /// This transform is used after quantising a [Softmax][crate::layers::transformer::softmax] layer to ensure that the
-/// associated attention mask has the correct negative infinity value set. The [NodeID] provided should be the Softmax layer's NodeID.
+/// associated attention mask has the correct negative infinity value set. The [NodeId] provided should be the Softmax layer's NodeId.
 /// The [Element] provided should be the negative infinity value used in the attention mask.
 ///
 /// TODO: Add "Padding" variant to attention mask so that if the previous layer was not a mask we insert a new mask node.
-pub struct SoftmaxMaskTransform(pub(crate) NodeID, pub(crate) Element);
+pub struct SoftmaxMaskTransform(pub(crate) NodeId, pub(crate) Element);
 
 impl SoftmaxMaskTransform {
-    pub fn new(softmax_node: NodeID, neg_inf: Element) -> Self {
+    pub fn new(softmax_node: NodeId, neg_inf: Element) -> Self {
         Self(softmax_node, neg_inf)
     }
 }
 
 impl ModelTransform<Element> for SoftmaxMaskTransform {
     fn apply(&self, mut model: Model<Element>) -> Result<Model<Element>> {
-        // First we get the input node, the provided NodeID should be the Softmax node
+        // First we get the input node, the provided NodeId should be the Softmax node
         let softmax_node = model
             .graph
-            .node(&self.0)
-            .ok_or(anyhow!("Softmax node not found"))?;
+            .node(self.0)
+            .ok_or(anyhow!("Softmax node not found"))?
+            .as_inner()
+            .context("expected layer")?;
 
         ensure!(
             softmax_node.short_name() == SOFTMAX_LAYER,
-            "Could not apply SoftmaxMaskTransform, provided NodeID was for layer: {}",
+            "Could not apply SoftmaxMaskTransform, provided NodeId was for layer: {}",
             softmax_node.short_name()
         );
 
         // Now we know that we have a Softmax Node check the input is an attention mask
         let input_node_id = {
-            let mut input_nodes = model
-                .graph
-                .node_neighbors(&self.0, Direction::Incoming)
-                .map(|(_, edge)| edge);
-            // safe to unwrap since we called node_neighbors
-            #[allow(clippy::clone_on_copy)]
-            let input_node_id = input_nodes
-                .next()
-                .context("Expected 1 input node")?
-                .source_id()
-                .unwrap()
-                .clone();
-            ensure!(
-                input_nodes.next().is_none(),
-                "Softmax node should have 1 input, found more"
-            );
-            input_node_id
+            let input_nodes = model.graph.incoming_feeds(self.0);
+            ensure!(input_nodes.len() == 1);
+            input_nodes[0].source.node_id
         };
 
-        let mut input_node = model
+        let input_node = model
             .graph
-            .node_mut(&input_node_id)
-            .expect("Softmax input node not found");
+            .node_mut(input_node_id)
+            .expect("Softmax input node not found")
+            .as_inner_mut()
+            .context("expected attention mask layer before SoftmaxMaskTransform")?;
+
         // Make sure its an attention mask
         ensure!(
             input_node.short_name() == ATTENTION_MASK_LAYER,
@@ -74,7 +62,7 @@ impl ModelTransform<Element> for SoftmaxMaskTransform {
         );
 
         // Now we can set the mask negative infinity value to be correct
-        let Layer::AttentionMask(mask) = &mut input_node else {
+        let Layer::AttentionMask(ref mut mask) = input_node else {
             unreachable!()
         };
 

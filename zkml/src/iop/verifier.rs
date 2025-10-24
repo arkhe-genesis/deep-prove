@@ -1,35 +1,26 @@
-use crate::iop::model_output_claims;
-use std::collections::HashMap;
-
+use super::{Proof, TableProof};
 use crate::{
     Claim, Element,
     commit::mmcs_context::CommitmentVerifier,
-    graph::PortID,
+    graph::{Node, NodeId, NodeInput, PortId},
     iop::{
-        ChallengeStorage,
-        context::VerifierContext,
-        prover::{MergeClaimNodeProof, MergeClaimsProof},
+        ChallengeStorage, context::VerifierContext, model_output_claims, prover::MergeClaimsProof,
     },
     layers::{
         LayerCtx, LayerProof,
         provable::{OpInfo, VerifiableCtx},
     },
     lookup::{context::LookupContext, logup_gkr::verifier::verify_logup_proof_multiple_sizes},
-    model::NodeID,
     tensor::{Tensor, TensorKey},
-    try_unzip,
 };
 use anyhow::{Context as _, anyhow, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::{Point, PolynomialCommitmentScheme};
-use std::collections::BTreeMap;
-use tracing::trace;
-
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::{BTreeMap, HashMap};
+use tracing::trace;
 use transcript::Transcript;
-
-use super::{Proof, TableProof};
 
 /// What the verifier must have besides the proof
 #[derive(Clone, Serialize, Deserialize)]
@@ -99,14 +90,13 @@ where
         ctx: &VerifierContext<E, PCS>,
         proof: Proof<E, PCS>,
     ) -> anyhow::Result<()> {
-        // 1. Instantiate everything and append relevant info to the transcript
+        // ===== Instantiate everything and append relevant info to the transcript =====
         let mut numerators = Vec::<E>::new();
         let mut denominators = Vec::<E>::new();
-
         ctx.write_to_transcript(self.transcript)?;
 
         // iterate over the step proofs in inference order
-        for (node_id, layer_ctx) in ctx.model.nodes.forward_iter() {
+        for (node_id, layer_ctx) in ctx.model.nodes.forward_inners() {
             if !layer_ctx.has_proof() {
                 // if the current node is not provable, there is no proof, so we can skip it
                 continue;
@@ -137,9 +127,10 @@ where
             ChallengeStorage::<E>::initialise(ctx, self.transcript)
         };
 
-        // 2. Derive output claims
-        // first, we bind each output to the node that computes it, so that we know whether we
-        // need to compute the output claim or not
+        // ===== Derive output claims =====
+        //
+        // First, we bind each output to the node that computes it, so that we
+        // know whether we need to compute the output claim or not
         let out_claims = model_output_claims(self.transcript, &self.io.output);
         let shape_steps = ctx.model.shape_steps(
             &ctx.unpadded_input_shapes,
@@ -151,56 +142,144 @@ where
                 .collect_vec(),
         )?;
 
-        // 4. Verify each proof sequentially, Always make sure the proof corresponds to the expected type of proof in the context.
-        // claims_by_layer is a map from node_id to the claims this layer generated, e.g. the claims that corresponds
-        // to the _inputs_ of that layer.
-        let mut claims_produced_by_layers: HashMap<NodeID, Vec<Claim<E>>> = HashMap::new();
-        for (node_id, layer) in ctx.model.nodes.backward_iter() {
-            let node_proof = if layer.has_proof() {
-                proof
-                    .steps
-                    .get(&node_id)
-                    .ok_or(anyhow!("Proof for node {node_id} not found"))?
-            } else {
-                &LayerProof::Dummy
-            };
-            let shape_step = shape_steps
-                .get(&node_id)
-                .ok_or(anyhow!("Shape for node {node_id} not found"))?;
-            trace!(
-                "Verifying proof {} for node {node_id}",
-                node_proof.variant_name(),
-            );
-            // all the claims that are incoming to this node
-            let claims_for_node =
-                ctx.model
-                    .claims_for_node(&node_id, &claims_produced_by_layers, &out_claims)?;
-            let claims_for_verify = self.verify_merge_claims_proof(
-                claims_for_node,
-                proof.merge_claim_proofs.get(&node_id),
-            )?;
+        // ===== Verify each proof sequentially =====
+        //
+        // always make sure the proof corresponds to the expected type of proof
+        // in the context.
+        let _claims = ctx.model.nodes.backward_iter().try_fold(
+            HashMap::<NodeInput, Claim<E>>::new(),
+            |mut claims, (node_id, node)| -> anyhow::Result<HashMap<NodeInput, Claim<E>>> {
+                match node {
+                    Node::Inner(layer) => {
+                        let node_proof = if layer.has_proof() {
+                            proof
+                                .steps
+                                .get(&node_id)
+                                .ok_or(anyhow!("Proof for node {node_id} not found"))?
+                        } else {
+                            &LayerProof::Dummy
+                        };
 
-            let claims = {
-                if layer.is_provable() {
-                    // we verify the proof
-                    layer
-                        .verify(
-                            node_proof,
-                            &claims_for_verify.iter().collect_vec(),
-                            &mut self,
-                            shape_step,
-                        )
-                        .context(format!("Verification failed for node with ID {node_id}"))?
-                } else {
-                    // we only propagate the claims, without changing them, as a non-provable layer
-                    // shouldn't change the input values
-                    claims_for_verify
-                }
-            };
-            claims_produced_by_layers.insert(node_id, claims);
-        }
+                        // In a bug-less situation, there is no reason for that
+                        // to ever happen.
+                        let shape_step = shape_steps
+                            .get(&node_id)
+                            .ok_or(anyhow!("Shape for node {node_id} not found"))?;
+                        trace!(
+                            "Verifying proof {} for node {node_id}",
+                            node_proof.variant_name(),
+                        );
 
-        // 5. Verify the lookup table proofs
+                        // ===== Compute the claims generated by this node =====
+                        //
+                        // There is one claim per input port for this node. This
+                        // claim is computed from the claims fed into this node
+                        // output ports. These are the claims associated to the
+                        // input port by which this node successors are
+                        // connected to this node.
+                        //
+                        // --
+                        //  |
+                        //  -> A -> B
+                        //  ->
+                        //  |
+                        // --
+                        //
+                        // A will generate two claims, for its ports 1 and 2,
+                        // computed from its incoming claim on output port 0,
+                        // which is the claim generated by B on its input port 0.
+                        let claims_for_node: BTreeMap<PortId, Vec<&Claim<E>>> =
+                            ctx.model.nodes.outgoing_feeds(node_id).into_iter().fold(
+                                BTreeMap::new(),
+                                |mut ax, feed| {
+                                    ax.entry(feed.source.port)
+                                        .or_default()
+                                        .push(&claims[&feed.target]);
+                                    ax
+                                },
+                            );
+
+                        // Merge claims that are redundant. If a node out port
+                        // is fed to two distinct nodes, then this will result
+                        // in this port receiving two claims. These must be
+                        // aggregated into a single one.
+                        let claims_for_verify = self.verify_merge_claims_proof(
+                            claims_for_node,
+                            proof.merge_claim_proofs.get(&node_id),
+                        )?;
+
+                        let my_claims = {
+                            if layer.is_provable() {
+                                // we verify the proof
+                                layer
+                                    .verify(
+                                        node_proof,
+                                        &claims_for_verify.iter().collect_vec(),
+                                        &mut self,
+                                        shape_step,
+                                    )
+                                    .context(format!(
+                                        "Verification failed for node with ID {node_id}"
+                                    ))?
+                            } else {
+                                // we only propagate the claims, without
+                                // changing them, as a non-provable layer
+                                // shouldn't change the input values
+                                claims_for_verify
+                            }
+                        };
+
+                        // Insert the claims generated by this node in the
+                        // global claim register.
+                        claims.extend(
+                            my_claims
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, claim)| (NodeInput::new(node_id, i), claim)),
+                        );
+
+                        // ===== Input verification =====
+                        //
+                        // evaluating the input at the random evaluation point
+                        // from the sumcheck.
+                        let (inputs, input_claims) = ctx
+                            .model
+                            .nodes
+                            .incoming_feeds(node_id)
+                            .into_iter()
+                            .filter(|feed| ctx.model.nodes[feed.source.node_id].is_input())
+                            .fold(
+                                (Vec::new(), Vec::new()),
+                                |(mut inputs, mut input_claims), feed| {
+                                    inputs.push(
+                                        &self.io.input[*ctx.model.nodes[feed.source.node_id]
+                                            .as_input()
+                                            .unwrap()],
+                                    );
+                                    input_claims
+                                        .push(&claims[&NodeInput::new(node_id, feed.target.port)]);
+                                    (inputs, input_claims)
+                                },
+                            );
+
+                        if !inputs.is_empty() {
+                            <LayerCtx<E> as VerifiableCtx<E, PCS>>::verify_input_claim(
+                                layer,
+                                &inputs,
+                                &input_claims,
+                            )?;
+                        }
+                    }
+                    Node::Input(_) => {}
+                    Node::Output(o) => {
+                        claims.insert(NodeInput::new(node_id, 0), out_claims[*o].clone());
+                    }
+                };
+                Ok(claims)
+            },
+        )?;
+
+        // ===== Verify the lookup table proofs =====
         if !proof.table_proofs.is_empty() {
             verify_table::<_, _, _>(
                 &proof.table_proofs[0],
@@ -212,41 +291,12 @@ where
             )?;
         }
 
-        // get each claim associated with the corresponding input node and the index in the input vector
-        let input_claims = ctx.model.input_claims(&claims_produced_by_layers)?;
-
-        // 6. input verification: evaluating the input at the random evaluation point from the sumcheck
-        let num_inputs = self.io.input.len();
-        for (node_id, claims) in input_claims.into_iter() {
-            let (inputs, claims): (Vec<_>, Vec<_>) = try_unzip(claims.into_iter()
-                // each claim is positioned at the 
-                .map(|(index, claim)| {
-                    ensure!(*index < num_inputs,
-                        "Processing claim associated to input {index}, but there are only {num_inputs} inputs",
-                    );
-                    Ok((
-                        &self.io.input[*index],
-                        claim,
-                    ))
-                }))?;
-            let layer_ctx = ctx
-                .model
-                .nodes
-                .node(&node_id)
-                .ok_or(anyhow!("Node {node_id} not found"))?;
-            <LayerCtx<E> as VerifiableCtx<E, PCS>>::verify_input_claim(
-                layer_ctx,
-                inputs.as_slice(),
-                &claims,
-            )?;
-        }
-
-        // 7. verify the opening of the accumulation of claims
+        // ===== Verify the opening of the accumulation of claims =====
         self.commit_verifier
             .verify(&ctx.commitment_ctx, proof.commit, self.transcript)?;
 
+        // ===== Verify that the accumulated numerator is zero and accumulated denominator is non-zero =====
         let num_len = numerators.len();
-        // 8. verify that the accumulated numerator is zero and accumulated denominator is non-zero
         let (final_num, final_denom) = numerators.into_iter().zip(denominators).fold(
             (E::ZERO, E::ONE),
             |(acc_num, acc_denom), (num, denom)| {
@@ -268,7 +318,7 @@ where
 
     fn verify_merge_claims_proof(
         &mut self,
-        claims: BTreeMap<PortID, Vec<&Claim<E>>>,
+        claims: BTreeMap<PortId, Vec<&Claim<E>>>,
         proof: Option<&MergeClaimsProof<E>>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         if proof.is_none() {
@@ -290,23 +340,15 @@ where
                         "Merge claim proof for output index {} not found",
                         port
                     ))?;
-                    self.verify_merge_claim_proof(&claims, merge_claim_proof)
+                    merge_claim_proof.verify_proof(self.transcript, &claims)
                 }
             })
             .collect()
     }
 
-    fn verify_merge_claim_proof(
-        &mut self,
-        claims: &[&Claim<E>],
-        proof: &MergeClaimNodeProof<E>,
-    ) -> anyhow::Result<Claim<E>> {
-        proof.verify_proof(self.transcript, claims)
-    }
-
     pub(crate) fn add_common_claims(
         &mut self,
-        node_id: NodeID,
+        node_id: NodeId,
         claims: HashMap<TensorKey, Claim<E>>,
     ) {
         self.commit_verifier.add_common_claims(
@@ -336,7 +378,7 @@ where
 fn verify_table<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
     proof: &TableProof<E, PCS>,
     lookup_ctx: &LookupContext,
-    table_node_id: NodeID,
+    table_node_id: NodeId,
     witness_verifier: &mut CommitmentVerifier<E, PCS>,
     t: &mut T,
     challenge_storage: &ChallengeStorage<E>,

@@ -1,25 +1,33 @@
-use std::{collections::HashMap, fmt::Debug};
-
-use anyhow::Context;
-use ff_ext::ExtensionField;
-use serde::{Deserialize, Serialize};
-use tenstore::{GenStore, StoreError};
-
 use crate::{
     Element, IO, Shape, Tensor,
+    graph::NodeId,
     layers::{Layer, NodeOut},
-    model::NodeID,
     quantization::{Fieldizer, ModelMetadata},
     tensor::DryTensor,
 };
+use anyhow::Context;
+use ff_ext::ExtensionField;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fmt::Debug};
+use tenstore::{GenStore, StoreError};
 
 #[derive(Default, Clone)]
 pub struct Trace<'a, E: ExtensionField, N, D> {
     pub(crate) store: GenStore,
-    pub(crate) steps: HashMap<NodeID, InferenceStep<'a, E, N, D>>,
+    pub(crate) steps: HashMap<NodeId, InferenceStep<'a, E, N, D>>,
     // TODO: convert to TensorKey
     pub(crate) input: Vec<DryTensor<D>>,
     pub(crate) output: Vec<DryTensor<D>>,
+}
+impl<'a, E: ExtensionField, N, D> Trace<'a, E, N, D> {
+    pub fn new(store: GenStore, input: Vec<DryTensor<D>>) -> Self {
+        Self {
+            store,
+            steps: Default::default(),
+            input,
+            output: Default::default(),
+        }
+    }
 }
 // The trace produce by running the model during inference
 pub type InferenceTrace<'a, E, N> = Trace<'a, E, N, N>;
@@ -31,12 +39,12 @@ where
     D: Serialize + for<'b> Deserialize<'b>,
 {
     /// Get the trace data for node `node_id`, if any
-    pub(crate) fn get_step(&self, node_id: &NodeID) -> Option<&InferenceStep<'a, E, N, D>> {
-        self.steps.get(node_id)
+    pub(crate) fn get_step(&self, node_id: NodeId) -> Option<&InferenceStep<'a, E, N, D>> {
+        self.steps.get(&node_id)
     }
 
     /// Insert the trace data `step` about node `node_id` in the trace
-    pub(crate) fn new_step(&mut self, node_id: NodeID, step: InferenceStep<'a, E, N, D>) {
+    pub(crate) fn new_step(&mut self, node_id: NodeId, step: InferenceStep<'a, E, N, D>) {
         self.steps.insert(node_id, step);
     }
 
@@ -167,16 +175,23 @@ impl<'a, E: ExtensionField> InferenceTrace<'a, E, Element> {
         let inputs = self
             .input
             .iter()
-            .zip(&md.input)
-            .map(|(dry, s)| dry.dry_cast(self.store.clone(), |x| s.dequantize(x)))
+            .enumerate()
+            .map(|(i, dry)| {
+                let sf = md.input_scaling(i);
+                dry.dry_cast(self.store.clone(), |x| sf.dequantize(x))
+            })
             .collect::<Result<Vec<DryTensor<f32>>, StoreError>>()?;
 
         let outputs = self
             .output
             .iter()
-            .zip(&md.output)
-            .map(|(dry, s)| dry.dry_cast(self.store.clone(), |x| s.dequantize(x)))
+            .enumerate()
+            .map(|(i, dry)| {
+                let sf = md.output_scaling(i);
+                dry.dry_cast(self.store.clone(), |x| sf.dequantize(x))
+            })
             .collect::<Result<Vec<DryTensor<f32>>, StoreError>>()?;
+
         let steps = self
             .steps
             .iter()
@@ -226,7 +241,7 @@ impl<'a, E: ExtensionField, N> InferenceStep<'a, E, N, Element> {
         &self,
         md: &ModelMetadata,
         store: GenStore,
-        node_id: NodeID,
+        node_id: NodeId,
     ) -> Result<InferenceStep<'a, E, N, f32>, StoreError> {
         Ok(InferenceStep {
             op: self.op,
@@ -292,7 +307,7 @@ impl<E: ExtensionField> StepData<Element, E> {
         &self,
         md: &ModelMetadata,
         store: GenStore,
-        node_id: NodeID,
+        node_id: NodeId,
     ) -> Result<StepData<f32, E>, StoreError> {
         Ok(StepData {
             node_inputs: self

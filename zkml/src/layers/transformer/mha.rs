@@ -1,9 +1,9 @@
 //! Multihead attention layer:
 //! The module performs all the operations inside the multi-head attention layer, relying on
 //! ConcatMatMul and Softmax layers as building blocks.
-
 use crate::{
     Claim, Element, Number, Prover, ScalingFactor, Shape, Tensor,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -26,7 +26,7 @@ use crate::{
         },
     },
     lookup::context::LookupWitnessGen,
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
     tensor::{TensorTypeParam, WrappedTensor},
@@ -56,7 +56,7 @@ pub struct MhaData<E: ExtensionField> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "E: ExtensionField + DeserializeOwned")]
 pub struct MhaCtx<E: ExtensionField> {
-    node_id: NodeID,
+    node_id: NodeId,
     inputs_reshape: ReshapeCtx,
     final_mul: ConcatMatMulCtx,
     softmax: SoftmaxCtx<E>,
@@ -219,7 +219,7 @@ where
     // It uses a collision-resistant hash function to pseudo-randomly select an ephemeral id
     // The id is ephemeral in the sense that it will not correspond to an actual node in the
     // model
-    fn compute_ephemeral_node_id(node_id: NodeID, domain_separator: &str) -> NodeID {
+    fn compute_ephemeral_node_id(node_id: NodeId, domain_separator: &str) -> NodeId {
         let bytes = (*node_id)
             .to_le_bytes()
             .into_iter()
@@ -234,15 +234,15 @@ where
         usize::from_be_bytes(byte_array).into()
     }
 
-    fn qk_node_id(node_id: NodeID) -> NodeID {
+    fn qk_node_id(node_id: NodeId) -> NodeId {
         Self::compute_ephemeral_node_id(node_id, "qk")
     }
     #[allow(dead_code)]
-    fn softmax_node_id(node_id: NodeID) -> NodeID {
+    fn softmax_node_id(node_id: NodeId) -> NodeId {
         Self::compute_ephemeral_node_id(node_id, "softmax")
     }
 
-    fn final_mul_node_id(node_id: NodeID) -> NodeID {
+    fn final_mul_node_id(node_id: NodeId) -> NodeId {
         Self::compute_ephemeral_node_id(node_id, "final_mul")
     }
 }
@@ -409,7 +409,7 @@ impl QuantizeOp for Mha<f32> {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: crate::model::NodeID,
+        node_id: NodeId,
         input_scaling: &[crate::ScalingFactor],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -507,7 +507,7 @@ impl QuantizeOp for Mha<f32> {
 impl ProveInfo for Mha<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let (ctx, mut reshaped_aux) = self.inputs_reshape.step_info(
@@ -729,7 +729,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -859,7 +859,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &crate::ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         _store: &mut GenStore,
@@ -1505,7 +1505,7 @@ mod test {
 
         let expected_output = outputs[0].clone();
         for (_, node) in quantized_model.graph.nodes() {
-            if let Layer::QKV(ref qkv) = node {
+            if let Some(Layer::QKV(ref qkv)) = node.as_inner() {
                 qkv.reset_cache();
             }
         }
@@ -1720,12 +1720,10 @@ mod test {
 
         let (quantized_model, inputs) =
             quantize_model(model, inputs, None, &mut GenStore::default()).unwrap();
-        quantized_model
-            .graph
-            .forward_iter()
-            .for_each(|(node_id, node)| {
-                println!("node with id {node_id}, node name: {}", node.describe())
-            });
+
+        for (node_id, node) in quantized_model.graph.forward_iter() {
+            println!("node with id {node_id}, node name: {}", node.describe())
+        }
         // run to get unpadded output
         let mut outputs = quantized_model
             .run::<GoldilocksExt2>(&inputs, None, &mut GenStore::default())

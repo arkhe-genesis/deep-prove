@@ -150,14 +150,17 @@ impl InputJSON {
         );
         Ok(())
     }
+
     fn into_elements(self, md: &ModelMetadata) -> (Vec<Vec<Element>>, Vec<Vec<Element>>) {
-        let input_sf = md.input.first().unwrap();
+        // NOTE: this rely on the assumption that there is only one input
+        let input_sf = md.input_scaling(0);
         let inputs = self
             .input_data
             .into_iter()
             .map(|input| input.into_iter().map(|e| input_sf.quantize(&e)).collect())
             .collect();
-        let output_sf = *md.output_scaling_factor().first().unwrap();
+        // NOTE: this rely on the assumption that there is only one output
+        let output_sf = *md.output_scaling(0);
         let outputs = self
             .output_data
             .into_iter()

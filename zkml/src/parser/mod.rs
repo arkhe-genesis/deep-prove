@@ -369,7 +369,7 @@ mod tests {
             .build()
             .unwrap();
         let input = crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0])
-            .to_quantized(&md.input[0]);
+            .to_quantized(md.input_scaling(0));
         let input = model.prepare_inputs(vec![input]).unwrap();
         let trace = model
             .run::<F>(&input, None, &mut GenStore::default())
@@ -408,8 +408,10 @@ mod tests {
         let inputs = model
             .unpadded_input_shapes()
             .into_iter()
-            .zip(&md.input)
-            .map(|(shape, s)| crate::tensor::Tensor::<f32>::random(&shape).to_quantized(s))
+            .enumerate()
+            .map(|(i, shape)| {
+                crate::tensor::Tensor::<f32>::random(&shape).to_quantized(md.input_scaling(i))
+            })
             .collect();
         let input = model.prepare_inputs(inputs).unwrap();
         info!("RUNNING MODEL...");
@@ -461,8 +463,9 @@ mod tests {
         let native_input = model
             .unpadded_input_shapes()
             .into_iter()
-            .zip(&md.input)
-            .map(|(shape, s)| crate::tensor::Tensor::<f32>::random(&shape).to_quantized(s))
+            .map(|shape| {
+                crate::tensor::Tensor::<f32>::random(&shape).to_quantized(md.input_scaling(0))
+            })
             .collect();
         let input = model.prepare_inputs(native_input).unwrap();
         let trace = model

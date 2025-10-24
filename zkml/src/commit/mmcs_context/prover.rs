@@ -1,5 +1,4 @@
 //! Module containing code for the model commitment prover
-
 use super::{CommitmentProverCtx, ModelOpeningProof};
 use crate::{
     Claim,
@@ -7,19 +6,11 @@ use crate::{
         compute_betas_eval,
         mmcs_context::{build_sumcheck_expression, table_poly_id},
     },
+    graph::NodeId,
     lookup::context::TableType,
-    model::NodeID,
     tensor::TensorKey,
 };
-
-use std::{
-    collections::{BTreeMap, HashMap},
-    marker::PhantomData,
-    slice,
-};
-
 use anyhow::{Result, anyhow};
-
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -28,8 +19,12 @@ use multilinear_extensions::{
     mle::{IntoMLE, MultilinearExtension, Point},
     virtual_polys::VirtualPolynomialsBuilder,
 };
-
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    collections::{BTreeMap, HashMap},
+    marker::PhantomData,
+    slice,
+};
 use sumcheck::{
     structs::{IOPProof, IOPProverState},
     util::optimal_sumcheck_threads,
@@ -37,7 +32,7 @@ use sumcheck::{
 use transcript::Transcript;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-/// A list of points and evaluations for polynomials stored in a batch commitment, together with the [`NodeID`] the evaluations were generated in. We have one [`Point`]
+/// A list of points and evaluations for polynomials stored in a batch commitment, together with the [`NodeId`] the evaluations were generated in. We have one [`Point`]
 /// per [`ceno_witness::RowMajorMatrix`] in the commitment, and the length of each [`Vec<E>`] should be the same as the number of columns in said [`ceno_witness::RowMajorMatrix`].
 pub struct BatchCommitmentClaim<E> {
     /// The claim on the commitment for that layer, a list of [`Point`] together with a [`Vec<E>`] that stores the evaluations
@@ -87,12 +82,12 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     /// A map storing all the claims for tensors fixed by the model.
-    /// The `NodeID` is only employed to sort the claims related to the same
+    /// The `NodeId` is only employed to sort the claims related to the same
     /// static tensor, assuming that only one claim for a static tensor is
     /// produced in each node
-    model_claims: HashMap<TensorKey, BTreeMap<NodeID, Claim<E>>>,
+    model_claims: HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
     /// The list of claims about the witness
-    witness_claims: BTreeMap<NodeID, BatchCommitmentClaim<E>>,
+    witness_claims: BTreeMap<NodeId, BatchCommitmentClaim<E>>,
     _phantom: PhantomData<PCS>,
 }
 
@@ -116,12 +111,12 @@ where
             _phantom: PhantomData,
         }
     }
-    pub fn add_witness_claim(&mut self, node_id: NodeID, claim: Vec<(Point<E>, Vec<E>)>) {
+    pub fn add_witness_claim(&mut self, node_id: NodeId, claim: Vec<(Point<E>, Vec<E>)>) {
         self.witness_claims
             .insert(node_id, BatchCommitmentClaim::<E>::new(claim));
     }
 
-    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, Vec<(NodeID, Claim<E>)>>) {
+    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, Vec<(NodeId, Claim<E>)>>) {
         claims.into_iter().for_each(|(poly_id, claims)| {
             let poly_claims = self.model_claims.entry(poly_id).or_default();
             claims
@@ -130,25 +125,25 @@ where
         });
     }
 
-    pub fn add_table_claim(&mut self, table_id: NodeID, table_type: &TableType, claim: Claim<E>) {
+    pub fn add_table_claim(&mut self, table_id: NodeId, table_type: &TableType, claim: Claim<E>) {
         self.model_claims.insert(
             table_poly_id(table_type.name()),
             BTreeMap::from([(table_id, claim)]),
         );
     }
 
-    /// Using a provided mapping from [`NodeID`] to [`PolynomialCommitmentScheme::CommitmentWithWitness`] construct
+    /// Using a provided mapping from [`NodeId`] to [`PolynomialCommitmentScheme::CommitmentWithWitness`] construct
     /// the data to be fed to the [`PolynomialCommitmentScheme::batch_open`] method.
     fn prep_for_open<'a>(
         &mut self,
-        node_id_mapping: &'a HashMap<NodeID, PCS::CommitmentWithWitness>,
+        node_id_mapping: &'a HashMap<NodeId, PCS::CommitmentWithWitness>,
     ) -> Result<Vec<ProverClaim<'a, E, PCS>>> {
         let witness_map = std::mem::take(&mut self.witness_claims);
         witness_map
             .into_iter()
             .map(|(node_id, batch_claim)| {
                 let commitment = node_id_mapping.get(&node_id).ok_or(anyhow!(
-                    "Proving failed, No commitment found for NodeID {node_id}"
+                    "Proving failed, No commitment found for NodeId {node_id}"
                 ))?;
                 let BatchCommitmentClaim { claims } = batch_claim;
                 Ok(ProverClaim::new(commitment, claims))
@@ -159,10 +154,10 @@ where
     pub fn prove<T: Transcript<E>>(
         mut self,
         ctx: &CommitmentProverCtx<E, PCS>,
-        witness_commitments: &HashMap<NodeID, PCS::CommitmentWithWitness>,
+        witness_commitments: &HashMap<NodeId, PCS::CommitmentWithWitness>,
         transcript: &mut T,
     ) -> Result<ModelOpeningProof<E, PCS>> {
-        // First we replace the `NodeID`s in the witness claims with the actual PCS::CommitmentWithWitness
+        // First we replace the `NodeId`s in the witness claims with the actual PCS::CommitmentWithWitness
         let mut rounds = self.prep_for_open(witness_commitments)?;
 
         // Now we arrange the model claims in the correct order, we iterate over the model_comms_map in reverse so the largest number of variables is
@@ -203,7 +198,7 @@ where
     }
 
     fn model_polys_sumcheck<T: Transcript<E>>(
-        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeID, Claim<E>>>,
+        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
         commit_ctx: &CommitmentProverCtx<E, PCS>,
         transcript: &mut T,
     ) -> Result<ModelSumcheckProof<E>> {

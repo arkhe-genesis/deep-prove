@@ -1,9 +1,12 @@
-use std::collections::HashMap;
-
+use super::{
+    LayerCtx,
+    provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
+};
 use crate::{
     Claim, Element, Prover, ProverContext, Shape, Tensor,
     backend::Maxpool2dConfig,
     commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{context::ShapeStep, verifier::Verifier},
     layers::{ContextAux, LayerProof},
     lookup::{
@@ -31,24 +34,17 @@ use multilinear_extensions::{
     util::{ceil_log2, transpose},
     virtual_polys::VirtualPolynomialsBuilder,
 };
-use serde::de::DeserializeOwned;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
 use sumcheck::{
-    structs::{IOPProof, IOPVerifierState},
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
 use tenstore::GenStore;
 use transcript::Transcript;
 use witness::RowMajorMatrix;
 
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use sumcheck::structs::IOPProverState;
-
-use super::{
-    LayerCtx,
-    provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
-};
-use crate::model::NodeID;
 /// Short name used to identify the pooling layer.
 pub const POOLING_LAYER: &str = "POOL";
 
@@ -62,7 +58,7 @@ pub enum Pooling {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PoolingCtx {
     pub poolinfo: Maxpool2D,
-    pub node_id: NodeID,
+    pub node_id: NodeId,
     pub lookup_ctx: LayerLookupContext,
 }
 
@@ -207,7 +203,7 @@ impl Evaluate<f32> for Pooling {
 impl ProveInfo for Pooling {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let info = match self {
@@ -259,7 +255,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -279,7 +275,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -426,7 +422,7 @@ impl Pooling {
         // input to the dense layer
         input: &Tensor<E>,
         info: &PoolingCtx,
-        id: NodeID,
+        id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
         E::BaseField: Serialize + DeserializeOwned,

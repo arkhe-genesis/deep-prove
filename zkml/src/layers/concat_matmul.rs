@@ -10,30 +10,10 @@
 //! Transpose: There is the option to transpose the output of the matmul. This is useful for proving to avoid
 //! having to prove explicitly the transpose operation with a separate layer, as sumcheck based proving can directly
 //! prove the transpose at the same time as the matmul.
-use std::{borrow::Borrow, collections::BTreeMap};
-
-use anyhow::{Result, ensure};
-use either::Either;
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    Expression,
-    mle::{IntoMLE, MultilinearExtension},
-    virtual_polys::VirtualPolynomialsBuilder,
-};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-use tenstore::GenStore;
-use tracing::trace;
-use transcript::Transcript;
-
 use crate::{
     Claim, Element, Prover, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -45,11 +25,31 @@ use crate::{
         },
         requant::Requant,
     },
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
     tensor::{TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
 };
+use anyhow::{Result, ensure};
+use either::Either;
+use ff_ext::ExtensionField;
+use itertools::Itertools;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{
+    Expression,
+    mle::{IntoMLE, MultilinearExtension},
+    virtual_polys::VirtualPolynomialsBuilder,
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{borrow::Borrow, collections::BTreeMap};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
+use tenstore::GenStore;
+use tracing::trace;
+use transcript::Transcript;
+
 /// Short name used to identify the concat matmul layer.
 pub const CONCAT_MATMUL_LAYER: &str = "CMML";
 
@@ -365,7 +365,7 @@ pub struct ConcatMatMul {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConcatMatMulCtx {
-    pub(crate) node_id: NodeID,
+    pub(crate) node_id: NodeId,
     permutations: MatrixPermutations,
 }
 
@@ -662,7 +662,7 @@ impl QuantizeOp for ConcatMatMul {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[crate::ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<super::provable::QuantizeOutput<Self::QuantizedOp>> {
@@ -686,7 +686,7 @@ impl QuantizeOp for ConcatMatMul {
 impl ProveInfo for ConcatMatMul {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let num_columns_left = aux.last_output_shape[0][self.permutations.left.mat_mul_dimension];
@@ -729,7 +729,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -1093,8 +1093,11 @@ mod test {
             ConcatMatMul::expected_dimension_for_right_input(),
         );
 
-        let first_node_id = model.add_layer(Layer::ConcatMatMul(first_matmul)).unwrap();
-        model.set_input(first_node_id, vec![0, 1]).unwrap();
+        let first_node_id = model
+            .graph
+            .add_inner(Layer::ConcatMatMul(first_matmul))
+            .unwrap();
+        model.connect_model_inputs([0, 1], first_node_id).unwrap();
 
         // add another concat matmul layer, multiplying the output of `first_node_id` with the additional
         // input tensor of the model
@@ -1105,11 +1108,16 @@ mod test {
                                               * the middle dimension */
         );
 
-        let second_node_id = model.add_layer(Layer::ConcatMatMul(second_matmul)).unwrap();
+        let second_node_id = model
+            .graph
+            .add_inner(Layer::ConcatMatMul(second_matmul))
+            .unwrap();
         model
             .add_edge(first_node_id, second_node_id, (0, 0))
             .unwrap();
-        model.set_input(second_node_id, vec![2]).unwrap();
+        model
+            .connect_model_input(2, second_node_id.input_at(1))
+            .unwrap();
 
         model.automatic_output_labelling().unwrap();
 

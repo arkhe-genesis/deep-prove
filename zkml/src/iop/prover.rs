@@ -2,7 +2,7 @@ use super::{ChallengeStorage, Proof, TableProof};
 use crate::{
     Claim, Element, Tensor,
     commit::{compute_betas_eval, mmcs_context, same_poly},
-    graph::PortID,
+    graph::{Node, NodeId, NodeInput, PortId},
     iop::{context::ProverContext, model_output_claims},
     layers::{
         LayerProof,
@@ -12,15 +12,12 @@ use crate::{
         context::{LookupWitness, TableType, generate_lookup_witnesses},
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
-    model::{InferenceStep, InferenceTrace, NodeID},
+    model::{InferenceStep, InferenceTrace},
     tensor::{TensorKey, get_root_of_unity},
 };
 use anyhow::{Context as _, anyhow, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
-use std::collections::{BTreeMap, HashMap};
-use tracing::trace;
-
 use itertools::Itertools;
 use mpcs::{Point, PolynomialCommitmentScheme};
 use multilinear_extensions::{
@@ -29,10 +26,10 @@ use multilinear_extensions::{
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-
+use std::collections::{BTreeMap, HashMap};
 use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use timed::timed_instrument;
-use tracing::debug;
+use tracing::{debug, trace};
 use transcript::Transcript;
 use utils::{Metrics, stream_metrics};
 
@@ -46,14 +43,14 @@ where
 {
     ctx: &'a ProverContext<E, PCS>,
     // proofs for each layer being filled
-    proofs: HashMap<NodeID, LayerProof<E, PCS>>,
+    proofs: HashMap<NodeId, LayerProof<E, PCS>>,
     table_proofs: Vec<TableProof<E, PCS>>,
-    merge_claim_proofs: HashMap<NodeID, MergeClaimsProof<E>>,
+    merge_claim_proofs: HashMap<NodeId, MergeClaimsProof<E>>,
     pub(crate) transcript: &'b mut T,
     /// Proves commitment openings
     pub(crate) commit_prover: mmcs_context::CommitmentProver<E, PCS>,
     /// The lookup witnesses
-    pub(crate) lookup_witness: HashMap<NodeID, PCS::CommitmentWithWitness>,
+    pub(crate) lookup_witness: HashMap<NodeId, PCS::CommitmentWithWitness>,
     /// Stores all the challenges for the different lookup/table types
     pub(crate) challenge_storage: ChallengeStorage<E>,
 }
@@ -153,7 +150,7 @@ where
 
     pub(crate) fn add_common_claims(
         &mut self,
-        node_id: NodeID,
+        node_id: NodeId,
         claims: HashMap<TensorKey, Claim<E>>,
     ) {
         self.commit_prover.add_common_claims(
@@ -170,17 +167,17 @@ where
             .add_table_claim(table_node_id, table_type, claim);
     }
 
-    pub(crate) fn add_witness_claim(&mut self, node_id: NodeID, claims: Vec<(Point<E>, Vec<E>)>) {
+    pub(crate) fn add_witness_claim(&mut self, node_id: NodeId, claims: Vec<(Point<E>, Vec<E>)>) {
         self.commit_prover.add_witness_claim(node_id, claims);
     }
 
-    pub(crate) fn lookup_witness(&self, id: NodeID) -> anyhow::Result<&PCS::CommitmentWithWitness> {
+    pub(crate) fn lookup_witness(&self, id: NodeId) -> anyhow::Result<&PCS::CommitmentWithWitness> {
         self.lookup_witness
             .get(&id)
             .ok_or(anyhow!("No lookup witness found for node {id}!"))
     }
 
-    pub(crate) fn push_proof(&mut self, node_id: NodeID, proof: LayerProof<E, PCS>) {
+    pub(crate) fn push_proof(&mut self, node_id: NodeId, proof: LayerProof<E, PCS>) {
         self.proofs.insert(node_id, proof);
     }
 
@@ -524,56 +521,105 @@ where
         // input vector.
         let out_claims = model_output_claims(self.transcript, &trace.outputs()?);
         let mut store = trace.store.clone();
+
         // each layer generates claims about its inputs. Each claim is stored at
         // the right position amongst all the "input ports" of the node, e.g. target_port when
         // considering incoming edges to this node.
-        let mut claims_produced_by_layers: HashMap<NodeID, Vec<Claim<E>>> = HashMap::new();
-        for (node_id, ctx) in self.ctx.model_ctx.nodes.backward_iter() {
-            let InferenceStep {
-                op: node_operation,
-                step_data,
-            } = trace
-                .get_step(&node_id)
-                .ok_or(anyhow!("Step in trace not found for node {node_id}"))?;
-            trace!(
-                "Proving node with id {node_id}: {:?}",
-                node_operation.describe()
-            );
-            let tensors = step_data
-                .node_outputs
-                .outputs
-                .iter()
-                .map(|t| t.hydrate(store.clone()).context("hydrating tensor"))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let claims_for_prove = self.flatten_and_merge_claims(
-                self.ctx.model_ctx.claims_for_node(
-                    &node_id,
-                    &claims_produced_by_layers,
-                    &out_claims,
-                )?,
-                &tensors.iter().collect::<Vec<_>>(),
-                node_id,
-            )?;
-            let claims = if node_operation.is_provable() {
-                node_operation
-                    .prove(
-                        node_id,
-                        ctx,
-                        claims_for_prove.iter().collect::<Vec<_>>(),
+        let mut claims: HashMap<NodeInput, Claim<E>> = HashMap::new();
+        for (node_id, node) in self.ctx.model_ctx.nodes.backward_iter() {
+            match node {
+                Node::Inner(ctx) => {
+                    let InferenceStep {
+                        op: node_operation,
                         step_data,
-                        &mut self,
-                        &mut store,
-                    )
-                    .with_context(|| {
-                        format!("proving {}: {}", node_id, node_operation.describe())
-                    })?
-            } else {
-                // we only propagate the claims, without changing them, as a non-provable layer
-                // shouldn't change the input values
-                claims_for_prove
-            };
-            claims_produced_by_layers.insert(node_id, claims);
+                    } = trace
+                        .get_step(node_id)
+                        // this should never happen in practice
+                        .ok_or(anyhow!("Step in trace not found for node {node_id}"))?;
+                    trace!(
+                        "Proving node with id {node_id}: {:?}",
+                        node_operation.describe()
+                    );
+
+                    // Hydrate all the output tensors of this node
+                    let tensors = step_data
+                        .node_outputs
+                        .outputs
+                        .iter()
+                        .map(|t| {
+                            t.hydrate(store.clone())
+                                .with_context(|| format!("hydrating tensor {}", t.storage_key()))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+
+                    // The claims for this node, i.e. the claims stemming from
+                    // the input nodes of the successor nodes connected to this
+                    // nodes output nodes, are collected and ordered by output
+                    // port (on this node) number. Remember that the graph is
+                    // traversed backwards, so output nodes are conceptually
+                    // inputs, and vice-versa.
+                    let claims_for_node: BTreeMap<PortId, Vec<&Claim<E>>> = self
+                        .ctx
+                        .model_ctx
+                        .nodes
+                        .outgoing_feeds(node_id)
+                        .into_iter()
+                        .fold(BTreeMap::new(), |mut ax, feed| {
+                            ax.entry(feed.source.port)
+                                .or_default()
+                                .push(&claims[&feed.target]);
+                            ax
+                        });
+
+                    // Just like for verification, there might be claims to be
+                    // merged if they are connected to the same output port for
+                    // this node.
+                    let claims_for_prove = self.flatten_and_merge_claims(
+                        claims_for_node,
+                        &tensors.iter().collect::<Vec<_>>(),
+                        node_id,
+                    )?;
+
+                    // prove or propagate the claims
+                    let my_claims = if node_operation.is_provable() {
+                        node_operation
+                            .prove(
+                                node_id,
+                                ctx,
+                                claims_for_prove.iter().collect::<Vec<_>>(),
+                                step_data,
+                                &mut self,
+                                &mut store,
+                            )
+                            .with_context(|| {
+                                format!("proving {}: {}", node_id, node_operation.describe())
+                            })?
+                    } else {
+                        // we only propagate the claims, without changing them, as a non-provable layer
+                        // shouldn't change the input values
+                        claims_for_prove
+                    };
+
+                    // Update the claim register with the input claims for this
+                    // node, that will become the data from which its
+                    // topological predecessors (but traversal successor,
+                    // remember the backward traversal) input claims will in
+                    // turn be derived.
+                    claims.extend(
+                        my_claims
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, claim)| (NodeInput::new(node_id, i), claim)),
+                    );
+                }
+                Node::Input(_) => {}
+                Node::Output(o) => {
+                    // Seed the claim register.
+                    claims.insert(NodeInput::new(node_id, 0), out_claims[*o].clone());
+                }
+            }
         }
+
         let span = metrics.to_span();
         stream_metrics("Claims", &span);
         debug!("== Claims generation metrics {} ==", span);
@@ -615,9 +661,9 @@ where
     /// there are claims linked to the same port, the claims will be merged.
     fn flatten_and_merge_claims(
         &mut self,
-        claims: BTreeMap<PortID, Vec<&Claim<E>>>,
+        claims: BTreeMap<PortId, Vec<&Claim<E>>>,
         outputs: &[&Tensor<E>],
-        node_id: NodeID,
+        node_id: NodeId,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         let mut merge_claim_proofs = HashMap::new();
         ensure!(

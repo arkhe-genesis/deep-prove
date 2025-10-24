@@ -9,23 +9,9 @@
 //! It is important to note that the LHS tensor "A" cannot be a constant tensor. In addition the contraction axes in the LHS and RHS tensors must appear in the same order
 //! (i.e. if the contraction axes in the LHS are "ik" then the contraction axes in the RHS must also be "ik", not "ki").
 //! This is to ensure that the einsum operation can be proven via Sumcheck.
-
-pub mod axis;
-pub(crate) mod evaluate;
-pub(crate) mod op_info;
-pub(crate) mod prove;
-pub(crate) mod quantise;
-pub(crate) mod verify;
-use axis::{AxesMapping, AxisType, Dimension};
-use evaluate::EvaluationInformation3D;
-use prove::EinSumProofInfo;
-use verify::EinSumVerifierInfo;
-
-use ff_ext::ExtensionField;
-use sumcheck::structs::IOPProof;
-
 use crate::{
     Claim, Element, Number, Shape, Tensor,
+    graph::NodeId,
     iop::{context::ContextAux, prover::Prover, verifier::Verifier},
     layers::{
         LayerCtx, LayerProof, ShapeStep,
@@ -34,18 +20,30 @@ use crate::{
             VerifiableCtx,
         },
     },
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{PaddingMode, ShapeData},
     quantization::{ScalingFactor, ScalingStrategy},
     tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
 };
-
 use anyhow::{Result, anyhow, ensure};
+use axis::{AxesMapping, AxisType, Dimension};
+use evaluate::EvaluationInformation3D;
+use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::Expression;
+use prove::EinSumProofInfo;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sumcheck::structs::IOPProof;
 use tenstore::GenStore;
 use transcript::Transcript;
+use verify::EinSumVerifierInfo;
+
+pub mod axis;
+pub(crate) mod evaluate;
+pub(crate) mod op_info;
+pub(crate) mod prove;
+pub(crate) mod quantise;
+pub(crate) mod verify;
 
 /// Identifier for the EinSum layer.
 pub(crate) const EINSUM_LAYER: &str = "EINS";
@@ -308,7 +306,7 @@ impl<N: Number> OpInfo for EinSum<N> {
 impl ProveInfo for EinSum<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         self.to_context(id, aux)
@@ -322,7 +320,7 @@ impl QuantizeOp for EinSum<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -349,7 +347,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -391,7 +389,7 @@ where
 /// - `einsum_sumcheck_expression`: The sumcheck expression for the einsum operation.
 /// - `input_aggregation_expression`: The sumcheck expression for the input aggregation operation, this checks that the same tensor was used as the LHS for all einsum operations. It is `None` if there are only two inputs to the einsum operation.
 pub struct EinSumContext<E: ExtensionField> {
-    pub node_id: NodeID,
+    pub node_id: NodeId,
     pub equation: String,
     pub mapping: AxesMapping,
     pub constant_keys: Vec<Option<TensorKey>>,

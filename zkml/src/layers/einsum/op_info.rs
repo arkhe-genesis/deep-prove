@@ -1,9 +1,6 @@
 //! Module that provides methods for generating [`EinsSumContext`] from an [`EinSum`] layer.
-
 use super::*;
-
 use crate::{Element, iop::context::ContextAux};
-
 use anyhow::Result;
 use either::Either;
 use multilinear_extensions::Expression;
@@ -12,7 +9,7 @@ impl EinSum<Element> {
     /// Create an [`EinSumContext`] from the current [`EinSum`] layer.
     pub fn to_context<E: ExtensionField>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(EinSumContext<E>, ContextAux)> {
         // Update the output shapes

@@ -1,18 +1,17 @@
-use crate::{Deserialize, Serialize, graph::PortID};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt::Debug,
-    hash::Hash,
-};
-
-use anyhow::{bail, ensure};
-
-use crate::graph::{DefaultNodeID, GenericNodeID};
-
 use super::{
     executor::Executor,
     graph::Direction,
     scheduler::{Colored, ExecGraph, ExecNode, GraphScheduler},
+};
+use crate::{
+    Deserialize, Serialize,
+    graph::{NodeId, NodeInput},
+};
+use anyhow::{bail, ensure};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt::Debug,
+    hash::Hash,
 };
 
 /// A partition represents a subgraph of nodes that share the same color and can be executed together.
@@ -42,14 +41,14 @@ use super::{
 /// // See ExecGraph::partition_by_color for examples
 /// ```
 #[derive(Debug, Clone)]
-pub struct Partition<N: ExecNode, C, NodeID = DefaultNodeID> {
+pub struct Partition<N: ExecNode, C> {
     /// The color identifier for this partition - all nodes in the partition share this color
     color: C,
     /// The executable subgraph for this partition
     ///
     /// Uses Option to allow consuming the graph during execution without cloning.
     /// The graph contains only nodes with the same color as this partition.
-    graph: Option<ExecGraph<N, C, NodeID>>,
+    graph: Option<ExecGraph<N, C>>,
     /// The color of the parent partition that should receive this partition's output
     ///
     /// `None` if this partition produces the final output of the entire computation.
@@ -58,18 +57,17 @@ pub struct Partition<N: ExecNode, C, NodeID = DefaultNodeID> {
     ///
     /// When this partition executes, it must wait for outputs from all child partitions.
     /// The ordering is maintained through the BTreeSet to ensure deterministic execution.
-    child_partition: BTreeSet<C>,
+    child_partition: HashMap<C, NodeInput>,
     /// Input data for source partitions
     ///
     /// Source partitions (those with no child partitions) receive external input data.
     /// Non-source partitions have empty inputs and wait for child partition outputs.
-    inputs: Vec<N::IO>,
+    inputs: HashMap<NodeId, N::IO>,
 }
 
-impl<NodeID, N: ExecNode, C> Partition<N, C, NodeID>
+impl<N: ExecNode, C> Partition<N, C>
 where
-    C: Ord + Clone,
-    NodeID: GenericNodeID,
+    C: Hash + Ord + Clone,
     <N as ExecNode>::IO: Clone,
 {
     /// Creates a new partition with the specified parameters.
@@ -101,13 +99,13 @@ where
     /// ```
     pub fn new(
         color: C,
-        graph: ExecGraph<N, C, NodeID>,
-        child_partition: BTreeSet<C>,
-        inputs: Vec<N::IO>,
+        graph: ExecGraph<N, C>,
+        child_partition: HashMap<C, NodeInput>,
+        inputs: HashMap<NodeId, N::IO>,
         parent_partition: Option<C>,
     ) -> anyhow::Result<Self> {
         ensure!(
-            graph.output_nodes().count() == 1,
+            graph.sink_nodes().count() == 1,
             "graph should have exactly one output node"
         );
         if let Some(ref parent_color) = parent_partition {
@@ -117,7 +115,7 @@ where
             );
         }
         ensure!(
-            !child_partition.contains(&color),
+            !child_partition.contains_key(&color),
             "child partition should not contain the current partition"
         );
         let is_source = child_partition.is_empty();
@@ -307,7 +305,7 @@ where
         ensure!(
             partitions
                 .iter()
-                .all(|p| p.graph.as_ref().unwrap().output_nodes().count() == 1),
+                .all(|p| p.graph.as_ref().unwrap().sink_nodes().count() == 1),
             "All partitions must have exactly one output node"
         );
         Ok(Self {
@@ -354,29 +352,40 @@ where
             return Ok(None);
         }
         let next_partition = self.partitions.get_mut(0);
-        let inputs = match next_partition {
+        let inputs: Option<HashMap<NodeInput, N::IO>> = match next_partition {
             Some(part) => {
                 if !part.is_source_partition() {
-                    // the next partition expects outputs from its child partitions (e.g. it has no graph data input).
-                    // we need to check if all the child outputs have been received.
+                    // the next partition expects outputs from its child
+                    // partitions (e.g. it has no graph data input). we need to
+                    // check if all the child outputs have been received.
                     let all_present = part
                         .child_partition
-                        .iter()
-                        .all(|k| self.pending_child_outputs.contains_key(k));
+                        .keys()
+                        .all(|color| self.pending_child_outputs.contains_key(color));
                     if !all_present {
                         None
                     } else {
                         Some(
                             part.child_partition
                                 .iter()
-                                .map(|c| self.pending_child_outputs.remove(c).unwrap())
+                                .map(|(color, node_input)| {
+                                    (
+                                        *node_input,
+                                        self.pending_child_outputs.remove(color).unwrap(),
+                                    )
+                                })
                                 .collect(),
                         )
                     }
                 } else {
                     // otherwise, the partition is a source partition, i.e. a partition that doesn't have
                     // any child partitions so we just read their inputs.
-                    Some(part.inputs.drain(..).collect())
+                    Some(
+                        part.inputs
+                            .drain()
+                            .map(|(node_id, io)| (NodeInput::new(node_id, 0), io))
+                            .collect(),
+                    )
                 }
             }
             None => unreachable!("partition should not be empty - precheck passed"),
@@ -441,9 +450,10 @@ where
             return Ok(());
         }
         let next_partition = self.partitions.first().unwrap();
-        if next_partition.child_partition.contains(&output.from) {
-            // we know the output is expected so we save it internally, and it'll be used at the next run if
-            // all outputs of all child partitions have been received.
+        if next_partition.child_partition.contains_key(&output.from) {
+            // we know the output is expected so we save it internally, and
+            // it'll be used at the next run if all outputs of all child
+            // partitions have been received.
             self.pending_child_outputs
                 .insert(output.from, output.output);
         } else {
@@ -478,12 +488,11 @@ where
     }
 }
 
-impl<NodeID, N, C> ExecGraph<N, C, NodeID>
+impl<N, C> ExecGraph<N, C>
 where
     C: PartialEq + Eq + Clone + Hash + Ord + Debug,
     N: ExecNode + Clone + Debug,
     N::IO: Clone,
-    NodeID: GenericNodeID,
     <N as ExecNode>::IO: Clone + Debug,
 {
     /// Partitions the graph by node colors for distributed execution.
@@ -519,10 +528,11 @@ where
     #[allow(clippy::type_complexity)]
     pub fn partition_by_color(
         &self,
-        inputs: Vec<N::IO>,
-    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C, NodeID>>>> {
+        inputs: Vec<(NodeId, N::IO)>,
+    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C>>>> {
         self.partition_by(|node| node.color(), inputs)
     }
+
     /// Partitions the graph using a custom color extraction function.
     ///
     /// This is the general partitioning method that allows custom logic for
@@ -561,26 +571,23 @@ where
     pub fn partition_by(
         &self,
         node_color: impl Fn(&Colored<N, C>) -> &C,
-        inputs: Vec<N::IO>,
-    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C, NodeID>>>> {
+        inputs: Vec<(NodeId, N::IO)>,
+    ) -> anyhow::Result<HashMap<C, Vec<Partition<N, C>>>> {
         let mut visited = HashSet::new();
         // for each color, we keep a list of its partitions:
         // first element is the vector graphs for all partitions
         // second element is the associated mapping original_graph_index => new_partition_index
-        let mut map = BTreeMap::<C, Vec<ExecGraph<N, C, NodeID>>>::new();
+        let mut map = BTreeMap::<C, Vec<ExecGraph<N, C>>>::new();
 
-        // We start itearting from the input nodes of the original graph, so we create the partitions "in order",
-        // starting from the lower partitions to the higher ones as this is the order of the execution of the graph.
-        let indices = self
-            .input_nodes()
-            .map(|(node_id, _)| node_id)
-            .chain(self.nodes().map(|(node_id, _)| node_id))
-            .collect::<BTreeSet<_>>();
-        for node in indices.into_iter() {
+        // We start itearting from the input nodes of the original graph, so we
+        // create the partitions "in order", starting from the lower partitions
+        // to the higher ones as this is the order of the execution of the
+        // graph.
+        for (node, _) in self.forward_iter() {
             if visited.contains(&node) {
                 continue;
             }
-            let color = node_color(&self[node]);
+            let color = node_color(self[node].inner());
 
             // Try to reach all nodes from this given node using DFS and
             // only keep the ones having the same color
@@ -592,35 +599,38 @@ where
                     continue;
                 }
                 partition.push(n);
-                for (_, edge) in self.node_neighbors(n, Direction::Any) {
-                    // there is a directly connected node sharing the same color, so it's part
-                    // of the same partition.
-                    // unwrap is safe since we filtered out the edges that are not between nodes
+                for (_, edge) in self.neighbors(n, Direction::Any) {
+                    // there is a directly connected node sharing the same
+                    // color, so it's part of the same partition.
+                    // unwrap is safe since we filtered out the edges that are
+                    // not between nodes
                     let other_end = edge.other_end(n).unwrap();
-                    if node_color(&self[other_end]) == color {
+                    if node_color(self[other_end].inner()) == color {
                         stack.push(other_end);
                     }
                 }
             }
 
             // Build a new Graph from this partition
-            let mut sub = ExecGraph::<N, C, NodeID>::new();
+            let mut sub = ExecGraph::<N, C>::new();
             // add all nodes to the graph
             for &node_id in &partition {
-                // we put empty edges for now since not all nodes in the partition have been added to the graph,
-                // we don't know yet their new index in the partition and therefore can't create all edges yet.
+                // we put empty edges for now since not all nodes in the
+                // partition have been added to the graph, we don't know yet
+                // their new index in the partition and therefore can't create
+                // all edges yet.
                 let node = self[node_id].clone();
-                sub.add_node_with_id(node_id.clone(), node)?;
+                sub.add_node_with_id(node_id, node)?;
             }
-            // add all edges inside the partition - excluding for now the input and output edges
+            // add all edges inside the partition - excluding for now the input
+            // and output edges
             for &node_id in &partition {
-                // we only add incoming edges - since eventually we go over all nodes of the graph, then we should
-                // have covered all the edges
-                for (_, edge) in self.node_neighbors(node_id, Direction::Incoming) {
-                    // unwrap is safe since we filtered out the edges that are not between nodes
-                    let source_id = edge.source_id().unwrap();
-                    // if the source is in the same partition, then we add the edge
-                    if let Some(_source_node) = sub.node(source_id) {
+                // we only add incoming edges - since eventually we go over all
+                // nodes of the graph, then we should have covered all the edges
+                for (_, edge) in self.incomings(node_id) {
+                    // if the source is in the same partition, then we add the
+                    // edge
+                    if let Some(_source_node) = sub.node(edge.source()) {
                         sub.add_edges_raw(vec![edge.clone()])?;
                     }
                 }
@@ -629,99 +639,93 @@ where
             map.entry(color.clone()).or_default().push(sub);
         }
 
-        let mut graph_root = self.output_nodes().collect::<Vec<_>>();
+        let mut graph_root = self.sink_nodes().collect::<Vec<_>>();
         ensure!(
             graph_root.len() == 1,
             "graph should have exactly one output node"
         );
-        let (graph_root, _) = graph_root.remove(0);
-        // At this point all the subgraphs have been built, but there some information missing:
-        //  - the links between the subgraphs, we need to extract which color partition depends on which other color partition.
-        //  - and then from it create the input edge on sink partitions: one node in each "parent" partition must now become an
-        //    input node in that partition to receive the output of the children partitions. The order is important here.
-        //  - Finding and setting the parent partition for each partition.
+        let graph_root = graph_root.remove(0);
+
+        // At this point all the subgraphs have been built, but there some
+        // information missing:
+        // - the links between the subgraphs, we need to
+        //   extract which color partition depends on which other color partition.
+        // - and then from it create the input edge on sink partitions: one node
+        //   in each "parent" partition must now become an input node in that
+        //   partition to receive the output of the children partitions. The order
+        //   is important here.
+        // - Finding and setting the parent partition for
+        //   each partition.
         map.into_iter()
             // all partitions sharing this color
             .map(|(color, partitions)| {
                 // the partitions as graphs
                 let mut final_partitions = Vec::with_capacity(partitions.len());
-                for mut subgraph in partitions.into_iter() {
-                    let mut child_partition_colors = BTreeSet::new();
-                    let mut flattened_partition_inputs = Vec::<N::IO>::new();
-                    // the input nodes in the new partition that should receive input data
-                    // we need to take the _same_ order of the inputs - given graph has a HashMap we take the ordering of the graph
-                    // TODO: maybe just turn the graph hashmap into a btreemap directly ?
-                    let partition_input_nodes = self
-                        .input_nodes()
-                        // check they're in the current partition
-                        .filter(|(idx, _)| subgraph.node(idx).is_some())
-                        .fold(
-                            BTreeMap::<&NodeID, Vec<PortID>>::new(),
-                            |mut acc, (idx, ports)| {
-                                #[allow(clippy::clone_on_copy)]
-                                acc.entry(idx).or_default().extend(ports.iter().map(|port| port.source_port.clone()));
-                                acc
-                            },
-                        );
-                    // 2 cases: either
-                    // 1. we are in a source partition, and we need to adjust the graph input data edges (maybe this partition only has one input
-                    // while the original graph had 3, the rest of the input nodes are in different partitions, so we need to adjust the indices of
-                    // the input data edges)
-                    // 2. we are in any parent partition, and we need to _create_ the graph input data edges
-                    if partition_input_nodes.is_empty() {
-                        // we are in a parent partition, so we need to manually add the input edges
-                        let mut source_nodes: Vec<_> = subgraph
-                            .nodes()
-                            .filter_map(|(idx, _)|
-                                // only take the nodes that have no incoming edges - that should
-                                match subgraph.node_neighbors(idx, Direction::Incoming).next() {
-                                    Some(_) => None,
-                                    // clone needed here since we're adding new edges right after depending
-                                    // on these IDs so we can't hold references only.
-                                    None => Some(idx.clone()),
-                                }
-                            )
-                            .collect();
+                for subgraph in partitions.into_iter() {
+                    let mut child_partition_colors = HashMap::<C, NodeInput>::new();
+                    let mut partition_inputs = HashMap::<NodeId, N::IO>::new();
+                    // the input nodes in the new partition that should receive
+                    // input data we need to take the _same_ order of the inputs
+                    // - given graph has a HashMap we take the ordering of the
+                    // graph
+                    //
+                    // TODO: maybe just turn the graph hashmap into a btreemap
+                    // directly ?
+
+                    // we are in a parent partition, so we need to manually add
+                    // the input edges
+                    if inputs.iter().all(|(node_id, _)| subgraph.node(*node_id).is_none()) {
+                        let source_nodes: Vec<_> = subgraph.source_nodes().collect();
                         ensure!(
                             source_nodes.len() == 1,
                             "INVALID GRAPH: a parent partition should have exactly one source node"
                         );
-                        let source_node = source_nodes.remove(0);
-                        // now search the incoming edges of the source node in the original graph.
-                        // For each edge, we add that info to the new partition
+                        let source_node = source_nodes[0];
+                        // now search the incoming edges of the source node in
+                        // the original graph. For each edge, we add that info
+                        // to the new partition
                         let edges = self
-                            .node_neighbors(&source_node, Direction::Incoming)
+                            .incomings(source_node)
                             .collect::<Vec<_>>();
 
-                        // we put the _position_ of the edge in the subgraph as _input_ of the subgraph
-                        // i.e. n-th child output should be the n-th input of source_node
-                        subgraph.set_input(source_node.clone(), (0..edges.len()).collect::<Vec<_>>(), None)?;
                         for (_, edge) in edges.into_iter()
                         {
                             // and we keep track of the order of the colors
-                            // unwrap is safe since we filtered out the edges that are not between nodes
-                            let edge_color = self[edge.source_id().unwrap()].color().clone();
-                            child_partition_colors.insert(edge_color);
+                            // unwrap is safe since we filtered out the edges
+                            // that are not between nodes
+                            let edge_color = self[edge.source()].inner().color().clone();
+                            for link in edge.ports().iter() {
+                                child_partition_colors.insert(
+                                    edge_color.clone(),
+                                    NodeInput::new(source_node, link.target_port)
+                                );
+                            }
                         }
                     } else {
-                        // we are in a source partition, so we need to adjust the input data indices
-                        for (node_id, input_indices) in partition_input_nodes.into_iter() {
-                            let offset = flattened_partition_inputs.len();
-                            // we also need to add the edges to the subgraph  - all inputs for this partition are concatenated together
-                            // TODO: remove the clone and use default values instead?
-                            flattened_partition_inputs
-                                .extend(input_indices.iter().map(|idx| inputs[*idx].clone()));
-                            let offsets = (0..input_indices.len()).map(|i| offset + i).collect::<Vec<_>>();
-                            subgraph.set_input(node_id.clone(), offsets, None)?;
-                        }
+                        // we are in a partition with raw inputs, select the
+                        // subset of raw inputs that map into this partition
+                        // (node IDs are stable between the original graph and
+                        // the partitions).
+                        partition_inputs.extend(
+                            inputs
+                                .iter()
+                                .filter_map(|(node_id, payload)|
+                                   if subgraph.node(*node_id).is_some() {
+                                       Some((*node_id, payload.clone()))
+                                   } else {
+                                       None
+                                   })
+                        );
                     }
 
-                    // now we want to find the parent partition for this partition such that its output can be sent to it.
-                    // we have to first find the root of the partition, and then set it as an output
+                    // now we want to find the parent partition for this
+                    // partition such that its output can be sent to it. we have
+                    // to first find the root of the partition, and then set it
+                    // as an output
                     let mut partition_root = subgraph.nodes()
-                        .filter_map(|(node_id, _)| {
-                            if subgraph.node_neighbors(node_id, Direction::Outgoing).count() == 0 {
-                                Some(node_id.clone())
+                        .filter_map(|(&node_id, _)| {
+                            if subgraph.is_sink(node_id) {
+                                Some(node_id)
                             } else {
                                 None
                             }
@@ -734,30 +738,27 @@ where
                         subgraph.edges,
                     );
                     let partition_root = partition_root.remove(0);
-                    subgraph.set_output(partition_root.clone(), 0, None)?;
-
                     let parent_node = self
-                        .node_neighbors(&partition_root, Direction::Outgoing)
+                        .outgoings(partition_root)
                         .next()
-                        // unwrap is safe since we filtered out the edges that are not between nodes
-                        .map(|(_, e)| e.target_id().unwrap());
+                        .map(|(_, e)| e.target());
 
                     // check if the partition is the root partition
-                    let parent_partition = if graph_root != &partition_root {
+                    let parent_partition = if graph_root != partition_root {
                         let Some(parent_node) = parent_node else {
                             bail!("any non root partition should have one parent partition");
                         };
-                        let parent_color = self[parent_node].color().clone();
+                        let parent_color = self[parent_node].inner().color().clone();
                         Some(parent_color)
                     } else {
                         None
                     };
 
-                    final_partitions.push(Partition::<N, C, NodeID>::new(
+                    final_partitions.push(Partition::<N, C>::new(
                         color.clone(),
                         subgraph,
                         child_partition_colors,
-                        flattened_partition_inputs,
+                        partition_inputs,
                         parent_partition,
                     )?);
                 }
@@ -766,7 +767,7 @@ where
             .collect::<anyhow::Result<Vec<_>>>()
             .map(|m| {
                 m.into_iter().flatten().fold(
-                    HashMap::<C, Vec<Partition<N, C, NodeID>>>::new(),
+                    HashMap::<C, Vec<Partition<N, C>>>::new(),
                     |mut acc, partition| {
                         acc.entry(partition.color.clone())
                             .or_default()
@@ -780,15 +781,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::graph::{
         Graph, PortLink, Ports,
         executor::{SequentialExecutor, tests::MathAST},
         scheduler::IntoColor,
     };
-
-    use super::*;
-
-    type NodeID = DefaultNodeID;
 
     ///            Pow_1
     ///            Pow_3
@@ -800,17 +798,36 @@ mod tests {
     /// and the inputs indices should be [1,2,5,6,3,4,7,8]
     /// Reason to choose sub and div is to test the non commutativity nature of the tasks, so the partitioning
     /// should dispatch the inputs to the correct partition in the right order and place.
-    fn create_graph() -> (ExecGraph<MathAST, usize>, NodeID) {
+    fn create_graph() -> (ExecGraph<MathAST, usize>, NodeId) {
         let mut graph = Graph::new();
+        let input_node_ids = [
+            graph.add_inner(MathAST::Input(0).colored(0)).unwrap(),
+            graph.add_inner(MathAST::Input(1).colored(0)).unwrap(),
+            graph.add_inner(MathAST::Input(2).colored(1)).unwrap(),
+            graph.add_inner(MathAST::Input(3).colored(1)).unwrap(),
+            graph.add_inner(MathAST::Input(4).colored(0)).unwrap(),
+            graph.add_inner(MathAST::Input(5).colored(0)).unwrap(),
+            graph.add_inner(MathAST::Input(6).colored(1)).unwrap(),
+            graph.add_inner(MathAST::Input(7).colored(1)).unwrap(),
+        ];
         // first partition
-        let add1 = graph.add_node(MathAST::Add.colored(0)).unwrap();
-        // the most high level way to add edges
-        graph.set_input(add1, vec![0, 1], None).unwrap();
+        let add1 = graph.add_inner(MathAST::Add.colored(0)).unwrap();
+        graph
+            .add_edge(input_node_ids[0], add1, (0, 0), None)
+            .unwrap();
+        graph
+            .add_edge(input_node_ids[1], add1, (0, 1), None)
+            .unwrap();
 
-        let sub1 = graph.add_node(MathAST::Sub.colored(0)).unwrap();
-        graph.set_input(sub1, vec![4, 5], None).unwrap();
+        let sub1 = graph.add_inner(MathAST::Sub.colored(0)).unwrap();
+        graph
+            .add_edge(input_node_ids[4], sub1, (0, 0), None)
+            .unwrap();
+        graph
+            .add_edge(input_node_ids[5], sub1, (0, 1), None)
+            .unwrap();
 
-        let agg1 = graph.add_node(MathAST::Div.colored(0)).unwrap();
+        let agg1 = graph.add_inner(MathAST::Div.colored(0)).unwrap();
         graph
             .add_edge(add1, agg1, Ports::consecutive(), None)
             .unwrap();
@@ -820,13 +837,23 @@ mod tests {
             .unwrap();
 
         // second partition
-        let add2 = graph.add_node(MathAST::Add.colored(1)).unwrap();
-        graph.set_input(add2, vec![2, 3], None).unwrap();
+        let add2 = graph.add_inner(MathAST::Add.colored(1)).unwrap();
+        graph
+            .add_edge(input_node_ids[2], add2, (0, 0), None)
+            .unwrap();
+        graph
+            .add_edge(input_node_ids[3], add2, (0, 1), None)
+            .unwrap();
 
-        let sub2 = graph.add_node(MathAST::Sub.colored(1)).unwrap();
-        graph.set_input(sub2, vec![6, 7], None).unwrap();
+        let sub2 = graph.add_inner(MathAST::Sub.colored(1)).unwrap();
+        graph
+            .add_edge(input_node_ids[6], sub2, (0, 0), None)
+            .unwrap();
+        graph
+            .add_edge(input_node_ids[7], sub2, (0, 1), None)
+            .unwrap();
 
-        let agg2 = graph.add_node(MathAST::Div.colored(1)).unwrap();
+        let agg2 = graph.add_inner(MathAST::Div.colored(1)).unwrap();
         graph
             .add_edge(add2, agg2, Ports::consecutive(), None)
             .unwrap();
@@ -835,7 +862,7 @@ mod tests {
             .unwrap();
 
         // third partition
-        let agg3 = graph.add_node(MathAST::Sub.colored(2)).unwrap();
+        let agg3 = graph.add_inner(MathAST::Sub.colored(2)).unwrap();
         graph
             .add_edge(agg1, agg3, Ports::consecutive(), None)
             .unwrap();
@@ -843,40 +870,61 @@ mod tests {
             .add_edge(agg2, agg3, PortLink::new(0, 1), None)
             .unwrap();
 
-        let agg33 = graph.add_node(MathAST::Pow2.colored(2)).unwrap();
+        let agg33 = graph.add_inner(MathAST::Pow2.colored(2)).unwrap();
         graph
             .add_edge(agg3, agg33, Ports::consecutive(), None)
             .unwrap();
 
-        let pow1 = graph.add_node(MathAST::Pow2.colored(0)).unwrap();
+        let pow1 = graph.add_inner(MathAST::Pow2.colored(0)).unwrap();
         graph
             .add_edge(agg33, pow1, Ports::consecutive(), None)
             .unwrap();
-        graph.set_output(pow1, 0, None).unwrap();
+
         (graph, pow1)
     }
 
     #[test]
     fn test_partition_by_color() {
         let (graph, agg33) = create_graph();
-        assert_eq!(
-            graph.output_nodes().map(|(id, _)| id).collect::<Vec<_>>(),
-            vec![&agg33]
-        );
+        assert_eq!(graph.sink_nodes().collect::<Vec<_>>(), vec![agg33]);
         let partitions = graph
-            .partition_by_color(vec![1, 2, 3, 4, 5, 6, 7, 8])
+            .partition_by_color(
+                [1, 2, 3, 4, 5, 6, 7, 8]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, io)| (i.into(), io))
+                    .collect(),
+            )
             .unwrap();
         assert_eq!(partitions.len(), 3);
         assert_eq!(partitions.get(&0).unwrap().len(), 2);
         assert_eq!(partitions.get(&1).unwrap().len(), 1);
         assert_eq!(partitions.get(&2).unwrap().len(), 1);
-        assert_eq!(partitions.get(&0).unwrap()[0].inputs, vec![1, 2, 5, 6]);
-        assert_eq!(partitions.get(&1).unwrap()[0].inputs, vec![3, 4, 7, 8]);
+        assert_eq!(
+            partitions.get(&0).unwrap()[0]
+                .inputs
+                .keys()
+                .map(|x| **x)
+                .collect::<HashSet<_>>(),
+            [0, 1, 4, 5].into_iter().collect()
+        );
+        assert_eq!(
+            partitions.get(&1).unwrap()[0]
+                .inputs
+                .keys()
+                .map(|x| **x)
+                .collect::<HashSet<_>>(),
+            [2, 3, 6, 7].into_iter().collect()
+        );
         assert_eq!(partitions.get(&2).unwrap()[0].inputs.len(), 0);
         assert_eq!(partitions.get(&2).unwrap()[0].child_partition.len(), 2);
         assert_eq!(
-            partitions.get(&2).unwrap()[0].child_partition,
-            BTreeSet::from([0, 1])
+            partitions.get(&2).unwrap()[0]
+                .child_partition
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            [0, 1].into_iter().collect()
         );
         assert_eq!(partitions.get(&0).unwrap()[0].parent_partition, Some(2));
         assert_eq!(partitions.get(&1).unwrap()[0].parent_partition, Some(2));
@@ -899,7 +947,13 @@ mod tests {
         // agg3 = agg1 - agg2 = 4 - 2 = 2
         // agg33 = pow2(agg3) = 2^2 = 4
         // final output = pow1 = pow2(agg33) = 4^2 = 16
-        let partitions = graph.partition_by_color(vec![1, 7, 3, 4, 4, 2, 6, 3])?;
+        let partitions = graph.partition_by_color(
+            [1, 7, 3, 4, 4, 2, 6, 3]
+                .into_iter()
+                .enumerate()
+                .map(|(i, io)| (i.into(), io))
+                .collect(),
+        )?;
         let mut schedulers =
             partitions
                 .into_iter()

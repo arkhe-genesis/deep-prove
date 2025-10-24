@@ -1,18 +1,6 @@
-use std::{
-    iter::once,
-    ops::Deref,
-    sync::{Arc, Mutex},
-};
-
-use anyhow::ensure;
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::GenStore;
-use transcript::Transcript;
-
 use crate::{
     Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -25,10 +13,21 @@ use crate::{
         },
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
-    model::{NodeID, StepData},
+    model::StepData,
     quantization::TensorFielder,
     tensor::{KeyedTensor, TensorKey, TensorSlice, TensorTypeParam, WrappedTensor},
 };
+use anyhow::ensure;
+use ff_ext::ExtensionField;
+use mpcs::PolynomialCommitmentScheme;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    iter::once,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
+use tenstore::GenStore;
+use transcript::Transcript;
 
 /// Data structure containing the proof data for the absolute variant of positional encoding layer
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,7 +47,7 @@ pub struct AbsoluteCtx {
     add_ctx: AddCtx,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
-    node_id: NodeID,
+    node_id: NodeId,
     positional_key: TensorKey,
 }
 
@@ -114,7 +113,7 @@ impl Absolute<f32> {
     pub(super) fn quantize<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: ScalingFactor,
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Absolute<Element>>> {
@@ -157,7 +156,7 @@ impl PadOp for Absolute<Element> {
 impl Absolute<Element> {
     pub(super) fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         aux: ContextAux,
     ) -> anyhow::Result<(AbsoluteCtx, ContextAux)> {
         let (ctx, mut aux) = self.add_layer.step_info(id, aux)?;
@@ -194,7 +193,7 @@ impl Absolute<Element> {
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     >(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         output_claim: &Claim<E>,
         step_data: &StepData<E, E>,
         prover: &mut Prover<E, T, PCS>,

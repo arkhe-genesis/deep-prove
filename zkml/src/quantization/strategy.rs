@@ -1,24 +1,22 @@
+use super::ScalingFactor;
 use crate::{
-    Shape,
-    graph::Source,
+    Element, Shape, Tensor,
+    graph::{Node, NodeId, NodeOutput, PortId},
     layers::provable::{OpInfo, QuantizeOp, TrackedDataId},
-    model::{Model, NodeID, transform::apply_transformations},
+    model::{Model, transform::apply_transformations},
     number::Number,
-    quantization::metadata::{MetadataBuilder, ModelMetadata},
+    padding::PaddingMode,
+    quantization::{self, ModelMetadata, metadata::MetadataBuilder},
     rng_from_env_or_random,
 };
-use std::collections::{BTreeMap, HashMap};
-
-use crate::{Element, Tensor, quantization};
 use anyhow::{Result, anyhow, ensure};
 use average::{Estimate, Max, Min, Quantile, Variance};
 use ff_ext::GoldilocksExt2;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use tenstore::GenStore;
 use tracing::{debug, info, warn};
-
-use super::ScalingFactor;
 
 /// Trait for quantizing a float-based model into a quantized model. The current implementation
 /// simply looks at the absolute maximum value of the model and uses that as the scaling factor
@@ -37,13 +35,13 @@ pub trait ScalingStrategy: std::fmt::Debug {
     /// the auxiliary data provided.
     fn scaling_factors_for_node(
         data: &Self::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         num_outputs: usize,
     ) -> Vec<ScalingFactor>;
 
     fn scaling_factor_for_intermediate_data(
         data: &Self::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         data_id: TrackedDataId,
     ) -> ScalingFactor;
 
@@ -80,6 +78,7 @@ impl InferenceObserver {
     }
 }
 
+// TODO: replace that with the actual input node ID
 const INPUT_TRACKING_ID: usize = 10_000;
 
 impl ScalingStrategy for InferenceObserver {
@@ -162,7 +161,7 @@ impl ScalingStrategy for InferenceObserver {
 
     fn scaling_factors_for_node(
         tracker: &InferenceTracker,
-        node_id: NodeID,
+        node_id: NodeId,
         num_outputs: usize,
     ) -> Vec<ScalingFactor> {
         (0..num_outputs)
@@ -175,7 +174,7 @@ impl ScalingStrategy for InferenceObserver {
 
     fn scaling_factor_for_intermediate_data(
         tracker: &InferenceTracker,
-        node_id: NodeID,
+        node_id: NodeId,
         data_id: TrackedDataId,
     ) -> ScalingFactor {
         tracker.scaling_factor_for_intermediate_data(node_id, data_id)
@@ -189,10 +188,10 @@ pub struct InferenceTracker {
     mode: InferenceTrackingMode,
     /// Streaming estimator of the selected statistics for each output of each
     /// node.
-    accumulators: HashMap<(NodeID, usize), InferenceTrackingAccumulator>,
+    accumulators: HashMap<(NodeId, usize), InferenceTrackingAccumulator>,
     /// Streaming estimator of the selected statistics for given intermediate data of
     /// each node, if any
-    intermediate_data_trackers: HashMap<(NodeID, TrackedDataId), InferenceTrackingAccumulator>,
+    intermediate_data_trackers: HashMap<(NodeId, TrackedDataId), InferenceTrackingAccumulator>,
 }
 /// Selects the statistic to use to generate the scaling range.
 enum InferenceTrackingMode {
@@ -267,7 +266,7 @@ impl InferenceTracker {
             intermediate_data_trackers: HashMap::new(),
         }
     }
-    pub(crate) fn track(&mut self, node_id: NodeID, output_index: usize, output: Tensor<f32>) {
+    pub(crate) fn track(&mut self, node_id: NodeId, output_index: usize, output: Tensor<f32>) {
         let accumulator = self
             .accumulators
             .entry((node_id, output_index))
@@ -279,7 +278,7 @@ impl InferenceTracker {
 
     pub(crate) fn track_intermediate_data(
         &mut self,
-        node_id: NodeID,
+        node_id: NodeId,
         data_id: TrackedDataId,
         data: Tensor<f32>,
     ) {
@@ -292,7 +291,7 @@ impl InferenceTracker {
         }
     }
 
-    pub(crate) fn scaling_range(&self, node_id: NodeID, output_index: usize) -> (f32, f32) {
+    pub(crate) fn scaling_range(&self, node_id: NodeId, output_index: usize) -> (f32, f32) {
         self.accumulators
             .get(&(node_id, output_index))
             .unwrap()
@@ -301,7 +300,7 @@ impl InferenceTracker {
 
     pub(crate) fn scaling_factor_for_intermediate_data(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         data_id: TrackedDataId,
     ) -> ScalingFactor {
         let (min, max) = self
@@ -372,7 +371,7 @@ impl ScalingStrategy for AbsoluteMax {
 
     fn scaling_factors_for_node(
         _data: &Self::AuxData,
-        _node_id: NodeID,
+        _node_id: NodeId,
         num_outputs: usize,
     ) -> Vec<ScalingFactor> {
         vec![ScalingFactor::default(); num_outputs]
@@ -380,7 +379,7 @@ impl ScalingStrategy for AbsoluteMax {
 
     fn scaling_factor_for_intermediate_data(
         _data: &Self::AuxData,
-        _node_id: NodeID,
+        _node_id: NodeId,
         _data_id: TrackedDataId,
     ) -> ScalingFactor {
         ScalingFactor::default()
@@ -394,87 +393,107 @@ fn quantize_model<S: ScalingStrategy>(
 ) -> anyhow::Result<(Model<Element>, ModelMetadata)> {
     let input_shapes = model.input_shapes();
     let input_not_padded_shapes = model.unpadded_input_shapes();
-    let mut md = MetadataBuilder::new(input_scaling);
-    // 2. Create the requant layers from the inferred data
+    let mut md = MetadataBuilder::new();
     let mut requant_layers = vec![];
-    // 3. Apply the post quantisation transforms if there are any
     let mut transforms = vec![];
-
-    let mut shape_map = HashMap::<NodeID, Vec<Shape>>::new();
+    // Accumulate all the layer output shapes as they are being encountered,
+    // required for `quantize_op`.
+    let mut shape_map = HashMap::<NodeOutput, Shape>::new();
     let quantized_graph = model
         .graph
-        // we create the quantized graph going in the inference order
-        // sometimes some layer may need to know some parts of the previously visited nodes
+        // we create the quantized graph going in the inference order sometimes
+        // some layer may need to know some parts of the previously visited
+        // nodes
+        //
         // XXX: is it true?
-        .try_into_map_forward(|node_id, node, edges| {
-            let input_scalings = md.map_to_input_scaling(
-                // take all the incoming edges to this node and fetch the relevant scaling factors
-                edges
-                    .iter()
-                    .filter(|edge| edge.is_incoming_to(&node_id))
-                    .copied(),
-            )?;
-            let shape_info = edges
-                .iter()
-                .filter(|edge| edge.is_incoming_to(&node_id))
-                .try_fold(BTreeMap::new(), |mut acc, edge| {
-                    for port in edge.ports().iter() {
-                        match edge.source() {
-                            Source::Node(n) => {
-                                let shape = shape_map
-                                    .get(n)
-                                    .map(|shape_vec| shape_vec[port.source_port].clone())
-                                    .ok_or(anyhow!("Shape info for node {n} not found"))?;
-                                acc.insert(port.target_port, shape);
-                            }
-                            Source::Input => {
-                                let shape = input_not_padded_shapes[port.source_port].clone();
-                                acc.insert(port.target_port, shape);
-                            }
-                        }
+        .try_into_map_forward(|node_id, node, incoming_feeds| {
+            Ok(match node {
+                Node::Inner(layer) => {
+                    tracing::debug!(
+                        "Quantising node {}, with node ID {node_id}",
+                        layer.short_name()
+                    );
+                    let shape_info = incoming_feeds
+                        .iter()
+                        .try_fold(BTreeMap::<PortId, Shape>::new(), |mut ax, in_feed| {
+                            let shape = shape_map
+                                .get(&in_feed.source)
+                                .ok_or(anyhow!("fetching shape info for {:?}", in_feed.source))?;
+                            ax.insert(in_feed.target.port, shape.clone());
+                            anyhow::Result::<BTreeMap<PortId, Shape>>::Ok(ax)
+                        })?
+                        .into_values()
+                        .collect::<Vec<Shape>>();
+
+                    // Ordered list of the input scalings for each input port of
+                    // this node. The ordering should be respected thanks to
+                    // `.incomings`
+                    let input_scalings = incoming_feeds
+                        .iter()
+                        .map(|feed| md.get_output_layer_scaling(feed.source))
+                        .collect::<Result<Vec<_>>>()?;
+
+                    // Compute the quantization for this node
+                    let quantized_out =
+                        layer.quantize_op::<S>(&data, node_id, &input_scalings, &shape_info)?;
+
+                    // Save this layer output scaling factors
+                    md.insert_layer_scalings(
+                        node_id,
+                        quantized_out.output_scalings,
+                        input_scalings,
+                    );
+
+                    // Extend the shape register with the output shapes for the
+                    // current node.
+                    shape_map.extend(
+                        quantized_out
+                            .quantized_op
+                            .output_shapes(&shape_info, PaddingMode::NoPadding)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(out_port, shape)| (NodeOutput::new(node_id, out_port), shape)),
+                    );
+
+                    if let Some(requant) = quantized_out.requant_layer {
+                        requant_layers.push((node_id, requant));
                     }
-                    Result::<BTreeMap<_, _>>::Ok(acc)
-                })?
-                .into_values()
-                .collect::<Vec<Shape>>();
-
-            let quantized_out =
-                node.quantize_op::<S>(&data, node_id, &input_scalings, &shape_info)?;
-            md.set_layers_scaling(node_id, quantized_out.output_scalings, input_scalings);
-            // Update the current shape info
-            let node_output_shapes = quantized_out
-                .quantized_op
-                .output_shapes(&shape_info, crate::padding::PaddingMode::NoPadding);
-            shape_map.insert(node_id, node_output_shapes);
-
-            if let Some(requant) = quantized_out.requant_layer {
-                requant_layers.push((node_id, requant));
-            }
-            if let Some(transform) = quantized_out.post_quant_rule {
-                transforms.push(transform);
-            }
-            Ok(quantized_out.quantized_op)
+                    if let Some(transform) = quantized_out.post_quant_rule {
+                        transforms.push(transform);
+                    }
+                    Node::Inner(quantized_out.quantized_op)
+                }
+                // Looks silly, but the `Node` are not actually of the same
+                // types left & right
+                Node::Input(i) => {
+                    md.insert_layer_scalings(node_id, vec![input_scaling[i]], vec![]);
+                    shape_map.insert(
+                        NodeOutput::new(node_id, 0),
+                        input_not_padded_shapes[i].clone(),
+                    );
+                    Node::Input(i)
+                }
+                Node::Output(o) => Node::Output(o),
+            })
         })?;
     let mut model = Model::new_from_shapes(input_not_padded_shapes, input_shapes, quantized_graph);
+
+    // add scaling factor to `md` for requant layers: the scaling factors of
+    // the inputs correspond to the scaling factors of the outputs of the
+    // previous node
     for (input_node_id, requant) in requant_layers {
         let requant_ids = model.add_requant_layer(requant, input_node_id)?;
-        // add scaling factor to `md` for requant layers: the scaling factors of the inputs correspond to
-        // the scaling factors of the outputs of the previous node
-        let input_scaling = md.get_output_layer_scaling(&input_node_id).ok_or(anyhow!(
-            "Scaling factors not found for node {input_node_id}"
-        ))?;
-        ensure!(
-            requant_ids.len() == input_scaling.len(),
-            "Number of requant layers must match number of output scalings"
-        );
-        for (node_id, scaling_factor) in requant_ids.into_iter().zip(input_scaling.to_vec()) {
-            md.set_layers_scaling(node_id, vec![scaling_factor], vec![scaling_factor]);
+        for (i, requant_id) in requant_ids.into_iter().enumerate() {
+            let node_out = NodeOutput::new(input_node_id, i);
+            let scaling_factor = md.get_output_layer_scaling(node_out)?;
+
+            md.insert_layer_scalings(requant_id, vec![scaling_factor], vec![scaling_factor]);
         }
     }
+
     // Apply any model transformations
     model = apply_transformations(model, transforms)?;
-    let out_nodes = model.graph.output_nodes();
-    let md = md.build(out_nodes)?;
+    let md = md.build(model.graph.input_node_ids(), model.graph.output_node_ids())?;
     info!("Quantized model with {} layers", model.graph.node_count());
     Ok((model, md))
 }

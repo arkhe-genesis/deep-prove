@@ -1,10 +1,4 @@
 use crate::{
-    parser::{gguf, json},
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
-};
-use std::iter::once;
-
-use crate::{
     ScalingFactor, ScalingStrategy,
     backend::Backend,
     commit::{compute_betas_eval, identity_eval},
@@ -12,10 +6,29 @@ use crate::{
         LayerProof,
         provable::{QuantizeOp, QuantizeOutput},
     },
+    parser::{gguf, json},
+    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
+use std::iter::once;
 
+use crate::{
+    Claim, Element, Prover, Shape, Tensor,
+    graph::NodeId,
+    iop::{
+        context::{ContextAux, ShapeStep},
+        verifier::Verifier,
+    },
+    layers::{
+        LayerCtx,
+        matrix_mul::{MatMul, OperandMatrix},
+        provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
+    },
+    model::StepData,
+    number::Number,
+    padding::{PaddingMode, ShapeInfo},
+};
 use anyhow::{anyhow, bail, ensure};
 use burn::tensor::{
     TensorPrimitive,
@@ -34,22 +47,6 @@ use sumcheck::{
 use tenstore::GenStore;
 use transcript::Transcript;
 
-use crate::{
-    Claim, Element, Prover, Shape, Tensor,
-    iop::{
-        context::{ContextAux, ShapeStep},
-        verifier::Verifier,
-    },
-    layers::{
-        LayerCtx,
-        matrix_mul::{MatMul, OperandMatrix},
-        provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
-    },
-    model::{NodeID, StepData},
-    number::Number,
-    padding::{PaddingMode, ShapeInfo},
-};
-
 /// The short name used to identify the embeddings layer
 pub const EMBEDDINGS_LAYER: &str = "EMBD";
 
@@ -62,7 +59,7 @@ pub struct Embeddings<N> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsCtx {
-    id: NodeID,
+    id: NodeId,
     vocab_size: usize,
     emb_size: usize,
     embedding_key: TensorKey,
@@ -308,7 +305,7 @@ impl PadOp for Embeddings<Element> {
 impl ProveInfo for Embeddings<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
@@ -361,7 +358,7 @@ impl QuantizeOp for Embeddings<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -390,7 +387,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,

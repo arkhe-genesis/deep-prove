@@ -1,27 +1,7 @@
-use std::sync::{Arc, Mutex};
-
-use anyhow::{Result, bail, ensure};
-use either::Either;
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    Expression,
-    mle::{IntoMLE, MultilinearExtension},
-    virtual_polys::VirtualPolynomialsBuilder,
-};
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-use tenstore::GenStore;
-use transcript::{Challenge, Transcript};
-
 use crate::{
     Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::same_poly,
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -34,13 +14,32 @@ use crate::{
         },
         requant::Requant,
     },
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
     tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
 };
+use anyhow::{Result, bail, ensure};
+use either::Either;
+use ff_ext::ExtensionField;
+use itertools::Itertools;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{
+    Expression,
+    mle::{IntoMLE, MultilinearExtension},
+    virtual_polys::VirtualPolynomialsBuilder,
+};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::sync::{Arc, Mutex};
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
+use tenstore::GenStore;
+use transcript::{Challenge, Transcript};
 
 /// Short name used to identify the QKV layer
 pub const QKV_LAYER: &str = "_QKV";
@@ -69,7 +68,7 @@ pub struct QKV<N> {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QKVCtx {
-    node_id: NodeID,
+    node_id: NodeId,
     unpadded_shape: Shape, // same shape for Q, K and V
     num_heads: usize,
     head_dim: usize,
@@ -423,7 +422,7 @@ impl QuantizeOp for QKV<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -540,7 +539,7 @@ impl Evaluate<Element> for QKV<Element> {
 impl ProveInfo for QKV<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         ensure!(
@@ -622,7 +621,7 @@ where
 
     fn prove<T: Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,

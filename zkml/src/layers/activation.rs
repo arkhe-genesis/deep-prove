@@ -1,6 +1,8 @@
+use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx};
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
     commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
@@ -20,13 +22,11 @@ use crate::{
     model::StepData,
     number::Number,
     padding::PaddingMode,
-    quantization::{self, Fieldizer},
-    tensor::{DryTensor, WrappedModuleFn, WrappedTensor},
+    quantization::{self, BIT_LEN, Fieldizer},
+    tensor::{DryTensor, Tensor, WrappedModuleFn, WrappedTensor},
 };
 use either::Either;
 use ff_ext::ExtensionField;
-use witness::RowMajorMatrix;
-
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
     Expression,
@@ -45,9 +45,7 @@ use sumcheck::{
 };
 use tenstore::GenStore;
 use transcript::Transcript;
-
-use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx};
-use crate::{model::NodeID, quantization::BIT_LEN, tensor::Tensor};
+use witness::RowMajorMatrix;
 
 /// The short name used to identify an activation layer.
 pub const ACTIVATION_LAYER: &str = "ACTI";
@@ -85,7 +83,7 @@ pub struct ActivationCtx<E: ExtensionField + Serialize + DeserializeOwned> {
     pub op: Activation<Element>,
     pub lookup_context: LayerLookupContext,
     pub sumcheck_expression: Vec<Expression<E>>,
-    pub node_id: NodeID,
+    pub node_id: NodeId,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,7 +181,7 @@ impl ActivationLayer<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         num_outputs: usize,
     ) -> anyhow::Result<QuantizeOutput<ActivationLayer<Element>>> {
@@ -227,7 +225,7 @@ impl ActivationLayer<Element> {
 
     fn lookup_witness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         activation_input: &Tensor<Element>,
         activation_output: &Tensor<Element>,
@@ -277,11 +275,11 @@ impl ActivationLayer<Element> {
 
         let commit = ctx.commitment_ctx.batch_commit(vec![rmm])?;
 
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.insert_logup_witness(id, commit);
-        gen.insert_element_count(self.table_type(), element_count);
+        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
+        gen_w.insert_logup_witness(id, commit);
+        gen_w.insert_element_count(self.table_type(), element_count);
 
-        Ok(gen)
+        Ok(gen_w)
     }
 
     fn table_type(&self) -> TableType {
@@ -329,7 +327,7 @@ impl QuantizeOp for Activation<f32> {
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[crate::ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -461,7 +459,7 @@ impl Evaluate<Element> for Activation<Element> {
 impl ProveInfo for Activation<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let lookup_context = match self.activation_type() {
@@ -543,7 +541,7 @@ where
 
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
-        id: NodeID,
+        id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -560,7 +558,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -656,7 +654,7 @@ impl Activation<Element> {
         last_claim: &Claim<E>,
         step: &ActivationCtx<E>,
         inputs: &[DryTensor<E>],
-        node_id: NodeID,
+        node_id: NodeId,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where

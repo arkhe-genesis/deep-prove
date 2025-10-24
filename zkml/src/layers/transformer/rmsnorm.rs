@@ -1,40 +1,15 @@
 //! Implementation of the RMSNorm layer
-use std::collections::HashMap;
-
-use anyhow::{Result, anyhow, ensure};
-use ark_std::Zero;
-use either::Either;
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    Expression,
-    mle::{IntoMLE, MultilinearExtension},
-    util::{ceil_log2, transpose},
-    utils::eval_by_expr_with_instance,
-    virtual_poly::VPAuxInfo,
-    virtual_polys::VirtualPolynomialsBuilder,
-};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-use tenstore::GenStore;
-use tracing::trace;
-use transcript::Transcript;
-use witness::{InstancePaddingStrategy, RowMajorMatrix};
-
 use crate::{
     Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Tensor,
     commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
         prover::Prover,
         verifier::Verifier,
     },
     layers::{
-        LayerCtx, LayerProof, NodeID, Requant,
+        LayerCtx, LayerProof, Requant,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
@@ -62,6 +37,30 @@ use crate::{
     tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
     to_base,
 };
+use anyhow::{Result, anyhow, ensure};
+use ark_std::Zero;
+use either::Either;
+use ff_ext::ExtensionField;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{
+    Expression,
+    mle::{IntoMLE, MultilinearExtension},
+    util::{ceil_log2, transpose},
+    utils::eval_by_expr_with_instance,
+    virtual_poly::VPAuxInfo,
+    virtual_polys::VirtualPolynomialsBuilder,
+};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
+use sumcheck::{
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::optimal_sumcheck_threads,
+};
+use tenstore::GenStore;
+use tracing::trace;
+use transcript::Transcript;
+use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 /// The short name used to identify the RMSNorm layer.
 pub(crate) const RMSNORM_LAYER: &str = "RMSN";
@@ -414,7 +413,7 @@ impl QuantizeOp for RMSNorm<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
@@ -479,7 +478,7 @@ impl PadOp for RMSNorm<Element> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "E: ExtensionField + DeserializeOwned")]
 pub struct RMSNormCtx<E: ExtensionField> {
-    node_id: NodeID,
+    node_id: NodeId,
     /// The result of calling [`f32::to_bits`] on the epsilon used for normalisation purposes
     eps: u32,
     /// The number of bits that get range checked (so we can know how many instances there are in the range lookup)
@@ -549,7 +548,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> RMSNormProof<E, PCS>
 impl ProveInfo for RMSNorm<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         if let Some(quant_info) = self.quant_info() {
@@ -691,7 +690,7 @@ where
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
         step_data: &StepData<E, E>,
@@ -716,7 +715,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -739,7 +738,7 @@ type ProveOut<E, PCS> = (Vec<Claim<E>>, RMSNormProof<E, PCS>);
 impl RMSNorm<Element> {
     pub(crate) fn prove_step<E, T, PCS>(
         &self,
-        node_id: NodeID,
+        node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
         ctx: &RMSNormCtx<E>,
         input_poly: MultilinearExtension<E>,
@@ -897,7 +896,7 @@ impl RMSNorm<Element> {
     /// Internal method for generating the lookup witness for a [`RMSNorm`] step.
     fn lookup_witness<E, PCS>(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         input_tensor: Tensor<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>>

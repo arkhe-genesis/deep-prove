@@ -1,25 +1,20 @@
 //! Module containing the logic to commit to instance and witness polynomials for a model using a MMCS
-
-use crate::model::NodeID;
+use crate::{graph::NodeId, lookup::context::TableType, tensor::TensorKey};
+use anyhow::{Context, Result, anyhow};
+use either::Either;
+use ff_ext::ExtensionField;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{Expression, mle::MultilinearExtension, util::transpose};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
 };
-
-use crate::{lookup::context::TableType, tensor::TensorKey};
-use anyhow::{Context, Result, anyhow};
-use either::Either;
-use ff_ext::ExtensionField;
-
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{Expression, mle::MultilinearExtension, util::transpose};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sumcheck::structs::IOPProof;
 use tracing::debug;
+use transcript::Transcript;
 use utils::Metrics;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
-
-use sumcheck::structs::IOPProof;
-use transcript::Transcript;
 
 mod prover;
 pub use prover::CommitmentProver;
@@ -45,8 +40,8 @@ where
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
     model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
-    /// This is the [`NodeID`] used for tables in this model
-    table_node_id: NodeID,
+    /// This is the [`NodeId`] used for tables in this model
+    table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
 }
@@ -117,7 +112,7 @@ where
         witness_poly_size: usize,
         polys: HashMap<TensorKey, MultilinearExtension<E>>,
         lookup_ctx: &[TableType],
-        max_node_id: NodeID,
+        max_node_id: NodeId,
     ) -> Result<GlobalCommitmentContext<E, PCS>> {
         // Find the maximum size so we can generate params
         let max_poly_size = polys
@@ -140,7 +135,7 @@ where
         debug!("{} PPs & VPs built", m.to_span());
 
         // Find the maximum node id used in this model so we can pick a unique node id for table related commitments.
-        let table_node_id = NodeID::from(max_node_id.0 + 1);
+        let table_node_id = NodeId::from(max_node_id.0 + 1);
 
         // First we take all the model polys and sort them by the number of variables they have.
         // Then we do the same for any table commitments but here we set all of them to have `table_node_id`.
@@ -275,8 +270,8 @@ where
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
     model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
-    /// This is the [`NodeID`] used for tables in this model
-    table_node_id: NodeID,
+    /// This is the [`NodeId`] used for tables in this model
+    table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
 }
@@ -324,7 +319,7 @@ where
         }
     }
 
-    pub fn table_node_id(&self) -> NodeID {
+    pub fn table_node_id(&self) -> NodeId {
         self.table_node_id
     }
 }
@@ -344,8 +339,8 @@ where
     model_commitment: Option<PCS::Commitment>,
     /// Map that stores the position of each individual polynomial in the batch commitment
     model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
-    /// This is the [`NodeID`] used for tables in this model
-    table_node_id: NodeID,
+    /// This is the [`NodeId`] used for tables in this model
+    table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
     max_model_num_vars: usize,
 }
@@ -381,7 +376,7 @@ where
         }
     }
 
-    pub fn table_node_id(&self) -> NodeID {
+    pub fn table_node_id(&self) -> NodeId {
         self.table_node_id
     }
 }

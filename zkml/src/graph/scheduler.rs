@@ -1,12 +1,9 @@
+use crate::graph::{NodeId, NodeInput, PortId, graph::Graph};
 use anyhow::ensure;
-use std::{collections::BTreeMap, fmt::Debug};
-
-use crate::graph::{
-    DefaultNodeID, GenericNodeID, PortID,
-    graph::{Direction, Graph},
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt::Debug,
 };
-
-use std::collections::{HashMap, HashSet};
 
 /// A trait defining executable operations that can be run as nodes in a computational graph.
 ///
@@ -63,17 +60,13 @@ pub trait ExecNode {
 ///
 /// Edge weights store the output data (`N::IO`) from executed nodes, which flows
 /// to successor nodes as input. The scheduler manages this data flow automatically.
-pub type ExecGraph<N, C, NodeID = DefaultNodeID> =
-    Graph<Colored<N, C>, <N as ExecNode>::IO, NodeID>;
+pub type ExecGraph<N, C> = Graph<Colored<N, C>, (), (), <N as ExecNode>::IO>;
 
-impl<N, C> Graph<Colored<N, C>, <N as ExecNode>::IO, DefaultNodeID>
+impl<N, C> ExecGraph<N, C>
 where
     N: ExecNode,
 {
-    /// Creates a new empty executable graph with default node IDs.
-    ///
-    /// This is a convenience constructor for the common case of using
-    /// [`DefaultNodeID`] as the node identifier type.
+    /// Creates a new empty executable graph.
     pub fn default_exec_graph() -> Self {
         Self::new()
     }
@@ -200,19 +193,19 @@ pub enum ReleasePolicy {
 }
 
 impl ReleasePolicy {
-    fn accept<N: ExecNode, C: PartialEq, NodeID: GenericNodeID>(
+    fn accept<N: ExecNode, C: PartialEq>(
         &self,
-        node_index: &NodeID,
-        scheduler: &GraphScheduler<N, C, NodeID>,
+        node_index: NodeId,
+        scheduler: &GraphScheduler<N, C>,
     ) -> bool {
         match self {
             ReleasePolicy::All => true,
             ReleasePolicy::UniqueColoring => {
-                let node_color = &scheduler.graph[node_index].color;
+                let node_color = &scheduler.graph[node_index].as_inner().unwrap().color;
                 scheduler
                     .running_nodes
                     .iter()
-                    .all(|nidx| &scheduler.graph[nidx].color != node_color)
+                    .all(|nidx| &scheduler.graph[*nidx].as_inner().unwrap().color != node_color)
             }
         }
     }
@@ -228,18 +221,18 @@ impl ReleasePolicy {
 ///
 /// * `N` - The executable node type implementing [`ExecNode`]
 /// * `C` - The color type used for scheduling
-/// * `NodeID` - The node identifier type (defaults to [`DefaultNodeID`])
+/// * `NodeId` - The node identifier type (defaults to [`DefaultNodeId`])
 #[derive(Debug, Clone)]
-pub struct ReadyNode<N: ExecNode, C, NodeID = DefaultNodeID> {
+pub struct ReadyNode<N: ExecNode, C> {
     /// The colored node containing the operation to execute
     pub(crate) node: Colored<N, C>,
     /// Input data collected from predecessor nodes and/or graph inputs
     pub(crate) inputs: Vec<N::IO>,
     /// The node's identifier in the original graph
-    pub(crate) node_id: NodeID,
+    pub(crate) node_id: NodeId,
 }
 
-impl<NodeID, N: ExecNode, C> ReadyNode<N, C, NodeID> {
+impl<N: ExecNode, C> ReadyNode<N, C> {
     /// Executes this ready node with the provided context.
     ///
     /// This method consumes the input data and runs the node's operation.
@@ -276,41 +269,40 @@ impl<NodeID, N: ExecNode, C> ReadyNode<N, C, NodeID> {
 ///
 /// * `N` - The executable node type implementing [`ExecNode`]
 /// * `C` - The color type used for scheduling policies
-/// * `NodeID` - The node identifier type (defaults to [`DefaultNodeID`])
+/// * `NodeId` - The node identifier type (defaults to [`DefaultNodeId`])
 #[derive(Debug, Clone)]
-pub struct GraphScheduler<N: ExecNode, C, NodeID = DefaultNodeID> {
+pub struct GraphScheduler<N: ExecNode, C> {
     /// The computational graph with colored nodes and data-carrying edges
-    graph: ExecGraph<N, C, NodeID>,
+    graph: ExecGraph<N, C>,
     /// Cached input data for nodes that receive both graph inputs and predecessor outputs
     ///
     /// Maps node IDs to their input data organized by port ID. This is used for nodes
     /// that have both external input edges and edges from other nodes.
-    waiting_input_data: HashMap<NodeID, BTreeMap<PortID, N::IO>>,
+    waiting_input_data: HashMap<NodeInput, N::IO>,
     /// Set of nodes currently being executed
     ///
     /// Used to track which nodes are in progress and enforce release policies.
-    running_nodes: HashSet<NodeID>,
+    running_nodes: HashSet<NodeId>,
     /// Set of nodes that have completed execution
     ///
     /// Used to determine when the entire graph is complete and to avoid
     /// re-executing nodes.
-    done_nodes: HashSet<NodeID>,
+    done_nodes: HashSet<NodeId>,
     /// Policy controlling which ready nodes are released for execution
     release_policy: ReleasePolicy,
 }
 
-impl<NodeID, N, C> GraphScheduler<N, C, NodeID>
+impl<N, C> GraphScheduler<N, C>
 where
     N: ExecNode + Clone,
     N::IO: Clone,
     C: PartialEq + Clone,
-    NodeID: GenericNodeID,
 {
     /// Creates a new scheduler for the given executable graph.
     ///
     /// The scheduler is initialized with the default release policy
     /// ([`ReleasePolicy::UniqueColoring`]) and empty execution state.
-    pub fn new(graph: ExecGraph<N, C, NodeID>) -> Self {
+    pub fn new(graph: ExecGraph<N, C>) -> Self {
         Self {
             graph,
             running_nodes: HashSet::new(),
@@ -324,11 +316,8 @@ where
     ///
     /// These are the nodes whose results should be collected as the final
     /// outputs of the computation.
-    pub fn output_nodes(&self) -> Vec<NodeID> {
-        self.graph
-            .output_nodes()
-            .map(|(node_idx, _)| node_idx.clone())
-            .collect()
+    pub fn output_nodes(&self) -> Vec<NodeId> {
+        self.graph.sink_nodes().collect()
     }
 
     /// Sets the release policy for this scheduler.
@@ -348,7 +337,9 @@ where
     ///
     /// # Parameters
     ///
-    /// * `input_data` - External input data for the graph, ordered by input port indices
+    /// * `input_data` - External input data for the graph, addressed by target
+    ///   [`NodeInput`]. Except for exotic cases, the inputs should simply be
+    ///   the port 0 of the target node.
     ///
     /// # Returns
     ///
@@ -359,77 +350,40 @@ where
     /// Returns an error if:
     /// - The scheduler has already been initialized (has running nodes)
     /// - The input data length doesn't match the number of input ports
+    ///
+    /// NOTE: this function works under the current partitioning that all
+    /// topological source nodes are pure input nodes.
     pub fn init_nodes(
         &mut self,
-        input_data: Vec<N::IO>,
-    ) -> anyhow::Result<Vec<ReadyNode<N, C, NodeID>>> {
+        input_data: HashMap<NodeInput, N::IO>,
+    ) -> anyhow::Result<Vec<ReadyNode<N, C>>> {
         ensure!(self.running_nodes.is_empty(), "Running nodes must be empty");
-        ensure!(
-            self.graph
-                .input_nodes()
-                .flat_map(|(_, ports)| ports.iter().map(|port| port.source_port))
-                .collect::<HashSet<_>>()
-                .len()
-                == input_data.len(),
-            "Number of input node ports and input data must match"
-        );
-        // we filter out the input nodes that have incoming edges (they might have one input edge and another input edge coming from a node)
-        // for the input nodes that also wait an incoming edge from other nodes, just register them in the waiting nodes under the constant input node index
-        Ok(self
-            .graph
-            .input_nodes()
-            .filter_map(|(input_node_id, ports)| {
-                // we know input_node_id has an input edge, but we want to take _only_ the ones that have no other edges
-                if self
-                    .graph
-                    .neighbors(input_node_id, Direction::Incoming)
-                    .filter(|(_, edge)| edge.is_between_nodes())
-                    .count()
-                    == 0
-                {
-                    // if the input node has no incoming edges, it is an *full* input node
-                    // in this case, we mark them directly as pending since we'll return them in this function
-                    self.running_nodes.insert(input_node_id.clone());
-                    // and prepare the ready node
-                    let node = self.graph[input_node_id].clone();
-                    Some(ReadyNode {
-                        node,
-                        // NOTE: we select the inputs by the source port and order them by the target port
-                        // TODO: if we want to avoid cloning, then we should either have N::IO: Default and replace
-                        // each entry in the vector by default, OR use an `enum InputData { Data(N::IO), Empty }` in the vector.
-                        // for now, we keep it simple.
-                        inputs: ports
-                            .iter()
-                            .map(|portlink| {
-                                (
-                                    portlink.target_port,
-                                    input_data[portlink.source_port].clone(),
-                                )
-                            })
-                            .collect::<BTreeMap<_, _>>()
-                            .into_values()
-                            .collect(),
-                        node_id: input_node_id.clone(),
-                    })
+        let input_data = input_data.into_iter().fold(
+            HashMap::<NodeId, BTreeMap<PortId, N::IO>>::new(),
+            |mut acc, (node_input, io)| {
+                if self.graph.is_source(node_input.node_id) {
+                    // If this is an input node, prepare its ordered inputs.
+                    acc.entry(node_input.node_id)
+                        .or_default()
+                        .insert(node_input.port, io);
                 } else {
-                    // in this case, we'll be waiting for the other nodes to be executed
-                    // and then their outputs will be set on the corresponding edges such that this node
-                    // will run after all its edges are filled with data.
-                    // BUT we still need to save that input data somewhere so that when all dependencies are resolved,
-                    // we can run this node
-                    self.waiting_input_data.insert(
-                        input_node_id.clone(),
-                        ports
-                            .iter()
-                            .map(|portlink| {
-                                (
-                                    portlink.target_port,
-                                    input_data[portlink.source_port].clone(),
-                                )
-                            })
-                            .collect::<BTreeMap<_, _>>(),
-                    );
-                    None
+                    // Otherwise, just store the IO data to be used later.
+                    self.waiting_input_data.insert(node_input, io);
+                }
+
+                acc
+            },
+        );
+
+        Ok(input_data
+            .into_iter()
+            .map(|(node_id, payload)| {
+                let node = &self.graph[node_id];
+                self.running_nodes.insert(node_id);
+                ReadyNode {
+                    node: node.as_inner().unwrap().clone(),
+                    inputs: payload.into_values().collect(),
+                    node_id,
                 }
             })
             .collect::<Vec<_>>())
@@ -451,22 +405,23 @@ where
     /// Returns an error if:
     /// - The node was not in the running state
     /// - The node was already marked as done
-    pub fn mark_done(&mut self, node_id: NodeID, output: &N::IO) -> anyhow::Result<()> {
-        ensure!(self.running_nodes.remove(&node_id), "node was not running");
+    pub fn mark_done(&mut self, node_id: NodeId, output: &N::IO) -> anyhow::Result<()> {
         ensure!(
-            self.done_nodes.insert(node_id.clone()),
-            "node was already done"
+            self.running_nodes.remove(&node_id),
+            "{node_id} was not running"
+        );
+        ensure!(
+            self.done_nodes.insert(node_id),
+            "{node_id} was already done"
         );
         // now look at all the nodes that are ready to run and put them in pending
         for (_, edge) in self
             .graph
-            .neighbors_mut(&node_id, Direction::Outgoing)
-            .filter(|(_, edge)| edge.is_between_nodes())
+            .outgoings_mut(node_id)
             // do not take nodes that are already done or pending
             .filter(|(_, edge)| {
-                // unwrap is safe since we filtered out the edges that are not between nodes
-                !self.done_nodes.contains(edge.target_id().unwrap())
-                    && !self.running_nodes.contains(edge.target_id().unwrap())
+                !self.done_nodes.contains(&edge.target())
+                    && !self.running_nodes.contains(&edge.target())
             })
         {
             // Set the data to the edge such that the successors may run afterwards
@@ -489,59 +444,61 @@ where
     /// - No nodes are ready (waiting for more completions)
     /// - The release policy prevents nodes from running
     /// - All nodes have been completed
-    pub fn next_ready_nodes(&mut self) -> Vec<ReadyNode<N, C, NodeID>> {
+    pub fn next_ready_nodes(&mut self) -> Vec<ReadyNode<N, C>> {
         let mut ready = Vec::new();
         let ready_node_ids = self
             .graph
             .edges()
-            .filter(|(_, edge)| edge.is_between_nodes())
-            .fold(HashMap::<NodeID, Vec<bool>>::new(), |mut acc, (_, edge)| {
-                acc.entry(edge.target_id().unwrap().clone())
+            .fold(HashMap::<NodeId, Vec<bool>>::new(), |mut acc, edge| {
+                acc.entry(edge.target())
                     .or_default()
                     .push(edge.weight.is_some());
                 acc
             })
             .into_iter()
             // only take the nodes whose ALL incoming edges are filled with input data
-            .filter(|(_, edges)| edges.iter().all(|edge| *edge))
+            .filter(|(_, edges)| edges.iter().all(|is_ready| *is_ready))
             // only take the nodes that are not already running
             .filter(|(node_id, _)| !self.running_nodes.contains(node_id))
             .map(|(node_id, _)| node_id)
             .collect::<Vec<_>>();
+
         for node_id in ready_node_ids {
-            // need to check here if the node is ready to run - each time we add a new node to the pending nodes,
-            // the policy might change decisions so we need to check again for future nodes
-            if !self.release_policy.accept(&node_id, self) {
+            // need to check here if the node is ready to run - each time we add
+            // a new node to the pending nodes, the policy might change
+            // decisions so we need to check again for future nodes
+            if !self.release_policy.accept(node_id, self) {
                 continue;
             }
-            self.running_nodes.insert(node_id.clone());
+            self.running_nodes.insert(node_id);
             // collect both the input data and the input from the edges
             let input_data = self
                 .graph
-                .neighbors_mut(&node_id, Direction::Incoming)
-                .filter(|(_, edge)| edge.is_between_nodes())
+                .incomings_mut(node_id)
                 .flat_map(|(edge_id, edge)| {
                     assert!(
                         edge.weight.is_some(),
-                        "Edge {edge_id:?} has no weight - invalid logic?"
+                        "Edge {edge_id:?} {} -> {} has no weight - invalid logic?",
+                        edge.source(),
+                        edge.target()
                     );
-                    // take the data on this edge and set it to none - unwrap is safe since index have been
-                    // collected just before
+                    // take the data on this edge and set it to none - unwrap is
+                    // safe since index have been collected just before
                     let data = edge.weight.take().unwrap();
                     edge.ports()
                         .iter()
                         .map(move |port| (port.target_port, data.clone()))
-                    // also remove the potential input data for nodes that also expect inoput data + predecessors data
                 })
+                // also remove the potential input data for nodes that also
+                // expect inoput data + predecessors data
                 .chain(
                     self.waiting_input_data
-                        .remove(&node_id)
-                        .unwrap_or_default()
-                        .into_iter(),
+                        .extract_if(|node_input, _| node_input.node_id == node_id)
+                        .map(|(node_input, io)| (node_input.port, io)),
                 )
-                .collect::<BTreeMap<PortID, N::IO>>();
+                .collect::<BTreeMap<PortId, N::IO>>();
             ready.push(ReadyNode {
-                node: self.graph[&node_id].clone(),
+                node: self.graph[node_id].as_inner().unwrap().clone(),
                 inputs: input_data.into_values().collect(),
                 node_id,
             });
@@ -567,14 +524,24 @@ mod tests {
     fn test_graph_scheduler() {
         let colored_graph = instantiate(2);
         println!("colored_graph: {colored_graph:?}");
-        assert_eq!(colored_graph.node_count(), 2);
-        assert_eq!(colored_graph.input_nodes().count(), 1);
+        assert_eq!(colored_graph.node_count(), 3);
+        assert_eq!(colored_graph.source_nodes().count(), 1);
+        let inputs = [(
+            NodeInput::new(colored_graph.source_nodes().next().unwrap(), 0),
+            "CommitData".to_string(),
+        )];
         let mut scheduler = GraphScheduler::new(colored_graph);
         let mut ready_node = scheduler
-            .init_nodes(vec!["CommitData".to_string()])
+            .init_nodes(inputs.into_iter().collect())
             .unwrap()
             .pop()
             .unwrap();
+        let output = ready_node.run(&()).unwrap();
+        scheduler.mark_done(ready_node.node_id, &output).unwrap();
+        assert_eq!(scheduler.done_nodes.len(), 1);
+        assert_eq!(scheduler.running_nodes.len(), 0);
+
+        let mut ready_node = scheduler.next_ready_nodes().pop().unwrap();
         assert!(matches!(ready_node.node.node, TestOperation::Test1));
         let output = ready_node.run(&()).unwrap();
         assert_eq!(
@@ -582,8 +549,6 @@ mod tests {
             format!("Test1: {:?}", vec!["CommitData".to_string()])
         );
         scheduler.mark_done(ready_node.node_id, &output).unwrap();
-        assert_eq!(scheduler.done_nodes.len(), 1);
-        assert_eq!(scheduler.running_nodes.len(), 0);
 
         let mut ready_node = scheduler.next_ready_nodes().pop().unwrap();
         assert!(
@@ -600,6 +565,7 @@ mod tests {
             )
         );
         scheduler.mark_done(ready_node.node_id, &output).unwrap();
+
         println!("done_nodes: {:?}", scheduler.done_nodes);
         println!("running_nodes: {:?}", scheduler.running_nodes);
         assert!(scheduler.is_done());

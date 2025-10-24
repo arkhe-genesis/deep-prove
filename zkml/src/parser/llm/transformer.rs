@@ -1,35 +1,26 @@
 use crate::{
-    Number,
+    Number, Tensor,
+    graph::NodeId,
     layers::{
-        add,
+        Layer, add,
         matrix_mul::MatMul,
         transformer::{
             attention::attention_mask::AttentionSpan, layernorm::LayerNorm, mha::Mha,
             positional::Positional, qkv::QKV, rmsnorm::RMSNorm,
         },
     },
-    model::NodeID,
+    model::Model,
     parser::{
-        gguf::FileTensorLoader,
+        gguf::{FileTensorLoader, unfuse_tensors},
+        json,
         json::unfuse_crate_tensors,
-        llm::{LLMVariant, config::AttentionHeadType},
+        llm::{FeedForward, LLMConfig, LLMVariant, config::AttentionHeadType},
     },
     tensor::KeyedTensor,
 };
 use anyhow::{Context, bail, ensure};
 use candle_core::Device;
 use tracing::trace;
-
-use crate::{
-    Tensor,
-    layers::Layer,
-    model::Model,
-    parser::{
-        gguf::unfuse_tensors,
-        json,
-        llm::{FeedForward, LLMConfig},
-    },
-};
 
 pub enum NormType {
     LayerNorm,
@@ -67,10 +58,10 @@ impl Attention<f32> {
     pub fn write_to_model(
         self,
         model: &mut Model<f32>,
-        input_node_id: Option<NodeID>,
+        input_node_id: Option<NodeId>,
         c: &LLMConfig,
         positional: Option<Positional<f32>>,
-    ) -> anyhow::Result<NodeID> {
+    ) -> anyhow::Result<NodeId> {
         let num_groups = match c.attention_config.head {
             AttentionHeadType::MHA => c.num_heads,
             AttentionHeadType::GQA(num_groups) => num_groups,
@@ -95,36 +86,39 @@ impl Attention<f32> {
         // shape goes to [seq_len, hidden_size] for each, Q K and V
         last_node_id = model.add_consecutive_layer(Layer::QKV(qkv), Some(last_node_id))?;
         // QKV outputs three tensors, but we may need to apply a norm on the second and third one
-        let (mut q_id, mut q_port): (NodeID, usize) = (last_node_id, 0);
-        let (mut k_id, mut k_port): (NodeID, usize) = (last_node_id, 1);
-        let (v_id, v_port): (NodeID, usize) = (last_node_id, 2);
+        let (mut q_id, mut q_port): (NodeId, usize) = (last_node_id, 0);
+        let (mut k_id, mut k_port): (NodeId, usize) = (last_node_id, 1);
+        let (v_id, v_port): (NodeId, usize) = (last_node_id, 2);
 
-        let mha_id = model.add_layer(Layer::Mha(mha))?;
+        let mha_id = model.graph.add_inner(Layer::Mha(mha))?;
         if let LLMVariant::Gemma3 = c.variant {
             let q_norm = self.q_norm.context("in gemma3, q_norm is expected")?;
             (q_id, q_port) = {
-                let q_norm_id = model.add_layer(q_norm.to_layer())?;
+                let q_norm_id = model.graph.add_inner(q_norm.to_layer())?;
                 model.add_edge(q_id, q_norm_id, (q_port, 0))?;
                 (q_norm_id, 0)
             };
             let k_norm = self.k_norm.context("in gemma3, k_norm is expected")?;
             (k_id, k_port) = {
-                let k_norm_id = model.add_layer(k_norm.to_layer())?;
+                let k_norm_id = model.graph.add_inner(k_norm.to_layer())?;
                 model.add_edge(k_id, k_norm_id, (k_port, 0))?;
                 (k_norm_id, 0)
             };
             let rope = positional.context("in gemma3, rope is expected")?;
             (q_id, q_port) = {
                 // we need to build the cache for the Q tensor
-                let rope_id = model.add_layer(Layer::Positional(Positional::new_from_variant(
-                    rope.variant.clone(),
-                )))?;
+                let rope_id =
+                    model
+                        .graph
+                        .add_inner(Layer::Positional(Positional::new_from_variant(
+                            rope.variant.clone(),
+                        )))?;
                 model.add_edge(q_id, rope_id, (q_port, 0))?;
                 (rope_id, 0)
             };
             (k_id, k_port) = {
                 // vector k doesn't need a cache since it's always of full sequence length
-                let rope_id = model.add_layer(Layer::Positional(
+                let rope_id = model.graph.add_inner(Layer::Positional(
                     Positional::new_from_variant(rope.variant.clone()).with_no_cache(),
                 ))?;
                 model.add_edge(k_id, rope_id, (k_port, 0))?;
@@ -148,11 +142,11 @@ impl Attention<f32> {
             None => last_node_id,
         };
         last_node_id = {
-            let add_id = model.add_layer(Layer::Add(add::Add::new()))?;
+            let add_id = model.graph.add_inner(Layer::Add(add::Add::new()))?;
             match input_node_id {
                 Some(id) => model.add_edge(id, add_id, (0, 0))?,
                 // in this case, this is the input to the model
-                None => model.set_input(add_id, 0)?,
+                None => unreachable!("never used"),
             };
             model.add_edge(last_node_id, add_id, (0, 1))?;
             add_id
@@ -167,7 +161,7 @@ impl Attention<f32> {
             None => last_node_id,
         };
         last_node_id = {
-            let add_id = model.add_layer(Layer::Add(add::Add::new()))?;
+            let add_id = model.graph.add_inner(Layer::Add(add::Add::new()))?;
             model.add_edge(pre_ffn_residual_id, add_id, (0, 0))?;
             model.add_edge(last_node_id, add_id, (0, 1))?;
             add_id

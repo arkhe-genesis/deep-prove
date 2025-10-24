@@ -1,10 +1,11 @@
 use super::{
-    DefaultNodeID, GenericNodeID,
+    NodeId,
     scheduler::{ExecNode, GraphScheduler, ReleasePolicy},
 };
+use crate::graph::NodeInput;
 use crossbeam_channel::unbounded;
 use rayon::scope;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A trait defining execution strategies for computational graphs.
 ///
@@ -22,7 +23,7 @@ use std::collections::HashSet;
 /// * `N` - The executable node type implementing [`ExecNode`]
 /// * `C` - The color type used for scheduling and partitioning
 /// * `NodeID` - The node identifier type (defaults to [`DefaultNodeID`])
-pub trait Executor<N: ExecNode, C, NodeID = DefaultNodeID> {
+pub trait Executor<N: ExecNode, C> {
     /// Configuration type for this executor.
     ///
     /// Different executors may require different configuration parameters
@@ -52,8 +53,8 @@ pub trait Executor<N: ExecNode, C, NodeID = DefaultNodeID> {
     /// scheduling/coordination issues.
     fn run(
         config: &Self::Config,
-        scheduler: GraphScheduler<N, C, NodeID>,
-        input_data: Vec<N::IO>,
+        scheduler: GraphScheduler<N, C>,
+        input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
     ) -> anyhow::Result<Vec<N::IO>>;
 }
@@ -75,12 +76,11 @@ pub trait Executor<N: ExecNode, C, NodeID = DefaultNodeID> {
 /// - Debugging complex computational graphs
 pub struct SequentialExecutor;
 
-impl<NodeID, N, C> Executor<N, C, NodeID> for SequentialExecutor
+impl<N, C> Executor<N, C> for SequentialExecutor
 where
     N::IO: Clone,
     C: Clone + PartialEq,
     N: ExecNode + Clone,
-    NodeID: GenericNodeID,
 {
     /// No configuration needed for sequential execution.
     type Config = ();
@@ -97,8 +97,8 @@ where
     /// run in parallel. This ensures predictable, deterministic execution.
     fn run(
         _config: &Self::Config,
-        mut scheduler: GraphScheduler<N, C, NodeID>,
-        input_data: Vec<N::IO>,
+        mut scheduler: GraphScheduler<N, C>,
+        input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
     ) -> anyhow::Result<Vec<N::IO>> {
         let mut ready_nodes = scheduler.init_nodes(input_data)?;
@@ -144,13 +144,12 @@ where
 /// - Node operations must be thread-safe
 pub struct ThreadPoolExecutor;
 
-impl<NodeID, N, C> Executor<N, C, NodeID> for ThreadPoolExecutor
+impl<N, C> Executor<N, C> for ThreadPoolExecutor
 where
     N::IO: Clone + Send + Sync,
     C: Clone + PartialEq + Send + Sync,
     N::Context: Sync, // Context is shared (not owned) across threads
     N: ExecNode + Clone + Send + Sync,
-    NodeID: GenericNodeID + Send + Sync,
 {
     /// No configuration needed - uses the global Rayon thread pool.
     ///
@@ -172,8 +171,8 @@ where
     /// - Final outputs: From coordinator to the main thread
     fn run(
         _config: &Self::Config,
-        scheduler: GraphScheduler<N, C, NodeID>,
-        input_data: Vec<N::IO>,
+        scheduler: GraphScheduler<N, C>,
+        input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
     ) -> anyhow::Result<Vec<N::IO>> {
         // we want to release all ready nodes all the time so that the threadpool is always busy
@@ -197,7 +196,7 @@ where
                     let result_sender_local = result_sender.clone();
                     // we put the task in the rayon threadpool and it'll be executed as soon as possible
                     s.spawn(move |_| {
-                        let node_id = node.node_id.clone();
+                        let node_id = node.node_id;
                         match node.run(context) {
                             Ok(output) => result_sender_local.send((node_id, Ok(output))).unwrap(),
                             // transmit error back to the main thread
@@ -208,7 +207,7 @@ where
                 // wait for a result - there is always one result
                 // since we know the graph is not done yet and each time
                 // we have an output we check if the graph is done
-                let (node_idx, output): (NodeID, Result<N::IO, anyhow::Error>) =
+                let (node_idx, output): (NodeId, Result<N::IO, anyhow::Error>) =
                     result_receiver.recv().unwrap();
                 match output {
                     Ok(output) => {
@@ -237,16 +236,16 @@ where
 
 #[cfg(test)]
 pub mod tests {
-
-    use crate::graph::{PortLink, Ports, scheduler::ExecGraph};
-
     use crate::graph::{
+        NodeInput, Ports,
         executor::{Executor, SequentialExecutor, ThreadPoolExecutor},
-        scheduler::{ExecNode, GraphScheduler, IntoColor},
+        scheduler::{ExecGraph, ExecNode, GraphScheduler, IntoColor},
     };
+    use std::collections::HashMap;
 
     #[derive(Debug, Clone)]
     pub enum MathAST {
+        Input(i32),
         Add,
         Mul,
         Div,
@@ -259,6 +258,7 @@ pub mod tests {
         type Context = ();
         fn describe(&self) -> String {
             match self {
+                MathAST::Input(i) => format!("Input({i})"),
                 MathAST::Add => "Add".to_string(),
                 MathAST::Mul => "Mul".to_string(),
                 MathAST::Div => "Div".to_string(),
@@ -268,6 +268,10 @@ pub mod tests {
         }
         fn run(&self, _ctx: &Self::Context, inputs: Vec<Self::IO>) -> anyhow::Result<Self::IO> {
             match self {
+                MathAST::Input(_) => {
+                    assert_eq!(inputs.len(), 1);
+                    Ok(inputs[0])
+                }
                 MathAST::Add => Ok(inputs[0] + inputs[1]),
                 MathAST::Mul => Ok(inputs[0] * inputs[1]),
                 MathAST::Div => Ok(inputs[0] / inputs[1]),
@@ -280,35 +284,44 @@ pub mod tests {
     #[test]
     fn test_graph_executor() {
         let mut graph = ExecGraph::default_exec_graph();
-        let add_node = graph.add_node(MathAST::Add.colored(0)).unwrap();
-        graph.set_input(add_node, vec![0, 1], None).unwrap();
+        let input_nodes = [
+            graph.add_inner(MathAST::Input(1).colored(0)).unwrap(),
+            graph.add_inner(MathAST::Input(2).colored(0)).unwrap(),
+            graph.add_inner(MathAST::Input(3).colored(0)).unwrap(),
+        ];
 
-        let mul_node = graph.add_node(MathAST::Mul.colored(0)).unwrap();
-        graph
-            .add_edge(add_node, mul_node, Ports::consecutive(), None)
-            .unwrap();
-        // mul_node is connected to add_node but is also an input node
-        println!("BUGGING INPUT");
-        graph.set_input(mul_node, 2, None).unwrap();
+        // add1 = 1 + 2
+        let add1 = graph.add_inner(MathAST::Add.colored(0)).unwrap();
+        graph.add_edge(input_nodes[0], add1, (0, 0), None).unwrap();
+        graph.add_edge(input_nodes[1], add1, (0, 1), None).unwrap();
 
-        let add_node_2 = graph.add_node(MathAST::Add.colored(0)).unwrap();
+        // mul = add1 * 3
+        let mul = graph.add_inner(MathAST::Mul.colored(0)).unwrap();
         graph
-            .add_edge(add_node, add_node_2, Ports::consecutive(), None)
+            .add_edge(add1, mul, Ports::consecutive(), None)
             .unwrap();
+        graph.add_edge(input_nodes[2], mul, (0, 1), None).unwrap();
+
+        // add2 = add1 + mul = add1 + (add1 * 3) = (1 + 2) + ((1 + 2) * 3) = 12
+        let add2 = graph.add_inner(MathAST::Add.colored(0)).unwrap();
         graph
-            .add_edge(mul_node, add_node_2, PortLink::new(0, 1), None)
+            .add_edge(add1, add2, Ports::consecutive(), None)
             .unwrap();
-        graph.set_output(add_node_2, 0, None).unwrap();
+        graph.add_edge(mul, add2, (0, 1), None).unwrap();
 
         let colored_graph = graph;
         let scheduler = GraphScheduler::new(colored_graph);
-        let output = SequentialExecutor::run(&(), scheduler.clone(), vec![1, 2, 3], &()).unwrap();
+        let inputs: HashMap<NodeInput, i32> = [1, 2, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, x)| (NodeInput::new(input_nodes[i], 0), x))
+            .collect();
+        let output = SequentialExecutor::run(&(), scheduler.clone(), inputs.clone(), &()).unwrap();
         // (1+2) + ((1 + 2) * 3)  = 12
         let expected_output = vec![12];
         assert_eq!(output, expected_output);
 
-        let thread_output =
-            ThreadPoolExecutor::run(&(), scheduler.clone(), vec![1, 2, 3], &()).unwrap();
+        let thread_output = ThreadPoolExecutor::run(&(), scheduler.clone(), inputs, &()).unwrap();
         assert_eq!(thread_output, output);
     }
 }

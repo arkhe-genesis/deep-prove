@@ -1,36 +1,11 @@
 //! File containing code for lookup witness generation.
-
-use crate::graph::{executor::SequentialExecutor, scheduler::GraphScheduler};
-use anyhow::{Context as CC, anyhow, bail, ensure};
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap, btree_map},
-    marker::PhantomData,
-    sync::Arc,
-};
-use tenstore::GenStore;
-
-use crate::graph::executor::Executor;
-use ceno_p3::field::{Field, FieldAlgebra};
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    mle::MultilinearExtension,
-    util::{ceil_log2, transpose},
-};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tracing::{debug, warn};
-use transcript::Transcript;
-use utils::Metrics;
-use witness::{InstancePaddingStrategy, RowMajorMatrix};
-
 use super::logup_gkr::error::LogUpError;
 use crate::{
     Claim, Element,
     graph::{
-        Graph,
-        scheduler::{Colored, ExecNode},
+        Graph, NodeId, NodeInput,
+        executor::{Executor, SequentialExecutor},
+        scheduler::{Colored, ExecNode, GraphScheduler},
     },
     iop::{ChallengeStorage, context::ProverContext},
     layers::{
@@ -43,11 +18,32 @@ use crate::{
         },
     },
     lookup::logup_gkr::structs::{LogUpBatchVerifierClaim, LogUpInput},
-    model::{InferenceTrace, NodeID},
+    model::InferenceTrace,
     quantization::{self, Fieldizer},
     to_base,
 };
+use anyhow::{Context as CC, anyhow, bail, ensure};
+use ceno_p3::field::{Field, FieldAlgebra};
+use ff_ext::ExtensionField;
+use itertools::Itertools;
+use mpcs::PolynomialCommitmentScheme;
+use multilinear_extensions::{
+    mle::MultilinearExtension,
+    util::{ceil_log2, transpose},
+};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, HashMap, btree_map},
+    marker::PhantomData,
+    sync::Arc,
+};
+use tenstore::GenStore;
+use tracing::{debug, warn};
+use transcript::Transcript;
+use utils::Metrics;
+use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Copy)]
 /// Enum used for establishing the different table types needed to prove non-linear functions in a model.
@@ -864,7 +860,7 @@ pub struct LookupWitnessGen<E: ExtensionField, PCS: PolynomialCommitmentScheme<E
     ///
     /// These values are later used to compute the GKR's multiplicities.
     element_count: BTreeMap<TableType, HashMap<Element, u64>>,
-    logup_witnesses: HashMap<NodeID, Arc<PCS::CommitmentWithWitness>>,
+    logup_witnesses: HashMap<NodeId, Arc<PCS::CommitmentWithWitness>>,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Clone for LookupWitnessGen<E, PCS> {
@@ -886,7 +882,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWi
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, PCS> {
-    pub fn insert_logup_witness(&mut self, node_id: NodeID, witness: PCS::CommitmentWithWitness) {
+    pub fn insert_logup_witness(&mut self, node_id: NodeId, witness: PCS::CommitmentWithWitness) {
         self.logup_witnesses.insert(node_id, Arc::new(witness));
     }
     pub fn insert_element_count(&mut self, table_type: TableType, elements: HashMap<Element, u64>) {
@@ -951,7 +947,7 @@ where
     E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    Input(NodeID),
+    Input(NodeId),
     Output(LookupWitnessGen<E, PCS>),
 }
 
@@ -970,7 +966,12 @@ where
         let GenerateWitnessIO::Input(node_id) = input else {
             bail!("Expected input to be a node_id");
         };
-        let step = ctx.trace.get_step(node_id).unwrap();
+
+        let step = ctx
+            .trace
+            .get_step(*node_id)
+            .with_context(|| format!("fetching trace for {node_id}"))?;
+
         Ok(step
             .op
             .gen_lookup_witness(*node_id, ctx.ctx, &step.step_data, &mut ctx.store.clone())
@@ -989,7 +990,7 @@ where
 #[derive(Debug)]
 pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     pub challenge_storage: ChallengeStorage<E>,
-    pub logup_witnesses: HashMap<NodeID, PCS::CommitmentWithWitness>,
+    pub logup_witnesses: HashMap<NodeId, PCS::CommitmentWithWitness>,
     pub table_witnesses: Option<PCS::CommitmentWithWitness>,
 }
 
@@ -1027,48 +1028,47 @@ where
     let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
     let store = trace.store.clone();
 
-    // We create the graph here for showcasing the graph module.
-    // The end goal is that we create the graph at the top level and every functionality of the prover
-    // is appended to that graph
+    // We create the graph here for showcasing the graph module. The end goal is
+    // that we create the graph at the top level and every functionality of the
+    // prover is appended to that graph
     //
-    // We also spin up a local executor here, since this is for the first PR to showcase the graph module
-    // as well. The endgoal is that once the full graph is created, the executor will simply run the
-    // graph to completion. Since we haven't "graphized" the whole prover yet, we limit the scope to
+    // We also spin up a local executor here, since this is for the first PR to
+    // showcase the graph module as well. The endgoal is that once the full
+    // graph is created, the executor will simply run the graph to completion.
+    // Since we haven't "graphized" the whole prover yet, we limit the scope to
     // this small function.
 
-    // the colour for now doesn't matter too much since everything is sequential.
-    // later on, the local executor can use a threadpool to run the graph in parallel with a master thread
+    // the colour for now doesn't matter too much since everything is
+    // sequential. later on, the local executor can use a threadpool to run the
+    // graph in parallel with a master thread
     let max_colour = 2;
     let mut graph = Graph::new();
-    let (_node_idxs, inputs): (Vec<_>, Vec<_>) = ctx
+    let inputs = ctx
         .model_ctx
         .nodes
-        .forward_iter()
+        .forward_inners()
         .enumerate()
         .map(|(idx, (node_id, _))| {
             let node_idx = graph
-                .add_node(
+                .add_inner(
                     Colored::new(GenerateWitness::default(), idx % max_colour),
-                    // TODO: get rid of that custom logup error. we're not using anywhere the custom error
-                    // types, we can't "act" on them so generic anyhow makes the code simpler and more readable.
+                    // TODO: get rid of that custom logup error. we're not using
+                    // anywhere the custom error types, we can't "act" on them
+                    // so generic anyhow makes the code simpler and more
+                    // readable.
                 )
                 .map_err(|e| LogUpError::ParameterError(e.to_string()))?;
-            graph
-                .set_input(node_idx, idx, None)
-                .map_err(|e| LogUpError::ParameterError(e.to_string()))?;
             let input = GenerateWitnessIO::Input(node_id);
-            Ok((node_idx, input))
+            Ok((NodeInput::new(node_idx, 0), input))
         })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .unzip();
+        .collect::<Result<HashMap<NodeInput, GenerateWitnessIO<_, _>>, LogUpError>>()?;
 
-    // here for the moment there is not yet a "parent node" so it's a directed graph ... but with no edges.
+    // here for the moment there is not yet a "parent node" so it's a directed
+    // graph ... but with no edges.
     let graph_ctx = GenerateWitnessContext { ctx, store, trace };
     let scheduler = GraphScheduler::<GenerateWitness<E, PCS>, usize>::new(graph);
-    // NOTE: until https://github.com/Plonky3/Plonky3/pull/999 is fixed, we have to use the sequential executor
-    // and not the threadpool executor.
-    // let mut executor = SequentialExecutor::new(graph, graph_ctx);
+    // NOTE: until https://github.com/Plonky3/Plonky3/pull/999 is fixed, we have
+    // to use the sequential executor and not the threadpool executor.
     for gen_w in SequentialExecutor::run(&(), scheduler, inputs, &graph_ctx)
         .map_err(|e| LogUpError::ProvingError(e.to_string()))?
         .into_iter()

@@ -1,33 +1,30 @@
-use crate::{graph::Source, layers::provable::PadOp};
-use anyhow::Context;
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
-};
-
-use anyhow::{Result, anyhow, bail, ensure};
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-use tracing::debug;
-
 use crate::{
     Element, Shape, Tensor,
+    graph::{Node, NodeInput, NodeOutput, order_by_in_port},
     layers::{
         concat_matmul::ConcatMatMul,
         dense::Dense,
         flatten::Flatten,
         matrix_mul::{MatMul, OperandMatrix},
         pooling::Pooling,
-        provable::OpInfo,
+        provable::{OpInfo, PadOp},
         reshape::Reshape,
         transformer::{
             mha::pad_matrix_to_ignore_mha_garbage,
             qkv::{CacheQKV, QKV},
         },
     },
-    model::{Model, NodeID},
+    model::Model,
     parser::safe_maxpool2d_shape,
 };
+use anyhow::{Context, Result, bail, ensure};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use tracing::debug;
 
 #[derive(Clone, Debug)]
 pub enum GarbagePad {
@@ -154,43 +151,45 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
         unpadded_input_shapes
     );
     // compute all shape infos to be able to pad the model afterwards.
-    let mut shape_infos = HashMap::<NodeID, ShapeInfo>::new();
-    let padded_graph = model.graph.try_into_map_forward(|node_id, layer, edges| {
-        let all_shapes = edges
-            .iter()
-            .filter(|edge| edge.is_incoming_to(&node_id))
-            .try_fold(BTreeMap::new(), |mut acc, edge| {
-                for link in edge.ports().iter() {
-                    match edge.source() {
-                        Source::Node(source_id) => {
-                            let shape_from_source = shape_infos
-                                .get(source_id)
-                                .map(|si: &ShapeInfo| si.shapes[*link.source_port].clone())
-                                .ok_or(anyhow!("Shapes for node {source_id} not found"))?;
-                            // we want to sort the input in the order the layer expects them , so we sort by the target_port
-                            acc.insert(*link.target_port, shape_from_source);
-                        }
-                        Source::Input => {
-                            acc.insert(
-                                *link.target_port,
-                                input_si.shapes[*link.source_port].clone(),
-                            );
-                        }
-                    }
+    let mut shape_infos: HashMap<NodeOutput, ShapeData> = Default::default();
+
+    let padded_graph = model
+        .graph
+        .try_into_map_forward(|node_id, node, incoming_feeds| {
+            Ok(match node {
+                Node::Inner(layer) => {
+                    let mut si = ShapeInfo {
+                        shapes: order_by_in_port(incoming_feeds.into_iter().map(|feed| {
+                            let in_shape = shape_infos[&feed.source].clone();
+                            (NodeInput::new(node_id, feed.target.port), in_shape)
+                        }))
+                        .collect(),
+                    };
+
+                    let desc = layer.describe();
+                    let padded_layer = layer
+                        .pad_node(&mut si)
+                        .context(format!("padding layer {:?}: {}", node_id, desc))?;
+
+                    shape_infos.extend(
+                        si.shapes
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, shape_data)| (NodeOutput::new(node_id, i), shape_data)),
+                    );
+
+                    Node::Inner(padded_layer)
                 }
-                anyhow::Ok(acc)
-            })?;
-        let all_shapes = all_shapes.into_values().collect();
-        let mut si = ShapeInfo { shapes: all_shapes };
-        let desc = layer.describe();
-        let padded_layer = layer
-            .pad_node(&mut si)
-            .context(format!("error padding layer {:?}: {}", node_id, desc))?;
-        shape_infos.insert(node_id, si);
-        Ok(padded_layer)
-    })?;
+                Node::Input(i) => {
+                    shape_infos.insert(node_id.as_model_input(), input_si.shapes[i].clone());
+                    Node::Input(i)
+                }
+                Node::Output(o) => Node::Output(o),
+            })
+        })?;
+
     model = Model::<Element>::new(unpadded_input_shapes, PaddingMode::Padding, padded_graph);
-    debug!("Padded model with {} layers", model.graph.graph_order());
+    debug!("Padded model with {} layers", model.graph.node_count());
     Ok(model)
 }
 

@@ -67,6 +67,12 @@ impl<T> From<&StorageKey<T>> for TensorKey {
     }
 }
 
+impl<T> From<StorageKey<T>> for TensorKey {
+    fn from(value: StorageKey<T>) -> Self {
+        Self(value.id().to_string())
+    }
+}
+
 impl<T> From<TensorKey> for StorageKey<T> {
     fn from(value: TensorKey) -> Self {
         StorageKey::<T>::new(value.0)

@@ -1,41 +1,6 @@
-pub mod activation;
-pub mod add;
-pub mod concat_matmul;
-pub mod convolution;
-pub mod dense;
-pub mod einsum;
-pub mod flatten;
-pub mod hadamard;
-pub mod matrix_mul;
-pub mod matvec;
-pub mod mul;
-pub mod permute;
-pub mod pooling;
-pub mod provable;
-pub mod requant;
-pub mod reshape;
-pub mod transformer;
-
-use std::{fmt::Debug, marker::PhantomData};
-
-use anyhow::{Context as _, Result, bail};
-use ff_ext::ExtensionField;
-use flatten::Flatten;
-use mpcs::PolynomialCommitmentScheme;
-use pooling::{PoolingCtx, PoolingProof};
-use provable::{
-    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
-    QuantizeOutput,
-};
-use requant::RequantCtx;
-use tenstore::{GenStore, StoreError};
-use transcript::Transcript;
-use transformer::{
-    layernorm::LayerNormData, logits::ArgmaxData, mha::MhaData, softmax::SoftmaxData,
-};
-
 use crate::{
     Element, ProverContext, ScalingStrategy, Shape,
+    graph::NodeId,
     iop::context::{ContextAux, ShapeStep},
     layers::{
         activation::{ACTIVATION_LAYER, Activation, ActivationData, ActivationProof},
@@ -64,16 +29,50 @@ use crate::{
         },
     },
     lookup::context::LookupWitnessGen,
-    model::{NodeID, StepData},
+    model::StepData,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, ModelMetadata, ScalingFactor},
     tensor::{ConvFFTData, DryTensor, TensorTypeParam, WrappedTensor},
 };
 use activation::ActivationCtx;
+use anyhow::{Context as _, Result, bail};
 use convolution::{ConvCtx, ConvProof};
 use dense::{DenseCtx, DenseProof};
+use ff_ext::ExtensionField;
+use flatten::Flatten;
 use matrix_mul::{MatMul, MatMulCtx, MatMulProof};
+use mpcs::PolynomialCommitmentScheme;
+use pooling::{PoolingCtx, PoolingProof};
+use provable::{
+    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
+    QuantizeOutput,
+};
+use requant::RequantCtx;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{fmt::Debug, marker::PhantomData};
+use tenstore::{GenStore, StoreError};
+use transcript::Transcript;
+use transformer::{
+    layernorm::LayerNormData, logits::ArgmaxData, mha::MhaData, softmax::SoftmaxData,
+};
+
+pub mod activation;
+pub mod add;
+pub mod concat_matmul;
+pub mod convolution;
+pub mod dense;
+pub mod einsum;
+pub mod flatten;
+pub mod hadamard;
+pub mod matrix_mul;
+pub mod matvec;
+pub mod mul;
+pub mod permute;
+pub mod pooling;
+pub mod provable;
+pub mod requant;
+pub mod reshape;
+pub mod transformer;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -361,7 +360,7 @@ impl<E: ExtensionField> NodeOut<Element, E> {
         &self,
         md: &ModelMetadata,
         store: GenStore,
-        node_id: NodeID,
+        node_id: NodeId,
     ) -> Result<NodeOut<f32, E>, StoreError> {
         Ok(NodeOut {
             _t: PhantomData,
@@ -570,7 +569,7 @@ impl Evaluate<Element> for Layer<Element> {
 impl ProveInfo for Layer<Element> {
     fn step_info<E: ExtensionField>(
         &self,
-        id: NodeID,
+        id: NodeId,
         aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         match self {
@@ -642,7 +641,7 @@ where
 
     fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
         &'a self,
-        node_id: NodeID,
+        node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&crate::Claim<E>>,
         step_data: &StepData<E, E>,
@@ -719,7 +718,7 @@ where
 
     fn gen_lookup_witness(
         &self,
-        id: NodeID,
+        id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &StepData<Element, E>,
         store: &mut GenStore,
@@ -773,7 +772,7 @@ impl QuantizeOp for Layer<f32> {
     fn quantize_op<S: ScalingStrategy>(
         self,
         data: &S::AuxData,
-        node_id: NodeID,
+        node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
