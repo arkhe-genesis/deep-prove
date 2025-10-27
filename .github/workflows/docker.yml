@@ -25,6 +25,7 @@ permissions:
   id-token: write
   contents: read
   actions: read
+  pull-requests: write
 
 jobs:
   changes:
@@ -100,6 +101,30 @@ jobs:
 
       - name: List Docker images
         run: docker images
+
+      - name: Run Trivy vulnerability scanner on built image
+        uses: aquasecurity/trivy-action@0.33.0
+        with:
+          image-ref: '${{ matrix.image }}:${{ github.sha }}'
+          output: 'trivy-results.txt'
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: true
+      - name: Create comment body
+        run: |
+          echo "## 🚨 Trivy Vulnerability Report for ${{ matrix.image }}:${{ github.sha }}" > comment-body.md
+          echo "" >> comment-body.md
+          echo "<details><summary>Click to view scan results</summary>" >> comment-body.md
+          echo "" >> comment-body.md
+          echo "\`\`\`" >> comment-body.md
+          # Add the table from the file to the code block
+          cat trivy-results.txt >> comment-body.md
+          echo "\`\`\`" >> comment-body.md
+          echo "</details>" >> comment-body.md
+      - name: Post or update PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: comment-body.md
+          header: 'trivy-scan-results-${{ matrix.image }}'
 
       - name: Package Docker image
         run: |
