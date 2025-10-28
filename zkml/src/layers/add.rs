@@ -16,7 +16,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{self, Fieldizer},
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Context, bail, ensure};
 use ff_ext::ExtensionField;
@@ -52,7 +52,7 @@ impl<N: TensorTypeParam> Default for Add<N> {
 pub struct AddCtx {
     node_id: NodeId,
     quant_info: AddQuantInfo,
-    operand_key: Option<TensorKey>,
+    operand_key: Option<CommitmentId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +118,7 @@ impl Add<Element> {
                     right_side / self.quant_info.as_ref().unwrap().right_scale().to_field();
                 let mut claims = HashMap::new();
                 claims.insert(
-                    operand.key(),
+                    operand.commitment_id(),
                     Claim::new(last_claim.point.clone(), right_eval),
                 );
                 // this claim gets verified by the PCS openings since it's a static one
@@ -479,9 +479,9 @@ impl ProveInfo for Add<Element> {
         };
         if let Some((ref op, _)) = self.operand {
             let mut model_polys = HashMap::new();
-            model_polys.insert(op.key(), op.get_data().to_vec());
+            model_polys.insert(op.commitment_id(), op.get_data().to_vec());
             aux.model_polys = Some(model_polys);
-            ctx.operand_key = Some(op.key());
+            ctx.operand_key = Some(op.commitment_id());
         };
         Ok((LayerCtx::Add(ctx), aux))
     }
@@ -608,6 +608,7 @@ mod test {
     use std::{fmt::Debug, ops::Range};
 
     use ff_ext::GoldilocksExt2;
+    use tenstore::StorageKey;
 
     use crate::{
         Element,
@@ -699,7 +700,10 @@ mod test {
         for _ in 0..25 {
             let mut model =
                 Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
-            let operand = KeyedTensor::new("add_operand", Tensor::<f32>::random(&input_shape));
+            let operand = KeyedTensor::new(
+                StorageKey::<f32>::new("add_operand"),
+                Tensor::<f32>::random(&input_shape),
+            );
             let add = Add::new_with(operand, input_shape.clone());
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
             model.automatic_output_labelling().unwrap();

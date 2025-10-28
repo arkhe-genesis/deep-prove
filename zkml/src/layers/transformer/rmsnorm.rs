@@ -34,7 +34,7 @@ use crate::{
     },
     quantization::{self, Fieldizer},
     shape::Shape,
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_base,
 };
 use anyhow::{Result, anyhow, ensure};
@@ -491,7 +491,7 @@ pub struct RMSNormCtx<E: ExtensionField> {
     lookup_ctx: LayerLookupContext,
     /// The sumcheck expression for verifying the lookup input and layer output are correctly calculated
     sumcheck_expression: Vec<Expression<E>>,
-    alpha_key: Option<TensorKey>,
+    alpha_key: Option<CommitmentId>,
 }
 
 impl<E: ExtensionField> OpInfo for RMSNormCtx<E> {
@@ -573,7 +573,10 @@ impl ProveInfo for RMSNorm<Element> {
             if let Some(alpha) = self.alpha.as_ref() {
                 aux.model_polys = {
                     let mut model_polys = HashMap::new();
-                    model_polys.insert(self.alpha.as_ref().unwrap().key(), alpha.data().to_vec());
+                    model_polys.insert(
+                        self.alpha.as_ref().unwrap().commitment_id(),
+                        alpha.data().to_vec(),
+                    );
                     Some(model_polys)
                 };
             }
@@ -598,7 +601,7 @@ impl ProveInfo for RMSNorm<Element> {
                     top_chunk_scalar_log: *top_chunk_scalar_log,
                     lookup_ctx,
                     sumcheck_expression: vec![expr],
-                    alpha_key: self.alpha.as_ref().map(|a| a.key()),
+                    alpha_key: self.alpha.as_ref().map(|a| a.commitment_id()),
                 }),
                 aux,
             ))
@@ -873,7 +876,7 @@ impl RMSNorm<Element> {
                 let point = io_point.iter().take(diff).copied().collect::<Vec<E>>();
                 let mut claims = HashMap::new();
                 claims.insert(
-                    self.alpha.as_ref().unwrap().key(),
+                    self.alpha.as_ref().unwrap().commitment_id(),
                     Claim::<E>::new(point.clone(), io_evaluations[2]),
                 );
                 claims
@@ -1154,7 +1157,7 @@ mod tests {
     use super::*;
 
     impl<N: Number> RMSNorm<N> {
-        pub fn random(size: usize, layer_name: Option<TensorKey>) -> Self {
+        pub fn random(size: usize, layer_name: Option<CommitmentId>) -> Self {
             let layer_name = layer_name.unwrap_or("rmsnorm".to_string().into());
             let alpha = KeyedTensor::new(
                 format!("alpha_{layer_name}"),

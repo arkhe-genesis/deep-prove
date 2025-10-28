@@ -28,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::{Ordering, PartialEq, min},
     fmt::{self, Debug},
-    marker::PhantomData,
     ops::{Deref, DerefMut, Range},
 };
 use tenstore::{GenStore, GenericStore, StorageKey, StoreError};
@@ -53,54 +52,61 @@ use crate::{
     derive_more::Display,
 )]
 #[display("{_0}")]
-pub struct TensorKey(String);
+pub struct CommitmentId(String);
 
-impl From<&str> for TensorKey {
+impl From<&str> for CommitmentId {
     fn from(value: &str) -> Self {
         value.to_string().into()
     }
 }
 
-impl<T> From<&StorageKey<T>> for TensorKey {
+impl<T> From<&StorageKey<T>> for CommitmentId {
     fn from(value: &StorageKey<T>) -> Self {
         Self(value.id().to_string())
     }
 }
 
-impl<T> From<StorageKey<T>> for TensorKey {
+impl<T> From<StorageKey<T>> for CommitmentId {
     fn from(value: StorageKey<T>) -> Self {
         Self(value.id().to_string())
     }
 }
 
-impl<T> From<TensorKey> for StorageKey<T> {
-    fn from(value: TensorKey) -> Self {
+impl<T> From<CommitmentId> for StorageKey<T> {
+    fn from(value: CommitmentId) -> Self {
         StorageKey::<T>::new(value.0)
     }
 }
 
-impl<T> From<&TensorKey> for StorageKey<T> {
-    fn from(value: &TensorKey) -> Self {
+impl<T> From<&CommitmentId> for StorageKey<T> {
+    fn from(value: &CommitmentId) -> Self {
         StorageKey::<T>::new(value.0.clone())
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyedTensor<T> {
-    pub(crate) key: TensorKey,
+    pub(crate) key: StorageKey<T>,
     pub(crate) tensor: Tensor<T>,
 }
 
 impl<T> KeyedTensor<T> {
-    pub fn new<K: Into<TensorKey>>(key: K, tensor: Tensor<T>) -> Self {
+    pub fn new<S>(key: S, tensor: Tensor<T>) -> Self
+    where
+        S: Into<StorageKey<T>>,
+    {
         Self {
             key: key.into(),
             tensor,
         }
     }
 
-    pub fn key(&self) -> TensorKey {
-        self.key.clone()
+    pub fn storage_key(&self) -> &StorageKey<T> {
+        &self.key
+    }
+
+    pub fn commitment_id(&self) -> CommitmentId {
+        (&self.key).into()
     }
 
     pub fn into_tensor(self) -> Tensor<T> {
@@ -123,14 +129,14 @@ impl<T> KeyedTensor<T> {
         f: impl FnOnce(Tensor<T>) -> anyhow::Result<Tensor<U>>,
     ) -> anyhow::Result<KeyedTensor<U>> {
         Ok(KeyedTensor {
-            key: self.key,
+            key: self.key.cast::<U>(),
             tensor: f(self.tensor)?,
         })
     }
 
     pub fn new_map_tensor<U>(&self, f: impl FnOnce(&Tensor<T>) -> Tensor<U>) -> KeyedTensor<U> {
         KeyedTensor {
-            key: self.key.clone(),
+            key: self.key.cast::<U>(),
             tensor: f(&self.tensor),
         }
     }
@@ -154,7 +160,7 @@ impl KeyedTensor<f32> {
     pub fn quantize(self, s: &ScalingFactor) -> KeyedTensor<Element> {
         let quantized_tensor = self.tensor.to_quantized(s);
         KeyedTensor {
-            key: self.key,
+            key: self.key.cast::<Element>(),
             tensor: quantized_tensor,
         }
     }
@@ -452,28 +458,29 @@ where
 #[derive(Clone, Debug)]
 pub struct DryTensor<T> {
     /// A unique key for this tensor.
-    k: TensorKey,
+    storage_key: StorageKey<Vec<T>>,
 
     /// The shape of the tensor.
     shape: Shape,
     unpadded_shape: Shape,
-
-    phantom: PhantomData<T>,
 }
 
 impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
-    pub(crate) fn new(k: TensorKey, shape: Shape, unpadded_shape: Shape) -> Self {
+    pub(crate) fn new(
+        storage_key: StorageKey<Vec<T>>,
+        shape: Shape,
+        unpadded_shape: Shape,
+    ) -> Self {
         Self {
-            k,
+            storage_key,
             shape,
             unpadded_shape,
-            phantom: PhantomData,
         }
     }
 
     /// Return a reference to this dry tensor key.
-    pub(crate) fn storage_key(&self) -> StorageKey<Vec<T>> {
-        StorageKey::from(&self.k)
+    pub(crate) fn storage_key(&self) -> &StorageKey<Vec<T>> {
+        &self.storage_key
     }
 
     /// Return a reference to this dry tensor shape.
@@ -488,7 +495,7 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
 
     /// Hydrate this dry tensor from `store`, generating a [`Tensor`] from it.
     pub(crate) fn hydrate(&self, mut store: GenStore) -> Result<Tensor<T>, StoreError> {
-        store.fetch(&self.storage_key()).map(|data| {
+        store.fetch(&self.storage_key).map(|data| {
             Tensor::new_with_unpadded_shape(self.shape.clone(), self.unpadded_shape.clone(), data)
         })
     }
@@ -506,11 +513,11 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
         S: Serialize + for<'a> Deserialize<'a>,
         F: Fn(&T) -> S,
     {
-        store.cast(&StorageKey::<Vec<T>>::from(&self.k), |xs| {
+        let storage_key = store.cast(&self.storage_key, |xs| {
             xs.iter().map(&f).collect::<Vec<S>>()
         })?;
         Ok(DryTensor::<S>::new(
-            self.k.clone(),
+            storage_key,
             self.shape.clone(),
             self.unpadded_shape.clone(),
         ))
@@ -530,7 +537,7 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
         F: Fn(&T) -> S,
     {
         store
-            .cast_and_fetch(&StorageKey::<Vec<T>>::from(&self.k), |xs| {
+            .cast_and_fetch(&self.storage_key, |xs| {
                 xs.iter().map(&f).collect::<Vec<S>>()
             })
             .map(|bytes| {

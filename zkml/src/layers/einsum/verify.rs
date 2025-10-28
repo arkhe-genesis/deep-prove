@@ -17,14 +17,14 @@ use crate::{
         axis::{FixedAxesMapping, FixedAxis},
         prove::reconstruct_full_point,
     },
-    tensor::TensorKey,
+    tensor::CommitmentId,
 };
 
 use super::*;
 
 pub(crate) struct EinSumVerifierInfo<E: ExtensionField> {
     pub(crate) claims: Vec<Claim<E>>,
-    pub(crate) constants_map: HashMap<TensorKey, Claim<E>>,
+    pub(crate) constants_map: HashMap<CommitmentId, Claim<E>>,
 }
 
 impl<E: ExtensionField> EinSumContext<E> {
@@ -216,7 +216,7 @@ impl<E: ExtensionField> EinSumContext<E> {
         let constant_polys_map = weight_claims
             .into_iter()
             .chain(bias_claims)
-            .collect::<HashMap<TensorKey, Claim<E>>>();
+            .collect::<HashMap<CommitmentId, Claim<E>>>();
 
         if let Some(agg_proof) = input_aggregation_sumcheck {
             let eq_points = lhs_fixes

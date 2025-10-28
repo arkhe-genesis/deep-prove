@@ -23,7 +23,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeData},
     quantization::{ScalingFactor, ScalingStrategy},
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, anyhow, ensure};
 use axis::{AxesMapping, AxisType, Dimension};
@@ -388,9 +388,9 @@ pub struct EinSumContext<E: ExtensionField> {
     pub node_id: NodeId,
     pub equation: String,
     pub mapping: AxesMapping,
-    pub constant_keys: Vec<Option<TensorKey>>,
+    pub constant_keys: Vec<Option<CommitmentId>>,
     pub constant_unpadded_shapes: Vec<Option<Shape>>,
-    pub bias_keys: Vec<Option<TensorKey>>,
+    pub bias_keys: Vec<Option<CommitmentId>>,
     pub bias_unpadded_shapes: Vec<Option<Shape>>,
     pub input_aggregation_expression: Option<Expression<E>>,
 }
@@ -516,6 +516,7 @@ where
 
 #[cfg(test)]
 mod tests {
+
     use crate::{
         layers::Layer,
         model::{Model, test::prove_model},
@@ -534,7 +535,7 @@ mod tests {
             PaddingMode::NoPadding,
         );
         let bias = Tensor::<f32>::random(&vec![d].into());
-        let keyed_bias = KeyedTensor::new("bias1".to_string(), bias);
+        let keyed_bias = KeyedTensor::new("bias1", bias);
         let einsum = EinSum::new(
             "A(ij)@B(kj)->C(ik)+BIAS(k)".to_string(),
             vec![None],

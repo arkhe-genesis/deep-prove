@@ -6,13 +6,14 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+use tenstore::StorageKey;
 
 use anyhow::{Context, bail, ensure};
 use candle_core::{CpuStorage, Device, Storage, quantized::gguf_file::Content};
 
 use crate::{
     Shape, Tensor,
-    tensor::{KeyedTensor, TensorKey},
+    tensor::{CommitmentId, KeyedTensor},
 };
 
 fn dequantize(qtensor: &QTensor) -> anyhow::Result<Tensor<f32>> {
@@ -206,7 +207,7 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     ///
     /// # Errors
     /// Returns an error if the reader lock cannot be acquired or if `Content::tensor` fails to load the `QTensor`.
-    pub(crate) fn get_qtensor(&self, name: &str) -> anyhow::Result<(TensorKey, Arc<QTensor>)> {
+    pub(crate) fn get_qtensor(&self, name: &str) -> anyhow::Result<(CommitmentId, Arc<QTensor>)> {
         let full_name = format!("{}{}", self.current_prefix, name);
         let mut reader_guard = self.reader.lock().map_err(|e| {
             anyhow::anyhow!("Failed to acquire reader lock for tensor '{full_name}': {e}")
@@ -231,7 +232,7 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     pub fn get_tensor(&self, name: &str) -> anyhow::Result<KeyedTensor<f32>> {
         let (key, qtensor) = self.get_qtensor(name)?;
         let tensor = dequantize(qtensor.as_ref())?;
-        Ok(KeyedTensor::new(key, tensor))
+        Ok(KeyedTensor::new(StorageKey::from(key), tensor))
     }
 
     pub fn metadata<T>(&self, key: &str) -> Option<T>

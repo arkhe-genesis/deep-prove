@@ -15,7 +15,7 @@ use crate::{
     },
     model::StepData,
     quantization::TensorFielder,
-    tensor::{KeyedTensor, TensorKey, TensorSlice, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
 use anyhow::ensure;
 use ff_ext::ExtensionField;
@@ -48,7 +48,7 @@ pub struct AbsoluteCtx {
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
     node_id: NodeId,
-    positional_key: TensorKey,
+    positional_key: CommitmentId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +166,7 @@ impl Absolute<Element> {
                 .unwrap_or_default()
                 .into_iter()
                 .chain(once((
-                    self.positional.key(),
+                    self.positional.commitment_id(),
                     self.positional.pad_next_power_of_two().into_data(),
                 )))
                 .collect(),
@@ -177,7 +177,7 @@ impl Absolute<Element> {
             unpadded_shape: self.unpadded_shape.clone(),
             num_vars_positional_matrix: self.num_vars(),
             node_id: id,
-            positional_key: self.positional.key(),
+            positional_key: self.positional.commitment_id(),
         };
 
         Ok((ctx, aux))
@@ -234,7 +234,7 @@ impl Absolute<Element> {
 
         prover.add_common_claims(
             node_id,
-            [(self.positional.key(), positional_matrix_claim)]
+            [(self.positional.commitment_id(), positional_matrix_claim)]
                 .into_iter()
                 .collect(),
         );
@@ -312,7 +312,7 @@ mod tests {
 
     use rstest::rstest;
 
-    use tenstore::GenStore;
+    use tenstore::{GenStore, StorageKey};
 
     use crate::{
         Element, Tensor,
@@ -345,7 +345,7 @@ mod tests {
         // build positional matrix
         let matrix_shape = vec![context_length, embedding_size];
         let positional_matrix = KeyedTensor::new(
-            "absolute_positional_mat",
+            StorageKey::new("absolute_positional_mat"),
             Tensor::random(&matrix_shape.into()),
         );
 
@@ -385,7 +385,7 @@ mod tests {
             (seq_len..=64usize).prop_map(move |context_length| {
                 let input = Tensor::<T>::random(&vec![seq_len, embedding_size].into());
                 let pos = KeyedTensor::new(
-                    "absolute_positional_mat",
+                    StorageKey::new("absolute_positional_mat"),
                     Tensor::<T>::random(&vec![context_length, embedding_size].into()),
                 );
                 Input {

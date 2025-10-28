@@ -9,9 +9,10 @@ mod genstore;
 
 pub use error::StoreError;
 pub use genstore::{GenStore, GenericStore};
+use serde::{Deserialize, Serialize};
 
 /// Identifier for storage data.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StorageKey<T> {
     /// User defined `ID`.
     id: String,
@@ -28,9 +29,9 @@ impl<T> StorageKey<T> {
     ///
     /// NOTE: The key itself does not guarantee the store is populated with
     /// data, since that may be its first use.
-    pub fn new(id: String) -> Self {
+    pub fn new(id: impl AsRef<str>) -> Self {
         StorageKey {
-            id,
+            id: id.as_ref().to_string(),
             kind: PhantomData,
         }
     }
@@ -75,6 +76,24 @@ impl<T> Hash for StorageKey<T> {
 impl<T> Display for StorageKey<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}@{}", self.id, std::any::type_name::<T>())
+    }
+}
+
+impl<T> From<String> for StorageKey<T> {
+    fn from(value: String) -> Self {
+        Self {
+            id: value,
+            kind: PhantomData,
+        }
+    }
+}
+
+impl<T> From<&str> for StorageKey<T> {
+    fn from(value: &str) -> Self {
+        Self {
+            id: value.to_string(),
+            kind: PhantomData,
+        }
     }
 }
 

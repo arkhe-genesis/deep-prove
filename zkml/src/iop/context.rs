@@ -8,7 +8,7 @@ use crate::{
     },
     lookup::context::{LookupContext, TableType},
     model::{Model, ModelCtx},
-    tensor::TensorKey,
+    tensor::CommitmentId,
     to_base,
 };
 use ff_ext::ExtensionField;
@@ -104,7 +104,7 @@ impl Model<Element> {
         };
 
         // TODO: refactor that management of polys
-        let mut model_polys = HashMap::<TensorKey, MultilinearExtension<E>>::new();
+        let mut model_polys = HashMap::<CommitmentId, MultilinearExtension<E>>::new();
         // The shape register is filled along the traversal of the graph.
         let mut shapes: HashMap<NodeOutput, Shape> = HashMap::new();
         debug!("Context : layer info generation ...");
@@ -287,14 +287,14 @@ impl ShapeStep {
 pub struct ContextAux {
     pub tables: BTreeSet<TableType>,
     pub last_output_shape: Vec<Shape>,
-    pub model_polys: Option<HashMap<TensorKey, Vec<Element>>>,
+    pub model_polys: Option<HashMap<CommitmentId, Vec<Element>>>,
     /// This field is only used in macro layers like MHA
     pub max_poly_len: usize,
 }
 
 fn compute_layer_ctx<E: ExtensionField>(
     ctx_aux: &mut ContextAux,
-    model_polys: &mut HashMap<TensorKey, MultilinearExtension<E>>,
+    model_polys: &mut HashMap<CommitmentId, MultilinearExtension<E>>,
     id: NodeId,
     layer: &Layer<Element>,
 ) -> anyhow::Result<LayerCtx<E>> {

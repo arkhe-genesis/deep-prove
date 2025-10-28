@@ -25,7 +25,7 @@ use crate::{
         llm::{LLMConfig, LLMVariant, transformer::expand},
     },
     quantization::{Fieldizer, TensorFielder},
-    tensor::{KeyedTensor, TensorKey, TensorSlice, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Ok, bail, ensure};
 use ff_ext::ExtensionField;
@@ -137,7 +137,7 @@ impl<N: TensorTypeParam> Positional<N> {
 
     pub fn new_rope(
         angles: Vec<f32>,
-        base_frequency_id: TensorKey,
+        base_frequency_id: CommitmentId,
         max_content_length: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(
@@ -147,7 +147,7 @@ impl<N: TensorTypeParam> Positional<N> {
 
     pub fn new_rope_from_frequency(
         base_frequency: f32,
-        base_frequency_id: TensorKey,
+        base_frequency_id: CommitmentId,
         head_size: usize,
         max_content_length: usize,
     ) -> anyhow::Result<Self> {

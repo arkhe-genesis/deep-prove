@@ -9,7 +9,7 @@ use crate::{
     commit::compute_betas_eval,
     layers::einsum::axis::{FixedAxis, FixedPolys},
     quantization::TensorFielder,
-    tensor::TensorKey,
+    tensor::CommitmentId,
 };
 
 use anyhow::{Result, anyhow, ensure};
@@ -28,14 +28,14 @@ use transcript::Transcript;
 pub(crate) struct EinSumProofInfo<E: ExtensionField> {
     pub(crate) claims: Vec<Claim<E>>,
     pub(crate) proof: EinSumProof<E>,
-    pub(crate) commitment_map: HashMap<TensorKey, Claim<E>>,
+    pub(crate) commitment_map: HashMap<CommitmentId, Claim<E>>,
 }
 
 impl<E: ExtensionField> EinSumProofInfo<E> {
     fn new(
         claims: Vec<Claim<E>>,
         proof: EinSumProof<E>,
-        commitment_map: HashMap<TensorKey, Claim<E>>,
+        commitment_map: HashMap<CommitmentId, Claim<E>>,
     ) -> Self {
         Self {
             claims,
@@ -187,7 +187,7 @@ impl EinSum<Element> {
             .enumerate()
             .filter_map(|(output_id, (bias_opt, split_point))| {
                 if let Some(bias) = bias_opt.as_ref() {
-                    let key = bias.key();
+                    let key = bias.commitment_id();
                     let bias_field: Tensor<E> = bias.to_fields();
                     let bias_poly = bias_field.to_mle();
                     let bias_point = self
@@ -232,7 +232,7 @@ impl EinSum<Element> {
                     .fold(E::ZERO, |acc, (coeff, eval)| acc + *coeff * *eval);
 
                 if let Some(weight) = weight_opt.as_ref() {
-                    Either::Right((weight.key(), Claim::<E>::new(full_point, eval)))
+                    Either::Right((weight.commitment_id(), Claim::<E>::new(full_point, eval)))
                 } else {
                     Either::Left(Claim::<E>::new(full_point, eval))
                 }
@@ -242,7 +242,7 @@ impl EinSum<Element> {
         let constant_poly_claims = rhs_constant_claims
             .into_iter()
             .chain(bias_claims)
-            .collect::<HashMap<TensorKey, Claim<E>>>();
+            .collect::<HashMap<CommitmentId, Claim<E>>>();
 
         if let Some(agg_expr) = ctx.input_aggregation_expression.as_ref() {
             let input_mle = inputs[0].to_mle();

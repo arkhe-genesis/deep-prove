@@ -13,7 +13,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
-    tensor::{KeyedTensor, Tensor, TensorKey, TensorTypeParam, WrappedModuleFn, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, Tensor, TensorTypeParam, WrappedModuleFn, WrappedTensor},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Result, ensure};
@@ -51,8 +51,8 @@ pub struct DenseCtx {
     pub node_id: NodeId,
     pub unpadded_matrix_shape: Shape,
     pub padded_matrix_shape: Shape,
-    matrix_key: TensorKey,
-    bias_key: Option<TensorKey>,
+    matrix_key: CommitmentId,
+    bias_key: Option<CommitmentId>,
 }
 
 /// Proof of the layer.
@@ -195,8 +195,8 @@ impl ProveInfo for Dense<Element> {
             node_id: id,
             unpadded_matrix_shape: self.matrix.unpadded_shape().clone(),
             padded_matrix_shape: self.matrix.shape().clone(),
-            matrix_key: self.matrix.key(),
-            bias_key: self.bias.as_ref().map(|b| b.key()),
+            matrix_key: self.matrix.commitment_id(),
+            bias_key: self.bias.as_ref().map(|b| b.commitment_id()),
         });
 
         let weights_evals = self.matrix.pad_next_power_of_two().into_data();
@@ -207,10 +207,10 @@ impl ProveInfo for Dense<Element> {
 
         aux.model_polys = {
             let mut model_polys = HashMap::new();
-            model_polys.insert(self.matrix.key(), weights_evals);
+            model_polys.insert(self.matrix.commitment_id(), weights_evals);
             if let Some(bias) = &self.bias {
                 model_polys.insert(
-                    bias.key(),
+                    bias.commitment_id(),
                     bias_evals.expect("No bias evals found in Dense Layer"),
                 );
             }
@@ -512,10 +512,10 @@ impl Dense<Element> {
         // Add common commitment claims to be proven
         let common_claims = {
             let mut claims = HashMap::new();
-            claims.insert(self.matrix.key(), weights_claim);
+            claims.insert(self.matrix.commitment_id(), weights_claim);
             if let Some(bias) = &self.bias {
                 claims.insert(
-                    bias.key(),
+                    bias.commitment_id(),
                     bias_claim.expect("No bias claim found when proving Dense Layer"),
                 );
             }
@@ -665,7 +665,7 @@ mod test {
     impl<T: TensorTypeParam> Dense<T> {
         /// Require a `layer_name` in case there is the need to use different tensor
         /// keys form the default ones
-        pub fn random(shape: Shape, layer_name: Option<TensorKey>) -> Self {
+        pub fn random(shape: Shape, layer_name: Option<CommitmentId>) -> Self {
             assert_eq!(shape.len(), 2);
             let (nrows, ncols) = (shape[0], shape[1]);
             let layer_name = layer_name.unwrap_or("dense".to_string().into());

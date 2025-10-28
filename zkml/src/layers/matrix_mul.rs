@@ -18,7 +18,7 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
     quantization::{self, bias_scaling_matmul},
-    tensor::{IntoBTensor, KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, IntoBTensor, KeyedTensor, TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -144,10 +144,10 @@ pub struct MatMulCtx {
     /// Unpadded and padded shapes of the right matrix, if the right matrx is a constant matrix
     pub(crate) right_matrix_shapes: Option<(Shape, Shape)>,
     pub(crate) config: Option<Config>,
-    /// `TensorKey` for the weight matrix, if any
-    weight_matrix_key: Option<TensorKey>,
-    /// `TensorKey` for the bias matrix, if any
-    bias_key: Option<TensorKey>,
+    /// `CommitmentId` for the weight matrix, if any
+    weight_matrix_key: Option<CommitmentId>,
+    /// `CommitmentId` for the bias matrix, if any
+    bias_key: Option<CommitmentId>,
 }
 
 /// Proof of the layer.
@@ -770,14 +770,14 @@ impl MatMul<Element> {
         }
     }
 
-    fn weight_tensor_key(&self) -> Option<TensorKey> {
+    fn weight_tensor_key(&self) -> Option<CommitmentId> {
         match (&self.left_matrix, &self.right_matrix) {
             (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => panic!(
                 "Found layer with 2 constant matrices, which is useless as the
                 product can be directly used instead"
             ),
-            (OperandMatrix::Weight(mat), OperandMatrix::Input) => Some(mat.tensor.key()),
-            (OperandMatrix::Input, OperandMatrix::Weight(mat)) => Some(mat.tensor.key()),
+            (OperandMatrix::Weight(mat), OperandMatrix::Input) => Some(mat.tensor.commitment_id()),
+            (OperandMatrix::Input, OperandMatrix::Weight(mat)) => Some(mat.tensor.commitment_id()),
             (OperandMatrix::Input, OperandMatrix::Input) => None,
         }
     }
@@ -806,7 +806,7 @@ impl MatMul<Element> {
         let (right_matrix, right_matrix_key) = match &self.right_matrix {
             OperandMatrix::Weight(mat) => (
                 Tensor::<E>::from(mat.tensor.deref()),
-                Some(mat.tensor.key()),
+                Some(mat.tensor.commitment_id()),
             ),
             OperandMatrix::Input => {
                 let matrix = inputs
@@ -819,7 +819,7 @@ impl MatMul<Element> {
         let (left_matrix, left_matrix_key) = match &self.left_matrix {
             OperandMatrix::Weight(mat) => (
                 Tensor::<E>::from(mat.tensor.deref()),
-                Some(mat.tensor.key()),
+                Some(mat.tensor.commitment_id()),
             ),
             OperandMatrix::Input => {
                 let matrix = inputs
@@ -888,7 +888,10 @@ impl MatMul<Element> {
         let bias_eval = self.bias.as_ref().map(|bias| {
             let bias_eval = bias.to_field::<E>().into_mle().evaluate(point_for_right);
             last_claim.eval -= bias_eval;
-            common_claims.insert(bias.key(), Claim::new(point_for_right.to_vec(), bias_eval));
+            common_claims.insert(
+                bias.commitment_id(),
+                Claim::new(point_for_right.to_vec(), bias_eval),
+            );
             bias_eval
         });
 
@@ -1009,7 +1012,7 @@ impl MatMul<Element> {
             right_matrix_shapes,
             config: self.config.clone(),
             weight_matrix_key: self.weight_tensor_key(),
-            bias_key: self.bias.as_ref().map(|bias| bias.key()),
+            bias_key: self.bias.as_ref().map(|bias| bias.commitment_id()),
         };
 
         ctx_aux.model_polys = self.eval_constant_matrix().map(|evals| {
@@ -1030,7 +1033,7 @@ impl MatMul<Element> {
         if let Some(bias) = self.bias.as_ref() {
             let bias_evals = bias.get_data().to_vec();
             let mut map = ctx_aux.model_polys.unwrap_or_default();
-            map.insert(bias.key(), bias_evals);
+            map.insert(bias.commitment_id(), bias_evals);
             ctx_aux.model_polys = Some(map);
         }
         Ok((info, ctx_aux))

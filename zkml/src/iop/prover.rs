@@ -13,7 +13,7 @@ use crate::{
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
     model::{InferenceStep, InferenceTrace},
-    tensor::{TensorKey, get_root_of_unity},
+    tensor::{CommitmentId, get_root_of_unity},
 };
 use anyhow::{Context as _, anyhow, ensure};
 use either::Either;
@@ -151,7 +151,7 @@ where
     pub(crate) fn add_common_claims(
         &mut self,
         node_id: NodeId,
-        claims: HashMap<TensorKey, Claim<E>>,
+        claims: HashMap<CommitmentId, Claim<E>>,
     ) {
         self.commit_prover.add_common_claims(
             claims

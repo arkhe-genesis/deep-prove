@@ -16,7 +16,7 @@ use crate::{
     model::StepData,
     quantization::{self, Fieldizer, TensorFielder},
     tensor::{
-        KeyedTensor, TensorKey, TensorSlice, TensorTypeParam, WrappedTensor,
+        CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor,
         is_close_with_tolerance,
     },
     util::from_mle_list_dimensions,
@@ -60,8 +60,8 @@ pub struct RopeCtx {
     node_id: NodeId,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
-    cosine_key: TensorKey,
-    sine_key: TensorKey,
+    cosine_key: CommitmentId,
+    sine_key: CommitmentId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,7 +74,7 @@ pub struct Rope<N> {
 impl<N: TensorTypeParam> Rope<N> {
     pub(crate) fn build_from_angles(
         angles: Vec<f32>,
-        base_id: TensorKey,
+        base_id: CommitmentId,
         max_content_length: usize,
     ) -> Result<Self> {
         // build the rotational vectors
@@ -107,7 +107,7 @@ impl<N: TensorTypeParam> Rope<N> {
 
     pub(crate) fn build_from_frequency(
         base_frequency: f32,
-        base_frequency_id: TensorKey,
+        base_frequency_id: CommitmentId,
         head_size: usize,
         max_content_length: usize,
     ) -> Result<Self> {
@@ -262,8 +262,8 @@ impl<N: TensorTypeParam> Rope<N> {
         };
 
         let commons_claims = [
-            (self.cosine_matrix.key(), cosine_claim),
-            (self.sine_matrix.key(), sine_claim),
+            (self.cosine_matrix.commitment_id(), cosine_claim),
+            (self.sine_matrix.commitment_id(), sine_claim),
         ]
         .into_iter()
         .collect();
@@ -473,10 +473,13 @@ impl Rope<Element> {
         aux.model_polys = Some(
             [
                 (
-                    self.cosine_matrix.key(),
+                    self.cosine_matrix.commitment_id(),
                     matrix_to_evals(&self.cosine_matrix),
                 ),
-                (self.sine_matrix.key(), matrix_to_evals(&self.sine_matrix)),
+                (
+                    self.sine_matrix.commitment_id(),
+                    matrix_to_evals(&self.sine_matrix),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -486,8 +489,8 @@ impl Rope<Element> {
             unpadded_shape: self.unpadded_shape.clone(),
             node_id: id,
             num_vars_positional_matrix: num_vars,
-            cosine_key: self.cosine_matrix.key(),
-            sine_key: self.sine_matrix.key(),
+            cosine_key: self.cosine_matrix.commitment_id(),
+            sine_key: self.sine_matrix.commitment_id(),
         };
 
         Ok((ctx, aux))

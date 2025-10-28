@@ -55,7 +55,7 @@ pub(crate) mod manual_attention {
             llm::{Attention, FeedForward, LLMConfig, transformer::Norm},
         },
         rng_from_env_or_random,
-        tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor, is_close},
+        tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor, is_close},
     };
 
     use super::{layernorm, mha, qkv};
@@ -340,7 +340,7 @@ pub(crate) mod manual_attention {
         pub fn random(
             emb_size: usize,
             num_heads: usize,
-            layer_name: Option<TensorKey>,
+            layer_name: Option<CommitmentId>,
         ) -> anyhow::Result<Self> {
             // Note in LLM, it's always the case that hidden_size = emb_size so we can apply residual
             let hidden_size = emb_size;

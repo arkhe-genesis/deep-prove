@@ -1,5 +1,5 @@
 //! Module containing the logic to commit to instance and witness polynomials for a model using a MMCS
-use crate::{graph::NodeId, lookup::context::TableType, tensor::TensorKey};
+use crate::{graph::NodeId, lookup::context::TableType, tensor::CommitmentId};
 use anyhow::{Context, Result, anyhow};
 use either::Either;
 use ff_ext::ExtensionField;
@@ -39,7 +39,7 @@ where
     /// the model has no weights/table commitments.
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
-    model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
+    model_comms_map: BTreeMap<usize, Vec<CommitmentId>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
@@ -63,9 +63,9 @@ where
     }
 }
 
-/// Compute the `TensorKey` employed to identify the constant polynomials
+/// Compute the `CommitmentId` employed to identify the constant polynomials
 /// associated to the lookup tables
-fn table_poly_id(table_name: String) -> TensorKey {
+fn table_poly_id(table_name: String) -> CommitmentId {
     format!("table_{table_name}").into()
 }
 
@@ -110,7 +110,7 @@ where
     /// Make a new [`GlobalCommitmentContext`]
     pub fn new(
         witness_poly_size: usize,
-        polys: HashMap<TensorKey, MultilinearExtension<E>>,
+        polys: HashMap<CommitmentId, MultilinearExtension<E>>,
         lookup_ctx: &[TableType],
         max_node_id: NodeId,
     ) -> Result<GlobalCommitmentContext<E, PCS>> {
@@ -153,7 +153,7 @@ where
                 .fold(
                     BTreeMap::new(),
                     |mut map_acc, (num_vars, (poly_id, mle))| {
-                        let (ids, polys): &mut (Vec<TensorKey>, Vec<MultilinearExtension<E>>) =
+                        let (ids, polys): &mut (Vec<CommitmentId>, Vec<MultilinearExtension<E>>) =
                             map_acc
                                 .entry(num_vars)
                                 .or_insert_with(|| (Vec::new(), Vec::new()));
@@ -269,7 +269,7 @@ where
     /// The batch commitment for the model
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
-    model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
+    model_comms_map: BTreeMap<usize, Vec<CommitmentId>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
@@ -338,7 +338,7 @@ where
     /// The batch commitment for the model
     model_commitment: Option<PCS::Commitment>,
     /// Map that stores the position of each individual polynomial in the batch commitment
-    model_comms_map: BTreeMap<usize, Vec<TensorKey>>,
+    model_comms_map: BTreeMap<usize, Vec<CommitmentId>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`

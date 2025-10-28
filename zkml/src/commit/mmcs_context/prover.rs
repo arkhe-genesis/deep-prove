@@ -8,7 +8,7 @@ use crate::{
     },
     graph::NodeId,
     lookup::context::TableType,
-    tensor::TensorKey,
+    tensor::CommitmentId,
 };
 use anyhow::{Result, anyhow};
 use either::Either;
@@ -85,7 +85,7 @@ where
     /// The `NodeId` is only employed to sort the claims related to the same
     /// static tensor, assuming that only one claim for a static tensor is
     /// produced in each node
-    model_claims: HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
+    model_claims: HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>>>,
     /// The list of claims about the witness
     witness_claims: BTreeMap<NodeId, BatchCommitmentClaim<E>>,
     _phantom: PhantomData<PCS>,
@@ -116,7 +116,7 @@ where
             .insert(node_id, BatchCommitmentClaim::<E>::new(claim));
     }
 
-    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, Vec<(NodeId, Claim<E>)>>) {
+    pub fn add_common_claims(&mut self, claims: HashMap<CommitmentId, Vec<(NodeId, Claim<E>)>>) {
         claims.into_iter().for_each(|(poly_id, claims)| {
             let poly_claims = self.model_claims.entry(poly_id).or_default();
             claims
@@ -198,7 +198,7 @@ where
     }
 
     fn model_polys_sumcheck<T: Transcript<E>>(
-        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
+        model_claims: &mut HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>>>,
         commit_ctx: &CommitmentProverCtx<E, PCS>,
         transcript: &mut T,
     ) -> Result<ModelSumcheckProof<E>> {

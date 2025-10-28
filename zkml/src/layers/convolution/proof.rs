@@ -11,7 +11,7 @@ use crate::{
         provable::{OpInfo, VerifiableCtx},
     },
     padding::PaddingMode,
-    tensor::{TensorKey, get_root_of_unity},
+    tensor::{CommitmentId, get_root_of_unity},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
@@ -68,8 +68,8 @@ pub struct ConvCtx {
     pub filter_size: usize,
     pub unpadded_filter_shape: Shape,
     pub padded_filter_shape: Shape,
-    pub filter_key: TensorKey,
-    pub bias_key: TensorKey,
+    pub filter_key: CommitmentId,
+    pub bias_key: CommitmentId,
 }
 
 impl OpInfo for ConvCtx {

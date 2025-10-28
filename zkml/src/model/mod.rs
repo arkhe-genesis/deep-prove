@@ -516,17 +516,17 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 Vec<DryTensor<N>>,
             )> {
                 let input_node_id = self.graph.input_node_id(i)?;
-                let tensor_key = input_node_id.output_at(0).to_storage_key();
+                let storage_key = input_node_id.output_at(0).to_storage_key();
                 let input_shape = tensor.shape().clone();
                 // save the tensor to the store
-                store.store(&tensor_key, tensor.data_vec())?;
+                store.store(&storage_key, tensor.data_vec())?;
                 // save the key => shape relation
                 shape_register.insert(
-                    tensor_key.clone(),
+                    storage_key.clone(),
                     (input_shape.clone(), tensor.unpadded_shape().clone()),
                 );
                 dry_tensors.push(DryTensor::new(
-                    tensor_key.into(),
+                    storage_key,
                     input_shape,
                     tensor.unpadded_shape().clone(),
                 ));
@@ -641,7 +641,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
             .iter()
             .map(|key| {
                 DryTensor::new(
-                    key.into(),
+                    key.clone(),
                     shape_register[key].clone().0,
                     shape_register[key].clone().1,
                 )
@@ -699,7 +699,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 Ok((
                     feed.source.port,
                     DryTensor::new(
-                        key.into(),
+                        key,
                         tensor.shape().clone().into(),
                         tensor.unpadded_shape().clone().into(),
                     ),
@@ -1241,8 +1241,8 @@ pub(crate) mod test {
                 filter_size: 1024,
                 unpadded_filter_shape: Shape::new(vec![16, 2, 4, 4]),
                 padded_filter_shape: Shape::new(vec![16, 2, 4, 4]),
-                filter_key: conv1.key(),
-                bias_key: bias.key(),
+                filter_key: conv1.commitment_id(),
+                bias_key: bias.commitment_id(),
             },
         );
 

@@ -540,7 +540,7 @@ mod tests {
             let c_shape = Shape::new(vec![dim1, dim3]);
             let bias_shape = Shape::new(vec![dim3]);
             let bias = Tensor::<N>::random(&bias_shape);
-            let keyed_bias = KeyedTensor::new("BIAS".to_string(), bias.clone());
+            let keyed_bias = KeyedTensor::new("BIAS", bias.clone());
             let einsum: EinSum<N> = EinSum::new(
                 "A(ab)@B(bc)->C(ac)+BIAS(c)".to_string(),
                 vec![None],
@@ -742,9 +742,9 @@ mod tests {
             let wk = Tensor::<N>::random(&wk_shape);
             let wv = Tensor::<N>::random(&wv_shape);
 
-            let keyed_wq = KeyedTensor::new("WQ".to_string(), wq.clone());
-            let keyed_wk = KeyedTensor::new("WK".to_string(), wk.clone());
-            let keyed_wv = KeyedTensor::new("WV".to_string(), wv.clone());
+            let keyed_wq = KeyedTensor::new("WQ", wq.clone());
+            let keyed_wk = KeyedTensor::new("WK", wk.clone());
+            let keyed_wv = KeyedTensor::new("WV", wv.clone());
 
             let einsum: EinSum<N> = EinSum::new(
                 "X(se)@WQ(ehd):WK(ed):WV(ed)->Q(hsd):K(sd):V(sd)".to_string(),

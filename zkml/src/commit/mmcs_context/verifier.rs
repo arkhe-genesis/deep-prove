@@ -8,7 +8,7 @@ use crate::{
     },
     graph::NodeId,
     lookup::context::TableType,
-    tensor::TensorKey,
+    tensor::CommitmentId,
 };
 use anyhow::{Result, anyhow, ensure};
 use ff_ext::ExtensionField;
@@ -72,7 +72,7 @@ pub struct CommitmentVerifier<E: ExtensionField, PCS: PolynomialCommitmentScheme
     /// The `NodeId` is only employed to sort the claims related to the same
     /// static tensor, assuming that only one claim for a static tensor is
     /// produced in each node
-    model_claims: HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
+    model_claims: HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>>>,
     /// The list of claims about the witness
     witness_claims: BTreeMap<NodeId, VerifierClaim<E, PCS>>,
 }
@@ -94,7 +94,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
             .insert(node_id, VerifierClaim::new(commitment, claim));
     }
 
-    pub fn add_common_claims(&mut self, claims: HashMap<TensorKey, HashMap<NodeId, Claim<E>>>) {
+    pub fn add_common_claims(&mut self, claims: HashMap<CommitmentId, HashMap<NodeId, Claim<E>>>) {
         claims.into_iter().for_each(|(poly_id, claims)| {
             let poly_claims = self.model_claims.entry(poly_id).or_default();
             claims
@@ -159,7 +159,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
     }
 
     fn verify_model_sumcheck<T: Transcript<E>>(
-        model_claims: &mut HashMap<TensorKey, BTreeMap<NodeId, Claim<E>>>,
+        model_claims: &mut HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>>>,
         sumcheck_proof: IOPProof<E>,
         sumcheck_evals: Vec<E>,
         commit_ctx: &CommitmentVerifierCtx<E, PCS>,

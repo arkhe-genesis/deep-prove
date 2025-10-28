@@ -28,7 +28,7 @@ use crate::{
     padding::PaddingMode,
     parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
     quantization::{self, Fieldizer},
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_base,
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -353,8 +353,8 @@ pub struct LayerNormCtx<E: ExtensionField> {
     first_sumcheck_expression: Vec<Expression<E>>,
     /// The sumcheck expression that verifies the mean has been calculated correctly
     mean_sumcheck_expression: Vec<Expression<E>>,
-    gamma_key: TensorKey,
-    beta_key: TensorKey,
+    gamma_key: CommitmentId,
+    beta_key: CommitmentId,
 }
 
 impl<E: ExtensionField> OpInfo for LayerNormCtx<E> {
@@ -697,8 +697,8 @@ impl ProveInfo for LayerNorm<Element> {
 
             aux.model_polys = {
                 let mut model_polys = HashMap::new();
-                model_polys.insert(self.gamma.key(), gamma_evals);
-                model_polys.insert(self.beta.key(), beta_evals);
+                model_polys.insert(self.gamma.commitment_id(), gamma_evals);
+                model_polys.insert(self.beta.commitment_id(), beta_evals);
                 Some(model_polys)
             };
 
@@ -723,8 +723,8 @@ impl ProveInfo for LayerNorm<Element> {
                     lookup_ctx,
                     first_sumcheck_expression: vec![first_expr],
                     mean_sumcheck_expression: vec![second_expr],
-                    gamma_key: self.gamma.key(),
-                    beta_key: self.beta.key(),
+                    gamma_key: self.gamma.commitment_id(),
+                    beta_key: self.beta.commitment_id(),
                 }),
                 aux,
             ))
@@ -1055,10 +1055,13 @@ impl LayerNorm<Element> {
             let point = io_point.iter().take(diff).copied().collect::<Vec<E>>();
             let mut claims = HashMap::new();
             claims.insert(
-                self.gamma.key(),
+                self.gamma.commitment_id(),
                 Claim::<E>::new(point.clone(), io_evaluations[3]),
             );
-            claims.insert(self.beta.key(), Claim::<E>::new(point, io_evaluations[4]));
+            claims.insert(
+                self.beta.commitment_id(),
+                Claim::<E>::new(point, io_evaluations[4]),
+            );
             claims
         };
         prover.add_common_claims(node_id, common_claims);
@@ -1369,7 +1372,7 @@ mod tests {
     use super::*;
 
     impl<N: Number + TensorTypeParam> LayerNorm<N> {
-        pub fn random(size: usize, layer_name: Option<TensorKey>) -> Self {
+        pub fn random(size: usize, layer_name: Option<CommitmentId>) -> Self {
             let layer_name = layer_name.unwrap_or("layernorm".to_string().into());
             let gamma = KeyedTensor::new(
                 format!("{layer_name}_gamma"),

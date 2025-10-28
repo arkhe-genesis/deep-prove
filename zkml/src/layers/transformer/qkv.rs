@@ -17,7 +17,7 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
 };
@@ -72,12 +72,12 @@ pub struct QKVCtx {
     unpadded_shape: Shape, // same shape for Q, K and V
     num_heads: usize,
     head_dim: usize,
-    q_weight_key: TensorKey,
-    k_weight_key: TensorKey,
-    v_weight_key: TensorKey,
-    q_bias_key: Option<TensorKey>,
-    k_bias_key: Option<TensorKey>,
-    v_bias_key: Option<TensorKey>,
+    q_weight_key: CommitmentId,
+    k_weight_key: CommitmentId,
+    v_weight_key: CommitmentId,
+    q_bias_key: Option<CommitmentId>,
+    k_bias_key: Option<CommitmentId>,
+    v_bias_key: Option<CommitmentId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -558,18 +558,18 @@ impl ProveInfo for QKV<Element> {
         );
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
         let mut array = vec![
-            (self.q.key(), &self.q),
-            (self.k.key(), &self.k),
-            (self.v.key(), &self.v),
+            (self.q.commitment_id(), &self.q),
+            (self.k.commitment_id(), &self.k),
+            (self.v.commitment_id(), &self.v),
         ];
         if let Some(ref q_bias) = self.q_bias {
-            array.push((q_bias.key(), q_bias));
+            array.push((q_bias.commitment_id(), q_bias));
         }
         if let Some(ref k_bias) = self.k_bias {
-            array.push((k_bias.key(), k_bias));
+            array.push((k_bias.commitment_id(), k_bias));
         }
         if let Some(ref v_bias) = self.v_bias {
-            array.push((v_bias.key(), v_bias));
+            array.push((v_bias.commitment_id(), v_bias));
         }
         aux.model_polys = Some(
             array
@@ -586,12 +586,12 @@ impl ProveInfo for QKV<Element> {
             unpadded_shape: self.weights_unpadded_shape.clone(),
             num_heads: self.num_heads,
             head_dim: self.head_dim,
-            q_weight_key: self.q.key(),
-            k_weight_key: self.k.key(),
-            v_weight_key: self.v.key(),
-            q_bias_key: self.q_bias.as_ref().map(|q| q.key()),
-            k_bias_key: self.k_bias.as_ref().map(|k| k.key()),
-            v_bias_key: self.v_bias.as_ref().map(|v| v.key()),
+            q_weight_key: self.q.commitment_id(),
+            k_weight_key: self.k.commitment_id(),
+            v_weight_key: self.v.commitment_id(),
+            q_bias_key: self.q_bias.as_ref().map(|q| q.commitment_id()),
+            k_bias_key: self.k_bias.as_ref().map(|k| k.commitment_id()),
+            v_bias_key: self.v_bias.as_ref().map(|v| v.commitment_id()),
         };
 
         Ok((LayerCtx::QKV(ctx), aux))
@@ -1151,7 +1151,7 @@ mod tests {
             emb_size: usize,
             hidden_size: usize,
             bias: bool,
-            layer_name: Option<TensorKey>,
+            layer_name: Option<CommitmentId>,
         ) -> Result<Self> {
             let layer_name = layer_name.unwrap_or("QKV".to_string().into());
             let q = KeyedTensor::new(

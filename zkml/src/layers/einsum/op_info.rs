@@ -48,7 +48,7 @@ impl EinSum<Element> {
                     .filter_map(|tensor_opt| {
                         tensor_opt
                             .as_ref()
-                            .map(|t| (t.key(), t.pad_next_power_of_two().into_data()))
+                            .map(|t| (t.commitment_id(), t.pad_next_power_of_two().into_data()))
                     })
                     .collect(),
             );
@@ -61,12 +61,12 @@ impl EinSum<Element> {
         let constant_keys = self
             .constant_tensors
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.key()))
+            .map(|t| t.as_ref().map(|tensor| tensor.commitment_id()))
             .collect();
         let bias_keys = self
             .biases
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.key()))
+            .map(|t| t.as_ref().map(|tensor| tensor.commitment_id()))
             .collect();
 
         Ok((

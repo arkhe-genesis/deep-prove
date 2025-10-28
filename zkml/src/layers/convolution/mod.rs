@@ -18,7 +18,8 @@ use crate::{
     quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
     shape::filter_size,
     tensor::{
-        ConvData, ConvFFTData, KeyedTensor, Tensor, TensorKey, TensorTypeParam, WrappedTensor, fft,
+        CommitmentId, ConvData, ConvFFTData, KeyedTensor, Tensor, TensorTypeParam, WrappedTensor,
+        fft,
     },
     util::from_mle_list_dimensions,
 };
@@ -41,7 +42,7 @@ use sumcheck::{
     structs::{IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
+use tenstore::{GenStore, StorageKey};
 use tracing::{info, warn};
 use transcript::Transcript;
 
@@ -183,10 +184,17 @@ impl<T> Filter<T> {
         }
     }
 
-    fn tensor_key(&self) -> TensorKey {
+    fn storage_key(&self) -> &StorageKey<T> {
         match &self.tensor {
-            FilterTensor::RawFilter(tensor) => tensor.key.clone(),
-            FilterTensor::FftFilter { tensor, .. } => tensor.key.clone(),
+            FilterTensor::RawFilter(tensor) => tensor.storage_key(),
+            FilterTensor::FftFilter { tensor, .. } => tensor.storage_key(),
+        }
+    }
+
+    fn commitment_id(&self) -> CommitmentId {
+        match &self.tensor {
+            FilterTensor::RawFilter(tensor) => tensor.commitment_id(),
+            FilterTensor::FftFilter { tensor, .. } => tensor.commitment_id(),
         }
     }
 }
@@ -440,15 +448,15 @@ impl<T> Convolution<T> {
             filter_size: self.fft_filter_size(),
             unpadded_filter_shape: self.filter.original_shape.clone(),
             padded_filter_shape: self.filter.pre_fft_shape().clone(),
-            filter_key: self.filter.tensor_key(),
-            bias_key: self.bias.key(),
+            filter_key: self.filter.commitment_id(),
+            bias_key: self.bias.commitment_id(),
         }
     }
 }
 impl<T: Number> Convolution<T> {
     pub(crate) fn new_without_bias(filter: KeyedTensor<T>) -> Self {
         let bias = KeyedTensor::new(
-            format!("{}_bias", filter.key),
+            StorageKey::new(format!("{}_bias", filter.key)),
             Tensor::zeros(Shape::new(vec![filter.dim(0)])),
         );
         Self::new(filter, bias)
@@ -484,7 +492,7 @@ impl Convolution<f32> {
         let quantized_filter = tensor.to_quantized(s);
         let bias = self.bias.quantize(bias_s);
         Convolution::<Element>::new(
-            KeyedTensor::new(self.filter.tensor_key(), quantized_filter),
+            KeyedTensor::new(self.filter.storage_key().cast(), quantized_filter),
             bias,
         )
     }
@@ -979,8 +987,8 @@ impl Convolution<Element> {
         // Add common polynomial commitment claims to the commitment prover
         let common_claims = {
             let mut claims = HashMap::new();
-            claims.insert(self.filter.tensor_key(), filter_claim);
-            claims.insert(self.bias.key.clone(), bias_claim);
+            claims.insert(self.filter.commitment_id(), filter_claim);
+            claims.insert(self.bias.commitment_id(), bias_claim);
             claims
         };
         prover.add_common_claims(id, common_claims);
@@ -1206,8 +1214,8 @@ impl ProveInfo for Convolution<Element> {
         let bias_poly = self.bias.pad_next_power_of_two().into_data();
         aux.model_polys = {
             let mut model_polys = HashMap::new();
-            model_polys.insert(self.filter.tensor_key(), filter_poly);
-            model_polys.insert(self.bias.key(), bias_poly);
+            model_polys.insert(self.filter.commitment_id(), filter_poly);
+            model_polys.insert(self.bias.commitment_id(), bias_poly);
             Some(model_polys)
         };
         Ok((conv_info, aux))

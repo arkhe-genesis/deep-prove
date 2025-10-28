@@ -11,7 +11,7 @@ use crate::{
         provable::{OpInfo, VerifiableCtx},
     },
     lookup::{context::LookupContext, logup_gkr::verifier::verify_logup_proof_multiple_sizes},
-    tensor::{Tensor, TensorKey},
+    tensor::{CommitmentId, Tensor},
 };
 use anyhow::{Context as _, anyhow, ensure};
 use ff_ext::ExtensionField;
@@ -349,7 +349,7 @@ where
     pub(crate) fn add_common_claims(
         &mut self,
         node_id: NodeId,
-        claims: HashMap<TensorKey, Claim<E>>,
+        claims: HashMap<CommitmentId, Claim<E>>,
     ) {
         self.commit_verifier.add_common_claims(
             claims

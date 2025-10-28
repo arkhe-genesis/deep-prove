@@ -7,7 +7,7 @@ use crate::{
         provable::{QuantizeOp, QuantizeOutput},
     },
     parser::{gguf, json},
-    tensor::{KeyedTensor, TensorKey, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
@@ -62,7 +62,7 @@ pub struct EmbeddingsCtx {
     id: NodeId,
     vocab_size: usize,
     emb_size: usize,
-    embedding_key: TensorKey,
+    embedding_key: CommitmentId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,11 +92,11 @@ impl<N: Number> Embeddings<N> {
         })
     }
 
-    fn embedding_matrix_key(&self) -> TensorKey {
+    fn embedding_matrix_key(&self) -> CommitmentId {
         let OperandMatrix::Weight(embedding_matrix) = &self.mat.right_matrix else {
             unreachable!()
         };
-        embedding_matrix.tensor.key()
+        embedding_matrix.tensor.commitment_id()
     }
 
     pub(crate) fn embedding_matrix(&self) -> &Tensor<N> {
