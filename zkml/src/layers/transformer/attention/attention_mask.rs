@@ -127,13 +127,13 @@ impl<N: TensorTypeParam> AttentionMask<N> {
     /// Apply the mask to an input, this method requires the input has rank between 2 and 4, and that the final two dims are either equal
     /// or the second to last dim is 1.
     #[cfg(test)]
-    fn apply(&self, input: &Tensor<N>, unpadded_input_shape: &Shape) -> Result<Tensor<N>>
+    fn apply(&self, input: &Tensor<N>) -> Result<Tensor<N>>
     where
         N: burn::tensor::Element,
         Tensor<N>: crate::tensor::IntoBTensor,
     {
         // Check the the input has suitable rank
-        let num_input_dims = unpadded_input_shape.rank();
+        let num_input_dims = input.unpadded_shape().rank();
         ensure!(
             (2..=4).contains(&num_input_dims),
             "To apply Attention Mask input need to have rank at least 2 and at most 4, got: {num_input_dims}",
@@ -149,9 +149,9 @@ impl<N: TensorTypeParam> AttentionMask<N> {
 
         let unpadded_shape = if num_input_dims < 4 {
             let diff = 4 - num_input_dims;
-            Shape::new(vec![1; diff]).extend(unpadded_input_shape)
+            Shape::new(vec![1; diff]).extend(input.unpadded_shape())
         } else {
-            unpadded_input_shape.clone()
+            input.unpadded_shape().clone()
         };
 
         let masked_shape = Shape::new(vec![
@@ -168,7 +168,7 @@ impl<N: TensorTypeParam> AttentionMask<N> {
         let mask = {
             let diff = shape.numel() - masked_shape.numel();
             let num_heads = masked_shape.slice(..masked_shape.rank() - 2).numel();
-            let seq_len = unpadded_input_shape.dim(-1);
+            let seq_len = input.unpadded_shape().dim(-1);
             let padded_q_len = input.shape().dim(-2);
             let padded_seq_len = input.shape().dim(-1);
             let data = (0..num_heads)
@@ -253,11 +253,8 @@ where
 {
     /// Apply the mask to an input, this method requires the input has rank between 2 and 4, and that the final two dims are either equal
     /// or the second to last dim is 1.
-    fn apply_new(
-        &self,
-        input: &WrappedTensor<T>,
-        unpadded_input_shape: &Shape,
-    ) -> Result<WrappedTensor<T>> {
+    fn apply_new(&self, input: &WrappedTensor<T>) -> Result<WrappedTensor<T>> {
+        let unpadded_input_shape: Shape = input.unpadded_shape().clone().into();
         // Check the the input has suitable rank
         let num_input_dims = unpadded_input_shape.rank();
         ensure!(
@@ -279,7 +276,7 @@ where
 
         let unpadded_shape = if num_input_dims < 4 {
             let diff = 4 - num_input_dims;
-            Shape::new(vec![1; diff]).extend(unpadded_input_shape)
+            Shape::new(vec![1; diff]).extend(&unpadded_input_shape)
         } else {
             unpadded_input_shape.clone()
         };
@@ -527,12 +524,10 @@ impl Evaluate<f32> for AttentionMask<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         inputs
             .iter()
-            .zip(unpadded_input_shapes.iter())
-            .map(|(input, unpadded_shape)| self.apply_new(input, unpadded_shape))
+            .map(|input| self.apply_new(input))
             .collect::<Result<Vec<WrappedTensor<f32>>>>()
             .map(LayerOut::from_vec)
     }
@@ -541,19 +536,17 @@ impl Evaluate<Element> for AttentionMask<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         inputs
             .iter()
-            .zip(unpadded_input_shapes.iter())
-            .map(|(input, unpadded_shape)| {
+            .map(|input| {
                 ensure!(
                     self.dim_size >= input.dim(-1)?,
                     "Attention Mask dimension size does not match the input shape: dim_size: {:?}, unpadded_input_shape.dim(-1): {:?}",
                     self.dim_size,
                     input.dim(-1)?
                 );
-                self.apply_new(input, unpadded_shape)
+                self.apply_new(input)
             })
             .collect::<Result<Vec<WrappedTensor<Element>>>>()
             .map(LayerOut::from_vec)
@@ -1332,8 +1325,8 @@ mod tests {
         println!("padded_cached_input: {padded_cached_input:?}");
 
         let mask = AttentionMask::new(seq_len, Element::MIN).with_span(AttentionSpan::Full)?;
-        let cached_output = mask.apply(&padded_cached_input, cached_input.shape())?;
-        let full_output = mask.apply(&padded_full_input, &full_input_shape)?;
+        let cached_output = mask.apply(&padded_cached_input)?;
+        let full_output = mask.apply(&padded_full_input)?;
         println!("full_output: {full_output:?}");
         println!("cached_output: {cached_output:?}");
         let (full_it, _) = full_output.slice_on_dim(0);
@@ -1404,11 +1397,7 @@ mod tests {
             let padded_input = input.pad_next_power_of_two();
             let mut store = GenStore::default();
             let output = model
-                .run::<F>(
-                    std::slice::from_ref(&padded_input),
-                    Some(vec![input_shape]),
-                    &mut store,
-                )
+                .run::<F>(std::slice::from_ref(&padded_input), &mut store)
                 .unwrap();
             let output_tensor = output.outputs().unwrap().pop().unwrap();
             assert_eq!(output_tensor.shape(), padded_input.shape());

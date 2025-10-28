@@ -41,7 +41,7 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
             .expect("failed to call load_input_flat on the model");
 
         let trace = model
-            .run(&input_tensor, None, &mut GenStore::default())
+            .run(&input_tensor, &mut GenStore::default())
             .unwrap_or_else(|_| panic!("input #{i} failed"));
 
         let mut prover_transcript = new_transcript();

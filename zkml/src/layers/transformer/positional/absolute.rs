@@ -78,7 +78,6 @@ impl<N> Absolute<N> {
     pub(super) fn evaluate<E: ExtensionField>(
         &self,
         input: &WrappedTensor<N>,
-        unpadded_input_shape: &Shape,
         positional_cache: &Arc<Mutex<PositionalCache>>,
     ) -> anyhow::Result<LayerOut<N, E>>
     where
@@ -94,11 +93,8 @@ impl<N> Absolute<N> {
         positional_cache
             .lock()
             .unwrap()
-            .set_seq_len(past_length + unpadded_input_shape[0])?;
-        let mut outputs = self
-            .add_layer
-            .evaluate::<E>(&[input, &sub_bt], &vec![self.unpadded_shape.clone(); 2])?
-            .outputs;
+            .set_seq_len(past_length + input.unpadded_shape().dims[0])?;
+        let mut outputs = self.add_layer.evaluate::<E>(&[input, &sub_bt])?.outputs;
         ensure!(
             outputs.len() == 1,
             "Expected 1 output from add in positional encoding layer, got {}",
@@ -413,7 +409,7 @@ mod tests {
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer
-                .evaluate::<GoldilocksExt2>(&input.as_wrapped(), &vec![seq_len, embedding_size].into(), &cache)
+                .evaluate::<GoldilocksExt2>(&input.as_wrapped(), &cache)
                 .expect("absolute evaluate should succeed")
                 .outputs
                 .pop()
@@ -432,7 +428,7 @@ mod tests {
 
         #[test]
         fn test_absolute_element(input in input::<f32>()) {
-            let Input { seq_len, embedding_size, input, pos, .. } = input.clone();
+            let Input { seq_len, input, pos, embedding_size, .. } = input.clone();
             let layer = Absolute::<f32>::new(pos.clone());
             let input_sf = ScalingFactor::from_tensor(&input, None);
             let shape = crate::Shape::new(vec![seq_len, embedding_size]);
@@ -442,20 +438,23 @@ mod tests {
             let layer_q = q.quantized_op;
             let input_q = input.to_quantized(&input_sf);
 
-            let (pos_q, add_q, unpadded) = (layer_q.positional.clone(), &layer_q.add_layer, layer_q.unpadded_shape.clone());
+            let (pos_q, add_q) = (layer_q.positional.clone(), &layer_q.add_layer);
             let sub_slice = TensorSlice::from(pos_q.deref()).slice_over_first_dim(0, seq_len);
+
             let sub_pos_q = Tensor::new(sub_slice.get_shape(), sub_slice.get_data().to_vec());
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer_q
-                .evaluate::<GoldilocksExt2>(&input_q.as_wrapped(), &vec![seq_len, embedding_size].into(), &cache)
+
+                .evaluate::<GoldilocksExt2>(&input_q.as_wrapped(),&cache)
                 .expect("quantized absolute evaluate should succeed")
                 .outputs
                 .pop()
                 .unwrap();
 
             let expected = add_q
-                .evaluate::<GoldilocksExt2>(&[&input_q.as_wrapped(), &sub_pos_q.as_wrapped()], &vec![unpadded.clone(); 2])
+
+                .evaluate::<GoldilocksExt2>(&[&input_q.as_wrapped(), &sub_pos_q.as_wrapped()], )
                 .expect("quantized add evaluate should succeed")
                 .outputs
                 .pop()

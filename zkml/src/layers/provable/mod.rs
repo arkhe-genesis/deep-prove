@@ -167,11 +167,7 @@ pub trait OpInfo {
 
 pub trait Evaluate<T: TensorTypeParam> {
     /// Evaluates the operation given any inputs tensors and constant inputs.
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<T>],
-        unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<T, E>>;
+    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T, E>>;
 }
 
 /// Helper method employed to call `Evaluate::evaluate` when there are no `unpadded_input_shapes`
@@ -179,9 +175,8 @@ pub trait Evaluate<T: TensorTypeParam> {
 pub fn evaluate_layer<E: ExtensionField, T: TensorTypeParam, O: Evaluate<T>>(
     layer: &O,
     inputs: &[&WrappedTensor<T>],
-    unpadded_input_shapes: Option<&[Shape]>,
 ) -> Result<LayerOut<T, E>> {
-    layer.evaluate(inputs, unpadded_input_shapes.unwrap_or_default())
+    layer.evaluate(inputs)
 }
 
 pub trait ProveInfo {

@@ -97,9 +97,7 @@ pub(crate) mod manual_attention {
             input: &Tensor<f32>,
             output: Option<&GPT2LayerOutput>,
         ) -> anyhow::Result<Tensor<f32>> {
-            let up = self
-                .up
-                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
+            let up = self.up.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
             if let Some(gpt2_output) = output {
                 let outputs: Vec<_> = up
                     .outputs()
@@ -109,9 +107,7 @@ pub(crate) mod manual_attention {
                 let outputs = outputs.iter().collect();
                 assert!(gpt2_output.is_ffn_up_close(outputs));
             }
-            let act = self
-                .activation
-                .evaluate::<GoldilocksExt2>(&up.outputs(), &[])?;
+            let act = self.activation.evaluate::<GoldilocksExt2>(&up.outputs())?;
             if let Some(gpt2_output) = output {
                 let outputs: Vec<_> = act
                     .outputs()
@@ -121,7 +117,7 @@ pub(crate) mod manual_attention {
                 let outputs = outputs.iter().collect();
                 assert!(gpt2_output.is_ffn_after_gelu_close(outputs));
             }
-            let down = self.down.evaluate::<GoldilocksExt2>(&act.outputs(), &[])?;
+            let down = self.down.evaluate::<GoldilocksExt2>(&act.outputs())?;
             if let Some(gpt2_output) = output {
                 let outputs: Vec<_> = down
                     .outputs()
@@ -131,10 +127,9 @@ pub(crate) mod manual_attention {
                 let outputs = outputs.iter().collect();
                 assert!(gpt2_output.is_ffn_after_down_close(outputs));
             }
-            let out = self.add.evaluate::<GoldilocksExt2>(
-                &[&input.as_wrapped(), down.outputs()[0]],
-                &[input.shape().clone(), down.outputs()[0].shape().into()],
-            )?;
+            let out = self
+                .add
+                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), down.outputs()[0]])?;
             Ok(out.outputs()[0].clone().to_native())
         }
     }
@@ -241,7 +236,7 @@ pub(crate) mod manual_attention {
 
             let normed = self
                 .layernorm
-                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
+                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
 
             if let Some(gpt2_output) = gpt2_output {
                 let outputs: Vec<_> = normed
@@ -252,10 +247,7 @@ pub(crate) mod manual_attention {
                 let outputs = outputs.iter().collect();
                 ensure!(gpt2_output.is_layernorm_close(outputs));
             }
-            let qkv = self.qkv.evaluate::<GoldilocksExt2>(
-                &normed.outputs(),
-                &[normed.outputs()[0].shape().into()],
-            )?;
+            let qkv = self.qkv.evaluate::<GoldilocksExt2>(&normed.outputs())?;
 
             if let Some(gpt2_output) = gpt2_output {
                 let outputs: Vec<_> = qkv
@@ -268,7 +260,7 @@ pub(crate) mod manual_attention {
             }
             let (mha, _, _, softmax_out, _) = self
                 .mha
-                .evaluate_with_intermediate_outputs::<GoldilocksExt2>(&qkv.outputs(), &[])?;
+                .evaluate_with_intermediate_outputs::<GoldilocksExt2>(&qkv.outputs())?;
 
             if let Some(gpt2_output) = gpt2_output {
                 assert!(
@@ -294,7 +286,7 @@ pub(crate) mod manual_attention {
                 );
             }
             // now we do the final projection - still [seq_len,hidden_size]
-            let projected = self.out.evaluate::<GoldilocksExt2>(&mha.outputs(), &[])?;
+            let projected = self.out.evaluate::<GoldilocksExt2>(&mha.outputs())?;
             if let Some(gpt2_output) = gpt2_output {
                 let outputs: Vec<_> = projected
                     .outputs()
@@ -306,10 +298,9 @@ pub(crate) mod manual_attention {
             }
 
             // and then residual connection, [1, hidden_size]
-            let out = self.add.evaluate::<GoldilocksExt2>(
-                &[&input.as_wrapped(), projected.outputs()[0]],
-                &[input.shape().clone(), projected.outputs()[0].shape().into()],
-            )?;
+            let out = self
+                .add
+                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), projected.outputs()[0]])?;
 
             if let Some(gpt2_output) = gpt2_output {
                 let outputs: Vec<_> = out
@@ -323,7 +314,7 @@ pub(crate) mod manual_attention {
 
             let normed = self
                 .pre_ffn_norm
-                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
+                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
             if let Some(gpt2_output) = gpt2_output {
                 let outputs: Vec<_> = normed
                     .outputs()

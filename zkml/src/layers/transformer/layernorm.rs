@@ -402,7 +402,6 @@ impl Evaluate<f32> for LayerNorm<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         assert_eq!(
             inputs.len(),
@@ -433,7 +432,6 @@ impl Evaluate<Element> for LayerNorm<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we check to see if there is any quant_info, if not error
         ensure!(
@@ -1406,7 +1404,7 @@ mod tests {
             quant_info: None,
         };
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]).into_wrapped();
-        let output = layernorm.evaluate::<E>(&[&input], &[]).unwrap();
+        let output = layernorm.evaluate::<E>(&[&input]).unwrap();
         assert_eq!(output.outputs[0].shape(), vec![1_usize, 1024].into());
         assert_eq!(output.outputs[0].get_data(), vec![0.0; 1024]);
     }
@@ -1423,7 +1421,7 @@ mod tests {
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = layernorm
-            .evaluate::<E>(&[&dequant_input.as_wrapped()], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&dequant_input.as_wrapped()])
             .unwrap()
             .outputs[0]
             .clone();
@@ -1432,7 +1430,7 @@ mod tests {
             layernorm.quantise(input_scaling, input_scaling).unwrap();
 
         let quant_output = quant_layernorm
-            .evaluate::<E>(&[&quant_tensor.as_wrapped()], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&quant_tensor.as_wrapped()])
             .unwrap()
             .outputs[0]
             .clone();
@@ -1577,8 +1575,9 @@ mod tests {
             &layer.gamma,
             layer.quant_info.as_ref().unwrap(),
         );
+
         let result = layer
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .unwrap();
         assert_eq!(
             &result.outputs()[0].get_data(),
@@ -1645,8 +1644,9 @@ mod tests {
             &layer.gamma,
             layer.quant_info.as_ref().unwrap(),
         );
+
         let result = layer
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .unwrap();
         assert_eq!(
             &result.outputs()[0].get_data(),
@@ -1677,7 +1677,8 @@ mod tests {
             let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 
             let expected = evaluate(&input.input, &layer.beta, &layer.gamma, layer.quant_info.as_ref().unwrap());
-            let result = layer.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()], &[]).unwrap();
+
+            let result = layer.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
             prop_assert_eq!(&result.outputs()[0].get_data(), &expected.2, "Output mismatch. input {:?}", data);
 
             let expected_proof_data = result.try_layernorm_data().unwrap();

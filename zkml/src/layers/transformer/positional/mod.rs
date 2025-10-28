@@ -318,7 +318,6 @@ where
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<N>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(
             inputs.len() == 1,
@@ -329,26 +328,17 @@ where
             inputs.iter().all(|x| x.rank() == 2),
             "positional embeddings only support 2d tensors"
         );
-        ensure!(
-            unpadded_input_shapes.len() == 1,
-            "Expected 1 input shape for positional layer, found {}",
-            unpadded_input_shapes.len(),
-        );
 
         // default cache to be provided in case the layer was not initialized with a cache
         let new_cache = Arc::new(Mutex::new(PositionalCache::new()));
 
         match &self.variant {
-            PositionalVariant::Absolute(absolute) => absolute.evaluate(
-                inputs[0],
-                &unpadded_input_shapes[0],
-                self.cache.as_ref().unwrap_or(&new_cache),
-            ),
-            PositionalVariant::Rope(rope) => rope.evaluate(
-                inputs[0],
-                &unpadded_input_shapes[0],
-                self.cache.as_ref().unwrap_or(&new_cache),
-            ),
+            PositionalVariant::Absolute(absolute) => {
+                absolute.evaluate(inputs[0], self.cache.as_ref().unwrap_or(&new_cache))
+            }
+            PositionalVariant::Rope(rope) => {
+                rope.evaluate(inputs[0], self.cache.as_ref().unwrap_or(&new_cache))
+            }
         }
     }
 }

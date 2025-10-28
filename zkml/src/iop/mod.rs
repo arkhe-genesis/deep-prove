@@ -155,7 +155,7 @@ mod test {
         let (model, input) = Model::random_with_rng(4, &mut rng).unwrap();
 
         model.describe();
-        let trace = model.run(&input, None, &mut Default::default()).unwrap();
+        let trace = model.run(&input, &mut Default::default()).unwrap();
         let io = trace.to_verifier_io().unwrap();
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -173,7 +173,7 @@ mod test {
         init_test_logging_default();
         let (model, input) = Model::random_pooling(4).unwrap();
         model.describe();
-        let trace = model.run(&input, None, &mut Default::default()).unwrap();
+        let trace = model.run(&input, &mut Default::default()).unwrap();
         let io = trace.to_verifier_io().unwrap();
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()

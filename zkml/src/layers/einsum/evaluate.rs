@@ -28,16 +28,14 @@ where
     pub(crate) fn evaluate_internal(
         &self,
         inputs: &[&WrappedTensor<N>],
-        unpadded_input_shapes: &[Shape],
     ) -> Result<Vec<WrappedTensor<N>>> {
         // Prepare the input tensors, applying permutations and reshaping as needed
         let mut unpadded_inputs_iter = inputs
             .iter()
-            .zip(unpadded_input_shapes.iter())
-            .map(|(&input_tens, unpadded_shape)| {
+            .map(|&input_tens| {
                 input_tens
                     .clone()
-                    .reduce_to_shape(&BShape::from(unpadded_shape.as_slice()))
+                    .reduce_to_shape(input_tens.unpadded_shape())
             })
             .collect::<Result<Vec<WrappedTensor<N>>>>()?
             .into_iter();
@@ -500,10 +498,7 @@ mod tests {
             let a = Tensor::<N>::random(&a_shape);
             let b = Tensor::<N>::random(&b_shape);
             let output = einsum
-                .evaluate_internal(
-                    &[&a.as_wrapped(), &b.as_wrapped()],
-                    &[a_shape.clone(), b_shape.clone()],
-                )
+                .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
             let a_burn = a.to_btensor::<2>();
@@ -556,10 +551,7 @@ mod tests {
             let a = Tensor::<N>::random(&a_shape);
             let b = Tensor::<N>::random(&b_shape);
             let output = einsum
-                .evaluate_internal(
-                    &[&a.as_wrapped(), &b.as_wrapped()],
-                    &[a_shape.clone(), b_shape.clone()],
-                )
+                .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
             let a_burn = a.to_btensor::<2>();
@@ -611,10 +603,7 @@ mod tests {
             let a = Tensor::<N>::random(&a_shape);
             let b = Tensor::<N>::random(&b_shape);
             let output = einsum
-                .evaluate_internal(
-                    &[&a.as_wrapped(), &b.as_wrapped()],
-                    &[a_shape.clone(), b_shape.clone()],
-                )
+                .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
             let a_burn = a.to_btensor::<3>();
@@ -674,10 +663,7 @@ mod tests {
             let b = Tensor::<N>::random(&b_shape);
             let c = Tensor::<N>::random(&c_shape);
             let outputs = einsum
-                .evaluate_internal(
-                    &[&a.as_wrapped(), &b.as_wrapped(), &c.as_wrapped()],
-                    &[a_shape.clone(), b_shape.clone(), c_shape.clone()],
-                )
+                .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped(), &c.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
             let a_burn = a.to_btensor::<3>();
@@ -768,7 +754,7 @@ mod tests {
             .expect("Failed to create EinSum layer");
 
             let output = einsum
-                .evaluate_internal(&[&x.as_wrapped()], std::slice::from_ref(&x_shape))
+                .evaluate_internal(&[&x.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
             // Manually compute the expected output
@@ -851,10 +837,7 @@ mod tests {
             let q_full = Tensor::<N>::random(&q_full_shape);
             let k = Tensor::<N>::random(&k_shape);
             let output_full = einsum
-                .evaluate_internal(
-                    &[&q_full.as_wrapped(), &k.as_wrapped()],
-                    &[q_full_shape.clone(), k_shape.clone()],
-                )
+                .evaluate_internal(&[&q_full.as_wrapped(), &k.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
             let k_burn = k.to_btensor::<3>();
@@ -894,10 +877,7 @@ mod tests {
             let qkt_single_shape = Shape::new(vec![group_size, heads, q_len, seq_len]);
             let q_single = Tensor::<N>::random(&q_single_shape);
             let output_single = einsum
-                .evaluate_internal(
-                    &[&q_single.as_wrapped(), &k.as_wrapped()],
-                    &[q_single_shape.clone(), k_shape.clone()],
-                )
+                .evaluate_internal(&[&q_single.as_wrapped(), &k.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
             let expected_single_data = calc_expected_output(q_single);

@@ -118,7 +118,7 @@ fn test_conv_unpadded_to_padded() {
     // now try to pad the input and conv and use the fft one
     let padded_input = input.pad_next_power_of_two();
     let fft_conv = Convolution::new(weight.clone(), bias).prepared_for_fft(&input_shape);
-    let (fft_output, conv_data) = fft_conv.fft::<GoldilocksExt2>(&padded_input, &input_shape);
+    let (fft_output, conv_data) = fft_conv.fft::<GoldilocksExt2>(&padded_input);
     let (valid, _garbage) = split_garbage(&fft_output, output.shape());
     assert_eq!(
         valid,
@@ -161,7 +161,7 @@ fn test_conv_padding_garbage() {
     let input = Tensor::random(&input_shape);
     let padded_input = input.pad_next_power_of_two();
     let (fft_output, _): (Tensor<Element>, ConvData<_>) =
-        fft_conv.fft::<GoldilocksExt2>(&padded_input, &input_shape);
+        fft_conv.fft::<GoldilocksExt2>(&padded_input);
     // just normal convolution
     let normal_output = input.conv2d(&w1, &bias1, 1);
 
@@ -220,16 +220,13 @@ fn test_conv_padding_garbage() {
     padded_dense.bias = padded_dense
         .bias
         .map(|b| b.map_tensor(|t| t.pad_1d(padded_nrows)));
-    let no_garbage_fft_output = evaluate_layer::<GoldilocksExt2, _, _>(
-        &padded_dense,
-        &[&flat_fft_output.as_wrapped()],
-        None,
-    )
-    .unwrap()
-    .outputs()[0]
-        .clone();
+    let no_garbage_fft_output =
+        evaluate_layer::<GoldilocksExt2, _, _>(&padded_dense, &[&flat_fft_output.as_wrapped()])
+            .unwrap()
+            .outputs()[0]
+            .clone();
     let no_garbage_normal_output =
-        evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&flat_normal_output.as_wrapped()], None)
+        evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&flat_normal_output.as_wrapped()])
             .unwrap()
             .outputs()[0]
             .clone();
@@ -265,22 +262,22 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     let fft_conv = Convolution::new(filter.clone(), bias).prepared_for_fft(&input_shape_og);
     let mut fft_input = input.clone();
     fft_input.pad_to_shape(input_shape_padded.clone());
-    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input, &input_shape_og);
+    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input);
 
     input_shape_og = conv2d_shape(&input_shape_og, filter.shape());
     input_shape_padded = conv2d_shape(&input_shape_padded, dims).next_power_of_two();
 
     // add a RELU layer
     let relu = Activation::new_relu();
-    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()], None)
+
+    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()])
         .unwrap()
         .outputs()[0]
         .clone();
-    let fft_output =
-        evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()], None)
-            .unwrap()
-            .outputs()[0]
-            .clone();
+    let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()])
+        .unwrap()
+        .outputs()[0]
+        .clone();
 
     // make a pooled output
     let pool = Pooling::Maxpool2D(Maxpool2D::default());
@@ -303,22 +300,22 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     let fft_conv = Convolution::new(filter.clone(), bias).prepared_for_fft(&input_shape_padded);
     let mut fft_input = fft_output;
     fft_input.pad_to_shape(input_shape_padded.clone());
-    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input, &input_shape_og);
+    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input);
 
     input_shape_og = conv2d_shape(&input_shape_og, filter.shape());
     input_shape_padded = conv2d_shape(&input_shape_padded, dims).next_power_of_two();
 
     // Add another RELU
     let relu = Activation::new_relu();
-    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()], None)
+
+    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()])
         .unwrap()
         .outputs()[0]
         .clone();
-    let fft_output =
-        evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()], None)
-            .unwrap()
-            .outputs()[0]
-            .clone();
+    let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()])
+        .unwrap()
+        .outputs()[0]
+        .clone();
 
     // make a pooled output
     let pool = Pooling::Maxpool2D(Maxpool2D::default());
@@ -348,11 +345,10 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
         KeyedTensor::new("dense_weight", weight.clone()),
         KeyedTensor::new("dense_bias", bias.clone()),
     );
-    let dense_output =
-        evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&output.as_wrapped()], None)
-            .unwrap()
-            .outputs()[0]
-            .clone();
+    let dense_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&output.as_wrapped()])
+        .unwrap()
+        .outputs()[0]
+        .clone();
 
     let fft_weight = weight.pad_matrix_to_ignore_garbage(
         &conv_shape_og,
@@ -376,7 +372,7 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
         output.shape().iter().product::<usize>()
     );
     let fft_dense_output =
-        evaluate_layer::<GoldilocksExt2, _, _>(&fft_dense, &[&fft_output.as_wrapped()], None)
+        evaluate_layer::<GoldilocksExt2, _, _>(&fft_dense, &[&fft_output.as_wrapped()])
             .unwrap()
             .outputs()[0]
             .clone();
@@ -414,7 +410,7 @@ fn convolution_test_simple_element() {
 
     let conv = Convolution::new(kernels, bias).prepared_for_fft(input.shape());
     let result = conv
-        .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[input.shape().clone()])
+        .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
         .unwrap();
     let fft_result = result.outputs()[0];
 
@@ -444,7 +440,7 @@ fn convolution_test_random_element() {
 
     let conv = Convolution::new(kernels, bias).prepared_for_fft(input.shape());
     let result = conv
-        .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[input.shape().clone()])
+        .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
         .unwrap();
     let fft_result = result.outputs()[0];
 
@@ -530,7 +526,7 @@ proptest! {
         let expected = input.input.conv2d(&input.kernels, &input.bias, stride);
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone());
-        let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()], &[]).unwrap();
+        let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
             prop_assert!(
@@ -548,7 +544,7 @@ proptest! {
         let expected = input.input.conv2d(&input.kernels, &input.bias, stride);
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone());
-        let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()], &[]).unwrap();
+        let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
             prop_assert!(
@@ -565,7 +561,7 @@ proptest! {
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone())
         .prepared_for_fft(input.input.shape());
-        let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()], &[input.input.shape().clone()]).unwrap();
+        let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         // Remove the leading dimension, the fft only supports 3d tensors.
         let conv2d_result = conv2d_result.squeeze(0);
@@ -578,7 +574,7 @@ proptest! {
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone())
         .prepared_for_fft(input.input.shape());
-        let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()], &[input.input.shape().clone()]).unwrap();
+        let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         // Remove the leading dimension, the fft only supports 3d tensors.
         let conv2d_result = conv2d_result.squeeze(0);

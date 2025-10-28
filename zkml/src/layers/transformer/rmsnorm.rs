@@ -323,7 +323,6 @@ impl Evaluate<f32> for RMSNorm<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         assert!(inputs.len() == 1);
         let input = inputs[0];
@@ -351,7 +350,6 @@ impl Evaluate<Element> for RMSNorm<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we check to see if there is any quant_info, if not error
         ensure!(
@@ -1178,7 +1176,7 @@ mod tests {
     fn test_rmsnorm() {
         let rmsnorm = RMSNorm::random(1024, None);
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
-        let output = rmsnorm.evaluate::<E>(&[&input.as_wrapped()], &[]).unwrap();
+        let output = rmsnorm.evaluate::<E>(&[&input.as_wrapped()]).unwrap();
         assert_eq!(
             output.outputs[0].shape().clone(),
             vec![1_usize, 1024].into()
@@ -1201,13 +1199,13 @@ mod tests {
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = rmsnorm
-            .evaluate::<E>(&[&dequant_input.as_wrapped()], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&dequant_input.as_wrapped()])
             .unwrap()
             .outputs[0]
             .clone();
 
         let quant_output = quant_rmsnorm
-            .evaluate::<E>(&[&quant_tensor.as_wrapped()], &[vec![2, 100].into()])
+            .evaluate::<E>(&[&quant_tensor.as_wrapped()])
             .unwrap()
             .outputs[0]
             .clone();

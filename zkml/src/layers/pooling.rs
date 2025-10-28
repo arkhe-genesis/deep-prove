@@ -125,7 +125,6 @@ impl Evaluate<Element> for Pooling {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         ensure!(
             inputs.len() == 1,
@@ -161,7 +160,6 @@ impl Evaluate<f32> for Pooling {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
@@ -826,8 +824,6 @@ pub fn maxpool2d_shape(input_shape: &Shape) -> Shape {
 }
 #[cfg(test)]
 mod tests {
-    use core::slice;
-
     use crate::{commit::compute_betas_eval, default_transcript, rng_from_env_or_random, to_base};
 
     use super::*;
@@ -1099,7 +1095,7 @@ mod tests {
             .maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
         let winput = input.as_wrapped();
         let result = Pooling::Maxpool2D(Maxpool2D::default())
-            .evaluate::<GoldilocksExt2>(&[&winput], slice::from_ref(input.shape()))
+            .evaluate::<GoldilocksExt2>(&[&winput])
             .unwrap();
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(&expected, &result.outputs[0].to_native());
@@ -1113,8 +1109,9 @@ mod tests {
         #[test]
         fn proptest_maxpool_f32(input in proptest_input::<f32>()) {
             let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
+
             let winput = input.as_wrapped();
-            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput], slice::from_ref(input.shape())).unwrap();
+            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput]).unwrap();
             prop_assert_eq!(result.outputs.len(), 1);
             prop_assert_eq!(&expected, &result.outputs[0].to_native());
         }
@@ -1122,8 +1119,9 @@ mod tests {
         #[test]
         fn proptest_maxpool_element(input in proptest_input::<Element>()) {
             let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
+
             let winput = input.as_wrapped();
-            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput], slice::from_ref(input.shape())).unwrap();
+            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput]).unwrap();
             prop_assert_eq!(result.outputs.len(), 1);
             prop_assert_eq!(&expected, &result.outputs[0].to_native());
         }

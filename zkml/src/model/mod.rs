@@ -206,7 +206,7 @@ where
             .into_iter()
             .zip(input_shapes)
             .map(|(mut input, shape)| {
-                if input.shape().clone() == shape {
+                if input.shape() == &shape {
                     // no need to pad, simply return the input
                     input
                 } else {
@@ -481,7 +481,7 @@ where
 
 impl Model<f32> {
     pub fn run_float(&self, input: &[Tensor<f32>]) -> anyhow::Result<Vec<Tensor<f32>>> {
-        self.run::<GoldilocksExt2>(input, None, &mut GenStore::default())?
+        self.run::<GoldilocksExt2>(input, &mut GenStore::default())?
             .outputs()
     }
 }
@@ -490,7 +490,6 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     pub(crate) fn run_with_tracker<E>(
         &self,
         inputs: &[Tensor<N>],
-        unpadded_input_shapes: Option<Vec<Shape>>,
         mut tracker: Option<&mut InferenceTracker>,
         store: &mut GenStore,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
@@ -501,38 +500,40 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     {
         // Concretize the unpadded input shapes, either from the provided shapes
         // or from the ones already stored in the [`Graph`].
-        let unpadded_input_shapes = unpadded_input_shapes
-            .as_ref()
-            .unwrap_or(&self.unpadded_input_shapes())
-            .clone();
+        let unpadded_input_shapes: Vec<_> =
+            inputs.iter().map(|i| i.unpadded_shape().clone()).collect();
+
         ensure!(unpadded_input_shapes.len() == inputs.len());
 
         // Seed the shape accumulators with the model inputs
-        let (mut unpadded_shape_register, mut shape_register, input_dry_tensors) =
-            inputs.iter().enumerate().try_fold(
-                (HashMap::new(), HashMap::new(), Vec::new()),
-                #[allow(clippy::type_complexity)]
-                |(mut unpadded_shape_register, mut shape_register, mut dry_tensors),
-                 (i, tensor)|
-                 -> anyhow::Result<(
-                    HashMap<StorageKey<Vec<N>>, Shape>,
-                    HashMap<StorageKey<Vec<N>>, Shape>,
-                    Vec<DryTensor<N>>,
-                )> {
-                    let input_node_id = self.graph.input_node_id(i)?;
-                    let tensor_key = input_node_id.output_at(0).to_storage_key();
-                    let input_shape = tensor.shape().clone();
-                    // save the tensor to the store
-                    store.store(&tensor_key, tensor.data_vec())?;
-                    // save the key => shape relation
-                    shape_register.insert(tensor_key.clone(), input_shape.clone());
-                    unpadded_shape_register
-                        .insert(tensor_key.clone(), unpadded_input_shapes[i].clone());
-                    dry_tensors.push(DryTensor::new(tensor_key.into(), input_shape));
+        let (mut shape_register, input_dry_tensors) = inputs.iter().enumerate().try_fold(
+            (HashMap::new(), Vec::new()),
+            #[allow(clippy::type_complexity)]
+            |(mut shape_register, mut dry_tensors),
+             (i, tensor)|
+             -> anyhow::Result<(
+                HashMap<StorageKey<Vec<N>>, (Shape, Shape)>,
+                Vec<DryTensor<N>>,
+            )> {
+                let input_node_id = self.graph.input_node_id(i)?;
+                let tensor_key = input_node_id.output_at(0).to_storage_key();
+                let input_shape = tensor.shape().clone();
+                // save the tensor to the store
+                store.store(&tensor_key, tensor.data_vec())?;
+                // save the key => shape relation
+                shape_register.insert(
+                    tensor_key.clone(),
+                    (input_shape.clone(), tensor.unpadded_shape().clone()),
+                );
+                dry_tensors.push(DryTensor::new(
+                    tensor_key.into(),
+                    input_shape,
+                    tensor.unpadded_shape().clone(),
+                ));
 
-                    Ok((unpadded_shape_register, shape_register, dry_tensors))
-                },
-            )?;
+                Ok((shape_register, dry_tensors))
+            },
+        )?;
         let mut trace = Trace::new(store.clone(), input_dry_tensors);
 
         for (node_id, layer) in self.graph.forward_inners() {
@@ -542,11 +543,11 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                     layer,
                     &self.graph.incoming_feeds(node_id),
                     &mut shape_register,
-                    &mut unpadded_shape_register,
                     &mut tracker,
                     store.clone(),
                 )
                 .context(format!("Error occurred at node ID: {node_id}"))?;
+
             trace.new_step(
                 node_id,
                 InferenceStep {
@@ -604,7 +605,6 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     pub fn run<E>(
         &self,
         input: &[Tensor<N>],
-        unpadded_input_shapes: Option<Vec<Shape>>,
         store: &mut GenStore,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
@@ -612,7 +612,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         E: ExtensionField + Serialize + DeserializeOwned,
         Layer<N>: Evaluate<N>,
     {
-        self.run_with_tracker(input, unpadded_input_shapes, None, store)
+        self.run_with_tracker(input, None, store)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -622,8 +622,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         layer: &Layer<N>,
         // inputs are assumed to be sorted by source port, e.g. in the order defined by the ports
         incomings: &[Feed],
-        shape_register: &mut HashMap<StorageKey<Vec<N>>, Shape>,
-        unpadded_shape_register: &mut HashMap<StorageKey<Vec<N>>, Shape>,
+        shape_register: &mut HashMap<StorageKey<Vec<N>>, (Shape, Shape)>,
         tracker: &mut Option<&mut InferenceTracker>,
         store: GenStore,
         // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
@@ -640,7 +639,13 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
         let prec_dried_tensors: Vec<DryTensor<_>> = prec_keys
             .iter()
-            .map(|key| DryTensor::new(key.into(), shape_register[key].clone()))
+            .map(|key| {
+                DryTensor::new(
+                    key.into(),
+                    shape_register[key].clone().0,
+                    shape_register[key].clone().1,
+                )
+            })
             .collect();
 
         let (prec_tensors, prec_unpadded_shapes): (Vec<_>, Vec<_>) = prec_keys
@@ -653,7 +658,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                     .unwrap();
                 (
                     WrappedTensor::try_from(&t).unwrap(),
-                    unpadded_shape_register[key].clone(),
+                    shape_register[key].1.clone(),
                 )
             })
             .unzip();
@@ -661,12 +666,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         let expected_num_outputs = layer.num_outputs(prec_tensors.len());
 
         // run the layer
-        // TODO: shall disappear after the Big Tensor Refactor
-        let layer_out = layer.evaluate(
-            // silly trick to convert Vec<X> to Vec<&X>
-            prec_tensors.iter().collect::<Vec<_>>().as_slice(),
-            &prec_unpadded_shapes,
-        )?;
+        let layer_out = layer.evaluate(prec_tensors.iter().collect::<Vec<_>>().as_slice())?;
         assert!(expected_num_outputs == layer_out.outputs.len());
 
         // the keys under which to save the output tensor of this layer. We save
@@ -698,7 +698,11 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                     .with_context(|| format!("storing outputs for tensor {key}"))?;
                 Ok((
                     feed.source.port,
-                    DryTensor::new(key.into(), Shape::new(tensor.shape().to_vec())),
+                    DryTensor::new(
+                        key.into(),
+                        tensor.shape().clone().into(),
+                        tensor.unpadded_shape().clone().into(),
+                    ),
                 ))
             })
             .collect::<Result<_>>()?;
@@ -729,16 +733,23 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         shape_register.extend(dry_output_tensors.values().map(|dry_tensor| {
             (
                 dry_tensor.storage_key().to_owned(),
-                dry_tensor.shape().to_owned(),
+                (
+                    dry_tensor.shape().to_owned(),
+                    dry_tensor.unpadded_shape().to_owned(),
+                ),
             )
         }));
-        unpadded_shape_register.extend(
-            layer
-                .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)
-                .into_iter()
-                .enumerate()
-                .map(|(i, shape)| (node_id.output_at(i).to_storage_key(), shape)),
-        );
+
+        for (i, shape) in layer
+            .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)
+            .into_iter()
+            .enumerate()
+        {
+            shape_register
+                .get_mut(&node_id.output_at(i).to_storage_key())
+                .unwrap()
+                .1 = shape;
+        }
 
         // Record the step into the trace
         Ok(StepData {
@@ -944,9 +955,7 @@ pub(crate) mod test {
     #[test]
     fn test_model_long() {
         let (model, input) = Model::random(3).unwrap();
-        model
-            .run::<F>(&input, None, &mut Default::default())
-            .unwrap();
+        model.run::<F>(&input, &mut Default::default()).unwrap();
     }
 
     fn random_vector_quant(n: usize) -> Vec<Element> {
@@ -983,8 +992,9 @@ pub(crate) mod test {
         // Here is not possible since we didnt run through the onnx loader
         let input = Tensor::random(&input_shape);
         let input_padded = model.prepare_inputs(vec![input]).unwrap();
+
         let _ = model
-            .run::<F>(&input_padded, None, &mut Default::default())
+            .run::<F>(&input_padded, &mut Default::default())
             .unwrap();
     }
 
@@ -1004,11 +1014,11 @@ pub(crate) mod test {
         );
         let input_shape = vec![dense1.ncols()].into();
         let input = Tensor::<Element>::random(&input_shape).into_wrapped();
-        let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &[&input], None)
+        let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &[&input])
             .unwrap()
             .outputs()[0]
             .clone();
-        let final_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense2, &[&output1], None)
+        let final_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense2, &[&output1])
             .unwrap()
             .outputs()[0]
             .clone();
@@ -1025,7 +1035,7 @@ pub(crate) mod test {
 
         let mut store = GenStore::default();
         let input = input.into_native();
-        let trace = model.run::<F>(&[input], None, &mut store).unwrap();
+        let trace = model.run::<F>(&[input], &mut store).unwrap();
         assert_eq!(trace.steps.len(), 2);
         // Verify first step
 
@@ -1058,7 +1068,7 @@ pub(crate) mod test {
         let (model, input) = Model::random(1).unwrap();
         model.describe();
         let trace = model
-            .run::<F>(&input, None, &mut Default::default())
+            .run::<F>(&input, &mut Default::default())
             .unwrap()
             .into_fields()
             .unwrap();
@@ -1144,7 +1154,7 @@ pub(crate) mod test {
             .unwrap();
         model.automatic_output_labelling().unwrap();
         model.describe();
-        let trace = model.run::<F>(&[input], None, &mut store).unwrap();
+        let trace = model.run::<F>(&[input], &mut store).unwrap();
         let mut tr: BasicTranscript<F> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1183,7 +1193,7 @@ pub(crate) mod test {
             .unwrap();
 
         let mut store = GenStore::default();
-        let trace = model.run::<F>(&input_tensor, None, &mut store).unwrap();
+        let trace = model.run::<F>(&input_tensor, &mut store).unwrap();
         let mut tr = BasicTranscript::<F>::new(b"matmul");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1239,7 +1249,7 @@ pub(crate) mod test {
         model.automatic_output_labelling().unwrap();
         model.describe();
         let mut store = GenStore::default();
-        let trace = model.run::<F>(&[input], None, &mut store).unwrap();
+        let trace = model.run::<F>(&[input], &mut store).unwrap();
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1311,7 +1321,7 @@ pub(crate) mod test {
         let input = random_vector(input_shape.iter().product());
         let input_tensor = Tensor::new(input_shape, input);
         let trace = model
-            .run::<E>(&[input_tensor], None, &mut Default::default())
+            .run::<E>(&[input_tensor], &mut Default::default())
             .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
@@ -1324,7 +1334,7 @@ pub(crate) mod test {
 
         let input_tensor = Tensor::random(&input_shape);
         let trace = model
-            .run::<E>(&[input_tensor], None, &mut Default::default())
+            .run::<E>(&[input_tensor], &mut Default::default())
             .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
@@ -1370,7 +1380,7 @@ pub(crate) mod test {
 
         let input_tensors = model.prepare_inputs(inputs).unwrap();
 
-        let trace = model.run(&input_tensors, None, store)?;
+        let trace = model.run(&input_tensors, store)?;
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"model");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1475,7 +1485,7 @@ pub(crate) mod test {
         model.add_edge(relu2, output_node_ids[1], (1, 0)).unwrap();
         model.add_edge(relu3, output_node_ids[2], (0, 0)).unwrap();
         model
-            .run::<GoldilocksExt2>(&input_tensor, None, &mut Default::default())
+            .run::<GoldilocksExt2>(&input_tensor, &mut Default::default())
             .unwrap();
     }
 

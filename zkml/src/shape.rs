@@ -54,6 +54,12 @@ impl<const T: usize> From<[usize; T]> for Shape {
     }
 }
 
+impl From<Shape> for burn::prelude::Shape {
+    fn from(value: Shape) -> Self {
+        burn::prelude::Shape { dims: value.0 }
+    }
+}
+
 impl Shape {
     /// Creates a new shape from the iterator.
     ///

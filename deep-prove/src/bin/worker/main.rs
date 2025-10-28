@@ -124,7 +124,6 @@ async fn run_model_v1<S: Store>(
 
             let trace_result = model.run(
                 &input_tensor,
-                None,
                 &mut tenstore::GenStore::new_temporary(1000 * 1024 * 1024)?,
             );
             // If model.run fails, print the error and continue to the next input

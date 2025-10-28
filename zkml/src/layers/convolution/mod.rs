@@ -18,8 +18,7 @@ use crate::{
     quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
     shape::filter_size,
     tensor::{
-        BShape, ConvData, ConvFFTData, KeyedTensor, Tensor, TensorKey, TensorTypeParam,
-        WrappedTensor, fft,
+        ConvData, ConvFFTData, KeyedTensor, Tensor, TensorKey, TensorTypeParam, WrappedTensor, fft,
     },
     util::from_mle_list_dimensions,
 };
@@ -536,14 +535,11 @@ impl Convolution<Element> {
     /// Compute the convolution using FFT.
     ///
     /// See: https://en.wikipedia.org/wiki/Convolution_theorem
-    fn fft<E: ExtensionField>(
-        &self,
-        input: &Tensor<Element>,
-        unpadded_input_shape: &Shape,
-    ) -> (Tensor<Element>, ConvData<E>) {
+    fn fft<E: ExtensionField>(&self, input: &Tensor<Element>) -> (Tensor<Element>, ConvData<E>) {
         let (conv_output, proving_data) = self.filter.fft_conv(input, &self.bias);
 
-        let unpadded_output_shape = conv2d_shape(unpadded_input_shape, &self.filter.original_shape);
+        let unpadded_output_shape =
+            conv2d_shape(&input.unpadded_shape().clone(), &self.filter.original_shape);
         debug_assert_eq!(
             padded_conv2d_shape(input.shape(), self.filter.pre_fft_shape()),
             *conv_output.shape(),
@@ -1069,7 +1065,6 @@ impl Evaluate<f32> for Convolution<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         let tensor = self.filter.as_pre_fft_tensor();
         ensure!(
@@ -1114,14 +1109,8 @@ impl Evaluate<Element> for Convolution<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
-        ensure!(
-            unpadded_input_shapes.len() == 1,
-            "Expected exactly 1 input shape when evaluating convolution layer, got {}",
-            unpadded_input_shapes.len(),
-        );
-        let unpadded_input_shape = BShape::from(unpadded_input_shapes[0].clone().into_vec());
+        let unpadded_input_shape = inputs[0].unpadded_shape();
         ensure!(
             inputs.len() == 1,
             "Expected exactly 1 input when evaluating convolution layer, got {}",
@@ -1152,7 +1141,7 @@ impl Evaluate<Element> for Convolution<Element> {
             .bias
             .reduce_to_shape(&Shape::new(vec![self.filter.original_shape[0]]));
 
-        let input = input.clone().reduce_to_shape(&unpadded_input_shape)?;
+        let input = input.clone().reduce_to_shape(unpadded_input_shape)?;
         let input = if input.rank() == 4 {
             input.squeeze(0)?
         } else {
@@ -1183,7 +1172,6 @@ impl Evaluate<Element> for Convolution<Element> {
             LayerOut::from_vec(vec![padded]).with_proving_data(ProvingData::Convolution(
                 ConvFFTData {
                     input: Tensor::try_from(inputs[0].clone())?,
-                    unpadded_input_shape: unpadded_input_shape.into(),
                 },
             )),
         )
@@ -1356,7 +1344,7 @@ where
         let output_tensor = step_data.output_tensor_at(0, store)?;
 
         let fft_data = step_data.node_outputs.try_convdata().unwrap();
-        let (_, conv_data) = self.fft(&fft_data.input, &fft_data.unpadded_input_shape);
+        let (_, conv_data) = self.fft(&fft_data.input);
 
         Ok(vec![self.prove_convolution_step(
             prover,

@@ -336,7 +336,6 @@ where
     fn evaluate_internal<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<N>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(inputs.len() == 1, "QKV expects 1 input");
         let shape = inputs[0].shape();
@@ -355,7 +354,8 @@ where
         // The reason is because the _first_ time we infere via this layer, this is on the user input which is X token long.
         // The subsequent times, it's just to run with the newly generated token, so there is only one here.
         let input = inputs[0].clone();
-        let unpadded_seq_len = unpadded_input_shapes[0].dim(0);
+        let unpadded_shape: Shape = input.unpadded_shape().clone().into();
+        let unpadded_seq_len = unpadded_shape.dim(0);
         let q = WrappedTensor::try_from(&self.q)?;
         let q_bias = self
             .q_bias
@@ -501,7 +501,6 @@ impl Evaluate<f32> for QKV<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         // f32 inference is only used for quantization parameter computation so we don't want
         // to make it stateful since it would have to make the quantization strategy be aware that
@@ -513,7 +512,7 @@ impl Evaluate<f32> for QKV<f32> {
             "Cache should be empty during float evaluation"
         );
 
-        self.evaluate_internal(inputs, unpadded_input_shapes)
+        self.evaluate_internal(inputs)
     }
 }
 
@@ -521,7 +520,6 @@ impl Evaluate<Element> for QKV<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         // as we only want to do the the matmul for the new token, not for the previously generated ones
         // This check is only true if the cache is not empty, i.e. if we've already used the cache before.
@@ -532,7 +530,7 @@ impl Evaluate<Element> for QKV<Element> {
             ensure!(inputs[0].shape().dims[0] == 1, "QKV: seq_len != 1");
         }
 
-        self.evaluate_internal(inputs, unpadded_input_shapes)
+        self.evaluate_internal(inputs)
     }
 }
 
@@ -1206,7 +1204,7 @@ mod tests {
         let qkv = QKV::random(num_heads, emb_size, hidden_size, true, None).unwrap();
         let input = Tensor::<Element>::random(&vec![1, emb_size].into());
         let output = qkv
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[vec![1, emb_size].into()])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
@@ -1223,7 +1221,7 @@ mod tests {
         // we dont concat here because we should only send the last token each time
         // input.concat(new_token_emb.clone());
         let output = qkv
-            .evaluate::<GoldilocksExt2>(&[&new_token_emb.as_wrapped()], &[vec![1, emb_size].into()])
+            .evaluate::<GoldilocksExt2>(&[&new_token_emb.as_wrapped()])
             .unwrap()
             .outputs;
         assert_eq!(output.len(), 3);
@@ -1396,12 +1394,8 @@ mod tests {
 
         // test also evaluation over padded layer
         let mut input = Tensor::<Element>::random(&unpadded_input_shape);
-        let output = evaluate_layer::<GoldilocksExt2, _, _>(
-            &layer,
-            &[&input.as_wrapped()],
-            Some(std::slice::from_ref(&unpadded_input_shape)),
-        )
-        .unwrap();
+        let output =
+            evaluate_layer::<GoldilocksExt2, _, _>(&layer, &[&input.as_wrapped()]).unwrap();
 
         println!("unpadded input shape: {unpadded_input_shape:?}");
         println!("padded input shape: {padded_input_shape:?}");
@@ -1430,12 +1424,8 @@ mod tests {
 
         input.pad_to_shape(padded_input_shape);
         assert_eq!(padded_layer.cache.lock().unwrap().full_seq_len(), 0);
-        let padded_output = evaluate_layer::<GoldilocksExt2, _, _>(
-            &padded_layer,
-            &[&input.as_wrapped()],
-            Some(&[unpadded_input_shape]),
-        )
-        .unwrap();
+        let padded_output =
+            evaluate_layer::<GoldilocksExt2, _, _>(&padded_layer, &[&input.as_wrapped()]).unwrap();
 
         assert!(
             padded_output
@@ -1572,8 +1562,7 @@ mod tests {
             let expected_v = input.matmul(&v).add_dim2(&v_bias);
 
             let layer = QKV::<f32>::new(q, Some(q_bias), k, Some(k_bias), v, Some(v_bias), num_heads,num_heads).unwrap();
-            let input_shape = input.shape().clone();
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[input_shape]).expect("qkv evaluation must be successful");
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()] ).expect("qkv evaluation must be successful");
 
             prop_assert_eq!(expected_q.shape(), &Shape::from(computed.outputs[0].shape()));
             prop_assert_eq!(expected_k.shape(), &Shape::from(computed.outputs[1].shape()));
@@ -1601,8 +1590,7 @@ mod tests {
             let expected_v = input.matmul(&v).add_dim2(&v_bias);
 
             let layer = QKV::<Element>::new(q, Some(q_bias), k, Some(k_bias), v, Some(v_bias), num_heads,num_heads).unwrap();
-            let input_shape = input.shape().clone();
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[input_shape]).expect("qkv evaluation must be successful");
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], ).expect("qkv evaluation must be successful");
 
             prop_assert_eq!(expected_q.shape(), &Shape::from(computed.outputs[0].shape()));
             prop_assert_eq!(expected_k.shape(), &Shape::from(computed.outputs[1].shape()));

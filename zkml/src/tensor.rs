@@ -222,6 +222,7 @@ macro_rules! auto_vec_binop {
 
         Tensor {
             shape: $self.shape.clone(),
+            unpadded_shape: $self.unpadded_shape.clone(),
             data,
         }
     }}
@@ -371,7 +372,6 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) {
 #[derive(Debug, Clone)]
 pub struct ConvFFTData {
     pub input: Tensor<Element>,
-    pub unpadded_input_shape: Shape,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -456,15 +456,17 @@ pub struct DryTensor<T> {
 
     /// The shape of the tensor.
     shape: Shape,
+    unpadded_shape: Shape,
 
     phantom: PhantomData<T>,
 }
 
 impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
-    pub(crate) fn new(k: TensorKey, shape: Shape) -> Self {
+    pub(crate) fn new(k: TensorKey, shape: Shape, unpadded_shape: Shape) -> Self {
         Self {
             k,
             shape,
+            unpadded_shape,
             phantom: PhantomData,
         }
     }
@@ -479,11 +481,16 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
         &self.shape
     }
 
+    /// Return a reference to this dry tensor shape.
+    pub(crate) fn unpadded_shape(&self) -> &Shape {
+        &self.unpadded_shape
+    }
+
     /// Hydrate this dry tensor from `store`, generating a [`Tensor`] from it.
     pub(crate) fn hydrate(&self, mut store: GenStore) -> Result<Tensor<T>, StoreError> {
-        store
-            .fetch(&self.storage_key())
-            .map(|data| Tensor::new(self.shape.clone(), data))
+        store.fetch(&self.storage_key()).map(|data| {
+            Tensor::new_with_unpadded_shape(self.shape.clone(), self.unpadded_shape.clone(), data)
+        })
     }
 
     /// Ensure that the tensor under the key `self.key` exist.
@@ -502,7 +509,11 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
         store.cast(&StorageKey::<Vec<T>>::from(&self.k), |xs| {
             xs.iter().map(&f).collect::<Vec<S>>()
         })?;
-        Ok(DryTensor::<S>::new(self.k.clone(), self.shape.clone()))
+        Ok(DryTensor::<S>::new(
+            self.k.clone(),
+            self.shape.clone(),
+            self.unpadded_shape.clone(),
+        ))
     }
 
     /// Fetch the tensor under the key `self.key`.
@@ -522,7 +533,13 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
             .cast_and_fetch(&StorageKey::<Vec<T>>::from(&self.k), |xs| {
                 xs.iter().map(&f).collect::<Vec<S>>()
             })
-            .map(|bytes| Tensor::new(self.shape.clone(), bytes.1))
+            .map(|bytes| {
+                Tensor::new_with_unpadded_shape(
+                    self.shape.clone(),
+                    self.unpadded_shape.clone(),
+                    bytes.1,
+                )
+            })
     }
 }
 
@@ -533,10 +550,16 @@ pub struct Tensor<T> {
     #[index_mut]
     data: Vec<T>,
     shape: Shape,
+    unpadded_shape: Shape,
 }
 impl<T> Tensor<T> {
     /// Create a new tensor with given shape and data
     pub fn new(shape: Shape, data: Vec<T>) -> Self {
+        Self::new_with_unpadded_shape(shape.clone(), shape, data)
+    }
+
+    /// Create a new tensor with given shape, unpadded shape and data
+    pub fn new_with_unpadded_shape(shape: Shape, unpadded_shape: Shape, data: Vec<T>) -> Self {
         assert!(
             shape.product() == data.len(),
             "Shape does not match data length: shape {:?}->{} vs data.len() {}",
@@ -544,13 +567,21 @@ impl<T> Tensor<T> {
             shape.product(),
             data.len(),
         );
-        Self { data, shape }
+        Self {
+            data,
+            shape,
+            unpadded_shape,
+        }
     }
 
     /// Create a new tensor with the given shapes & data, not ensuring that they
     /// actually match.
     pub fn new_unchecked(shape: Shape, data: Vec<T>) -> Self {
-        Self { data, shape }
+        Self {
+            data,
+            shape: shape.clone(),
+            unpadded_shape: shape,
+        }
     }
 
     /// Return an immutable reference to this tensor data.
@@ -680,6 +711,7 @@ impl<T> Tensor<T> {
         Self {
             data: self.data,
             shape: new_shape,
+            unpadded_shape: self.unpadded_shape,
         }
     }
 
@@ -731,6 +763,10 @@ impl<T> Tensor<T> {
     pub fn shape(&self) -> &Shape {
         assert!(!self.shape.is_empty(), "Empty tensor");
         &self.shape
+    }
+
+    pub fn unpadded_shape(&self) -> &Shape {
+        &self.unpadded_shape
     }
 
     /// Get the dimensions of the tensor
@@ -797,7 +833,11 @@ impl Tensor<Element> {
             .iter()
             .map(|e| s.dequantize(e))
             .collect::<Vec<_>>();
-        Tensor::new(self.shape.clone(), data)
+        Tensor {
+            shape: self.shape.clone(),
+            data,
+            unpadded_shape: self.unpadded_shape.clone(),
+        }
     }
 
     /// Converts this [Tensor<Element>] into [MultilinearExtension].
@@ -895,6 +935,7 @@ impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
         Self {
             data: value.to_field::<F>(),
             shape: value.shape.clone(),
+            unpadded_shape: value.unpadded_shape.clone(),
         }
     }
 }
@@ -902,7 +943,11 @@ impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
 impl Tensor<f32> {
     pub fn to_quantized(&self, s: &ScalingFactor) -> Tensor<Element> {
         let data = self.data.iter().map(|x| s.quantize(x)).collect::<Vec<_>>();
-        Tensor::new(self.shape.clone(), data)
+        Tensor {
+            shape: self.shape.clone(),
+            data,
+            unpadded_shape: self.unpadded_shape.clone(),
+        }
     }
 
     /// Consumes this tensor and creates a [burn::tensor::Tensor].
@@ -918,6 +963,7 @@ impl<T: Clone> Tensor<T> {
         Self {
             data: new_data,
             shape: new_shape.into(),
+            unpadded_shape: self.unpadded_shape.clone(),
         }
     }
     pub fn matrix_from_coeffs(data: Vec<Vec<T>>) -> anyhow::Result<Self> {
@@ -929,8 +975,13 @@ impl<T: Clone> Tensor<T> {
                 "Number of rows and columns do not match with the total number of values in the Vec<Vec<>>"
             );
         };
-        let shape = vec![n_rows, n_cols].into();
-        Ok(Self { data, shape })
+        let shape: Shape = vec![n_rows, n_cols].into();
+
+        Ok(Self {
+            data,
+            shape: shape.clone(),
+            unpadded_shape: shape,
+        })
     }
     /// Returns the boolean iterator indicating the given row in the right endianness to be
     /// evaluated by an MLE
@@ -1021,7 +1072,8 @@ impl<T: Number> Tensor<T> {
     pub fn one(shape: Shape) -> Self {
         Tensor {
             data: vec![T::unit(); shape.numel()],
-            shape,
+            shape: shape.clone(),
+            unpadded_shape: shape,
         }
     }
 
@@ -1085,6 +1137,7 @@ impl<T: Number> Tensor<T> {
         Tensor {
             shape: self.shape.clone(),
             data,
+            unpadded_shape: self.unpadded_shape.clone(),
         }
     }
 
@@ -1107,6 +1160,7 @@ impl<T: Number> Tensor<T> {
         Tensor {
             data,
             shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
         }
     }
 
@@ -1121,6 +1175,7 @@ impl<T: Number> Tensor<T> {
         Tensor {
             data: scaled,
             shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
         }
     }
 
@@ -1320,6 +1375,7 @@ impl<T: Number> Tensor<T> {
         Tensor {
             data: output,
             shape: new_shape,
+            unpadded_shape: self.unpadded_shape.clone(),
         }
     }
 
@@ -1366,6 +1422,7 @@ impl<T: Number> Tensor<T> {
         let padded_maxpool_tensor = Tensor {
             data: padded_maxpool_data,
             shape: self.shape().clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
         };
 
         (maxpool_result, padded_maxpool_tensor)
@@ -1440,7 +1497,8 @@ impl<T: Number> Tensor<T> {
 
         Tensor {
             data: output,
-            shape: shape_out,
+            shape: shape_out.clone(),
+            unpadded_shape: shape_out,
         }
     }
 
@@ -1452,6 +1510,7 @@ impl<T: Number> Tensor<T> {
                 .map(Number::to_f32)
                 .collect::<anyhow::Result<Vec<_>>>()?,
             shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
         })
     }
     /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
@@ -1506,6 +1565,7 @@ impl<T: Number> Tensor<T> {
                 .map(f)
                 .collect::<anyhow::Result<Vec<_>>>()?,
             shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
         })
     }
 
@@ -1517,9 +1577,12 @@ impl<T: Number> Tensor<T> {
         assert!(end <= self.shape[0]);
         let blocks = self.shape[1] * self.shape[2];
         let sliced = self.data[blocks * start..blocks * end].to_vec();
+        let shape: Shape = vec![end - start, self.shape[1], self.shape[2]].into();
+
         Self {
             data: sliced,
-            shape: vec![end - start, self.shape[1], self.shape[2]].into(),
+            shape: shape.clone(),
+            unpadded_shape: shape,
         }
     }
 
@@ -1531,10 +1594,11 @@ impl<T: Number> Tensor<T> {
         assert!(self.shape.len() == 2);
         let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
         let data = self.data[range].to_vec();
-        let new_shape = vec![dim2_end - dim2_start, self.shape[1]];
+        let new_shape: Shape = vec![dim2_end - dim2_start, self.shape[1]].into();
         Self {
             data,
-            shape: new_shape.into(),
+            shape: new_shape.clone(),
+            unpadded_shape: new_shape,
         }
     }
 
@@ -1546,6 +1610,7 @@ impl<T: Number> Tensor<T> {
         data.prop_map(move |data| Self {
             data,
             shape: shape.clone(),
+            unpadded_shape: shape.clone(),
         })
     }
 
@@ -1561,9 +1626,11 @@ impl<T: Number> Tensor<T> {
         let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
         let size = shape.product();
         let data = (0..size).map(|_| T::random(&mut rng)).collect();
+
         Self {
             data,
             shape: shape.clone(),
+            unpadded_shape: shape.clone(),
         }
     }
 }
@@ -1692,8 +1759,11 @@ where
                 }
             })
             .collect();
-
-        Tensor::new(mat_shp_pad.to_vec().into(), new_data)
+        Tensor::new_with_unpadded_shape(
+            mat_shp_pad.to_vec().into(),
+            self.unpadded_shape.clone(),
+            new_data,
+        )
     }
 }
 
@@ -1863,6 +1933,7 @@ impl<T: Default + Clone + Copy> Tensor<T> {
         Self {
             data,
             shape: new_shape,
+            unpadded_shape: self.unpadded_shape.clone(),
         }
     }
 }
@@ -1872,7 +1943,8 @@ impl<T: Copy> Tensor<T> {
     pub fn initialised(shape: Shape, default: T) -> Self {
         Tensor {
             data: vec![default; shape.numel()],
-            shape,
+            shape: shape.clone(),
+            unpadded_shape: shape,
         }
     }
 }
@@ -1947,6 +2019,7 @@ impl<T: Copy + Default> Tensor<T> {
         let mut new_tensor = Tensor {
             data: new_data,
             shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
         };
         new_tensor.pad_to_shape(new_shape);
 
@@ -2112,6 +2185,7 @@ impl<T: Default> Tensor<T> {
         Tensor {
             data: self.data.iter().map(f).collect(),
             shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
         }
     }
 
@@ -3381,6 +3455,7 @@ mod test {
                 Tensor {
                     data,
                     shape: Shape::new(vec![new_a, new_b, new_c]),
+                    unpadded_shape: Shape::new(vec![new_a, new_b, new_c]),
                 }
             }
 

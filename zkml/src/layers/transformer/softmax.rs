@@ -493,7 +493,6 @@ impl Evaluate<f32> for Softmax<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(
             inputs.len() == 1,
@@ -539,7 +538,6 @@ impl Evaluate<Element> for Softmax<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         // First we check that we have some quantisation info.
         ensure!(
@@ -568,13 +566,15 @@ impl Evaluate<Element> for Softmax<Element> {
             "Expected input to quantised softmax to have rank 2 or 3, got: {input_rank}",
         );
 
+        let unpadded_input_shape: Shape = inputs[0].unpadded_shape().clone().into();
+
         let (input, unpadded_input_shape) = if input_rank == 2 {
             (
                 inputs[0].clone().unsqueeze_dim_3(),
-                unpadded_input_shapes[0].insert(0, 1),
+                unpadded_input_shape.insert(0, 1),
             )
         } else {
-            (inputs[0].clone(), unpadded_input_shapes[0].clone())
+            (inputs[0].clone(), inputs[0].unpadded_shape().clone().into())
         };
 
         let shift_shape = Shape::new(vec![unpadded_input_shape[0], input.shape().dims[1], 1]);
@@ -1980,17 +1980,11 @@ mod tests {
 
             // Obtain the quantised output
             let quant_output = quant_softmax
-                .evaluate::<GoldilocksExt2>(
-                    &[&test_qk_quant.as_wrapped()],
-                    &[vec![num_tokens, num_tokens].into()],
-                )
+                .evaluate::<GoldilocksExt2>(&[&test_qk_quant.as_wrapped()])
                 .unwrap();
             // The result of running the quantised input as floats
             let dequant_output = softmax
-                .evaluate::<GoldilocksExt2>(
-                    &[&test_qk_dequant.as_wrapped()],
-                    &[vec![num_tokens, num_tokens].into()],
-                )
+                .evaluate::<GoldilocksExt2>(&[&test_qk_dequant.as_wrapped()])
                 .unwrap();
 
             let QuantisedSoftmaxData {
@@ -2042,7 +2036,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
         let output = softmax
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[vec![1, 3, 3].into()])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .unwrap();
         assert_eq!(output.outputs[0].shape(), vec![1_usize, 3, 3].into());
 
@@ -2102,8 +2096,9 @@ mod tests {
         fn prop_softmax_f32(input in any_softmax_input(-4.0..4.0)) {
             let SoftmaxInput { n, data } = input;
             let tensor = Tensor::new(vec![1, n, n].into(), data.clone());
+
             let layer = Softmax::<f32>::new(n);
-            let eval = layer.evaluate::<GoldilocksExt2>(&[&tensor.as_wrapped()], &[vec![1,n,n].into()]).unwrap();
+                let eval = layer.evaluate::<GoldilocksExt2>(&[&tensor.as_wrapped()]).unwrap();
             let got = eval.outputs[0].get_data();
 
             for row in got.chunks(n) { prop_assert!(((row.iter().sum::<f32>() - 1.0).abs()) < 1e-4 * n as f32 + 1e-6); }
@@ -2119,7 +2114,7 @@ mod tests {
             let layer_f = Softmax::<f32>::new(n);
             let layer_q = layer_f.quantise(scaling, *quantization::BIT_LEN).unwrap();
 
-            let out_q = layer_q.evaluate::<GoldilocksExt2>(&[&quant_input.as_wrapped()], &[vec![1,n,n].into()]).unwrap();
+            let out_q = layer_q.evaluate::<GoldilocksExt2>(&[&quant_input.as_wrapped()]).unwrap();
 
             let quant_rows = out_q.outputs[0].get_data();
             let qi = layer_q.quant_info().unwrap();

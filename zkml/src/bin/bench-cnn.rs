@@ -320,7 +320,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         let metrics = Metrics::new();
         let input_tensor = model.load_input_flat(vec![input])?;
 
-        let trace_result = model.run(&input_tensor, None, &mut GenStore::default());
+        let trace_result = model.run(&input_tensor, &mut GenStore::default());
 
         let span = metrics.to_span();
         stream_metrics(format!("Inference {i}"), &span);

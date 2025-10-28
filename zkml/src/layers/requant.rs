@@ -149,7 +149,6 @@ impl Evaluate<Element> for Requant {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        _unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         let max_abs_val: Element = 1 << self.intermediate_bit_size;
         let rounding: Element = 1 << (self.shift() - 1);
@@ -168,9 +167,12 @@ impl Evaluate<Element> for Requant {
                 .mul_scalar(self.fixed_point_multiplier)
                 .add_scalar(rounding)
                 .bitwise_right_shift_scalar(shift);
-            let clamped = unclamped
+            let mut clamped = unclamped
                 .clamp_max(*quantization::MAX)
                 .clamp_min(*quantization::MIN);
+
+            clamped.set_unpadded_shape(input.unpadded_shape().clone());
+
             result.push(clamped);
         }
 
@@ -1095,8 +1097,6 @@ impl<E: ExtensionField> RequantCtx<E> {
 
 #[cfg(test)]
 mod tests {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
 
@@ -1174,9 +1174,8 @@ mod tests {
             tensor in input()
         ) {
             let layer = Requant::from_multiplier(2.0, 8);
-            let input_sizes = slice::from_ref(tensor.shape());
             let wtensor = tensor.as_wrapped();
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&wtensor], input_sizes).unwrap().outputs;
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&wtensor]).unwrap().outputs;
             let expected = requant_reference(&layer, &[&tensor]);
 
             prop_assert_eq!(&expected, &computed.into_iter().map(|t| t.to_native()).collect::<Vec<_>>());

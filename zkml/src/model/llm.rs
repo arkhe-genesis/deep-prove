@@ -189,12 +189,9 @@ impl Driver<f32> {
             .collect::<Vec<_>>();
 
         let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone());
-        let shape = tensor.shape().clone();
         let mut store = GenStore::default();
 
-        let trace = self
-            .model
-            .run::<E>(&[tensor], Some(vec![shape]), &mut store)?;
+        let trace = self.model.run::<E>(&[tensor], &mut store)?;
 
         if let Some(ref obs) = observer {
             obs.observe(0, &trace);
@@ -280,17 +277,12 @@ where
             let trace = if let PaddingMode::NoPadding = self.padding_mode {
                 self.model
                     // TODO: make it re-usable at least for the static weights
-                    .run::<E>(
-                        &[tensor.clone()],
-                        Some(vec![tensor.shape().clone()]),
-                        &mut store,
-                    )
+                    .run::<E>(&[tensor.clone()], &mut store)
             } else {
                 let unpadded_shape = tensor.shape().clone();
                 let padded = tensor.pad_next_power_of_two();
                 info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
-                self.model
-                    .run::<E>(&[padded], Some(vec![unpadded_shape]), &mut store)
+                self.model.run::<E>(&[padded], &mut store)
             }
             .context(format!(
                 "runng the {} iteration loop",
@@ -338,11 +330,7 @@ where
         info!("Running last iteration (heavy) with {input_len} tokens");
 
         let mut store = GenStore::default();
-        let trace = self.model.run::<E>(
-            &[tensor],
-            Some(vec![Shape::new(vec![input_len])]),
-            &mut store,
-        )?;
+        let trace = self.model.run::<E>(&[tensor], &mut store)?;
         for i in user_len..input_len {
             assert_eq!(
                 trace.outputs().unwrap()[0].get_data()[i - 1],

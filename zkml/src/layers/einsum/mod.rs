@@ -170,12 +170,8 @@ impl<N> Evaluate<N> for EinSum<N>
 where
     N: TensorTypeParam,
 {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<N>],
-        unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<N, E>> {
-        let outputs = self.evaluate_internal(inputs, unpadded_input_shapes)?;
+    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<N>]) -> Result<LayerOut<N, E>> {
+        let outputs = self.evaluate_internal(inputs)?;
         Ok(LayerOut::from_vec(outputs))
     }
 }

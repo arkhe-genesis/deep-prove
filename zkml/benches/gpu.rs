@@ -17,8 +17,6 @@ fn sizes(range: Range<i32>) -> impl Iterator<Item = Args> {
 
 #[divan::bench_group]
 mod add_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         ScalingFactor, Shape, Tensor,
@@ -45,8 +43,6 @@ mod add_layer {
         let result_scaling = ScalingFactor::from_tensor(&result, None);
 
         let input = WrappedTensor::try_from(&input.to_quantized(&input_scaling)).unwrap();
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = layer
             .quantize(&[operand_scaling, input_scaling], result_scaling)
@@ -55,7 +51,7 @@ mod add_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Add should succeed")
         });
     }
@@ -67,8 +63,6 @@ mod add_layer {
         let operand = Tensor::<f32>::random(&shape);
 
         let input = WrappedTensor::<f32>::random(&shape);
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Add::<f32>::new_with(
             KeyedTensor::new("add_operand", operand.clone()),
@@ -77,7 +71,7 @@ mod add_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Add should succeed")
         });
     }
@@ -85,8 +79,6 @@ mod add_layer {
 
 #[divan::bench_group]
 mod dense_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape, Tensor,
@@ -103,8 +95,6 @@ mod dense_layer {
         let bias = Tensor::<Element>::random(&Shape::new(vec![size]));
 
         let input = WrappedTensor::<Element>::random(&Shape::new(vec![size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Dense::<Element>::new(
             KeyedTensor::new("dense_weight", matrix.clone()),
@@ -113,7 +103,7 @@ mod dense_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Dense should succeed")
         });
     }
@@ -125,8 +115,6 @@ mod dense_layer {
         let bias = Tensor::<f32>::random(&Shape::new(vec![size]));
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Dense::<f32>::new(
             KeyedTensor::new("dense_weight", matrix.clone()),
@@ -135,7 +123,7 @@ mod dense_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Dense should succeed")
         });
     }
@@ -143,7 +131,6 @@ mod dense_layer {
 
 #[divan::bench_group]
 mod convolution_layer {
-    use core::slice;
     use std::ops::Range;
 
     use ff_ext::GoldilocksExt2;
@@ -182,8 +169,6 @@ mod convolution_layer {
 
         let input =
             WrappedTensor::<Element>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Convolution::<Element>::new(
             KeyedTensor::new("conv_filter", kernels.clone()),
@@ -193,7 +178,7 @@ mod convolution_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Convolution should succeed")
         });
     }
@@ -205,8 +190,6 @@ mod convolution_layer {
         let bias = Tensor::<f32>::random(&Shape::new(vec![BATCHES]));
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![BATCHES, CHANNELS, size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Convolution::<f32>::new(
             KeyedTensor::new("conv_filter", kernels.clone()),
@@ -215,7 +198,7 @@ mod convolution_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Convolution should succeed")
         });
     }
@@ -223,8 +206,6 @@ mod convolution_layer {
 
 #[divan::bench_group]
 mod embeddings_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
@@ -248,14 +229,12 @@ mod embeddings_layer {
         );
 
         let input = WrappedTensor::try_from(&input.to_quantized(&scaling)).unwrap();
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer =
             Embeddings::<Element>::new(KeyedTensor::new("embedding_matrix", emb.clone())).unwrap();
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Embeddings should succeed")
         });
     }
@@ -266,14 +245,12 @@ mod embeddings_layer {
         let emb = Tensor::<f32>::random(&Shape::new(vec![size, size]));
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer =
             Embeddings::<f32>::new(KeyedTensor::new("embeddings_matrix", emb.clone())).unwrap();
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Embeddings should succeed")
         });
     }
@@ -281,7 +258,6 @@ mod embeddings_layer {
 
 #[divan::bench_group]
 mod flatten_layer {
-    use core::slice;
     use std::ops::{Range, RangeInclusive};
 
     use ff_ext::GoldilocksExt2;
@@ -310,12 +286,10 @@ mod flatten_layer {
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<Element>::random(&Shape::new([size].repeat(args.rank)));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
         let layer = Flatten;
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Flatten should succeed")
         });
     }
@@ -324,12 +298,10 @@ mod flatten_layer {
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<f32>::random(&Shape::new([size].repeat(args.rank)));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
         let layer = Flatten;
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Flatten should succeed")
         });
     }
@@ -337,8 +309,6 @@ mod flatten_layer {
 
 #[divan::bench_group]
 mod gelu_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Shape,
@@ -352,12 +322,10 @@ mod gelu_layer {
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
         let layer = GELU::<f32>::new();
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("GeLU should succeed")
         });
     }
@@ -370,7 +338,7 @@ mod matmul_layer {
 
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        Element, Shape, Tensor,
+        Element, Tensor,
         layers::{
             matrix_mul::{self, MatMul},
             provable::Evaluate,
@@ -405,10 +373,7 @@ mod matmul_layer {
         .unwrap();
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[Shape::from(left.shape()), Shape::from(right.shape())],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("MatMul should succeed")
         });
     }
@@ -431,10 +396,7 @@ mod matmul_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[Shape::from(left.shape()), Shape::from(right.shape())],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("MatMul should succeed")
         });
     }
@@ -480,10 +442,7 @@ mod concat_matmul_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[Shape::from(left.shape()), Shape::from(right.shape())],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("ConcatMatMul should succeed")
         });
     }
@@ -507,10 +466,7 @@ mod concat_matmul_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[Shape::from(left.shape()), Shape::from(right.shape())],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("ConcantMatMul should succeed")
         });
     }
@@ -518,7 +474,6 @@ mod concat_matmul_layer {
 
 #[divan::bench_group]
 mod qkv_layer {
-    use core::slice;
     use std::ops::Range;
 
     use ff_ext::GoldilocksExt2;
@@ -553,8 +508,6 @@ mod qkv_layer {
         let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
 
         let input = WrappedTensor::<Element>::random(&Shape::new(vec![size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         bencher
             .with_inputs(|| {
@@ -573,7 +526,7 @@ mod qkv_layer {
             })
             .bench_refs(|layer| {
                 layer
-                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("QKV should succeed");
             });
     }
@@ -594,8 +547,6 @@ mod qkv_layer {
         let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = QKV::<f32>::new(
             q,
@@ -611,7 +562,7 @@ mod qkv_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("QKV should succeed")
         });
     }
@@ -619,8 +570,6 @@ mod qkv_layer {
 
 #[divan::bench_group]
 mod logits_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape,
@@ -637,14 +586,12 @@ mod logits_layer {
         let shape = Shape::new(vec![rows, cols]);
 
         let input = WrappedTensor::<Element>::random(&shape);
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Logits should succeed")
         });
     }
@@ -656,13 +603,11 @@ mod logits_layer {
         let shape = Shape::new(vec![rows, cols]);
 
         let input = WrappedTensor::<f32>::random(&shape);
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Logits should succeed")
         });
     }
@@ -685,14 +630,12 @@ mod logits_layer {
         let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
 
         let input = WrappedTensor::<Element>::random(&shape);
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Logits high rank should succeed")
         });
     }
@@ -702,13 +645,11 @@ mod logits_layer {
         let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
 
         let input = WrappedTensor::<f32>::random(&shape);
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Logits::Argmax;
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Logits high rank should succeed")
         });
     }
@@ -716,7 +657,6 @@ mod logits_layer {
 
 #[divan::bench_group]
 mod norm_layer {
-    use core::slice;
     use std::ops::Range;
 
     use ff_ext::GoldilocksExt2;
@@ -760,7 +700,6 @@ mod norm_layer {
         let layer = LayerNorm::<Element>::new(gamma, beta, EPS);
 
         let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
-        let input_shape = slice::from_ref(input.shape());
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let input = WrappedTensor::try_from(&input).unwrap();
@@ -768,7 +707,7 @@ mod norm_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Norm should succeed")
         });
     }
@@ -779,8 +718,6 @@ mod norm_layer {
         let dim1 = 1 << args.dim1_pow2;
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let gamma = KeyedTensor::new(
             "layernorm_gamma",
@@ -794,7 +731,7 @@ mod norm_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Norm should succeed")
         });
     }
@@ -802,7 +739,6 @@ mod norm_layer {
 
 #[divan::bench_group]
 mod positional_absolute_layer {
-    use core::slice;
     use ff_ext::GoldilocksExt2;
     use zkml::{
         ScalingFactor, Shape, Tensor,
@@ -828,8 +764,6 @@ mod positional_absolute_layer {
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
         let input = WrappedTensor::try_from(&input_f32.to_quantized(&input_scaling)).unwrap();
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         bencher
             .with_inputs(|| {
@@ -845,7 +779,7 @@ mod positional_absolute_layer {
             })
             .bench_refs(|layer| {
                 layer
-                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional absolute should succeed");
             });
     }
@@ -860,13 +794,11 @@ mod positional_absolute_layer {
         );
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
         bencher
             .with_inputs(|| Positional::<f32>::new_absolute(pos.clone()))
             .bench_refs(|layer| {
                 layer
-                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional absolute should succeed");
             });
     }
@@ -874,7 +806,6 @@ mod positional_absolute_layer {
 
 #[divan::bench_group]
 mod positional_rope_layer {
-    use core::slice;
     use ff_ext::GoldilocksExt2;
     use std::f32::consts::PI;
     use zkml::{
@@ -900,8 +831,6 @@ mod positional_rope_layer {
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
         let input = WrappedTensor::try_from(&input_f32.to_quantized(&input_scaling)).unwrap();
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let num_angles = size / 2;
         let angles: Vec<f32> = (0..num_angles)
@@ -920,14 +849,14 @@ mod positional_rope_layer {
                     &(),
                     0usize.into(),
                     &[input_scaling],
-                    input_shape,
+                    &[Shape::new(vec![context, size])],
                 )
                 .expect("quantize positional rope should succeed")
                 .quantized_op
             })
             .bench_refs(|layer| {
                 layer
-                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional rope should succeed");
             });
     }
@@ -945,8 +874,6 @@ mod positional_rope_layer {
             .collect();
 
         let input = WrappedTensor::random(&Shape::new(vec![size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
         bencher
             .with_inputs(|| {
                 Positional::<f32>::new_rope(
@@ -958,7 +885,7 @@ mod positional_rope_layer {
             })
             .bench_refs(|layer| {
                 layer
-                    .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                    .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional rope should succeed");
             });
     }
@@ -966,7 +893,6 @@ mod positional_rope_layer {
 
 #[divan::bench_group]
 mod permute_layer {
-    use core::slice;
     use std::ops::Range;
 
     use ff_ext::GoldilocksExt2;
@@ -987,14 +913,12 @@ mod permute_layer {
         let shape = Shape::new(vec![size, size, size]);
 
         let input = WrappedTensor::<Element>::random(&shape);
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Permute::new(vec![2, 1, 0]);
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Permute should succeed")
         });
     }
@@ -1005,13 +929,11 @@ mod permute_layer {
         let shape = Shape::new(vec![size, size, size]);
 
         let input = WrappedTensor::<f32>::random(&shape);
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Permute::new(vec![2, 1, 0]);
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Permute should succeed")
         });
     }
@@ -1019,8 +941,6 @@ mod permute_layer {
 
 #[divan::bench_group]
 mod softmax_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
@@ -1036,7 +956,6 @@ mod softmax_layer {
         let size = 1 << args.pow2;
 
         let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
-        let input_shape = slice::from_ref(input.shape());
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let input = WrappedTensor::try_from(&input).unwrap();
@@ -1046,7 +965,7 @@ mod softmax_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Softmax should succeed")
         });
     }
@@ -1056,14 +975,12 @@ mod softmax_layer {
         let size = 1 << args.pow2;
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Softmax::new(size);
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Softmax should succeed")
         });
     }
@@ -1071,8 +988,6 @@ mod softmax_layer {
 
 #[divan::bench_group]
 mod requant_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape,
@@ -1086,14 +1001,12 @@ mod requant_layer {
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<Element>::random(&Shape::new(vec![size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Requant::from_multiplier(2.0, 8);
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Requant should succeed")
         });
     }
@@ -1101,8 +1014,6 @@ mod requant_layer {
 
 #[divan::bench_group]
 mod pooling_layer {
-    use core::slice;
-
     use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape,
@@ -1120,8 +1031,6 @@ mod pooling_layer {
         let size = 1 << args.pow2;
 
         let input = WrappedTensor::<Element>::random(&Shape::new(vec![size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Pooling::Maxpool2D(Maxpool2D {
             kernel_size: MAXPOOL2D_KERNEL_SIZE,
@@ -1130,7 +1039,7 @@ mod pooling_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Softmax should succeed")
         });
     }
@@ -1140,8 +1049,6 @@ mod pooling_layer {
         let size = 1 << args.pow2;
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
-        let input_shape = Shape::from(input.shape());
-        let input_shape = slice::from_ref(&input_shape);
 
         let layer = Pooling::Maxpool2D(Maxpool2D {
             kernel_size: MAXPOOL2D_KERNEL_SIZE,
@@ -1150,7 +1057,7 @@ mod pooling_layer {
 
         bencher.bench(|| {
             layer
-                .evaluate::<GoldilocksExt2>(&[&input], input_shape)
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("Softmax should succeed")
         });
     }
@@ -1198,7 +1105,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&input], &[Shape::new(vec![size, size])])
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("EinSum should succeed")
         });
     }
@@ -1228,7 +1135,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&input], &[Shape::new(vec![size, size])])
+                .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("EinSum should succeed")
         });
     }
@@ -1247,7 +1154,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right], &[shape.clone(), shape.clone()])
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("EinSum should succeed")
         });
     }
@@ -1266,7 +1173,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right], &[shape.clone(), shape.clone()])
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("EinSum should succeed")
         });
     }
@@ -1287,10 +1194,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[Shape::new(vec![size, size]), Shape::new(vec![size, size])],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("EinSum should succeed")
         });
     }
@@ -1311,10 +1215,7 @@ mod einsum_layer {
 
         bencher.bench(|| {
             einsum_layer
-                .evaluate::<GoldilocksExt2>(
-                    &[&left, &right],
-                    &[Shape::new(vec![size, size]), Shape::new(vec![size, size])],
-                )
+                .evaluate::<GoldilocksExt2>(&[&left, &right])
                 .expect("EinSum should succeed")
         });
     }

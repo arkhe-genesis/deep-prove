@@ -43,8 +43,6 @@ pub const DENSE_LAYER: &str = "DENS";
 pub struct Dense<T> {
     pub matrix: KeyedTensor<T>,
     pub bias: Option<KeyedTensor<T>>,
-    // set to matrix shape if the matrix is not padded
-    pub unpadded_matrix_shape: Shape,
 }
 
 /// Information stored in the context (setup phase) for this layer.
@@ -91,12 +89,7 @@ impl<T: TensorTypeParam> Dense<T> {
         if let Some(ref bbias) = bias {
             assert_eq!(matrix.nrows_2d(), bbias.shape()[0]);
         }
-        let unpadded_matrix_shape = matrix.shape().clone();
-        Self {
-            matrix,
-            bias,
-            unpadded_matrix_shape,
-        }
+        Self { matrix, bias }
     }
     pub fn ncols(&self) -> usize {
         self.matrix.ncols_2d()
@@ -110,17 +103,13 @@ impl<T: TensorTypeParam> Dense<T> {
         let bias = self
             .bias
             .map(|b| b.map_tensor(|t| t.pad_1d(matrix.nrows_2d())));
-        Self {
-            matrix,
-            bias,
-            unpadded_matrix_shape: self.unpadded_matrix_shape,
-        }
+        Self { matrix, bias }
     }
 
     pub fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
         let matrix_shape = match padding_mode {
-            PaddingMode::NoPadding => self.unpadded_matrix_shape.clone(),
-            PaddingMode::Padding => self.unpadded_matrix_shape.next_power_of_two(),
+            PaddingMode::NoPadding => self.matrix.unpadded_shape().clone(),
+            PaddingMode::Padding => self.matrix.unpadded_shape().clone().next_power_of_two(),
         };
         output_shape(input_shape, &matrix_shape)
     }
@@ -171,11 +160,7 @@ where
     T: TensorTypeParam,
     WrappedTensor<T>: WrappedModuleFn,
 {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<T>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<T, E>> {
+    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T, E>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating dense layer"
@@ -208,7 +193,7 @@ impl ProveInfo for Dense<Element> {
 
         let dense_info = LayerCtx::Dense(DenseCtx {
             node_id: id,
-            unpadded_matrix_shape: self.unpadded_matrix_shape.clone(),
+            unpadded_matrix_shape: self.matrix.unpadded_shape().clone(),
             padded_matrix_shape: self.matrix.shape().clone(),
             matrix_key: self.matrix.key(),
             bias_key: self.bias.as_ref().map(|b| b.key()),
@@ -388,19 +373,13 @@ impl Dense<f32> {
     pub fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Dense<Element> {
         let matrix = self.matrix.quantize(s);
         let bias = self.bias.map(|b| b.quantize(bias_s));
-        Dense::<Element> {
-            matrix,
-            bias,
-            unpadded_matrix_shape: self.unpadded_matrix_shape,
-        }
+        Dense::<Element> { matrix, bias }
     }
 
     pub fn new_from_weights(weights: KeyedTensor<f32>, bias: Option<KeyedTensor<f32>>) -> Self {
-        let unpadded_matrix_shape = weights.shape().clone();
         Self {
             matrix: weights,
             bias,
-            unpadded_matrix_shape,
         }
     }
 
@@ -881,12 +860,12 @@ mod test {
         let input_tensor = Tensor::<Element>::new(vec![3].into(), quantized_input).into_wrapped();
 
         // Apply the dense operation on both original and padded
-        let output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&input_tensor], None)
+        let output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&input_tensor])
             .unwrap()
             .outputs()[0]
             .clone();
         let padded_output =
-            evaluate_layer::<GoldilocksExt2, _, _>(&padded, &[&input_tensor.pad_1d(4)], None)
+            evaluate_layer::<GoldilocksExt2, _, _>(&padded, &[&input_tensor.pad_1d(4)])
                 .unwrap()
                 .outputs()[0]
                 .clone();
@@ -924,7 +903,7 @@ mod test {
 
             let dense = Dense::<Element>::new(matrix.clone(), bias.clone());
             let input = input.into_wrapped();
-            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("Dense evaluation must be successful");
+            let computed = dense.evaluate::<GoldilocksExt2>(&[&input]).expect("Dense evaluation must be successful");
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
@@ -937,7 +916,7 @@ mod test {
 
             let dense = Dense::<f32>::new(matrix.clone(), bias.clone());
             let input = input.into_wrapped();
-            let computed = dense.evaluate::<GoldilocksExt2>(&[&input], &[]).expect("Dense evaluation must be successful");
+            let computed = dense.evaluate::<GoldilocksExt2>(&[&input]).expect("Dense evaluation must be successful");
 
             for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
                 prop_assert!(

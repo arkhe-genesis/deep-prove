@@ -254,7 +254,6 @@ impl<N: TensorTypeParam> Mha<N> {
     pub(crate) fn evaluate_with_intermediate_outputs<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<N>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<(
         LayerOut<N, E>,
         LayerOut<N, E>,
@@ -266,70 +265,68 @@ impl<N: TensorTypeParam> Mha<N> {
         Softmax<N>: Evaluate<N>,
         AttentionMask<N>: Evaluate<N>,
     {
-        let unpadded_input_shapes = if unpadded_input_shapes.is_empty() {
-            // take input shapes from inputs
-            inputs
-                .iter()
-                .map(|input| Shape::from(input.shape().clone()))
-                .collect::<Vec<_>>()
-        } else {
-            unpadded_input_shapes.to_vec()
-        };
-
         ensure!(
             inputs.len() == 3,
             "MHA layer expects 3 inputs, found {}",
             inputs.len()
         );
 
+        let unpadded_input_shapes: Vec<_> = inputs
+            .iter()
+            .map(|input| input.unpadded_shape().clone().into())
+            .collect();
+
         let reshaped_input_shapes = self
             .inputs_reshape
             .output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding);
 
-        let reshaped_inputs = self
-            .inputs_reshape
-            .evaluate::<E>(inputs, &unpadded_input_shapes)?;
-
+        let reshaped_inputs = self.inputs_reshape.evaluate::<E>(inputs)?;
         let qk_out_shapes = self
             .qk
             .output_shapes(&reshaped_input_shapes, PaddingMode::NoPadding);
 
-        let qk_out = self
-            .qk
-            .evaluate::<E>(&reshaped_inputs.outputs()[..2], &reshaped_input_shapes[..2])?;
+        let qk_out = self.qk.evaluate::<E>(&reshaped_inputs.outputs()[..2])?;
+
+        let qk_outputs: Vec<_> = qk_out
+            .outputs()
+            .iter()
+            .zip(qk_out_shapes.iter())
+            .map(|(&f, shape)| {
+                let mut f = f.clone();
+                f.set_unpadded_shape(shape.clone().into());
+                f
+            })
+            .collect();
+
+        let qk_outputs_refs: Vec<_> = qk_outputs.iter().collect();
 
         // Apply the mask
-        let qk_outputs: Vec<_> = qk_out.outputs();
-        let mask_out = self.mask.evaluate::<E>(&qk_outputs, &qk_out_shapes)?;
+        let mask_out = self.mask.evaluate::<E>(&qk_outputs_refs)?;
 
-        // apply softmax
-        let soft_out_shapes = self
-            .softmax
-            .output_shapes(&qk_out_shapes, PaddingMode::NoPadding);
+        let mask_outputs_refs = mask_out.outputs();
 
-        let mask_outputs: Vec<_> = mask_out.outputs();
-        let soft_out = self.softmax.evaluate::<E>(&mask_outputs, &qk_out_shapes)?;
+        let soft_out = self.softmax.evaluate::<E>(&mask_outputs_refs)?;
 
         ensure!(
             soft_out.outputs().len() == 1,
             "Softmax should return one output"
         );
+        // apply softmax
+        let soft_out_shapes = self
+            .softmax
+            .output_shapes(&qk_out_shapes, PaddingMode::NoPadding);
 
-        let final_mul_input_shapes =
-            vec![soft_out_shapes[0].clone(), reshaped_input_shapes[2].clone()];
+        let final_mul_input_shapes = [soft_out_shapes[0].clone(), reshaped_input_shapes[2].clone()];
 
-        let out_shapes = self
-            .final_mul
-            .output_shapes(&final_mul_input_shapes, PaddingMode::NoPadding);
+        let mut sf = soft_out.outputs()[0].clone();
+        let mut ri = reshaped_inputs.outputs()[2].clone();
 
-        let final_mul_out = self.final_mul.evaluate::<E>(
-            &[soft_out.outputs()[0], reshaped_inputs.outputs()[2]],
-            &final_mul_input_shapes,
-        )?;
+        sf.set_unpadded_shape(final_mul_input_shapes[0].clone().into());
+        ri.set_unpadded_shape(final_mul_input_shapes[0].clone().into());
 
-        let out = self
-            .final_reshape
-            .evaluate(&final_mul_out.outputs(), &out_shapes)?;
+        let final_mul_out = self.final_mul.evaluate::<E>(&[&sf, &ri])?;
+
+        let out = self.final_reshape.evaluate(&final_mul_out.outputs())?;
 
         Ok((out, final_mul_out, mask_out, soft_out, qk_out))
     }
@@ -366,10 +363,8 @@ impl Evaluate<f32> for Mha<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<f32, E>> {
-        let (out, _, _, _, _) =
-            self.evaluate_with_intermediate_outputs(inputs, unpadded_input_shapes)?;
+        let (out, _, _, _, _) = self.evaluate_with_intermediate_outputs(inputs)?;
 
         Ok(out)
     }
@@ -379,10 +374,9 @@ impl Evaluate<Element> for Mha<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<Element, E>> {
         let (out, final_mul_out, mask_out, soft_out, qk_out) =
-            self.evaluate_with_intermediate_outputs(inputs, unpadded_input_shapes)?;
+            self.evaluate_with_intermediate_outputs(inputs)?;
 
         let LayerOut {
             outputs,
@@ -752,14 +746,9 @@ where
         );
 
         // apply reshaping to input and output tensors before employing them in proving logic
-        let reshaped_inputs = self.inputs_reshape.evaluate_original::<E, E>(
-            &input_tensors.iter().collect_vec(),
-            input_tensors
-                .iter()
-                .map(|input| input.shape().clone())
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )?;
+        let reshaped_inputs = self
+            .inputs_reshape
+            .evaluate_original::<E, E>(&input_tensors.iter().collect_vec())?;
 
         let reshaped_input_shapes = self
             .inputs_reshape
@@ -1140,7 +1129,7 @@ mod test {
             let q = Tensor::<Element>::random(&vec![q_len, num_heads, head_dim].into());
             let k = Tensor::<Element>::random(&vec![seq_len, num_heads, head_dim].into());
             let mut output = mha_qk
-                .evaluate::<GoldilocksExt2>(&[&q.as_wrapped(), &k.as_wrapped()], &[])
+                .evaluate::<GoldilocksExt2>(&[&q.as_wrapped(), &k.as_wrapped()])
                 .unwrap();
             assert_eq!(output.outputs.len(), 1);
             let qk = output.outputs.remove(0);
@@ -1180,10 +1169,7 @@ mod test {
                 .unwrap()
                 .final_mul;
             let mut output = mha_mul
-                .evaluate::<GoldilocksExt2>(
-                    &[&qk.as_wrapped(), &v.as_wrapped()],
-                    &[qk.shape().clone(), v.shape().clone()],
-                )
+                .evaluate::<GoldilocksExt2>(&[&qk.as_wrapped(), &v.as_wrapped()])
                 .expect("mha_final_mul should not fail");
             assert_eq!(output.outputs.len(), 1);
             let out = output.outputs.remove(0);
@@ -1421,6 +1407,7 @@ mod test {
 
     #[test]
     fn test_proven_mha() {
+        init_test_logging("info");
         let num_heads = 5;
         let head_dim = 7;
         let seq_len = 10;
@@ -1497,7 +1484,7 @@ mod test {
         // need to clone the model as subsequent calls expect seq_len = 1 due to caching
         // and the trace keeps an immutable reference so the cloned model lifetime still needs to be active
         let trace = quantized_model
-            .run::<GoldilocksExt2>(&quantized_input, None, &mut GenStore::default())
+            .run::<GoldilocksExt2>(&quantized_input, &mut GenStore::default())
             .unwrap();
         let outputs = trace.outputs().unwrap();
 
@@ -1636,11 +1623,10 @@ mod test {
         );
         let embedded = llm_model
             .embeddings
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])?;
-        let positioned = llm_model.positional.evaluate::<GoldilocksExt2>(
-            &[embedded.outputs()[0]],
-            &[Shape::from(embedded.outputs()[0].shape())],
-        )?;
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
+        let positioned = llm_model
+            .positional
+            .evaluate::<GoldilocksExt2>(&[embedded.outputs()[0]])?;
 
         let input_shape = positioned.outputs()[0].shape();
 
@@ -1687,6 +1673,7 @@ mod test {
 
     #[test]
     fn test_mha_padding() {
+        init_test_logging("info");
         let seq_len = 12;
         let num_heads = 5;
         let head_dim = 6;
@@ -1726,7 +1713,7 @@ mod test {
         }
         // run to get unpadded output
         let mut outputs = quantized_model
-            .run::<GoldilocksExt2>(&inputs, None, &mut GenStore::default())
+            .run::<GoldilocksExt2>(&inputs, &mut GenStore::default())
             .unwrap()
             .outputs()
             .unwrap();
@@ -1743,7 +1730,7 @@ mod test {
 
         // compute padded evaluation, with garbage removal in matmul
         let mut outputs = padded_model
-            .run::<GoldilocksExt2>(&padded_inputs, None, &mut GenStore::default())
+            .run::<GoldilocksExt2>(&padded_inputs, &mut GenStore::default())
             .unwrap()
             .outputs()
             .unwrap();

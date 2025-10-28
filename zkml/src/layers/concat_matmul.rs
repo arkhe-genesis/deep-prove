@@ -594,7 +594,6 @@ where
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<N>],
-        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
         ensure!(inputs.len() == 2, "ConcatMatMul expects 2 inputs");
         let a = inputs[0].clone();
@@ -940,7 +939,7 @@ mod test {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()])
             .unwrap();
         assert_eq!(
             &result.outputs[0].get_data(),
@@ -964,7 +963,7 @@ mod test {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()])
             .unwrap();
         let expected = Tensor::new(
             vec![2, 2, 2].into(),
@@ -999,7 +998,7 @@ mod test {
         );
 
         let result = concat_matmul
-            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()])
             .unwrap();
         let expected = Tensor::new(
             vec![2, 3, 3].into(),
@@ -1139,9 +1138,9 @@ mod test {
 
             let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
 
-            let expected = layer.evaluate_original::<Element>(&[&left, &right], &[]).unwrap();
+            let expected = layer.evaluate_original::<Element>(&[&left, &right]).unwrap();
 
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&left.as_wrapped(), &right.as_wrapped()], &[]).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&left.as_wrapped(), &right.as_wrapped()]).unwrap();
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
@@ -1151,9 +1150,9 @@ mod test {
 
             let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
 
-            let expected = layer.evaluate_original::<f32>(&[&left, &right], &[]).unwrap();
+            let expected = layer.evaluate_original::<f32>(&[&left, &right]).unwrap();
 
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&left.as_wrapped(), &right.as_wrapped()], &[]).unwrap();
+            let computed = layer.evaluate::<GoldilocksExt2>(&[&left.as_wrapped(), &right.as_wrapped()]).unwrap();
 
             for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
                 let abs = (left - right).abs();
@@ -1241,11 +1240,7 @@ mod test {
     }
 
     impl ConcatMatMul {
-        fn evaluate_original<N: Number>(
-            &self,
-            inputs: &[&Tensor<N>],
-            _unpadded_input_shapes: &[Shape],
-        ) -> anyhow::Result<Tensor<N>> {
+        fn evaluate_original<N: Number>(&self, inputs: &[&Tensor<N>]) -> anyhow::Result<Tensor<N>> {
             ensure!(inputs.len() == 2, "ConcatMatMul expects 2 inputs");
             let a = inputs[0];
             let b = inputs[1];

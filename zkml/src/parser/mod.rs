@@ -371,9 +371,7 @@ mod tests {
         let input = crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0])
             .to_quantized(md.input_scaling(0));
         let input = model.prepare_inputs(vec![input]).unwrap();
-        let trace = model
-            .run::<F>(&input, None, &mut GenStore::default())
-            .unwrap();
+        let trace = model.run::<F>(&input, &mut GenStore::default()).unwrap();
         println!("Result: {:?}", trace.outputs());
     }
 
@@ -415,9 +413,7 @@ mod tests {
             .collect();
         let input = model.prepare_inputs(inputs).unwrap();
         info!("RUNNING MODEL...");
-        let trace = model
-            .run::<F>(&input, None, &mut GenStore::default())
-            .unwrap();
+        let trace = model.run::<F>(&input, &mut GenStore::default()).unwrap();
         info!("RUNNING MODEL DONE...");
         println!("Result: {:?}", trace.outputs());
 
@@ -468,9 +464,7 @@ mod tests {
             })
             .collect();
         let input = model.prepare_inputs(native_input).unwrap();
-        let trace = model
-            .run::<F>(&input, None, &mut GenStore::default())
-            .unwrap();
+        let trace = model.run::<F>(&input, &mut GenStore::default()).unwrap();
 
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model

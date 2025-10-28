@@ -551,11 +551,7 @@ impl<N: TensorTypeParam> OpInfo for MatMul<N> {
 }
 
 impl<T: TensorTypeParam> Evaluate<T> for MatMul<T> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<T>],
-        _unpadded_input_shapes: &[Shape],
-    ) -> Result<LayerOut<T, E>> {
+    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T, E>> {
         let output = self.op_new(inputs)?;
         Ok(LayerOut::from_vec(vec![output]))
     }
@@ -1562,7 +1558,7 @@ mod tests {
         let matmul = MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap();
         let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
         let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
-        let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b], &[]).unwrap();
+        let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b]).unwrap();
         assert_eq!(result.outputs[0].get_data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
@@ -1575,11 +1571,12 @@ mod tests {
             Config::TransposeB,
         )
         .unwrap();
+
         let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
         let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
             .into_wrapped()
             .transpose();
-        let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b], &[]).unwrap();
+        let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b]).unwrap();
         assert_eq!(result.outputs[0].get_data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
 
@@ -1723,7 +1720,7 @@ mod tests {
                 config).unwrap();
             let inputs:Vec<_> = inputs.into_iter().map(|t| t.into_wrapped()).collect();
             let inputs:Vec<_> = inputs.iter().collect();
-            let computed = layer.evaluate::<GoldilocksExt2>(&inputs, &[]).expect("matmul evaluation must be successful");
+            let computed = layer.evaluate::<GoldilocksExt2>(&inputs).expect("matmul evaluation must be successful");
 
             for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
                 let abs = (left - right).abs();
@@ -1762,7 +1759,7 @@ mod tests {
             ).unwrap();
             let inputs:Vec<_> = inputs.into_iter().map(|t| t.into_wrapped()).collect();
             let inputs:Vec<_> = inputs.iter().collect();
-            let computed = layer.evaluate::<GoldilocksExt2>(&inputs, &[]).expect("matmul evaluation must be successful");
+            let computed = layer.evaluate::<GoldilocksExt2>(&inputs).expect("matmul evaluation must be successful");
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }

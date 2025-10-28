@@ -502,14 +502,9 @@ mod tests {
             .collect::<Vec<f32>>();
 
         let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone());
-        let shape = tensor.shape();
         let mut store = GenStore::default();
 
-        let trace = model.run::<F>(
-            std::slice::from_ref(&tensor),
-            Some(vec![shape.clone()]),
-            &mut store,
-        )?;
+        let trace = model.run::<F>(std::slice::from_ref(&tensor), &mut store)?;
         // Get the final node of the Model, we will compare the inputs to this node before and after the transformation (we compare the inputs because the outputs of this layer are tokens
         // and it may be the case that we would get the same tokens out but the actual logits are different)
         let last_model_node_id = model
@@ -531,11 +526,7 @@ mod tests {
         // Now we generate the post-transformation trace and extract the logits step data
         let mut store = GenStore::default();
 
-        let new_trace = model.run::<F>(
-            std::slice::from_ref(&tensor),
-            Some(vec![shape.clone()]),
-            &mut store,
-        )?;
+        let new_trace = model.run::<F>(std::slice::from_ref(&tensor), &mut store)?;
 
         let post_transform_final_step = new_trace.get_step(last_model_node_id).unwrap();
         let post_transform_inputs = post_transform_final_step

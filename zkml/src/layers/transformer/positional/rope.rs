@@ -283,7 +283,6 @@ impl<N> Rope<N> {
     pub(super) fn evaluate<E: ExtensionField>(
         &self,
         input: &WrappedTensor<N>,
-        unpadded_input_shape: &Shape,
         positional_cache: &Arc<Mutex<PositionalCache>>,
     ) -> Result<LayerOut<N, E>>
     where
@@ -332,7 +331,7 @@ impl<N> Rope<N> {
         positional_cache
             .lock()
             .unwrap()
-            .set_seq_len(past_length + unpadded_input_shape[0])?;
+            .set_seq_len(past_length + input.unpadded_shape().dims[0])?;
 
         ensure!(
             cosine_slice_bt.shape() == input.shape(),
@@ -790,7 +789,7 @@ mod tests {
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
 
             let out = layer
-                .evaluate::<GoldilocksExt2>(&input.as_wrapped(), &vec![seq_len, embedding_size].into(), &cache)
+                .evaluate::<GoldilocksExt2>(&input.as_wrapped(), &cache)
                 .expect("rope evaluate").outputs.into_iter().next().unwrap();
 
             let mut expected = Vec::with_capacity(seq_len * embedding_size);
@@ -824,7 +823,7 @@ mod tests {
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
 
             let out_q = layer_q
-                .evaluate::<GoldilocksExt2>(&input_q.as_wrapped(), &vec![seq_len, embedding_size].into(), &cache)
+                .evaluate::<GoldilocksExt2>(&input_q.as_wrapped(), &cache)
                 .expect("rope evaluate quant").outputs.into_iter().next().unwrap();
 
             prop_assert_eq!(out_q.shape(), vec![seq_len, embedding_size].into());

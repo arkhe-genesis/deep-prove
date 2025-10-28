@@ -143,7 +143,6 @@ impl Reshape {
     pub(crate) fn evaluate_layer<N, E>(
         &self,
         inputs: &[&WrappedTensor<N>],
-        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>>
     where
         N: TensorTypeParam,
@@ -207,9 +206,8 @@ where
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<N>],
-        unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<LayerOut<N, E>> {
-        self.evaluate_layer(inputs, unpadded_input_shapes)
+        self.evaluate_layer(inputs)
     }
 }
 
@@ -217,7 +215,6 @@ impl Reshape {
     pub fn evaluate_original<N: Clone, E: ExtensionField>(
         &self,
         inputs: &[&Tensor<N>],
-        _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<Vec<Tensor<N>>> {
         let output_shapes =
             self.internal_output(&inputs.iter().map(|x| x.shape().clone()).collect::<Vec<_>>())?;
@@ -317,7 +314,7 @@ mod tests {
         );
         let reshape = Reshape::new_fixed(vec![vec![3, 2, 3].into()]);
         let output = reshape
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .expect("reshape shouldn't fail");
         assert_eq!(output.outputs[0].shape(), vec![3_usize, 2, 3].into());
         assert_eq!(output.outputs[0].get_data(), input.get_data());
@@ -328,7 +325,7 @@ mod tests {
         let input = Tensor::<Element>::new(vec![2, 3].into(), vec![0, 1, 2, 3, 4, 5]);
         let reshape = Reshape::new_squeeze(1);
         let output = reshape
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .expect("reshape shouldn't fail");
         assert_eq!(output.outputs[0].shape(), vec![2_usize, 1, 3].into());
         assert_eq!(output.outputs[0].get_data(), vec![0, 1, 2, 3, 4, 5]);
@@ -350,7 +347,7 @@ mod tests {
         );
         let reshape = Reshape::new_subspace(1..2, vec![3, 4]);
         let output = reshape
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .expect("reshape shouldn't fail");
         assert_eq!(output.outputs[0].shape(), vec![2_usize, 3, 4].into());
         assert_eq!(
@@ -375,7 +372,7 @@ mod tests {
         );
         let reshape = Reshape::new_subspace(1..=2, vec![3, 4]);
         let output = reshape
-            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], &[])
+            .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .expect("reshape shouldn't fail");
         assert_eq!(output.outputs[0].shape(), vec![2_usize, 3, 4].into());
         assert_eq!(

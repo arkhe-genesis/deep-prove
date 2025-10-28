@@ -489,33 +489,28 @@ impl Evaluate<f32> for Layer<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<f32>],
-        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<f32, E>> {
         match self {
-            Layer::Dense(dense) => dense.evaluate(inputs, unpadded_input_shapes),
-            Layer::Convolution(convolution) => convolution.evaluate(inputs, unpadded_input_shapes),
-            Layer::MatMul(mat) => mat.evaluate(inputs, unpadded_input_shapes),
-            Layer::QKV(qkv) => qkv.evaluate(inputs, unpadded_input_shapes),
-            Layer::Mha(mha) => mha.evaluate(inputs, unpadded_input_shapes),
-            Layer::ConcatMatMul(concat_matmul) => {
-                concat_matmul.evaluate(inputs, unpadded_input_shapes)
-            }
-            Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs, unpadded_input_shapes),
-            Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs, unpadded_input_shapes),
-            Layer::Softmax(softmax) => softmax.evaluate(inputs, unpadded_input_shapes),
-            Layer::Add(add) => add.evaluate(inputs, unpadded_input_shapes),
-            Layer::Logits(logits) => logits.evaluate(inputs, unpadded_input_shapes),
-            Layer::Positional(positional) => positional.evaluate(inputs, unpadded_input_shapes),
-            Layer::Reshape(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
-            Layer::Embeddings(embeddings) => embeddings.evaluate(inputs, unpadded_input_shapes),
-            Layer::Activation(activation) => activation.evaluate(inputs, unpadded_input_shapes),
+            Layer::Dense(dense) => dense.evaluate(inputs),
+            Layer::Convolution(convolution) => convolution.evaluate(inputs),
+            Layer::MatMul(mat) => mat.evaluate(inputs),
+            Layer::QKV(qkv) => qkv.evaluate(inputs),
+            Layer::Mha(mha) => mha.evaluate(inputs),
+            Layer::ConcatMatMul(concat_matmul) => concat_matmul.evaluate(inputs),
+            Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::Softmax(softmax) => softmax.evaluate(inputs),
+            Layer::Add(add) => add.evaluate(inputs),
+            Layer::Logits(logits) => logits.evaluate(inputs),
+            Layer::Positional(positional) => positional.evaluate(inputs),
+            Layer::Reshape(reshape) => reshape.evaluate(inputs),
+            Layer::Embeddings(embeddings) => embeddings.evaluate(inputs),
+            Layer::Activation(activation) => activation.evaluate(inputs),
             Layer::Requant(_) => unreachable!("Requant layer found when evaluating over float"),
-            Layer::Pooling(pooling) => pooling.evaluate(inputs, unpadded_input_shapes),
-            Layer::Flatten(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
-            Layer::AttentionMask(attention_mask) => {
-                attention_mask.evaluate(inputs, unpadded_input_shapes)
-            }
-            Layer::EinSum(einsum) => einsum.evaluate(inputs, unpadded_input_shapes),
+            Layer::Pooling(pooling) => pooling.evaluate(inputs),
+            Layer::Flatten(reshape) => reshape.evaluate(inputs),
+            Layer::AttentionMask(attention_mask) => attention_mask.evaluate(inputs),
+            Layer::EinSum(einsum) => einsum.evaluate(inputs),
         }
     }
 }
@@ -524,33 +519,28 @@ impl Evaluate<Element> for Layer<Element> {
     fn evaluate<E: ExtensionField>(
         &self,
         inputs: &[&WrappedTensor<Element>],
-        unpadded_input_shapes: &[Shape],
     ) -> Result<LayerOut<Element, E>> {
         let output = match self {
-            Layer::Dense(dense) => dense.evaluate(inputs, unpadded_input_shapes),
-            Layer::Convolution(convolution) => convolution.evaluate(inputs, unpadded_input_shapes),
-            Layer::MatMul(mat) => mat.evaluate(inputs, unpadded_input_shapes),
-            Layer::QKV(qkv) => qkv.evaluate(inputs, unpadded_input_shapes),
-            Layer::Mha(mha) => mha.evaluate(inputs, unpadded_input_shapes),
-            Layer::ConcatMatMul(concat_matmul) => {
-                concat_matmul.evaluate(inputs, unpadded_input_shapes)
-            }
-            Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs, unpadded_input_shapes),
-            Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs, unpadded_input_shapes),
-            Layer::Softmax(softmax) => softmax.evaluate(inputs, unpadded_input_shapes),
-            Layer::Add(add) => add.evaluate(inputs, unpadded_input_shapes),
-            Layer::Logits(logits) => logits.evaluate(inputs, unpadded_input_shapes),
-            Layer::Positional(positional) => positional.evaluate(inputs, unpadded_input_shapes),
-            Layer::Embeddings(embeddings) => embeddings.evaluate(inputs, unpadded_input_shapes),
-            Layer::Reshape(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
-            Layer::Activation(activation) => activation.evaluate(inputs, unpadded_input_shapes),
-            Layer::Requant(requant) => requant.evaluate(inputs, unpadded_input_shapes),
-            Layer::Pooling(pooling) => pooling.evaluate(inputs, unpadded_input_shapes),
-            Layer::Flatten(reshape) => reshape.evaluate(inputs, unpadded_input_shapes),
-            Layer::AttentionMask(attention_mask) => {
-                attention_mask.evaluate(inputs, unpadded_input_shapes)
-            }
-            Layer::EinSum(einsum) => einsum.evaluate(inputs, unpadded_input_shapes),
+            Layer::Dense(dense) => dense.evaluate(inputs),
+            Layer::Convolution(convolution) => convolution.evaluate(inputs),
+            Layer::MatMul(mat) => mat.evaluate(inputs),
+            Layer::QKV(qkv) => qkv.evaluate(inputs),
+            Layer::Mha(mha) => mha.evaluate(inputs),
+            Layer::ConcatMatMul(concat_matmul) => concat_matmul.evaluate(inputs),
+            Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::Softmax(softmax) => softmax.evaluate(inputs),
+            Layer::Add(add) => add.evaluate(inputs),
+            Layer::Logits(logits) => logits.evaluate(inputs),
+            Layer::Positional(positional) => positional.evaluate(inputs),
+            Layer::Embeddings(embeddings) => embeddings.evaluate(inputs),
+            Layer::Reshape(reshape) => reshape.evaluate(inputs),
+            Layer::Activation(activation) => activation.evaluate(inputs),
+            Layer::Requant(requant) => requant.evaluate(inputs),
+            Layer::Pooling(pooling) => pooling.evaluate(inputs),
+            Layer::Flatten(reshape) => reshape.evaluate(inputs),
+            Layer::AttentionMask(attention_mask) => attention_mask.evaluate(inputs),
+            Layer::EinSum(einsum) => einsum.evaluate(inputs),
         };
 
         #[cfg(feature = "capture-layers-quant")]

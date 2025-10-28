@@ -288,11 +288,12 @@ mod test {
         assert_eq!(shapes.len(), 1);
         let shape = &shapes[0];
         assert_eq!(shape.len(), 1);
-        let input = Tensor::random(&vec![shape[0] - 1].into());
+        let input = Tensor::random(&vec![shape[0]].into());
         println!("input: {:?}", input.get_data());
         let input = model.prepare_inputs(vec![input])?;
 
-        let trace = model.run(&input, None, &mut GenStore::default()).unwrap();
+        let trace = model.run(&input, &mut GenStore::default()).unwrap();
+
         let output = trace.output_at(0)?;
         println!("[+] Run inference. Result: {output:?}");
 
