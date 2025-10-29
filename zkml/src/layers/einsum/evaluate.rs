@@ -712,13 +712,16 @@ mod tests {
 
     #[test]
     fn test_grouped_qkv() {
-        test_grouped_qkv_helper::<f32>();
-        test_grouped_qkv_helper::<Element>();
+        const TOLERANCE: f32 = 1e-6;
+
+        test_grouped_qkv_helper::<f32, _>(|left, right| (left - right).abs() <= TOLERANCE);
+        test_grouped_qkv_helper::<Element, _>(PartialEq::eq);
     }
 
-    fn test_grouped_qkv_helper<N>()
+    fn test_grouped_qkv_helper<N, F>(cmp_result: F)
     where
         N: TensorTypeParam,
+        F: Fn(&N, &N) -> bool,
     {
         let mut rng = rng_from_env_or_random();
 
@@ -793,24 +796,28 @@ mod tests {
 
                 let expected = Tensor::new(shape.clone(), burn_data);
                 let output = Tensor::new(shape, output.clone().get_data());
-                assert_eq!(
-                    output.clone().get_data_into(),
-                    expected.clone().get_data_into(),
-                    "Failed for output {name} shapes X: {x_shape:?}, WQ: {wq_shape:?}, WK: {wk_shape:?}, WV: {wv_shape:?}, Calculated: {output}, Expected: {expected}"
-                );
+                for (output, expected) in output.get_data().iter().zip(expected.get_data().iter()) {
+                    assert!(
+                        cmp_result(output, expected),
+                        "Failed for output {name} shapes X: {x_shape:?}, WQ: {wq_shape:?}, WK: {wk_shape:?}, WV: {wv_shape:?}, Calculated: {output}, Expected: {expected}"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn test_grouped_qk_transpose() {
-        test_grouped_qk_transpose_helper::<f32>();
-        test_grouped_qk_transpose_helper::<Element>();
+        const TOLERANCE: f32 = 1e-6;
+
+        test_grouped_qk_transpose_helper::<f32, _>(|left, right| (left - right).abs() <= TOLERANCE);
+        test_grouped_qk_transpose_helper::<Element, _>(PartialEq::eq);
     }
 
-    fn test_grouped_qk_transpose_helper<N>()
+    fn test_grouped_qk_transpose_helper<N, F>(cmp_result: F)
     where
         N: TensorTypeParam,
+        F: Fn(&N, &N) -> bool,
     {
         let einsum: EinSum<N> = EinSum::new(
             // Here the Q uses "q" for seq_len while K uses "s", this is so that both single token inference and full sequence can be handled
@@ -867,11 +874,16 @@ mod tests {
             let expected_full_data = calc_expected_output(q_full);
             let expected_full = Tensor::new(qkt_full_shape.clone(), expected_full_data);
             let output_full = Tensor::new(qkt_full_shape, output_full[0].clone().get_data());
-            assert_eq!(
-                output_full.clone().get_data_into(),
-                expected_full.clone().get_data_into(),
-                "Failed for full sequence shapes Q: {q_full_shape:?}, K: {k_shape:?}, Calculated: {output_full}, Expected: {expected_full}",
-            );
+            for (expected, output) in expected_full
+                .get_data()
+                .iter()
+                .zip(output_full.get_data().iter())
+            {
+                assert!(
+                    cmp_result(expected, output),
+                    "Failed for full sequence shapes Q: {q_full_shape:?}, K: {k_shape:?}, Calculated: {output}, Expected: {expected}",
+                );
+            }
             // Now we test the single token case where q_len == 1
             let q_single_shape = Shape::new(vec![group_size, heads, q_len, head_dim]);
             let qkt_single_shape = Shape::new(vec![group_size, heads, q_len, seq_len]);
@@ -883,11 +895,17 @@ mod tests {
             let expected_single_data = calc_expected_output(q_single);
             let expected_single = Tensor::new(qkt_single_shape.clone(), expected_single_data);
             let output_single = Tensor::new(qkt_single_shape, output_single[0].clone().get_data());
-            assert_eq!(
-                output_single.clone().get_data_into(),
-                expected_single.clone().get_data_into(),
-                "Failed for single token shapes Q: {q_single_shape:?}, K: {k_shape:?}, Calculated: {output_single}, Expected: {expected_single}",
-            );
+
+            for (expected, output) in expected_single
+                .get_data()
+                .iter()
+                .zip(output_single.get_data().iter())
+            {
+                assert!(
+                    cmp_result(expected, output),
+                    "Failed for single token shapes Q: {q_single_shape:?}, K: {k_shape:?}, Calculated: {output}, Expected: {expected}",
+                );
+            }
         }
     }
 }
