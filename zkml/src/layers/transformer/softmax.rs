@@ -47,6 +47,7 @@ use multilinear_extensions::{
     virtual_poly::VPAuxInfo,
     virtual_polys::VirtualPolynomialsBuilder,
 };
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
@@ -784,7 +785,7 @@ impl Softmax<Element> {
         &self,
         node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
-        ctx: &SoftmaxCtx<E>,
+        ctx: &SoftmaxCtx,
         softmax_data: &SoftmaxData,
         input_shape: &Shape,
         prover: &mut crate::Prover<E, T, PCS>,
@@ -890,8 +891,14 @@ impl Softmax<Element> {
         let num_threads = optimal_sumcheck_threads(num_vars);
         let expr_builder =
             VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
-        let virtual_poly =
-            expr_builder.to_virtual_polys(&ctx.sumcheck_expression[..first_dim], &challenges);
+
+        let sumcheck_expression = build_softmax_sumcheck_expression::<E>(
+            number_of_zero_chunks,
+            first_dim,
+            final_dim_size,
+        );
+
+        let virtual_poly = expr_builder.to_virtual_polys(&sumcheck_expression, &challenges);
         let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
         let sumcheck_point = state
             .challenges
@@ -1267,7 +1274,7 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
 {
-    type Ctx = SoftmaxCtx<E>;
+    type Ctx = SoftmaxCtx;
 
     fn prove<T: transcript::Transcript<E>>(
         &self,
@@ -1367,15 +1374,12 @@ impl QuantizeOp for Softmax<f32> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "E: ExtensionField + DeserializeOwned")]
-pub struct SoftmaxCtx<E: ExtensionField> {
+pub struct SoftmaxCtx {
     node_id: NodeId,
     /// This is the quantisation data for the [`Softmax`] op
     quant_info: QuantisedSoftmaxData,
     /// The data about the lookups that are performed in this layer
     lookup_ctx: LayerLookupContext,
-    /// The expression used in the sumcheck for the layer
-    sumcheck_expression: Vec<Expression<E>>,
 }
 
 impl LayerLookupContext {
@@ -1485,7 +1489,7 @@ impl LayerLookupContext {
     }
 }
 
-impl<E: ExtensionField> OpInfo for SoftmaxCtx<E> {
+impl OpInfo for SoftmaxCtx {
     fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
         input_shapes.to_vec()
     }
@@ -1551,14 +1555,6 @@ impl ProveInfo for Softmax<Element> {
                 shape.rank() == 2 || shape.rank() == 3,
                 "Softmax only supports 2D or 3D tensors"
             );
-            let first_dim = if shape.rank() == 3 { shape[0] } else { 1 };
-            let last_dim = if shape.rank() == 3 {
-                shape[2]
-            } else {
-                shape[1]
-            };
-            let sumcheck_expression =
-                build_softmax_sumcheck_expression::<E>(number_zero_chunks, first_dim, last_dim);
 
             // The output shape is the same as the input shape so we don't need to update it
             // return the LayerCtx and the updated ContextAux
@@ -1567,7 +1563,6 @@ impl ProveInfo for Softmax<Element> {
                     node_id: id,
                     quant_info,
                     lookup_ctx,
-                    sumcheck_expression,
                 }),
                 aux,
             ))
@@ -1627,7 +1622,7 @@ fn build_softmax_sumcheck_expression<E: ExtensionField>(
         .collect::<Vec<Expression<E>>>()
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for SoftmaxCtx<E>
+impl<E, PCS> VerifiableCtx<E, PCS> for SoftmaxCtx
 where
     E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
@@ -1793,23 +1788,17 @@ where
             .flat_map(|(&a, b)| [a, b])
             .collect::<Vec<E>>();
         // Check that the provided evaluation matches the expected evaluation from the sumcheck
-        let calc_subclaim =
-            self.sumcheck_expression
-                .iter()
-                .take(first_dim)
-                .fold(E::ZERO, |acc, expr| {
-                    eval_by_expr_with_instance(
-                        &[],
-                        &all_sumcheck_evals,
-                        &[],
-                        &[],
-                        &challenges,
-                        expr,
-                    )
-                    .right()
-                    .unwrap()
-                        + acc
-                });
+        let sumcheck_expression = build_softmax_sumcheck_expression::<E>(
+            number_of_zero_chunks,
+            first_dim,
+            final_dim_size,
+        );
+        let calc_subclaim = sumcheck_expression.iter().fold(E::ZERO, |acc, expr| {
+            eval_by_expr_with_instance(&[], &all_sumcheck_evals, &[], &[], &challenges, expr)
+                .right()
+                .unwrap()
+                + acc
+        });
 
         ensure!(
             subclaim.expected_evaluation == calc_subclaim,

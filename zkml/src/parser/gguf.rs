@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{BufReader, Read, Seek},
     ops::Deref,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tenstore::StorageKey;
@@ -13,8 +13,42 @@ use candle_core::{CpuStorage, Device, Storage, quantized::gguf_file::Content};
 
 use crate::{
     Shape, Tensor,
+    parser::{ModelNameProvider, llm::transformer::NormType},
     tensor::{CommitmentId, KeyedTensor},
 };
+
+/// Contains the path to the GGUF file. Given the GGUF file
+/// contains all required metadata including the tokenizer, we don't need to track anything else.
+#[derive(Clone, Debug)]
+pub struct RawGGUF(PathBuf);
+
+impl RawGGUF {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self(path.as_ref().to_path_buf())
+    }
+    pub fn loader(&self) -> anyhow::Result<FileTensorLoader> {
+        FileTensorLoader::from_path(self.0.clone())
+    }
+}
+
+impl ModelNameProvider for RawGGUF {
+    fn model_metadata(&self) -> anyhow::Result<Vec<String>> {
+        let l = FileTensorLoader::from_path(self.0.as_path())?;
+        let names = [
+            "general.name",
+            "general.architecture",
+            "general.basename",
+            "general.base_model.0.name",
+        ]
+        .iter()
+        .filter_map(|key| l.metadata::<String>(key))
+        .collect::<Vec<_>>();
+        if names.is_empty() {
+            bail!("model name not found");
+        }
+        Ok(names)
+    }
+}
 
 fn dequantize(qtensor: &QTensor) -> anyhow::Result<Tensor<f32>> {
     let shape = Shape::new(qtensor.shape().dims().to_vec());
@@ -245,6 +279,50 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     pub fn raw_metadata(&self, key: &str) -> Option<&Value> {
         self.content.metadata.get(key)
     }
+
+    pub fn num_heads_key(&self, model_name: &str) -> String {
+        format!("{model_name}.attention.head_count")
+    }
+    pub fn head_size_key(&self, model_name: &str) -> String {
+        format!("{model_name}.attention.key_length")
+    }
+    pub fn context_length_key(&self, model_name: &str) -> String {
+        format!("{model_name}.context_length")
+    }
+    pub fn num_block_key(&self, model_name: &str) -> String {
+        format!("{model_name}.block_count")
+    }
+    pub fn embedding_size_key(&self, model_name: &str) -> String {
+        format!("{model_name}.embedding_length")
+    }
+    pub fn hidden_size_key(&self, model_name: &str) -> String {
+        Self::embedding_size_key(self, model_name)
+    }
+    pub fn norm_epsilon_key(&self, model_name: &str, norm_type: NormType) -> String {
+        match norm_type {
+            NormType::LayerNorm => format!("{model_name}.attention.layer_norm_epsilon"),
+            NormType::RMSNorm => format!("{model_name}.attention.layer_norm_rms_epsilon"),
+        }
+    }
+    pub fn find_norm_epsilon(&self, model_name: &str) -> Option<f32> {
+        match self.raw_metadata(&self.norm_epsilon_key(model_name, NormType::LayerNorm)) {
+            Some(value) => Some(value.to_f32().unwrap()),
+            None => self
+                .raw_metadata(&self.norm_epsilon_key(model_name, NormType::RMSNorm))
+                .map(|v| v.to_f32().unwrap()),
+        }
+    }
+
+    pub fn eos_token_key(&self) -> String {
+        "tokenizer.ggml.eos_token_id".to_string()
+    }
+    /// NOTE: that it may not exist if the attention mechanism is MHA for example. It's only for GQA.
+    pub fn num_kv_heads_key(&self, model_name: &str) -> String {
+        format!("{model_name}.attention.head_count_kv")
+    }
+    pub fn sliding_window_key(&self, model_name: &str) -> String {
+        format!("{model_name}.attention.sliding_window")
+    }
 }
 
 impl TensorLoader<BufReader<File>> {
@@ -285,61 +363,18 @@ pub mod tests {
     use gguf_rs::get_gguf_container;
     use std::{fs::File, ops::Deref};
 
-    use crate::{
-        layers::transformer::embeddings::Embeddings,
-        parser::{
-            file_cache,
-            llm::{HFTokenizer, LLMConfig, LLMTokenizer, LLMVariant, transformer::Attention},
-        },
+    use crate::parser::{
+        file_cache,
+        llm::models::{gemma3::tests::GEMMA3_Q8, gpt2::tests::GPT2_Q8_0},
     };
 
     // download at https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF
     // pub const GPT2_Q8_0_PATH: &str = "assets/scripts/llms/gpt2.q8_0.gguf";
     // const GPT2_Q8_0_URL: &str = "https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF/resolve/main/gpt2.q8_0.gguf";
-    pub const GPT2_Q8_0: &str = "gpt2.Q8_0.gguf";
-    pub const GEMMA3_Q8: &str = "gemma-3-270m-it-Q8_0.gguf";
-
-    #[test]
-    fn test_gguf_load_model() -> anyhow::Result<()> {
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let loader = FileTensorLoader::from_path(model_path)?;
-        let config = LLMConfig::from_content(&loader)?;
-        let _model = config.model(&loader)?;
-        println!("model: {:?}", config.variant);
-        Ok(())
-    }
-
-    #[test]
-    fn test_gguf_load_attention() -> anyhow::Result<()> {
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let loader = FileTensorLoader::from_path(model_path)?;
-        let config = LLMConfig::from_content(&loader)?;
-        let block0_loader = loader.pp("blk.0.");
-
-        let _attention = Attention::from_loader(&block0_loader, &config)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_gguf_load_config() -> anyhow::Result<()> {
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let loader = FileTensorLoader::from_path(model_path)?;
-        let config = LLMConfig::from_content(&loader)?;
-        println!("config: {config:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn test_gguf_load_embedding() -> anyhow::Result<()> {
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let loader = FileTensorLoader::from_path(model_path)?;
-        let _embedding = Embeddings::from_loader(&loader)?;
-        Ok(())
-    }
 
     // https://docs.rs/candle-transformers/latest/src/candle_transformers/models/llama.rs.html#517-535
     #[test]
-    //#[ignore = "just a test to explore gguf internal structure"]
+    #[ignore = "just a test to explore gguf internal structure"]
     fn test_load_and_inspect_gpt2_gguf() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
 
@@ -391,6 +426,7 @@ pub mod tests {
 
     use crate::parser::gguf::FileTensorLoader;
     #[test]
+    #[ignore = "just a test to explore gguf internal structure"]
     fn test_tensor_loader_subscoping_and_lazy_load() -> anyhow::Result<()> {
         // let gguf_path = GPT2_Q8_0_PATH;
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
@@ -455,18 +491,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_gguf_load_tokenizer() -> anyhow::Result<()> {
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let loader = FileTensorLoader::from_path(model_path)?;
-        let tokenizer = HFTokenizer::from_loader(&loader)?;
-        let s = "do or don't. there is no try.";
-        let tokens = tokenizer.tokenize(s);
-        let s2 = tokenizer.detokenize(&tokens);
-        assert_eq!(s, s2);
-        Ok(())
-    }
-
-    #[test]
+    #[ignore = "just a test to explore gguf internal structure"]
     fn test_gguf_print_keys() -> anyhow::Result<()> {
         for path in [GPT2_Q8_0, GEMMA3_Q8] {
             let model_path = file_cache::from_cache(path)?;
@@ -517,7 +542,6 @@ pub mod tests {
         for key in tensor_keys {
             println!("\t- {key}");
         }
-        println!(" VARIANT: {:?}", LLMVariant::from_loader(&loader)?);
 
         Ok(())
     }

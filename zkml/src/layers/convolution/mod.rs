@@ -14,7 +14,6 @@ use crate::{
     model::StepData,
     number::Number,
     padding::{PaddingMode, ShapeInfo},
-    parser::{check_filter, safe_conv2d_shape},
     quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
     shape::filter_size,
     tensor::{
@@ -1327,6 +1326,25 @@ impl PadOp for Convolution<Element> {
         shape_data.input_shape_padded = output_shape.next_power_of_two();
         Ok(self)
     }
+}
+pub fn check_filter(filter_shape: &Shape) -> Result<()> {
+    ensure!(filter_shape.len() == 4, "Filter should be 4D tensor.");
+    ensure!(
+        filter_shape[2] == filter_shape[3],
+        "Filter should be square."
+    );
+    Ok(())
+}
+
+pub fn safe_conv2d_shape(input_shape: &Shape, filter_shape: &Shape) -> Result<Shape> {
+    check_filter(filter_shape).context("conv2d: Failed to check filter shape")?;
+    check_cnn_input(input_shape).context("conv2d: invalid input shape")?;
+    Ok(conv2d_shape(input_shape, filter_shape))
+}
+pub fn check_cnn_input(input_shape: &Shape) -> Result<()> {
+    ensure!(input_shape.len() == 3, "input should be 3d tensor");
+    ensure!(input_shape[1] == input_shape[2], "input should be square");
+    Ok(())
 }
 
 impl<E, PCS> ProvableOp<E, PCS> for Convolution<Element>

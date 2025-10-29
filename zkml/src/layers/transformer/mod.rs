@@ -33,6 +33,7 @@ pub fn causal_mask(num_heads: usize, q_len: usize, seq_len: usize) -> Tensor<f32
 pub(crate) mod manual_attention {
     use std::{fs::File, slice};
 
+    use crate::parser::{json::RawJSON, llm::models::gpt2::GPT2};
     use anyhow::{Context, ensure};
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
@@ -49,8 +50,6 @@ pub(crate) mod manual_attention {
         },
         number::Number,
         parser::{
-            file_cache,
-            gguf::{FileTensorLoader, tests::GPT2_Q8_0},
             json::test::{TINY_GPT2_DEBUG_NAME, TINY_GPT2_NAME},
             llm::{Attention, FeedForward, LLMConfig, transformer::Norm},
         },
@@ -68,6 +67,7 @@ pub(crate) mod manual_attention {
     }
 
     impl FlatFFN<f32> {
+        #[allow(dead_code)]
         pub fn new_from_gguf(_c: &LLMConfig, ffn: FeedForward<f32>) -> Self {
             let up = {
                 // normally we would do this
@@ -186,6 +186,7 @@ pub(crate) mod manual_attention {
     }
 
     impl FlatAttention<f32> {
+        #[allow(dead_code)]
         pub fn new_from_parser(c: &LLMConfig, att: Attention<f32>) -> anyhow::Result<Self> {
             let qkv = qkv::QKV::new(
                 att.q,
@@ -399,23 +400,6 @@ pub(crate) mod manual_attention {
         println!("output shape: {:?}", output.shape());
     }
 
-    #[test]
-    fn test_flat_attention_from_gguf() -> anyhow::Result<()> {
-        let path = file_cache::from_cache(GPT2_Q8_0)?;
-        let loader = FileTensorLoader::from_path(path)?;
-        let config = LLMConfig::from_content(&loader)?;
-        let mut model = config.model(&loader)?;
-        println!("model: {:?}", config.variant);
-        // 10 for first seq_len, then 1 for subsequent token since we use caching
-        for seq_len in [10, 1] {
-            let input = Tensor::<f32>::random(&vec![seq_len, config.embedding_size].into());
-            let mut att = FlatAttention::new_from_parser(&config, model.blocks.remove(0)).unwrap();
-            let flat_output = att.forward(&input, None).unwrap();
-            println!("output shape: {:?}", flat_output.shape());
-        }
-        Ok(())
-    }
-
     #[derive(Debug, Deserialize)]
     pub(crate) struct GPT2Output {
         #[allow(dead_code)]
@@ -506,7 +490,7 @@ pub(crate) mod manual_attention {
         }
     }
 
-    use crate::parser::json;
+    use crate::parser::{ModelLoader, json};
 
     /// Compares the graph implementation vs the output of the pytorch model over
     /// all passes including to the final logits selection.
@@ -518,9 +502,7 @@ pub(crate) mod manual_attention {
         // too big to run in JSON mode - need to switch format
         // let model_weights_path = json::test::get_json_file(DISTIL_GPT2_NAME)?;
         // let debug_output_path = json::test::get_json_file(DISTIL_GPT2_DEBUG_NAME)?;
-        let loader = json::FileTensorLoader::new_from_path(model_weights_path)?;
-        let config = LLMConfig::from_json(&loader)?;
-        let llm_model = config.model_json(&loader)?;
+        let (model, config) = GPT2.parse(&RawJSON::new(model_weights_path))?;
         let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
             File::open(debug_output_path.clone())
                 .context(format!("failed to open file {}", debug_output_path.clone()))?,
@@ -533,18 +515,14 @@ pub(crate) mod manual_attention {
             gpt2_output.input_ids.iter().map(|x| *x as f32).collect(),
         );
         // also test on a single random token
-        let max_token = rng_from_env_or_random().gen_range(0..llm_model.embeddings.vocab_size);
+        let max_token = rng_from_env_or_random().gen_range(0..config.embedding_size);
         let single_input = Tensor::new(vec![1].into(), vec![max_token as f32]);
-        let model = llm_model
-            .clone()
-            .into_provable_model(&config, single_input.shape().clone())?;
         model.describe();
         model.run_float(slice::from_ref(&single_input))?;
         // Reset is needed here because the `llm_model` contains layer that contains some cache.
         // When we clone a layer, we just clone a Arc<Mutex<_>>, so the cache data itself is not cloned.
         model.reset();
 
-        let model = llm_model.into_provable_model(&config, input.shape().clone())?;
         model.describe();
         let output = model.run_float(slice::from_ref(&input))?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,

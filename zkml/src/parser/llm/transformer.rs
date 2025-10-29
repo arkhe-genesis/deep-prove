@@ -11,17 +11,22 @@ use crate::{
     },
     model::Model,
     parser::{
-        gguf::{FileTensorLoader, unfuse_tensors},
-        json,
-        json::unfuse_crate_tensors,
-        llm::{FeedForward, LLMConfig, LLMVariant, config::AttentionHeadType},
+        gguf,
+        json::{self, unfuse_crate_tensors},
+        llm::{
+            FeedForward, LLMConfig,
+            config::{AttentionHeadType, LLMStructure, PositionalConfig},
+        },
+        safe,
     },
     tensor::KeyedTensor,
 };
 use anyhow::{Context, bail, ensure};
-use candle_core::Device;
 use tracing::trace;
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Copy, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NormType {
     LayerNorm,
     RMSNorm,
@@ -59,11 +64,11 @@ impl Attention<f32> {
         self,
         model: &mut Model<f32>,
         input_node_id: Option<NodeId>,
-        c: &LLMConfig,
+        c: &LLMStructure,
         positional: Option<Positional<f32>>,
     ) -> anyhow::Result<NodeId> {
         let num_groups = match c.attention_config.head {
-            AttentionHeadType::MHA => c.num_heads,
+            AttentionHeadType::MHA => c.generic.num_heads,
             AttentionHeadType::GQA(num_groups) => num_groups,
         };
         let qkv = QKV::new(
@@ -73,12 +78,16 @@ impl Attention<f32> {
             self.k_bias,
             self.v,
             self.v_bias,
-            c.num_heads,
+            c.generic.num_heads,
             num_groups,
         )?;
         // TODO : change for GQA if needed by also giving the Q and K norms and the ROPE table
-        let mha =
-            Mha::new(c.context_length, c.num_heads, c.head_size)?.with_attention_span(self.span)?;
+        let mha = Mha::new(
+            c.generic.context_length,
+            c.generic.num_heads,
+            c.generic.head_size,
+        )?
+        .with_attention_span(self.span)?;
         let out = MatMul::new_constant(self.out, self.out_bias)?;
         // input is [seq_len, emb_size]
         let mut last_node_id =
@@ -91,20 +100,24 @@ impl Attention<f32> {
         let (v_id, v_port): (NodeId, usize) = (last_node_id, 2);
 
         let mha_id = model.graph.add_inner(Layer::Mha(mha))?;
-        if let LLMVariant::Gemma3 = c.variant {
-            let q_norm = self.q_norm.context("in gemma3, q_norm is expected")?;
+        if let Some(q_norm) = self.q_norm {
             (q_id, q_port) = {
                 let q_norm_id = model.graph.add_inner(q_norm.to_layer())?;
                 model.add_edge(q_id, q_norm_id, (q_port, 0))?;
                 (q_norm_id, 0)
             };
-            let k_norm = self.k_norm.context("in gemma3, k_norm is expected")?;
+        }
+        if let Some(k_norm) = self.k_norm {
             (k_id, k_port) = {
                 let k_norm_id = model.graph.add_inner(k_norm.to_layer())?;
                 model.add_edge(k_id, k_norm_id, (k_port, 0))?;
                 (k_norm_id, 0)
             };
-            let rope = positional.context("in gemma3, rope is expected")?;
+        }
+        if let PositionalConfig::Rope(_) = &c.positional_config {
+            let Some(rope) = positional else {
+                bail!("Positional encoding is expected after QK");
+            };
             (q_id, q_port) = {
                 // we need to build the cache for the Q tensor
                 let rope_id =
@@ -131,7 +144,7 @@ impl Attention<f32> {
             model.add_edge(q_id, mha_id, (q_port, 0))?;
             model.add_edge(k_id, mha_id, (k_port, 1))?;
             model.add_edge(v_id, mha_id, (v_port, 2))?;
-        } else if let LLMVariant::GPT2 = c.variant {
+        } else {
             // in GPT2, there is only one edge between QKV and MHA, and QKV outputs three tensors
             model.add_edge(q_id, mha_id, vec![(q_port, 0), (k_port, 1), (v_port, 2)])?;
         }
@@ -168,245 +181,12 @@ impl Attention<f32> {
         };
         Ok(last_node_id)
     }
-    // Replaces from_var_builder and from_tensor_loader
-    // 'loader' is expected to be the block-level loader (e.g., scoped to "blk.N.")
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        let embedding_size = c.embedding_size;
-        let hidden_size = c.hidden_size;
-        ensure!(
-            embedding_size == hidden_size,
-            "embedding_size must be equal to hidden_size"
-        );
-        match c.variant {
-            LLMVariant::GPT2 => Self::from_loader_gpt2(loader, c),
-            LLMVariant::Gemma3 => Self::from_loader_gemma3(loader, c),
-        }
-    }
 
     pub fn with_span(self, span: AttentionSpan) -> Self {
         Self { span, ..self }
     }
 
-    fn from_loader_gemma3(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        let hidden_size = c.hidden_size;
-        let head_size = c.head_size;
-        let num_heads = c.num_heads;
-        let num_groups = c.num_groups();
-
-        let pre_norm = RMSNorm::from_loader(&loader.pp("attn_"), c, false)?;
-        assert_eq!(
-            pre_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.embedding_size]
-        );
-
-        let q_tensor = loader
-            .get_tensor("attn_q.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        let q_norm = RMSNorm::from_loader(&loader.pp("attn_q_"), c, true)?;
-        assert_eq!(
-            q_tensor.shape().as_ref(),
-            &[c.hidden_size, num_heads * head_size],
-            "embedding_size {} hidden_size {} num_heads {} head_size {}",
-            c.embedding_size,
-            c.hidden_size,
-            num_heads,
-            head_size
-        );
-        assert_eq!(
-            q_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            // HACK: stacking
-            &[c.head_size * c.num_heads]
-        );
-
-        let k_tensor = loader
-            .get_tensor("attn_k.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        let k_norm = RMSNorm::from_loader(&loader.pp("attn_k_"), c, true)?;
-        assert_eq!(
-            k_tensor.shape().as_ref(),
-            &[hidden_size, num_groups * head_size]
-        );
-        // head_dim = num_groups * head_size
-        assert_eq!(
-            k_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            // HACK: stacking
-            &[c.head_size * c.num_heads]
-        );
-
-        let v_tensor = loader
-            .get_tensor("attn_v.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        assert_eq!(
-            v_tensor.shape().as_ref(),
-            &[hidden_size, num_groups * head_size]
-        );
-
-        // HACK: since we don't have proper GQA for now, we fake the "one" group by stacking multiple times
-        // the K and V tensors on themselves, as many times as there are heads. In Gemma3 270M there are only
-        // 4 heads so it's ok for now. This means when we split inside MHA per head, then each head will have
-        // the same K and V tensors, effectively enforcing a single group.
-        // TODO: remove this once we have proper GQA
-        ensure!(num_groups == 1, "GQA is not supported yet");
-        ensure!(
-            num_heads == 4,
-            "GQA is not supported yet so stacking is expensive"
-        );
-
-        // println!("LLM LOADER: k_tensor shape: {:?}", k_tensor.shape());
-        // println!("LLM LOADER: v_tensor shape: {:?}", v_tensor.shape());
-        let k_tensor = k_tensor.map_tensor(|t| expand(t, num_heads));
-        let v_tensor = v_tensor.map_tensor(|t| expand(t, num_heads));
-
-        let out = loader
-            .get_tensor("attn_output.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        assert_eq!(out.shape().as_ref(), &[num_heads * head_size, hidden_size]);
-
-        let post_attn_norm = RMSNorm::from_loader(&loader.pp("post_attention_"), c, false)?;
-        assert_eq!(
-            post_attn_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.hidden_size]
-        );
-
-        let ff = FeedForward::from_loader(loader, c)?;
-        let scope_loader = loader.pp("post_ffw_");
-        let post_ffn_norm = RMSNorm::from_loader(&scope_loader, c, false)?;
-        assert_eq!(
-            post_ffn_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.hidden_size]
-        );
-        let ffn_norm_loader = loader.pp("ffn_");
-
-        let pre_ffn_norm = c
-            .variant
-            .norm_type()
-            .from_loader(&ffn_norm_loader, c, false)?;
-        Ok(Self {
-            pre_norm: Norm::RMSNorm(pre_norm),
-            q: q_tensor,
-            q_bias: None,
-            q_norm: Some(Norm::RMSNorm(q_norm)),
-            k: k_tensor,
-            k_bias: None,
-            k_norm: Some(Norm::RMSNorm(k_norm)),
-            v: v_tensor,
-            v_bias: None,
-            out,
-            out_bias: None,
-            post_norm: None,
-            pre_ffn_norm,
-            feedforward: ff,
-            post_ffn_norm: Some(Norm::RMSNorm(post_ffn_norm)),
-            span: AttentionSpan::Full,
-        })
-    }
-
-    fn from_loader_gpt2(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        let embedding_size = c.embedding_size;
-        let hidden_size = c.hidden_size;
-        ensure!(
-            embedding_size == hidden_size,
-            "embedding_size must be equal to hidden_size"
-        );
-        let (qkv_key, qkv_weight_qtensor) = loader.get_qtensor("attn_qkv.weight")?;
-        let qkv_weight_candle = qkv_weight_qtensor.dequantize(&Device::Cpu)?;
-        let mut unfused_weights =
-            unfuse_tensors(qkv_weight_candle, embedding_size * embedding_size)?;
-        ensure!(unfused_weights.len() == 3, "qkv_weight must have 3 chunks");
-        let q = KeyedTensor::new(
-            format!("{qkv_key}.q"),
-            crate::Tensor::new(
-                vec![embedding_size, hidden_size].into(),
-                unfused_weights.remove(0),
-            )
-            .transpose(),
-        );
-        let k = KeyedTensor::new(
-            format!("{qkv_key}.k"),
-            crate::Tensor::new(
-                vec![embedding_size, hidden_size].into(),
-                unfused_weights.remove(0),
-            )
-            .transpose(),
-        );
-        let v = KeyedTensor::new(
-            format!("{qkv_key}.v"),
-            crate::Tensor::new(
-                vec![embedding_size, hidden_size].into(),
-                unfused_weights.remove(0),
-            )
-            .transpose(),
-        );
-
-        let (qkv_bias_key, qkv_bias_qtensor) = loader.get_qtensor("attn_qkv.bias")?;
-        let qkv_bias_candle = qkv_bias_qtensor.dequantize(&Device::Cpu)?;
-        let mut unfused_biases = unfuse_tensors(qkv_bias_candle, embedding_size)?;
-        ensure!(unfused_biases.len() == 3, "qkv_bias must have 3 chunks");
-        let q_bias = KeyedTensor::new(
-            format!("{qkv_bias_key}.q"),
-            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
-        );
-        let k_bias = KeyedTensor::new(
-            format!("{qkv_bias_key}.k"),
-            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
-        );
-        let v_bias = KeyedTensor::new(
-            format!("{qkv_bias_key}.v"),
-            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
-        );
-
-        let attn_norm_loader = loader.pp("attn_");
-        // Use new LayerNorm::from_loader
-        let pre_norm = LayerNorm::from_loader(&attn_norm_loader, c)?;
-
-        // attn_output.weight is stored as [out_features, in_features] in GGUF (same as PyTorch)
-        // Our MatMul layer expects the right-hand constant to be in the orientation [in_features, out_features],
-        // so we transpose it once here after loading.
-        let out = loader
-            .get_tensor("attn_output.weight")?
-            .map_tensor(|t| t.transpose());
-        let out_bias = loader.get_tensor("attn_output.bias")?;
-        ensure!(
-            out.shape().as_ref() == &[embedding_size, embedding_size],
-            "out must have shape [hidden_size, hidden_size]"
-        );
-        ensure!(
-            out_bias.shape().as_ref() == &[embedding_size],
-            "out_bias must have shape [hidden_size]"
-        );
-
-        let ffn_norm_loader = loader.pp("ffn_");
-
-        let pre_ffn_norm = c
-            .variant
-            .norm_type()
-            .from_loader(&ffn_norm_loader, c, false)?;
-
-        // Use new FeedForward::from_loader
-        let ff = FeedForward::from_loader(loader, c)?;
-        Ok(Self {
-            out,
-            out_bias: Some(out_bias),
-            pre_norm: Norm::LayerNorm(pre_norm),
-            q,
-            q_bias: Some(q_bias),
-            q_norm: None,
-            k,
-            k_bias: Some(k_bias),
-            k_norm: None,
-            v,
-            v_bias: Some(v_bias),
-            pre_ffn_norm,
-            feedforward: ff,
-            post_norm: None,
-            post_ffn_norm: None,
-            span: AttentionSpan::Full,
-        })
-    }
     pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        if let LLMVariant::Gemma3 = c.variant {
-            bail!("Gemma3 is not supported yet for custom JSON format");
-        }
         let norm = LayerNorm::from_json(&l.pp("attn_"), c)
             .context("Failed to load LayerNorm for attention in from_json")?;
 
@@ -541,15 +321,29 @@ impl<N: Number> Norm<N> {
 }
 
 impl NormType {
-    pub fn from_loader(
+    pub fn from_gguf(
         &self,
-        loader: &FileTensorLoader,
+        loader: &gguf::FileTensorLoader,
         c: &LLMConfig,
         stack: bool,
     ) -> anyhow::Result<Norm<f32>> {
         Ok(match self {
-            NormType::LayerNorm => Norm::LayerNorm(LayerNorm::from_loader(loader, c)?),
-            NormType::RMSNorm => Norm::RMSNorm(RMSNorm::from_loader(loader, c, stack)?),
+            NormType::LayerNorm => Norm::LayerNorm(LayerNorm::from_gguf(loader, c)?),
+            NormType::RMSNorm => Norm::RMSNorm(RMSNorm::from_gguf(loader, c, stack)?),
+        })
+    }
+    pub fn from_safetensors(
+        &self,
+        loader: &safe::FileTensorLoader,
+        config: &safe::ConfigJSON,
+        c: &LLMConfig,
+        stack: bool,
+    ) -> anyhow::Result<Norm<f32>> {
+        Ok(match self {
+            NormType::LayerNorm => Norm::LayerNorm(LayerNorm::from_safetensors(loader, config, c)?),
+            NormType::RMSNorm => {
+                Norm::RMSNorm(RMSNorm::from_safetensors(loader, config, c, stack)?)
+            }
         })
     }
 }

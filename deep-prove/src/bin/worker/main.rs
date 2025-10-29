@@ -12,8 +12,9 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt::format::FmtSpan};
 use url::Url;
 use zkml::{
-    Element, FloatOnnxLoader, Prover, default_transcript,
+    Element, Prover, default_transcript,
     model::Model,
+    parser::onnx::FloatOnnxLoader,
     quantization::{AbsoluteMax, ModelMetadata},
 };
 

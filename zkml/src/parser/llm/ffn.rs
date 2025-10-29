@@ -6,15 +6,17 @@ use crate::{
         activation::{Activation, GeGlu},
         matrix_mul::MatMul,
     },
+};
+use anyhow::ensure;
+
+use crate::{
     model::Model,
     parser::{
-        gguf::FileTensorLoader,
         json,
-        llm::{LLMConfig, LLMVariant},
+        llm::{LLMConfig, config::LLMStructure},
     },
     tensor::KeyedTensor,
 };
-use anyhow::{bail, ensure};
 
 #[derive(Debug, Clone)]
 pub struct FeedForward<N: Number> {
@@ -28,7 +30,7 @@ pub struct FeedForward<N: Number> {
 impl FeedForward<f32> {
     pub fn write_to_model(
         self,
-        _config: &LLMConfig,
+        _config: &LLMStructure,
         model: &mut Model<f32>,
         input_node_id: NodeId,
     ) -> anyhow::Result<NodeId> {
@@ -61,66 +63,9 @@ impl FeedForward<f32> {
             model.add_consecutive_layer(Layer::MatMul(down), Some(activation_node_id))?;
         Ok(last_node_id)
     }
-    // Replaces from_var_builder and from_tensor_loader
-    // 'loader' is expected to be the block-level loader (e.g., scoped to "blk.N.")
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        let gate = match &c.variant {
-            LLMVariant::GPT2 => None,
-            LLMVariant::Gemma3 => {
-                let gate = loader
-                    .get_tensor("ffn_gate.weight")?
-                    .map_tensor(|t| t.transpose());
-                ensure!(
-                    gate.shape()[0] == c.hidden_size,
-                    "gate have shape {:?} but in features should be equal to hidden_size: {}",
-                    gate.shape(),
-                    c.hidden_size
-                );
-                Some(MatMul::new_constant(gate, None)?)
-            }
-        };
 
-        let up = loader
-            .get_tensor("ffn_up.weight")?
-            .map_tensor(|t| t.transpose());
-        let up_bias = if c.variant.has_biases() {
-            Some(loader.get_tensor("ffn_up.bias")?)
-        } else {
-            None
-        };
-        let down = loader
-            .get_tensor("ffn_down.weight")?
-            .map_tensor(|t| t.transpose());
-        let down_bias = if !c.variant.has_biases() {
-            None
-        } else {
-            Some(loader.get_tensor("ffn_down.bias")?)
-        };
-        ensure!(
-            up.shape()[0] == c.hidden_size,
-            "up have shape {:?} but in features should be equal to hidden_size: {}",
-            up.shape(),
-            c.hidden_size
-        );
-        ensure!(
-            down.shape()[1] == c.embedding_size,
-            "down have shape {:?} but out features should be equal to embedding_size: {}",
-            down.shape(),
-            c.embedding_size
-        );
-        Ok(Self {
-            gate,
-            up,
-            up_bias,
-            down,
-            down_bias,
-        })
-    }
-
+    /// only supports gpt2 for now
     pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        if let LLMVariant::Gemma3 = c.variant {
-            bail!("Gemma3 is not supported yet for custom JSON format");
-        }
         let up = l.get_tensor("ffn_up.weight")?;
         let up_bias = l.get_tensor("ffn_up.bias")?;
         let down = l.get_tensor("ffn_down.weight")?;

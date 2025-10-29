@@ -163,7 +163,7 @@ pub enum LayerCtx<E: ExtensionField> {
     RMSNorm(RMSNormCtx<E>),
     Flatten,
     Add(AddCtx),
-    Softmax(SoftmaxCtx<E>),
+    Softmax(SoftmaxCtx),
     Reshape(ReshapeCtx),
     Embeddings(EmbeddingsCtx),
     Positional(PositionalCtx),

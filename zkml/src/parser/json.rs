@@ -1,9 +1,26 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, ensure};
 use serde::Deserialize;
 
-use crate::{Shape, Tensor, tensor::KeyedTensor};
+use crate::{Shape, Tensor, parser::ModelNameProvider, tensor::KeyedTensor};
+
+pub struct RawJSON(pub PathBuf);
+
+impl RawJSON {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self(path.as_ref().to_path_buf())
+    }
+}
+
+impl ModelNameProvider for RawJSON {
+    fn model_metadata(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec!["gpt2".to_string()])
+    }
+}
 
 /// Generic helper function to unfuse a tensor's data into multiple chunks.
 /// Expects the input tensor `fused_tensor` (crate::Tensor<f32>) to contain flat data.
@@ -138,7 +155,7 @@ impl FileTensorLoader {
 
 #[cfg(test)]
 pub mod test {
-    use crate::parser::llm::LLMConfig;
+    use crate::parser::llm::{LLMConfig, LLMModel, models::gpt2::gpt2_structure};
     use std::path::PathBuf;
 
     use super::*;
@@ -167,7 +184,12 @@ pub mod test {
         println!("loader keys: {:?}", loader.content.metadata.keys());
         let config = LLMConfig::from_json(&loader)?;
         println!("tiny gpt2 config: {config:?}");
-        config.model_json(&loader)?;
+        let model = LLMModel::from_json(&loader, &config)?;
+        let structure = gpt2_structure(&config);
+        let init_user_shape = Shape::from(vec![1]);
+        let model = model.into_provable_model(&structure, init_user_shape)?;
+        let input = Tensor::new(Shape::from(vec![1]), vec![512.0]);
+        model.run_float(std::slice::from_ref(&input))?;
         Ok(())
     }
 }

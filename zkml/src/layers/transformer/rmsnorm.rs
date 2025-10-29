@@ -28,16 +28,16 @@ use crate::{
     number::Number,
     padding::PaddingMode,
     parser::{
-        gguf::FileTensorLoader,
-        json,
-        llm::{LLMConfig, LLMVariant},
+        gguf, json,
+        llm::{LLMConfig, transformer::NormType},
+        safe,
     },
     quantization::{self, Fieldizer},
     shape::Shape,
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_base,
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use ark_std::Zero;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -267,35 +267,55 @@ impl RMSNorm<f32> {
         let eps = l.metadata_to_f32("norm_epsilon")?;
         Self::new(Some(alpha), eps, None)
     }
+
+    fn hack_stack_gqa(alpha: KeyedTensor<f32>, c: &LLMConfig) -> KeyedTensor<f32> {
+        alpha.map_tensor(|alpha| {
+            let (it, _) = alpha.slice_on_dim(0);
+            let data = it
+                .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut shape = alpha.shape().clone();
+            let new_dim = shape.dim(-1) * c.num_heads;
+            shape.set_dim(-1, new_dim);
+            Tensor::new(shape, data)
+        })
+    }
     // Replaces from_var_builder and from_tensor_loader
     // The 'loader' passed here is expected to be pre-scoped by the caller
     // (e.g., loader.pp("attn_") or loader.pp("ffn_"))
     // HACK NOTE: "stack" is a temporary measure to counter the fact we dont have full GQA support yet
     // so we stack K and V and therefore we need to stack the norms as well
-    pub fn from_loader(
-        loader: &FileTensorLoader,
+    pub fn from_gguf(
+        loader: &gguf::FileTensorLoader,
         c: &LLMConfig,
         stack: bool,
     ) -> anyhow::Result<Self> {
         let mut alpha = loader.get_tensor("norm.weight")?;
-        if matches!(c.variant, LLMVariant::Gemma3) && stack {
-            alpha = alpha.map_tensor(|alpha| {
-                let (it, _) = alpha.slice_on_dim(0);
-                let data = it
-                    .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut shape = alpha.shape().clone();
-                let new_dim = shape.dim(-1) * c.num_heads;
-                shape.set_dim(-1, new_dim);
-                Tensor::new(shape, data)
-            });
+        if stack {
+            alpha = Self::hack_stack_gqa(alpha, c);
         }
         // we can have any checks on the shape alpha here since it depends of the context
         // a RMSNorm after  Q doesn't have the same shape as a RMSNorm after K or inside FeedForward etc
         let eps = loader
-            .metadata::<f32>(c.variant.norm_epsilon_key())
+            .metadata::<f32>(&loader.norm_epsilon_key(&c.model_name, NormType::RMSNorm))
             .unwrap_or_default();
+        Self::new(Some(alpha), eps, None)
+    }
+
+    pub fn from_safetensors(
+        loader: &safe::FileTensorLoader,
+        config: &safe::ConfigJSON,
+        c: &LLMConfig,
+        stack: bool,
+    ) -> anyhow::Result<Self> {
+        let mut alpha = loader.get_tensor("norm.weight")?;
+        if stack {
+            alpha = Self::hack_stack_gqa(alpha, c);
+        }
+        let eps = config
+            .get::<f32, _>("rms_norm_eps")
+            .context("norm_epsilon not found")?;
         Self::new(Some(alpha), eps, None)
     }
 }

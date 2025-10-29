@@ -14,7 +14,7 @@ use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, fmt};
-use zkml::FloatOnnxLoader;
+use zkml::parser::onnx::FloatOnnxLoader;
 
 use serde::{Deserialize, Serialize};
 use zkml::{Element, Prover, argmax, default_transcript, verify};

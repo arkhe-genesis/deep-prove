@@ -54,6 +54,7 @@ timed-core = { git = "https://github.com/nikkolasg/timed-rs" }
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tract-onnx = "0.21"
+ureq = { version = "3.1.2", features = ["default", "json"] }
 
 ceno-p3 = { package = "p3", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 ff_ext = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }

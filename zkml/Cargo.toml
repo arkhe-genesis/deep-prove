@@ -55,6 +55,7 @@ either = { workspace = true }
 ff_ext = { workspace = true }
 get-size2 = "0.6.2"
 gguf-rs = "0.1.4"
+half = "2.4.1"
 hex = { workspace = true }
 humansize = "2.1.3"
 itertools.workspace = true
@@ -68,6 +69,7 @@ postcard = { version = "1.1.3", features = ["use-std"] }
 prost-tract-compat = { package = "prost", version = "0.11.9" }
 rayon.workspace = true
 rmp-serde.workspace = true
+safetensors = "0.6.2"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"
@@ -86,6 +88,7 @@ tracing-subscriber = { workspace = true, features = [
 ] }
 tract-onnx = { workspace = true }
 transcript = { workspace = true }
+ureq = { workspace = true }
 utils = { path = "../utils" }
 witness = { workspace = true }
 

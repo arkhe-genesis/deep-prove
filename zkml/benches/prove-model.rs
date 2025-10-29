@@ -3,9 +3,10 @@ use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use tenstore::GenStore;
 use zkml::{
-    Element, FloatOnnxLoader, Prover, default_transcript,
+    Element, Prover, default_transcript,
     inputs::Input,
     model::Model,
+    parser::onnx::FloatOnnxLoader,
     quantization::{AbsoluteMax, ModelMetadata},
     verify,
 };

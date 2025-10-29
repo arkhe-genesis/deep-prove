@@ -74,16 +74,21 @@ jobs:
         run: cargo check --all --tests --benches
         env:
           RUSTFLAGS: "-W warnings"
+          IN_CI: "true"
 
       - name: Run light tests
         if: github.event.pull_request.draft == true
         shell: devenv shell bash -- -e {0}
         run: cargo nextest run -- --skip test_llm_driver_prove_
+        env:
+          IN_CI: "true"
 
       - name: Run all tests
         if: github.event.pull_request.draft == false
         shell: devenv shell bash -- -e {0}
         run: cargo nextest run
+        env:
+          IN_CI: "true"
 
       - name: Run doc tests
         shell: devenv shell bash -- -e {0}

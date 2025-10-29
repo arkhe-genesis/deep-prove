@@ -10,7 +10,11 @@ use zkml::{
     model::llm::{LLMContext, LLMTokenizerObserver},
     parser::{
         file_cache,
-        llm::tokenizer::{HFTokenizer, LLMTokenizer},
+        gguf::RawGGUF,
+        llm::{
+            models::gpt2::GPT2,
+            tokenizer::{LLMTokenizer, TokenizerLoader},
+        },
     },
 };
 
@@ -65,12 +69,12 @@ fn main() -> anyhow::Result<()> {
     timed_core::set_output(Output::CSV("bench-llm.csv".to_string()));
     let args = LLMArgs::parse();
     let model_path = file_cache::from_cache(&args.gguf)?;
+    let format = RawGGUF::new(model_path);
 
-    let (driver, tokenizer) = match args.model.as_str() {
-        "gpt2" => {
-            let driver =
-                Driver::load_external_model(&model_path)?.with_max_context(args.max_context);
-            let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+    let (driver, tokenizer) = match args.model.to_lowercase().as_str() {
+        zkml::parser::llm::models::gpt2::GPT2_NAME => {
+            let driver = Driver::load_from_model(GPT2, &format, Some(args.max_context))?;
+            let tokenizer = GPT2.load_tokenizer(&format)?;
             (driver, tokenizer)
         }
         _ => bail!("Model {:?} not supported", args.model),
@@ -84,7 +88,7 @@ fn main() -> anyhow::Result<()> {
         HEADER_ACCURACY,
         HEADER_MODEL_QUANT,
     ]);
-    let driver = bencher.r(HEADER_MODEL_QUANT, || driver.into_provable_llm())?;
+    let driver = bencher.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
     let ctx: LLMContext<F, Pcs<F>> = bencher.r(HEADER_CONTEXT_TIME, || driver.context())?;
 
     bencher.set(HEADER_MODEL, args.model);

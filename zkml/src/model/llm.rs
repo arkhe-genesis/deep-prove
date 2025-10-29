@@ -8,7 +8,12 @@ use crate::{
     IO, Proof, Prover, ProverContext,
     iop::context::VerifierContext,
     padding::PaddingMode,
-    quantization::{InferenceObserver, IntoElement, ScalingStrategy},
+    parser::{
+        PipelineConfig, default_pipeline_config,
+        llm::{LLMConfig, LLMTokenizer, Token, models::LLMModelLoader},
+        to_quantized,
+    },
+    quantization::{InferenceObserver, IntoElement},
     tensor::TensorTypeParam,
     verify,
 };
@@ -18,7 +23,6 @@ use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::path::Path;
 use tenstore::GenStore;
 use tracing::{debug, info};
 use transcript::BasicTranscript;
@@ -28,11 +32,6 @@ use crate::{
     layers::{Layer, provable::Evaluate},
     model::{InferenceTrace, Model},
     number::Number,
-    padding::pad_model,
-    parser::{
-        gguf, json,
-        llm::{LLMConfig, LLMTokenizer, Token},
-    },
 };
 
 pub trait Observer<N: TensorTypeParam> {
@@ -93,79 +92,59 @@ where
 }
 
 impl Driver<f32> {
-    /// Loads a model from a gguf or json external file. It returns the raw model in float precision.
-    pub fn load_external_model<S: AsRef<Path>>(path: S) -> anyhow::Result<Self> {
-        // detect the type of the model info, either json or gguf depending on the file extension
-        let (config, llm_model) = match path
-            .as_ref()
-            .extension()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap()
-        {
-            "json" => {
-                let loader = json::FileTensorLoader::new_from_path(path)?;
-                let config = LLMConfig::from_json(&loader)?;
-                let llm_model = config.model_json(&loader)?;
-                (config, llm_model)
-            }
-            "gguf" => {
-                let loader = gguf::FileTensorLoader::from_path(path)?;
-                let config = LLMConfig::from_content(&loader)?;
-                let llm_model = config.model(&loader)?;
-                (config, llm_model)
-            }
-            _ => anyhow::bail!(
-                "Unsupported model file extension: {}",
-                path.as_ref()
-                    .extension()
-                    .unwrap_or_default()
-                    .to_str()
-                    .unwrap()
-            ),
-        };
-
-        // even though the llm runtime doesn't care about the model input shape, which is designed for "static" input shapes, we still
-        // need to provide one.
-        let init_user_shape = Shape::from(vec![1]);
-        let model = llm_model.into_provable_model(&config, init_user_shape)?;
+    /// Loads a model from a gguf, safetensors, or json external file. It returns the raw model in float precision.
+    /// NOTE: the max_context is only there to hack around the creation of Rope to avoid loading the full matrix if we don't need it. That should
+    /// be removed if when we remove this hack.
+    pub fn load_from_model<DataFormat, M: LLMModelLoader<DataFormat>>(
+        mut model_type: M,
+        data_format: &DataFormat,
+        max_context: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        if let Some(max_context) = max_context {
+            model_type = model_type.with_max_context_length(max_context);
+        }
+        let (model, config) = model_type.parse(data_format)?;
         Ok(Self {
             model,
             config,
-            max_context: None,
-            padding_mode: PaddingMode::NoPadding,
-        })
-    }
-
-    pub fn into_runnable_llm(mut self) -> anyhow::Result<Driver<Element>> {
-        let numel = self.max_context.unwrap_or(self.config.context_length);
-        let n_inputs = 1;
-        let representative_inputs = (0..n_inputs)
-            .map(|_| {
-                self.random_sequence(numel)
-                    .into_iter()
-                    .map(|t| t.as_number())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        self.model.unpadded_input_shapes = vec![Shape::from(vec![numel])];
-        self.model.input_shapes = vec![Shape::from(vec![numel, 1])];
-        let (quantized_model, _md) =
-            InferenceObserver::new_with_representative_input(vec![representative_inputs])
-                .quantize(self.model, &mut GenStore::default())?;
-        Ok(Driver {
-            model: quantized_model,
-            config: self.config,
-            max_context: self.max_context,
+            max_context,
             padding_mode: PaddingMode::NoPadding,
         })
     }
 
     /// Transform the model into a provable llm model with quantization and padding done.
     /// The result can be serialized and deserialized at will to serve inference+proving for this model.
-    pub fn into_provable_llm(self) -> anyhow::Result<Driver<Element>> {
-        let quantized_llm = self.into_runnable_llm()?;
-        quantized_llm.pad_model()
+    pub fn into_provable_llm<'a>(
+        self,
+        mut pipeline_config: Option<PipelineConfig<'a, InferenceObserver>>,
+    ) -> anyhow::Result<Driver<Element>> {
+        let numel = self.max_context.unwrap_or(self.config.context_length);
+        let n_inputs = 1;
+        let representative_inputs = (0..n_inputs)
+            .map(|_| {
+                self.random_sequence(numel)
+                    .into_iter()
+                    .map(|t| t.as_number::<f32>())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let quantization_strategy =
+            InferenceObserver::new_with_representative_input(vec![representative_inputs]);
+        let conf = pipeline_config.take().unwrap_or_else(|| {
+            // override the shapes to adhere to the expected input shape of the representative inputs
+            default_pipeline_config()
+                .with_strategy(quantization_strategy)
+                .with_input_shapes(vec![Shape::from(vec![numel])])
+        });
+        let mut quantized_model = to_quantized(self.model, conf)?;
+        // just set to one because we run one token after another to derive the full trace.
+        quantized_model.input_shapes = vec![Shape::from(vec![1])];
+        Ok(Driver {
+            model: quantized_model,
+            config: self.config,
+            max_context: self.max_context,
+            padding_mode: PaddingMode::Padding,
+        })
     }
 
     pub fn run<E>(
@@ -357,18 +336,6 @@ impl Driver<Element> {
         self.run_internal::<E>(input, observer)
     }
 
-    pub fn pad_model(mut self) -> anyhow::Result<Self> {
-        let numel = self.max_context.unwrap_or(self.config.context_length);
-        self.model.input_shapes = vec![Shape::from(vec![numel, 1]).next_power_of_two()];
-        let model = pad_model(self.model)?;
-        Ok(Self {
-            model,
-            config: self.config,
-            max_context: self.max_context,
-            padding_mode: PaddingMode::Padding,
-        })
-    }
-
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
     /// It returns a `HashMap` which associates a given context to the maximum polynomial size supported
     /// by that context. The proper context to be used for a given input size `input_len` is found in the
@@ -555,17 +522,25 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        init_test_logging,
+        Number, init_test_logging,
+        model::llm::{Driver, LLMContext, LLMTokenizerObserver},
         parser::{
             file_cache,
-            gguf::tests::{GEMMA3_Q8, GPT2_Q8_0},
-            llm::{HFTokenizer, Token},
+            gguf::{RawGGUF, TensorLoader},
+            llm::{
+                HFTokenizer, LLMTokenizer, Token,
+                models::{
+                    gemma3::{Gemma3, tests::GEMMA3_Q8},
+                    gpt2::{GPT2, tests::GPT2_Q8_0},
+                },
+                tokenizer::TokenizerLoader,
+            },
         },
         testing::Pcs,
     };
-
-    use super::*;
+    use anyhow::Context;
     use ff_ext::GoldilocksExt2;
+    use tracing::info;
 
     #[test]
     fn test_llm_driver_prove_gpt2() -> anyhow::Result<()> {
@@ -573,8 +548,9 @@ mod test {
         init_test_logging("debug");
 
         // Load the model file
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
+        // Load the model file
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let cache_filename = {
             let mut hasher = blake3::Hasher::new();
             hasher
@@ -587,9 +563,12 @@ mod test {
         // Generate or load the prover & verifier contexts
         let (driver, ctx): (_, LLMContext<GoldilocksExt2, Pcs<GoldilocksExt2>>) =
             file_cache::deserialize_or_create_with(&cache_filename, || {
-                let driver = Driver::load_external_model(&model_path)?
-                    .with_max_context(MAX_CONTEXT)
-                    .into_provable_llm()?;
+                let driver = Driver::load_from_model(
+                    GPT2,
+                    &RawGGUF::new(model_path.clone()),
+                    Some(MAX_CONTEXT),
+                )?
+                .into_provable_llm(None)?;
 
                 let ctx = driver
                     .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
@@ -600,7 +579,7 @@ mod test {
 
         // Generate the trace
         let sentence = "The sky is";
-        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path))?;
         let user_tokens = tokenizer.tokenize(sentence);
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
@@ -632,13 +611,11 @@ mod test {
         const PRUNED_GPT2: &str = "gpt2.Q2_K.gguf";
         let model_path = file_cache::from_cache(PRUNED_GPT2)?;
         // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
-        let driver = Driver::load_external_model(&model_path)?
-            .with_max_context(6)
-            .into_runnable_llm()?;
+        let driver = Driver::load_from_model(GPT2, &RawGGUF::new(model_path.clone()), Some(6))?;
         let sentence = "The sky is";
 
         // Best to load the tokenizer from the gguf file if it's available.
-        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path.clone()))?;
         let user_tokens = tokenizer.tokenize(sentence);
         let detokenized = tokenizer.detokenize(&user_tokens);
         assert_eq!(detokenized, sentence);
@@ -668,13 +645,13 @@ mod test {
     fn test_llm_driver_prove_gemma3() -> anyhow::Result<()> {
         init_test_logging("debug");
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
-        let driver = Driver::load_external_model(&model_path)?.with_max_context(6);
+        let gguf = RawGGUF::new(model_path.clone());
+        let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(6))?;
 
-        let driver = driver.into_runnable_llm()?;
         println!("LLM DRIVER: config: {:?}", driver.config);
 
         let sentence = "The sky is";
-        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens,
@@ -713,11 +690,11 @@ mod test {
         };
 
         // Generate or load the prover & verifier contexts
-        let (mut driver, ctx): (_, LLMContext<GoldilocksExt2, Pcs<GoldilocksExt2>>) =
+        let (driver, ctx): (_, LLMContext<GoldilocksExt2, Pcs<GoldilocksExt2>>) =
             file_cache::deserialize_or_create_with(&cache_filename, || {
-                let driver = Driver::load_external_model(&model_path)?
-                    .with_max_context(MAX_CONTEXT)
-                    .into_provable_llm()?;
+                let gguf = RawGGUF::new(model_path.clone());
+                let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(MAX_CONTEXT))?
+                    .into_provable_llm(None)?;
 
                 let ctx = driver
                     .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
@@ -729,10 +706,9 @@ mod test {
         println!("LLM DRIVER: config: {:?}", driver.config);
         // Generate the trace
         let sentence = "The sky is";
-        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let loader = TensorLoader::from_path(model_path)?;
+        let tokenizer = HFTokenizer::sentencepiece_from_gguf(&loader)?;
         let user_tokens = tokenizer.tokenize(sentence);
-
-        driver = driver.pad_model()?;
 
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),

@@ -1,5 +1,6 @@
 //! Deepprove library
 #![feature(iter_next_chunk)]
+#![feature(min_specialization)]
 #![feature(exact_size_is_empty)]
 
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
@@ -35,7 +36,6 @@ pub use iop::{
     prover::Prover,
     verifier::{IO, verify},
 };
-pub use parser::{FloatOnnxLoader, ModelType};
 pub use quantization::{ScalingFactor, ScalingStrategy};
 pub use shape::Shape;
 pub use tensor::Tensor;
@@ -248,9 +248,9 @@ mod test {
     use tenstore::GenStore;
 
     use crate::{
-        FloatOnnxLoader, default_transcript,
+        default_transcript,
         iop::{prover::Prover, verifier::verify},
-        parser::ModelType,
+        parser::onnx::FloatOnnxLoader,
         rng_from_env_or_random,
         tensor::Tensor,
         testing::Pcs,
@@ -274,9 +274,7 @@ mod test {
 
     fn test_model_run_helper() -> anyhow::Result<()> {
         let filepath = workspace_root().join("zkml/assets/model.onnx");
-        let (model, _md) = FloatOnnxLoader::new(&filepath.to_string_lossy())
-            .with_model_type(ModelType::MLP)
-            .build()?;
+        let (model, _md) = FloatOnnxLoader::new(&filepath.to_string_lossy()).build()?;
 
         println!("[+] Loaded onnx file");
         let (prover_ctx, verifier_ctx) = model

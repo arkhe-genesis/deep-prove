@@ -1,3 +1,13 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use tracing::debug;
+
 use crate::{
     Element, Shape, Tensor,
     graph::{Node, NodeInput, NodeOutput, order_by_in_port},
@@ -6,7 +16,7 @@ use crate::{
         dense::Dense,
         flatten::Flatten,
         matrix_mul::{MatMul, OperandMatrix},
-        pooling::Pooling,
+        pooling::{Pooling, safe_maxpool2d_shape},
         provable::{OpInfo, PadOp},
         reshape::Reshape,
         transformer::{
@@ -15,16 +25,7 @@ use crate::{
         },
     },
     model::Model,
-    parser::safe_maxpool2d_shape,
 };
-use anyhow::{Context, Result, bail, ensure};
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
-use tracing::debug;
 
 #[derive(Clone, Debug)]
 pub enum GarbagePad {

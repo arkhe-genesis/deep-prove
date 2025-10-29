@@ -7,7 +7,7 @@ use anyhow::Context;
 use deep_prove::store::MemStore;
 use memmap2::Mmap;
 use tracing::info;
-use zkml::{ModelType, inputs::Input, quantization::ScalingStrategyKind};
+use zkml::{inputs::Input, quantization::ScalingStrategyKind};
 
 use crate::RunMode;
 
@@ -25,21 +25,6 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
     let model = unsafe { Mmap::map(&model_file) }
         .context("mmap-ing model file")?
         .to_vec();
-
-    let proto = {
-        use prost_tract_compat::Message;
-        tract_onnx::pb::ModelProto::decode(&*model).context("decoding ModelProto")?
-    };
-    let model_type = onnx
-        .extension()
-        .and_then(|ext| match ext.to_ascii_lowercase().to_str() {
-            Some("cnn") => Some(ModelType::CNN),
-            Some("mlp") => Some(ModelType::MLP),
-            _ => None,
-        });
-    if let Some(model_type) = model_type {
-        model_type.validate_proto(&proto)?;
-    }
 
     let scaling_strategy = ScalingStrategyKind::AbsoluteMax;
     let scaling_input_hash = None;

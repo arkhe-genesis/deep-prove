@@ -20,14 +20,17 @@ use crate::{
     model::StepData,
     padding::{PaddingMode, ShapeInfo},
     parser::{
-        gguf::FileTensorLoader,
-        json,
-        llm::{LLMConfig, LLMVariant, transformer::expand},
+        gguf, json,
+        llm::{
+            LLMConfig,
+            config::{AttentionHeadType, LLMStructure, PositionalConfig},
+            transformer::expand,
+        },
     },
     quantization::{Fieldizer, TensorFielder},
     tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
-use anyhow::{Ok, bail, ensure};
+use anyhow::{Context, Ok, bail, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
@@ -482,43 +485,56 @@ impl PadOp for Positional<Element> {
 }
 
 impl Positional<f32> {
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        match c.variant {
-            LLMVariant::Gemma3 => {
-                let base_freq_id = "gemma3.rope.freq_base";
+    /// HACK: Currently since we don't support GQA officially, we emulate it by stacking the tensors multiple times
+    /// This is a temporary solution to allow GQA to work, and will be removed once we support GQA officially.
+    fn hack_stack_gqa(p: Self, c: &LLMStructure) -> anyhow::Result<Self> {
+        if let AttentionHeadType::GQA(_) = c.attention_config.head {
+            let PositionalVariant::Rope(mut rope) = p.variant else {
+                bail!("Expected Rope variant for gemma3");
+            };
+            rope.cosine_matrix = rope
+                .cosine_matrix
+                .map_tensor(|t| expand(t, c.generic.num_heads));
+            rope.sine_matrix = rope
+                .sine_matrix
+                .map_tensor(|t| expand(t, c.generic.num_heads));
+            rope.unpadded_shape
+                .set_dim(-1, rope.unpadded_shape.dim(-1) * c.generic.num_heads);
+            Ok(Positional::new_from_variant(PositionalVariant::Rope(rope)))
+        } else {
+            Ok(p)
+        }
+    }
+    pub fn from_gguf(loader: &gguf::FileTensorLoader, c: &LLMStructure) -> anyhow::Result<Self> {
+        match c.positional_config {
+            PositionalConfig::Rope(max_ctx_length) => {
+                let base_freq_id = format!("{}.rope.freq_base", c.generic.model_name);
                 let freq_base = loader
-                    .metadata::<f32>(base_freq_id)
-                    .ok_or(anyhow::anyhow!("gemma3.rope.freq_base not found"))?;
-                let head_size = c.head_size;
-                let max_content_length = c.max_sequence_length();
+                    .metadata::<f32>(&base_freq_id)
+                    .ok_or(anyhow::anyhow!("rope.freq_base not found"))?;
+                let head_size = c.generic.head_size;
                 let p = Self::new_rope_from_frequency(
                     freq_base,
                     base_freq_id.to_string().into(),
                     head_size,
-                    max_content_length,
+                    max_ctx_length,
                 )?;
-                let PositionalVariant::Rope(mut rope) = p.variant else {
-                    bail!("Expected Rope variant for gemma3");
-                };
-                rope.cosine_matrix = rope.cosine_matrix.map_tensor(|t| expand(t, c.num_heads));
-                rope.sine_matrix = rope.sine_matrix.map_tensor(|t| expand(t, c.num_heads));
-                rope.unpadded_shape
-                    .set_dim(-1, rope.unpadded_shape.dim(-1) * c.num_heads);
-                Ok(Positional::new_from_variant(PositionalVariant::Rope(rope)))
+                // HACK: right now we emulate GQA by stacking tensors multiple times.
+                Self::hack_stack_gqa(p, c)
             }
-            LLMVariant::GPT2 => {
+            PositionalConfig::FixedPositional => {
                 let position_embd = loader.get_tensor("position_embd.weight")?;
                 let shape = position_embd.shape();
                 ensure!(
-                    shape[0] == c.context_length,
+                    shape[0] == c.generic.context_length,
                     "position_embd must have shape [{}] vs given {:?}",
-                    c.context_length,
+                    c.generic.context_length,
                     position_embd.shape()
                 );
                 ensure!(
-                    shape[1] == c.embedding_size,
+                    shape[1] == c.generic.embedding_size,
                     "position_embd must have shape [{}] vs given {:?}",
-                    c.embedding_size,
+                    c.generic.embedding_size,
                     position_embd.shape()
                 );
                 Ok(Self::new_absolute(position_embd))
@@ -541,6 +557,48 @@ impl Positional<f32> {
             position_embd.shape()
         );
         Ok(Self::new_absolute(position_embd))
+    }
+    pub fn from_safetensors_loader(
+        loader: &crate::parser::safe::FileTensorLoader,
+        safe_config: &crate::parser::safe::ConfigJSON,
+        c: &LLMStructure,
+    ) -> anyhow::Result<Self> {
+        match c.positional_config {
+            PositionalConfig::Rope(max_ctx_length) => {
+                // Build angles per head and repeat across heads (no theta in safetensors header here)
+                let head_size = c.generic.head_size;
+                let base_freq_id = "rope_local_base_freq".to_string();
+                let base_freq = safe_config
+                    .get::<f32, _>(&base_freq_id)
+                    .context("rope_local_base_freq not found")?;
+                let p = Self::new_rope_from_frequency(
+                    base_freq,
+                    base_freq_id.into(),
+                    head_size,
+                    max_ctx_length,
+                )?;
+                Self::hack_stack_gqa(p, c)
+            }
+            PositionalConfig::FixedPositional => {
+                let position_embd = loader
+                    .get_tensor("position_embd.weight")
+                    .or_else(|_| loader.get_tensor("transformer.wpe.weight"))?;
+                let shape = position_embd.shape();
+                ensure!(
+                    shape[0] == c.generic.context_length,
+                    "position_embd must have shape [{}] vs given {:?}",
+                    c.generic.context_length,
+                    position_embd.shape()
+                );
+                ensure!(
+                    shape[1] == c.generic.embedding_size,
+                    "position_embd must have shape [{}] vs given {:?}",
+                    c.generic.embedding_size,
+                    position_embd.shape()
+                );
+                Ok(Self::new_absolute(position_embd))
+            }
+        }
     }
 }
 

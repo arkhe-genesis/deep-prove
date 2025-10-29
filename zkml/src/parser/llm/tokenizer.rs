@@ -1,4 +1,5 @@
 use ahash::AHashMap;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -10,41 +11,42 @@ use tokenizers::{
     tokenizer::Tokenizer as InnerTokenizer,
 };
 
-use crate::parser::{
-    gguf::FileTensorLoader,
-    llm::{LLMVariant, Token as LLMToken},
-};
+use crate::parser::{gguf::FileTensorLoader, llm::Token as LLMToken};
 
 /// A trait for tokenizers that can be used to tokenize and detokenize text.
-pub trait LLMTokenizer {
+pub trait LLMTokenizer:
+    Send + Sync + std::fmt::Debug + Clone + Serialize + for<'a> Deserialize<'a>
+{
     /// Tokenize a sentence into a vector of tokens
     fn tokenize(&self, sentence: &str) -> Vec<LLMToken>;
     /// Detokenize a vector of tokens back into a string
     fn detokenize(&self, ids: &[LLMToken]) -> String;
 }
 
+/// A trait for loading a tokenizer from a given model data.
+pub trait TokenizerLoader<DataFormat> {
+    // NOTE: for now, no need for generics for the tokenizer, will revisit down the line
+    fn load_tokenizer(&self, raw: &DataFormat) -> anyhow::Result<HFTokenizer>;
+}
+
 /// Wrapper around the HuggingFace tokenizers library
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HFTokenizer {
     /// The underlying HuggingFace tokenizer
     tokenizer: InnerTokenizer,
 }
 
 impl HFTokenizer {
-    pub fn from_gguf_path(path: &Path) -> Result<Self> {
-        let loader = FileTensorLoader::from_path(path)?;
-        Self::from_loader(&loader)
-    }
-    /// Create a tokenizer from a GGUF file loader
-    pub fn from_loader(loader: &FileTensorLoader) -> Result<Self> {
-        let variant = LLMVariant::from_loader(loader)?;
-        match variant {
-            LLMVariant::GPT2 => Self::bpe_from_loader(loader),
-            LLMVariant::Gemma3 => Self::sentencepiece_from_loader(loader),
-        }
+    /// Create a tokenizer directly from a `tokenizer.json` file.
+    /// This leverages the full pipeline stored in the JSON (pre-tokenizers, decoders, etc.).
+    pub fn from_tokenizer_json_path(path: &Path) -> Result<Self> {
+        let tokenizer = InnerTokenizer::from_file(path)
+            .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
+        Ok(Self { tokenizer })
     }
 
     /// Create a SentencePiece/Unigram tokenizer from GGUF loader
-    pub fn sentencepiece_from_loader(loader: &FileTensorLoader) -> Result<Self> {
+    pub fn sentencepiece_from_gguf(loader: &FileTensorLoader) -> Result<Self> {
         let tokens = loader
             .metadata::<Vec<Value>>("tokenizer.ggml.tokens")
             .context("tokens metadata not found")?
@@ -86,7 +88,7 @@ impl HFTokenizer {
     }
 
     /// Create a BPE tokenizer from GGUF loader
-    pub fn bpe_from_loader(loader: &FileTensorLoader) -> Result<Self> {
+    pub fn bpe_from_gguf(loader: &FileTensorLoader) -> Result<Self> {
         let tokens = loader
             .metadata::<Vec<Value>>("tokenizer.ggml.tokens")
             .unwrap()
@@ -188,23 +190,50 @@ fn parse_merges(merges: &[String]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use crate::parser::{
-        file_cache,
-        gguf::tests::{GEMMA3_Q8, GPT2_Q8_0},
+        ModelNameProvider, file_cache,
+        gguf::RawGGUF,
+        llm::models::{
+            gemma3::{Gemma3, is_gemma3_model, tests::GEMMA3_Q8},
+            gpt2::{GPT2, is_gpt2_model, tests::GPT2_Q8_0},
+        },
     };
+    use std::path::PathBuf;
 
     use super::*;
 
     #[test]
     fn test_tokenizer_from_gguf_path() -> anyhow::Result<()> {
         let paths = vec![GPT2_Q8_0, GEMMA3_Q8];
-        for path in paths {
-            let path = file_cache::from_cache(path)?;
-            let tokenizer = HFTokenizer::from_gguf_path(&path)?;
+        for opath in paths {
+            let path = file_cache::from_cache(opath)?;
+            let mygguf = RawGGUF::new(path);
+            let model_names = mygguf.model_metadata()?;
+            let tokenizer = if is_gemma3_model(&model_names) {
+                Gemma3::new().load_tokenizer(&mygguf)?
+            } else if is_gpt2_model(&model_names) {
+                GPT2::new().load_tokenizer(&mygguf)?
+            } else {
+                bail!("Unknown model: {}", opath);
+            };
             let s = "do or don't. there is no try.";
             let tokens = tokenizer.tokenize(s);
             let s2 = tokenizer.detokenize(&tokens);
-            assert_eq!(s, s2, "failing token for model {}", path.display());
+            assert_eq!(s, s2, "failing token for model {}", opath);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_tokenizer_from_json_path() -> anyhow::Result<()> {
+        let path = PathBuf::from("assets/scripts/llms/tokenizer.json");
+        if !path.exists() {
+            return Ok(());
+        }
+        let tokenizer = HFTokenizer::from_tokenizer_json_path(&path)?;
+        let s = "do or don't. there is no try.";
+        let tokens = tokenizer.tokenize(s);
+        let s2 = tokenizer.detokenize(&tokens);
+        assert_eq!(s, s2);
         Ok(())
     }
 }

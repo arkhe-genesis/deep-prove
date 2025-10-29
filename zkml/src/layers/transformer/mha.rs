@@ -59,7 +59,7 @@ pub struct MhaCtx<E: ExtensionField> {
     node_id: NodeId,
     inputs_reshape: ReshapeCtx,
     final_mul: ConcatMatMulCtx,
-    softmax: SoftmaxCtx<E>,
+    softmax: SoftmaxCtx,
     mask: AttentionMaskCtx<E>,
     qk: ConcatMatMulCtx,
     final_reshape: ReshapeCtx,
@@ -541,7 +541,7 @@ impl ProveInfo for Mha<Element> {
             unreachable!()
         };
 
-        let (ctx, mut aux) = self.softmax.step_info(id, aux)?;
+        let (ctx, mut aux) = self.softmax.step_info::<E>(id, aux)?;
 
         let LayerCtx::Softmax(softmax_ctx) = ctx else {
             unreachable!()
@@ -1087,9 +1087,12 @@ mod test {
         padding::pad_model,
         parser::{
             file_cache,
-            gguf::{FileTensorLoader, tests::GPT2_Q8_0},
+            gguf::FileTensorLoader,
             json::{self, test::TINY_GPT2_DEBUG_NAME},
-            llm::LLMConfig,
+            llm::{
+                Attention, LLMConfig, LLMModel,
+                models::gpt2::{GPT2_GGUF_NAME, gpt2_structure, tests::GPT2_Q8_0},
+            },
         },
         quantization::{self, Fieldizer},
         tensor::KeyedTensor,
@@ -1610,8 +1613,9 @@ mod test {
         let debug_output_path = json::test::get_json_file(TINY_GPT2_DEBUG_NAME)?;
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let loader = FileTensorLoader::from_path(model_path)?;
-        let config = LLMConfig::from_content(&loader)?;
-        let llm_model = config.model(&loader)?;
+        let config = LLMConfig::from_gguf(&loader, GPT2_GGUF_NAME)?;
+        let structure = gpt2_structure(&config);
+        let llm_model = LLMModel::from_gguf(&loader, &structure, Attention::from_gguf_gpt2)?;
         let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
             File::open(debug_output_path.clone())
                 .context(format!("failed to open file {}", debug_output_path.clone()))?,

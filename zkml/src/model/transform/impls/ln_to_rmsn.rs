@@ -436,9 +436,13 @@ mod tests {
         init_test_logging,
         model::llm::{Driver, LLMTokenizerObserver},
         parser::{
-            file_cache,
-            gguf::tests::GPT2_Q8_0,
-            llm::{HFTokenizer, LLMTokenizer},
+            default_pipeline_config, file_cache,
+            gguf::RawGGUF,
+            llm::{
+                LLMTokenizer,
+                models::gpt2::{GPT2, tests::GPT2_Q8_0},
+                tokenizer::TokenizerLoader,
+            },
         },
         rng_from_env_or_random,
         tensor::is_close_with_tolerance,
@@ -487,13 +491,14 @@ mod tests {
         init_test_logging("debug");
         // First we load up a GPT-2 model
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let driver = Driver::load_external_model(&model_path)?.with_max_context(10);
+        let gguf = RawGGUF::new(model_path);
+        let driver = Driver::load_from_model(GPT2, &gguf, Some(10))?;
         // Extract the model
         let Driver { model, .. } = driver;
         model.describe();
         // Make a tester input for the model so we can compare the pre and post transformation outputs
         let sentence = "The sky is";
-        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let tokenizer = GPT2.load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
 
         let input_tokens = user_tokens
@@ -555,18 +560,17 @@ mod tests {
         let max_context = 10;
         // First we load up a GPT-2 model
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let mut driver = Driver::load_external_model(&model_path)?.with_max_context(max_context);
-        // Extract the model
-        let Driver { model, .. } = driver.clone();
+        let gguf = RawGGUF::new(model_path);
+        let driver = Driver::load_from_model(GPT2, &gguf, Some(max_context))?;
         // Make a tester input for the model so we can compare the pre and post transformation outputs
         let sentence = "The sky is";
-        let tokenizer = HFTokenizer::from_gguf_path(&model_path)?;
+        let tokenizer = GPT2.load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
 
         // Rewrite the model by applying our transformation rule
-        driver.model = LayerNormToRMSNorm.apply(model)?;
+        let conf = default_pipeline_config().with_float_rules(vec![Box::new(LayerNormToRMSNorm)]);
 
-        let driver = driver.into_provable_llm()?;
+        let driver = driver.into_provable_llm(Some(conf))?;
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
             Some(LLMTokenizerObserver {

@@ -64,7 +64,7 @@ pub struct AttentionMask<N> {
 }
 
 /// AttentionSpan determines which entries do the mask keep.
-#[derive(Clone, Debug, Serialize, Deserialize, Copy, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Copy, Default, PartialEq, Eq)]
 pub enum AttentionSpan {
     /// The mask is applied to each previous token of the one of interest
     #[default]

@@ -8,7 +8,7 @@ use crate::{
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
     iop::{context::ShapeStep, verifier::Verifier},
-    layers::{ContextAux, LayerProof},
+    layers::{ContextAux, LayerProof, convolution::check_cnn_input},
     lookup::{
         context::{LayerLookupContext, LookupWitnessGen, TableType},
         logup_gkr::{
@@ -23,7 +23,8 @@ use crate::{
     tensor::WrappedTensor,
     to_base,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
+
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
@@ -822,6 +823,12 @@ pub fn maxpool2d_shape(input_shape: &Shape) -> Shape {
 
     Shape::new(vec![d1, d2, d2])
 }
+
+pub fn safe_maxpool2d_shape(input_shape: &Shape) -> anyhow::Result<Shape> {
+    check_cnn_input(input_shape).context("maxpool2d: invalid input shape")?;
+    Ok(maxpool2d_shape(input_shape))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{commit::compute_betas_eval, default_transcript, rng_from_env_or_random, to_base};

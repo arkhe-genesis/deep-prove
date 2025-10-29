@@ -632,6 +632,16 @@ impl Embeddings<f32> {
         let emb_tensor = loader.get_tensor("token_embd.weight")?;
         Embeddings::new(emb_tensor)
     }
+    pub fn from_safetensors_loader(
+        loader: &crate::parser::safe::FileTensorLoader,
+    ) -> anyhow::Result<Self> {
+        // Try common key names across models; prefer Gemma3 safetensors first
+        let emb_tensor = loader
+            .get_tensor("model.embed_tokens.weight")
+            .or_else(|_| loader.get_tensor("token_embd.weight"))
+            .or_else(|_| loader.get_tensor("tok_embeddings.weight"))?;
+        Embeddings::new(emb_tensor)
+    }
 }
 
 fn one_hot_shape(input_shape: &Shape, vocab_size: usize, mode: PaddingMode) -> Shape {

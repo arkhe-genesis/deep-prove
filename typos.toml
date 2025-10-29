@@ -1,5 +1,5 @@
 [files]
-extend-exclude = ["*.nix"]
+extend-exclude = ["*.nix", "zkml/model_cache/**"]
 
 [default]
 check-filename = true
@@ -9,3 +9,7 @@ format = "brief"
 [default.extend-words]
 Ein = "Ein"
 arange = "arange"
+
+[type.json]
+check-file = false
+extend-glob = ["*.json"]

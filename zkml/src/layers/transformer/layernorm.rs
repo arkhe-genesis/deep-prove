@@ -26,7 +26,11 @@ use crate::{
     model::StepData,
     number::Number,
     padding::PaddingMode,
-    parser::{gguf::FileTensorLoader, json, llm::LLMConfig},
+    parser::{
+        gguf, json,
+        llm::{LLMConfig, transformer::NormType},
+        safe,
+    },
     quantization::{self, Fieldizer},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_base,
@@ -311,7 +315,7 @@ impl LayerNorm<f32> {
     // Replaces from_var_builder and from_tensor_loader
     // The 'loader' passed here is expected to be pre-scoped by the caller
     // (e.g., loader.pp("attn_") or loader.pp("ffn_"))
-    pub fn from_loader(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
+    pub fn from_gguf(loader: &gguf::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         let gamma = loader.get_tensor("norm.weight")?;
         let beta = loader.get_tensor("norm.bias")?;
         ensure!(
@@ -327,8 +331,33 @@ impl LayerNorm<f32> {
             beta.shape()
         );
         let eps = loader
-            .metadata::<f32>(c.variant.norm_epsilon_key())
+            .metadata::<f32>(&loader.norm_epsilon_key(&c.model_name, NormType::LayerNorm))
             .context("norm_epsilon not found")?;
+        Ok(Self::new(gamma, beta, eps))
+    }
+
+    pub fn from_safetensors(
+        loader: &safe::FileTensorLoader,
+        config: &safe::ConfigJSON,
+        c: &LLMConfig,
+    ) -> anyhow::Result<Self> {
+        let gamma = loader.get_tensor("norm.weight")?;
+        let beta = loader.get_tensor("norm.bias")?;
+        let eps = config
+            .get::<f32, _>("norm_epsilon")
+            .context("norm_epsilon not found")?;
+        ensure!(
+            gamma.shape().as_ref() == &[c.embedding_size],
+            "norm_gamma must have shape [{}] vs given {:?}",
+            c.embedding_size,
+            gamma.shape()
+        );
+        ensure!(
+            beta.shape().as_ref() == &[c.embedding_size],
+            "norm_beta must have shape [{}] vs given {:?}",
+            c.embedding_size,
+            beta.shape()
+        );
         Ok(Self::new(gamma, beta, eps))
     }
 }
