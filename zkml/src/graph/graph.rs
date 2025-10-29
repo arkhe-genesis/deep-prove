@@ -531,18 +531,18 @@ where
     /// ```rust
     /// # use zkml::graph::{Graph, Ports, PortLink};
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
-    /// let node2 = graph.add_node("second").unwrap();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
     ///
     /// // Simple consecutive connection
     /// let edge_id = graph.add_edge(node1, node2, Ports::consecutive(), Some(())).unwrap();
     ///
     /// // Custom port mapping using PortLink
-    /// let node3 = graph.add_node("third").unwrap();
+    /// let node3 = graph.add_inner("third").unwrap();
     /// graph.add_edge(node2, node3, PortLink::new(0, 0), None).unwrap();
     ///
     /// // Or using a (usize, usize) tuple directly
-    /// let node4 = graph.add_node("fourth").unwrap();
+    /// let node4 = graph.add_inner("fourth").unwrap();
     /// graph.add_edge(node3, node4, (0, 0), None).unwrap();
     /// ```
     pub fn add_edge<P: Into<Ports>, WO: Into<Option<W>>>(
@@ -562,9 +562,9 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
-    /// let node2 = graph.add_node("second").unwrap();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
     ///
     /// let edge_id = graph.add_consecutive_edge(node1, node2, Some(())).unwrap();
     /// assert_eq!(graph.neighbors(node1, zkml::graph::Direction::Outgoing).count(), 1);
@@ -585,12 +585,12 @@ where
     /// # Examples
     ///
     /// ```rust
-    /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
+    /// # use zkml::graph::{Graph, Node};
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
+    /// let node1 = graph.add_inner("first").unwrap();
     ///
     /// // Add a node connected to an existing node
-    /// let node2 = graph.add_consecutive_node("second", node1, Some(())).unwrap();
+    /// let node2 = graph.add_consecutive_node(Node::Inner("second"), node1, Some(())).unwrap();
     /// assert_eq!(graph.neighbors(node1, zkml::graph::Direction::Outgoing).count(), 1);
     /// ```
     pub fn add_consecutive_node<WO: Into<Option<W>>>(
@@ -651,8 +651,8 @@ where
     /// # use zkml::graph::Graph;
     /// # use zkml::graph::Ports;
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
-    /// let node2 = graph.add_node("second").unwrap();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
     /// let edge_id = graph.add_edge(node1, node2, Ports::consecutive(), Some(())).unwrap();
     ///
     /// assert_eq!(graph.edges().count(), 1);
@@ -689,11 +689,11 @@ where
     /// # Examples
     ///
     /// ```rust
-    /// # use zkml::graph::Graph;
+    /// # use zkml::graph::{Graph, Node};
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
-    /// let node_id = graph.add_node("test").unwrap();
+    /// let node_id = graph.add_inner("test").unwrap();
     ///
-    /// assert_eq!(graph.node(node_id), Some(&"test"));
+    /// assert_eq!(graph.node(node_id).map(Node::inner), Some(&"test"));
     /// assert_eq!(graph.node(999.into()), None);
     /// ```
     pub fn node(&self, node_id: NodeId) -> Option<&Node<N, I, O>> {
@@ -714,7 +714,7 @@ where
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
     /// assert_eq!(graph.node_count(), 0);
     ///
-    /// let node1 = graph.add_node("first").unwrap();
+    /// let node1 = graph.add_inner("first").unwrap();
     /// assert_eq!(graph.node_count(), 1);
     /// ```
     pub fn node_count(&self) -> usize {
@@ -728,8 +728,8 @@ where
     /// ```rust
     /// # use zkml::graph::Graph;
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
-    /// let node2 = graph.add_node("second").unwrap();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
     ///
     /// let nodes: Vec<_> = graph.nodes().collect();
     /// assert_eq!(nodes.len(), 2);
@@ -816,8 +816,8 @@ where
     /// ```rust
     /// # use zkml::graph::Graph;
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
-    /// let node2 = graph.add_node("second").unwrap();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
     /// let edge_id = graph.add_edge(node1, node2, zkml::graph::Ports::consecutive(), Some(())).unwrap();
     ///
     /// let edges: Vec<_> = graph.edges().collect();
@@ -992,15 +992,15 @@ where
     ///
     /// ```rust
     /// # use zkml::graph::Graph;
-    /// let mut graph: Graph<&str, ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
-    /// let node2 = graph.add_node("second").unwrap();
-    /// let node3 = graph.add_node("third").unwrap();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
+    /// let node3 = graph.add_inner("third").unwrap();
     ///
     /// graph.add_edge(node1, node2, zkml::graph::Ports::consecutive(), Some(())).unwrap();
     /// graph.add_edge(node2, node3, zkml::graph::Ports::consecutive(), Some(())).unwrap();
     ///
-    /// let order: Vec<_> = graph.forward_iter().map(|(_, data)| *data).collect();
+    /// let order: Vec<_> = graph.forward_iter().map(|(_, data)| *data.inner()).collect();
     /// assert_eq!(order, vec!["first", "second", "third"]);
     /// ```
     pub fn forward_iter(&self) -> impl Iterator<Item = (NodeId, &Node<N, I, O>)> {
@@ -1025,14 +1025,14 @@ where
     /// ```rust
     /// # use zkml::graph::Graph;
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
-    /// let node1 = graph.add_node("first").unwrap();
-    /// let node2 = graph.add_node("second").unwrap();
-    /// let node3 = graph.add_node("third").unwrap();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
+    /// let node3 = graph.add_inner("third").unwrap();
     ///
     /// graph.add_edge(node1, node2, zkml::graph::Ports::consecutive(), Some(())).unwrap();
     /// graph.add_edge(node2, node3, zkml::graph::Ports::consecutive(), Some(())).unwrap();
     ///
-    /// let order: Vec<_> = graph.backward_iter().map(|(_, data)| *data).collect();
+    /// let order: Vec<_> = graph.backward_iter().map(|(_, data)| *data.inner()).collect();
     /// assert_eq!(order, vec!["third", "second", "first"]);
     /// ```
     pub fn backward_iter(&self) -> impl Iterator<Item = (NodeId, &Node<N, I, O>)> {

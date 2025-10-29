@@ -91,7 +91,7 @@ jobs:
         run: |
           cd zkml
           # Skip tests that require py exported model
-          cargo test --release --features capture-layers-quant -- \
+          cargo test --lib --release --features capture-layers-quant -- \
             --skip layers::transformer::test::test_gpt2_model_full_pass \
             --skip layers::transformer::test::test_read_gpt2_pytorch_embeddings \
             --skip layers::transformer::test::test_read_gpt2_pytorch_output_first \
@@ -116,7 +116,7 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: |
           cd zkml
-          cargo test --release --features capture-layers-quant -- \
+          cargo test --lib --release --features capture-layers-quant -- \
             --skip layers::transformer::test::test_gpt2_model_full_pass \
             --skip layers::transformer::test::test_read_gpt2_pytorch_embeddings \
             --skip layers::transformer::test::test_read_gpt2_pytorch_output_first \

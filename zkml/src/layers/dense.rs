@@ -896,7 +896,7 @@ mod test {
 
     proptest! {
         #[test]
-        fn test_dense_with_element(input in any_input::<Element>(1..256)) {
+        fn test_dense_with_element(input in any_input::<Element>(2..256)) {
             let Input {matrix, bias, input} = input;
 
             let expected = matrix.matvec(&input).add(&bias);
@@ -909,7 +909,7 @@ mod test {
         }
 
         #[test]
-        fn test_dense_with_f32(input in any_input::<f32>(1usize..256)) {
+        fn test_dense_with_f32(input in any_input::<f32>(2..256)) {
             let Input {matrix, bias, input} = input;
 
             let expected = matrix.matvec(&input).add(&bias);

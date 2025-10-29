@@ -85,6 +85,10 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: cargo nextest run
 
+      - name: Run doc tests
+        shell: devenv shell bash -- -e {0}
+        run: cargo test --doc
+
   linting:
     needs: changes
     runs-on: ['nix']
