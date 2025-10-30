@@ -55,7 +55,7 @@ fn dequantize(qtensor: &QTensor) -> anyhow::Result<Tensor<f32>> {
 
     let dequantized_candle_tensor = qtensor
         .dequantize(&Device::Cpu)
-        .map_err(anyhow::Error::from) // Convert candle_core::Error to anyhow::Error
+        .map_err(anyhow::Error::from)
         .with_context(|| {
             format!(
                 "Failed to dequantize QTensor (dtype: {:?}, shape: {:?})",
@@ -84,35 +84,10 @@ fn dequantize(qtensor: &QTensor) -> anyhow::Result<Tensor<f32>> {
     Ok(Tensor::new(shape, data))
 }
 
-pub fn unfuse_tensors(
-    fused: candle_core::Tensor,
-    chunk_len: usize,
-) -> anyhow::Result<Vec<Vec<f32>>> {
-    let (s, _l) = fused.storage_and_layout();
-    let data: Vec<f32> = match s.deref() {
-        Storage::Cpu(cpu) => match cpu {
-            CpuStorage::F32(d) => d.to_vec(),
-            CpuStorage::F16(d) => d.iter().map(|x| x.to_f32()).collect(),
-            _ => bail!(
-                "unsupported storage type (only f32 or f16 is supported for unfusing candle::Tensor)"
-            ),
-        },
-        _ => {
-            bail!("unsupported storage backend (only cpu is supported for unfusing candle::Tensor)")
-        }
-    };
-    let num_elements = data.len();
-    ensure!(
-        num_elements.is_multiple_of(chunk_len),
-        "Total elements {num_elements} is not divisible by chunk_len {chunk_len} for unfusing"
-    );
-    let tensors: Vec<Vec<f32>> = data
-        .chunks_exact(chunk_len)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-    Ok(tensors)
-}
-
+/// Trait to allow for conversion of [Value].
+///
+/// This trait is necessary because [Value] doesn't implement [From] or [Into],
+/// a new trait is needed to get around the orphan rules.
 pub trait FromValue<T> {
     fn from_value(v: &Value) -> T;
 }
@@ -223,50 +198,74 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
         }
     }
 
-    pub fn get_tensor_shape(&self, name: &str) -> anyhow::Result<Shape> {
-        let info = self
-            .content
-            .tensor_infos
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("tensor not found: {name}"))?;
-        Ok(Shape::new(info.shape.dims().to_vec()))
-    }
-
     /// Retrieves a quantized tensor (`QTensor`) by its name relative to the current scope.
-    /// The full tensor name is formed by `current_prefix + name`.
-    /// This method is primarily for internal use or advanced scenarios where the `QTensor` is needed directly.
-    ///
-    /// # Arguments
-    /// * `name` - The name of the tensor, relative to the current scope (e.g., `weight`).
-    ///
-    /// # Errors
-    /// Returns an error if the reader lock cannot be acquired or if `Content::tensor` fails to load the `QTensor`.
-    pub(crate) fn get_qtensor(&self, name: &str) -> anyhow::Result<(CommitmentId, Arc<QTensor>)> {
+    fn get_qtensor(&self, name: &str) -> anyhow::Result<(CommitmentId, Arc<QTensor>)> {
         let full_name = format!("{}{}", self.current_prefix, name);
         let mut reader_guard = self.reader.lock().map_err(|e| {
             anyhow::anyhow!("Failed to acquire reader lock for tensor '{full_name}': {e}")
         })?;
-        self.content
+        let qtensor = self
+            .content
             .tensor(&mut *reader_guard, &full_name, &self.device)
-            .map_err(|e| anyhow::anyhow!("Failed to load QTensor '{full_name}' from GGUF: {e}"))
-            .map(|qtensor| (full_name.into(), Arc::new(qtensor)))
+            .map_err(|e| anyhow::anyhow!("Failed to load QTensor '{full_name}' from GGUF: {e}"))?;
+
+        Ok((CommitmentId::from(full_name), Arc::new(qtensor)))
     }
 
     /// Retrieves and dequantizes a tensor by its name relative to the current scope.
     ///
-    /// This method first loads the quantized tensor (`QTensor`) using `get_qtensor`,
-    /// then calls the `dequantize` function (expected to be available in the same module)
-    /// to convert it into a `crate::Tensor<f32>`.
-    ///
     /// # Arguments
-    /// * `name` - The name of the tensor, relative to the current scope (e.g., `attn_norm.weight`).
+    ///
+    /// - `name` Tensor's name relative to the current scope, e.g. `attn_norm.weight`.
     ///
     /// # Errors
-    /// Returns an error if `get_qtensor` fails or if the subsequent dequantization fails.
+    ///
+    /// Returns an error if:
+    ///
+    /// - A previous thread paniced while loading data (internal lock is poisoned).
+    /// - Dequantization failed.
     pub fn get_tensor(&self, name: &str) -> anyhow::Result<KeyedTensor<f32>> {
         let (key, qtensor) = self.get_qtensor(name)?;
         let tensor = dequantize(qtensor.as_ref())?;
         Ok(KeyedTensor::new(StorageKey::from(key), tensor))
+    }
+
+    pub fn unfuse_tensors(
+        &self,
+        name: &str,
+        chunk_len: usize,
+    ) -> anyhow::Result<(CommitmentId, Vec<Vec<f32>>)> {
+        let (commitment_id, weight) = self.get_qtensor(name)?;
+        let fused = weight.dequantize(&Device::Cpu)?;
+        let (storage_guard, _layout) = fused.storage_and_layout();
+
+        let data: Vec<f32> = match storage_guard.deref() {
+            Storage::Cpu(cpu) => match cpu {
+                CpuStorage::F32(data) => data.to_vec(),
+                CpuStorage::F16(data) => data.iter().map(|x| x.to_f32()).collect(),
+                _ => bail!(
+                    "unsupported storage type (only f32 or f16 is supported for unfusing candle::Tensor)"
+                ),
+            },
+            _ => {
+                bail!(
+                    "unsupported storage backend (only cpu is supported for unfusing candle::Tensor)"
+                )
+            }
+        };
+
+        let num_elements = data.len();
+        ensure!(
+            num_elements.is_multiple_of(chunk_len),
+            "Total elements {num_elements} is not divisible by chunk_len {chunk_len} for unfusing"
+        );
+
+        let tensors: Vec<Vec<f32>> = data
+            .chunks_exact(chunk_len)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        Ok((commitment_id, tensors))
     }
 
     pub fn metadata<T>(&self, key: &str) -> Option<T>
@@ -283,27 +282,34 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     pub fn num_heads_key(&self, model_name: &str) -> String {
         format!("{model_name}.attention.head_count")
     }
+
     pub fn head_size_key(&self, model_name: &str) -> String {
         format!("{model_name}.attention.key_length")
     }
+
     pub fn context_length_key(&self, model_name: &str) -> String {
         format!("{model_name}.context_length")
     }
+
     pub fn num_block_key(&self, model_name: &str) -> String {
         format!("{model_name}.block_count")
     }
+
     pub fn embedding_size_key(&self, model_name: &str) -> String {
         format!("{model_name}.embedding_length")
     }
+
     pub fn hidden_size_key(&self, model_name: &str) -> String {
         Self::embedding_size_key(self, model_name)
     }
+
     pub fn norm_epsilon_key(&self, model_name: &str, norm_type: NormType) -> String {
         match norm_type {
             NormType::LayerNorm => format!("{model_name}.attention.layer_norm_epsilon"),
             NormType::RMSNorm => format!("{model_name}.attention.layer_norm_rms_epsilon"),
         }
     }
+
     pub fn find_norm_epsilon(&self, model_name: &str) -> Option<f32> {
         match self.raw_metadata(&self.norm_epsilon_key(model_name, NormType::LayerNorm)) {
             Some(value) => Some(value.to_f32().unwrap()),
@@ -316,10 +322,12 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     pub fn eos_token_key(&self) -> String {
         "tokenizer.ggml.eos_token_id".to_string()
     }
+
     /// NOTE: that it may not exist if the attention mechanism is MHA for example. It's only for GQA.
     pub fn num_kv_heads_key(&self, model_name: &str) -> String {
         format!("{model_name}.attention.head_count_kv")
     }
+
     pub fn sliding_window_key(&self, model_name: &str) -> String {
         format!("{model_name}.attention.sliding_window")
     }
@@ -340,7 +348,8 @@ impl TensorLoader<BufReader<File>> {
         Self::from_reader(reader)
     }
 
-    pub fn meta_and_tensor_keys(&self) -> (Vec<String>, Vec<String>) {
+    #[cfg(test)]
+    fn meta_and_tensor_keys(&self) -> (Vec<String>, Vec<String>) {
         let mut meta_keys = self.content.metadata.keys().cloned().collect::<Vec<_>>();
         let mut tensor_keys = self
             .content

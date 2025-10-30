@@ -1,6 +1,5 @@
 use crate::parser::llm::Norm;
 use anyhow::ensure;
-use candle_core::Device;
 
 use crate::{
     Shape,
@@ -8,7 +7,7 @@ use crate::{
     model::Model,
     parser::{
         ModelLoader,
-        gguf::{FileTensorLoader, RawGGUF, unfuse_tensors},
+        gguf::{FileTensorLoader, RawGGUF},
         json,
         json::RawJSON,
         llm::{
@@ -122,10 +121,8 @@ impl Attention<f32> {
             embedding_size == hidden_size,
             "embedding_size must be equal to hidden_size"
         );
-        let (qkv_key, qkv_weight_qtensor) = loader.get_qtensor("attn_qkv.weight")?;
-        let qkv_weight_candle = qkv_weight_qtensor.dequantize(&Device::Cpu)?;
-        let mut unfused_weights =
-            unfuse_tensors(qkv_weight_candle, embedding_size * embedding_size)?;
+        let (qkv_key, mut unfused_weights) =
+            loader.unfuse_tensors("attn_qkv.weight", embedding_size * embedding_size)?;
         ensure!(unfused_weights.len() == 3, "qkv_weight must have 3 chunks");
         let q = KeyedTensor::new(
             format!("{qkv_key}.q"),
@@ -152,9 +149,8 @@ impl Attention<f32> {
             .transpose(),
         );
 
-        let (qkv_bias_key, qkv_bias_qtensor) = loader.get_qtensor("attn_qkv.bias")?;
-        let qkv_bias_candle = qkv_bias_qtensor.dequantize(&Device::Cpu)?;
-        let mut unfused_biases = unfuse_tensors(qkv_bias_candle, embedding_size)?;
+        let (qkv_bias_key, mut unfused_biases) =
+            loader.unfuse_tensors("attn_qkv.bias", embedding_size)?;
         ensure!(unfused_biases.len() == 3, "qkv_bias must have 3 chunks");
         let q_bias = KeyedTensor::new(
             format!("{qkv_bias_key}.q"),
