@@ -11,10 +11,13 @@ mod kernels;
 #[cfg(feature = "cpu")]
 mod ndarray;
 
-#[cfg(all(feature = "cpu", not(feature = "gpu")))]
+#[cfg(all(not(feature = "wgpu"), not(feature = "cuda")))]
 pub type Backend = burn::backend::NdArray<f32, Element>;
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
+pub type Backend = burn::backend::Cuda<f32, Element>;
+
+#[cfg(all(feature = "wgpu", not(feature = "cuda")))]
 pub type Backend = burn::backend::Wgpu<f32, Element>;
 
 #[derive(Debug, Clone)]

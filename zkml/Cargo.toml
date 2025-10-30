@@ -22,6 +22,13 @@ default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
 capture-layers-quant = []
 cpu = ["burn/ndarray", "dep:burn-ndarray"]
+# If `cuda` is also enabled it takes precedence over `wgpu`
+wgpu = ["burn/wgpu", "gpu"]
+# Linux only
+cuda = ["burn/cuda", "gpu"]
+mem-track = ["utils/mem-track"]
+
+# Internal. Use `wgpu` or `cuda` which will enable `gpu`
 gpu = [
   "burn/wgpu",
   "burn/fusion",
@@ -30,7 +37,6 @@ gpu = [
   "dep:burn-fusion",
   "dep:cubecl",
 ]
-mem-track = ["utils/mem-track"]
 
 [dependencies]
 ahash = "0.8.12"
@@ -98,7 +104,6 @@ burn = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef9
 ] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 burn = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef92cd6040b8626c3ce1901b4e", default-features = false, features = [
-  # "cuda",
   "vulkan",
 ] }
 
