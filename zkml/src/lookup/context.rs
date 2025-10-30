@@ -974,7 +974,7 @@ where
 
         Ok(step
             .op
-            .gen_lookup_witness(*node_id, ctx.ctx, &step.step_data, &mut ctx.store.clone())
+            .gen_lookup_witness(*node_id, ctx.ctx, step, &mut ctx.store.clone())
             .map_err(|e| {
                 LogUpError::ParameterError(format!(
                     "Error generating lookup witness for node {node_id:?} with error: {e:?}"

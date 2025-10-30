@@ -10,7 +10,7 @@ use crate::{
         verifier::Verifier,
     },
     layers::{LayerCtx, LayerProof, requant::Requant},
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeInfo, pad_dense},
     quantization::{self, ScalingFactor, model_scaling_factor_from_tensor_and_bias},
     tensor::{CommitmentId, KeyedTensor, Tensor, TensorTypeParam, WrappedModuleFn, WrappedTensor},
@@ -296,7 +296,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {

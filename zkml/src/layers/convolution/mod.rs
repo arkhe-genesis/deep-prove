@@ -11,7 +11,7 @@ use crate::{
     graph::NodeId,
     iop::{context::ContextAux, prover::BatchFFTProof},
     layers::{LayerProof, hadamard, provable::ProvingData, requant::Requant},
-    model::StepData,
+    model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo},
     quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
@@ -1363,7 +1363,7 @@ where
         id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {

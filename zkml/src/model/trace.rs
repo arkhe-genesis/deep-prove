@@ -14,7 +14,7 @@ use tenstore::{GenStore, StoreError};
 #[derive(Default, Clone)]
 pub struct Trace<'a, E: ExtensionField, N, D> {
     pub(crate) store: GenStore,
-    pub(crate) steps: HashMap<NodeId, InferenceStep<'a, E, N, D>>,
+    pub(crate) steps: HashMap<NodeId, Step<'a, E, N, D>>,
     // TODO: convert to TensorKey
     pub(crate) input: Vec<DryTensor<D>>,
     pub(crate) output: Vec<DryTensor<D>>,
@@ -39,12 +39,13 @@ where
     D: Serialize + for<'b> Deserialize<'b>,
 {
     /// Get the trace data for node `node_id`, if any
-    pub(crate) fn get_step(&self, node_id: NodeId) -> Option<&InferenceStep<'a, E, N, D>> {
+    pub(crate) fn get_step(&self, node_id: NodeId) -> Option<&Step<'a, E, N, D>> {
         self.steps.get(&node_id)
     }
 
     /// Insert the trace data `step` about node `node_id` in the trace
-    pub(crate) fn new_step(&mut self, node_id: NodeId, step: InferenceStep<'a, E, N, D>) {
+    pub(crate) fn new_step(&mut self, node_id: NodeId, step: Step<'a, E, N, D>) {
+        assert!(!self.steps.contains_key(&node_id));
         self.steps.insert(node_id, step);
     }
 
@@ -87,17 +88,15 @@ where
             .map(|dry| dry.dry_cast(self.store.clone(), |x: &D| x.to_field()))
             .collect::<Result<Vec<DryTensor<E>>, StoreError>>()
             .context("converting output")?;
-        let field_steps = self
-            .steps
-            .into_iter()
-            .map(|(id, step)| {
-                Ok((
-                    id,
-                    InferenceStep {
-                        op: step.op,
-                        step_data: StepData {
+        let field_steps =
+            self.steps
+                .into_iter()
+                .map(|(id, step)| {
+                    Ok((
+                        id,
+                        Step {
+                            op: step.op,
                             node_inputs: step
-                                .step_data
                                 .node_inputs
                                 .into_iter()
                                 .map(|dry| {
@@ -108,18 +107,16 @@ where
                                 .collect::<anyhow::Result<Vec<DryTensor<_>>>>()?,
 
                             node_outputs: step
-                                .step_data
                                 .node_outputs
                                 .into_fields(store.clone())
                                 .context("converting node_outputs")?,
-                            unpadded_output_shapes: step.step_data.unpadded_output_shapes,
-                            unpadded_input_shapes: step.step_data.unpadded_input_shapes,
+                            unpadded_output_shapes: step.unpadded_output_shapes,
+                            unpadded_input_shapes: step.unpadded_input_shapes,
                         },
-                    },
-                ))
-            })
-            .collect::<anyhow::Result<HashMap<_, _>>>()
-            .context("converting steps")?;
+                    ))
+                })
+                .collect::<anyhow::Result<HashMap<_, _>>>()
+                .context("converting steps")?;
         Ok(Trace {
             store: self.store,
             steps: field_steps,
@@ -196,17 +193,8 @@ impl<'a, E: ExtensionField> InferenceTrace<'a, E, Element> {
             .steps
             .iter()
             .map(|(node_id, step)| {
-                Ok((
-                    *node_id,
-                    InferenceStep {
-                        op: step.op,
-                        step_data: step.step_data.to_dequantize(
-                            md,
-                            self.store.clone(),
-                            *node_id,
-                        )?,
-                    },
-                ))
+                step.to_dequantize(md, self.store.clone(), *node_id)
+                    .map(|step| (*node_id, step))
             })
             .collect::<Result<HashMap<_, _>, StoreError>>()?;
         Ok(Trace {
@@ -218,51 +206,30 @@ impl<'a, E: ExtensionField> InferenceTrace<'a, E, Element> {
     }
 }
 
-// TODO: inline StepData
 /// Data found in the trace for each node of the model
 #[derive(Clone)]
-pub struct InferenceStep<'a, E: ExtensionField, N, D> {
+pub struct Step<'a, E: ExtensionField, N, D> {
+    /// The operation that generated this trace element.
     pub(crate) op: &'a Layer<N>,
-    pub(crate) step_data: StepData<D, E>,
-}
-
-impl<'a, E: ExtensionField, N, D> InferenceStep<'a, E, N, D>
-where
-    D: Serialize + for<'b> Deserialize<'b>,
-{
-    /// Returns the output tensors of the node
-    pub fn outputs(&self) -> &[DryTensor<D>] {
-        self.step_data.node_outputs.outputs.as_slice()
-    }
-}
-
-impl<'a, E: ExtensionField, N> InferenceStep<'a, E, N, Element> {
-    pub fn to_dequantize(
-        &self,
-        md: &ModelMetadata,
-        store: GenStore,
-        node_id: NodeId,
-    ) -> Result<InferenceStep<'a, E, N, f32>, StoreError> {
-        Ok(InferenceStep {
-            op: self.op,
-            step_data: self.step_data.to_dequantize(md, store, node_id)?,
-        })
-    }
-}
-
-/// Data about the input and output tensors in a trace
-/// for each node in the model
-#[derive(Clone)]
-pub struct StepData<D, E: ExtensionField> {
     /// Ordered by input port (e.g. target_port of the incoming edges)
     pub(crate) node_inputs: Vec<DryTensor<D>>,
+    /// Ordered by output port (e.g. source_port of the incoming edges)
     pub(crate) node_outputs: NodeOut<D, E>,
     /// Ordered by output port (e.g. source_port of the outgoing edges)
     pub(crate) unpadded_output_shapes: Vec<Shape>,
     /// Ordered by input port (e.g. target_port of the incoming edges)
     pub(crate) unpadded_input_shapes: Vec<Shape>,
 }
-impl<D: Serialize + for<'a> Deserialize<'a>, E: ExtensionField> StepData<D, E> {
+
+impl<'a, E: ExtensionField, N, D> Step<'a, E, N, D>
+where
+    D: Serialize + for<'b> Deserialize<'b>,
+{
+    /// Returns the output tensors of the node
+    pub fn outputs(&self) -> &[DryTensor<D>] {
+        self.node_outputs.outputs.as_slice()
+    }
+
     /// Hydrate all the input tensors of the node corresponding to this step.
     pub(crate) fn input_tensors(&self, store: &mut GenStore) -> Result<Vec<Tensor<D>>, StoreError> {
         self.node_inputs
@@ -302,14 +269,15 @@ impl<D: Serialize + for<'a> Deserialize<'a>, E: ExtensionField> StepData<D, E> {
     }
 }
 
-impl<E: ExtensionField> StepData<Element, E> {
-    pub(crate) fn to_dequantize(
+impl<'a, E: ExtensionField, N> Step<'a, E, N, Element> {
+    pub fn to_dequantize(
         &self,
         md: &ModelMetadata,
         store: GenStore,
         node_id: NodeId,
-    ) -> Result<StepData<f32, E>, StoreError> {
-        Ok(StepData {
+    ) -> Result<Step<'a, E, N, f32>, StoreError> {
+        Ok(Step {
+            op: self.op,
             node_inputs: self
                 .node_inputs
                 .iter()

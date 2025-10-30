@@ -30,7 +30,6 @@ pub(crate) fn filter_size(shape: &Shape) -> usize {
 }
 
 /// Structure that holds a shape of a tensor.
-/// NOTE: it is currently being phased in incrementally the codebase currently. There will be places where we still use Vec<usize>
 #[derive(
     Debug,
     Clone,

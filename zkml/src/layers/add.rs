@@ -13,7 +13,7 @@ use crate::{
         },
         requant::{FIXED_POINT_SCALE, Requant},
     },
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{self, Fieldizer},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
@@ -524,7 +524,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>

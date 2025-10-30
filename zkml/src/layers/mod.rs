@@ -29,7 +29,7 @@ use crate::{
         },
     },
     lookup::context::LookupWitnessGen,
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, ModelMetadata, ScalingFactor},
     tensor::{ConvFFTData, DryTensor, TensorTypeParam, WrappedTensor},
@@ -634,7 +634,7 @@ where
         node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&crate::Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<crate::Claim<E>>> {
@@ -710,7 +710,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
+        step_data: &Step<E, Element, Element>,
         store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         match self {

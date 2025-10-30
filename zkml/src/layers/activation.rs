@@ -19,7 +19,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::StepData,
+    model::Step,
     number::Number,
     padding::PaddingMode,
     quantization::{self, BIT_LEN, Fieldizer},
@@ -533,7 +533,7 @@ where
         id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
@@ -549,7 +549,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
+        step_data: &Step<E, Element, Element>,
         store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors(store)?;
@@ -980,7 +980,7 @@ fn gelu_float(x: &f32) -> f32 {
     // let inner_term = c * (x + 0.044715 * x_cubed);
     // 0.5 * x * (1.0 + inner_term.tanh())
 
-    // NOTE This forumla matches burn's GELU implementation.
+    // NOTE This formula matches burn's GELU implementation.
     // The difference from PyTorch is that instead of tanh approx. it uses
     // error function from `libm::erf`
     let inner_term = libm::erf((x / 2.0_f32.sqrt()) as f64) as f32;

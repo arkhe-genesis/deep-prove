@@ -24,7 +24,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::StepData,
+    model::Step,
     number::Number,
     padding::PaddingMode,
     parser::{
@@ -714,7 +714,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
@@ -738,7 +738,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
+        step_data: &Step<E, Element, Element>,
         store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let output_tensors = step_data.output_tensors(store)?;

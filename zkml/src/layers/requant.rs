@@ -23,7 +23,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::StepData,
+    model::Step,
     padding::PaddingMode,
     quantization::{self, Fieldizer},
     tensor::WrappedTensor,
@@ -448,7 +448,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        _step_data: &StepData<E, E>,
+        _step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
@@ -461,7 +461,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
+        step_data: &Step<E, Element, Element>,
         store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors(store)?;
@@ -596,16 +596,13 @@ where
 
         let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm1, rmm2])?;
 
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
-
+        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
         if !zero_check_count.is_empty() {
-            gen.insert_element_count(TableType::RequantZeroTable, zero_check_count);
+            gen_w.insert_element_count(TableType::RequantZeroTable, zero_check_count);
         }
-
-        gen.insert_element_count(TableType::Range, range_check_count);
-
-        gen.insert_logup_witness(id, layer_commitment);
-        Ok(gen)
+        gen_w.insert_element_count(TableType::Range, range_check_count);
+        gen_w.insert_logup_witness(id, layer_commitment);
+        Ok(gen_w)
     }
 }
 

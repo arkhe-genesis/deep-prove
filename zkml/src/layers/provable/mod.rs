@@ -16,7 +16,7 @@ use crate::{
         transformer::{logits::ArgmaxData, mha::MhaData},
     },
     lookup::context::LookupWitnessGen,
-    model::{trace::StepData, transform::ModelTransform},
+    model::{trace::Step, transform::ModelTransform},
     padding::{PaddingMode, ShapeInfo},
     tensor::{ConvFFTData, TensorTypeParam, WrappedTensor},
 };
@@ -296,7 +296,7 @@ where
         _node_id: NodeId,
         _ctx: &'b Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        _step_data: &StepData<E, E>,
+        _step_data: &Step<E, Element, E>,
         _prover: &mut Prover<'c, 'd, E, T, PCS>,
         _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
@@ -313,7 +313,7 @@ where
         &self,
         _id: NodeId,
         _ctx: &ProverContext<E, PCS>,
-        _step_data: &StepData<Element, E>,
+        _step_data: &Step<E, Element, Element>,
         _store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         Ok(Default::default())

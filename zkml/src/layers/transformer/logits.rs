@@ -23,7 +23,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{IntoElement, TensorFielder},
     tensor::{TensorTypeParam, WrappedTensor},
@@ -346,7 +346,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
@@ -503,7 +503,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
+        step_data: &Step<E, Element, Element>,
         store: &mut GenStore,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         ensure!(

@@ -14,7 +14,7 @@ use crate::{
         },
         requant::Requant,
     },
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
     quantization::model_scaling_factor_from_tensor_and_bias,
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
@@ -622,7 +622,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {

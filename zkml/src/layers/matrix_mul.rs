@@ -14,7 +14,7 @@ use crate::{
         verifier::Verifier,
     },
     layers::LayerProof,
-    model::StepData,
+    model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
     quantization::{self, bias_scaling_matmul},
@@ -705,7 +705,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {

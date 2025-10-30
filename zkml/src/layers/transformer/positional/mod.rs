@@ -17,7 +17,7 @@ use crate::{
             rope::{Rope, RopeCtx, RopeProof},
         },
     },
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeInfo},
     parser::{
         gguf, json,
@@ -615,7 +615,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {

@@ -27,7 +27,7 @@ use crate::{
             verifier::verify_logup_proof_multiple_sizes,
         },
     },
-    model::{StepData, transform::impls::softmax_mask::SoftmaxMaskTransform},
+    model::{Step, transform::impls::softmax_mask::SoftmaxMaskTransform},
     padding::PaddingMode,
     quantization::{self, Fieldizer, ScalingFactor},
     tensor::{TensorTypeParam, WrappedTensor},
@@ -1281,7 +1281,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut crate::Prover<E, T, PCS>,
         _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
@@ -1302,7 +1302,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
+        step_data: &Step<E, Element, Element>,
         store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let input_tensors = step_data.input_tensors(store)?;

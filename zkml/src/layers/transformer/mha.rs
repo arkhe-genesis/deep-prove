@@ -26,7 +26,7 @@ use crate::{
         },
     },
     lookup::context::LookupWitnessGen,
-    model::StepData,
+    model::Step,
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
     tensor::{TensorTypeParam, WrappedTensor},
@@ -726,7 +726,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
@@ -850,7 +850,7 @@ where
         &self,
         id: NodeId,
         ctx: &crate::ProverContext<E, PCS>,
-        step_data: &StepData<Element, E>,
+        step_data: &Step<E, Element, Element>,
         _store: &mut GenStore,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         let mha_data = step_data

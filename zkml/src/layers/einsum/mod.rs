@@ -20,7 +20,7 @@ use crate::{
             VerifiableCtx,
         },
     },
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeData},
     quantization::{ScalingFactor, ScalingStrategy},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
@@ -346,7 +346,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {

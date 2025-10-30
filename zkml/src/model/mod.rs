@@ -25,7 +25,7 @@ pub mod llm;
 pub(crate) mod trace;
 pub mod transform;
 pub use context::ModelCtx;
-pub use trace::{InferenceStep, InferenceTrace, StepData};
+pub use trace::{InferenceTrace, Step};
 
 pub trait ToStorageKey<N> {
     /// Return the key under which the data of the object referred to by the
@@ -548,13 +548,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 )
                 .context(format!("Error occurred at node ID: {node_id}"))?;
 
-            trace.new_step(
-                node_id,
-                InferenceStep {
-                    op: layer,
-                    step_data: new_step,
-                },
-            );
+            trace.new_step(node_id, new_step);
         }
 
         // compute the output tensor from the outputs of the output nodes
@@ -616,17 +610,17 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_layer<E: ExtensionField>(
+    pub(crate) fn run_layer<'a, E: ExtensionField>(
         &self,
         node_id: NodeId,
-        layer: &Layer<N>,
+        layer: &'a Layer<N>,
         // inputs are assumed to be sorted by source port, e.g. in the order defined by the ports
         incomings: &[Feed],
         shape_register: &mut HashMap<StorageKey<Vec<N>>, (Shape, Shape)>,
         tracker: &mut Option<&mut InferenceTracker>,
         store: GenStore,
         // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
-    ) -> Result<StepData<N, E>>
+    ) -> Result<Step<'a, E, N, N>>
     where
         N: TensorTypeParam,
         Layer<N>: Evaluate<N>,
@@ -752,7 +746,8 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         }
 
         // Record the step into the trace
-        Ok(StepData {
+        Ok(Step {
+            op: layer,
             node_inputs: prec_dried_tensors,
             node_outputs: NodeOut::new(
                 dry_output_tensors.into_values().collect(),
@@ -1043,7 +1038,6 @@ pub(crate) mod test {
             trace
                 .get_step(first_id)
                 .unwrap()
-                .step_data
                 .output_tensor_at(0, &mut store)
                 .unwrap(),
             output1.into_native()
@@ -1054,7 +1048,6 @@ pub(crate) mod test {
             trace
                 .get_step(second_id)
                 .unwrap()
-                .step_data
                 .output_tensor_at(0, &mut store)
                 .unwrap(),
             final_output.clone().into_native()
@@ -1090,7 +1083,6 @@ pub(crate) mod test {
         let computed_eval1 = trace
             .get_step(dense_layers[0].0)
             .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
-            .step_data
             .output_tensor_at(0, &mut store)
             .unwrap()
             .get_data()

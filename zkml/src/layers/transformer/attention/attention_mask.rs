@@ -16,7 +16,7 @@ use crate::{
         },
         transformer::mha::eval_zeroifier_mle,
     },
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeInfo},
     quantization::Fieldizer,
     tensor::{BShape, TensorTypeParam, WrappedTensor},
@@ -740,7 +740,7 @@ where
         node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {

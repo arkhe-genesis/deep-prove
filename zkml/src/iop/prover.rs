@@ -12,7 +12,7 @@ use crate::{
         context::{LookupWitness, TableType, generate_lookup_witnesses},
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
-    model::{InferenceStep, InferenceTrace},
+    model::InferenceTrace,
     tensor::{CommitmentId, get_root_of_unity},
 };
 use anyhow::{Context as _, anyhow, ensure};
@@ -529,20 +529,16 @@ where
         for (node_id, node) in self.ctx.model_ctx.nodes.backward_iter() {
             match node {
                 Node::Inner(ctx) => {
-                    let InferenceStep {
-                        op: node_operation,
-                        step_data,
-                    } = trace
+                    let section = trace
                         .get_step(node_id)
-                        // this should never happen in practice
                         .ok_or(anyhow!("Step in trace not found for node {node_id}"))?;
                     trace!(
                         "Proving node with id {node_id}: {:?}",
-                        node_operation.describe()
+                        section.op.describe()
                     );
 
                     // Hydrate all the output tensors of this node
-                    let tensors = step_data
+                    let tensors = section
                         .node_outputs
                         .outputs
                         .iter()
@@ -581,18 +577,19 @@ where
                     )?;
 
                     // prove or propagate the claims
-                    let my_claims = if node_operation.is_provable() {
-                        node_operation
+                    let my_claims = if section.op.is_provable() {
+                        section
+                            .op
                             .prove(
                                 node_id,
                                 ctx,
                                 claims_for_prove.iter().collect::<Vec<_>>(),
-                                step_data,
+                                section,
                                 &mut self,
                                 &mut store,
                             )
                             .with_context(|| {
-                                format!("proving {}: {}", node_id, node_operation.describe())
+                                format!("proving {}: {}", node_id, section.op.describe())
                             })?
                     } else {
                         // we only propagate the claims, without changing them, as a non-provable layer

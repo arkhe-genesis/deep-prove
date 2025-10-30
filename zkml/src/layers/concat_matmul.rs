@@ -25,7 +25,7 @@ use crate::{
         },
         requant::Requant,
     },
-    model::StepData,
+    model::Step,
     padding::{PaddingMode, ShapeInfo, pad_concat_mat_mul},
     tensor::{TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
@@ -731,7 +731,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> Result<Vec<crate::Claim<E>>> {

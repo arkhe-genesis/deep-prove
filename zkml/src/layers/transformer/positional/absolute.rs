@@ -13,7 +13,7 @@ use crate::{
         },
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
-    model::StepData,
+    model::Step,
     quantization::TensorFielder,
     tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
@@ -191,7 +191,7 @@ impl Absolute<Element> {
         &self,
         node_id: NodeId,
         output_claim: &Claim<E>,
-        step_data: &StepData<E, E>,
+        step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
