@@ -13,12 +13,13 @@ use crate::{
     },
     layers::{
         activation::ActivationData,
+        convolution::ConvFFTData,
         transformer::{logits::ArgmaxData, mha::MhaData},
     },
     lookup::context::LookupWitnessGen,
     model::{trace::Step, transform::ModelTransform},
     padding::{PaddingMode, ShapeInfo},
-    tensor::{ConvFFTData, TensorTypeParam, WrappedTensor},
+    tensor::{TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, bail, ensure};
 use derive_more::{From, Into};

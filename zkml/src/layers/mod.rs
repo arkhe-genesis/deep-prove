@@ -6,7 +6,7 @@ use crate::{
         activation::{ACTIVATION_LAYER, Activation, ActivationData, ActivationProof},
         add::{ADD_LAYER, Add, AddCtx, AddProof},
         concat_matmul::{CONCAT_MATMUL_LAYER, ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof},
-        convolution::{CONVOLUTION_LAYER, Convolution},
+        convolution::{CONVOLUTION_LAYER, ConvFFTData, Convolution},
         dense::{DENSE_LAYER, Dense},
         einsum::{EINSUM_LAYER, EinSum, EinSumContext, EinSumProof},
         flatten::FLATTEN_LAYER,
@@ -32,7 +32,7 @@ use crate::{
     model::Step,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, ModelMetadata, ScalingFactor},
-    tensor::{ConvFFTData, DryTensor, TensorTypeParam, WrappedTensor},
+    tensor::{DryTensor, TensorTypeParam, WrappedTensor},
 };
 use activation::ActivationCtx;
 use anyhow::{Context as _, Result, bail};

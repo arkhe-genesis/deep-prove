@@ -14,12 +14,9 @@ use crate::{
     model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo},
-    quantization::{self, BIT_LEN, Fieldizer, ScalingFactor, TensorFielder},
+    quantization::{self, BIT_LEN, Fieldizer, IntoElement, ScalingFactor, TensorFielder},
     shape::filter_size,
-    tensor::{
-        CommitmentId, ConvData, ConvFFTData, KeyedTensor, Tensor, TensorTypeParam, WrappedTensor,
-        fft,
-    },
+    tensor::{CommitmentId, KeyedTensor, Tensor, TensorTypeParam, WrappedTensor, fft},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
@@ -55,6 +52,85 @@ pub(crate) mod proof;
 mod test;
 
 pub(crate) use proof::{ConvCtx, ConvProof};
+
+#[derive(Debug, Default, Clone)]
+pub struct ConvData<E>
+where
+    E: Clone + ExtensionField,
+{
+    /// Convolution input data.
+    ///
+    /// This is the same as the convolution input data converted to extension
+    /// field elements, before padding or FFT.
+    ///
+    /// Used for debugging purposes
+    pub real_input: Vec<E>,
+
+    /// The input chunked and reversed
+    pub input: Vec<Vec<E>>,
+
+    /// The input after applying the FFT transformation.
+    ///
+    /// Same as `FFT(input)`.
+    pub input_fft: Vec<Vec<E>>,
+
+    /// The result of the convolution in the frequency domain.
+    ///
+    /// Same as `FFT(input) * FFT(filter)`.
+    pub prod: Vec<Vec<E>>,
+
+    /// The result of the convolution in its original domain.
+    ///
+    /// Same as `iFFT(FFT(input) * FFT(filter))`.
+    pub output: Vec<Vec<E>>,
+
+    /// The result converted to `Element`.
+    ///
+    /// Same as `output` after transforming its type.
+    pub output_as_element: Vec<Element>,
+}
+
+impl<E> ConvData<E>
+where
+    E: Copy + ExtensionField,
+{
+    pub fn new(
+        real_input: Vec<E>,
+        input: Vec<Vec<E>>,
+        input_fft: Vec<Vec<E>>,
+        prod: Vec<Vec<E>>,
+        output: Vec<Vec<E>>,
+        n_x: usize,
+    ) -> Self {
+        let n_x_squared = n_x * n_x;
+        let output_elems = output
+            .iter()
+            .flat_map(|output| {
+                let data = output.as_slice();
+                (0..data.len() / 2)
+                    .map(|i| data[n_x_squared - 1 - i].to_element())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self {
+            real_input,
+            input,
+            input_fft,
+            prod,
+            output,
+            output_as_element: output_elems,
+        }
+    }
+    pub fn set_output(&mut self, output: &[Element]) {
+        self.output_as_element = output.to_vec();
+    }
+}
+
+/// Caries the data needed to perform the FFT convolution.
+#[derive(Debug, Clone)]
+pub struct ConvFFTData {
+    pub input: Tensor<Element>,
+}
 
 /// The filter weights, a 4D tensor of the shape `(feature_maps, channels_out,
 /// kernel_height, kernel_width)` whose shape depends on the current life stage
@@ -1502,6 +1578,79 @@ fn index_wf<E: ExtensionField>(
             E::ZERO
         }
     })
+}
+
+/// Applies a 2-dimensional convolution
+// [1] - https://onnx.ai/onnx/operators/onnx__Conv.html
+// [2] - https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d
+// [3] - https://github.com/vdumoulin/conv_arithmetic
+pub(crate) fn conv2d<T: Number>(
+    input: &Tensor<T>,
+    kernels: &Tensor<T>,
+    bias: &Tensor<T>,
+    stride: usize,
+) -> Tensor<T> {
+    // (N x C x H x W)
+    let (batch_size, channels_in, height_in, width_in) = input.get4d();
+    // (M x C/group x kH x kW)
+    let (feature_maps, channels_out, kernel_height, kernel_width) = kernels.get4d();
+
+    assert!(input.rank() <= 4, "Supports at most 4D input.");
+    assert!(kernels.rank() <= 4, "Supports at most 4D filters.");
+    assert_eq!(
+        channels_in,
+        channels_out,
+        "Grouping is not supported, input channels {channels_in} and kernel {channels_out} must match! {:?} vs kernel {:?}",
+        input.shape(),
+        kernels.shape()
+    );
+    assert!(
+        bias.shape().as_ref() == &[feature_maps],
+        "Bias shape must match number of kernels!",
+    );
+
+    // NOTE: neither padding nor dilation is supported
+    //
+    // The shape formula can be found at pythorch [1], the one below is
+    // simplified since padding is no supported (defaults to 0) and neither
+    // dilation is supported (defaults to 1).
+    //
+    // [1] - https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d
+    let height_out = (height_in - kernel_height) / stride + 1;
+    let width_out = (width_in - kernel_width) / stride + 1;
+    let shape_out = Shape::new(vec![batch_size, feature_maps, height_out, width_out]);
+
+    let output: Vec<T> = (0..shape_out.numel())
+        .into_par_iter()
+        .map(|idx| {
+            // Decompose flat index into (n, o, oh, ow)
+            let batch = idx / (feature_maps * height_out * width_out);
+            let rem1 = idx % (feature_maps * height_out * width_out);
+            let o = rem1 / (height_out * width_out);
+            let rem2 = rem1 % (height_out * width_out);
+            let oh = rem2 / width_out;
+            let ow = rem2 % width_out;
+
+            let mut sum = T::default();
+
+            // Convolution
+            for channel in 0..channels_out {
+                for kh in 0..kernel_height {
+                    for kw in 0..kernel_width {
+                        let h = oh * stride + kh;
+                        let w = ow * stride + kw;
+                        let input_val = input.get_at_4d(batch, channel, h, w);
+                        let weight_val = kernels.get_at_4d(o, channel, kh, kw);
+                        sum += input_val * weight_val;
+                    }
+                }
+            }
+
+            sum + bias.data()[o]
+        })
+        .collect();
+
+    Tensor::new(shape_out, output)
 }
 
 /// Assumes stride=1, padding=0, and dilation=1

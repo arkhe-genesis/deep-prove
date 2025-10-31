@@ -6,7 +6,9 @@ pub use burn_wrapper::{
     BShape, BTensorKind, Conversion, IntoBTensor, TensorTypeParam, WrappedModuleFn, WrappedTensor,
 };
 
-use crate::{ScalingFactor, backend::Backend, number::Number, shape::Shape, to_field};
+use crate::{
+    ScalingFactor, backend::Backend, layers::convolution, number::Number, shape::Shape, to_field,
+};
 use anyhow::{Result, bail, ensure};
 use burn::tensor::{Int, Tensor as BTensor};
 use ceno_p3::{
@@ -33,10 +35,7 @@ use std::{
 use tenstore::{GenStore, GenericStore, StorageKey, StoreError};
 
 use crate::{
-    Element,
-    layers::pooling::MAXPOOL2D_KERNEL_SIZE,
-    quantization::{Fieldizer, IntoElement},
-    to_bit_sequence_le,
+    Element, layers::pooling::MAXPOOL2D_KERNEL_SIZE, quantization::Fieldizer, to_bit_sequence_le,
 };
 
 #[derive(
@@ -371,85 +370,6 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) {
         v.par_iter_mut().for_each(|val| {
             *val *= ilen;
         });
-    }
-}
-
-/// Caries the data needed to perform the FFT convolution.
-#[derive(Debug, Clone)]
-pub struct ConvFFTData {
-    pub input: Tensor<Element>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ConvData<E>
-where
-    E: Clone + ExtensionField,
-{
-    /// Convolution input data.
-    ///
-    /// This is the same as the convolution input data converted to extension
-    /// field elements, before padding or FFT.
-    ///
-    /// Used for debugging purposes
-    pub real_input: Vec<E>,
-
-    /// The input chunked and reversed
-    pub input: Vec<Vec<E>>,
-
-    /// The input after applying the FFT transformation.
-    ///
-    /// Same as `FFT(input)`.
-    pub input_fft: Vec<Vec<E>>,
-
-    /// The result of the convolution in the frequency domain.
-    ///
-    /// Same as `FFT(input) * FFT(filter)`.
-    pub prod: Vec<Vec<E>>,
-
-    /// The result of the convolution in its original domain.
-    ///
-    /// Same as `iFFT(FFT(input) * FFT(filter))`.
-    pub output: Vec<Vec<E>>,
-
-    /// The result converted to `Element`.
-    ///
-    /// Same as `output` after transforming its type.
-    pub output_as_element: Vec<Element>,
-}
-
-impl<E> ConvData<E>
-where
-    E: Copy + ExtensionField,
-{
-    pub fn new(
-        real_input: Vec<E>,
-        input: Vec<Vec<E>>,
-        input_fft: Vec<Vec<E>>,
-        prod: Vec<Vec<E>>,
-        output: Vec<Vec<E>>,
-        n_x: usize,
-    ) -> Self {
-        let n_x_squared = n_x * n_x;
-        let output_elems = output
-            .iter()
-            .flat_map(|output| {
-                let data = output.as_slice();
-                (0..data.len() / 2)
-                    .map(|i| data[n_x_squared - 1 - i].to_element())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        Self {
-            real_input,
-            input,
-            input_fft,
-            prod,
-            output,
-            output_as_element: output_elems,
-        }
-    }
-    pub fn set_output(&mut self, output: &[Element]) {
-        self.output_as_element = output.to_vec();
     }
 }
 
@@ -1435,78 +1355,9 @@ impl<T: Number> Tensor<T> {
         (maxpool_result, padded_maxpool_tensor)
     }
 
-    // Applies a 2dimensional convolution.
-    //
-    // [1] - https://onnx.ai/onnx/operators/onnx__Conv.html
-    // [2] - https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d
-    // [3] - https://github.com/vdumoulin/conv_arithmetic
+    // Applies a 2-dimensional convolution.
     pub fn conv2d(&self, kernels: &Tensor<T>, bias: &Tensor<T>, stride: usize) -> Tensor<T> {
-        // (N x C x H x W)
-        let (batch_size, channels_in, height_in, width_in) = self.get4d();
-        // (M x C/group x kH x kW)
-        let (feature_maps, channels_out, kernel_height, kernel_width) = kernels.get4d();
-
-        assert!(self.rank() <= 4, "Supports at most 4D input.");
-        assert!(kernels.rank() <= 4, "Supports at most 4D filters.");
-        assert_eq!(
-            channels_in,
-            channels_out,
-            "Grouping is not supported, input channels {channels_in} and kernel {channels_out} must match! {:?} vs kernel {:?}",
-            self.shape(),
-            kernels.shape()
-        );
-        assert_eq!(
-            bias.shape.as_ref(),
-            &[feature_maps],
-            "Bias shape must match number of kernels!",
-        );
-
-        // NOTE: neither padding nor dilation is supported
-        //
-        // The shape formula can be found at pythorch [1], the one below is
-        // simplified since padding is no supported (defaults to 0) and neither
-        // dilation is supported (defaults to 1).
-        //
-        // [1] - https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d
-        let height_out = (height_in - kernel_height) / stride + 1;
-        let width_out = (width_in - kernel_width) / stride + 1;
-        let shape_out = Shape::new(vec![batch_size, feature_maps, height_out, width_out]);
-
-        let output: Vec<T> = (0..shape_out.numel())
-            .into_par_iter()
-            .map(|idx| {
-                // Decompose flat index into (n, o, oh, ow)
-                let batch = idx / (feature_maps * height_out * width_out);
-                let rem1 = idx % (feature_maps * height_out * width_out);
-                let o = rem1 / (height_out * width_out);
-                let rem2 = rem1 % (height_out * width_out);
-                let oh = rem2 / width_out;
-                let ow = rem2 % width_out;
-
-                let mut sum = T::default();
-
-                // Convolution
-                for channel in 0..channels_out {
-                    for kh in 0..kernel_height {
-                        for kw in 0..kernel_width {
-                            let h = oh * stride + kh;
-                            let w = ow * stride + kw;
-                            let input = self.get_at_4d(batch, channel, h, w);
-                            let weight = kernels.get_at_4d(o, channel, kh, kw);
-                            sum += input * weight;
-                        }
-                    }
-                }
-
-                sum + bias.data[o]
-            })
-            .collect();
-
-        Tensor {
-            data: output,
-            shape: shape_out.clone(),
-            unpadded_shape: shape_out,
-        }
+        convolution::conv2d(self, kernels, bias, stride)
     }
 
     pub fn to_f32(&self) -> anyhow::Result<Tensor<f32>> {
