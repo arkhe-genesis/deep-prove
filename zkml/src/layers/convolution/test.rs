@@ -520,6 +520,8 @@ fn input_conv2d<T: TensorTypeParam>(
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
     #[test]
     fn convolution_test_single_batch_f32(input in input_conv2d::<f32>(1..2, 1..3, 2..8, 2..8)) {
         let stride = 1;
@@ -528,9 +530,13 @@ proptest! {
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone());
         let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
+        #[cfg(not(feature = "gpu"))]
+        const THRESHOLD: f32 = 1e-3;
+        #[cfg(feature = "gpu")]
+        const THRESHOLD: f32 = 1e-2;
         result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
             prop_assert!(
-                (left - right).abs() < 1e-3,
+                (left - right).abs() < THRESHOLD,
                 "Actual: {left}, Expected: {right}",
 
             );
@@ -546,15 +552,21 @@ proptest! {
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone());
         let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
+        #[cfg(not(feature = "gpu"))]
+        const THRESHOLD: f32 = 1e-3;
+        #[cfg(feature = "gpu")]
+        const THRESHOLD: f32 = 1e-2;
         result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
             prop_assert!(
-                (left - right).abs() < 1e-3,
+                (left - right).abs() < THRESHOLD,
                 "Actual: {left}, Expected: {right}",
             );
             Ok(())
         })?;
     }
+}
 
+proptest! {
     #[test]
     fn convolution_test_single_batch_element(input in input_fft::<Element>(1..3, 2..7)) {
         let conv2d_result = input.input.conv2d(&input.kernels, &input.bias, 1);

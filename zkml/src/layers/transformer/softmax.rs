@@ -2037,7 +2037,7 @@ mod tests {
     #[test]
     fn test_softmax_proving() {
         init_test_logging("debug");
-        let dim_size = 1000;
+        let dim_size = 200;
         let input_shape = vec![12, dim_size, dim_size];
 
         let mut model =

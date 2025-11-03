@@ -30,7 +30,6 @@ mem-track = ["utils/mem-track"]
 
 # Internal. Use `wgpu` or `cuda` which will enable `gpu`
 gpu = [
-  "burn/wgpu",
   "burn/fusion",
   "burn/autotune",
   "dep:burn-cubecl",
@@ -43,10 +42,10 @@ ahash = "0.8.12"
 anyhow.workspace = true
 ark-std.workspace = true
 average = { version = "0.16.0", features = ["std"] }
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef92cd6040b8626c3ce1901b4e", default-features = false }
-burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef92cd6040b8626c3ce1901b4e", default-features = false, optional = true }
-burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef92cd6040b8626c3ce1901b4e", default-features = false, optional = true }
-burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef92cd6040b8626c3ce1901b4e", optional = true, default-features = false, features = [
+burn = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false }
+burn-cubecl = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, optional = true }
+burn-fusion = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, optional = true }
+burn-ndarray = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", optional = true, default-features = false, features = [
   "std",
   "multi-threads",
 ] }
@@ -99,11 +98,11 @@ utils = { path = "../utils" }
 witness = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef92cd6040b8626c3ce1901b4e", default-features = false, features = [
+burn = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, features = [
   "metal",
 ] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "97273a08a6a398ef92cd6040b8626c3ce1901b4e", default-features = false, features = [
+burn = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, features = [
   "vulkan",
 ] }
 

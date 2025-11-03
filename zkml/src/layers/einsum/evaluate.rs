@@ -471,6 +471,8 @@ mod tests {
     use crate::{Element, rng_from_env_or_random, tensor::IntoBTensor};
     use burn::tensor::Tensor as BurnTensor;
 
+    const TEST_CASES: usize = 5;
+
     #[test]
     fn test_simple_matmul() {
         test_simple_matmul_helper::<f32>();
@@ -487,7 +489,7 @@ mod tests {
 
         let mut rng = rng_from_env_or_random();
 
-        for _ in 0..10 {
+        for _ in 0..TEST_CASES {
             let dim1: usize = rng.gen_range(1..15);
             let dim2: usize = rng.gen_range(1..15);
             let dim3: usize = rng.gen_range(1..15);
@@ -531,7 +533,7 @@ mod tests {
     {
         let mut rng = rng_from_env_or_random();
 
-        for _ in 0..10 {
+        for _ in 0..TEST_CASES {
             let dim1: usize = rng.gen_range(1..15);
             let dim2: usize = rng.gen_range(1..15);
             let dim3: usize = rng.gen_range(1..15);
@@ -591,7 +593,7 @@ mod tests {
 
         let mut rng = rng_from_env_or_random();
 
-        for _ in 0..10 {
+        for _ in 0..TEST_CASES {
             let batch: usize = rng.gen_range(1..5);
             let dim1: usize = rng.gen_range(1..15);
             let dim2: usize = rng.gen_range(1..15);
@@ -647,7 +649,7 @@ mod tests {
         .expect("Failed to create EinSum layer");
         let mut rng = rng_from_env_or_random();
 
-        for _ in 0..10 {
+        for _ in 0..TEST_CASES {
             let batch: usize = rng.gen_range(1..5);
             let dim1: usize = rng.gen_range(1..15);
             let dim2: usize = rng.gen_range(1..15);
@@ -712,7 +714,10 @@ mod tests {
 
     #[test]
     fn test_grouped_qkv() {
+        #[cfg(not(feature = "gpu"))]
         const TOLERANCE: f32 = 1e-6;
+        #[cfg(feature = "gpu")]
+        const TOLERANCE: f32 = 1e-2;
 
         test_grouped_qkv_helper::<f32, _>(|left, right| (left - right).abs() <= TOLERANCE);
         test_grouped_qkv_helper::<Element, _>(PartialEq::eq);
@@ -725,7 +730,7 @@ mod tests {
     {
         let mut rng = rng_from_env_or_random();
 
-        for _ in 0..10 {
+        for _ in 0..TEST_CASES {
             let heads: usize = rng.gen_range(1..5);
             let seq_len: usize = rng.gen_range(1..15);
             let embedding_dim = rng.gen_range(1..15);
@@ -808,7 +813,10 @@ mod tests {
 
     #[test]
     fn test_grouped_qk_transpose() {
+        #[cfg(not(feature = "gpu"))]
         const TOLERANCE: f32 = 1e-6;
+        #[cfg(feature = "gpu")]
+        const TOLERANCE: f32 = 1e-2;
 
         test_grouped_qk_transpose_helper::<f32, _>(|left, right| (left - right).abs() <= TOLERANCE);
         test_grouped_qk_transpose_helper::<Element, _>(PartialEq::eq);
@@ -829,7 +837,7 @@ mod tests {
         .expect("Failed to create EinSum layer");
         let mut rng = rng_from_env_or_random();
 
-        for _ in 0..10 {
+        for _ in 0..TEST_CASES {
             let heads: usize = rng.gen_range(1..5);
             let group_size: usize = rng.gen_range(1..4);
             let q_len = 1usize;

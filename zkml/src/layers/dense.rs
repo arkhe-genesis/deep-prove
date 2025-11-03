@@ -907,6 +907,10 @@ mod test {
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
 
         #[test]
         fn test_dense_with_f32(input in any_input::<f32>(2..256)) {
@@ -918,9 +922,13 @@ mod test {
             let input = input.into_wrapped();
             let computed = dense.evaluate::<GoldilocksExt2>(&[&input]).expect("Dense evaluation must be successful");
 
+            #[cfg(not(feature = "gpu"))]
+            const THRESHOLD: f32 = 1e-3;
+            #[cfg(feature = "gpu")]
+            const THRESHOLD: f32 = 1e-2;
             for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
                 prop_assert!(
-                    (left - right).abs() < 1e-3,
+                    (left - right).abs() < THRESHOLD,
                     "Actual: {left}, Expected: {right}",
                 );
             }

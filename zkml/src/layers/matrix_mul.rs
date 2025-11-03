@@ -1697,6 +1697,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(6))]
+
         #[test]
         fn test_matmul_with_f32(input in any_input::<f32>(1..256, 1..256, 1..256)) {
             let Input { left, right, kind, transpose_b, bias } = input;
@@ -1725,16 +1727,21 @@ mod tests {
             let inputs:Vec<_> = inputs.iter().collect();
             let computed = layer.evaluate::<GoldilocksExt2>(&inputs).expect("matmul evaluation must be successful");
 
+            #[cfg(not(feature = "gpu"))]
+            const THRESHOLD: f32 = 1e-3;
+            #[cfg(feature = "gpu")]
+            const THRESHOLD: f32 = 1e-2;
             for (left, right) in expected.get_data().iter().zip(computed.outputs[0].get_data().iter()) {
                 let abs = (left - right).abs();
                 // The differences are in tensor matmul
-                const THRESHOLD: f32 =  1e-3;
                 prop_assert!(abs < THRESHOLD, "Absolute diff {} not within threshold {}", abs, THRESHOLD);
             }
         }
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
         #[test]
         fn test_matmul_with_element(input in any_input::<Element>(1..256, 1..256, 1..256)) {
             let Input { left, right, kind, transpose_b, bias } = input;

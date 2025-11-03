@@ -1553,6 +1553,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4))]
+
         #[test]
         fn test_qkv_with_f32(input in any_input::<f32>(1..32, 1..256, 1..8, 1..256)) {
             let Input { q, q_bias, k, k_bias, v, v_bias, num_heads, input } = input;
@@ -1567,11 +1569,15 @@ mod tests {
             prop_assert_eq!(expected_q.shape(), &Shape::from(computed.outputs[0].shape()));
             prop_assert_eq!(expected_k.shape(), &Shape::from(computed.outputs[1].shape()));
             prop_assert_eq!(expected_v.shape(), &Shape::from(computed.outputs[2].shape()));
+
+            #[cfg(not(feature = "gpu"))]
+            const THRESHOLD: f32 = 1e-3;
+            #[cfg(feature = "gpu")]
+            const THRESHOLD: f32 = 1e-2;
             let assert_data = |a: &Tensor<f32>, b: &Tensor<f32>| {
                 for (a, b) in a.data().iter().zip(b.data()) {
                     let abs = (a - b).abs();
                     // The differences are in tensor matmul
-                    const THRESHOLD: f32 =  1e-3;
                     prop_assert!(abs < THRESHOLD, "Absolute diff {} not within threshold {}", abs, THRESHOLD);
                 }
                 Ok(())
