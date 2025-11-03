@@ -2,7 +2,7 @@ use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use candle_core::quantized::gguf_file::Value;
 use tokenizers::{
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
@@ -135,11 +135,11 @@ impl HFTokenizer {
         // Add ByteLevel decoder for proper detokenization in GPT2
         tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
 
-        assert!(
+        ensure!(
             tokenizer.id_to_token(bos_id).is_some(),
             "no BOS token present"
         );
-        assert!(
+        ensure!(
             tokenizer.id_to_token(eos_id).is_some(),
             "no EOS token present"
         );

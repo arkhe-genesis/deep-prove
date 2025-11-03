@@ -35,7 +35,7 @@ use crate::{
     tensor::{DryTensor, TensorTypeParam, WrappedTensor},
 };
 use activation::ActivationCtx;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use convolution::{ConvCtx, ConvProof};
 use dense::{DenseCtx, DenseProof};
 use ff_ext::ExtensionField;
@@ -257,23 +257,31 @@ impl<E: ExtensionField> LayerCtx<E> {
         !matches!(self, Self::Flatten)
     }
 
-    pub fn next_shape_step(&self, last_step: &ShapeStep) -> ShapeStep {
+    pub fn next_shape_step(&self, last_step: &ShapeStep) -> Result<ShapeStep> {
         let unpadded_output =
-            self.output_shapes(&last_step.unpadded_output_shape, PaddingMode::NoPadding);
+            self.output_shapes(&last_step.unpadded_output_shape, PaddingMode::NoPadding)?;
         let padded_output =
-            self.output_shapes(&last_step.padded_output_shape, PaddingMode::Padding);
-        ShapeStep::next_step(last_step, unpadded_output, padded_output)
+            self.output_shapes(&last_step.padded_output_shape, PaddingMode::Padding)?;
+        Ok(ShapeStep::next_step(
+            last_step,
+            unpadded_output,
+            padded_output,
+        ))
     }
 
-    pub fn shape_step(&self, unpadded_input: &[Shape], padded_input: &[Shape]) -> ShapeStep {
-        let unpadded_output = self.output_shapes(unpadded_input, PaddingMode::NoPadding);
-        let padded_output = self.output_shapes(padded_input, PaddingMode::Padding);
-        ShapeStep::new(
+    pub fn shape_step(
+        &self,
+        unpadded_input: &[Shape],
+        padded_input: &[Shape],
+    ) -> Result<ShapeStep> {
+        let unpadded_output = self.output_shapes(unpadded_input, PaddingMode::NoPadding)?;
+        let padded_output = self.output_shapes(padded_input, PaddingMode::Padding)?;
+        Ok(ShapeStep::new(
             unpadded_input.to_vec(),
             padded_input.to_vec(),
             unpadded_output,
             padded_output,
-        )
+        ))
     }
 }
 
@@ -377,7 +385,11 @@ impl<E: ExtensionField> NodeOut<Element, E> {
 }
 
 impl<N: TensorTypeParam> OpInfo for Layer<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         match self {
             Layer::Dense(dense) => dense.output_shapes(input_shapes, padding_mode),
             Layer::Convolution(convolution) => {
@@ -408,7 +420,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
         }
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         match self {
             Layer::Dense(dense) => dense.num_outputs(num_inputs),
             Layer::Convolution(convolution) => convolution.num_outputs(num_inputs),
@@ -740,11 +752,11 @@ where
             Layer::Requant(requant) => requant.gen_lookup_witness(id, ctx, step_data, store),
             Layer::Pooling(pooling) => pooling.gen_lookup_witness(id, ctx, step_data, store),
             Layer::Reshape(r) => {
-                assert!(!r.is_provable());
+                ensure!(!r.is_provable(), "reshape {r:?} is provable");
                 Ok(Default::default())
             }
             Layer::Flatten(r) => {
-                assert!(!r.is_provable());
+                ensure!(!r.is_provable(), "flatten {r:?} is provable");
                 Ok(Default::default())
             }
             Layer::AttentionMask(attention_mask) => {
@@ -770,8 +782,8 @@ impl QuantizeOp for Layer<f32> {
                 let output =
                     dense.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Dense(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::Convolution(convolution) => {
                 let output = convolution.quantize_op::<S>(
@@ -784,29 +796,29 @@ impl QuantizeOp for Layer<f32> {
                     Layer::Convolution(output.quantized_op),
                     output.output_scalings,
                 )
-                .maybe_requants(output.requant_layer)
-                .maybe_transform(output.post_quant_rule)
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
             }
             Layer::MatMul(mat) => {
                 let output =
                     mat.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::MatMul(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::QKV(qkv) => {
                 let output =
                     qkv.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::QKV(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::Mha(mha) => {
                 let output =
                     mha.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Mha(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::ConcatMatMul(concat_matmul) => {
                 let output = concat_matmul.quantize_op::<S>(
@@ -819,8 +831,8 @@ impl QuantizeOp for Layer<f32> {
                     Layer::ConcatMatMul(output.quantized_op),
                     output.output_scalings,
                 )
-                .maybe_requants(output.requant_layer)
-                .maybe_transform(output.post_quant_rule)
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
             }
             Layer::LayerNorm(layernorm) => {
                 let output = layernorm.quantize_op::<S>(
@@ -833,8 +845,8 @@ impl QuantizeOp for Layer<f32> {
                     Layer::LayerNorm(output.quantized_op),
                     output.output_scalings,
                 )
-                .maybe_requants(output.requant_layer)
-                .maybe_transform(output.post_quant_rule)
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
             }
             Layer::RMSNorm(rmsnorm) => {
                 let output = rmsnorm.quantize_op::<S>(
@@ -844,8 +856,8 @@ impl QuantizeOp for Layer<f32> {
                     unpadded_input_shapes,
                 )?;
                 QuantizeOutput::new(Layer::RMSNorm(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::Softmax(softmax) => {
                 let output = softmax.quantize_op::<S>(
@@ -855,22 +867,22 @@ impl QuantizeOp for Layer<f32> {
                     unpadded_input_shapes,
                 )?;
                 QuantizeOutput::new(Layer::Softmax(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::Add(add) => {
                 let output =
                     add.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Add(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::Logits(logits) => {
                 let output =
                     logits.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::Logits(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
             Layer::Positional(positional) => {
                 let output = positional.quantize_op::<S>(
@@ -883,8 +895,8 @@ impl QuantizeOp for Layer<f32> {
                     Layer::Positional(output.quantized_op),
                     output.output_scalings,
                 )
-                .maybe_requants(output.requant_layer)
-                .maybe_transform(output.post_quant_rule)
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
             }
             Layer::Embeddings(embeddings) => {
                 let output = embeddings.quantize_op::<S>(
@@ -897,8 +909,8 @@ impl QuantizeOp for Layer<f32> {
                     Layer::Embeddings(output.quantized_op),
                     output.output_scalings,
                 )
-                .maybe_requants(output.requant_layer)
-                .maybe_transform(output.post_quant_rule)
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
             }
             Layer::Activation(activation) => {
                 let output = activation.quantize_op::<S>(
@@ -911,7 +923,7 @@ impl QuantizeOp for Layer<f32> {
                     Layer::Activation(output.quantized_op),
                     output.output_scalings,
                 )
-                .maybe_requants(output.requant_layer)
+                .maybe_requants(output.requant_layer)?
             }
             Layer::Requant(requant) => {
                 QuantizeOutput::new(Layer::Requant(requant), input_scaling.to_vec())
@@ -936,15 +948,15 @@ impl QuantizeOp for Layer<f32> {
                     Layer::AttentionMask(output.quantized_op),
                     output.output_scalings,
                 )
-                .maybe_requants(output.requant_layer)
-                .maybe_transform(output.post_quant_rule)
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
             }
             Layer::EinSum(einsum) => {
                 let output =
                     einsum.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
                 QuantizeOutput::new(Layer::EinSum(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)
-                    .maybe_transform(output.post_quant_rule)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
             }
         })
     }

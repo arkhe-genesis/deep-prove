@@ -30,7 +30,7 @@ use crate::{
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
-use anyhow::{anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use burn::tensor::Shape as BShape;
 use ceno_p3::field::FieldAlgebra;
 use either::Either;
@@ -240,12 +240,12 @@ impl OpInfo for Logits {
         &self,
         input_shapes: &[Shape],
         padding_mode: crate::padding::PaddingMode,
-    ) -> Vec<Shape> {
-        Self::output_shapes(input_shapes, padding_mode)
+    ) -> Result<Vec<Shape>> {
+        Ok(Self::output_shapes(input_shapes, padding_mode))
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -269,7 +269,7 @@ impl ProveInfo for Logits {
             aux.last_output_shape.len(),
         );
 
-        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
+        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
         aux.tables.insert(TableType::Range);
 
         let lookup_ctx = LayerLookupContext::new(vec![TableType::Range], vec![1]);
@@ -295,7 +295,7 @@ impl QuantizeOp for Logits {
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         // no need to quantize, we just propagate the scaling factors
         let num_inputs = input_scaling.len();
-        let num_outputs = self.num_outputs(num_inputs);
+        let num_outputs = self.num_outputs(num_inputs)?;
         let output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
 
         Ok(QuantizeOutput::new(self, output_scalings))
@@ -309,10 +309,11 @@ impl PadOp for Logits {
     {
         let unpadded_input_shapes = si.unpadded_input_shapes();
         let unpadded_output_shapes =
-            self.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding);
+            self.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding)?;
 
         let padded_input_shapes = si.padded_input_shapes();
-        let padded_output_shapes = self.output_shapes(&padded_input_shapes, PaddingMode::Padding);
+        let padded_output_shapes =
+            self.output_shapes(&padded_input_shapes, PaddingMode::Padding)?;
 
         ensure!(
             si.shapes.iter().all(|s| s.ignore_garbage_pad.is_none()),
@@ -426,7 +427,7 @@ where
             .collect::<Vec<E::BaseField>>();
         // `base_lt_evals` is the MLE evals on the boolean hypercube for one row, now we need to repeat this number of rows times
         let lt_mle = vec![base_lt_evals; 1 << num_row_vars].concat().into_mle();
-        let input_mle = input.to_mle_2d();
+        let input_mle = input.to_mle_2d()?;
 
         let padded_max_evals = max_mle
             .get_base_field_vec()
@@ -596,12 +597,12 @@ impl OpInfo for LogitsCtx {
         &self,
         input_shapes: &[Shape],
         padding_mode: crate::padding::PaddingMode,
-    ) -> Vec<Shape> {
-        Logits::output_shapes(input_shapes, padding_mode)
+    ) -> Result<Vec<Shape>> {
+        Ok(Logits::output_shapes(input_shapes, padding_mode))
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -896,7 +897,7 @@ mod test {
 
     #[test]
     fn test_logits_argmax() -> anyhow::Result<()> {
-        let input = Tensor::new(vec![3, 2].into(), vec![0.0, 1.0, 3.0, 2.0, 4.0, 5.0]);
+        let input = Tensor::new(vec![3, 2].into(), vec![0.0, 1.0, 3.0, 2.0, 4.0, 5.0]).unwrap();
         let logits = Logits::Argmax;
 
         let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
@@ -952,7 +953,7 @@ mod test {
                 data.push(val);
             }
         }
-        let input = Tensor::new(vec![2, 3, 4].into(), data);
+        let input = Tensor::new(vec![2, 3, 4].into(), data).unwrap();
         let logits = Logits::Argmax;
         let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
         let indices = out.outputs()[0].get_data();
@@ -968,7 +969,7 @@ mod test {
         fn prop_logits_argmax_f32((shape, data, expected) in logits_input_strategy()) {
             //  rows = product of all leading dims (shape[..rank-1]).
             //  Each row has a unique argmax and the output tensor shape is [rows,1].
-            let input = Tensor::new(shape.clone().into(), data);
+            let input = Tensor::new(shape.clone().into(), data).unwrap();
             let logits = Logits::Argmax;
             let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).unwrap();
             let indices = out.outputs()[0].get_data();
@@ -979,7 +980,7 @@ mod test {
         #[test]
         fn prop_logits_argmax_element((shape, data, expected) in logits_input_strategy()) {
             let data_elem: Vec<Element> = data.into_iter().map(|v| v.round_ties_even() as Element).collect();
-            let input = Tensor::new(shape.clone().into(), data_elem);
+            let input = Tensor::new(shape.clone().into(), data_elem).unwrap();
             let logits = Logits::Argmax;
 
             let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).unwrap();

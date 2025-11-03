@@ -31,7 +31,7 @@ use crate::{
     quantization::{Fieldizer, TensorFielder},
     tensor::{TensorTypeParam, WrappedTensor},
 };
-use anyhow::{anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use ff_ext::{ExtensionField, FieldFrom};
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
@@ -98,16 +98,22 @@ impl<'a, E: ExtensionField> From<&'a MhaCtx<E>> for MhaOutputShaper<'a> {
 }
 
 impl<'a> MhaOutputShaper<'a> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         let reshaped_input_shapes = self
             .inputs_reshape
-            .output_shapes(input_shapes, padding_mode);
+            .output_shapes(input_shapes, padding_mode)?;
 
         let linear_out_shapes = self
             .qk
-            .output_shapes(&reshaped_input_shapes[..2], padding_mode);
+            .output_shapes(&reshaped_input_shapes[..2], padding_mode)?;
 
-        let soft_out_shapes = self.softmax.output_shapes(&linear_out_shapes, padding_mode);
+        let soft_out_shapes = self
+            .softmax
+            .output_shapes(&linear_out_shapes, padding_mode)?;
 
         let final_mul_input_shapes = vec![
             soft_out_shapes[0].clone(),
@@ -116,7 +122,7 @@ impl<'a> MhaOutputShaper<'a> {
 
         let final_mul_shapes = self
             .final_mul
-            .output_shapes(&final_mul_input_shapes, padding_mode);
+            .output_shapes(&final_mul_input_shapes, padding_mode)?;
 
         self.final_reshape
             .output_shapes(&final_mul_shapes, padding_mode)
@@ -182,7 +188,7 @@ where
         let final_mul = ConcatMatMul::new_with_permute(
             InputMatrixDimensions::new(0, 2, 1),
             InputMatrixDimensions::new(1, 0, 2),
-            Permutation::new(vec![1, 0, 2]),
+            Permutation::new(vec![1, 0, 2])?,
         )
         .update_intermediate_bit_size(
             vec![
@@ -278,12 +284,12 @@ impl<N: TensorTypeParam> Mha<N> {
 
         let reshaped_input_shapes = self
             .inputs_reshape
-            .output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding);
+            .output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding)?;
 
         let reshaped_inputs = self.inputs_reshape.evaluate::<E>(inputs)?;
         let qk_out_shapes = self
             .qk
-            .output_shapes(&reshaped_input_shapes, PaddingMode::NoPadding);
+            .output_shapes(&reshaped_input_shapes, PaddingMode::NoPadding)?;
 
         let qk_out = self.qk.evaluate::<E>(&reshaped_inputs.outputs()[..2])?;
 
@@ -314,7 +320,7 @@ impl<N: TensorTypeParam> Mha<N> {
         // apply softmax
         let soft_out_shapes = self
             .softmax
-            .output_shapes(&qk_out_shapes, PaddingMode::NoPadding);
+            .output_shapes(&qk_out_shapes, PaddingMode::NoPadding)?;
 
         let final_mul_input_shapes = [soft_out_shapes[0].clone(), reshaped_input_shapes[2].clone()];
 
@@ -333,12 +339,16 @@ impl<N: TensorTypeParam> Mha<N> {
 }
 
 impl<N: TensorTypeParam> OpInfo for Mha<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         MhaOutputShaper::from(self).output_shapes(input_shapes, padding_mode)
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -424,10 +434,10 @@ impl QuantizeOp for Mha<f32> {
 
         let reshaped_inputs = self
             .inputs_reshape
-            .output_shapes(unpadded_input_shapes, PaddingMode::NoPadding);
+            .output_shapes(unpadded_input_shapes, PaddingMode::NoPadding)?;
         let updated_shapes = self
             .qk
-            .output_shapes(&reshaped_inputs[..2], PaddingMode::NoPadding);
+            .output_shapes(&reshaped_inputs[..2], PaddingMode::NoPadding)?;
         // quantise the mask
         let QuantizeOutput {
             quantized_op: mut quantised_mask,
@@ -649,7 +659,7 @@ where
         })
         .collect();
 
-    Ok(Tensor::new(vec![nrows, ncols].into(), padded_matrix_data))
+    Tensor::new(vec![nrows, ncols].into(), padded_matrix_data)
 }
 
 impl PadOp for Mha<Element> {
@@ -752,7 +762,7 @@ where
 
         let reshaped_input_shapes = self
             .inputs_reshape
-            .output_shapes(&step_data.unpadded_input_shapes, PaddingMode::NoPadding);
+            .output_shapes(&step_data.unpadded_input_shapes, PaddingMode::NoPadding)?;
 
         ensure!(
             reshaped_inputs.len() == 3,
@@ -768,7 +778,7 @@ where
 
         let qk_out_shapes = self
             .qk
-            .output_shapes(&reshaped_input_shapes, PaddingMode::NoPadding);
+            .output_shapes(&reshaped_input_shapes, PaddingMode::NoPadding)?;
         let mha_data = step_data
             .node_outputs
             .try_mha_data()
@@ -869,12 +879,16 @@ where
 }
 
 impl<E: ExtensionField> OpInfo for MhaCtx<E> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         MhaOutputShaper::from(self).output_shapes(input_shapes, padding_mode)
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -918,22 +932,22 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let reshaped_inputs = LayerCtx::<E>::Reshape(self.inputs_reshape.clone()).shape_step(
             &shape_step.unpadded_input_shape,
             &shape_step.padded_input_shape,
-        );
+        )?;
 
         let qk_shapes = LayerCtx::<E>::ConcatMatMul(self.qk.clone()).shape_step(
             &reshaped_inputs.unpadded_output_shape[..2],
             &reshaped_inputs.padded_output_shape[..2],
-        );
+        )?;
 
         let mask_shapes = LayerCtx::<E>::AttentionMask(self.mask.clone()).shape_step(
             &qk_shapes.unpadded_output_shape,
             &qk_shapes.padded_output_shape,
-        );
+        )?;
 
         let softmax_shapes = LayerCtx::<E>::Softmax(self.softmax.clone()).shape_step(
             &mask_shapes.unpadded_output_shape,
             &mask_shapes.padded_output_shape,
-        );
+        )?;
 
         let final_mul_shapes = LayerCtx::<E>::ConcatMatMul(self.final_mul.clone()).shape_step(
             &[
@@ -944,7 +958,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
                 softmax_shapes.padded_output_shape[0].clone(),
                 reshaped_inputs.padded_output_shape[2].clone(),
             ],
-        );
+        )?;
 
         // now we call the verifier of each sub-layer
         let mut claims = self.final_mul.verify(
@@ -999,7 +1013,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
     }
 }
 
-pub fn zeroifier<N: Number>(num_heads: usize, q_len: usize, seq_len: usize) -> Tensor<N> {
+pub fn zeroifier<N: Number>(num_heads: usize, q_len: usize, seq_len: usize) -> Result<Tensor<N>> {
     let zeroified = (0..num_heads)
         .into_par_iter()
         .flat_map(|_head| {
@@ -1022,7 +1036,7 @@ pub fn infinitizer<N: Number>(
     q_len: usize,
     seq_len: usize,
     minus_infinity: N,
-) -> Tensor<N> {
+) -> Result<Tensor<N>> {
     let zeroified = (0..num_heads)
         .into_par_iter()
         .flat_map(|_head| {
@@ -1138,10 +1152,12 @@ mod test {
             let qk = output.outputs.remove(0);
             // normally [1,seq_len] per head, so with all heads [num_heads, 1, seq_len]
             assert_eq!(qk.shape(), vec![num_heads, q_len, seq_len].into());
-            let output_shapes = mha_qk.output_shapes(
-                &[q.shape().clone(), k.shape().clone()],
-                PaddingMode::NoPadding,
-            );
+            let output_shapes = mha_qk
+                .output_shapes(
+                    &[q.shape().clone(), k.shape().clone()],
+                    PaddingMode::NoPadding,
+                )
+                .unwrap();
             assert_eq!(output_shapes, vec![Shape::from(qk.shape())]);
         }
     }
@@ -1177,10 +1193,12 @@ mod test {
             assert_eq!(output.outputs.len(), 1);
             let out = output.outputs.remove(0);
             assert_eq!(out.shape(), vec![q_len, num_heads, head_dim].into());
-            let output_shapes = mha_mul.output_shapes(
-                &[qk.shape().clone(), v.shape().clone()],
-                PaddingMode::NoPadding,
-            );
+            let output_shapes = mha_mul
+                .output_shapes(
+                    &[qk.shape().clone(), v.shape().clone()],
+                    PaddingMode::NoPadding,
+                )
+                .unwrap();
             assert_eq!(output_shapes, vec![Shape::from(out.shape())]);
         }
     }
@@ -1191,8 +1209,8 @@ mod test {
         let q_len = 4;
         let seq_len = 4;
         let input = Tensor::<Element>::random(&vec![num_heads, q_len, seq_len].into());
-        let zeros = zeroifier(num_heads, q_len, seq_len);
-        let minus_infinity = infinitizer(num_heads, q_len, seq_len, Element::MIN);
+        let zeros = zeroifier(num_heads, q_len, seq_len).unwrap();
+        let minus_infinity = infinitizer(num_heads, q_len, seq_len, Element::MIN).unwrap();
         let zeroified = input.mul(&zeros);
         let infinitized = zeroified.add(&minus_infinity);
         assert_eq!(zeroified.shape(), input.shape());
@@ -1201,7 +1219,7 @@ mod test {
         slice_it.enumerate().all(|(head_idx, head)| {
             head.chunks(q_len).enumerate().all(|(q_idx, q)| {
                 q.iter().enumerate().all(|(i, v)| {
-                    let input_value = input.get(vec![head_idx, q_idx, i]);
+                    let input_value = input.get(vec![head_idx, q_idx, i]).unwrap();
                     // if we are less than the q_len, we dont have causal mask
                     if i <= q_idx {
                         input_value == *v
@@ -1230,11 +1248,11 @@ mod test {
         let num_columns = 1 << NUM_BITS;
         let num_heads = 1 << NUM_HEADS_BITS;
 
-        let zeroifier = zeroifier::<Element>(num_heads, num_columns, num_columns);
+        let zeroifier = zeroifier::<Element>(num_heads, num_columns, num_columns).unwrap();
 
         let zeroifier_heads = {
             let (it, shape) = zeroifier.slice_on_dim(0);
-            it.map(|data| Tensor::new(shape.clone(), data.to_vec()))
+            it.map(|data| Tensor::new(shape.clone(), data.to_vec()).unwrap())
                 .collect_vec()
         };
 
@@ -1320,11 +1338,11 @@ mod test {
         let minus_infinity = *quantization::MIN;
 
         let infinitizer =
-            infinitizer::<Element>(num_heads, num_columns, num_columns, minus_infinity);
+            infinitizer::<Element>(num_heads, num_columns, num_columns, minus_infinity).unwrap();
 
         let infinitizer_heads = {
             let (it, shape) = infinitizer.slice_on_dim(0);
-            it.map(|data| Tensor::new(shape.clone(), data.to_vec()))
+            it.map(|data| Tensor::new(shape.clone(), data.to_vec()).unwrap())
                 .collect_vec()
         };
 
@@ -1562,7 +1580,7 @@ mod test {
         let input_shape = Shape::new(vec![seq_len, hidden_size]);
         let input = Tensor::random(&input_shape);
 
-        let output = input.matmul(&matrix);
+        let output = input.matmul(&matrix).unwrap();
 
         println!("Matrix: {matrix:?}, padded: {padded_matrix:?}");
 
@@ -1582,9 +1600,9 @@ mod test {
             padded_input_data[row * padded_input_shape[1] + padded_col] = *value
         });
 
-        let padded_input = Tensor::new(padded_input_shape, padded_input_data);
+        let padded_input = Tensor::new(padded_input_shape, padded_input_data).unwrap();
 
-        let padded_output = padded_input.matmul(&padded_matrix);
+        let padded_output = padded_input.matmul(&padded_matrix).unwrap();
 
         let padded_out_shape = padded_output.shape();
 
@@ -1624,7 +1642,8 @@ mod test {
         let input = Tensor::new(
             vec![gpt2_output.input_ids.len()].into(),
             gpt2_output.input_ids.iter().map(|x| *x as f32).collect(),
-        );
+        )
+        .unwrap();
         let embedded = llm_model
             .embeddings
             .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;

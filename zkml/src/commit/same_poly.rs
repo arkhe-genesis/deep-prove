@@ -148,7 +148,7 @@ where
     pub fn verify<T: Transcript<E>>(self, proof: &Proof<E>, t: &mut T) -> anyhow::Result<Claim<E>> {
         let fs_challenges = t.read_challenges(self.claims.len());
         let (rs, ys): (Vec<_>, Vec<_>) = self.claims.into_iter().map(|c| (c.point, c.eval)).unzip();
-        let y_res = aggregated_rlc(&ys, &fs_challenges);
+        let y_res = aggregated_rlc(&ys, &fs_challenges)?;
         // check sumcheck proof
         let subclaim = IOPVerifierState::<E>::verify(y_res, &proof.sumcheck, &self.ctx.vp_info, t);
         let point = subclaim

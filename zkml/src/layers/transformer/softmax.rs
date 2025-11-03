@@ -306,7 +306,7 @@ impl<N: TensorTypeParam> Softmax<N> {
             (epsilon * (1u64 << FIXED_POINT_SCALE) as f32).round_ties_even() as Element;
 
         // Assertion to check that we can perform requantisation, we need intermediate_bit_size + fp_scale <= 63
-        assert!(
+        ensure!(
             intermediate_bit_size + fp_scale <= 63,
             "intermediate bit size: {intermediate_bit_size}, fp scale: {fp_scale}, int part: {int_part}",
         );
@@ -484,7 +484,7 @@ impl Softmax<Element> {
             .into_vec()
             .map_err(|e| anyhow!("Could not convert burn Softmax shift data to Element: {e:?}"))?;
 
-        let shift_tensor = Tensor::<Element>::new(shift_shape, shift_data);
+        let shift_tensor = Tensor::<Element>::new(shift_shape, shift_data)?;
 
         Ok((shift_tensor, shift_btensor))
     }
@@ -518,12 +518,12 @@ impl<N> OpInfo for Softmax<N> {
         &self,
         input_shapes: &[Shape],
         _padding_mode: crate::padding::PaddingMode,
-    ) -> Vec<Shape> {
-        input_shapes.to_vec()
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -628,9 +628,9 @@ impl Evaluate<Element> for Softmax<Element> {
             WrappedTensor::try_from(&Tensor::<Element>::new(
                 inputs[0].shape().into(),
                 output_data,
-            ))?
+            )?)?
         } else {
-            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data))?
+            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data)?)?
         };
 
         Ok(LayerOut {
@@ -665,13 +665,20 @@ impl RangeChecks {
         });
     }
 
-    fn merge(&mut self, other: RangeChecks) {
-        assert_eq!(self.number_of_chunks, other.number_of_chunks);
+    fn merge(&mut self, other: RangeChecks) -> Result<()> {
+        ensure!(
+            self.number_of_chunks == other.number_of_chunks,
+            "RangeChecks::merge failed to merge unequal number of chunkcs self: {} other {}",
+            self.number_of_chunks,
+            other.number_of_chunks
+        );
         let RangeChecks { chunks, .. } = other;
         self.chunks
             .iter_mut()
             .zip(chunks)
             .for_each(|(a, b)| a.extend(b));
+
+        Ok(())
     }
 
     fn count_iterator(&self) -> Vec<Element> {
@@ -743,8 +750,13 @@ impl ZeroChecks {
         });
     }
 
-    fn merge(&mut self, other: ZeroChecks) {
-        assert_eq!(self.number_of_chunks, other.number_of_chunks);
+    fn merge(&mut self, other: ZeroChecks) -> Result<()> {
+        ensure!(
+            self.number_of_chunks == other.number_of_chunks,
+            "RangeChecks::merge failed to merge unequal number of chunkcs self: {} other {}",
+            self.number_of_chunks,
+            other.number_of_chunks
+        );
         let ZeroChecks {
             input_chunks,
             output_chunks,
@@ -758,6 +770,8 @@ impl ZeroChecks {
             .iter_mut()
             .zip(output_chunks)
             .for_each(|(a, b)| a.extend(b));
+
+        Ok(())
     }
 
     fn count_iterator(&self) -> Vec<Element> {
@@ -1144,9 +1158,10 @@ impl Softmax<Element> {
                                                 (range_checks, exp_lookups, zero_checks)
                                             },
                                         );
-                                    outer_range.merge(inner_range);
+                                    // TODO: refactor this iterator and propagate errors.
+                                    outer_range.merge(inner_range).unwrap();
                                     outer_exp.merge(inner_exp);
-                                    outer_zero.merge(inner_zero);
+                                    outer_zero.merge(inner_zero).unwrap();
                                     (outer_range, outer_exp, outer_zero)
                                 },
                             );
@@ -1490,12 +1505,16 @@ impl LayerLookupContext {
 }
 
 impl OpInfo for SoftmaxCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -1954,7 +1973,7 @@ mod tests {
             let test_q_quant = test_q.to_quantized(&q_scaling);
             let test_k_quant = test_k.to_quantized(&k_scaling);
 
-            let test_qk_quant = test_q_quant.matmul(&test_k_quant);
+            let test_qk_quant = test_q_quant.matmul(&test_k_quant).unwrap();
 
             let test_qk_dequant = test_qk_quant.dequantize(&qk_scaling);
 
@@ -2023,7 +2042,8 @@ mod tests {
         let input = Tensor::new(
             vec![1, 3, 3].into(),
             vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        );
+        )
+        .unwrap();
         let output = softmax
             .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .unwrap();
@@ -2084,7 +2104,7 @@ mod tests {
         #[test]
         fn prop_softmax_f32(input in any_softmax_input(-4.0..4.0)) {
             let SoftmaxInput { n, data } = input;
-            let tensor = Tensor::new(vec![1, n, n].into(), data.clone());
+            let tensor = Tensor::new(vec![1, n, n].into(), data.clone()).unwrap();
 
             let layer = Softmax::<f32>::new(n);
                 let eval = layer.evaluate::<GoldilocksExt2>(&[&tensor.as_wrapped()]).unwrap();
@@ -2096,7 +2116,7 @@ mod tests {
         #[test]
         fn prop_softmax_quantized(input in any_softmax_input(-2.0..2.0)) {
             let SoftmaxInput { n, data } = input;
-            let float_tensor = Tensor::<f32>::new(vec![1, n, n].into(), data.clone());
+            let float_tensor = Tensor::<f32>::new(vec![1, n, n].into(), data.clone()).unwrap();
             let scaling = ScalingFactor::from_tensor(&float_tensor, None);
             let quant_input = float_tensor.to_quantized(&scaling);
 

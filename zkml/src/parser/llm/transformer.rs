@@ -213,21 +213,21 @@ impl Attention<f32> {
             Tensor::new(
                 vec![c.embedding_size, hidden_size].into(),
                 unfused_weights_data.remove(0),
-            ),
+            )?,
         );
         let k_weight = KeyedTensor::new(
             format!("{}.k", fused_qkv_weight.key),
             Tensor::new(
                 vec![c.embedding_size, hidden_size].into(),
                 unfused_weights_data.remove(0),
-            ),
+            )?,
         );
         let v_weight = KeyedTensor::new(
             format!("{}.v", fused_qkv_weight.key),
             Tensor::new(
                 vec![c.embedding_size, hidden_size].into(),
                 unfused_weights_data.remove(0),
-            ),
+            )?,
         );
         trace!("fused qkv: {fused_qkv_weight:?}");
         trace!("qkv full tensor {unfused_weights_data:?}");
@@ -245,15 +245,15 @@ impl Attention<f32> {
 
         let q_bias_vec = KeyedTensor::new(
             format!("{fused_qvk_bias_key}.q"),
-            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0)),
+            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0))?,
         );
         let k_bias_vec = KeyedTensor::new(
             format!("{fused_qvk_bias_key}.k"),
-            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0)),
+            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0))?,
         );
         let v_bias_vec = KeyedTensor::new(
             format!("{fused_qvk_bias_key}.v"),
-            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0)),
+            Tensor::new(vec![hidden_size].into(), unfused_biases_data.remove(0))?,
         );
 
         // These are the individual Q, K, V matrices and biases now.
@@ -347,7 +347,7 @@ impl NormType {
         })
     }
 }
-pub(crate) fn expand<N: Number>(t: Tensor<N>, num_heads: usize) -> Tensor<N> {
+pub(crate) fn expand<N: Number>(t: Tensor<N>, num_heads: usize) -> anyhow::Result<Tensor<N>> {
     let (it, _) = t.slice_on_dim(0);
     let data = it
         .flat_map(|t| std::iter::repeat_n(t, num_heads).flatten())

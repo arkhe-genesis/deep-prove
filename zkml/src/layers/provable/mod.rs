@@ -153,11 +153,15 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
 
 pub trait OpInfo {
     /// Returns the shapes of the outputs (in the same order)
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape>;
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>>;
 
     /// Compute the number of output tensors, given the number of input tensors
     /// `num_inputs`
-    fn num_outputs(&self, num_inputs: usize) -> usize;
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize>;
 
     /// Textual description of the operation
     fn describe(&self) -> String;
@@ -210,48 +214,51 @@ impl<Op> QuantizeOutput<Op> {
             post_quant_rule: None,
         }
     }
-    pub fn with_requant(self, requant: Requant) -> Self {
-        assert!(
+    pub fn with_requant(self, requant: Requant) -> Result<Self> {
+        ensure!(
             self.output_scalings.len() == 1,
             "Number of output scalings must be 1"
         );
         Self::with_requants(self, vec![requant])
     }
-    pub fn with_requants(self, requants: Vec<Requant>) -> Self {
-        assert!(self.requant_layer.is_none(), "Requant layer already exists");
-        assert!(
+    pub fn with_requants(self, requants: Vec<Requant>) -> Result<Self> {
+        ensure!(self.requant_layer.is_none(), "Requant layer already exists");
+        ensure!(
             self.output_scalings.len() == requants.len(),
             "Number of output scalings and requants must be the same"
         );
-        Self {
+        Ok(Self {
             quantized_op: self.quantized_op,
             output_scalings: self.output_scalings,
             requant_layer: Some(requants),
             post_quant_rule: self.post_quant_rule,
-        }
+        })
     }
-    pub fn with_transform(self, transform: Box<dyn ModelTransform<Element>>) -> Self {
-        assert!(
+    pub fn with_transform(self, transform: Box<dyn ModelTransform<Element>>) -> Result<Self> {
+        ensure!(
             self.post_quant_rule.is_none(),
             "Post quantization rule already exists"
         );
-        Self {
+        Ok(Self {
             quantized_op: self.quantized_op,
             output_scalings: self.output_scalings,
             requant_layer: self.requant_layer,
             post_quant_rule: Some(transform),
-        }
+        })
     }
-    pub fn maybe_requants(self, requant: Option<Vec<Requant>>) -> Self {
+    pub fn maybe_requants(self, requant: Option<Vec<Requant>>) -> Result<Self> {
         match requant {
             Some(requant) => self.with_requants(requant),
-            None => self,
+            None => Ok(self),
         }
     }
-    pub fn maybe_transform(self, transform: Option<Box<dyn ModelTransform<Element>>>) -> Self {
+    pub fn maybe_transform(
+        self,
+        transform: Option<Box<dyn ModelTransform<Element>>>,
+    ) -> Result<Self> {
         match transform {
             Some(transform) => self.with_transform(transform),
-            None => self,
+            None => Ok(self),
         }
     }
 }
@@ -302,7 +309,7 @@ where
         _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
-        assert!(
+        ensure!(
             !self.is_provable(),
             "Running default prove implementation for a provable operation! Implement prove method"
         );
@@ -410,11 +417,15 @@ pub(crate) fn write_proof_to_transcript<
 pub(crate) struct NonProvableVerifierCtx<'a, O>(&'a O);
 
 impl<'a, O: OpInfo> OpInfo for NonProvableVerifierCtx<'a, O> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         self.0.output_shapes(input_shapes, padding_mode)
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         self.0.num_outputs(num_inputs)
     }
 
@@ -440,7 +451,7 @@ impl<'a, O: OpInfo + Debug, E: ExtensionField, PCS: PolynomialCommitmentScheme<E
         _shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
-        assert!(
+        ensure!(
             !self.is_provable(),
             "Running default prove implementation for a provable operation! Implement prove method"
         );
@@ -458,7 +469,11 @@ impl<'a, O: OpInfo + Debug, E: ExtensionField, PCS: PolynomialCommitmentScheme<E
 }
 
 impl<E: ExtensionField> OpInfo for LayerCtx<E> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         match self {
             LayerCtx::Dense(dense_ctx) => dense_ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Convolution(conv_ctx) => conv_ctx.output_shapes(input_shapes, padding_mode),
@@ -489,7 +504,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
         }
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         match self {
             LayerCtx::Dense(dense_ctx) => dense_ctx.num_outputs(num_inputs),
             LayerCtx::Convolution(conv_ctx) => conv_ctx.num_outputs(num_inputs),

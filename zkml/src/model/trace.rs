@@ -51,7 +51,7 @@ where
 
     /// Compute the inputs and outputs tensors from the trace, which are necessary
     /// for the verifier to verify the proof of the model inference
-    pub fn to_verifier_io(&self) -> Result<IO<E>, StoreError>
+    pub fn to_verifier_io(&self) -> anyhow::Result<IO<E>>
     where
         D: Fieldizer<E>,
     {
@@ -59,13 +59,13 @@ where
             .input
             .iter()
             .map(|dry| dry.hydrated_cast(self.store.clone(), |x| x.to_field()))
-            .collect::<Result<Vec<_>, StoreError>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let outputs = self
             .output
             .iter()
             .map(|dry| dry.hydrated_cast(self.store.clone(), |x| x.to_field()))
-            .collect::<Result<Vec<_>, StoreError>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(IO::new(inputs, outputs))
     }
 
@@ -127,20 +127,18 @@ where
 
     /// Get the output tensors of the inference represented by this trace
     pub fn outputs(&self) -> anyhow::Result<Vec<Tensor<D>>> {
-        Ok(self
-            .output
+        self.output
             .iter()
             .map(|dry| dry.hydrate(self.store.clone()))
-            .collect::<Result<Vec<_>, StoreError>>()?)
+            .collect::<anyhow::Result<Vec<_>>>()
     }
 
     /// Get the inputs tensors of the inference represented by this trace
     pub fn inputs(&self) -> anyhow::Result<Vec<Tensor<D>>> {
-        Ok(self
-            .input
+        self.input
             .iter()
             .map(|dry| dry.hydrate(self.store.clone()))
-            .collect::<Result<Vec<_>, StoreError>>()?)
+            .collect::<anyhow::Result<Vec<_>>>()
     }
 
     /// Get the (hydrated) ith input tensor of the inference represented by
@@ -231,11 +229,11 @@ where
     }
 
     /// Hydrate all the input tensors of the node corresponding to this step.
-    pub(crate) fn input_tensors(&self, store: &mut GenStore) -> Result<Vec<Tensor<D>>, StoreError> {
+    pub(crate) fn input_tensors(&self, store: &mut GenStore) -> anyhow::Result<Vec<Tensor<D>>> {
         self.node_inputs
             .iter()
             .map(|dry| dry.hydrate(store.clone()))
-            .collect::<Result<Vec<_>, StoreError>>()
+            .collect()
     }
 
     /// Hydrate one of the input tensors of the node corresponding to this step.
@@ -243,20 +241,17 @@ where
         &self,
         i: usize,
         store: &mut GenStore,
-    ) -> Result<Tensor<D>, StoreError> {
+    ) -> anyhow::Result<Tensor<D>> {
         self.node_inputs[i].hydrate(store.clone())
     }
 
     /// Hydrate all the output tensors of the node corresponding to this step.
-    pub(crate) fn output_tensors(
-        &self,
-        store: &mut GenStore,
-    ) -> Result<Vec<Tensor<D>>, StoreError> {
+    pub(crate) fn output_tensors(&self, store: &mut GenStore) -> anyhow::Result<Vec<Tensor<D>>> {
         self.node_outputs
             .outputs
             .iter()
             .map(|dry| dry.hydrate(store.clone()))
-            .collect::<Result<Vec<_>, StoreError>>()
+            .collect()
     }
 
     /// Hydrate one of the output tensors of the node corresponding to this step.
@@ -264,7 +259,7 @@ where
         &self,
         i: usize,
         store: &mut GenStore,
-    ) -> Result<Tensor<D>, StoreError> {
+    ) -> anyhow::Result<Tensor<D>> {
         self.node_outputs.outputs[i].hydrate(store.clone())
     }
 }

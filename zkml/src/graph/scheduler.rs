@@ -1,5 +1,5 @@
 use crate::graph::{NodeId, NodeInput, PortId, graph::Graph};
-use anyhow::ensure;
+use anyhow::{Result, ensure};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
@@ -444,7 +444,7 @@ where
     /// - No nodes are ready (waiting for more completions)
     /// - The release policy prevents nodes from running
     /// - All nodes have been completed
-    pub fn next_ready_nodes(&mut self) -> Vec<ReadyNode<N, C>> {
+    pub fn next_ready_nodes(&mut self) -> Result<Vec<ReadyNode<N, C>>> {
         let mut ready = Vec::new();
         let ready_node_ids = self
             .graph
@@ -471,39 +471,39 @@ where
                 continue;
             }
             self.running_nodes.insert(node_id);
+
+            let mut input_data = BTreeMap::new();
             // collect both the input data and the input from the edges
-            let input_data = self
-                .graph
-                .incomings_mut(node_id)
-                .flat_map(|(edge_id, edge)| {
-                    assert!(
-                        edge.weight.is_some(),
-                        "Edge {edge_id:?} {} -> {} has no weight - invalid logic?",
-                        edge.source(),
-                        edge.target()
-                    );
-                    // take the data on this edge and set it to none - unwrap is
-                    // safe since index have been collected just before
-                    let data = edge.weight.take().unwrap();
-                    edge.ports()
-                        .iter()
-                        .map(move |port| (port.target_port, data.clone()))
-                })
-                // also remove the potential input data for nodes that also
-                // expect inoput data + predecessors data
-                .chain(
-                    self.waiting_input_data
-                        .extract_if(|node_input, _| node_input.node_id == node_id)
-                        .map(|(node_input, io)| (node_input.port, io)),
-                )
-                .collect::<BTreeMap<PortId, N::IO>>();
+            for (edge_id, edge) in self.graph.incomings_mut(node_id) {
+                ensure!(
+                    edge.weight.is_some(),
+                    "Edge {edge_id:?} {} -> {} has no weight - invalid logic?",
+                    edge.source(),
+                    edge.target()
+                );
+                // take the data on this edge and set it to none - unwrap is
+                // safe since index have been collected just before
+                let data = edge.weight.take().unwrap();
+                for port in edge.ports().iter() {
+                    input_data.insert(port.target_port, data.clone());
+                }
+            }
+
+            // also remove the potential input data for nodes that also
+            // expect inoput data + predecessors data
+            for (node_input, io) in self
+                .waiting_input_data
+                .extract_if(|node_input, _| node_input.node_id == node_id)
+            {
+                input_data.insert(node_input.port, io);
+            }
             ready.push(ReadyNode {
                 node: self.graph[node_id].as_inner().unwrap().clone(),
                 inputs: input_data.into_values().collect(),
                 node_id,
             });
         }
-        ready
+        Ok(ready)
     }
 
     /// Returns true if all nodes in the graph have been executed.
@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(scheduler.done_nodes.len(), 1);
         assert_eq!(scheduler.running_nodes.len(), 0);
 
-        let mut ready_node = scheduler.next_ready_nodes().pop().unwrap();
+        let mut ready_node = scheduler.next_ready_nodes().unwrap().pop().unwrap();
         assert!(matches!(ready_node.node.node, TestOperation::Test1));
         let output = ready_node.run(&()).unwrap();
         assert_eq!(
@@ -550,7 +550,7 @@ mod tests {
         );
         scheduler.mark_done(ready_node.node_id, &output).unwrap();
 
-        let mut ready_node = scheduler.next_ready_nodes().pop().unwrap();
+        let mut ready_node = scheduler.next_ready_nodes().unwrap().pop().unwrap();
         assert!(
             matches!(ready_node.node.node, TestOperation::Test2),
             "Node {ready_node:?} has operation {:?}",

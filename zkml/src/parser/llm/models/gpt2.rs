@@ -129,24 +129,24 @@ impl Attention<f32> {
             crate::Tensor::new(
                 vec![embedding_size, hidden_size].into(),
                 unfused_weights.remove(0),
-            )
-            .transpose(),
+            )?
+            .transpose()?,
         );
         let k = KeyedTensor::new(
             format!("{qkv_key}.k"),
             crate::Tensor::new(
                 vec![embedding_size, hidden_size].into(),
                 unfused_weights.remove(0),
-            )
-            .transpose(),
+            )?
+            .transpose()?,
         );
         let v = KeyedTensor::new(
             format!("{qkv_key}.v"),
             crate::Tensor::new(
                 vec![embedding_size, hidden_size].into(),
                 unfused_weights.remove(0),
-            )
-            .transpose(),
+            )?
+            .transpose()?,
         );
 
         let (qkv_bias_key, mut unfused_biases) =
@@ -154,15 +154,15 @@ impl Attention<f32> {
         ensure!(unfused_biases.len() == 3, "qkv_bias must have 3 chunks");
         let q_bias = KeyedTensor::new(
             format!("{qkv_bias_key}.q"),
-            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
+            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0))?,
         );
         let k_bias = KeyedTensor::new(
             format!("{qkv_bias_key}.k"),
-            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
+            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0))?,
         );
         let v_bias = KeyedTensor::new(
             format!("{qkv_bias_key}.v"),
-            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0)),
+            crate::Tensor::new(vec![hidden_size].into(), unfused_biases.remove(0))?,
         );
 
         let attn_norm_loader = loader.pp("attn_");
@@ -174,7 +174,7 @@ impl Attention<f32> {
         // so we transpose it once here after loading.
         let out = loader
             .get_tensor("attn_output.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         let out_bias = loader.get_tensor("attn_output.bias")?;
         ensure!(
             out.shape().as_ref() == &[embedding_size, embedding_size],
@@ -216,11 +216,11 @@ impl FeedForward<f32> {
     pub fn from_gguf_gpt2(loader: &FileTensorLoader, c: &LLMStructure) -> anyhow::Result<Self> {
         let up = loader
             .get_tensor("ffn_up.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         let up_bias = Some(loader.get_tensor("ffn_up.bias")?);
         let down = loader
             .get_tensor("ffn_down.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         let down_bias = Some(loader.get_tensor("ffn_down.bias")?);
         ensure!(
             up.shape()[0] == c.generic.hidden_size,
@@ -279,7 +279,7 @@ pub mod tests {
         assert_eq!(config.norm_epsilon, 1e-5);
         assert_eq!(config.vocab_size, 50257);
         assert_eq!(config.eos_token, 50256usize.into());
-        let input = Tensor::new(vec![1].into(), vec![546.0]);
+        let input = Tensor::new(vec![1].into(), vec![546.0]).unwrap();
         model.run_float(&[input])?;
         Ok(())
     }

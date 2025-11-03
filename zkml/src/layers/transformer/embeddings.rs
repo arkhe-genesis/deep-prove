@@ -29,7 +29,7 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeInfo},
 };
-use anyhow::{anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use burn::tensor::{
     TensorPrimitive,
     ops::{FloatTensorOps, IntTensorOps},
@@ -168,26 +168,31 @@ fn output_shapes(
 }
 
 impl<N: TensorTypeParam> OpInfo for Embeddings<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        assert!(
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        ensure!(
             input_shapes.len() == 1,
-            "embeddings only support 1 input tensor"
+            "embeddings only support 1 input tensor, got {}",
+            input_shapes.len()
         );
-        assert_eq!(
+        ensure!(
+            input_shapes[0].rank() == 1,
+            "embeddings only support 1d tensors, got {}",
             input_shapes[0].rank(),
-            1,
-            "embeddings only support 1d tensors"
         );
         let seq_len = input_shapes[0].dim(0);
         let shape = match padding_mode {
             PaddingMode::NoPadding => Shape::new(vec![seq_len, self.emb_size]),
             PaddingMode::Padding => Shape::new(vec![seq_len, self.emb_size]).next_power_of_two(),
         };
-        vec![shape]
+        Ok(vec![shape])
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -308,7 +313,7 @@ impl ProveInfo for Embeddings<Element> {
         id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
-        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
+        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
         aux.model_polys = Some(
             once((
                 self.embedding_matrix_key(),
@@ -332,12 +337,16 @@ impl ProveInfo for Embeddings<Element> {
 }
 
 impl OpInfo for EmbeddingsCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        output_shapes(input_shapes, padding_mode, self.emb_size)
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(output_shapes(input_shapes, padding_mode, self.emb_size))
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -431,25 +440,25 @@ where
             anyhow::Ok(())
         })?;
 
-        let reduced_one_hot = Tensor::new(vec![1, vocab_size].into(), reduced_one_hot);
+        let reduced_one_hot = Tensor::new(vec![1, vocab_size].into(), reduced_one_hot)?;
 
         let embedding_matrix = self.embedding_matrix();
 
         ensure!(
-            vocab_size == embedding_matrix.nrows_2d(),
+            vocab_size == embedding_matrix.nrows_2d()?,
             "Expected {vocab_size} rows for embedding matrix, found {}",
-            embedding_matrix.nrows_2d(),
+            embedding_matrix.nrows_2d()?,
         );
 
         ensure!(
-            emb_size == embedding_matrix.ncols_2d(),
+            emb_size == embedding_matrix.ncols_2d()?,
             "Expected {emb_size} columns for embedding matrix, found {}",
-            embedding_matrix.ncols_2d(),
+            embedding_matrix.ncols_2d()?,
         );
 
-        let input_mle = reduced_one_hot.to_mle_2d();
+        let input_mle = reduced_one_hot.to_mle_2d()?;
 
-        let mut embedding_mat_mle = embedding_matrix.to_2d_mle();
+        let mut embedding_mat_mle = embedding_matrix.to_2d_mle()?;
 
         embedding_mat_mle.fix_variables_in_place_parallel(column_point);
 
@@ -696,7 +705,7 @@ mod tests {
             .map(|_| rng_from_env_or_random().gen_range(0..vocab_size) as f32)
             .collect::<Vec<_>>();
         let input_shape = Shape::from(vec![seq_len]);
-        let input = Tensor::new(input_shape.clone(), indices.clone());
+        let input = Tensor::new(input_shape.clone(), indices.clone()).unwrap();
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
 
@@ -721,7 +730,7 @@ mod tests {
             one_hot[idx] = E::ONE;
             data.extend_from_slice(&one_hot);
         }
-        Tensor::new(vec![indices.len(), vocab_size].into(), data)
+        Tensor::new(vec![indices.len(), vocab_size].into(), data).unwrap()
     }
 
     #[test]
@@ -729,7 +738,7 @@ mod tests {
         let seq_len: usize = 5;
         let indices_elem: Vec<Element> = (0..seq_len).map(|i| i as Element).collect::<Vec<_>>();
         let indices: Tensor<GoldilocksExt2> =
-            Tensor::<Element>::new(vec![5].into(), indices_elem.clone()).to_fields();
+            Tensor::<Element>::new(vec![5].into(), indices_elem.clone())?.to_fields();
         let vocab_size = 6;
         let emb_size = 10;
         let one_hot = one_hot_encoding(indices.get_data(), vocab_size);
@@ -773,11 +782,11 @@ mod tests {
 
         let emb = Tensor::<Element>::random(&vec![vocab_size, 10].into());
         let embeddings = Embeddings::new(KeyedTensor::new("embeddings_mat", emb.clone()))?;
-        let input = Tensor::new(vec![seq_len].into(), indices_elem.clone());
+        let input = Tensor::new(vec![seq_len].into(), indices_elem.clone()).unwrap();
         let out = embeddings.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
         assert_eq!(Shape::from(out.outputs()[0].shape()), expected_shape);
-        let onehot_result = one_hot.matmul(&emb.to_fields());
+        let onehot_result = one_hot.matmul(&emb.to_fields())?;
         assert_eq!(
             onehot_result.get_data(),
             out.outputs()[0].to_native().to_fields().get_data()
@@ -798,7 +807,7 @@ mod tests {
                 .collect()
         };
         let table = (0..vocab_size).flat_map(emb_vector).collect::<Vec<_>>();
-        let emb_tensor = Tensor::new(vec![vocab_size, emb_size].into(), table);
+        let emb_tensor = Tensor::new(vec![vocab_size, emb_size].into(), table)?;
         let embeddings = Embeddings::new(KeyedTensor::new("embeddings_mat", emb_tensor))?;
 
         // generate random indices
@@ -806,7 +815,7 @@ mod tests {
             .into_iter()
             .map(|x| Element::from(x as Element))
             .collect::<Vec<_>>();
-        let x = Tensor::new(vec![seq_len].into(), input_data.clone());
+        let x = Tensor::new(vec![seq_len].into(), input_data.clone()).unwrap();
         let out = embeddings.evaluate::<GoldilocksExt2>(&[&x.as_wrapped()])?;
         assert_eq!(out.outputs()[0].shape(), vec![seq_len, emb_size].into());
         // for each input index, check that the embedding vector is the correct one
@@ -842,7 +851,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let out_shape = Shape::new(vec![seq_len, emb_size]);
-            let expected = Tensor::new(out_shape, new_emb);
+            let expected = Tensor::new(out_shape, new_emb).unwrap();
 
             let layer = Embeddings::<f32>::new(
                 KeyedTensor::new(
@@ -884,7 +893,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let out_shape = Shape::new(vec![seq_len, emb_size]);
-            let expected = Tensor::new(out_shape, new_emb);
+            let expected = Tensor::new(out_shape, new_emb).unwrap();
 
             let layer = Embeddings::<Element>::new(
                 KeyedTensor::new(

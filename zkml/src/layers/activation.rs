@@ -286,10 +286,10 @@ impl ActivationLayer<Element> {
 }
 
 impl<N> OpInfo for Activation<N> {
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         match self {
-            Self::Plain(_) => num_inputs,
-            Self::GLU(_) => 1,
+            Self::Plain(_) => Ok(num_inputs),
+            Self::GLU(_) => Ok(1),
         }
     }
 
@@ -300,10 +300,14 @@ impl<N> OpInfo for Activation<N> {
         }
     }
 
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         match self {
-            Self::Plain(_) => input_shapes.to_vec(), // same as input shapes,
-            Self::GLU(_) => vec![input_shapes[0].clone()], /* in GLU, there is only one output, which has the same shape as the first input */
+            Self::Plain(_) => Ok(input_shapes.to_vec()), // same as input shapes,
+            Self::GLU(_) => Ok(vec![input_shapes[0].clone()]), /* in GLU, there is only one output, which has the same shape as the first input */
         }
     }
 
@@ -324,7 +328,7 @@ impl QuantizeOp for Activation<f32> {
         input_scaling: &[crate::ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len());
+        let num_outputs = self.num_outputs(input_scaling.len())?;
         match self {
             Self::Plain(layer) => layer
                 .quantize_op::<S>(data, node_id, input_scaling, num_outputs)
@@ -376,7 +380,7 @@ impl QuantizeOp for Activation<f32> {
                 let requant = Requant::from_multiplier(multiplier, intermediate_bit_size);
                 Ok(
                     QuantizeOutput::new(Activation::GLU(quantized_op), output_scalings)
-                        .with_requant(requant),
+                        .with_requant(requant)?,
                 )
             }
         }
@@ -591,11 +595,15 @@ where
 }
 
 impl<E: ExtensionField> OpInfo for ActivationCtx<E> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         self.op.output_shapes(input_shapes, padding_mode)
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         self.op.num_outputs(num_inputs)
     }
 
@@ -880,7 +888,7 @@ impl Relu {
         Shape::new(vec![2, Self::poly_len()])
     }
 
-    pub fn op<T: Number>(&self, input: &Tensor<T>) -> Tensor<T> {
+    pub fn op<T: Number>(&self, input: &Tensor<T>) -> anyhow::Result<Tensor<T>> {
         Tensor::new(
             input.shape().clone(),
             input
@@ -1098,8 +1106,9 @@ mod test {
     fn test_activation_gelu_evaluate_f32() -> anyhow::Result<()> {
         let gelu = GELU::<f32>::new();
         let input_data = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
-        let input_tensor =
-            Tensor::new(vec![1, input_data.len()].into(), input_data.clone()).into_wrapped();
+        let input_tensor = Tensor::new(vec![1, input_data.len()].into(), input_data.clone())
+            .unwrap()
+            .into_wrapped();
 
         let expected_output_data = input_data.iter().map(gelu_float).collect::<Vec<_>>();
 
@@ -1130,11 +1139,11 @@ mod test {
 
             let btensor = tensor.clone().to_btensor::<1>();
             let data = gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
-            let resultb = Tensor::<f32>::new(shape.clone(), data);
+            let resultb = Tensor::<f32>::new(shape.clone(), data).unwrap();
 
             let data = tensor.get_data();
             let data = data.iter().map(gelu_float).collect::<Vec<_>>();
-            let result = Tensor::new(shape, data);
+            let result = Tensor::new(shape, data).unwrap();
 
             resultb.get_data().iter().zip(result.get_data().iter()).try_for_each(|(left, right)| {
                 prop_assert!(

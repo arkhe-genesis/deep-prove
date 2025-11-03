@@ -918,7 +918,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
         let lhs_mles = lhs_evals
             .into_iter()
             .map(|evals| Self::mles_from_tensor(evals, lhs, unpadded_shape))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok((lhs_mles, stacking_coeffs))
     }
@@ -987,11 +987,11 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
             .collect::<Vec<Vec<FixedAxis<Vec<E>>>>>();
 
         // Now we can construct the multilinear extensions that have been fixed along the correct axes.
-        Ok(izip!(rhs_evals, rhs, unpadded_shapes)
+        izip!(rhs_evals, rhs, unpadded_shapes)
             .map(|(rhs_evals, tensor, unpadded_shape)| {
                 Self::mles_from_tensor(rhs_evals, tensor, unpadded_shape)
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Method that constructs the multilinear extensions from a tensor after fixing the correct axes.
@@ -999,9 +999,9 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
         fixed_axes: Vec<FixedAxis<Vec<E>>>,
         tensor: &Tensor<E>,
         unpadded_shape: &Shape,
-    ) -> Vec<MultilinearExtension<'static, E>> {
+    ) -> Result<Vec<MultilinearExtension<'static, E>>> {
         // First we reduce the tensor to the unpadded shape
-        let unpadded_data = tensor.reduce_to_shape(unpadded_shape).into_data();
+        let unpadded_data = tensor.reduce_to_shape(unpadded_shape)?.into_data();
 
         // Now we can construct the multilinear extensions that has been fixed at the correct locations
         let (evaluations, _, contraction_size) =
@@ -1075,7 +1075,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
         // `evaluations` represents the MLE of the full tensor (without padding) with all the outer axes fixed.
         // We now need to split this into multiple MLEs, with the total number of MLEs equal to the size of the combined stacking axes
         // and each individual MLE being over the contraction axes only.
-        evaluations
+        Ok(evaluations
             .chunks(contraction_size)
             .map(|eval_chunk| {
                 MultilinearExtension::<E>::from_evaluations_ext_vec(
@@ -1087,7 +1087,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                         .collect(),
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>())
     }
 
     fn into_fixed_polys<'b>(
@@ -1319,7 +1319,7 @@ mod tests {
                 .flat_map(|row| row.iter().copied().cycle().take(j * l))
                 .collect::<Vec<Element>>();
             let broadcasted_bias =
-                Tensor::<Element>::new(expected_output_shape.clone(), broadcasted_data);
+                Tensor::<Element>::new(expected_output_shape.clone(), broadcasted_data).unwrap();
 
             // Pad both tensors and convert to fields
             let bias_field: Tensor<F> = bias_tensor.pad_next_power_of_two().to_fields();

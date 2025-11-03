@@ -53,7 +53,7 @@ where
                         if let (Some(const_tensor), Some(unpadded_shape)) =
                             (opt_const, unpadded_shape)
                         {
-                            WrappedTensor::try_from(&const_tensor.reduce_to_shape(unpadded_shape))
+                            WrappedTensor::try_from(&const_tensor.reduce_to_shape(unpadded_shape)?)
                         } else {
                             unpadded_inputs_iter
                                 .next()
@@ -167,7 +167,7 @@ where
                 };
                 // Add the bias if provided
                 let with_bias = if let Some(bias_tensor) = bias {
-                    let wrapped_bias = WrappedTensor::try_from(&bias_tensor)?;
+                    let wrapped_bias = WrappedTensor::try_from(&bias_tensor?)?;
                     permuted.add(wrapped_bias)?
                 } else {
                     permuted
@@ -252,7 +252,7 @@ impl DimensionSorter {
                 Ok((None, reshape))
             } else {
                 Ok((
-                    Some(Permutation::new(new_order.into_iter().copied().collect())),
+                    Some(Permutation::new(new_order.into_iter().copied().collect())?),
                     reshape,
                 ))
             }
@@ -281,7 +281,7 @@ impl DimensionSorter {
                 Ok((None, reshape))
             } else {
                 Ok((
-                    Some(Permutation::new(new_order.into_iter().copied().collect())),
+                    Some(Permutation::new(new_order.into_iter().copied().collect())?),
                     reshape,
                 ))
             }
@@ -314,7 +314,10 @@ impl OutputDimensionSorter {
             .collect();
     }
 
-    fn calculate_permutation(&mut self, intermediate_order: &[char]) -> Option<Permutation> {
+    fn calculate_permutation(
+        &mut self,
+        intermediate_order: &[char],
+    ) -> Result<Option<Permutation>> {
         self.finalise();
 
         let actual_order = self.order.iter().map(|&(_, c)| c).collect::<Vec<char>>();
@@ -323,13 +326,13 @@ impl OutputDimensionSorter {
             .zip(actual_order.iter())
             .all(|(&i, &p)| i == p)
         {
-            None
+            Ok(None)
         } else {
             let output_order = find_output_dims_in_inputs_option(&actual_order, intermediate_order)
                 .into_iter()
                 .map(|o| o.expect("Output dimension not found, should be impossible"))
                 .collect::<Vec<usize>>();
-            Some(Permutation::new(output_order))
+            Ok(Some(Permutation::new(output_order)?))
         }
     }
 }
@@ -415,7 +418,7 @@ impl EvaluationInformation3D {
             .iter_mut()
             .zip(intermediate_orders.iter())
             .map(|(sorter, order)| sorter.calculate_permutation(order))
-            .collect::<Vec<Option<Permutation>>>();
+            .collect::<Result<Vec<Option<Permutation>>>>()?;
 
         Ok(EvaluationInformation3D {
             lhs_permutation,
@@ -511,8 +514,8 @@ mod tests {
                 .into_data()
                 .into_vec()
                 .expect("Failed to convert expected output to vec");
-            let expected = Tensor::new(c_shape.clone(), burn_data);
-            let output = Tensor::new(c_shape, output[0].clone().get_data());
+            let expected = Tensor::new(c_shape.clone(), burn_data).unwrap();
+            let output = Tensor::new(c_shape, output[0].clone().get_data()).unwrap();
             assert_eq!(
                 output.clone().get_data_into(),
                 expected.clone().get_data_into(),
@@ -567,8 +570,8 @@ mod tests {
                 .into_data()
                 .into_vec()
                 .expect("Failed to convert expected output to vec");
-            let expected = Tensor::new(c_shape.clone(), burn_data);
-            let output = Tensor::new(c_shape, output[0].clone().get_data());
+            let expected = Tensor::new(c_shape.clone(), burn_data).unwrap();
+            let output = Tensor::new(c_shape, output[0].clone().get_data()).unwrap();
             assert_eq!(
                 output.clone().get_data_into(),
                 expected.clone().get_data_into(),
@@ -621,8 +624,8 @@ mod tests {
                 .into_data()
                 .into_vec()
                 .expect("Failed to convert expected output to vec");
-            let expected = Tensor::new(c_shape.clone(), burn_data);
-            let output = Tensor::new(c_shape, output[0].clone().get_data());
+            let expected = Tensor::new(c_shape.clone(), burn_data).unwrap();
+            let output = Tensor::new(c_shape, output[0].clone().get_data()).unwrap();
             assert_eq!(
                 output.clone().get_data_into(),
                 expected.clone().get_data_into(),
@@ -701,8 +704,8 @@ mod tests {
                     .into_vec()
                     .expect("Failed to convert expected output to vec");
 
-                let expected = Tensor::new(shape.clone(), burn_data);
-                let output = Tensor::new(shape, output.clone().get_data());
+                let expected = Tensor::new(shape.clone(), burn_data).unwrap();
+                let output = Tensor::new(shape, output.clone().get_data()).unwrap();
                 assert_eq!(
                     output.clone().get_data_into(),
                     expected.clone().get_data_into(),
@@ -799,8 +802,8 @@ mod tests {
                     .into_vec()
                     .expect("Failed to convert expected output to vec");
 
-                let expected = Tensor::new(shape.clone(), burn_data);
-                let output = Tensor::new(shape, output.clone().get_data());
+                let expected = Tensor::new(shape.clone(), burn_data).unwrap();
+                let output = Tensor::new(shape, output.clone().get_data()).unwrap();
                 for (output, expected) in output.get_data().iter().zip(expected.get_data().iter()) {
                     assert!(
                         cmp_result(output, expected),
@@ -880,8 +883,9 @@ mod tests {
             };
 
             let expected_full_data = calc_expected_output(q_full);
-            let expected_full = Tensor::new(qkt_full_shape.clone(), expected_full_data);
-            let output_full = Tensor::new(qkt_full_shape, output_full[0].clone().get_data());
+            let expected_full = Tensor::new(qkt_full_shape.clone(), expected_full_data).unwrap();
+            let output_full =
+                Tensor::new(qkt_full_shape, output_full[0].clone().get_data()).unwrap();
             for (expected, output) in expected_full
                 .get_data()
                 .iter()
@@ -901,8 +905,10 @@ mod tests {
                 .expect("Failed to evaluate EinSum layer");
 
             let expected_single_data = calc_expected_output(q_single);
-            let expected_single = Tensor::new(qkt_single_shape.clone(), expected_single_data);
-            let output_single = Tensor::new(qkt_single_shape, output_single[0].clone().get_data());
+            let expected_single =
+                Tensor::new(qkt_single_shape.clone(), expected_single_data).unwrap();
+            let output_single =
+                Tensor::new(qkt_single_shape, output_single[0].clone().get_data()).unwrap();
 
             for (expected, output) in expected_single
                 .get_data()

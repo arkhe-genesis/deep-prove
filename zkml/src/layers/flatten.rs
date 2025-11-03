@@ -22,15 +22,19 @@ pub struct Flatten;
 pub struct FlattenCtx;
 
 impl OpInfo for Flatten {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes
             .iter()
             .map(|s| Shape::new(vec![s.product()]))
-            .collect()
+            .collect())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {

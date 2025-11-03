@@ -333,7 +333,7 @@ impl FileTensorLoader {
 
         let shape = Shape::new(view.shape().to_vec());
         let data_f32 = view_to_f32(view)?;
-        Ok(KeyedTensor::new(full, Tensor::new(shape, data_f32)))
+        Ok(KeyedTensor::new(full, Tensor::new(shape, data_f32)?))
     }
 
     /// Access metadata value converted to type `T` if possible. Values are read from
@@ -522,7 +522,7 @@ impl RMSNorm<f32> {
             .get_tensor("weight")
             .or_else(|_| loader.get_tensor("norm.weight"))?;
         if stack {
-            alpha = alpha.map_tensor(|alpha| {
+            alpha = alpha.try_map_tensor(|alpha| {
                 let (it, _) = alpha.slice_on_dim(0);
                 let data = it
                     .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
@@ -532,7 +532,7 @@ impl RMSNorm<f32> {
                 let new_dim = shape.dim(-1) * c.num_heads;
                 shape.set_dim(-1, new_dim);
                 Tensor::new(shape, data)
-            });
+            })?;
         }
         let eps = c.norm_epsilon;
         RMSNorm::new(Some(alpha), eps, None)

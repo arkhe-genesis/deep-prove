@@ -133,11 +133,11 @@ impl ScalingStrategy for InferenceObserver {
                 .zip(model.unpadded_input_shapes())
                 .enumerate()
                 .map(|(i, (inp, shape))| {
-                    let input_tensor = Tensor::new(shape, inp);
+                    let input_tensor = Tensor::new(shape, inp)?;
                     tracker.track(INPUT_TRACKING_ID.into(), i, input_tensor.clone());
-                    input_tensor
+                    Ok(input_tensor)
                 })
-                .collect_vec();
+                .collect::<Result<Vec<_>>>()?;
             debug!("Running float inference with the {}-th input", nsamples + 1);
             model.run_with_tracker::<GoldilocksExt2>(&input_tensors, Some(&mut tracker), store)?;
             nsamples += 1;
@@ -444,7 +444,7 @@ fn quantize_model<S: ScalingStrategy>(
                     shape_map.extend(
                         quantized_out
                             .quantized_op
-                            .output_shapes(&shape_info, PaddingMode::NoPadding)
+                            .output_shapes(&shape_info, PaddingMode::NoPadding)?
                             .into_iter()
                             .enumerate()
                             .map(|(out_port, shape)| (NodeOutput::new(node_id, out_port), shape)),

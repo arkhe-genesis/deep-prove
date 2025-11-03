@@ -241,52 +241,42 @@ impl Attention<f32> {
         };
 
         let pre_norm = RMSNorm::from_gguf(&loader.pp("attn_"), &c.generic, false)?;
-        assert_eq!(
-            pre_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.generic.embedding_size]
-        );
+        ensure!(pre_norm.alpha.as_ref().unwrap().shape().as_ref() == &[c.generic.embedding_size]);
 
         let q_tensor = loader
             .get_tensor("attn_q.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
         let q_norm = RMSNorm::from_gguf(&loader.pp("attn_q_"), &c.generic, true)?;
-        assert_eq!(
-            q_tensor.shape().as_ref(),
-            &[c.generic.hidden_size, num_heads * head_size],
+        ensure!(
+            q_tensor.shape().as_ref() == &[c.generic.hidden_size, num_heads * head_size],
             "embedding_size {} hidden_size {} num_heads {} head_size {}",
             c.generic.embedding_size,
             c.generic.hidden_size,
             num_heads,
             head_size
         );
-        assert_eq!(
-            q_norm.alpha.as_ref().unwrap().shape().as_ref(),
+        ensure!(
+            q_norm.alpha.as_ref().unwrap().shape().as_ref() ==
             // HACK: stacking
             &[c.generic.head_size * c.generic.num_heads]
         );
 
         let k_tensor = loader
             .get_tensor("attn_k.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
         let k_norm = RMSNorm::from_gguf(&loader.pp("attn_k_"), &c.generic, true)?;
-        assert_eq!(
-            k_tensor.shape().as_ref(),
-            &[hidden_size, num_groups * head_size]
-        );
+        ensure!(k_tensor.shape().as_ref() == &[hidden_size, num_groups * head_size]);
         // head_dim = num_groups * head_size
-        assert_eq!(
-            k_norm.alpha.as_ref().unwrap().shape().as_ref(),
+        ensure!(
+            k_norm.alpha.as_ref().unwrap().shape().as_ref() ==
             // HACK: stacking
             &[c.generic.head_size * c.generic.num_heads]
         );
 
         let v_tensor = loader
             .get_tensor("attn_v.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        assert_eq!(
-            v_tensor.shape().as_ref(),
-            &[hidden_size, num_groups * head_size]
-        );
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
+        ensure!(v_tensor.shape().as_ref() == &[hidden_size, num_groups * head_size]);
 
         // HACK: since we don't have proper GQA for now, we fake the "one" group by stacking multiple times
         // the K and V tensors on themselves, as many times as there are heads. In Gemma3 270M there are only
@@ -299,27 +289,23 @@ impl Attention<f32> {
             "GQA is not supported yet so stacking is expensive"
         );
 
-        let k_tensor = k_tensor.map_tensor(|t| expand(t, num_heads));
-        let v_tensor = v_tensor.map_tensor(|t| expand(t, num_heads));
+        let k_tensor = k_tensor.try_map_tensor(|t| expand(t, num_heads))?;
+        let v_tensor = v_tensor.try_map_tensor(|t| expand(t, num_heads))?;
 
         let out = loader
             .get_tensor("attn_output.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        assert_eq!(out.shape().as_ref(), &[num_heads * head_size, hidden_size]);
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
+        ensure!(out.shape().as_ref() == &[num_heads * head_size, hidden_size]);
 
         let post_attn_norm = RMSNorm::from_gguf(&loader.pp("post_attention_"), &c.generic, false)?;
-        assert_eq!(
-            post_attn_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.generic.hidden_size]
+        ensure!(
+            post_attn_norm.alpha.as_ref().unwrap().shape().as_ref() == &[c.generic.hidden_size]
         );
 
         let ff = FeedForward::from_gguf_gemma3(loader, c)?;
         let scope_loader = loader.pp("post_ffw_");
         let post_ffn_norm = RMSNorm::from_gguf(&scope_loader, &c.generic, false)?;
-        assert_eq!(
-            post_ffn_norm.alpha.as_ref().unwrap().shape().as_ref(),
-            &[c.generic.hidden_size]
-        );
+        ensure!(post_ffn_norm.alpha.as_ref().unwrap().shape().as_ref() == &[c.generic.hidden_size]);
         let ffn_norm_loader = loader.pp("ffn_");
         let pre_ffn_norm = NormType::RMSNorm.from_gguf(&ffn_norm_loader, &c.generic, false)?;
         Ok(Self {
@@ -357,11 +343,10 @@ impl Attention<f32> {
 
         let q_tensor = loader
             .get_tensor("self_attn.q_proj.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
         let q_norm = RMSNorm::from_safe(&loader.pp("self_attn.q_norm."), &c.generic, true)?;
-        assert_eq!(
-            q_tensor.shape().as_ref(),
-            &[hidden_size, num_heads * head_size],
+        ensure!(
+            q_tensor.shape().as_ref() == &[hidden_size, num_heads * head_size],
             "embedding_size {} hidden_size {} num_heads {} head_size {}",
             c.generic.embedding_size,
             c.generic.hidden_size,
@@ -371,20 +356,14 @@ impl Attention<f32> {
 
         let k_tensor = loader
             .get_tensor("self_attn.k_proj.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
         let k_norm = RMSNorm::from_safe(&loader.pp("self_attn.k_norm."), &c.generic, true)?;
-        assert_eq!(
-            k_tensor.shape().as_ref(),
-            &[hidden_size, num_groups * head_size]
-        );
+        ensure!(k_tensor.shape().as_ref() == &[hidden_size, num_groups * head_size]);
 
         let v_tensor = loader
             .get_tensor("self_attn.v_proj.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        assert_eq!(
-            v_tensor.shape().as_ref(),
-            &[hidden_size, num_groups * head_size]
-        );
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
+        ensure!(v_tensor.shape().as_ref() == &[hidden_size, num_groups * head_size]);
 
         ensure!(num_groups == 1, "GQA is not supported yet");
         ensure!(
@@ -392,13 +371,13 @@ impl Attention<f32> {
             "GQA is not supported yet so stacking is expensive"
         );
 
-        let k_tensor = k_tensor.map_tensor(|t| expand(t, num_heads));
-        let v_tensor = v_tensor.map_tensor(|t| expand(t, num_heads));
+        let k_tensor = k_tensor.try_map_tensor(|t| expand(t, num_heads))?;
+        let v_tensor = v_tensor.try_map_tensor(|t| expand(t, num_heads))?;
 
         let out = loader
             .get_tensor("self_attn.o_proj.weight")?
-            .map_tensor(|t| Tensor::transpose(&t));
-        assert_eq!(out.shape().as_ref(), &[num_heads * head_size, hidden_size]);
+            .try_map_tensor(|t| Tensor::transpose(&t))?;
+        ensure!(out.shape().as_ref() == &[num_heads * head_size, hidden_size]);
 
         let pre_ffn_norm =
             RMSNorm::from_safe(&loader.pp("post_attention_layernorm."), &c.generic, false)?;
@@ -433,7 +412,7 @@ impl FeedForward<f32> {
     ) -> anyhow::Result<Self> {
         let gate_tensor = loader
             .get_tensor("ffn_gate.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         ensure!(
             gate_tensor.shape()[0] == c.generic.hidden_size,
             "gate have shape {:?} but in features should be equal to hidden_size: {}",
@@ -444,11 +423,11 @@ impl FeedForward<f32> {
 
         let up = loader
             .get_tensor("ffn_up.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         let up_bias = None;
         let down = loader
             .get_tensor("ffn_down.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         let down_bias = None;
         ensure!(
             up.shape()[0] == c.generic.hidden_size,
@@ -477,7 +456,7 @@ impl FeedForward<f32> {
     ) -> anyhow::Result<Self> {
         let gate_tensor = loader
             .get_tensor("mlp.gate_proj.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         ensure!(
             gate_tensor.shape()[0] == c.generic.hidden_size,
             "gate have shape {:?} but in features should be equal to hidden_size: {}",
@@ -488,11 +467,11 @@ impl FeedForward<f32> {
 
         let up = loader
             .get_tensor("mlp.up_proj.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         let up_bias = None;
         let down = loader
             .get_tensor("mlp.down_proj.weight")?
-            .map_tensor(|t| t.transpose());
+            .try_map_tensor(|t| t.transpose())?;
         let down_bias = None;
         ensure!(
             up.shape()[0] == c.generic.hidden_size,
@@ -555,7 +534,7 @@ pub mod tests {
         assert_eq!(config.norm_epsilon, 1e-6);
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.eos_token, 106usize.into());
-        let input = Tensor::new(vec![1].into(), vec![1562_f32]);
+        let input = Tensor::new(vec![1].into(), vec![1562_f32])?;
         model.run_float(&[input])?;
         Ok(())
     }
@@ -596,7 +575,7 @@ pub mod tests {
             let input = Tensor::new(
                 input_shape.clone(),
                 logit.input_token.iter().map(|x| *x as f32).collect(),
-            )
+            )?
             .pad_next_power_of_two();
             let mut store = GenStore::default();
             let trace = model.run::<GoldilocksExt2>(&[input], &mut store)?;
@@ -645,7 +624,7 @@ pub mod safe_tests {
         assert_eq!(config.norm_epsilon, 1e-6);
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.eos_token, 1usize.into());
-        let input = Tensor::new(vec![1].into(), vec![1562_f32]);
+        let input = Tensor::new(vec![1].into(), vec![1562_f32])?;
         model.run_float(&[input])?;
         Ok(())
     }

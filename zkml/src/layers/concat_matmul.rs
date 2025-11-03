@@ -57,16 +57,16 @@ pub const CONCAT_MATMUL_LAYER: &str = "CMML";
 pub struct Permutation(pub(crate) Vec<usize>);
 
 impl Permutation {
-    pub fn new(perm: Vec<usize>) -> Self {
-        assert!(
+    pub fn new(perm: Vec<usize>) -> Result<Self> {
+        ensure!(
             perm.len() > 1,
             "Permutation must have at least two elements"
         );
-        assert!(
+        ensure!(
             perm.iter().all(|&x| x < perm.len()),
             "Permutation indices must be less than the length of the permutation"
         );
-        Self(perm)
+        Ok(Self(perm))
     }
 
     pub fn apply(&self, shape: &Shape) -> Shape {
@@ -106,16 +106,16 @@ impl InputMatrixDimensions {
         }
     }
     /// Compute the permutation, if any, to be applied to the input tensor to re-arrange the dimensions as in `expected_dimensions`
-    fn compute_permutation(&self, expected_dimensions: &Self) -> Option<Permutation> {
+    fn compute_permutation(&self, expected_dimensions: &Self) -> Result<Option<Permutation>> {
         if self != expected_dimensions {
             // we need to permute to get to `expected_dimensions`
             let mut permute = vec![0; 3];
             permute[expected_dimensions.concat_dimension] = self.concat_dimension;
             permute[expected_dimensions.output_dimension] = self.output_dimension;
             permute[expected_dimensions.mat_mul_dimension] = self.mat_mul_dimension;
-            Some(Permutation::new(permute))
+            Ok(Some(Permutation::new(permute)?))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -148,7 +148,7 @@ impl InputMatrixDimensions {
         &self,
         input: &'a Tensor<E>,
         partial_point: &[E],
-    ) -> MultilinearExtension<'a, E> {
+    ) -> Result<MultilinearExtension<'a, E>> {
         // determine if we need to permute the matrix for sum-check
         if self.concat_dimension > self.mat_mul_dimension || self.output_dimension == 1 {
             // we need to permute the matrix; for simplicity, we alwayes permute in order to get
@@ -158,9 +158,9 @@ impl InputMatrixDimensions {
                 self.mat_mul_dimension,
                 self.output_dimension,
             ];
-            let mut mle = input.permute3d(&permute).into_mle();
+            let mut mle = input.permute3d(&permute)?.into_mle();
             mle.fix_variables_in_place_parallel(partial_point);
-            mle
+            Ok(mle)
         } else {
             // no permutation needed, just compute the MLE
             let mut mle = input.to_mle();
@@ -173,7 +173,7 @@ impl InputMatrixDimensions {
                 // related to the last dimension, which are the least significant ones
                 mle.fix_variables_in_place_parallel(partial_point);
             }
-            mle
+            Ok(mle)
         }
     }
 }
@@ -190,7 +190,7 @@ struct MatrixPermutations {
 
 impl MatrixPermutations {
     fn ensure_shape_consistency<S: Borrow<Shape>>(&self, shapes: &[S]) -> anyhow::Result<()> {
-        assert!(shapes.len() == 2, "ConcatMatMul expects 2 inputs");
+        ensure!(shapes.len() == 2, "ConcatMatMul expects 2 inputs");
         ensure!(
             shapes[0].borrow().rank() == shapes[1].borrow().rank(),
             "ConcatMatMul expects input shapes with same rank: {:?} vs {:?}",
@@ -219,17 +219,17 @@ impl MatrixPermutations {
         &self,
         input_shapes: &[Shape],
         padding_mode: crate::padding::PaddingMode,
-    ) -> Vec<Shape> {
+    ) -> Result<Vec<Shape>> {
         let a_shape = &input_shapes[0];
         let b_shape = &input_shapes[1];
         self.ensure_shape_consistency(&[a_shape, b_shape]).unwrap();
         // inner matrix shapes
-        let a_shape = if let Some(permute) = self.compute_permutation_for_left_input() {
+        let a_shape = if let Some(permute) = self.compute_permutation_for_left_input()? {
             permute.apply(a_shape)
         } else {
             a_shape.clone()
         };
-        let b_shape = if let Some(permute) = self.compute_permutation_for_right_input() {
+        let b_shape = if let Some(permute) = self.compute_permutation_for_right_input()? {
             permute.apply(b_shape)
         } else {
             b_shape.clone()
@@ -244,17 +244,17 @@ impl MatrixPermutations {
             trace!("ConcatMatMul: Permute: {permute:?} over resulting shape {mat_result_shape:?}",);
             mat_result_shape = mat_result_shape.permute(&permute.0);
         }
-        vec![mat_result_shape]
+        Ok(vec![mat_result_shape])
     }
 
     /// Compute permutation to be applied to the left input tensor, if any
-    fn compute_permutation_for_left_input(&self) -> Option<Permutation> {
+    fn compute_permutation_for_left_input(&self) -> Result<Option<Permutation>> {
         let expected_dimensions = ConcatMatMul::expected_dimension_for_left_input();
         self.left.compute_permutation(&expected_dimensions)
     }
 
     /// Compute permutation to be applied to the right input tensor, if any
-    fn compute_permutation_for_right_input(&self) -> Option<Permutation> {
+    fn compute_permutation_for_right_input(&self) -> Result<Option<Permutation>> {
         let expected_dimensions = ConcatMatMul::expected_dimension_for_right_input();
         self.right.compute_permutation(&expected_dimensions)
     }
@@ -502,13 +502,13 @@ impl ConcatMatMul {
         let left = self
             .permutations
             .left
-            .input_mle_for_proving(inputs[0].as_ref(), point_for_row);
+            .input_mle_for_proving(inputs[0].as_ref(), point_for_row)?;
 
         // determine if we need to permute the right matrix for sum-check
         let right = self
             .permutations
             .right
-            .input_mle_for_proving(inputs[1].as_ref(), point_for_col);
+            .input_mle_for_proving(inputs[1].as_ref(), point_for_col)?;
 
         ensure!(
             left.num_vars() == right.num_vars(),
@@ -602,12 +602,12 @@ where
         let b_shape = b.shape();
         self.ensure_shape_consistency(&[Shape::from(a_shape), Shape::from(b_shape)])?;
 
-        let a = if let Some(permute) = self.permutations.compute_permutation_for_left_input() {
+        let a = if let Some(permute) = self.permutations.compute_permutation_for_left_input()? {
             a.permute(&permute.to_3d_axes())?
         } else {
             a
         };
-        let b = if let Some(permute) = self.permutations.compute_permutation_for_right_input() {
+        let b = if let Some(permute) = self.permutations.compute_permutation_for_right_input()? {
             b.permute(&permute.to_3d_axes())?
         } else {
             b
@@ -638,12 +638,12 @@ impl OpInfo for ConcatMatMul {
         &self,
         input_shapes: &[Shape],
         padding_mode: crate::padding::PaddingMode,
-    ) -> Vec<Shape> {
+    ) -> Result<Vec<Shape>> {
         self.permutations.output_shapes(input_shapes, padding_mode)
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -665,7 +665,7 @@ impl QuantizeOp for ConcatMatMul {
         input_scaling: &[crate::ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<super::provable::QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len());
+        let num_outputs = self.num_outputs(input_scaling.len())?;
         let output_scale = S::scaling_factors_for_node(data, node_id, num_outputs)[0];
         // normally it's input_scaling * model_scaling / output_scaling, except in this case, we don't have a model_scaling
         // but we have the second matrix scaling, so we use that.
@@ -678,7 +678,7 @@ impl QuantizeOp for ConcatMatMul {
             output_scale,
             intermediate_bit_size,
         );
-        Ok(super::provable::QuantizeOutput::new(self, vec![output_scale]).with_requant(requant))
+        super::provable::QuantizeOutput::new(self, vec![output_scale]).with_requant(requant)
     }
 }
 
@@ -694,10 +694,11 @@ impl ProveInfo for ConcatMatMul {
 
         ensure!(
             num_columns_left == num_rows_right,
-            "ConcatMatMul: number of columns in left matrix chunk different from number of rows in right matrix chunk: {num_columns_left} vs {num_rows_right}",
+            "ConcatMatMul: number of columns in left matrix chunk different from number of rows in\
+            right matrix chunk: {num_columns_left} vs {num_rows_right}",
         );
 
-        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
+        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
 
         let ctx = ConcatMatMulCtx {
             node_id: id,
@@ -761,12 +762,16 @@ where
 }
 
 impl OpInfo for ConcatMatMulCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         self.permutations.output_shapes(input_shapes, padding_mode)
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -933,11 +938,13 @@ mod test {
         let a = Tensor::new(
             vec![2, 2, 2].into(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
+        )
+        .unwrap();
         let b = Tensor::new(
             vec![2, 2, 2].into(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
+        )
+        .unwrap();
         let result = concat_matmul
             .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()])
             .unwrap();
@@ -952,29 +959,34 @@ mod test {
         let concat_matmul = ConcatMatMul::new_with_permute(
             ConcatMatMul::expected_dimension_for_left_input(),
             ConcatMatMul::expected_dimension_for_right_input(),
-            Permutation::new(vec![1, 0, 2]),
+            Permutation::new(vec![1, 0, 2]).unwrap(),
         );
         let a = Tensor::new(
             vec![2, 2, 2].into(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
+        )
+        .unwrap();
         let b = Tensor::new(
             vec![2, 2, 2].into(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-        );
+        )
+        .unwrap();
         let result = concat_matmul
             .evaluate::<GoldilocksExt2>(&[&a.as_wrapped(), &b.as_wrapped()])
             .unwrap();
         let expected = Tensor::new(
             vec![2, 2, 2].into(),
             vec![7.0, 10.0, 15.0, 22.0, 67.0, 78.0, 91.0, 106.0],
-        );
-        let expected = expected.permute3d(&[1, 0, 2]);
+        )
+        .unwrap();
+        let expected = expected.permute3d(&[1, 0, 2]).unwrap();
         assert_eq!(result.outputs[0].get_data(), expected.data());
-        let expected_shape = concat_matmul.output_shapes(
-            &[a.shape().clone(), b.shape().clone()],
-            PaddingMode::NoPadding,
-        );
+        let expected_shape = concat_matmul
+            .output_shapes(
+                &[a.shape().clone(), b.shape().clone()],
+                PaddingMode::NoPadding,
+            )
+            .unwrap();
         assert_eq!(Shape::from(result.outputs[0].shape()), expected_shape[0]);
     }
 
@@ -985,13 +997,15 @@ mod test {
             vec![
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
             ],
-        );
+        )
+        .unwrap();
         let b = Tensor::new(
             vec![2, 3, 2].into(),
             vec![
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
             ],
-        );
+        )
+        .unwrap();
         let concat_matmul = ConcatMatMul::new(
             InputMatrixDimensions::new(1, 2, 0),
             InputMatrixDimensions::new(0, 2, 1),
@@ -1006,12 +1020,15 @@ mod test {
                 5.0, 11.0, 17.0, 17.0, 39.0, 61.0, 29.0, 67.0, 105.0, 53.0, 67.0, 81.0, 113.0,
                 143.0, 173.0, 173.0, 219.0, 265.0,
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(result.outputs[0].get_data(), expected.data());
-        let expected_shape = concat_matmul.output_shapes(
-            &[a.shape().clone(), b.shape().clone()],
-            PaddingMode::NoPadding,
-        );
+        let expected_shape = concat_matmul
+            .output_shapes(
+                &[a.shape().clone(), b.shape().clone()],
+                PaddingMode::NoPadding,
+            )
+            .unwrap();
         assert_eq!(Shape::from(result.outputs[0].shape()), expected_shape[0]);
     }
 
@@ -1103,8 +1120,8 @@ mod test {
         let second_matmul = ConcatMatMul::new_with_permute(
             ConcatMatMul::expected_dimension_for_left_input(),
             InputMatrixDimensions::new(1, 2, 0),
-            Permutation::new(vec![2, 0, 1]), /* we also permute the output tensor to have the concat dimension as
-                                              * the middle dimension */
+            Permutation::new(vec![2, 0, 1]).unwrap(), /* we also permute the output tensor to have the concat dimension as
+                                                       * the middle dimension */
         );
 
         let second_node_id = model
@@ -1249,12 +1266,14 @@ mod test {
             self.ensure_shape_consistency(&[a_shape, b_shape])?;
             let permuted_a = self
                 .permutations
-                .compute_permutation_for_left_input()
-                .map(|p| a.permute3d(&p.0));
+                .compute_permutation_for_left_input()?
+                .map(|p| a.permute3d(&p.0))
+                .transpose()?;
             let permuted_b = self
                 .permutations
-                .compute_permutation_for_right_input()
-                .map(|p| b.permute3d(&p.0));
+                .compute_permutation_for_right_input()?
+                .map(|p| b.permute3d(&p.0))
+                .transpose()?;
             let a = permuted_a.as_ref().unwrap_or(a);
             let b = permuted_b.as_ref().unwrap_or(b);
             let a_shape = a.shape();
@@ -1267,23 +1286,27 @@ mod test {
             );
             let results = (0..a_shape.dim(0))
                 .map(|batch| {
-                    let batch_a = a.slice_3d(batch, batch + 1).reshaped(a_shape.slice(1..=2));
-                    let batch_b = b.slice_3d(batch, batch + 1).reshaped(b_shape.slice(1..=2));
+                    let batch_a = a
+                        .slice_3d(batch, batch + 1)?
+                        .reshaped(a_shape.slice(1..=2))?;
+                    let batch_b = b
+                        .slice_3d(batch, batch + 1)?
+                        .reshaped(b_shape.slice(1..=2))?;
                     batch_a.matmul(&batch_b)
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             let mut it = results.into_iter();
             // reshape because concat expects a 3d tensor so he can accumulate in the highest dimension.
             let concat =
                 it.next()
                     .unwrap()
-                    .reshaped(Shape::new(vec![1, a_shape.dim(1), b_shape.dim(2)]));
-            let mut concat = it.fold(concat, |mut acc, x| {
-                acc.concat(x);
-                acc
-            });
+                    .reshaped(Shape::new(vec![1, a_shape.dim(1), b_shape.dim(2)]))?;
+            let mut concat = it.try_fold(concat, |mut acc, x| -> anyhow::Result<Tensor<_>> {
+                acc.concat(x)?;
+                Ok(acc)
+            })?;
             if let Some(ref transpose) = self.permutations.permute {
-                concat = concat.permute3d(&transpose.0);
+                concat = concat.permute3d(&transpose.0)?;
             }
             Ok(concat)
         }

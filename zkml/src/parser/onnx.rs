@@ -501,11 +501,11 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     let weight_shape = weight.shape().clone();
     if weight_shape.len() > 2 {
         let input_flattened = weight_shape[1..].iter().product::<usize>();
-        weight.reshape(Shape::new(vec![weight_shape[0], input_flattened]));
+        weight.reshape(Shape::new(vec![weight_shape[0], input_flattened]))?;
     } else if weight_shape.len() == 1 {
         // A Gemm is always a matrix - so if there's only one dimension, we need to add 1 to
         // to the output features
-        weight.reshape(weight_shape.insert(0, 1));
+        weight.reshape(weight_shape.insert(0, 1))?;
     };
     ensure_onnx!(
         weight.shape().is_matrix(),
@@ -536,9 +536,9 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         if *weight_shape.last().unwrap() == out_features {
             // Layout is likely [...in_features, out_features].
             let in_features = weight_size_flattened / out_features;
-            weight.reshape(Shape::new(vec![in_features, out_features]));
+            weight.reshape(Shape::new(vec![in_features, out_features]))?;
             // Transpose to get [out_features, in_features] for subsequent logic.
-            weight = weight.map_tensor(|t| t.transpose());
+            weight = weight.try_map_tensor(|t| t.transpose())?;
         } else if weight_shape[0] == out_features {
             // Layout is likely [out_features, ...in_features].
             let in_features = weight_shape[1..].iter().product::<usize>();
@@ -548,7 +548,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
                 in_features,
                 input_size_flattened
             );
-            weight.reshape(Shape::new(vec![out_features, in_features]));
+            weight.reshape(Shape::new(vec![out_features, in_features]))?;
         } else {
             return err(format!(
                 "Could not determine layout of weights for Gemm. Shape: {weight_shape:?}, expecting output dim of size {out_features}"
@@ -562,7 +562,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     );
 
     if input_shape.len() != 1 {
-        assert!(
+        ensure!(
             input_shape[0] == 1,
             "First dimension of Gemm layer input should be 1. Input shape was: {input_shape:?}"
         );
@@ -576,7 +576,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
 
     let mut weight_shape = weight.shape();
     if weight_shape[1] != input_shape[0] {
-        weight = weight.map_tensor(|t| t.transpose());
+        weight = weight.try_map_tensor(|t| t.transpose())?;
         weight_shape = weight.shape();
     }
     ensure_onnx!(
@@ -597,7 +597,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         weight.shape_mut().insert(0, 1);
     } else {
         if weight_shape[1] != input_shape[0] {
-            weight = weight.map_tensor(|t| t.transpose());
+            weight = weight.try_map_tensor(|t| t.transpose())?;
             weight_shape = weight.shape();
         }
         ensure_onnx!(
@@ -673,7 +673,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
                     "Bias tensor must be 1D with batch: {:?}",
                     bias_shape
                 );
-                bias_tensor.reshape(bias_shape.slice(1..));
+                bias_tensor.reshape(bias_shape.slice(1..))?;
             }
             ensure_onnx!(
                 bias_tensor.shape()[0] == weight.shape()[0],
@@ -683,7 +683,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         })
         .transpose()?;
 
-    let dense = crate::layers::dense::Dense::new_with(weight, bias_tensor);
+    let dense = crate::layers::dense::Dense::new_with(weight, bias_tensor)?;
     // we put the bias id if present so next layers refer to it and not the gemm node
     let zkml_node_id = model.graph.add_inner(Layer::Dense(dense))?;
     model.add_edge(
@@ -724,9 +724,9 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
     let filter_const = extract_const_tensor(filter_node)?;
     let bias_const = extract_const_tensor(bias_node)?;
     let conv = if bias_const.shape().is_empty() {
-        Convolution::new_without_bias(filter_const)
+        Convolution::new_without_bias(filter_const)?
     } else {
-        Convolution::new(filter_const, bias_const)
+        Convolution::new(filter_const, bias_const)?
     };
     let zkml_node_id = model.graph.add_inner(Layer::Convolution(conv))?;
     model.add_edge(
@@ -752,7 +752,7 @@ fn extract_const_tensor(node: &OnnxNode) -> Result<KeyedTensor<f32>> {
     };
     Ok(KeyedTensor::new(
         format!("{}-{}", node.name, node.id),
-        crate::Tensor::new(shape.to_vec().into(), slice.to_vec()),
+        crate::Tensor::new(shape.to_vec().into(), slice.to_vec())?,
     ))
 }
 

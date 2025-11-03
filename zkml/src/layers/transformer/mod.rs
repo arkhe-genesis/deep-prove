@@ -10,10 +10,12 @@ pub mod qkv;
 pub mod rmsnorm;
 pub mod softmax;
 
+use anyhow::Result;
+
 /// Normally q_len == seq_len when the input is contains multiple tokens.
 /// However, if the input contains 1 token, (e.g. with caching for example) then
 /// q_len == 1 and seq_len > 1 if we are down multiple inference steps.
-pub fn causal_mask(num_heads: usize, q_len: usize, seq_len: usize) -> Tensor<f32> {
+pub fn causal_mask(num_heads: usize, q_len: usize, seq_len: usize) -> Result<Tensor<f32>> {
     assert!(q_len == 1 || q_len == seq_len);
     let mask_len = num_heads * q_len * seq_len;
     let mut mask = vec![0.0; mask_len];
@@ -513,10 +515,10 @@ pub(crate) mod manual_attention {
             // or call unsqueeze
             vec![gpt2_output.input_ids.len()].into(),
             gpt2_output.input_ids.iter().map(|x| *x as f32).collect(),
-        );
+        )?;
         // also test on a single random token
         let max_token = rng_from_env_or_random().gen_range(0..config.embedding_size);
-        let single_input = Tensor::new(vec![1].into(), vec![max_token as f32]);
+        let single_input = Tensor::new(vec![1].into(), vec![max_token as f32])?;
         model.describe();
         model.run_float(slice::from_ref(&single_input))?;
         // Reset is needed here because the `llm_model` contains layer that contains some cache.

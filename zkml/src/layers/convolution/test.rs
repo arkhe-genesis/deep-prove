@@ -55,18 +55,19 @@ fn test_conv() {
                     let input_size = padded_input_shape.numel();
 
                     let bias = Tensor::<Element>::zeros(Shape::new(vec![feature_maps]));
-                    let input = Tensor::new(padded_input_shape.clone(), vec![3; input_size]);
+                    let input =
+                        Tensor::new(padded_input_shape.clone(), vec![3; input_size]).unwrap();
                     let mut filter = Filter::new(KeyedTensor::new(
                         "conv_filter",
                         Tensor::random(&filter_shape),
                     ));
 
-                    let expected = input.conv2d(filter.as_pre_fft_tensor(), &bias, 1);
-                    let expected = expected.squeeze(0);
+                    let expected = input.conv2d(filter.as_pre_fft_tensor(), &bias, 1).unwrap();
+                    let expected = expected.squeeze(0).unwrap();
 
-                    filter.prepare_for_fft(&padded_input_shape);
+                    filter.prepare_for_fft(&padded_input_shape).unwrap();
 
-                    let (result, _) = filter.fft_conv::<GoldilocksExt2>(&input, &bias);
+                    let (result, _) = filter.fft_conv::<GoldilocksExt2>(&input, &bias).unwrap();
                     check_tensor_consistency(&expected, &result);
                 }
             }
@@ -78,23 +79,23 @@ fn test_conv() {
 fn test_clear_garbage() {
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![1, 1, 2]);
-    let tensor = Tensor::new(padded_shape, vec![1, 2]);
-    assert_eq!(clear_garbage(&tensor, &shape).data(), [1, 0]);
+    let tensor = Tensor::new(padded_shape, vec![1, 2]).unwrap();
+    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0]);
 
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![1, 2, 1]);
-    let tensor = Tensor::new(padded_shape, vec![1, 2]);
-    assert_eq!(clear_garbage(&tensor, &shape).data(), [1, 0]);
+    let tensor = Tensor::new(padded_shape, vec![1, 2]).unwrap();
+    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0]);
 
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![2, 1, 1]);
-    let tensor = Tensor::new(padded_shape, vec![1, 2]);
-    assert_eq!(clear_garbage(&tensor, &shape).data(), [1, 0]);
+    let tensor = Tensor::new(padded_shape, vec![1, 2]).unwrap();
+    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0]);
 
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![1, 2, 2]);
-    let tensor = Tensor::new(padded_shape, vec![1, 2, 3, 4]);
-    assert_eq!(clear_garbage(&tensor, &shape).data(), [1, 0, 0, 0]);
+    let tensor = Tensor::new(padded_shape, vec![1, 2, 3, 4]).unwrap();
+    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0, 0, 0]);
 }
 
 #[test]
@@ -114,11 +115,14 @@ fn test_conv_unpadded_to_padded() {
     let weight = KeyedTensor::new("conv_filter", Tensor::random(&conv_shape_og));
     let bias = KeyedTensor::new("conv_bias", Tensor::zeros(vec![conv_shape_og[0]].into()));
     let input = Tensor::random(&input_shape);
-    let output = input.conv2d(&weight, &bias, 1);
+    let output = input.conv2d(&weight, &bias, 1).unwrap();
     // now try to pad the input and conv and use the fft one
     let padded_input = input.pad_next_power_of_two();
-    let fft_conv = Convolution::new(weight.clone(), bias).prepared_for_fft(&input_shape);
-    let (fft_output, conv_data) = fft_conv.fft::<GoldilocksExt2>(&padded_input);
+    let fft_conv = Convolution::new(weight.clone(), bias)
+        .unwrap()
+        .prepared_for_fft(&input_shape)
+        .unwrap();
+    let (fft_output, conv_data) = fft_conv.fft::<GoldilocksExt2>(&padded_input).unwrap();
     let (valid, _garbage) = split_garbage(&fft_output, output.shape());
     assert_eq!(
         valid,
@@ -140,8 +144,8 @@ fn test_conv_unpadded_to_padded() {
     assert_eq!(*fft_output.shape(), fft_output_shape);
 
     let fft_output_data = conv_data.output_as_element;
-    let reconstructed_fft_tensor = Tensor::new(fft_output_shape.clone(), fft_output_data);
-    let hadamard_clearing = new_clearing_tensor(output.shape(), &fft_output_shape);
+    let reconstructed_fft_tensor = Tensor::new(fft_output_shape.clone(), fft_output_data).unwrap();
+    let hadamard_clearing = new_clearing_tensor(output.shape(), &fft_output_shape).unwrap();
     let hadamard_cleared = reconstructed_fft_tensor
         .to_flatten()
         .mul(&hadamard_clearing);
@@ -157,13 +161,16 @@ fn test_conv_padding_garbage() {
     let w1 = KeyedTensor::new("conv_filter", Tensor::random(&conv_shape_og));
     let bias1 = KeyedTensor::new("conv_bias", Tensor::zeros(vec![conv_shape_og[0]].into()));
     // creation of the padded and fft'd convolution
-    let fft_conv = Convolution::new(w1.clone(), bias1.clone()).prepared_for_fft(&input_shape);
+    let fft_conv = Convolution::new(w1.clone(), bias1.clone())
+        .unwrap()
+        .prepared_for_fft(&input_shape)
+        .unwrap();
     let input = Tensor::random(&input_shape);
     let padded_input = input.pad_next_power_of_two();
     let (fft_output, _): (Tensor<Element>, ConvData<_>) =
-        fft_conv.fft::<GoldilocksExt2>(&padded_input);
+        fft_conv.fft::<GoldilocksExt2>(&padded_input).unwrap();
     // just normal convolution
-    let normal_output = input.conv2d(&w1, &bias1, 1);
+    let normal_output = input.conv2d(&w1, &bias1, 1).unwrap();
 
     // Flatten for the dense layer
     let flat_fft_output = fft_output.to_flatten();
@@ -178,7 +185,8 @@ fn test_conv_padding_garbage() {
         &Tensor::new(
             fft_output.shape().clone(),
             flat_fft_output.get_data().to_vec(),
-        ),
+        )
+        .unwrap(),
         normal_output.shape(),
     );
     // at this point the garbage should be all zeros and the valid should be the same as the non fft output as before
@@ -196,10 +204,12 @@ fn test_conv_padding_garbage() {
             Tensor::new(
                 dense_shape.clone().into(),
                 vec![1; dense_shape.iter().product()],
-            ),
+            )
+            .unwrap(),
         ),
         KeyedTensor::new("dense_bias", Tensor::zeros(vec![dense_shape[0]].into())),
-    );
+    )
+    .unwrap();
     // create the padded version:
     // take the "conv2d"input shape
     let conv_input_shape = conv2d_shape(&input_shape, w1.shape());
@@ -209,17 +219,22 @@ fn test_conv_padding_garbage() {
         flat_fft_output.shape()[0].next_power_of_two(),
     ];
     let mut padded_dense = dense.clone();
-    padded_dense.matrix = padded_dense.matrix.map_tensor(|t| {
-        t.pad_matrix_to_ignore_garbage(
-            &conv_input_shape,
-            &conv_input_shape_padded,
-            &dense_shape_padded.into(),
-        )
-    });
-    let padded_nrows = padded_dense.nrows();
+    padded_dense.matrix = padded_dense
+        .matrix
+        .try_map_tensor(|t| {
+            t.pad_matrix_to_ignore_garbage(
+                &conv_input_shape,
+                &conv_input_shape_padded,
+                &dense_shape_padded.into(),
+            )
+        })
+        .unwrap();
+    let padded_nrows = padded_dense.nrows().unwrap();
     padded_dense.bias = padded_dense
         .bias
-        .map(|b| b.map_tensor(|t| t.pad_1d(padded_nrows)));
+        .map(|b| b.try_map_tensor(|t| t.pad_1d(padded_nrows)))
+        .transpose()
+        .unwrap();
     let no_garbage_fft_output =
         evaluate_layer::<GoldilocksExt2, _, _>(&padded_dense, &[&flat_fft_output.as_wrapped()])
             .unwrap()
@@ -230,7 +245,7 @@ fn test_conv_padding_garbage() {
             .unwrap()
             .outputs()[0]
             .clone();
-    let max_rows = dense.nrows();
+    let max_rows = dense.nrows().unwrap();
     assert_eq!(
         &no_garbage_fft_output.get_data()[..max_rows],
         no_garbage_normal_output.get_data()
@@ -257,12 +272,12 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     let bias = KeyedTensor::new("conv_bias", Tensor::random(&vec![k_w].into()));
     let input = Tensor::random(&input_shape_og);
 
-    let output = input.conv2d(&filter, &bias, 1);
+    let output = input.conv2d(&filter, &bias, 1)?;
     let dims = filter.shape();
-    let fft_conv = Convolution::new(filter.clone(), bias).prepared_for_fft(&input_shape_og);
+    let fft_conv = Convolution::new(filter.clone(), bias)?.prepared_for_fft(&input_shape_og)?;
     let mut fft_input = input.clone();
-    fft_input.pad_to_shape(input_shape_padded.clone());
-    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input);
+    fft_input.pad_to_shape(input_shape_padded.clone()).unwrap();
+    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input)?;
 
     input_shape_og = conv2d_shape(&input_shape_og, filter.shape());
     input_shape_padded = conv2d_shape(&input_shape_padded, dims).next_power_of_two();
@@ -270,19 +285,17 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     // add a RELU layer
     let relu = Activation::new_relu();
 
-    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()])
-        .unwrap()
-        .outputs()[0]
-        .clone();
-    let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()])
-        .unwrap()
+    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()])?.outputs()
+        [0]
+    .clone();
+    let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()])?
         .outputs()[0]
         .clone();
 
     // make a pooled output
     let pool = Pooling::Maxpool2D(Maxpool2D::default());
-    let output = pool.op(&output.to_native());
-    let fft_output = pool.op(&fft_output.to_native());
+    let output = pool.op(&output.to_native())?;
+    let fft_output = pool.op(&fft_output.to_native())?;
     input_shape_og = maxpool2d_shape(&input_shape_og);
     input_shape_padded = maxpool2d_shape(&input_shape_padded);
 
@@ -295,12 +308,14 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     println!("2AND CONV: filter.shape() : {:?}", filter.shape());
     println!("2AND CONV: bias.shape() : {:?}", bias.shape());
     println!("2AND CONV: input.shape() : {:?}", output.shape());
-    let output = output.conv2d(&filter, &bias, 1);
+    let output = output.conv2d(&filter, &bias, 1)?;
     let dims = filter.shape();
-    let fft_conv = Convolution::new(filter.clone(), bias).prepared_for_fft(&input_shape_padded);
+    let fft_conv = Convolution::new(filter.clone(), bias)?
+        .prepared_for_fft(&input_shape_padded)
+        .unwrap();
     let mut fft_input = fft_output;
-    fft_input.pad_to_shape(input_shape_padded.clone());
-    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input);
+    fft_input.pad_to_shape(input_shape_padded.clone()).unwrap();
+    let (fft_output, _proving_data) = fft_conv.fft::<GoldilocksExt2>(&fft_input)?;
 
     input_shape_og = conv2d_shape(&input_shape_og, filter.shape());
     input_shape_padded = conv2d_shape(&input_shape_padded, dims).next_power_of_two();
@@ -308,19 +323,17 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     // Add another RELU
     let relu = Activation::new_relu();
 
-    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()])
-        .unwrap()
-        .outputs()[0]
-        .clone();
-    let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()])
-        .unwrap()
+    let output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&output.as_wrapped()])?.outputs()
+        [0]
+    .clone();
+    let fft_output = evaluate_layer::<GoldilocksExt2, _, _>(&relu, &[&fft_output.as_wrapped()])?
         .outputs()[0]
         .clone();
 
     // make a pooled output
     let pool = Pooling::Maxpool2D(Maxpool2D::default());
-    let output = pool.op(&output.to_native());
-    let fft_output = pool.op(&fft_output.to_native());
+    let output = pool.op(&output.to_native())?;
+    let fft_output = pool.op(&fft_output.to_native())?;
     input_shape_og = maxpool2d_shape(&input_shape_og);
     input_shape_padded = maxpool2d_shape(&input_shape_padded);
 
@@ -344,9 +357,8 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
     let dense = Dense::new(
         KeyedTensor::new("dense_weight", weight.clone()),
         KeyedTensor::new("dense_bias", bias.clone()),
-    );
-    let dense_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&output.as_wrapped()])
-        .unwrap()
+    )?;
+    let dense_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&output.as_wrapped()])?
         .outputs()[0]
         .clone();
 
@@ -354,12 +366,12 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
         &conv_shape_og,
         &conv_shape_pad,
         &vec![new_rows, new_cols].into(),
-    );
-    let fft_bias = bias.clone().pad_1d(new_rows);
+    )?;
+    let fft_bias = bias.clone().pad_1d(new_rows)?;
     let fft_dense = Dense::new(
         KeyedTensor::new("fft_dense_weight", fft_weight.clone()),
         KeyedTensor::new("fft_dense_bias", fft_bias.clone()),
-    );
+    )?;
     println!("-- new_rows : {new_rows}, new_cols : {new_cols}");
     println!("weight.shape() : {:?}", weight.shape());
     println!("bias.shape() : {:?}", bias.shape());
@@ -372,13 +384,12 @@ pub fn test_conv_fft_vs_naive() -> anyhow::Result<()> {
         output.shape().iter().product::<usize>()
     );
     let fft_dense_output =
-        evaluate_layer::<GoldilocksExt2, _, _>(&fft_dense, &[&fft_output.as_wrapped()])
-            .unwrap()
-            .outputs()[0]
-            .clone();
+        evaluate_layer::<GoldilocksExt2, _, _>(&fft_dense, &[&fft_output.as_wrapped()])?.outputs()
+            [0]
+        .clone();
     assert_eq!(
-        dense_output.get_data()[..weight.nrows_2d()],
-        fft_dense_output.get_data()[..weight.nrows_2d()]
+        dense_output.get_data()[..weight.nrows_2d()?],
+        fft_dense_output.get_data()[..weight.nrows_2d()?]
     );
     Ok(())
 }
@@ -393,22 +404,27 @@ fn convolution_test_simple_element() {
         Tensor::<Element>::new(
             Shape::new(vec![1, channels, filter_size, filter_size]),
             vec![2, 3, 5, 7],
-        ),
+        )
+        .unwrap(),
     );
     let input = Tensor::<Element>::new(
         Shape::new(vec![channels, size, size]),
         vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4],
-    );
+    )
+    .unwrap();
     let bias = KeyedTensor::new(
         "conv_bias",
-        Tensor::<Element>::new(Shape::new(vec![1]), vec![1]),
+        Tensor::<Element>::new(Shape::new(vec![1]), vec![1]).unwrap(),
     );
 
-    let expected = input.conv2d(&kernels, &bias, 1);
+    let expected = input.conv2d(&kernels, &bias, 1).unwrap();
     // Remove the leading dimension, the fft only supports 3d tensors.
-    let mut conv2d_result = expected.squeeze(0);
+    let mut conv2d_result = expected.squeeze(0).unwrap();
 
-    let conv = Convolution::new(kernels, bias).prepared_for_fft(input.shape());
+    let conv = Convolution::new(kernels, bias)
+        .unwrap()
+        .prepared_for_fft(input.shape())
+        .unwrap();
     let result = conv
         .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
         .unwrap();
@@ -417,7 +433,9 @@ fn convolution_test_simple_element() {
     check_tensor_consistency(&conv2d_result, &fft_result.to_native());
 
     // Pad the conv2d result to match the fft padded shape with the extra values set to 0.
-    conv2d_result.pad_to_shape(fft_result.to_native().shape().clone());
+    conv2d_result
+        .pad_to_shape(fft_result.to_native().shape().clone())
+        .unwrap();
 
     assert_eq!(conv2d_result.get_data(), fft_result.get_data());
 }
@@ -434,11 +452,14 @@ fn convolution_test_random_element() {
     let input = Tensor::<Element>::random(&Shape::new(vec![channels, size, size]));
     let bias = KeyedTensor::new("conv_bias", Tensor::<Element>::random(&Shape::new(vec![1])));
 
-    let expected = input.conv2d(&kernels, &bias, 1);
+    let expected = input.conv2d(&kernels, &bias, 1).unwrap();
     // Remove the leading dimension, the fft only supports 3d tensors.
-    let mut conv2d_result = expected.squeeze(0);
+    let mut conv2d_result = expected.squeeze(0).unwrap();
 
-    let conv = Convolution::new(kernels, bias).prepared_for_fft(input.shape());
+    let conv = Convolution::new(kernels, bias)
+        .unwrap()
+        .prepared_for_fft(input.shape())
+        .unwrap();
     let result = conv
         .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
         .unwrap();
@@ -447,7 +468,9 @@ fn convolution_test_random_element() {
     check_tensor_consistency(&conv2d_result, &fft_result.to_native());
 
     // Pad the conv2d result to match the fft padded shape with the extra values set to 0.
-    conv2d_result.pad_to_shape(fft_result.to_native().shape().clone());
+    conv2d_result
+        .pad_to_shape(fft_result.to_native().shape().clone())
+        .unwrap();
 
     assert_eq!(conv2d_result.get_data(), fft_result.get_data());
 }
@@ -525,9 +548,9 @@ proptest! {
     #[test]
     fn convolution_test_single_batch_f32(input in input_conv2d::<f32>(1..2, 1..3, 2..8, 2..8)) {
         let stride = 1;
-        let expected = input.input.conv2d(&input.kernels, &input.bias, stride);
+        let expected = input.input.conv2d(&input.kernels, &input.bias, stride).unwrap();
 
-        let conv = Convolution::new(input.kernels.clone(), input.bias.clone());
+        let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap();
         let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         #[cfg(not(feature = "gpu"))]
@@ -547,9 +570,9 @@ proptest! {
     #[test]
     fn convolution_test_multiple_batches_f32(input in input_conv2d::<f32>(1..4, 1..3, 2..8, 2..8)) {
         let stride = 1;
-        let expected = input.input.conv2d(&input.kernels, &input.bias, stride);
+        let expected = input.input.conv2d(&input.kernels, &input.bias, stride).unwrap();
 
-        let conv = Convolution::new(input.kernels.clone(), input.bias.clone());
+        let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap();
         let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         #[cfg(not(feature = "gpu"))]
@@ -569,27 +592,27 @@ proptest! {
 proptest! {
     #[test]
     fn convolution_test_single_batch_element(input in input_fft::<Element>(1..3, 2..7)) {
-        let conv2d_result = input.input.conv2d(&input.kernels, &input.bias, 1);
+        let conv2d_result = input.input.conv2d(&input.kernels, &input.bias, 1).unwrap();
 
-        let conv = Convolution::new(input.kernels.clone(), input.bias.clone())
-        .prepared_for_fft(input.input.shape());
+        let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap()
+        .prepared_for_fft(input.input.shape()).unwrap();
         let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         // Remove the leading dimension, the fft only supports 3d tensors.
-        let conv2d_result = conv2d_result.squeeze(0);
+        let conv2d_result = conv2d_result.squeeze(0).unwrap();
         check_tensor_consistency(&conv2d_result, &fft_result.outputs()[0].to_native());
     }
 
     #[test]
     fn convolution_test_multiple_batches_element(input in input_fft::<Element>(1..3, 2..7)) {
-        let conv2d_result = input.input.conv2d(&input.kernels, &input.bias, 1);
+        let conv2d_result = input.input.conv2d(&input.kernels, &input.bias, 1).unwrap();
 
-        let conv = Convolution::new(input.kernels.clone(), input.bias.clone())
-        .prepared_for_fft(input.input.shape());
+        let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap()
+        .prepared_for_fft(input.input.shape()).unwrap();
         let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
 
         // Remove the leading dimension, the fft only supports 3d tensors.
-        let conv2d_result = conv2d_result.squeeze(0);
+        let conv2d_result = conv2d_result.squeeze(0).unwrap();
         check_tensor_consistency(&conv2d_result, &fft_result.outputs()[0].to_native());
     }
 
@@ -598,9 +621,9 @@ proptest! {
         let og_shape = Shape::new(vec![channels, width, height]);
         let padded = Tensor::random(&og_shape.next_power_of_two());
 
-        let clearing_tensor = new_clearing_tensor(&og_shape, padded.shape());
+        let clearing_tensor = new_clearing_tensor(&og_shape, padded.shape()).unwrap();
         let cleared_tensor1 = padded.to_flatten().mul(&clearing_tensor);
-        let cleared_tensor2 = clear_garbage(&padded, &og_shape);
+        let cleared_tensor2 = clear_garbage(&padded, &og_shape).unwrap();
         assert_eq!(cleared_tensor1.get_data(), cleared_tensor2.get_data());
     }
 }

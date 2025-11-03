@@ -114,7 +114,7 @@ where
                 .for_each(|(node, output)| {
                     scheduler.mark_done(node.node_id, &output).unwrap();
                 });
-            ready_nodes = scheduler.next_ready_nodes();
+            ready_nodes = scheduler.next_ready_nodes()?;
         }
         Ok(outputs)
     }
@@ -189,7 +189,7 @@ where
         // NOTE: all the channels are used in only one direction and are sequential (a -> b -> c) so there is no risk of deadlock
         let (outputs_sender, outputs_receiver) = unbounded();
         let mut ready_nodes = scheduler.init_nodes(input_data)?;
-        scope(move |s| {
+        scope(move |s| -> anyhow::Result<()> {
             while !scheduler.is_done() {
                 // execute all ready tasks
                 for mut node in ready_nodes.drain(..) {
@@ -216,17 +216,18 @@ where
                             outputs_sender.clone().send(Ok(output.clone())).unwrap();
                         }
                         scheduler.mark_done(node_idx, &output).unwrap();
-                        ready_nodes = scheduler.next_ready_nodes();
+                        ready_nodes = scheduler.next_ready_nodes()?;
                     }
                     Err(e) => {
                         // transmit the error back to the main thread
                         let err = anyhow::anyhow!("Error running node {node_idx:?}: {e}");
                         outputs_sender.send(Err(err)).unwrap();
-                        return;
+                        return Ok(());
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
         for output in outputs_receiver.iter() {
             outputs.push(output?);
         }

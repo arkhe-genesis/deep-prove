@@ -95,17 +95,21 @@ where
 const IS_PROVABLE: bool = true;
 
 impl OpInfo for Pooling {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         match self {
-            Pooling::Maxpool2D(maxpool2_d) => input_shapes
+            Pooling::Maxpool2D(maxpool2_d) => Ok(input_shapes
                 .iter()
                 .map(|shape| maxpool2_d.output_shape(shape))
-                .collect(),
+                .collect()),
         }
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -210,7 +214,7 @@ impl ProveInfo for Pooling {
                 aux.tables.insert(TableType::Range);
 
                 aux.last_output_shape =
-                    self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
+                    self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
 
                 // Set the model polys to be empty
                 aux.model_polys = None;
@@ -297,7 +301,7 @@ where
 
         let mut column_evals = match self {
             Pooling::Maxpool2D(maxpool2d) => {
-                let field_vecs = maxpool2d.compute_polys::<E>(&input_tensors[0]);
+                let field_vecs = maxpool2d.compute_polys::<E>(&input_tensors[0]).unwrap();
 
                 for value in field_vecs.iter().flat_map(|v| v.iter()) {
                     let el = E::from(*value).to_element();
@@ -328,15 +332,19 @@ where
 }
 
 impl OpInfo for PoolingCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes
             .iter()
             .map(|shape| self.poolinfo.output_shape(shape))
-            .collect()
+            .collect())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        Pooling::num_outputs(num_inputs)
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(Pooling::num_outputs(num_inputs))
     }
 
     fn describe(&self) -> String {
@@ -388,7 +396,7 @@ impl Pooling {
         num_inputs
     }
 
-    pub fn op<T: Number>(&self, input: &Tensor<T>) -> Tensor<T> {
+    pub fn op<T: Number>(&self, input: &Tensor<T>) -> Result<Tensor<T>> {
         match self {
             Pooling::Maxpool2D(maxpool2d) => {
                 input.maxpool2d(maxpool2d.kernel_size, maxpool2d.stride)
@@ -430,8 +438,12 @@ impl Pooling {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
-        assert_eq!(input.rank(), 3, "Maxpool needs 3D inputs.");
-        let output_shapes = self.output_shapes(&[input.shape().clone()], PaddingMode::Padding);
+        ensure!(
+            input.rank() == 3,
+            "Maxpool needs 3D inputs, got {}",
+            input.rank()
+        );
+        let output_shapes = self.output_shapes(&[input.shape().clone()], PaddingMode::Padding)?;
         let num_vars = Self::num_vars_for_outputs(output_shapes.as_slice())?;
         // Should only be one prover_info for this step
         let layer_commitment = prover.lookup_witness(id)?;
@@ -598,7 +610,7 @@ impl PoolingCtx {
         let poly_evals = batch_claim.poly_evals();
         // 2. Verify the sumcheck proof
         let output_shapes =
-            self.output_shapes(&shape_step.padded_input_shape, PaddingMode::Padding);
+            self.output_shapes(&shape_step.padded_input_shape, PaddingMode::Padding)?;
         let num_vars = Pooling::num_vars_for_outputs(&output_shapes)?;
         let poly_aux = crate::util::from_mle_list_dimensions(&[vec![num_vars; 5]]);
         let batching_challenge = verifier
@@ -725,11 +737,11 @@ impl Maxpool2D {
     pub fn compute_polys<E: ExtensionField>(
         &self,
         input: &Tensor<Element>,
-    ) -> Vec<Vec<E::BaseField>> {
+    ) -> Result<Vec<Vec<E::BaseField>>> {
         let padded_input = input.pad_next_power_of_two();
 
         let padded_output = input
-            .maxpool2d(self.kernel_size, self.stride)
+            .maxpool2d(self.kernel_size, self.stride)?
             .pad_next_power_of_two();
         let padded_input_shape = padded_input.shape();
 
@@ -806,7 +818,7 @@ impl Maxpool2D {
             })
             .unzip();
 
-        [even_diff, odd_diff].concat()
+        Ok([even_diff, odd_diff].concat())
     }
 }
 
@@ -864,14 +876,14 @@ mod tests {
             let data = (0..input_data_size)
                 .map(|_| rng.gen_range(-128..128))
                 .collect::<Vec<Element>>();
-            let input = Tensor::<Element>::new(random_shape, data);
+            let input = Tensor::<Element>::new(random_shape, data).unwrap();
 
             let info = Maxpool2D {
                 kernel_size: MAXPOOL2D_KERNEL_SIZE,
                 stride: MAXPOOL2D_KERNEL_SIZE,
             };
 
-            let output = input.maxpool2d(info.kernel_size, info.stride);
+            let output = input.maxpool2d(info.kernel_size, info.stride).unwrap();
 
             let padded_input = input.pad_next_power_of_two();
 
@@ -1096,10 +1108,11 @@ mod tests {
 
     #[test]
     fn test_maxpool_f32_simple() {
-        let input = Tensor::new(Shape::new(vec![2, 2]), vec![1.0, 2.0, 3.0, 4.0]);
+        let input = Tensor::new(Shape::new(vec![2, 2]), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let expected = input
             .clone()
-            .maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
+            .maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE)
+            .unwrap();
         let winput = input.as_wrapped();
         let result = Pooling::Maxpool2D(Maxpool2D::default())
             .evaluate::<GoldilocksExt2>(&[&winput])
@@ -1115,7 +1128,7 @@ mod tests {
     proptest! {
         #[test]
         fn proptest_maxpool_f32(input in proptest_input::<f32>()) {
-            let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
+            let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE).unwrap();
 
             let winput = input.as_wrapped();
             let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput]).unwrap();
@@ -1125,7 +1138,7 @@ mod tests {
 
         #[test]
         fn proptest_maxpool_element(input in proptest_input::<Element>()) {
-            let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE);
+            let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE).unwrap();
 
             let winput = input.as_wrapped();
             let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput]).unwrap();

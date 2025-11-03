@@ -202,19 +202,19 @@ where
             input_shapes.len(),
             inputs.len()
         );
-        Ok(inputs
+        inputs
             .into_iter()
             .zip(input_shapes)
             .map(|(mut input, shape)| {
                 if input.shape() == &shape {
                     // no need to pad, simply return the input
-                    input
+                    Ok(input)
                 } else {
-                    input.pad_to_shape(shape);
-                    input
+                    input.pad_to_shape(shape)?;
+                    Ok(input)
                 }
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     /// Textual description of the model
@@ -251,12 +251,12 @@ where
     /// Build the inputs tensors, according to the expected input shapes,
     /// from a set of flat data
     pub fn load_input_flat(&self, input: Vec<Vec<N>>) -> Result<Vec<Tensor<N>>> {
-        let input_tensor = input
+        let input_tensor: Result<Vec<_>> = input
             .into_iter()
             .zip(self.unpadded_input_shapes())
             .map(|(inp, shape)| Tensor::new(shape, inp))
             .collect();
-        self.prepare_inputs(input_tensor)
+        self.prepare_inputs(input_tensor?)
     }
 
     /// Add re-quantization nodes to the model after the node with id `input_node_id`
@@ -360,7 +360,7 @@ where
                         acc
                     })
                     .len();
-                layer.num_outputs(input_ports)
+                layer.num_outputs(input_ports)?
             }
             Node::Input(_) => 1,
             Node::Output(_) => 0,
@@ -657,11 +657,11 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
             })
             .unzip();
 
-        let expected_num_outputs = layer.num_outputs(prec_tensors.len());
+        let expected_num_outputs = layer.num_outputs(prec_tensors.len())?;
 
         // run the layer
         let layer_out = layer.evaluate(prec_tensors.iter().collect::<Vec<_>>().as_slice())?;
-        assert!(expected_num_outputs == layer_out.outputs.len());
+        ensure!(expected_num_outputs == layer_out.outputs.len());
 
         // the keys under which to save the output tensor of this layer. We save
         // one tensor per source port so we index the output edges by the source
@@ -735,7 +735,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         }));
 
         for (i, shape) in layer
-            .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)
+            .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?
             .into_iter()
             .enumerate()
         {
@@ -754,7 +754,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 layer_out.proving_data,
             ),
             unpadded_output_shapes: layer
-                .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding),
+                .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?,
             unpadded_input_shapes: prec_unpadded_shapes,
         })
     }
@@ -830,10 +830,10 @@ pub(crate) mod test {
                     let dense = Dense::random(
                         vec![nrows.next_power_of_two(), ncols.next_power_of_two()].into(),
                         Some(format!("dense_{selector}").into()),
-                    );
+                    )?;
                     // Figure out the requant information such that output is still within range
                     let (min_output_range, max_output_range) =
-                        dense.output_range(*quantization::MIN, *quantization::MAX);
+                        dense.output_range(*quantization::MIN, *quantization::MAX)?;
                     let output_scaling_factor = ScalingFactor::from_scale(
                         ((max_output_range - min_output_range) as f64
                             / (*quantization::MAX - *quantization::MIN) as f64)
@@ -850,7 +850,7 @@ pub(crate) mod test {
                     ) as f32;
                     let model_scaling_factor = ScalingFactor::from_absolute_max(max_model, None);
 
-                    let intermediate_bit_size = dense.output_bitsize();
+                    let intermediate_bit_size = dense.output_bitsize()?;
                     let requant = Requant::from_scaling_factors(
                         input_scaling_factor,
                         model_scaling_factor,
@@ -937,7 +937,7 @@ pub(crate) mod test {
                 Layer::Dense(Dense::random(
                     vec![nrows.next_power_of_two(), ncols.next_power_of_two()].into(),
                     None,
-                )),
+                )?),
                 last_node_id,
             )?;
 
@@ -969,7 +969,10 @@ pub(crate) mod test {
         let conv_layer = model
             .add_consecutive_layer(
                 Layer::Convolution(
-                    Convolution::new(filter.clone(), bias1.clone()).prepared_for_fft(&input_shape),
+                    Convolution::new(filter.clone(), bias1.clone())
+                        .unwrap()
+                        .prepared_for_fft(&input_shape)
+                        .unwrap(),
                 ),
                 None,
             )
@@ -998,16 +1001,18 @@ pub(crate) mod test {
         let dense1 = Dense::<Element>::random(
             vec![10usize.next_power_of_two(), 11usize.next_power_of_two()].into(),
             Some("dense_1".to_string().into()),
-        );
+        )
+        .unwrap();
         let dense2 = Dense::<Element>::random(
             vec![
                 7usize.next_power_of_two(),
-                dense1.ncols().next_power_of_two(),
+                dense1.ncols().unwrap().next_power_of_two(),
             ]
             .into(),
             Some("dense_2".to_string().into()),
-        );
-        let input_shape = vec![dense1.ncols()].into();
+        )
+        .unwrap();
+        let input_shape = vec![dense1.ncols().unwrap()].into();
         let input = Tensor::<Element>::random(&input_shape).into_wrapped();
         let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &[&input])
             .unwrap()
@@ -1052,7 +1057,7 @@ pub(crate) mod test {
                 .unwrap(),
             final_output.clone().into_native()
         );
-        let (nrow, _) = (dense2.nrows(), dense2.ncols());
+        let (nrow, _) = (dense2.nrows().unwrap(), dense2.ncols());
         assert_eq!(final_output.get_data().len(), nrow);
     }
 
@@ -1076,10 +1081,10 @@ pub(crate) mod test {
             .collect_vec();
         let matrices_mle = dense_layers
             .iter()
-            .map(|(id, d)| (*id, d.matrix.to_2d_mle::<F>()))
+            .map(|(id, d)| (*id, d.matrix.to_2d_mle::<F>().unwrap()))
             .collect_vec();
         assert_eq!(dense_layers.len(), 1);
-        let point1 = random_bool_vector(dense_layers[0].1.nrows().ilog2() as usize);
+        let point1 = random_bool_vector(dense_layers[0].1.nrows().unwrap().ilog2() as usize);
         let computed_eval1 = trace
             .get_step(dense_layers[0].0)
             .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
@@ -1133,16 +1138,19 @@ pub(crate) mod test {
         let w1 = random_vector_quant(1024 * 1024);
         let conv1 = KeyedTensor::new(
             "matvec_weight",
-            Tensor::new(vec![1024, 1024].into(), w1.clone()),
+            Tensor::new(vec![1024, 1024].into(), w1.clone()).unwrap(),
         );
         let w2 = random_vector_quant(1024);
-        let conv2 = KeyedTensor::new("matvec_bias", Tensor::new(vec![1024].into(), w2.clone()));
+        let conv2 = KeyedTensor::new(
+            "matvec_bias",
+            Tensor::new(vec![1024].into(), w2.clone()).unwrap(),
+        );
         let input_shape = vec![1024].into();
 
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::Padding);
         let input = Tensor::random(&model.input_shapes()[0]);
         model
-            .add_consecutive_layer(Layer::Dense(Dense::new(conv1, conv2)), None)
+            .add_consecutive_layer(Layer::Dense(Dense::new(conv1, conv2).unwrap()), None)
             .unwrap();
         model.automatic_output_labelling().unwrap();
         model.describe();
@@ -1163,8 +1171,8 @@ pub(crate) mod test {
         // layer matrix shape
         let m_shape: Shape = vec![100, 200].into();
         let m = random_vector_quant(m_shape[0] * m_shape[1]);
-        let tensor_m = KeyedTensor::new("matmul_weight", Tensor::new(m_shape, m));
-        let input_shape: Shape = vec![5, tensor_m.nrows_2d()].into();
+        let tensor_m = KeyedTensor::new("matmul_weight", Tensor::new(m_shape, m).unwrap());
+        let input_shape: Shape = vec![5, tensor_m.nrows_2d().unwrap()].into();
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::Padding);
         let matmul_layer = MatMul::new(
@@ -1181,7 +1189,7 @@ pub(crate) mod test {
 
         let input = random_vector_quant(input_shape[0] * input_shape[1]);
         let input_tensor = model
-            .prepare_inputs(vec![Tensor::new(input_shape, input)])
+            .prepare_inputs(vec![Tensor::new(input_shape, input).unwrap()])
             .unwrap();
 
         let mut store = GenStore::default();
@@ -1217,7 +1225,9 @@ pub(crate) mod test {
         let input = Tensor::random(&model.input_shapes()[0]);
         let bias = KeyedTensor::new("conv_bias", Tensor::random(&vec![conv1.dim(0)].into()));
         let conv_layer = Convolution::new(conv1.clone(), bias.clone())
-            .prepared_for_fft(&in_dimensions[0].clone().into());
+            .unwrap()
+            .prepared_for_fft(&in_dimensions[0].clone().into())
+            .unwrap();
         let conv_layer_id = model
             .add_consecutive_layer(Layer::Convolution(conv_layer.clone()), None)
             .unwrap();
@@ -1273,9 +1283,11 @@ pub(crate) mod test {
         let dense = Dense::random(
             vec![nrows, ncols].into(),
             Some("dense_1".to_string().into()),
-        );
-        let dense_out_shape =
-            &dense.output_shapes(&model.unpadded_input_shapes(), PaddingMode::NoPadding)[0];
+        )
+        .unwrap();
+        let dense_out_shape = &dense
+            .output_shapes(&model.unpadded_input_shapes(), PaddingMode::NoPadding)
+            .unwrap()[0];
         let input_node = model
             .add_consecutive_layer(
                 Layer::Dense(dense),
@@ -1293,7 +1305,8 @@ pub(crate) mod test {
         let dense = Dense::random(
             vec![nrows, ncols].into(),
             Some("dense_2".to_string().into()),
-        );
+        )
+        .unwrap();
         let _ = model
             .add_consecutive_layer(Layer::Dense(dense), Some(relu_node))
             .unwrap();
@@ -1311,7 +1324,7 @@ pub(crate) mod test {
         let input_shape = model.input_shapes()[0].clone();
 
         let input = random_vector(input_shape.iter().product());
-        let input_tensor = Tensor::new(input_shape, input);
+        let input_tensor = Tensor::new(input_shape, input).unwrap();
         let trace = model
             .run::<E>(&[input_tensor], &mut Default::default())
             .unwrap();
@@ -1498,11 +1511,14 @@ pub(crate) mod test {
         let dense = Dense::random(
             vec![nrows, ncols].into(),
             Some("dense_1".to_string().into()),
-        );
-        let first_dense_out_shape = &dense.output_shapes(
-            &[model.unpadded_input_shapes()[0].clone()],
-            PaddingMode::NoPadding,
-        )[0];
+        )
+        .unwrap();
+        let first_dense_out_shape = &dense
+            .output_shapes(
+                &[model.unpadded_input_shapes()[0].clone()],
+                PaddingMode::NoPadding,
+            )
+            .unwrap()[0];
         let first_input_dense = model.graph.add_inner(Layer::Dense(dense)).unwrap();
         // set that it will consume the first input
         model
@@ -1515,11 +1531,14 @@ pub(crate) mod test {
         let dense = Dense::random(
             vec![nrows, ncols].into(),
             Some("dense_2".to_string().into()),
-        );
-        let second_dense_out_shape = &dense.output_shapes(
-            &[model.unpadded_input_shapes()[1].clone()],
-            PaddingMode::NoPadding,
-        )[0];
+        )
+        .unwrap();
+        let second_dense_out_shape = &dense
+            .output_shapes(
+                &[model.unpadded_input_shapes()[1].clone()],
+                PaddingMode::NoPadding,
+            )
+            .unwrap()[0];
         let second_input_dense = model.graph.add_inner(Layer::Dense(dense)).unwrap();
         model
             .connect_model_input(1, second_input_dense.input_at(0))
@@ -1539,7 +1558,8 @@ pub(crate) mod test {
         let dense = Dense::random(
             vec![nrows, ncols].into(),
             Some("dense_out_1".to_string().into()),
-        );
+        )
+        .unwrap();
         let dense1 = model
             .add_consecutive_layer(Layer::Dense(dense), Some(second_relu_node))
             .unwrap();
@@ -1548,7 +1568,8 @@ pub(crate) mod test {
         let dense = Dense::random(
             vec![nrows, ncols].into(),
             Some("dense_out_2".to_string().into()),
-        );
+        )
+        .unwrap();
         let dense2 = model
             .add_consecutive_layer(Layer::Dense(dense), Some(first_relu_node))
             .unwrap();

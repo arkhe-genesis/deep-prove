@@ -188,7 +188,7 @@ impl LLMModel {
             //  there might or not be a bias
             let proj_weights = loader
                 .get_tensor("output.weight")?
-                .map_tensor(|t| t.transpose());
+                .try_map_tensor(|t| t.transpose())?;
             let proj_bias = loader.get_tensor("output.bias").ok();
             Some(MatMul::new_constant(proj_weights, proj_bias)?)
         } else {
@@ -207,7 +207,9 @@ impl LLMModel {
             .map(|i| Attention::from_json(&l.pp(&format!("blk.{i}.")), config))
             .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
         let final_norm = Norm::LayerNorm(LayerNorm::from_json(&l.pp("output_"), config)?);
-        let proj_weights = l.get_tensor("output.weight")?.map_tensor(|t| t.transpose());
+        let proj_weights = l
+            .get_tensor("output.weight")?
+            .try_map_tensor(|t| t.transpose())?;
         let proj_bias = l.get_tensor("output.bias").ok();
         let final_proj = MatMul::new_constant(proj_weights, proj_bias)?;
         Ok(Self::new(

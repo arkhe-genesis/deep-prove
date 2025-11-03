@@ -44,13 +44,15 @@ impl<T: Number> MatVec<T> {
 
     /// Note that it flattens the input vector, and the output is "flat" as in it's a vector.
     /// When integrating this into a convolution layer for example, one needs to reshape the output to the expected shape.
-    pub fn op(&self, input: &Tensor<T>) -> Tensor<T> {
+    pub fn op(&self, input: &Tensor<T>) -> anyhow::Result<Tensor<T>> {
         self.matrix.matvec(&input.to_flatten())
     }
-    pub fn aux_info<E: ExtensionField>(&self) -> VPAuxInfo<E> {
+    pub fn aux_info<E: ExtensionField>(&self) -> anyhow::Result<VPAuxInfo<E>> {
         // we fix the rows variables during sumcheck so we only consider the columns
-        let num_vars = self.matrix.ncols_2d().ilog2() as usize;
-        crate::util::from_mle_list_dimensions(&[vec![num_vars, num_vars]])
+        let num_vars = self.matrix.ncols_2d()?.ilog2() as usize;
+        Ok(crate::util::from_mle_list_dimensions(&[vec![
+            num_vars, num_vars,
+        ]]))
     }
 }
 
@@ -66,27 +68,25 @@ impl MatVec<Element> {
         E::BaseField: Serialize + DeserializeOwned,
         T: Transcript<E>,
     {
-        let (nrows, ncols) = (self.matrix.nrows_2d(), self.matrix.ncols_2d());
-        assert_eq!(
-            nrows.ilog2() as usize,
-            last_claim.point.len(),
+        let (nrows, ncols) = (self.matrix.nrows_2d()?, self.matrix.ncols_2d()?);
+        ensure!(
+            nrows.ilog2() as usize == last_claim.point.len(),
             "invalid last_claim dimension: mat {}x{} vs {}",
             nrows,
             ncols,
             last_claim.point.len()
         );
-        assert_eq!(
-            ncols,
-            input.get_data().len(),
+        ensure!(
+            ncols == input.get_data().len(),
             "invalid input dimension: mat {}x{} vs {}",
             nrows,
             ncols,
             input.get_data().len()
         );
-        let mut mat_mle = self.matrix.to_2d_mle();
+        let mut mat_mle = self.matrix.to_2d_mle()?;
         mat_mle.fix_high_variables_in_place(&last_claim.point);
         let input_mle = input.get_data().to_vec().into_mle();
-        assert_eq!(mat_mle.num_vars(), input_mle.num_vars());
+        ensure!(mat_mle.num_vars() == input_mle.num_vars());
         let num_vars = input_mle.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
         let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
@@ -97,7 +97,7 @@ impl MatVec<Element> {
 
         debug_assert!(
             {
-                let output = self.matrix.tensor().to_fields().matvec(input);
+                let output = self.matrix.tensor().to_fields().matvec(input)?;
                 let claimed_sum = output
                     .get_data()
                     .to_vec()
@@ -119,8 +119,8 @@ impl MatVec<Element> {
         Ok((proof, claim))
     }
 
-    pub fn evaluate_matrix_at<E: ExtensionField>(&self, point: &[E]) -> E {
-        self.matrix.to_2d_mle().evaluate(point)
+    pub fn evaluate_matrix_at<E: ExtensionField>(&self, point: &[E]) -> anyhow::Result<E> {
+        Ok(self.matrix.to_2d_mle()?.evaluate(point))
     }
 }
 
@@ -174,7 +174,7 @@ mod test {
         );
         let input = Tensor::<Element>::random_seed(&vec![3].into(), None).pad_next_power_of_two();
         let matvec = MatVec::new(matrix);
-        let output = matvec.op(&input);
+        let output = matvec.op(&input).unwrap();
         let mut transcript = default_transcript::<F>();
         let output_point = random_field_vector(output.get_data().len().ilog2() as usize);
         let output_claim = Claim::new(
@@ -190,8 +190,8 @@ mod test {
             &mut default_transcript(),
             &output_claim,
             &proof,
-            &matvec.aux_info(),
-            |point| matvec.evaluate_matrix_at(point),
+            &matvec.aux_info().unwrap(),
+            |point| matvec.evaluate_matrix_at(point).unwrap(),
         )
         .expect("verification failed");
         assert_eq!(claim, input_claim);

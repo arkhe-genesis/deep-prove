@@ -81,7 +81,7 @@ fn dequantize(qtensor: &QTensor) -> anyhow::Result<Tensor<f32>> {
             dequantized_candle_tensor.device()
         ),
     };
-    Ok(Tensor::new(shape, data))
+    Tensor::new(shape, data)
 }
 
 /// Trait to allow for conversion of [Value].
@@ -434,6 +434,7 @@ pub mod tests {
     }
 
     use crate::parser::gguf::FileTensorLoader;
+    use anyhow::ensure;
     #[test]
     #[ignore = "just a test to explore gguf internal structure"]
     fn test_tensor_loader_subscoping_and_lazy_load() -> anyhow::Result<()> {
@@ -491,7 +492,7 @@ pub mod tests {
 
         // Test that loading a non-existent tensor fails
         let non_existent_tensor_result = blk0_loader.get_tensor("non_existent_tensor.weight");
-        assert!(
+        ensure!(
             non_existent_tensor_result.is_err(),
             "Expected error for non-existent tensor"
         );

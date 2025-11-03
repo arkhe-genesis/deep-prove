@@ -92,11 +92,11 @@ impl<N: TensorTypeParam> Rope<N> {
         }
         let cosine_matrix = KeyedTensor::new(
             format!("{}_cosine", base_id),
-            Tensor::new(matrix_shape.clone(), cosine_data),
+            Tensor::new(matrix_shape.clone(), cosine_data)?,
         );
         let sine_matrix = KeyedTensor::new(
             format!("{}_sine", base_id),
-            Tensor::new(matrix_shape.clone(), sine_data),
+            Tensor::new(matrix_shape.clone(), sine_data)?,
         );
         Ok(Self {
             cosine_matrix,
@@ -437,7 +437,7 @@ impl Rope<f32> {
             unpadded_shape: self.unpadded_shape,
         };
 
-        Ok(QuantizeOutput::new(quantized_rope, output_scalings).with_requant(requant))
+        Ok(QuantizeOutput::new(quantized_rope, output_scalings).with_requant(requant)?)
     }
 }
 
@@ -808,7 +808,7 @@ mod tests {
                     expected.push(x2 * cosv + x1 * sinv);
                 }
             }
-            let expected_t = Tensor::new(vec![seq_len, embedding_size].into(), expected);
+            let expected_t = Tensor::new(vec![seq_len, embedding_size].into(), expected).unwrap();
             let out = is_close_with_tolerance(&out.get_data(), expected_t.data(), 1e-5, 1e-4);
             prop_assert!(out);
         }

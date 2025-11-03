@@ -167,7 +167,7 @@ impl Driver<f32> {
             .map(|t| t.as_number::<f32>())
             .collect::<Vec<_>>();
 
-        let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone());
+        let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
         let mut store = GenStore::default();
 
         let trace = self.model.run::<E>(&[tensor], &mut store)?;
@@ -232,7 +232,7 @@ where
             .map(|t| t.as_tensor_type_param::<N>())
             .collect::<Vec<_>>();
 
-        let mut tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone());
+        let mut tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
         let max_window = self.max_context.unwrap_or(self.config.context_length);
 
         ensure!(
@@ -280,7 +280,7 @@ where
             } else {
                 output.get_data()[unpadded_seq_len - 1]
             };
-            tensor = Tensor::new(Shape::new(vec![1]), vec![last_token]);
+            tensor = Tensor::new(Shape::new(vec![1]), vec![last_token])?;
             full_tokens.push(last_token);
             if last_token == eos_token {
                 break;
@@ -296,11 +296,11 @@ where
         // and we take only the part that corresponds to the _generated_ tokens
         full_tokens.splice(..user_len, input_tokens);
         let input_len = full_tokens.len();
-        tensor = Tensor::new(Shape::new(vec![input_len]), full_tokens.clone());
+        tensor = Tensor::new(Shape::new(vec![input_len]), full_tokens.clone())?;
         // 2. padding: we pad the input to the expected shape of the model
         let target_padded_shape = vec![max_window.next_power_of_two()].into();
         if let PaddingMode::Padding = self.padding_mode {
-            tensor.pad_to_shape(target_padded_shape)
+            tensor.pad_to_shape(target_padded_shape)?
         };
         // 3. model resetting: we need to _reset_ the cache of every QKV layer in the model - that's because we only
         // expect 1 token to be generated at a time after the first inference.

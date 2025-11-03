@@ -124,12 +124,16 @@ where
 const IS_PROVABLE: bool = true;
 
 impl OpInfo for Requant {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec() // preserve the input shape
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec()) // preserve the input shape
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -607,11 +611,15 @@ where
 }
 
 impl<E: ExtensionField> OpInfo for RequantCtx<E> {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         Requant::num_outputs(&self.requant, num_inputs)
     }
 
@@ -748,7 +756,7 @@ impl Requant {
             .map(|(i,e)| {if e.abs() <= max_abs_val {Ok(self.apply(e))} else {Err(anyhow!("Could not apply requantisation, tensor element {i} had absolute value too large, given value: {e}, max value: {max_abs_val}"))}})
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-        Ok(Tensor::<Element>::new(input.shape().clone(), res))
+        Tensor::<Element>::new(input.shape().clone(), res)
     }
 
     /// Function that tells us how many bits are not shifted away
@@ -1131,7 +1139,10 @@ mod tests {
         prove_model(model, &mut GenStore::default()).unwrap();
     }
 
-    fn requant_reference(layer: &Requant, inputs: &[&Tensor<Element>]) -> Vec<Tensor<Element>> {
+    fn requant_reference(
+        layer: &Requant,
+        inputs: &[&Tensor<Element>],
+    ) -> Result<Vec<Tensor<Element>>> {
         inputs
             .iter()
             .map(|input| {
@@ -1158,7 +1169,7 @@ mod tests {
                     .collect();
                 Tensor::<Element>::new(input.shape().clone(), res)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()
     }
 
     fn input() -> impl Strategy<Value = Tensor<Element>> {
@@ -1173,7 +1184,7 @@ mod tests {
             let layer = Requant::from_multiplier(2.0, 8);
             let wtensor = tensor.as_wrapped();
             let computed = layer.evaluate::<GoldilocksExt2>(&[&wtensor]).unwrap().outputs;
-            let expected = requant_reference(&layer, &[&tensor]);
+            let expected = requant_reference(&layer, &[&tensor]).unwrap();
 
             prop_assert_eq!(&expected, &computed.into_iter().map(|t| t.to_native()).collect::<Vec<_>>());
         }

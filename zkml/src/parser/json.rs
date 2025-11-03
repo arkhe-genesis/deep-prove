@@ -74,7 +74,7 @@ pub struct JsonTensor {
 }
 
 impl JsonTensor {
-    pub fn as_tensor(&self) -> Tensor<f32> {
+    pub fn as_tensor(&self) -> anyhow::Result<Tensor<f32>> {
         Tensor::new(self.shape.clone(), self.data.clone())
     }
 }
@@ -128,7 +128,7 @@ impl FileTensorLoader {
             .ok_or_else(|| anyhow::anyhow!("tensor not found: {key}"))?;
         Ok(KeyedTensor::new(
             self.full_key(key),
-            Tensor::new(tensor.shape.clone(), tensor.data.clone()),
+            Tensor::new(tensor.shape.clone(), tensor.data.clone())?,
         ))
     }
 
@@ -188,7 +188,7 @@ pub mod test {
         let structure = gpt2_structure(&config);
         let init_user_shape = Shape::from(vec![1]);
         let model = model.into_provable_model(&structure, init_user_shape)?;
-        let input = Tensor::new(Shape::from(vec![1]), vec![512.0]);
+        let input = Tensor::new(Shape::from(vec![1]), vec![512.0])?;
         model.run_float(std::slice::from_ref(&input))?;
         Ok(())
     }

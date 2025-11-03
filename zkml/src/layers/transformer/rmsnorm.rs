@@ -229,19 +229,23 @@ impl<N: Number> RMSNorm<N> {
             top_chunk_scalar_log,
         };
 
-        let quant_alpha = self.alpha.as_ref().map(|alpha| {
-            alpha.new_map_tensor(|alpha| {
-                let new_data = alpha
-                    .iter()
-                    .map(|v| {
-                        let vf32 = v.to_f32()?;
-                        Ok(model_scaling.quantize(&vf32))
-                    })
-                    .collect::<Result<Vec<Element>, anyhow::Error>>()
-                    .expect("Converting an f32 to f32 and quantising should never fail");
-                Tensor::<Element>::new(alpha.shape().clone(), new_data)
+        let quant_alpha = self
+            .alpha
+            .as_ref()
+            .map(|alpha| {
+                alpha.try_new_map_tensor(|alpha| {
+                    let new_data = alpha
+                        .iter()
+                        .map(|v| {
+                            let vf32 = v.to_f32()?;
+                            Ok(model_scaling.quantize(&vf32))
+                        })
+                        .collect::<Result<Vec<Element>, anyhow::Error>>()
+                        .expect("Converting an f32 to f32 and quantising should never fail");
+                    Tensor::<Element>::new(alpha.shape().clone(), new_data)
+                })
             })
-        });
+            .transpose()?;
 
         // To calculate the intermediate bit size we have that the output is `self.alpha * input  * lookup_output`
         // So lets work out the left hand bit size
@@ -268,8 +272,8 @@ impl RMSNorm<f32> {
         Self::new(Some(alpha), eps, None)
     }
 
-    fn hack_stack_gqa(alpha: KeyedTensor<f32>, c: &LLMConfig) -> KeyedTensor<f32> {
-        alpha.map_tensor(|alpha| {
+    fn hack_stack_gqa(alpha: KeyedTensor<f32>, c: &LLMConfig) -> anyhow::Result<KeyedTensor<f32>> {
+        alpha.try_map_tensor(|alpha| {
             let (it, _) = alpha.slice_on_dim(0);
             let data = it
                 .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
@@ -293,7 +297,7 @@ impl RMSNorm<f32> {
     ) -> anyhow::Result<Self> {
         let mut alpha = loader.get_tensor("norm.weight")?;
         if stack {
-            alpha = Self::hack_stack_gqa(alpha, c);
+            alpha = Self::hack_stack_gqa(alpha, c)?;
         }
         // we can have any checks on the shape alpha here since it depends of the context
         // a RMSNorm after  Q doesn't have the same shape as a RMSNorm after K or inside FeedForward etc
@@ -311,7 +315,7 @@ impl RMSNorm<f32> {
     ) -> anyhow::Result<Self> {
         let mut alpha = loader.get_tensor("norm.weight")?;
         if stack {
-            alpha = Self::hack_stack_gqa(alpha, c);
+            alpha = Self::hack_stack_gqa(alpha, c)?;
         }
         let eps = config
             .get::<f32, _>("rms_norm_eps")
@@ -322,12 +326,16 @@ impl RMSNorm<f32> {
 
 impl<N: TensorTypeParam> OpInfo for RMSNorm<N> {
     // https://docs.rs/burn/0.17.0/burn/nn/struct.RmsNorm.html#impl-RmsNorm%3CB%3E
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -344,7 +352,7 @@ impl Evaluate<f32> for RMSNorm<f32> {
         &self,
         inputs: &[&WrappedTensor<f32>],
     ) -> anyhow::Result<LayerOut<f32, E>> {
-        assert!(inputs.len() == 1);
+        ensure!(inputs.len() == 1);
         let input = inputs[0];
         ensure!(
             input.rank() == 2,
@@ -420,7 +428,7 @@ impl Evaluate<Element> for RMSNorm<Element> {
             .collect::<Vec<Element>>();
 
         let output_tensor =
-            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data))?;
+            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data)?)?;
         Ok(LayerOut::from_tensor(output_tensor))
     }
 }
@@ -466,7 +474,7 @@ impl QuantizeOp for RMSNorm<f32> {
             intermediate_bit_size,
         );
 
-        Ok(QuantizeOutput::new(quantised_rmsnorm, vec![output_scaling]).with_requant(requant))
+        QuantizeOutput::new(quantised_rmsnorm, vec![output_scaling]).with_requant(requant)
     }
 }
 
@@ -515,12 +523,16 @@ pub struct RMSNormCtx<E: ExtensionField> {
 }
 
 impl<E: ExtensionField> OpInfo for RMSNormCtx<E> {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -1198,7 +1210,7 @@ mod tests {
     #[test]
     fn test_rmsnorm() {
         let rmsnorm = RMSNorm::random(1024, None);
-        let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]);
+        let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]).unwrap();
         let output = rmsnorm.evaluate::<E>(&[&input.as_wrapped()]).unwrap();
         assert_eq!(
             output.outputs[0].shape().clone(),

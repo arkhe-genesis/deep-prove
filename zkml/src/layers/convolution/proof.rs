@@ -73,14 +73,18 @@ pub struct ConvCtx {
 }
 
 impl OpInfo for ConvCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes
             .iter()
             .map(|shape| self.output_shape(shape, padding_mode))
-            .collect()
+            .collect())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         Convolution::<Element>::num_outputs(num_inputs)
     }
 
@@ -95,6 +99,7 @@ impl OpInfo for ConvCtx {
         IS_PROVABLE
     }
 }
+
 impl ConvCtx {
     pub fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
         match padding_mode {
@@ -118,7 +123,7 @@ impl ConvCtx {
         delegation_poly_aux: &[VPAuxInfo<E>],
         delegation_points: &[Vec<E>],
         mut prev_r: Vec<E>,
-    ) {
+    ) -> Result<()> {
         let iter = delegation_proof.len();
         // Verify delegation protocol of W iFFT matrix
         let exponents = pow_two_omegas(iter + 1, false);
@@ -130,33 +135,35 @@ impl ConvCtx {
                 verifier.transcript,
             );
 
-            assert_eq!(
-                identity_eval(delegation_points[i].as_slice(), prev_r.clone().as_slice()),
-                delegation_claims[i][0],
+            ensure!(
+                identity_eval(delegation_points[i].as_slice(), prev_r.clone().as_slice())
+                    == delegation_claims[i][0],
                 "Error in identity evaluation fft delegation iter : {i}"
             );
 
-            assert_eq!(
+            ensure!(
                 phi_eval(
                     &delegation_points[i],
                     proof.hadamard_point[i],
                     prev_r[prev_r.len() - 1],
                     &exponents,
                     i == 0
-                ),
-                delegation_claims[i][1],
+                ) == delegation_claims[i][1],
                 "Error in phi computation fft delegation iter : {i}"
             );
 
             claim = delegation_claims[i][2];
             prev_r = delegation_points[i].clone();
         }
-        assert_eq!(
-            claim,
-            (E::ONE - E::from_canonical_u64(2) * proof.hadamard_point[iter]) * prev_r[0] + E::ONE
-                - prev_r[0],
+        ensure!(
+            claim
+                == (E::ONE - E::from_canonical_u64(2) * proof.hadamard_point[iter]) * prev_r[0]
+                    + E::ONE
+                    - prev_r[0],
             "Error in final FFT delegation step"
         );
+
+        Ok(())
     }
 
     pub(crate) fn verify_convolution<
@@ -192,7 +199,7 @@ impl ConvCtx {
         );
         let real_output_shape =
             padded_conv2d_shape(&shape_step.padded_input_shape[0], &self.padded_filter_shape);
-        let clearing_tensor = new_clearing_tensor(&unpadded_output_shape, &real_output_shape);
+        let clearing_tensor = new_clearing_tensor(&unpadded_output_shape, &real_output_shape)?;
         // now we need to verify the hadamard proof for the sumcheck part.
         let hctx = hadamard::HadamardCtx::from_len(real_output_shape.product());
         let expected_v2_eval = clearing_tensor
@@ -214,16 +221,18 @@ impl ConvCtx {
         for i in (0..(self.filter_size.ilog2() as usize)).rev() {
             delegation_fft_aux.push(from_mle_list_dimensions(&[vec![i + 1, i + 1, i + 1]]));
         }
-        assert_eq!(
+        ensure!(
+            delegation_fft_aux.len() == proof.ifft_delegation_proof.len(),
+            "Inconsistency in iFFT delegation proofs/aux size, {} != {}",
             delegation_fft_aux.len(),
             proof.ifft_delegation_proof.len(),
-            "Inconsistency in iFFT delegation proofs/aux size"
         );
 
         let fft_aux = from_mle_list_dimensions(&[vec![
             (self.filter_size.ilog2() as usize) + 1,
             (self.filter_size.ilog2() as usize) + 1,
         ]]);
+
         let hadamard_aux = from_mle_list_dimensions(&[vec![
             ((self.kx * self.filter_size).ilog2() as usize) + 1,
             ((self.kx * self.filter_size).ilog2() as usize) + 1,
@@ -243,23 +252,21 @@ impl ConvCtx {
                 &delegation_fft_aux[i],
                 verifier.transcript,
             );
-            assert_eq!(
+            ensure!(
                 identity_eval(
                     proof.ifft_delegation_points[i].as_slice(),
                     prev_r.clone().as_slice()
-                ),
-                proof.ifft_delegation_claims[i][0],
+                ) == proof.ifft_delegation_claims[i][0],
                 "Error in identity evaluation ifft delegation iter : {i}"
             );
-            assert_eq!(
+            ensure!(
                 phi_eval(
                     proof.ifft_delegation_points[i].as_slice(),
                     E::ONE - last_claim.point[i],
                     prev_r[prev_r.len() - 1],
                     &exponents,
                     false
-                ),
-                proof.ifft_delegation_claims[i][1],
+                ) == proof.ifft_delegation_claims[i][1],
                 "Error in phi computation ifft delegation iter : {i}"
             );
 
@@ -268,9 +275,8 @@ impl ConvCtx {
         }
         let scale = E::from_canonical_u64(1 << (iter + 1)).inverse();
 
-        assert_eq!(
-            claim,
-            scale * (E::ONE) * prev_r[0] + scale * (E::ONE - prev_r[0]),
+        ensure!(
+            claim == scale * (E::ONE) * prev_r[0] + scale * (E::ONE - prev_r[0]),
             "Error in final iFFT delegation step"
         );
 
@@ -280,9 +286,8 @@ impl ConvCtx {
             &hadamard_aux,
             verifier.transcript,
         );
-        assert_eq!(
-            proof.hadamard_clams[2],
-            identity_eval(&proof.ifft_point, &proof.hadamard_point),
+        ensure!(
+            proof.hadamard_clams[2] == identity_eval(&proof.ifft_point, &proof.hadamard_point),
             "Error in Beta evaluation"
         );
 
@@ -296,9 +301,8 @@ impl ConvCtx {
         );
         claim = proof.fft_claims[1];
 
-        assert_eq!(
-            delegation_fft_aux.len(),
-            proof.fft_delegation_proof.len(),
+        ensure!(
+            delegation_fft_aux.len() == proof.fft_delegation_proof.len(),
             "Inconsistency in FFT delegation proofs/aux size"
         );
 
@@ -311,7 +315,7 @@ impl ConvCtx {
             &delegation_fft_aux,
             &proof.fft_delegation_points,
             proof.fft_point.clone(),
-        );
+        )?;
 
         IOPVerifierState::<E>::verify(
             proof.hadamard_clams[0],
@@ -329,7 +333,7 @@ impl ConvCtx {
             &delegation_fft_aux,
             &proof.fft_delegation_weights_points,
             proof.fft_weight_point.clone(),
-        );
+        )?;
 
         // Validate the correctness of the padded weights claim
         // using the partial_evals provided by the prover
@@ -347,9 +351,8 @@ impl ConvCtx {
                     )
             });
 
-        assert_eq!(
-            proof.fft_weight_claims[0] * v,
-            y_weights,
+        ensure!(
+            proof.fft_weight_claims[0] * v == y_weights,
             "Error in padded_fft evaluation claim"
         );
 

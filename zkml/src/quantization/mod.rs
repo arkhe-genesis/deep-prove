@@ -265,7 +265,10 @@ where
     T: Fieldizer<F>,
 {
     fn to_fields(self) -> Tensor<F> {
-        Tensor::new(self.get_shape(), to_field::<T, F, _>(self.get_data()))
+        Tensor::new(self.get_shape(), to_field::<T, F, _>(self.get_data())).expect(
+            "a tensor can always be created from previously\
+            successfully created shape and data; qed",
+        )
     }
 }
 

@@ -18,7 +18,7 @@ use crate::{
     quantization::{self, Fieldizer},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
 };
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{mle::IntoMLE, util::ceil_log2};
@@ -217,7 +217,11 @@ impl Evaluate<Element> for Add<Element> {
 }
 
 impl<N> OpInfo for Add<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         if let Some((_, og_shape)) = &self.operand {
             assert!(
                 input_shapes.len() == 1,
@@ -242,13 +246,13 @@ impl<N> OpInfo for Add<N> {
             );
         }
         match padding_mode {
-            PaddingMode::NoPadding => vec![input_shapes[0].clone()],
-            PaddingMode::Padding => vec![input_shapes[0].next_power_of_two()],
+            PaddingMode::NoPadding => Ok(vec![input_shapes[0].clone()]),
+            PaddingMode::Padding => Ok(vec![input_shapes[0].next_power_of_two()]),
         }
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -261,18 +265,22 @@ impl<N> OpInfo for Add<N> {
 }
 
 impl OpInfo for AddCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         match padding_mode {
-            PaddingMode::NoPadding => input_shapes.to_vec(),
-            PaddingMode::Padding => input_shapes
+            PaddingMode::NoPadding => Ok(input_shapes.to_vec()),
+            PaddingMode::Padding => Ok(input_shapes
                 .iter()
                 .map(|shape| shape.next_power_of_two())
-                .collect(),
+                .collect()),
         }
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        1
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(1)
     }
 
     fn describe(&self) -> String {
@@ -428,7 +436,7 @@ impl Add<f32> {
         };
 
         let requant = requant_from_add(add_quant_info);
-        Ok(QuantizeOutput::new(quantized_model, vec![output_scaling]).with_requant(requant))
+        QuantizeOutput::new(quantized_model, vec![output_scaling]).with_requant(requant)
     }
 }
 
@@ -658,7 +666,8 @@ mod test {
                     }
                 })
                 .collect::<Vec<_>>(),
-        );
+        )
+        .unwrap();
 
         let close_to_float = is_close_with_tolerance(
             computed_result.get_data(),

@@ -142,7 +142,7 @@ impl<T> EinSum<T> {
                         mapping.compute_new_bias_shape(output_id, bias_id, tensor.shape())?;
                     bias_id += 1;
                     let data = tensor.into_data();
-                    Ok(Some(KeyedTensor::new(key, Tensor::new(new_shape, data))))
+                    Ok(Some(KeyedTensor::new(key, Tensor::new(new_shape, data)?)))
                 } else {
                     Ok(None)
                 }
@@ -186,8 +186,9 @@ impl PadOp for EinSum<Element> {
         let padded_input_shapes = si.padded_input_shapes();
 
         let unpadded_output_shapes =
-            self.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding);
-        let padded_output_shapes = self.output_shapes(&padded_input_shapes, PaddingMode::Padding);
+            self.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding)?;
+        let padded_output_shapes =
+            self.output_shapes(&padded_input_shapes, PaddingMode::Padding)?;
 
         // We must pad any constant tensors and bias tensors to ensure they are compatible with the padded inputs.
         // However, we do not need to change the equation or mapping, as the padding is handled by the input shapes.
@@ -238,7 +239,11 @@ impl PadOp for EinSum<Element> {
 }
 
 impl<N: Number> OpInfo for EinSum<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         let mut input_shapes_iter = input_shapes.iter();
         // The left hand side of the equation cannot be a constant tensor, so we should always have at least one input shape provided
         let full_input_shapes = match padding_mode {
@@ -281,13 +286,14 @@ impl<N: Number> OpInfo for EinSum<N> {
             }
         };
 
-        self.mapping
+        Ok(self
+            .mapping
             .output_shapes(&full_input_shapes)
-            .expect("Failed to compute output shapes for EinSum")
+            .expect("Failed to compute output shapes for EinSum"))
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        self.mapping.output_count()
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(self.mapping.output_count())
     }
 
     fn describe(&self) -> String {
@@ -396,7 +402,11 @@ pub struct EinSumContext<E: ExtensionField> {
 }
 
 impl<E: ExtensionField> OpInfo for EinSumContext<E> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         let mut input_shapes_iter = input_shapes.iter();
         // The left hand side of the equation cannot be a constant tensor, so we should always have at least one input shape provided
         let full_input_shapes = match padding_mode {
@@ -439,13 +449,14 @@ impl<E: ExtensionField> OpInfo for EinSumContext<E> {
             }
         };
 
-        self.mapping
+        Ok(self
+            .mapping
             .output_shapes(&full_input_shapes)
-            .expect("Failed to compute output shapes for EinSum")
+            .expect("Failed to compute output shapes for EinSum"))
     }
 
-    fn num_outputs(&self, _num_inputs: usize) -> usize {
-        self.mapping.output_count()
+    fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {
+        Ok(self.mapping.output_count())
     }
 
     fn describe(&self) -> String {

@@ -267,7 +267,7 @@ impl AbsoluteCtx {
         let unpadded_input_shapes = vec![shape_step.unpadded_input_shape[0].clone(); 2];
         let padded_input_shapes = vec![shape_step.padded_input_shape[0].clone(); 2];
         let shape_step = LayerCtx::<E>::Add(self.add_ctx.clone())
-            .shape_step(&unpadded_input_shapes, &padded_input_shapes);
+            .shape_step(&unpadded_input_shapes, &padded_input_shapes)?;
 
         let mut claims =
             self.add_ctx
@@ -421,7 +421,7 @@ mod tests {
             for i in 0..seq_len { for j in 0..embedding_size {
                 expected_data.push(in_data[i * embedding_size + j] + pos_data[i * embedding_size + j]);
             }}
-            let expected = Tensor::new(vec![seq_len, embedding_size].into(), expected_data);
+            let expected = Tensor::new(vec![seq_len, embedding_size].into(), expected_data).unwrap();
             let close = is_close_with_tolerance(&out.get_data(), expected.data(), 1e-6, 1e-5);
             prop_assert!(close);
         }
@@ -441,7 +441,7 @@ mod tests {
             let (pos_q, add_q) = (layer_q.positional.clone(), &layer_q.add_layer);
             let sub_slice = TensorSlice::from(pos_q.deref()).slice_over_first_dim(0, seq_len);
 
-            let sub_pos_q = Tensor::new(sub_slice.get_shape(), sub_slice.get_data().to_vec());
+            let sub_pos_q = Tensor::new(sub_slice.get_shape(), sub_slice.get_data().to_vec()).unwrap();
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer_q

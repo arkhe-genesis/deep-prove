@@ -99,7 +99,8 @@ mod dense_layer {
         let layer = Dense::<Element>::new(
             KeyedTensor::new("dense_weight", matrix.clone()),
             KeyedTensor::new("dense_bias", bias.clone()),
-        );
+        )
+        .unwrap();
 
         bencher.bench(|| {
             layer
@@ -119,7 +120,8 @@ mod dense_layer {
         let layer = Dense::<f32>::new(
             KeyedTensor::new("dense_weight", matrix.clone()),
             KeyedTensor::new("dense_bias", bias.clone()),
-        );
+        )
+        .unwrap();
 
         bencher.bench(|| {
             layer
@@ -174,7 +176,9 @@ mod convolution_layer {
             KeyedTensor::new("conv_filter", kernels.clone()),
             KeyedTensor::new("conv_bias", bias.clone()),
         )
-        .prepared_for_fft(&Shape::from(input.shape()));
+        .unwrap()
+        .prepared_for_fft(&Shape::from(input.shape()))
+        .unwrap();
 
         bencher.bench(|| {
             layer
@@ -194,7 +198,8 @@ mod convolution_layer {
         let layer = Convolution::<f32>::new(
             KeyedTensor::new("conv_filter", kernels.clone()),
             KeyedTensor::new("conv_bias", bias.clone()),
-        );
+        )
+        .unwrap();
 
         bencher.bench(|| {
             layer
@@ -431,7 +436,7 @@ mod concat_matmul_layer {
         let size = 1 << args.pow2;
         let left_perm = InputMatrixDimensions::new(1, 2, 0);
         let right_perm = InputMatrixDimensions::new(1, 0, 2);
-        let out_perm = Permutation::new(vec![2, 1, 0]);
+        let out_perm = Permutation::new(vec![2, 1, 0]).unwrap();
 
         // concat dim must match the `left_perm` and `right_perm` config
         let shape = Shape::new(vec![size, CONCATS, size]);
@@ -456,7 +461,7 @@ mod concat_matmul_layer {
         let size = 1 << args.pow2;
         let left_perm = InputMatrixDimensions::new(1, 2, 0);
         let right_perm = InputMatrixDimensions::new(1, 0, 2);
-        let out_perm = Permutation::new(vec![2, 1, 0]);
+        let out_perm = Permutation::new(vec![2, 1, 0]).unwrap();
 
         // concat dim must match the `left_perm` and `right_perm` config
         let shape = Shape::new(vec![size, CONCATS, size]);
@@ -697,7 +702,7 @@ mod norm_layer {
             "layernom_beta",
             Tensor::<Element>::random(&Shape::new(vec![dim1])),
         );
-        let layer = LayerNorm::<Element>::new(gamma, beta, EPS);
+        let layer = LayerNorm::<Element>::new(gamma, beta, EPS).unwrap();
 
         let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
 
@@ -727,7 +732,7 @@ mod norm_layer {
             "layernorm_beta",
             Tensor::<f32>::random(&Shape::new(vec![dim1])),
         );
-        let layer = LayerNorm::<f32>::new(gamma, beta, EPS);
+        let layer = LayerNorm::<f32>::new(gamma, beta, EPS).unwrap();
 
         bencher.bench(|| {
             layer
@@ -914,7 +919,7 @@ mod permute_layer {
 
         let input = WrappedTensor::<Element>::random(&shape);
 
-        let layer = Permute::new(vec![2, 1, 0]);
+        let layer = Permute::new(vec![2, 1, 0]).unwrap();
 
         bencher.bench(|| {
             layer
@@ -930,7 +935,7 @@ mod permute_layer {
 
         let input = WrappedTensor::<f32>::random(&shape);
 
-        let layer = Permute::new(vec![2, 1, 0]);
+        let layer = Permute::new(vec![2, 1, 0]).unwrap();
         bencher.bench(|| {
             layer
                 .evaluate::<GoldilocksExt2>(&[&input])

@@ -150,9 +150,8 @@ impl<N: TensorTypeParam> QKV<N> {
         // mat mul : [a,b] * [b, c] -> [a, c] + [c]
         let hidden_size = q.shape()[1];
         if let Some(ref q_bias) = q_bias {
-            assert_eq!(
-                hidden_size,
-                q_bias.shape()[0],
+            ensure!(
+                hidden_size == q_bias.shape()[0],
                 "q.shape() {:?} != q_bias.shape() {:?}",
                 q.shape(),
                 q_bias.shape()
@@ -264,8 +263,16 @@ const IS_PROVABLE: bool = true;
 
 impl<N: TensorTypeParam> OpInfo for QKV<N> {
     /// Returns the shapes of the outputs (in the same order)
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        assert_eq!(input_shapes.len(), 1, "Expected one input for QKV layer");
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        ensure!(
+            input_shapes.len() == 1,
+            "Expected one input for QKV layer, got {}",
+            input_shapes.len()
+        );
         let input_shape = input_shapes[0].clone();
         let full_seq_len = if self.cache.lock().unwrap().is_initialized() {
             self.cache.lock().unwrap().full_seq_len() // this assumes the `evaluate` method has already been called for the
@@ -274,7 +281,7 @@ impl<N: TensorTypeParam> OpInfo for QKV<N> {
             input_shape[0]
         };
 
-        match padding_mode {
+        let ret = match padding_mode {
             PaddingMode::NoPadding => {
                 // [q_len, emb_size], [seq_len, emb_size], [seq_len, emb_size]
                 vec![
@@ -308,13 +315,15 @@ impl<N: TensorTypeParam> OpInfo for QKV<N> {
                     .into(),
                 ]
             }
-        }
+        };
+
+        Ok(ret)
     }
 
     /// Compute the number of output tensors, given the number of input tensors
     /// `num_inputs`
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs * 3
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs * 3)
     }
 
     /// Textual description of the operation
@@ -426,7 +435,7 @@ impl QuantizeOp for QKV<f32> {
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len());
+        let num_outputs = self.num_outputs(input_scaling.len())?;
         let output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
         ensure!(
             output_scalings.len() == num_outputs,
@@ -445,7 +454,7 @@ impl QKV<f32> {
         ensure!(input_scaling.len() == 1, "QKV: input_scaling.len() != 1");
         ensure!(output_scaling.len() == 3, "QKV: output_scaling.len() != 3");
         // for each tensor, we look at the scaling factor and the scaling factor of the associated bias
-        let (matrices, (biases, requants)): (Vec<_>, (Vec<_>, Vec<_>)) = output_scaling
+        let (matrices, (biases, requants)) = output_scaling
             .iter()
             .zip(vec![
                 (self.q, self.q_bias),
@@ -461,16 +470,17 @@ impl QKV<f32> {
                 let input_scaling = &input_scaling[0];
                 let quantized_matrix = tensor.quantize(&model_scaling);
                 let quantized_bias = bias.map(|bias| bias.quantize(&bias_scaling));
-                let intermediate_bitsize = quantized_matrix.matmul_output_bitsize(None, None);
+                let intermediate_bitsize = quantized_matrix.matmul_output_bitsize(None, None)?;
                 let requant = Requant::from_scaling_factors(
                     *input_scaling,
                     model_scaling,
                     *output_scaling,
                     intermediate_bitsize,
                 );
-                (quantized_matrix, (quantized_bias, requant))
+                Ok((quantized_matrix, (quantized_bias, requant)))
             })
-            .unzip();
+            .collect::<Result<(Vec<_>, (Vec<_>, Vec<_>))>>()?;
+
         let mut matit = matrices.into_iter();
         let (q, k, v) = (
             matit.next().unwrap(),
@@ -493,7 +503,7 @@ impl QKV<f32> {
             self.num_heads,
             self.num_groups,
         )?;
-        Ok(QuantizeOutput::new(quantized_op, output_scaling.to_vec()).with_requants(requants))
+        QuantizeOutput::new(quantized_op, output_scaling.to_vec()).with_requants(requants)
     }
 }
 
@@ -506,9 +516,8 @@ impl Evaluate<f32> for QKV<f32> {
         // to make it stateful since it would have to make the quantization strategy be aware that
         // we're using caching and it's LLM. It's currently not in scope.
         self.cache.lock().unwrap().reset();
-        assert_eq!(
-            self.cache.lock().unwrap().full_seq_len(),
-            0,
+        ensure!(
+            self.cache.lock().unwrap().full_seq_len() == 0,
             "Cache should be empty during float evaluation"
         );
 
@@ -556,7 +565,7 @@ impl ProveInfo for QKV<Element> {
             self.cache.lock().unwrap().full_seq_len() == 0,
             "Cache should be empty"
         );
-        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
+        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
         let mut array = vec![
             (self.q.commitment_id(), &self.q),
             (self.k.commitment_id(), &self.k),
@@ -629,7 +638,7 @@ where
         let input_tensors = step_data.input_tensors(store)?;
         let output_tensors = step_data.output_tensors(store)?;
 
-        let expected_num_outputs = self.num_outputs(1);
+        let expected_num_outputs = self.num_outputs(1)?;
         ensure!(
             last_claims.len() == expected_num_outputs,
             "Expected {expected_num_outputs} output claims for QKV layer, found {}",
@@ -645,13 +654,13 @@ where
             input.shape().is_matrix(),
             "Input tensor for QKV layer is not a matrix"
         );
-        let ncols = input.ncols_2d();
-        let nrows = self.q.nrows_2d();
+        let ncols = input.ncols_2d()?;
+        let nrows = self.q.nrows_2d()?;
         ensure!(
             ncols == nrows,
             "Number of columns in input matrix ({ncols}) different from number of rows in Q weight matrix of QKV layer ({nrows})"
         );
-        let expected_output_shape: Shape = vec![input.nrows_2d(), self.q.ncols_2d()].into();
+        let expected_output_shape: Shape = vec![input.nrows_2d()?, self.q.ncols_2d()?].into();
         ensure!(
             output_tensors.len() == expected_num_outputs,
             "Expected {expected_num_outputs} output tensors in inference data for QKV layer, found {}",
@@ -705,7 +714,7 @@ where
         let challenges =
             Self::challenges_for_batched_sumcheck(prover.transcript, &last_claims, &evals_pre_bias);
 
-        let input_mle = input.to_mle_2d();
+        let input_mle = input.to_mle_2d()?;
 
         // Number of variables involved in the sum-check corresponds to the number of columns of the input matrix
         let num_vars = input.shape().num_vars_2d().1;
@@ -716,7 +725,7 @@ where
             .iter()
             .zip([&self.q, &self.k, &self.v])
             .map(|(&claim, weight_matrix)| {
-                let mut weight_mle = weight_matrix.to_2d_mle();
+                let mut weight_mle = weight_matrix.to_2d_mle()?;
                 let (point_for_row, point_for_column) =
                     Self::split_claim_point(&claim.point, output_num_vars_2d)?;
                 let fixed_input_mle = input_mle.fix_high_variables(point_for_row);
@@ -815,7 +824,11 @@ where
 }
 
 impl OpInfo for QKVCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         let weight_shape = match padding_mode {
             PaddingMode::NoPadding => &self.unpadded_shape,
             PaddingMode::Padding => {
@@ -823,23 +836,27 @@ impl OpInfo for QKVCtx {
             }
         };
 
-        assert_eq!(
-            input_shapes.len(),
-            1,
-            "Expected only 1 input shape for QKV layer"
+        ensure!(
+            input_shapes.len() == 1,
+            "Expected only 1 input shape for QKV layer, got {}",
+            input_shapes.len()
         );
 
-        assert_eq!(
-            input_shapes[0][1], weight_shape[0],
+        ensure!(
+            input_shapes[0][1] == weight_shape[0],
             "Shape mismatch for QKV ctx: number of columns in input shape different from number of rows of weight matrices {} != {}",
-            input_shapes[0][1], weight_shape[0],
+            input_shapes[0][1],
+            weight_shape[0],
         );
 
-        vec![vec![input_shapes[0][0], weight_shape[1]].into(); self.num_outputs(1)]
+        Ok(vec![
+            vec![input_shapes[0][0], weight_shape[1]].into();
+            self.num_outputs(1)?
+        ])
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs * 3
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs * 3)
     }
 
     fn describe(&self) -> String {
@@ -875,7 +892,7 @@ where
             shape_step.padded_input_shape.len(),
         );
         let padded_input_shape = &shape_step.padded_input_shape[0];
-        let expected_num_outputs = self.num_outputs(1);
+        let expected_num_outputs = self.num_outputs(1)?;
         ensure!(
             shape_step.padded_output_shape.len() == expected_num_outputs,
             "Expected {expected_num_outputs} shapes for QKV verifier, found {}",
@@ -1044,8 +1061,10 @@ impl<N: TensorTypeParam> Default for CacheQKV<N> {
 impl<N: TensorTypeParam> CacheQKV<N> {
     pub fn new() -> Self {
         Self {
-            cache_k: Tensor::new(vec![0].into(), vec![]),
-            cache_v: Tensor::new(vec![0].into(), vec![]),
+            cache_k: Tensor::new(vec![0].into(), vec![])
+                .expect("creating a single element tensor with 0 value always works; qed"),
+            cache_v: Tensor::new(vec![0].into(), vec![])
+                .expect("creating a single element tensor with 0 value always works; qed"),
             seq_len: 0,
             initialized: false,
             padding_mode: PaddingMode::NoPadding,
@@ -1061,24 +1080,22 @@ impl<N: TensorTypeParam> CacheQKV<N> {
         self.seq_len
     }
     pub fn stack(&mut self, k: Tensor<N>, v: Tensor<N>, seq_len: usize) -> anyhow::Result<()> {
-        assert_eq!(
-            k.shape(),
-            v.shape(),
+        ensure!(
+            k.shape() == v.shape(),
             "k and v have different shapes {:?} != {:?}",
             k.shape(),
             v.shape()
         );
         if self.initialized {
-            assert!(k.shape().is_vector(), "k is not a vector {:?}", k.shape());
-            assert_eq!(
-                self.cache_k.shape()[1],
-                k.shape()[1],
+            ensure!(k.shape().is_vector(), "k is not a vector {:?}", k.shape());
+            ensure!(
+                self.cache_k.shape()[1] == k.shape()[1],
                 "cache_k and k have different last dimension {:?} != {:?}",
                 self.cache_k.shape(),
                 k.shape()
             );
-            assert_eq!(
-                seq_len, 1,
+            ensure!(
+                seq_len == 1,
                 "subsequent forward pass after the initial one must have seq_len = 1"
             );
 
@@ -1092,16 +1109,14 @@ impl<N: TensorTypeParam> CacheQKV<N> {
                 self.seq_len + 1
             };
             // we can only check the padded version since the unpadded version is "hidden" inside the shape of the tensor
-            assert_eq!(
-                self.cache_k.shape()[0],
-                expected_first_dim,
+            ensure!(
+                self.cache_k.shape()[0] == expected_first_dim,
                 "cache_k shape is not correct {:?} != {:?}",
                 self.cache_k.shape()[0],
                 expected_first_dim,
             );
-            assert_eq!(
-                self.cache_v.shape()[0],
-                expected_first_dim,
+            ensure!(
+                self.cache_v.shape()[0] == expected_first_dim,
                 "cache_v shape is not correct {:?} != {:?}",
                 self.cache_v.shape()[0],
                 expected_first_dim,
@@ -1195,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_qkv_cache() {
+    fn test_qkv_cache() -> anyhow::Result<()> {
         // first token
         let seq_len = 1;
         let emb_size = 2;
@@ -1210,9 +1225,9 @@ mod tests {
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].shape(), BShape::from(vec![1, hidden_size]));
         assert_eq!(output[1].shape(), BShape::from(vec![seq_len, hidden_size]));
-        let mut out_k = input.matmul(&qkv.k).add_dim2(qkv.k_bias.as_ref().unwrap());
+        let mut out_k = input.matmul(&qkv.k)?.add_dim2(qkv.k_bias.as_ref().unwrap());
         assert_eq!(output[1].get_data(), out_k.get_data());
-        let mut out_v = input.matmul(&qkv.v).add_dim2(qkv.v_bias.as_ref().unwrap());
+        let mut out_v = input.matmul(&qkv.v)?.add_dim2(qkv.v_bias.as_ref().unwrap());
         assert_eq!(output[2].shape(), BShape::from(vec![seq_len, hidden_size]));
         assert_eq!(output[2].get_data(), out_v.get_data());
         // second token
@@ -1229,24 +1244,26 @@ mod tests {
         assert_eq!(output[1].shape(), BShape::from(vec![seq_len, hidden_size]));
         assert_eq!(output[2].shape(), BShape::from(vec![seq_len, hidden_size]));
         let out_q = new_token_emb
-            .matmul(&qkv.q)
+            .matmul(&qkv.q)?
             .add_dim2(qkv.q_bias.as_ref().unwrap());
         assert_eq!(output[0].get_data(), out_q.get_data());
         out_k.concat(
             new_token_emb
-                .matmul(&qkv.k)
+                .matmul(&qkv.k)?
                 .add_dim2(qkv.k_bias.as_ref().unwrap()),
-        );
+        )?;
         assert_eq!(output[1].get_data(), out_k.get_data());
         out_v.concat(
             new_token_emb
-                .matmul(&qkv.v)
+                .matmul(&qkv.v)?
                 .add_dim2(qkv.v_bias.as_ref().unwrap()),
-        );
+        )?;
         assert_eq!(output[2].get_data(), out_v.get_data());
 
         qkv.cache.lock().unwrap().reset();
         assert_eq!(qkv.cache.lock().unwrap().seq_len, 0);
+
+        Ok(())
     }
 
     //#[test]
@@ -1326,21 +1343,26 @@ mod tests {
         let padded_weight_shape = weight_shape.next_power_of_two();
         let padded_bias_shape = bias_shape.next_power_of_two();
 
-        let unpadded_output_shapes = layer.output_shapes(
-            slice::from_ref(&unpadded_input_shape),
-            PaddingMode::NoPadding,
-        );
+        let unpadded_output_shapes = layer
+            .output_shapes(
+                slice::from_ref(&unpadded_input_shape),
+                PaddingMode::NoPadding,
+            )
+            .unwrap();
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check unpadded output shapes for padded layer
-        let unpadded_output_shapes = padded_layer.output_shapes(
-            slice::from_ref(&unpadded_input_shape),
-            PaddingMode::NoPadding,
-        );
+        let unpadded_output_shapes = padded_layer
+            .output_shapes(
+                slice::from_ref(&unpadded_input_shape),
+                PaddingMode::NoPadding,
+            )
+            .unwrap();
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check padded output shapes
         let padded_input_shape = unpadded_input_shape.next_power_of_two();
-        let padded_output_shapes =
-            padded_layer.output_shapes(slice::from_ref(&padded_input_shape), PaddingMode::Padding);
+        let padded_output_shapes = padded_layer
+            .output_shapes(slice::from_ref(&padded_input_shape), PaddingMode::Padding)
+            .unwrap();
         assert_eq!(padded_output_shapes, si.padded_input_shapes(),);
         assert!(matches!(
             padded_layer.cache.lock().unwrap().padding_mode,
@@ -1422,7 +1444,7 @@ mod tests {
                 .all(|(out, expected_shape)| Shape::from(out.shape()) == *expected_shape)
         );
 
-        input.pad_to_shape(padded_input_shape);
+        input.pad_to_shape(padded_input_shape).unwrap();
         assert_eq!(padded_layer.cache.lock().unwrap().full_seq_len(), 0);
         let padded_output =
             evaluate_layer::<GoldilocksExt2, _, _>(&padded_layer, &[&input.as_wrapped()]).unwrap();
@@ -1492,20 +1514,25 @@ mod tests {
             .into();
         let padded_layer = layer.clone().pad_node(&mut si).unwrap();
 
-        let unpadded_output_shapes = layer.output_shapes(
-            slice::from_ref(&unpadded_input_shape),
-            PaddingMode::NoPadding,
-        );
+        let unpadded_output_shapes = layer
+            .output_shapes(
+                slice::from_ref(&unpadded_input_shape),
+                PaddingMode::NoPadding,
+            )
+            .unwrap();
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check unpadded output shapes for padded layer
-        let unpadded_output_shapes = padded_layer.output_shapes(
-            slice::from_ref(&unpadded_input_shape),
-            PaddingMode::NoPadding,
-        );
+        let unpadded_output_shapes = padded_layer
+            .output_shapes(
+                slice::from_ref(&unpadded_input_shape),
+                PaddingMode::NoPadding,
+            )
+            .unwrap();
         assert_eq!(unpadded_output_shapes, si.unpadded_input_shapes(),);
         // check padded output shapes
         let padded_output_shapes = padded_layer
-            .output_shapes(slice::from_ref(&unpadded_input_shape), PaddingMode::Padding);
+            .output_shapes(slice::from_ref(&unpadded_input_shape), PaddingMode::Padding)
+            .unwrap();
         assert_eq!(padded_output_shapes, si.padded_input_shapes(),);
 
         assert_eq!(*padded_layer.q.shape(), weight_shape);
@@ -1559,9 +1586,9 @@ mod tests {
         fn test_qkv_with_f32(input in any_input::<f32>(1..32, 1..256, 1..8, 1..256)) {
             let Input { q, q_bias, k, k_bias, v, v_bias, num_heads, input } = input;
 
-            let expected_q = input.matmul(&q).add_dim2(&q_bias);
-            let expected_k = input.matmul(&k).add_dim2(&k_bias);
-            let expected_v = input.matmul(&v).add_dim2(&v_bias);
+            let expected_q = input.matmul(&q).unwrap().add_dim2(&q_bias);
+            let expected_k = input.matmul(&k).unwrap().add_dim2(&k_bias);
+            let expected_v = input.matmul(&v).unwrap().add_dim2(&v_bias);
 
             let layer = QKV::<f32>::new(q, Some(q_bias), k, Some(k_bias), v, Some(v_bias), num_heads,num_heads).unwrap();
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()] ).expect("qkv evaluation must be successful");
@@ -1591,9 +1618,9 @@ mod tests {
         fn test_qkv_with_element(input in any_input::<Element>(1..64, 1..64, 1..8, 1..64)) {
             let Input { q, q_bias, k, k_bias, v, v_bias, num_heads, input } = input;
 
-            let expected_q = input.matmul(&q).add_dim2(&q_bias);
-            let expected_k = input.matmul(&k).add_dim2(&k_bias);
-            let expected_v = input.matmul(&v).add_dim2(&v_bias);
+            let expected_q = input.matmul(&q).unwrap().add_dim2(&q_bias);
+            let expected_k = input.matmul(&k).unwrap().add_dim2(&k_bias);
+            let expected_v = input.matmul(&v).unwrap().add_dim2(&v_bias);
 
             let layer = QKV::<Element>::new(q, Some(q_bias), k, Some(k_bias), v, Some(v_bias), num_heads,num_heads).unwrap();
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()], ).expect("qkv evaluation must be successful");

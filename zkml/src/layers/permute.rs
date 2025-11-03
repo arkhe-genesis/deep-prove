@@ -1,4 +1,4 @@
-use anyhow::ensure;
+use anyhow::{Result, ensure};
 use ff_ext::ExtensionField;
 
 use crate::{
@@ -12,13 +12,13 @@ pub struct Permute {
 }
 
 impl Permute {
-    pub fn new(args: Vec<usize>) -> Self {
-        assert_eq!(
-            args.len(),
-            3,
-            "Only 3D tensors currently supported by permute"
+    pub fn new(args: Vec<usize>) -> Result<Self> {
+        ensure!(
+            args.len() == 3,
+            "Only 3D tensors currently supported by permute, got {} dimensions",
+            args.len()
         );
-        Self { args }
+        Ok(Self { args })
     }
 }
 
@@ -79,7 +79,7 @@ mod test {
     #[test]
     fn test_permute() {
         let input = Tensor::<Element>::random(&vec![2, 3, 4].into());
-        let permute = Permute::new(vec![1, 0, 2]);
+        let permute = Permute::new(vec![1, 0, 2]).unwrap();
         let output = permute
             .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
             .unwrap();
@@ -100,16 +100,16 @@ mod test {
 
             let element_data = Tensor::<Element>::random(&Shape::new(vec![a, b, c]));
             for order in &permutations {
-                let expected = element_data.permute3d(order);
-                let layer = Permute::new(order.to_vec());
+                let expected = element_data.permute3d(order).unwrap();
+                let layer = Permute::new(order.to_vec()).unwrap();
                     let result = layer.evaluate::<GoldilocksExt2>(&[&element_data.as_wrapped()]).unwrap();
                 prop_assert_eq!(&expected, &result.outputs()[0].to_native());
             }
 
             let float_data = Tensor::<Element>::random(&Shape::new(vec![a, b, c]));
             for order in &permutations {
-                let expected = float_data.permute3d(order);
-                let layer = Permute::new(order.to_vec());
+                let expected = float_data.permute3d(order).unwrap();
+                let layer = Permute::new(order.to_vec()).unwrap();
                     let result = layer.evaluate::<GoldilocksExt2>(&[&float_data.as_wrapped()]).unwrap();
                 prop_assert_eq!(&expected, &result.outputs()[0].to_native());
             }

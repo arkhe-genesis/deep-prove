@@ -1,5 +1,6 @@
 use std::{cmp::min, marker::PhantomData};
 
+use anyhow::{Result, ensure};
 use burn::{
     backend::{
         ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr},
@@ -27,9 +28,9 @@ use super::{Maxpool2dConfig, ZKMLBackend};
 /// If `total` is a power-of-two this function will return an exact [CubeCount]
 /// which calls the kernel the correct number of times, otherwise there will be
 /// extra invocations.
-fn fit_to_cube(total: u32, (max_x, max_y, max_z): (u32, u32, u32)) -> CubeCount {
+fn fit_to_cube(total: u32, (max_x, max_y, max_z): (u32, u32, u32)) -> Result<CubeCount> {
     let maximum = max_x.saturating_mul(max_y.saturating_mul(max_z));
-    assert!(
+    ensure!(
         total <= maximum,
         "Request number of calls exceeds the maximum supported. requested {total} maximum {maximum}"
     );
@@ -94,7 +95,7 @@ fn fit_to_cube(total: u32, (max_x, max_y, max_z): (u32, u32, u32)) -> CubeCount 
         }
     }
 
-    CubeCount::Static(x, y, z)
+    Ok(CubeCount::Static(x, y, z))
 }
 
 /// Computes the shape of the output tensor after performing the conv2d
@@ -102,13 +103,13 @@ fn conv2d_i_out_shape(
     input_dims: [usize; 4],
     kernels_dims: [usize; 4],
     config: &super::Conv2dConfig,
-) -> BShape {
+) -> Result<BShape> {
     // (N x C x H x W)
     let [batch_size, channels_in, height_in, width_in] = input_dims;
     // (M x C/group x kH x kW)
     let [feature_maps, channels_out, kernel_height, kernel_width] = kernels_dims;
 
-    assert!(
+    ensure!(
         channels_in == channels_out,
         "Grouping is currently not supported. channels in {channels_in} out {channels_out}",
     );
@@ -116,7 +117,12 @@ fn conv2d_i_out_shape(
     // see [tensor::Tensor::conv2d] for details of the formula below
     let height_out = (height_in - kernel_height) / config.stride + 1;
     let width_out = (width_in - kernel_width) / config.stride + 1;
-    BShape::new([batch_size, feature_maps, height_out, width_out])
+    Ok(BShape::new([
+        batch_size,
+        feature_maps,
+        height_out,
+        width_out,
+    ]))
 }
 
 /// Computes the shape of the output tensor after performing the max_pool2d
@@ -138,12 +144,12 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
         kernels: IntTensor<Self>,
         bias: IntTensor<Self>,
         config: super::Conv2dConfig,
-    ) -> IntTensor<Self> {
-        assert!(input.shape.num_dims() == 4);
-        assert!(kernels.shape.num_dims() == 4);
-        assert!(bias.shape.num_dims() == 1);
+    ) -> Result<IntTensor<Self>> {
+        ensure!(input.shape.num_dims() == 4);
+        ensure!(kernels.shape.num_dims() == 4);
+        ensure!(bias.shape.num_dims() == 1);
 
-        let shape_out = conv2d_i_out_shape(input.shape.dims(), kernels.shape.dims(), &config);
+        let shape_out = conv2d_i_out_shape(input.shape.dims(), kernels.shape.dims(), &config)?;
 
         let buffer = input
             .client
@@ -165,7 +171,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
         let cube_count = fit_to_cube(
             (output.shape.num_elements() as u32).div_ceil(cube_dim.num_elems()),
             R::max_cube_count(),
-        );
+        )?;
 
         let input_strides = Shape::from(&input.shape).strides();
         let input_strides = SequenceArg {
@@ -208,11 +214,14 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
             config.stride as u32,
         );
 
-        output
+        Ok(output)
     }
 
-    fn zkml_max_pool2d_i(input: IntTensor<Self>, config: Maxpool2dConfig) -> IntTensor<Self> {
-        assert!(input.shape.num_dims() == 4);
+    fn zkml_max_pool2d_i(
+        input: IntTensor<Self>,
+        config: Maxpool2dConfig,
+    ) -> Result<IntTensor<Self>> {
+        ensure!(input.shape.num_dims() == 4);
         let shape_out = max_pool2d_i_out_shape(input.shape.dims(), &config);
 
         let buffer = input
@@ -235,7 +244,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
         let cube_count = fit_to_cube(
             (output.shape.num_elements() as u32).div_ceil(cube_dim.num_elems()),
             R::max_cube_count(),
-        );
+        )?;
 
         let input_strides = Shape::from(&input.shape).strides();
         let input_strides = SequenceArg {
@@ -268,7 +277,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
             config.stride as u32,
         );
 
-        output
+        Ok(output)
     }
 }
 
@@ -278,7 +287,7 @@ impl<B: FusionBackend + ZKMLBackend> ZKMLBackend for Fusion<B> {
         kernels: IntTensor<Self>,
         bias: IntTensor<Self>,
         config: super::Conv2dConfig,
-    ) -> IntTensor<Self> {
+    ) -> Result<IntTensor<Self>> {
         /// Metadata needed to run the operation once scheduled.
         #[derive(Debug)]
         struct Conv2dIIR {
@@ -307,7 +316,8 @@ impl<B: FusionBackend + ZKMLBackend> ZKMLBackend for Fusion<B> {
                     kernels,
                     bias,
                     self.description.config.clone(),
-                );
+                )
+                .expect("should be able to execute conv2diops; qed");
                 handles.register_int_tensor::<B>(&self.description.out.id, output);
             }
         }
@@ -317,7 +327,7 @@ impl<B: FusionBackend + ZKMLBackend> ZKMLBackend for Fusion<B> {
         streams.tensor(&kernels);
         streams.tensor(&bias);
 
-        let shape = conv2d_i_out_shape(input.shape().dims(), kernels.shape().dims(), &config);
+        let shape = conv2d_i_out_shape(input.shape().dims(), kernels.shape().dims(), &config)?;
         let out = input
             .client
             .tensor_uninitialized(shape.dims.clone().into(), input.dtype());
@@ -343,7 +353,7 @@ impl<B: FusionBackend + ZKMLBackend> ZKMLBackend for Fusion<B> {
             },
         );
 
-        out
+        Ok(out)
     }
 }
 
@@ -360,7 +370,7 @@ mod tests {
             let max_x = 1 << max;
             let max_y = 1 << max;
             let max_z = 1 << max;
-            match fit_to_cube(total, (max_x, max_y, max_z)) {
+            match fit_to_cube(total, (max_x, max_y, max_z)).unwrap() {
                 CubeCount::Static(x, y, z) => {
                     prop_assert!(
                         total <= x * y * z,

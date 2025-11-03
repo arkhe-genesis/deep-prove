@@ -1,5 +1,6 @@
 use ff_ext::ExtensionField;
 
+use anyhow::{Result, ensure};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 pub mod mmcs_context;
@@ -28,13 +29,18 @@ pub fn compute_betas_eval<E: ExtensionField>(r: &[E]) -> Vec<E> {
 }
 
 /// Random linear combination of claims and random elements derived from transcript
-pub fn aggregated_rlc<E: ExtensionField>(claims: &[E], challenges: &[E]) -> E {
-    assert_eq!(claims.len(), challenges.len());
-    claims
+pub fn aggregated_rlc<E: ExtensionField>(claims: &[E], challenges: &[E]) -> Result<E> {
+    ensure!(
+        claims.len() == challenges.len(),
+        "claims length not equal to challenges length {} != {}",
+        claims.len(),
+        challenges.len()
+    );
+    Ok(claims
         .par_iter()
         .zip(challenges)
         .fold(|| E::ZERO, |acc, (claim, r)| acc + *claim * *r)
-        .reduce(|| E::ZERO, |res, acc| res + acc)
+        .reduce(|| E::ZERO, |res, acc| res + acc))
 }
 
 /// Compute multilinear identity test between two points: returns 1 if points are equal, 0 if different.

@@ -15,7 +15,7 @@ use crate::{
     model::InferenceTrace,
     tensor::{CommitmentId, get_root_of_unity},
 };
-use anyhow::{Context as _, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -433,7 +433,7 @@ where
         }
     }
 
-    pub fn prove_batch_ifft(&mut self, r: Vec<E>, prod: &[Vec<E>]) -> BatchFFTProof<E> {
+    pub fn prove_batch_ifft(&mut self, r: Vec<E>, prod: &[Vec<E>]) -> Result<BatchFFTProof<E>> {
         let scale: E = E::from_canonical_u64(prod[0].len() as u64).inverse();
 
         // Partition r in (r1,r2)
@@ -441,10 +441,10 @@ where
         let mut r2 = vec![E::ZERO; prod.len().ilog2() as usize];
         let r1_len = r1.len();
         r1.copy_from_slice(&r[..r1_len]);
-        assert_eq!(
-            r1[r1.len() - 1],
-            E::ZERO,
-            "Error in randomness init batch ifft"
+        ensure!(
+            r1[r1.len() - 1] == E::ZERO,
+            "Error in randomness init batch ifft {:?}",
+            r1[r1.len() - 1]
         );
         for i in 0..r2.len() {
             r2[i] = r[i + r1.len()];
@@ -483,13 +483,13 @@ where
         let (proofs, matrix_claims, points) =
             self.delegate_matrix_evaluation(&mut f_middle, &r1, out_point.clone(), true);
 
-        BatchFFTProof {
+        Ok(BatchFFTProof {
             proof,
             claims,
             point: out_point,
             matrix_eval: (proofs, matrix_claims),
             delegation_points: points,
-        }
+        })
     }
 
     pub fn prove<'d: 'a>(

@@ -154,26 +154,26 @@ impl<T: Clone + Copy + Default> FilterTensor<T> {
     /// This prepares the filter to be used to compute a FFT. Note the shape may
     /// be altered without the underlying data being padded, the padding happens
     /// during layer evaluation.
-    fn prepare_for_fft(&mut self, padded_input_shape: &Shape) {
+    fn prepare_for_fft(&mut self, padded_input_shape: &Shape) -> Result<()> {
         let FilterTensor::RawFilter(ref mut tensor) = self else {
             unreachable!("filter already ready for FFT")
         };
 
         // The ephemeral stage-2 filter tensor.
         let padded_shape = tensor.shape().next_power_of_two();
-        tensor.pad_to_shape(padded_shape);
+        tensor.pad_to_shape(padded_shape)?;
 
         let pre_fft_shape = tensor.shape().clone();
-        assert!(
+        ensure!(
             pre_fft_shape.product() == tensor.data().len(),
             "Shape does not match data length."
         );
-        assert!(
+        ensure!(
             pre_fft_shape.rank() == 4,
             "Tensor shape does not match a convolution. expected 4 got {}",
             pre_fft_shape.rank(),
         );
-        assert!(
+        ensure!(
             pre_fft_shape[2].is_power_of_two(),
             "Filter dimension is not power of two"
         );
@@ -191,6 +191,8 @@ impl<T: Clone + Copy + Default> FilterTensor<T> {
             tensor,
             pre_fft_shape,
         };
+
+        Ok(())
     }
 }
 
@@ -276,8 +278,10 @@ impl<T> Filter<T> {
 impl<T: Default + Clone + Copy> Filter<T> {
     /// Prepare the filter to be used in FFT computation by converting the
     /// encapsulated filter tensor from stage-1 to stage-3.
-    fn prepare_for_fft(&mut self, padded_input_shape: &Shape) {
-        self.tensor.prepare_for_fft(padded_input_shape);
+    fn prepare_for_fft(&mut self, padded_input_shape: &Shape) -> Result<()> {
+        self.tensor.prepare_for_fft(padded_input_shape)?;
+
+        Ok(())
     }
 }
 impl Filter<Element> {
@@ -288,7 +292,7 @@ impl Filter<Element> {
         &self,
         input: &Tensor<Element>,
         bias: &Tensor<Element>,
-    ) -> (Tensor<Element>, ConvData<F>) {
+    ) -> Result<(Tensor<Element>, ConvData<F>)> {
         /// Properly pad a filter
         ///
         /// We use this function so that filter is amenable to FFT based conv2d
@@ -315,55 +319,50 @@ impl Filter<Element> {
         let (tensor, pre_fft_shape) = self.as_fft_tensor();
 
         // Sanity check, this layer must have been padded to perform the FFT
-        assert_eq!(
-            pre_fft_shape[0],
-            tensor.dim(0),
+        ensure!(
+            pre_fft_shape[0] == tensor.dim(0),
             "The number of features maps must match after padding. original {:?} padded {:?}",
             pre_fft_shape,
             tensor.shape(),
         );
-        assert_eq!(
-            pre_fft_shape[1],
-            tensor.dim(1),
+        ensure!(
+            pre_fft_shape[1] == tensor.dim(1),
             "The number of channels out must match after padding. original {:?} padded {:?}",
             pre_fft_shape,
             tensor.shape(),
         );
-        assert!(
+        ensure!(
             pre_fft_shape[2] <= tensor.dim(2),
             "The padded width must be greater-than-equal the original width. original {:?} padded {:?}",
             pre_fft_shape,
             tensor.shape(),
         );
-        assert!(
+        ensure!(
             pre_fft_shape[3] <= tensor.dim(3),
             "The padded height must be greater-than-equal the original height. original {:?} padded {:?}",
             pre_fft_shape,
             tensor.shape(),
         );
-        assert!(
+        ensure!(
             tensor.dim(2).is_power_of_two(),
             "The padded width must be a power of two",
         );
-        assert!(
+        ensure!(
             tensor.dim(3).is_power_of_two(),
             "The padded height must be a power of two",
         );
-        assert_eq!(
-            input.shape().rank(),
-            3,
+        ensure!(
+            input.shape().rank() == 3,
             "Only 3D input tensors are supported",
         );
-        assert_eq!(
-            input.dim(0),
-            tensor.dim(1),
+        ensure!(
+            input.dim(0) == tensor.dim(1),
             "Grouping is not support, input and output channels must match. input {:?} padded {:?}",
             input,
             tensor.shape(),
         );
-        assert_eq!(
-            input.dim(1),
-            input.dim(2),
+        ensure!(
+            input.dim(1) == input.dim(2),
             "Input must be square. shape {:?}",
             input.shape(),
         );
@@ -377,7 +376,7 @@ impl Filter<Element> {
         // This will also collect proving/debugging data.
         let (input_fft, input): (Vec<Vec<F>>, Vec<Vec<F>>) = real_input
             .par_chunks(n_x * n_x)
-            .map(|chunk| {
+            .map(|chunk| -> anyhow::Result<_> {
                 let xx_input = chunk.iter().cloned().rev().collect::<Vec<_>>();
                 let mut xx_fft = xx_input
                     .iter()
@@ -385,10 +384,26 @@ impl Filter<Element> {
                     .chain(std::iter::repeat(F::ZERO))
                     .take(new_n)
                     .collect::<Vec<_>>();
-                fft(&mut xx_fft, false);
-                (xx_fft, xx_input)
+                fft(&mut xx_fft, false)?;
+                Ok((xx_fft, xx_input))
             })
-            .unzip();
+            .try_fold(
+                || (Vec::new(), Vec::new()),
+                |mut acc, pair| -> anyhow::Result<_> {
+                    let (fft, inp) = pair?;
+                    acc.0.push(fft);
+                    acc.1.push(inp);
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || (Vec::new(), Vec::new()),
+                |mut a, mut b| {
+                    a.0.append(&mut b.0);
+                    a.1.append(&mut b.1);
+                    Ok(a)
+                },
+            )?;
 
         let mut output = vec![vec![F::ZERO; 2 * filter_size(tensor.shape())]; tensor.dim(0)];
 
@@ -412,7 +427,7 @@ impl Filter<Element> {
                 .collect::<Vec<F>>();
 
                 // Convert the convolution filter to frequency domain
-                fft(&mut w_fft_temp, false);
+                fft(&mut w_fft_temp, false)?;
 
                 // Perform the point wise multiplication
                 for k in 0..batch_output.len() {
@@ -424,17 +439,16 @@ impl Filter<Element> {
         // Convert the result back from the frequency domain
         let prod = output.clone();
         for elt in output.iter_mut() {
-            fft(elt, true);
+            fft(elt, true)?;
         }
 
         let mut conv_data = ConvData::new(real_input, input, input_fft, prod, output, n_x);
         let mut result = Tensor::new(
             vec![tensor.shape()[0], n_x, n_x].into(),
             conv_data.output_as_element.clone(),
-        );
-        assert_eq!(
-            result.data().len(),
-            result.shape().product(),
+        )?;
+        ensure!(
+            result.data().len() == result.shape().product(),
             "Result should have the correct number of elements",
         );
 
@@ -452,7 +466,7 @@ impl Filter<Element> {
         // XXX: Deentagle ConvData and the result.
         conv_data.set_output(result.get_data());
 
-        (result, conv_data)
+        Ok((result, conv_data))
     }
 }
 
@@ -468,14 +482,14 @@ pub struct Convolution<T> {
     bias: KeyedTensor<T>,
 }
 impl<T> Convolution<T> {
-    pub fn new(filter: KeyedTensor<T>, bias: KeyedTensor<T>) -> Self {
-        assert_eq!(bias.rank(), 1);
-        assert_eq!(filter.dim(0), bias.shape()[0]);
-        assert_eq!(filter.rank(), 4);
-        Self {
+    pub fn new(filter: KeyedTensor<T>, bias: KeyedTensor<T>) -> Result<Self> {
+        ensure!(bias.rank() == 1);
+        ensure!(filter.dim(0) == bias.shape()[0]);
+        ensure!(filter.rank() == 4);
+        Ok(Self {
             filter: Filter::new(filter),
             bias,
-        }
+        })
     }
 
     pub(crate) fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
@@ -507,9 +521,9 @@ impl<T> Convolution<T> {
         filter_size(self.filter.pre_fft_shape())
     }
 
-    fn num_outputs(num_inputs: usize) -> usize {
-        assert_eq!(num_inputs, 1);
-        1
+    fn num_outputs(num_inputs: usize) -> Result<usize> {
+        ensure!(num_inputs == 1);
+        Ok(1)
     }
 
     /// Returns this layers [ConvCtx].
@@ -529,7 +543,7 @@ impl<T> Convolution<T> {
     }
 }
 impl<T: Number> Convolution<T> {
-    pub(crate) fn new_without_bias(filter: KeyedTensor<T>) -> Self {
+    pub(crate) fn new_without_bias(filter: KeyedTensor<T>) -> Result<Self> {
         let bias = KeyedTensor::new(
             StorageKey::new(format!("{}_bias", filter.key)),
             Tensor::zeros(Shape::new(vec![filter.dim(0)])),
@@ -538,14 +552,18 @@ impl<T: Number> Convolution<T> {
     }
 }
 impl<T: TensorTypeParam> OpInfo for Convolution<T> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes
             .iter()
             .map(|shape| self.output_shape(shape, padding_mode))
-            .collect()
+            .collect())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         Self::num_outputs(num_inputs)
     }
 
@@ -562,7 +580,7 @@ impl Convolution<f32> {
     /// Quantizes the filter and the bias.
     /// It uses a custom scaling factor `bias_s` for the bias, if provided,
     /// otherwise the same scaling factor of the weights (i.e., `s`) is used
-    fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Convolution<Element> {
+    fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Result<Convolution<Element>> {
         let tensor = self.filter.as_pre_fft_tensor();
         let quantized_filter = tensor.to_quantized(s);
         let bias = self.bias.quantize(bias_s);
@@ -601,25 +619,30 @@ impl Convolution<Element> {
     /// are the same, i.e. the filter is a square. In cases this does happen the
     /// filter data is not padded, this is performed during fft computation at layer
     /// evaluation.
-    pub(crate) fn prepare_for_fft(&mut self, unpadded_input_shape: &Shape) {
+    pub(crate) fn prepare_for_fft(&mut self, unpadded_input_shape: &Shape) -> Result<()> {
         let padded_bias_shape = self.bias.shape().next_power_of_two();
-        self.bias.pad_to_shape(padded_bias_shape);
+        self.bias.pad_to_shape(padded_bias_shape)?;
 
         self.filter
-            .prepare_for_fft(&unpadded_input_shape.next_power_of_two());
+            .prepare_for_fft(&unpadded_input_shape.next_power_of_two())?;
+
+        Ok(())
     }
 
     /// Chainable version of [`prepare_for_fft`]
-    pub fn prepared_for_fft(mut self, unpadded_input_shape: &Shape) -> Self {
-        self.prepare_for_fft(unpadded_input_shape);
-        self
+    pub fn prepared_for_fft(mut self, unpadded_input_shape: &Shape) -> Result<Self> {
+        self.prepare_for_fft(unpadded_input_shape)?;
+        Ok(self)
     }
 
     /// Compute the convolution using FFT.
     ///
     /// See: https://en.wikipedia.org/wiki/Convolution_theorem
-    fn fft<E: ExtensionField>(&self, input: &Tensor<Element>) -> (Tensor<Element>, ConvData<E>) {
-        let (conv_output, proving_data) = self.filter.fft_conv(input, &self.bias);
+    fn fft<E: ExtensionField>(
+        &self,
+        input: &Tensor<Element>,
+    ) -> Result<(Tensor<Element>, ConvData<E>)> {
+        let (conv_output, proving_data) = self.filter.fft_conv(input, &self.bias)?;
 
         let unpadded_output_shape =
             conv2d_shape(&input.unpadded_shape().clone(), &self.filter.original_shape);
@@ -630,9 +653,9 @@ impl Convolution<Element> {
         );
 
         // Set additional data due to padding to `0`.
-        let cleared_tensor = clear_garbage(&conv_output, &unpadded_output_shape);
+        let cleared_tensor = clear_garbage(&conv_output, &unpadded_output_shape)?;
 
-        (cleared_tensor, proving_data)
+        Ok((cleared_tensor, proving_data))
     }
 
     /// Returns the maximum bitsize of the output of this layer
@@ -762,7 +785,7 @@ impl Convolution<Element> {
         // 0s) The non-cleared tensor claim gets passed to the main regular
         // logic of convolution The clearing tensor one gets stored in the proof
         // and will be checked manually by the verifier (CURRENTLY)
-        let clearing_tensor = new_clearing_tensor(unpadded_output_shape, output.shape());
+        let clearing_tensor = new_clearing_tensor(unpadded_output_shape, output.shape())?;
         // Take the elements BEFORE bias addition - this is what the rest of the
         // convolution proving step expects.
         //
@@ -771,7 +794,7 @@ impl Convolution<Element> {
         let conv_after_bias = Tensor::new(
             output.shape().clone(),
             proving_data.output_as_element.clone(),
-        );
+        )?;
         debug_assert!({
             info!(
                 "PROVE: conv_after_bias.shape(): {:?}",
@@ -800,14 +823,13 @@ impl Convolution<Element> {
         );
 
         let filter = self;
-        assert_eq!(
-            filter.fft_filter_size() * filter.kw() * 2,
-            proving_data.output.len() * proving_data.output[0].len(),
+        ensure!(
+            filter.fft_filter_size() * filter.kw() * 2
+                == proving_data.output.len() * proving_data.output[0].len(),
             "Inconsistent output size"
         );
-        assert_eq!(
-            (filter.fft_filter_size() * filter.kw()).ilog2() as usize,
-            last_claim.point.len(),
+        ensure!(
+            (filter.fft_filter_size() * filter.kw()).ilog2() as usize == last_claim.point.len(),
             "Inconsistent random point size. Expected : {}, got: {}",
             ((filter.fft_filter_size() * filter.kw()).ilog2()),
             last_claim.point.len()
@@ -853,11 +875,10 @@ impl Convolution<Element> {
             claims: ifft_claim,
             matrix_eval: ifft_del_proof,
             delegation_points: ifft_delegation_points,
-        } = prover.prove_batch_ifft(r.clone(), &proving_data.prod);
+        } = prover.prove_batch_ifft(r.clone(), &proving_data.prod)?;
 
-        assert_eq!(
-            filter.fft_filter_size().ilog2() as usize + 1,
-            ifft_proof_point.len(),
+        ensure!(
+            filter.fft_filter_size().ilog2() as usize + 1 == ifft_proof_point.len(),
             "Error in ifft sumceck"
         );
 
@@ -932,7 +953,7 @@ impl Convolution<Element> {
         let mut aggregated_filter = vec![vec![E::ZERO; og_filter_size]; tensor.dim(1)];
         // Compute aggregated_filter using iterators
         // TO DO: PARALLELIZE
-        (0..tensor.dim(1)).for_each(|i| {
+        (0..tensor.dim(1)).try_for_each(|i| -> Result<()> {
             (0..tensor.dim(0)).for_each(|j| {
                 aggregated_filter[i]
                     .iter_mut()
@@ -952,8 +973,10 @@ impl Convolution<Element> {
             )
             .collect::<Vec<E>>();
 
-            fft(&mut aggregated_filter[i], false);
-        });
+            fft(&mut aggregated_filter[i], false)?;
+
+            Ok(())
+        })?;
 
         // We need to fix the high variables in place for the filter at r1.
         let f1 = aggregated_filter
@@ -1018,9 +1041,8 @@ impl Convolution<Element> {
             ]
             .concat();
             let y = tensor.to_field::<E>().into_mle().evaluate(&r);
-            assert_eq!(
-                y,
-                partial_evals.clone().into_mle().evaluate(&weights_rand),
+            ensure!(
+                y == partial_evals.clone().into_mle().evaluate(&weights_rand),
                 "Error in fft_weights eval"
             );
             let mut indexes = vec![0_usize; self.pre_fft_filter_size()];
@@ -1041,9 +1063,8 @@ impl Convolution<Element> {
                 .map(|(&beta, &eval)| beta * eval)
                 .sum();
 
-            assert_eq!(
-                y,
-                fft_weight_claims[0] * v_weights,
+            ensure!(
+                y == fft_weight_claims[0] * v_weights,
                 "Error in padded weights eval"
             );
             y == fft_weight_claims[0] * v_weights
@@ -1114,16 +1135,15 @@ impl Convolution<Element> {
                 .collect::<Vec<E>>()
                 .into_mle()
                 .evaluate(&p);
-            assert_eq!(y, fft_claim[0] * v, "Error in input eval CONV PROVER");
+            ensure!(y == fft_claim[0] * v, "Error in input eval CONV PROVER");
             for element in p
                 .iter_mut()
                 .take((filter.fft_filter_size().ilog2()) as usize)
             {
                 *element = E::ONE - *element;
             }
-            assert_eq!(
-                proving_data.real_input.clone().into_mle().evaluate(&p),
-                fft_claim[0] * v,
+            ensure!(
+                proving_data.real_input.clone().into_mle().evaluate(&p) == fft_claim[0] * v,
                 "Error in real input eval CONV PROVER"
             );
             proving_data.real_input.clone().into_mle().evaluate(&p) == fft_claim[0] * v
@@ -1219,10 +1239,10 @@ impl Evaluate<Element> for Convolution<Element> {
             self.filter.original_shape.next_power_of_two(),
         );
 
-        let kernels = filter.reduce_to_shape(&self.filter.original_shape);
+        let kernels = filter.reduce_to_shape(&self.filter.original_shape)?;
         let bias = self
             .bias
-            .reduce_to_shape(&Shape::new(vec![self.filter.original_shape[0]]));
+            .reduce_to_shape(&Shape::new(vec![self.filter.original_shape[0]]))?;
 
         let input = input.clone().reduce_to_shape(unpadded_input_shape)?;
         let input = if input.rank() == 4 {
@@ -1247,7 +1267,7 @@ impl Evaluate<Element> for Convolution<Element> {
         // conv2d always return a 4D tensor
         let padded = {
             let mut native = Tensor::try_from(conv_output)?;
-            native.pad_to_shape(fft_shape);
+            native.pad_to_shape(fft_shape)?;
             WrappedTensor::try_from(&native)?
         };
 
@@ -1319,7 +1339,7 @@ impl Convolution<f32> {
                 Some((min_quantized, max_quantized)),
             )
         };
-        let quantized_conv = self.quantize(&model_scaling, &bias_scaling);
+        let quantized_conv = self.quantize(&model_scaling, &bias_scaling)?;
         let intermediate_bit_size = quantized_conv.output_bitsize();
         let requant = Requant::from_scaling_factors(
             *input_scaling,
@@ -1328,7 +1348,7 @@ impl Convolution<f32> {
             intermediate_bit_size,
         );
 
-        Ok(QuantizeOutput::new(quantized_conv, vec![output_scaling]).with_requant(requant))
+        QuantizeOutput::new(quantized_conv, vec![output_scaling]).with_requant(requant)
     }
 }
 
@@ -1342,7 +1362,7 @@ impl QuantizeOp for Convolution<f32> {
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len());
+        let num_outputs = self.num_outputs(input_scaling.len())?;
         let mut output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
         ensure!(
             output_scalings.len() == 1,
@@ -1397,7 +1417,7 @@ impl PadOp for Convolution<Element> {
             "Filter dimensions in convolution have to be smaller than input dimensions",
         );
 
-        self.prepare_for_fft(&shape_data.input_shape_og);
+        self.prepare_for_fft(&shape_data.input_shape_og)?;
         let output_shape: Shape = safe_conv2d_shape(&shape_data.input_shape_padded, &filter_shape)?;
         shape_data.input_shape_padded = output_shape.next_power_of_two();
         Ok(self)
@@ -1446,7 +1466,7 @@ where
         let output_tensor = step_data.output_tensor_at(0, store)?;
 
         let fft_data = step_data.node_outputs.try_convdata().unwrap();
-        let (_, conv_data) = self.fft(&fft_data.input);
+        let (_, conv_data) = self.fft(&fft_data.input)?;
 
         Ok(vec![self.prove_convolution_step(
             prover,
@@ -1473,24 +1493,25 @@ fn to_bits<E: ExtensionField>(mut num: usize, bitlen: usize) -> Vec<E> {
 /// This function iterates over the dimensions that have been increased via padding,
 /// and zero out the values in the padded regions, preserving the values in the original
 /// space.
-fn clear_garbage<T: Number>(output_tensor: &Tensor<T>, unpadded_output_shape: &Shape) -> Tensor<T> {
+fn clear_garbage<T: Number>(
+    output_tensor: &Tensor<T>,
+    unpadded_output_shape: &Shape,
+) -> Result<Tensor<T>> {
     let unpadded_output_shape = if unpadded_output_shape.len() == 4 {
-        assert_eq!(unpadded_output_shape[0], 1, "Grouping is not supported");
+        ensure!(unpadded_output_shape[0] == 1, "Grouping is not supported");
         unpadded_output_shape.slice(1..)
     } else {
         unpadded_output_shape.clone()
     };
 
-    assert_eq!(
-        output_tensor.shape().rank(),
-        unpadded_output_shape.rank(),
+    ensure!(
+        output_tensor.shape().rank() == unpadded_output_shape.rank(),
         "The original and padded shapes must have the same rank. original {} padded {}",
         output_tensor.shape().rank(),
         unpadded_output_shape.rank(),
     );
-    assert_eq!(
-        output_tensor.shape().rank(),
-        3,
+    ensure!(
+        output_tensor.shape().rank() == 3,
         "Only rank 3 shapes are supported. got {}",
         output_tensor.shape().rank(),
     );
@@ -1519,24 +1540,22 @@ fn clear_garbage<T: Number>(output_tensor: &Tensor<T>, unpadded_output_shape: &S
 /// the positions matching original and zero in the padded positions.
 ///
 /// The returned tensor can be used to clear out garbage via multiplication.
-fn new_clearing_tensor(og_shape: &Shape, padded_shape: &Shape) -> Tensor<Element> {
+fn new_clearing_tensor(og_shape: &Shape, padded_shape: &Shape) -> Result<Tensor<Element>> {
     let og_shape = if og_shape.len() == 4 {
-        assert_eq!(og_shape[0], 1, "Grouping is not supported");
+        ensure!(og_shape[0] == 1, "Grouping is not supported");
         og_shape.slice(1..)
     } else {
         og_shape.clone()
     };
 
-    assert_eq!(
-        padded_shape.rank(),
-        og_shape.rank(),
+    ensure!(
+        padded_shape.rank() == og_shape.rank(),
         "The original and padded shapes must have the same rank. original {} padded {}",
         padded_shape.rank(),
         og_shape.rank(),
     );
-    assert_eq!(
-        padded_shape.rank(),
-        3,
+    ensure!(
+        padded_shape.rank() == 3,
         "Only rank 3 shapes are supported. got {}",
         padded_shape.rank(),
     );
@@ -1589,22 +1608,21 @@ pub(crate) fn conv2d<T: Number>(
     kernels: &Tensor<T>,
     bias: &Tensor<T>,
     stride: usize,
-) -> Tensor<T> {
+) -> Result<Tensor<T>> {
     // (N x C x H x W)
     let (batch_size, channels_in, height_in, width_in) = input.get4d();
     // (M x C/group x kH x kW)
     let (feature_maps, channels_out, kernel_height, kernel_width) = kernels.get4d();
 
-    assert!(input.rank() <= 4, "Supports at most 4D input.");
-    assert!(kernels.rank() <= 4, "Supports at most 4D filters.");
-    assert_eq!(
-        channels_in,
-        channels_out,
+    ensure!(input.rank() <= 4, "Supports at most 4D input.");
+    ensure!(kernels.rank() <= 4, "Supports at most 4D filters.");
+    ensure!(
+        channels_in == channels_out,
         "Grouping is not supported, input channels {channels_in} and kernel {channels_out} must match! {:?} vs kernel {:?}",
         input.shape(),
         kernels.shape()
     );
-    assert!(
+    ensure!(
         bias.shape().as_ref() == &[feature_maps],
         "Bias shape must match number of kernels!",
     );
@@ -1639,16 +1657,16 @@ pub(crate) fn conv2d<T: Number>(
                     for kw in 0..kernel_width {
                         let h = oh * stride + kh;
                         let w = ow * stride + kw;
-                        let input_val = input.get_at_4d(batch, channel, h, w);
-                        let weight_val = kernels.get_at_4d(o, channel, kh, kw);
+                        let input_val = input.get_at_4d(batch, channel, h, w)?;
+                        let weight_val = kernels.get_at_4d(o, channel, kh, kw)?;
                         sum += input_val * weight_val;
                     }
                 }
             }
 
-            sum + bias.data()[o]
+            Ok(sum + bias.data()[o])
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Tensor::new(shape_out, output)
 }

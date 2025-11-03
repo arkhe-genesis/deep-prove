@@ -98,17 +98,17 @@ impl<T> OperandMatrix<T> {
         }
     }
 
-    pub(crate) fn nrows(&self) -> Option<usize> {
+    pub(crate) fn nrows(&self) -> Result<Option<usize>> {
         match self {
-            OperandMatrix::Weight(mat) => Some(mat.tensor.nrows_2d()),
-            OperandMatrix::Input => None,
+            OperandMatrix::Weight(mat) => Ok(Some(mat.tensor.nrows_2d()?)),
+            OperandMatrix::Input => Ok(None),
         }
     }
 
-    pub(crate) fn ncols(&self) -> Option<usize> {
+    pub(crate) fn ncols(&self) -> Result<Option<usize>> {
         match self {
-            OperandMatrix::Weight(mat) => Some(mat.tensor.ncols_2d()),
-            OperandMatrix::Input => None,
+            OperandMatrix::Weight(mat) => Ok(Some(mat.tensor.ncols_2d()?)),
+            OperandMatrix::Input => Ok(None),
         }
     }
 
@@ -194,7 +194,7 @@ impl<T> MatMul<T> {
             right_matrix.is_matrix(),
             "right matrix for MatMul layer is not a matrix"
         );
-        if let (Some(left_cols), Some(right_rows)) = (left_matrix.ncols(), right_matrix.nrows()) {
+        if let (Some(left_cols), Some(right_rows)) = (left_matrix.ncols()?, right_matrix.nrows()?) {
             ensure!(
                 left_cols == right_rows,
                 "Number of columns in left matrix different from number of rows of right matrix: {left_cols} != {right_rows}",
@@ -307,7 +307,7 @@ impl<T> MatMul<T> {
         };
         let data = res.to_data().into_vec().expect("Failed to compute MatMul");
         let shape = Shape::new(vec![left_cols, right_rows]);
-        let out = Tensor::new(shape, data);
+        let out = Tensor::new(shape, data)?;
         Ok(out)
     }
 
@@ -454,9 +454,12 @@ impl<T> MatMul<T> {
         (point_for_left, point_for_right)
     }
 
-    fn num_outputs(num_inputs: usize) -> usize {
-        assert!(num_inputs < 3, "MatMul layer should have at most 2 inputs");
-        1
+    fn num_outputs(num_inputs: usize) -> Result<usize> {
+        ensure!(
+            num_inputs < 3,
+            "MatMul layer should have at most 2 inputs, got {num_inputs}"
+        );
+        Ok(1)
     }
 }
 
@@ -469,30 +472,27 @@ fn compute_output_shapes(
     left_matrix_shape: Option<&Shape>,
     right_matrix_shape: Option<&Shape>,
     config: &Option<Config>,
-) -> Vec<Shape> {
+) -> Result<Vec<Shape>> {
     let (left_shape, right_shape) = match (left_matrix_shape, right_matrix_shape) {
         (None, None) => {
-            assert_eq!(
-                input_shapes.len(),
-                2,
+            ensure!(
+                input_shapes.len() == 2,
                 "Expected 2 inputs for MatMul layer found {}",
                 input_shapes.len()
             );
             (&input_shapes[0], &input_shapes[1])
         }
         (None, Some(shape)) => {
-            assert_eq!(
-                input_shapes.len(),
-                1,
+            ensure!(
+                input_shapes.len() == 1,
                 "Expected 1 input for MatMul layer found {}",
                 input_shapes.len()
             );
             (&input_shapes[0], shape)
         }
         (Some(shape), None) => {
-            assert_eq!(
-                input_shapes.len(),
-                1,
+            ensure!(
+                input_shapes.len() == 1,
                 "Expected 1 input for MatMul layer found {}",
                 input_shapes.len()
             );
@@ -505,17 +505,22 @@ fn compute_output_shapes(
     } else {
         right_shape.clone()
     };
-    assert_eq!(
-        left_shape[1], right_shape[0],
+    ensure!(
+        left_shape[1] == right_shape[0],
         "Incompatible shapes for MatMul layer: left matrix has {} columns, right matrix has {} rows",
-        left_shape[1], right_shape[0],
+        left_shape[1],
+        right_shape[0],
     );
-    vec![Shape::new(vec![left_shape[0], right_shape[1]])]
+    Ok(vec![Shape::new(vec![left_shape[0], right_shape[1]])])
 }
 const IS_PROVABLE: bool = true;
 
 impl<N: TensorTypeParam> OpInfo for MatMul<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         let left_matrix_shape = self.left_matrix.get_shape(padding_mode);
         let right_matrix_shape = self.right_matrix.get_shape(padding_mode);
         compute_output_shapes(
@@ -526,7 +531,7 @@ impl<N: TensorTypeParam> OpInfo for MatMul<N> {
         )
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         Self::num_outputs(num_inputs)
     }
 
@@ -652,10 +657,10 @@ impl MatMul<f32> {
             .as_ref()
             .map(|_bias| bias_scaling_matmul(&input_scaling[0], &output_scaling));
         let quantized = self.quantize(&left_matrix_scaling, &right_matrix_scaling, bias_scaling);
-        let output_bitsize = quantized.output_bitsize(*quantization::MIN, *quantization::MAX);
+        let output_bitsize = quantized.output_bitsize(*quantization::MIN, *quantization::MAX)?;
         let requant = Requant::from_multiplier(multiplier, output_bitsize);
 
-        Ok(QuantizeOutput::new(quantized, vec![output_scaling]).with_requant(requant))
+        QuantizeOutput::new(quantized, vec![output_scaling]).with_requant(requant)
     }
 }
 
@@ -669,7 +674,7 @@ impl QuantizeOp for MatMul<f32> {
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len());
+        let num_outputs = self.num_outputs(input_scaling.len())?;
         let mut output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
         ensure!(
             output_scalings.len() == 1,
@@ -728,17 +733,17 @@ const MAX_BITS: u32 = 30;
 
 impl MatMul<Element> {
     /// Returns the maximum bit size of the output, given the provided bounds on the inputs
-    pub fn output_bitsize(&self, min_input: Element, max_input: Element) -> usize {
+    pub fn output_bitsize(&self, min_input: Element, max_input: Element) -> anyhow::Result<usize> {
         // Get either the number of columns of the left matrix or the number of rows of the right matrix,
         // which corresponds to the number of additions performed in a matrix multiplication.
         // If neither of the 2 matrices is constant in the model, then this number
         // will be undefined, and in this case the default value of MAX_BITS is used.
-        let ncols = self.left_matrix.ncols().or(if self.is_right_transposed() {
-            self.right_matrix.ncols()
+        let ncols = self.left_matrix.ncols()?.or(if self.is_right_transposed() {
+            self.right_matrix.ncols()?
         } else {
-            self.right_matrix.nrows()
+            self.right_matrix.nrows()?
         });
-        ncols
+        Ok(ncols
             .map(|ncols| {
                 // Number of addition is defined, so we return the number of bits as
                 // min_bits + max_bits + log(ncols) + 1, where `min_bit` and `max_bit` are the
@@ -747,7 +752,7 @@ impl MatMul<Element> {
                 let max_bits = max_input.abs().ilog2() + 1;
                 min_bits + max_bits + ncols.ilog2() + 1
             })
-            .unwrap_or(MAX_BITS) as usize
+            .unwrap_or(MAX_BITS) as usize)
     }
 
     // Return evaluations for the constant matrix employed in the layer.
@@ -847,17 +852,17 @@ impl MatMul<Element> {
             right_matrix.shape().is_matrix(),
             "right input matrix for MatMul layer is not a matrix"
         );
-        let nrows_left = left_matrix.nrows_2d();
+        let nrows_left = left_matrix.nrows_2d()?;
         let ncols_right = if transposed {
-            right_matrix.nrows_2d()
+            right_matrix.nrows_2d()?
         } else {
-            right_matrix.ncols_2d()
+            right_matrix.ncols_2d()?
         };
         ensure!(
             output.shape().is_matrix(),
             "Output tensor for MatMul layer is not a matrix"
         );
-        let (nrows_out, ncols_out) = (output.nrows_2d(), output.ncols_2d());
+        let (nrows_out, ncols_out) = (output.nrows_2d()?, output.ncols_2d()?);
         ensure!(
             nrows_out == nrows_left,
             "Wrong number of rows in output matrix: expected {nrows_left}, found {nrows_out}",
@@ -876,8 +881,8 @@ impl MatMul<Element> {
         );
 
         // construct the MLE combining the input and the matrix
-        let mut right_mat_mle: MultilinearExtension<'_, E> = right_matrix.to_mle_2d();
-        let mut left_mat_mle = left_matrix.to_mle_2d();
+        let mut right_mat_mle: MultilinearExtension<'_, E> = right_matrix.to_mle_2d()?;
+        let mut left_mat_mle = left_matrix.to_mle_2d()?;
         // For a repeating matrix M like [v,v,v,...], where v is a column vector, then
         // the trick is that M(r1,r2) = v(r1) - here we take the right split that corresponds to
         // the number of variables that the bias has and subtract its eval from the last claim.
@@ -910,7 +915,7 @@ impl MatMul<Element> {
 
         // check that after fixing the variables in both matrices the number of free
         // variables is the same
-        assert_eq!(left_mat_mle.num_vars(), right_mat_mle.num_vars());
+        ensure!(left_mat_mle.num_vars() == right_mat_mle.num_vars());
 
         let num_vars = left_mat_mle.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
@@ -994,7 +999,7 @@ impl MatMul<Element> {
         };
 
         ctx_aux.last_output_shape =
-            self.output_shapes(&ctx_aux.last_output_shape, PaddingMode::Padding);
+            self.output_shapes(&ctx_aux.last_output_shape, PaddingMode::Padding)?;
 
         let left_matrix_shapes = self
             .left_matrix
@@ -1041,7 +1046,11 @@ impl MatMul<Element> {
 }
 
 impl OpInfo for MatMulCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         let left_matrix_shape = self
             .left_matrix_shapes
             .as_ref()
@@ -1064,7 +1073,7 @@ impl OpInfo for MatMulCtx {
         )
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         MatMul::<Element>::num_outputs(num_inputs)
     }
 
@@ -1499,7 +1508,7 @@ mod tests {
             .unwrap(),
         );
 
-        let input_shape = vec![matrix.ncols_2d(), 5];
+        let input_shape = vec![matrix.ncols_2d().unwrap(), 5];
 
         // Create input data that needs quantization
         let mut rng = rng_from_env_or_random();
@@ -1527,7 +1536,7 @@ mod tests {
         let padded = layer.clone().pad_next_power_of_two().unwrap();
 
         // Create input tensor
-        let input_tensor = Tensor::<Element>::new(input_shape.into(), quantized_input);
+        let input_tensor = Tensor::<Element>::new(input_shape.into(), quantized_input).unwrap();
 
         // Apply the layer operation on both original and padded
         let output = layer.op(vec![&input_tensor]).unwrap();
@@ -1559,8 +1568,12 @@ mod tests {
     #[test]
     fn test_matmul() {
         let matmul = MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap();
-        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
-        let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
+        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .into_wrapped();
+        let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .into_wrapped();
         let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b]).unwrap();
         assert_eq!(result.outputs[0].get_data(), vec![22.0, 28.0, 49.0, 64.0]);
     }
@@ -1575,8 +1588,11 @@ mod tests {
         )
         .unwrap();
 
-        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).into_wrapped();
+        let a = Tensor::new(vec![2, 3].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
+            .into_wrapped();
         let b = Tensor::new(vec![3, 2].into(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap()
             .into_wrapped()
             .transpose();
         let result = matmul.evaluate::<GoldilocksExt2>(&[&a, &b]).unwrap();
@@ -1704,11 +1720,11 @@ mod tests {
             let Input { left, right, kind, transpose_b, bias } = input;
 
             let right_ = if transpose_b {
-                right.clone().transpose()
+                right.clone().transpose().unwrap()
             } else {
                 right.clone()
             };
-            let expected = left.clone().matmul(&right_);
+            let expected = left.clone().matmul(&right_).unwrap();
             let expected = if let Some(bias) = bias.as_ref() {
                 expected.add_dim2(bias)
             } else {
@@ -1747,11 +1763,11 @@ mod tests {
             let Input { left, right, kind, transpose_b, bias } = input;
 
             let right_ = if transpose_b {
-                right.clone().transpose()
+                right.clone().transpose().unwrap()
             } else {
                 right.clone()
             };
-            let expected = left.clone().matmul(&right_);
+            let expected = left.clone().matmul(&right_).unwrap();
             let expected = if let Some(bias) = bias.as_ref() {
                 expected.add_dim2(bias)
             } else {

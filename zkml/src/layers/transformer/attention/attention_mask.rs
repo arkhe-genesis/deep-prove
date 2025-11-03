@@ -214,7 +214,7 @@ impl<N: TensorTypeParam> AttentionMask<N> {
             .into_vec()
             .map_err(|e| anyhow::anyhow!("Failed to apply Casual Mask: {e:?}"))?;
 
-        let output = Tensor::new(input.shape().clone(), masked_data);
+        let output = Tensor::new(input.shape().clone(), masked_data)?;
         // println!("Mask output: {output}");
         Ok(output)
     }
@@ -340,7 +340,11 @@ where
         } else if input.rank() == 3 {
             output.squeeze(0)?
         } else {
-            assert_eq!(input.rank(), 4);
+            ensure!(
+                input.rank() == 4,
+                "expected input rank of 4, got {}",
+                input.rank()
+            );
             output
         };
         Ok(output)
@@ -565,12 +569,16 @@ impl PadOp for AttentionMask<Element> {
 }
 
 impl<N: TensorTypeParam> OpInfo for AttentionMask<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -705,12 +713,16 @@ impl<E: ExtensionField> AttentionMaskCtx<E> {
 }
 
 impl<E: ExtensionField> OpInfo for AttentionMaskCtx<E> {
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -1316,7 +1328,8 @@ mod tests {
             section.copy_from_slice(to_copy);
             new_full_tensor.extend(new_full_head);
         }
-        let padded_full_input = Tensor::new(padded_full_input.shape().clone(), new_full_tensor);
+        let padded_full_input =
+            Tensor::new(padded_full_input.shape().clone(), new_full_tensor).unwrap();
         println!("num_heads: {num_heads}, q_len: {q_len}, seq_len: {seq_len}");
         println!(
             "padded_num_heads: {padded_num_heads}, padded_q_len: {padded_q_len}, padded_seq_len: {padded_seq_len}"

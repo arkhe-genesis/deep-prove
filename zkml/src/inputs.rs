@@ -1,6 +1,6 @@
 use std::{io::BufReader, path::Path};
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -43,9 +43,9 @@ impl Input {
         Ok(())
     }
 
-    pub fn filter(&self, indices: Option<&Vec<usize>>) -> Self {
+    pub fn filter(&self, indices: Option<&Vec<usize>>) -> Result<Self> {
         if let Some(indices) = indices {
-            assert!(
+            ensure!(
                 indices.iter().all(|i| *i < self.input_data.len()),
                 "Index {} is out of range (max: {})",
                 indices.iter().max().unwrap(),
@@ -55,9 +55,9 @@ impl Input {
                 .iter()
                 .map(|i| self.input_data[*i].clone())
                 .collect();
-            Self { input_data }
+            Ok(Self { input_data })
         } else {
-            self.clone()
+            Ok(self.clone())
         }
     }
 

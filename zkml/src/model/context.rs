@@ -65,7 +65,7 @@ impl<E: ExtensionField> ModelCtx<E> {
                                 }),
                         )
                         .unzip();
-                        shapes.insert(node_id, layer.shape_step(&un, &pad));
+                        shapes.insert(node_id, layer.shape_step(&un, &pad)?);
                     }
                     Node::Input(i) => {
                         shapes.insert(

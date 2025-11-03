@@ -863,7 +863,7 @@ impl WrappedTensor<Element> {
         let Self::Rank1(bias, ..) = bias else {
             bail!("Unexpected bias rank: {bias_rank}, expected 1.")
         };
-        let out = zkml_conv2d_i(x, weight, bias, options);
+        let out = zkml_conv2d_i(x, weight, bias, options)?;
         Ok(WrappedTensor::Rank4(out, unpadded_shape))
     }
 
@@ -873,7 +873,7 @@ impl WrappedTensor<Element> {
             bail!("Unexpected input rank: {input_rank}, expected 4.")
         };
         Ok(WrappedTensor::Rank4(
-            zkml_max_pool2d_i(input, config),
+            zkml_max_pool2d_i(input, config)?,
             unpadded_shape,
         ))
     }
@@ -1105,7 +1105,7 @@ where
             .to_data()
             .into_vec()
             .map_err(|e| anyhow::format_err!("{e:?}"))?;
-        Ok(Tensor::<T>::new(shape, data))
+        Tensor::<T>::new(shape, data)
     }
 }
 
@@ -1178,7 +1178,7 @@ mod test {
     #[test]
     fn test_tensor_next_pow_of_two() {
         let shape = Shape::new(vec![1, 1, 1, 1]);
-        let tensor = Tensor::new(shape.clone(), vec![1]).into_wrapped();
+        let tensor = Tensor::new(shape.clone(), vec![1]).unwrap().into_wrapped();
         assert_eq!(
             tensor.clone().pad_next_power_of_two().to_native(),
             tensor.to_native(),
@@ -1186,7 +1186,9 @@ mod test {
         );
 
         let shape = Shape::new(vec![2, 2]);
-        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2]).into_wrapped();
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2])
+            .unwrap()
+            .into_wrapped();
         assert_eq!(
             tensor.clone().pad_next_power_of_two().to_native(),
             tensor.to_native(),
@@ -1202,7 +1204,9 @@ mod test {
         );
 
         let shape = Shape::new(vec![3, 3]);
-        let tensor = Tensor::new(shape.clone(), vec![1, 2, 3, 1, 2, 3, 1, 2, 3]).into_wrapped();
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 3, 1, 2, 3, 1, 2, 3])
+            .unwrap()
+            .into_wrapped();
         let new_tensor = tensor.pad_next_power_of_two();
         assert_eq!(
             Shape::from(new_tensor.shape()),
@@ -1216,7 +1220,9 @@ mod test {
         );
 
         let shape = Shape::new(vec![3, 2]);
-        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2, 1, 2]).into_wrapped();
+        let tensor = Tensor::new(shape.clone(), vec![1, 2, 1, 2, 1, 2])
+            .unwrap()
+            .into_wrapped();
         let new_tensor = tensor.pad_next_power_of_two();
         assert_eq!(
             Shape::from(new_tensor.shape()),
@@ -1236,6 +1242,7 @@ mod test {
                 1, 1, 1, 2, 2, 2, 3, 3, 3, 11, 11, 11, 12, 12, 12, 13, 13, 13,
             ],
         )
+        .unwrap()
         .into_wrapped();
         let new_tensor = tensor.pad_next_power_of_two();
         assert_eq!(

@@ -82,28 +82,29 @@ fn output_shape(input_shape: &Shape, matrix_shape: &Shape) -> Shape {
 }
 
 impl<T: TensorTypeParam> Dense<T> {
-    pub fn new(matrix: KeyedTensor<T>, bias: KeyedTensor<T>) -> Self {
+    pub fn new(matrix: KeyedTensor<T>, bias: KeyedTensor<T>) -> Result<Self> {
         Self::new_with(matrix, Some(bias))
     }
-    pub fn new_with(matrix: KeyedTensor<T>, bias: Option<KeyedTensor<T>>) -> Self {
+    pub fn new_with(matrix: KeyedTensor<T>, bias: Option<KeyedTensor<T>>) -> Result<Self> {
         if let Some(ref bbias) = bias {
-            assert_eq!(matrix.nrows_2d(), bbias.shape()[0]);
+            ensure!(matrix.nrows_2d()? == bbias.shape()[0]);
         }
-        Self { matrix, bias }
+        Ok(Self { matrix, bias })
     }
-    pub fn ncols(&self) -> usize {
+    pub fn ncols(&self) -> Result<usize> {
         self.matrix.ncols_2d()
     }
-    pub fn nrows(&self) -> usize {
+    pub fn nrows(&self) -> Result<usize> {
         self.matrix.nrows_2d()
     }
 
-    pub fn pad_next_power_of_two(self) -> Self {
+    pub fn pad_next_power_of_two(self) -> Result<Self> {
         let matrix = self.matrix.map_tensor(|t| t.pad_next_power_of_two());
         let bias = self
             .bias
-            .map(|b| b.map_tensor(|t| t.pad_1d(matrix.nrows_2d())));
-        Self { matrix, bias }
+            .map(|b| b.try_map_tensor(|t| t.pad_1d(matrix.nrows_2d()?)))
+            .transpose()?;
+        Ok(Self { matrix, bias })
     }
 
     pub fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
@@ -114,29 +115,33 @@ impl<T: TensorTypeParam> Dense<T> {
         output_shape(input_shape, &matrix_shape)
     }
 
-    fn num_outputs(num_inputs: usize) -> usize {
-        assert_eq!(num_inputs, 1);
-        1
+    fn num_outputs(num_inputs: usize) -> Result<usize> {
+        ensure!(num_inputs == 1);
+        Ok(1)
     }
 }
 
 const IS_PROVABLE: bool = true;
 
 impl<N: TensorTypeParam> OpInfo for Dense<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes
             .iter()
             .map(|shape| self.output_shape(shape, padding_mode))
-            .collect()
+            .collect())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         Self::num_outputs(num_inputs)
     }
 
     fn describe(&self) -> String {
         format!(
-            "Dense: ({}x{}) + bias ({})",
+            "Dense: ({:?}x{:?}) + bias ({})",
             self.nrows(),
             self.ncols(),
             !self
@@ -187,9 +192,10 @@ impl ProveInfo for Dense<Element> {
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         // construct dimension of the polynomial given to the sumcheck
+        let n_rows = self.nrows()?;
         aux.last_output_shape
             .iter_mut()
-            .for_each(|shape| *shape = Shape::new(vec![self.nrows()]));
+            .for_each(|shape| *shape = Shape::new(vec![n_rows]));
 
         let dense_info = LayerCtx::Dense(DenseCtx {
             node_id: id,
@@ -247,7 +253,7 @@ impl Dense<f32> {
         );
         let input_scaling = &input_scaling[0];
         let quantized_dense = self.quantize(&model_scaling, &bias_scaling);
-        let intermediate_bit_size = quantized_dense.output_bitsize();
+        let intermediate_bit_size = quantized_dense.output_bitsize()?;
         let requant = Requant::from_scaling_factors(
             *input_scaling,
             model_scaling,
@@ -255,7 +261,7 @@ impl Dense<f32> {
             intermediate_bit_size,
         );
 
-        Ok(QuantizeOutput::new(quantized_dense, vec![output_scaling]).with_requant(requant))
+        QuantizeOutput::new(quantized_dense, vec![output_scaling]).with_requant(requant)
     }
 }
 
@@ -269,7 +275,7 @@ impl QuantizeOp for Dense<f32> {
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len());
+        let num_outputs = self.num_outputs(input_scaling.len())?;
         let mut output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
         ensure!(
             output_scalings.len() == 1,
@@ -315,14 +321,18 @@ where
 }
 
 impl OpInfo for DenseCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes
             .iter()
             .map(|shape| self.output_shape(shape, padding_mode))
-            .collect()
+            .collect())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         Dense::<Element>::num_outputs(num_inputs)
     }
 
@@ -407,22 +417,26 @@ impl Dense<f32> {
 
 impl Dense<Element> {
     /// Returns the (min,max) output range of the dense layer for a given input range.
-    pub fn output_range(&self, _min_input: Element, _max_input: Element) -> (Element, Element) {
+    pub fn output_range(
+        &self,
+        _min_input: Element,
+        _max_input: Element,
+    ) -> Result<(Element, Element)> {
         // formula is 2^{2 * BIT_LEN + log(c) + 1} where c is the number of columns and +1 because of the bias
-        let ncols = self.matrix.ncols_2d() as u32;
+        let ncols = self.matrix.ncols_2d()? as u32;
         // - 1 because numbers are signed so only half of the range is used when doing multiplication
         let power = 2 * (*quantization::BIT_LEN as u32 - 1) + ncols.ilog2() + 1;
         let min = -(2u64.pow(power) as Element);
         let max = 2u64.pow(power) as Element;
-        (min, max)
+        Ok((min, max))
     }
 
     /// Returns the maximum size in bits of the output
-    pub fn output_bitsize(&self) -> usize {
+    pub fn output_bitsize(&self) -> Result<usize> {
         // formula is 2^{2 * BIT_LEN + log(c) + 1} where c is the number of columns and +1 because of the bias
-        let ncols = self.matrix.ncols_2d();
+        let ncols = self.matrix.ncols_2d()?;
         // - 1 because numbers are signed so only half of the range is used when doing multiplication
-        2 * (*quantization::BIT_LEN - 1) + ceil_log2(ncols) + 1
+        Ok(2 * (*quantization::BIT_LEN - 1) + ceil_log2(ncols) + 1)
     }
 
     #[timed::timed_instrument(name = "Prover::prove_dense")]
@@ -444,31 +458,27 @@ impl Dense<Element> {
         PCS::ProverParam: Send + Sync,
     {
         let matrix = &self.matrix;
-        let (nrows, ncols) = (self.nrows(), self.ncols());
-        assert_eq!(
-            nrows,
-            output.get_data().len(),
+        let (nrows, ncols) = (self.nrows()?, self.ncols()?);
+        ensure!(
+            nrows == output.get_data().len(),
             "dense proving: nrows {} vs output {}",
             nrows,
             output.get_data().len()
         );
-        assert_eq!(
-            nrows.ilog2() as usize,
-            last_claim.point.len(),
+        ensure!(
+            nrows.ilog2() as usize == last_claim.point.len(),
             "something's wrong with the randomness"
         );
-        assert_eq!(
-            ncols,
-            input.get_data().len(),
+        ensure!(
+            ncols == input.get_data().len(),
             "something's wrong with the input"
         );
         // Evaluates the bias at the random point so verifier can subtract the evaluation
         // from the sumcheck claim that is only about the matrix2vec product.
         // If there is no bias, then then there is no bias claim as well !
         let bias_eval = if let Some(bias) = &self.bias {
-            assert_eq!(
-                bias.get_data().len().ilog2() as usize,
-                last_claim.point.len(),
+            ensure!(
+                bias.get_data().len().ilog2() as usize == last_claim.point.len(),
                 "something's wrong with the randomness"
             );
             Some(bias.to_field::<E>().into_mle().evaluate(&last_claim.point))
@@ -476,7 +486,7 @@ impl Dense<Element> {
             None
         };
         // construct the MLE combining the input and the matrix
-        let mut mat_mle: MultilinearExtension<'_, E> = matrix.to_2d_mle();
+        let mut mat_mle: MultilinearExtension<'_, E> = matrix.to_2d_mle()?;
         // fix the variables from the random input
         // NOTE: here we must fix the HIGH variables because the MLE is addressing in little
         // endian so (rows,cols) is actually given in (cols, rows)
@@ -490,7 +500,7 @@ impl Dense<Element> {
         let input_expr = expr_builder.lift(Either::Left(&input_mle));
         let dense_expr = mat_expr * input_expr;
         let virtual_poly = expr_builder.to_virtual_polys(&[dense_expr], &[]);
-        assert_eq!(mat_mle.num_vars(), input_mle.num_vars());
+        ensure!(mat_mle.num_vars() == input_mle.num_vars());
 
         let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
 
@@ -665,7 +675,7 @@ mod test {
     impl<T: TensorTypeParam> Dense<T> {
         /// Require a `layer_name` in case there is the need to use different tensor
         /// keys form the default ones
-        pub fn random(shape: Shape, layer_name: Option<CommitmentId>) -> Self {
+        pub fn random(shape: Shape, layer_name: Option<CommitmentId>) -> Result<Self> {
             assert_eq!(shape.len(), 2);
             let (nrows, ncols) = (shape[0], shape[1]);
             let layer_name = layer_name.unwrap_or("dense".to_string().into());
@@ -698,13 +708,13 @@ mod test {
 
         let bias = KeyedTensor::new(
             "dense_bias",
-            Tensor::<Element>::new(vec![3].into(), vec![10, 11, 12]),
+            Tensor::<Element>::new(vec![3].into(), vec![10, 11, 12]).unwrap(),
         );
 
-        let dense = Dense::new(matrix, bias);
+        let dense = Dense::new(matrix, bias).unwrap();
 
         // Pad to next power of two
-        let padded = dense.pad_next_power_of_two();
+        let padded = dense.pad_next_power_of_two().unwrap();
 
         // Check padded dimensions are powers of two
         let padded_dims = padded.matrix.shape();
@@ -752,13 +762,13 @@ mod test {
 
         let bias = KeyedTensor::new(
             "dense_bias",
-            Tensor::<Element>::new(vec![4].into(), vec![20, 21, 22, 23]),
+            Tensor::<Element>::new(vec![4].into(), vec![20, 21, 22, 23]).unwrap(),
         );
 
-        let dense = Dense::new(matrix, bias);
+        let dense = Dense::new(matrix, bias).unwrap();
 
         // Pad to next power of two
-        let padded = dense.clone().pad_next_power_of_two();
+        let padded = dense.clone().pad_next_power_of_two().unwrap();
 
         // Check dimensions remain the same
         let padded_dims = padded.matrix.shape();
@@ -797,13 +807,13 @@ mod test {
 
         let bias = KeyedTensor::new(
             "dense_bias",
-            Tensor::<Element>::new(vec![3].into(), vec![20, 21, 22]),
+            Tensor::<Element>::new(vec![3].into(), vec![20, 21, 22]).unwrap(),
         );
 
-        let dense = Dense::new(matrix, bias);
+        let dense = Dense::new(matrix, bias).unwrap();
 
         // Pad to next power of two
-        let padded = dense.pad_next_power_of_two();
+        let padded = dense.pad_next_power_of_two().unwrap();
 
         // Check dimensions are padded correctly
         let padded_dims = padded.matrix.shape();
@@ -848,16 +858,18 @@ mod test {
 
         let bias = KeyedTensor::new(
             "dense_bias",
-            Tensor::<Element>::new(vec![2].into(), vec![10, 11]),
+            Tensor::<Element>::new(vec![2].into(), vec![10, 11]).unwrap(),
         );
 
-        let dense = Dense::new(matrix, bias);
+        let dense = Dense::new(matrix, bias).unwrap();
 
         // Pad the dense layer
-        let padded = dense.clone().pad_next_power_of_two();
+        let padded = dense.clone().pad_next_power_of_two().unwrap();
 
         // Create input tensor
-        let input_tensor = Tensor::<Element>::new(vec![3].into(), quantized_input).into_wrapped();
+        let input_tensor = Tensor::<Element>::new(vec![3].into(), quantized_input)
+            .unwrap()
+            .into_wrapped();
 
         // Apply the dense operation on both original and padded
         let output = evaluate_layer::<GoldilocksExt2, _, _>(&dense, &[&input_tensor])
@@ -884,7 +896,7 @@ mod test {
         let mut model =
             Model::new_from_input_shapes(vec![first_input_shape.into()], PaddingMode::NoPadding);
 
-        let dense = Dense::<f32>::random(vec![b, a].into(), None);
+        let dense = Dense::<f32>::random(vec![b, a].into(), None).unwrap();
 
         let _ = model
             .add_consecutive_layer(Layer::Dense(dense), None)
@@ -899,9 +911,9 @@ mod test {
         fn test_dense_with_element(input in any_input::<Element>(2..256)) {
             let Input {matrix, bias, input} = input;
 
-            let expected = matrix.matvec(&input).add(&bias);
+            let expected = matrix.matvec(&input).unwrap().add(&bias);
 
-            let dense = Dense::<Element>::new(matrix.clone(), bias.clone());
+            let dense = Dense::<Element>::new(matrix.clone(), bias.clone()).unwrap();
             let input = input.into_wrapped();
             let computed = dense.evaluate::<GoldilocksExt2>(&[&input]).expect("Dense evaluation must be successful");
 
@@ -916,9 +928,9 @@ mod test {
         fn test_dense_with_f32(input in any_input::<f32>(2..256)) {
             let Input {matrix, bias, input} = input;
 
-            let expected = matrix.matvec(&input).add(&bias);
+            let expected = matrix.matvec(&input).unwrap().add(&bias);
 
-            let dense = Dense::<f32>::new(matrix.clone(), bias.clone());
+            let dense = Dense::<f32>::new(matrix.clone(), bias.clone()).unwrap();
             let input = input.into_wrapped();
             let computed = dense.evaluate::<GoldilocksExt2>(&[&input]).expect("Dense evaluation must be successful");
 

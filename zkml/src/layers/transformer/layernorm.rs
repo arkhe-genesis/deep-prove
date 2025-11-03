@@ -122,28 +122,26 @@ pub struct LayerNormData {
 }
 
 impl<N: Number> LayerNorm<N> {
-    pub fn new(gamma: KeyedTensor<N>, beta: KeyedTensor<N>, eps: f32) -> Self {
-        assert_eq!(
-            gamma.shape(),
-            beta.shape(),
+    pub fn new(gamma: KeyedTensor<N>, beta: KeyedTensor<N>, eps: f32) -> Result<Self> {
+        ensure!(
+            gamma.shape() == beta.shape(),
             "Gamma and beta shape must match. gamma {:?} beta {:?}",
             gamma.shape(),
             beta.shape(),
         );
-        assert_eq!(
-            gamma.rank(),
-            1,
+        ensure!(
+            gamma.rank() == 1,
             "Gamma and beta must be 1D. gamma {:?} beta {:?}",
             gamma.shape(),
             beta.shape(),
         );
 
-        Self {
+        Ok(Self {
             gamma,
             beta,
             eps,
             quant_info: None,
-        }
+        })
     }
 
     /// Returns the size of the dimension normalisation occurs over.
@@ -230,10 +228,7 @@ impl<N: Number> LayerNorm<N> {
                 })
                 .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-            Ok(Tensor::<Element>::new(
-                gamma.shape().clone(),
-                quant_gamma_data,
-            ))
+            Tensor::<Element>::new(gamma.shape().clone(), quant_gamma_data)
         })?;
         // Work out how to quantise the bias, it needs to have the same scale factor as the end product.
         // This will be `input_scaling.scale() * model_scaling.scale() * 1.0f32 / LAYERNORM_OUTPUT_SCALE_FACTOR as f32`
@@ -261,10 +256,7 @@ impl<N: Number> LayerNorm<N> {
                 })
                 .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
-            Ok(Tensor::<Element>::new(
-                beta.shape().clone(),
-                quant_bias_data,
-            ))
+            Tensor::<Element>::new(beta.shape().clone(), quant_bias_data)
         })?;
 
         ensure!(
@@ -310,7 +302,7 @@ impl LayerNorm<f32> {
         let gamma = l.get_tensor("norm.weight")?;
         let beta = l.get_tensor("norm.bias")?;
         let eps = l.metadata_to_f32("norm_epsilon")?;
-        Ok(Self::new(gamma, beta, eps))
+        Self::new(gamma, beta, eps)
     }
     // Replaces from_var_builder and from_tensor_loader
     // The 'loader' passed here is expected to be pre-scoped by the caller
@@ -333,7 +325,7 @@ impl LayerNorm<f32> {
         let eps = loader
             .metadata::<f32>(&loader.norm_epsilon_key(&c.model_name, NormType::LayerNorm))
             .context("norm_epsilon not found")?;
-        Ok(Self::new(gamma, beta, eps))
+        Self::new(gamma, beta, eps)
     }
 
     pub fn from_safetensors(
@@ -358,7 +350,7 @@ impl LayerNorm<f32> {
             c.embedding_size,
             beta.shape()
         );
-        Ok(Self::new(gamma, beta, eps))
+        Self::new(gamma, beta, eps)
     }
 }
 
@@ -388,12 +380,16 @@ pub struct LayerNormCtx<E: ExtensionField> {
 
 impl<E: ExtensionField> OpInfo for LayerNormCtx<E> {
     // https://docs.rs/burn/0.17.0/burn/nn/struct.LayerNorm.html#method.forward
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -410,12 +406,16 @@ impl<E: ExtensionField> OpInfo for LayerNormCtx<E> {
 
 impl<N: TensorTypeParam> OpInfo for LayerNorm<N> {
     // https://docs.rs/burn/0.17.0/burn/nn/struct.LayerNorm.html#method.forward
-    fn output_shapes(&self, input_shapes: &[Shape], _padding_mode: PaddingMode) -> Vec<Shape> {
-        input_shapes.to_vec()
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        _padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(input_shapes.to_vec())
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -691,7 +691,7 @@ impl QuantizeOp for LayerNorm<f32> {
             intermediate_bit_size,
         )?;
 
-        Ok(QuantizeOutput::new(quantised_layernorm, vec![output_scaling]).with_requant(requant))
+        QuantizeOutput::new(quantised_layernorm, vec![output_scaling]).with_requant(requant)
     }
 }
 
@@ -1413,6 +1413,7 @@ mod tests {
             );
             let eps = 1e-5;
             Self::new(gamma, beta, eps)
+                .expect("gamma und beta are created with the same sizes; qed")
         }
     }
 
@@ -1422,11 +1423,11 @@ mod tests {
     fn test_layernorm() {
         let gamma = KeyedTensor::new(
             "layernorm_gamma",
-            Tensor::<f32>::new(vec![1024].into(), vec![1.0; 1024]),
+            Tensor::<f32>::new(vec![1024].into(), vec![1.0; 1024]).unwrap(),
         );
         let beta = KeyedTensor::new(
             "layernorm_beta",
-            Tensor::<f32>::new(vec![1024].into(), vec![0.0; 1024]),
+            Tensor::<f32>::new(vec![1024].into(), vec![0.0; 1024]).unwrap(),
         );
         let eps = 1e-5;
         let layernorm = LayerNorm {
@@ -1435,7 +1436,9 @@ mod tests {
             eps,
             quant_info: None,
         };
-        let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]).into_wrapped();
+        let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024])
+            .unwrap()
+            .into_wrapped();
         let output = layernorm.evaluate::<E>(&[&input]).unwrap();
         assert_eq!(output.outputs[0].shape(), vec![1_usize, 1024].into());
         assert_eq!(output.outputs[0].get_data(), vec![0.0; 1024]);
@@ -1643,7 +1646,8 @@ mod tests {
                 -126, -128, 105, -111, -47, 89, -113, 9, -64, 42, -111, 54, 104, 62, 127, 12, 84,
                 7, -54, -80, 0, -122, -41,
             ],
-        );
+        )
+        .unwrap();
         let gamma = KeyedTensor::new(
             "layernorm_gamma",
             Tensor::<Element>::new(
@@ -1651,7 +1655,8 @@ mod tests {
                 vec![
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ],
-            ),
+            )
+            .unwrap(),
         );
         let beta = KeyedTensor::new(
             "layernorm_beta",
@@ -1660,13 +1665,14 @@ mod tests {
                 vec![
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ],
-            ),
+            )
+            .unwrap(),
         );
 
         // NOTE:
         // Layer quantisation changes the values of beta and gamma, use the
         // values stored in the layer for the comparison.
-        let layer = LayerNorm::new(gamma, beta, 1e-5);
+        let layer = LayerNorm::new(gamma, beta, 1e-5).unwrap();
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 
@@ -1704,7 +1710,7 @@ mod tests {
             // Layer quantisation changes the values of beta and gamma, use the
             // values stored in the layer for the comparison.
             let data = input.clone();
-            let layer = LayerNorm::new(input.gamma, input.beta, 1e-5);
+            let layer = LayerNorm::new(input.gamma, input.beta, 1e-5).unwrap();
             let input_scaling = ScalingFactor::from_tensor(&input.input, None);
             let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 

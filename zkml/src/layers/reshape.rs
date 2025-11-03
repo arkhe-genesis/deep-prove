@@ -11,7 +11,7 @@ use crate::{
     padding::{PaddingMode, pad_reshape_layer},
     tensor::{TensorTypeParam, WrappedTensor},
 };
-use anyhow::ensure;
+use anyhow::{Result, ensure};
 use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
@@ -171,19 +171,23 @@ impl Reshape {
 }
 
 impl OpInfo for Reshape {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         let reshape = match padding_mode {
             PaddingMode::NoPadding => self.to_unpadded_reshape(),
             PaddingMode::Padding => self.to_padded_reshape(),
         };
         match reshape.internal_output(input_shapes) {
-            Ok(out) => out,
+            Ok(out) => Ok(out),
             Err(e) => panic!("invalid reshape parameters: {e:?}"),
         }
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -219,10 +223,9 @@ impl Reshape {
         let output_shapes =
             self.internal_output(&inputs.iter().map(|x| x.shape().clone()).collect::<Vec<_>>())?;
         let mut out_tensors = inputs.iter().map(|&x| x.clone()).collect::<Vec<_>>();
-        output_shapes
-            .into_iter()
-            .zip(out_tensors.iter_mut())
-            .for_each(|(new_dim, input_tensor)| input_tensor.reshape(new_dim));
+        for (new_dim, input_tensor) in output_shapes.into_iter().zip(out_tensors.iter_mut()) {
+            input_tensor.reshape(new_dim)?
+        }
         Ok(out_tensors)
     }
 }
@@ -263,18 +266,22 @@ impl ProveInfo for Reshape {
         _id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(super::LayerCtx<E>, ContextAux)> {
-        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding);
+        aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
 
         Ok((LayerCtx::Reshape(ReshapeCtx(self.clone())), aux))
     }
 }
 
 impl OpInfo for ReshapeCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         self.0.output_shapes(input_shapes, padding_mode)
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         self.0.num_outputs(num_inputs)
     }
 
@@ -311,7 +318,8 @@ mod tests {
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
             ],
-        );
+        )
+        .unwrap();
         let reshape = Reshape::new_fixed(vec![vec![3, 2, 3].into()]);
         let output = reshape
             .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
@@ -322,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_reshape_squeeze() {
-        let input = Tensor::<Element>::new(vec![2, 3].into(), vec![0, 1, 2, 3, 4, 5]);
+        let input = Tensor::<Element>::new(vec![2, 3].into(), vec![0, 1, 2, 3, 4, 5]).unwrap();
         let reshape = Reshape::new_squeeze(1);
         let output = reshape
             .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
@@ -336,7 +344,8 @@ mod tests {
         let input = Tensor::<Element>::new(
             vec![2, 12].into(),
             (0..24).map(|i| i as Element).collect::<Vec<_>>(),
-        );
+        )
+        .unwrap();
         println!(
             "expected output: {:?}",
             input
@@ -361,7 +370,8 @@ mod tests {
         let input = Tensor::<Element>::new(
             vec![2, 6, 2].into(),
             (0..24).map(|i| i as Element).collect::<Vec<_>>(),
-        );
+        )
+        .unwrap();
         println!(
             "expected output: {:?}",
             input

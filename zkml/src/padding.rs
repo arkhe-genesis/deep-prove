@@ -47,7 +47,7 @@ impl GarbagePad {
                     previous_input_shape_og.as_ref(),
                     previous_input_shape_padded.as_ref(),
                     &padded_matrix_shape,
-                );
+                )?;
             }
             GarbagePad::MHA(previous_shape) => {
                 *matrix = pad_matrix_to_ignore_mha_garbage(
@@ -243,16 +243,16 @@ pub(crate) fn pad_dense(mut d: Dense<Element>, si: &mut ShapeInfo) -> Result<Den
         sd.input_shape_padded = vec![sd.input_shape_padded.product()].into();
         sd.input_shape_og = vec![sd.input_shape_og.product()].into();
     }
-    let mut new_cols = d.matrix.ncols_2d();
-    if d.matrix.ncols_2d() != sd.input_shape_padded.dim(0) {
-        if d.matrix.ncols_2d() < sd.input_shape_padded.dim(0) {
+    let mut new_cols = d.matrix.ncols_2d()?;
+    if d.matrix.ncols_2d()? != sd.input_shape_padded.dim(0) {
+        if d.matrix.ncols_2d()? < sd.input_shape_padded.dim(0) {
             new_cols = sd.input_shape_padded.dim(0);
         } else {
             // If we have too many columns, we can't shrink without losing information
             bail!(
                 "Dense layer matrix has more columns ({}) than previous layer output size ({}).
                             Cannot shrink without losing information.",
-                d.matrix.ncols_2d(),
+                d.matrix.ncols_2d()?,
                 sd.input_shape_padded.dim(0)
             );
         }
@@ -261,16 +261,19 @@ pub(crate) fn pad_dense(mut d: Dense<Element>, si: &mut ShapeInfo) -> Result<Den
     // be needing at least input shape of total size 4 due to usage of lookups.
     // current logup gkr implementation requires at least 2 variables for poly.
     let ncols = pad_minimum(new_cols);
-    let nrows = pad_minimum(d.matrix.nrows_2d());
+    let nrows = pad_minimum(d.matrix.nrows_2d()?);
 
     if let Some(garbage_pad) = sd.ignore_garbage_pad.as_ref() {
         garbage_pad.pad_matrix_to_ignore_garbage(&mut d.matrix, vec![nrows, ncols].into())?;
         sd.ignore_garbage_pad = None;
     } else {
         d.matrix
-            .reshape_to_fit_inplace_2d(vec![nrows, ncols].into());
+            .reshape_to_fit_inplace_2d(vec![nrows, ncols].into())?;
     }
-    d.bias = d.bias.map(|b| b.map_tensor(|t| t.pad_1d(nrows)));
+    d.bias = d
+        .bias
+        .map(|b| b.try_map_tensor(|t| t.pad_1d(nrows)))
+        .transpose()?;
     sd.input_shape_padded = vec![nrows].into();
     Ok(d)
 }
@@ -295,7 +298,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
         .map(|s| (s.input_shape_og.clone(), s.input_shape_padded.clone()))
         .collect();
     let mut unpadded_output_shapes =
-        mat.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding);
+        mat.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding)?;
     ensure!(
         unpadded_output_shapes.len() == 1,
         "Expected 1 unpadded output shape for MatMul, found {}",
@@ -304,18 +307,18 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
     let unpadded_output_shape = unpadded_output_shapes.pop().unwrap();
     let (left_shape, mut right_shape) = match (&mut mat.left_matrix, &mut mat.right_matrix) {
         (OperandMatrix::Weight(m), OperandMatrix::Input) => {
-            let nrows = pad_minimum(m.tensor.nrows_2d());
-            let ncols = pad_minimum(m.tensor.ncols_2d());
+            let nrows = pad_minimum(m.tensor.nrows_2d()?);
+            let ncols = pad_minimum(m.tensor.ncols_2d()?);
             m.tensor
-                .reshape_to_fit_inplace_2d(vec![nrows, ncols].into());
+                .reshape_to_fit_inplace_2d(vec![nrows, ncols].into())?;
             (
                 m.tensor.shape().clone(),
                 padded_input_shapes.pop().unwrap(), /* safe to unwrap since we checked the number of inputs at the beginning */
             )
         }
         (OperandMatrix::Input, OperandMatrix::Weight(m)) => {
-            let nrows = pad_minimum(m.tensor.nrows_2d());
-            let ncols = pad_minimum(m.tensor.ncols_2d());
+            let nrows = pad_minimum(m.tensor.nrows_2d()?);
+            let ncols = pad_minimum(m.tensor.ncols_2d()?);
             let padded_matrix_shape = vec![nrows, ncols].into();
             // check if there is garbage pad: this is the only case we support in matrix mul where there
             // could be garbage pad
@@ -323,7 +326,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
                 garbage_pad.pad_matrix_to_ignore_garbage(&mut m.tensor, padded_matrix_shape)?;
                 si.shapes[0].ignore_garbage_pad = None;
             } else {
-                m.tensor.reshape_to_fit_inplace_2d(padded_matrix_shape)
+                m.tensor.reshape_to_fit_inplace_2d(padded_matrix_shape)?
             };
             (padded_input_shapes.pop().unwrap(), m.tensor.shape().clone())
         }
@@ -355,7 +358,7 @@ pub(crate) fn pad_matmul(mut mat: MatMul<Element>, si: &mut ShapeInfo) -> Result
         ignore_garbage_pad: None,
     }];
     if let Some(bias) = &mut mat.bias {
-        bias.pad_to_shape(right_shape.slice(1..));
+        bias.pad_to_shape(right_shape.slice(1..))?;
     }
     Ok(mat)
 }
@@ -384,8 +387,8 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
     let unpadded_output_shapes = qkv.output_shapes(
         std::slice::from_ref(&sd.input_shape_og),
         PaddingMode::NoPadding,
-    );
-    let expected_num_outputs = qkv.num_outputs(1);
+    )?;
+    let expected_num_outputs = qkv.num_outputs(1).unwrap();
     ensure!(
         unpadded_output_shapes.len() == expected_num_outputs,
         "Expected {expected_num_outputs} unpadded output shapes for QKV layer, found {}",
@@ -406,7 +409,7 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
     let padded_num_heads = pad_minimum(qkv.num_heads);
     [&mut qkv.q, &mut qkv.k, &mut qkv.v].into_iter().try_for_each(|weight_mat| {
         let weight_tensor = weight_mat;
-        let nrows = weight_tensor.nrows_2d();
+        let nrows = weight_tensor.nrows_2d()?;
         ensure!(nrows <= sd.input_shape_padded.dim(1),
             "Weight matrices in QKV layer has more rows than the number of columns of padded input shapes: Expected at most {} rows, found {}",
             sd.input_shape_padded.dim(1), nrows,
@@ -416,33 +419,34 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
             nrows,
             qkv.num_heads,
             head_dim,
-        ]));
+        ]))?;
         let nrows = pad_minimum(sd.input_shape_padded.dim(1));
         weight_tensor.pad_to_shape(
             vec![nrows, padded_num_heads, padded_head_dim].into()
-        );
+        )?;
         weight_tensor.reshape(Shape::new(vec![
             nrows,
             padded_num_heads*padded_head_dim,
-        ]));
+        ]))?;
         Ok(())
     })?;
 
     // Pad bias vectors
     [&mut qkv.q_bias, &mut qkv.k_bias, &mut qkv.v_bias]
         .into_iter()
-        .for_each(|bias_vec| {
+        .try_for_each(|bias_vec| -> Result<()> {
             if let Some(bias) = bias_vec.as_mut() {
-                bias.reshape(Shape::new(vec![qkv.num_heads, head_dim]));
-                bias.pad_to_shape(vec![padded_num_heads, padded_head_dim].into());
-                bias.reshape(Shape::new(vec![padded_num_heads * padded_head_dim]));
+                bias.reshape(Shape::new(vec![qkv.num_heads, head_dim]))?;
+                bias.pad_to_shape(vec![padded_num_heads, padded_head_dim].into())?;
+                bias.reshape(Shape::new(vec![padded_num_heads * padded_head_dim]))?;
             }
-        });
+            Ok(())
+        })?;
 
     let padded_output_shapes = qkv.output_shapes(
         std::slice::from_ref(&sd.input_shape_padded),
         PaddingMode::Padding,
-    );
+    )?;
     ensure!(
         unpadded_output_shapes.len() == padded_output_shapes.len(),
         "Number of unpadded output shapes different from number of padded output shapes for QKV layer"
@@ -464,7 +468,7 @@ pub(crate) fn pad_qkv(mut qkv: QKV<Element>, si: &mut ShapeInfo) -> Result<QKV<E
         .collect();
 
     qkv.cache.lock().unwrap().padding_mode = PaddingMode::Padding;
-    assert_eq!(qkv.cache.lock().unwrap().full_seq_len(), 0);
+    ensure!(qkv.cache.lock().unwrap().full_seq_len() == 0);
 
     Ok(qkv)
 }
@@ -481,8 +485,9 @@ pub(crate) fn pad_concat_mat_mul(mat: ConcatMatMul, si: &mut ShapeInfo) -> Resul
 
     mat.ensure_shape_consistency(&unpadded_input_shapes)?;
 
-    let unpadded_output_shapes = mat.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding);
-    let expected_num_outputs = mat.num_outputs(2);
+    let unpadded_output_shapes =
+        mat.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding)?;
+    let expected_num_outputs = mat.num_outputs(2)?;
     ensure!(
         unpadded_output_shapes.len() == expected_num_outputs,
         "Expected {expected_num_outputs} unpadded output shapes when padding ConcatMatMul, found {}",
@@ -501,7 +506,7 @@ pub(crate) fn pad_concat_mat_mul(mat: ConcatMatMul, si: &mut ShapeInfo) -> Resul
         Ok(())
     })?;
 
-    let padded_output_shapes = mat.output_shapes(&padded_input_shapes, PaddingMode::Padding);
+    let padded_output_shapes = mat.output_shapes(&padded_input_shapes, PaddingMode::Padding)?;
 
     ensure!(
         padded_output_shapes.len() == expected_num_outputs,
@@ -529,10 +534,10 @@ pub(crate) fn pad_concat_mat_mul(mat: ConcatMatMul, si: &mut ShapeInfo) -> Resul
 
 pub(crate) fn pad_reshape_layer(reshape: Reshape, si: &mut ShapeInfo) -> Result<Reshape> {
     let unpadded_output_shapes =
-        reshape.output_shapes(&si.unpadded_input_shapes(), PaddingMode::NoPadding);
+        reshape.output_shapes(&si.unpadded_input_shapes(), PaddingMode::NoPadding)?;
 
     let padded_output_shapes =
-        reshape.output_shapes(&si.padded_input_shapes(), PaddingMode::Padding);
+        reshape.output_shapes(&si.padded_input_shapes(), PaddingMode::Padding)?;
 
     ensure!(
         unpadded_output_shapes.len() == padded_output_shapes.len(),

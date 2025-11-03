@@ -30,7 +30,7 @@ use crate::{
     quantization::{Fieldizer, TensorFielder},
     tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
-use anyhow::{Context, Ok, bail, ensure};
+use anyhow::{Context, Ok, Result, bail, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
@@ -290,16 +290,16 @@ impl<N: TensorTypeParam> Positional<N> {
         // now, evaluate the MLE of each sub-matrix
         let sub_matrix_evals = (0..diff_vars)
             .into_par_iter()
-            .map(|i| {
-                (
+            .map(|i| -> anyhow::Result<_> {
+                Ok((
                     i,
                     sub_matrices[i]
                         .to_fields()
-                        .to_mle_2d()
+                        .to_mle_2d()?
                         .evaluate(&evaluation_point[..sub_pos_vars + i]),
-                )
+                ))
             })
-            .collect::<BTreeMap<_, _>>()
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?
             .into_values()
             .collect::<Vec<_>>();
 
@@ -365,19 +365,27 @@ fn output_shapes(
 }
 
 impl<N: TensorTypeParam> OpInfo for Positional<N> {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
         match &self.variant {
-            PositionalVariant::Absolute(absolute) => {
-                output_shapes(input_shapes, &absolute.unpadded_shape, padding_mode)
-            }
-            PositionalVariant::Rope(rope) => {
-                output_shapes(input_shapes, &rope.unpadded_shape, padding_mode)
-            }
+            PositionalVariant::Absolute(absolute) => Ok(output_shapes(
+                input_shapes,
+                &absolute.unpadded_shape,
+                padding_mode,
+            )),
+            PositionalVariant::Rope(rope) => Ok(output_shapes(
+                input_shapes,
+                &rope.unpadded_shape,
+                padding_mode,
+            )),
         }
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {
@@ -494,10 +502,10 @@ impl Positional<f32> {
             };
             rope.cosine_matrix = rope
                 .cosine_matrix
-                .map_tensor(|t| expand(t, c.generic.num_heads));
+                .try_map_tensor(|t| expand(t, c.generic.num_heads))?;
             rope.sine_matrix = rope
                 .sine_matrix
-                .map_tensor(|t| expand(t, c.generic.num_heads));
+                .try_map_tensor(|t| expand(t, c.generic.num_heads))?;
             rope.unpadded_shape
                 .set_dim(-1, rope.unpadded_shape.dim(-1) * c.generic.num_heads);
             Ok(Positional::new_from_variant(PositionalVariant::Rope(rope)))
@@ -643,12 +651,20 @@ where
 }
 
 impl OpInfo for PositionalCtx {
-    fn output_shapes(&self, input_shapes: &[Shape], padding_mode: PaddingMode) -> Vec<Shape> {
-        output_shapes(input_shapes, self.unpadded_shape(), padding_mode)
+    fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        Ok(output_shapes(
+            input_shapes,
+            self.unpadded_shape(),
+            padding_mode,
+        ))
     }
 
-    fn num_outputs(&self, num_inputs: usize) -> usize {
-        num_inputs
+    fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
+        Ok(num_inputs)
     }
 
     fn describe(&self) -> String {

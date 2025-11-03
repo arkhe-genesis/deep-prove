@@ -126,9 +126,6 @@ impl EinSum<f32> {
             bias_unpadded_shapes: self.bias_unpadded_shapes,
             padded: self.padded,
         };
-        Ok(
-            QuantizeOutput::new(quantized_op, output_scaling_factors.to_vec())
-                .with_requants(requants),
-        )
+        QuantizeOutput::new(quantized_op, output_scaling_factors.to_vec()).with_requants(requants)
     }
 }
