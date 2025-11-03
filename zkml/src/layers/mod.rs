@@ -66,7 +66,6 @@ pub mod flatten;
 pub mod hadamard;
 pub mod matrix_mul;
 pub mod matvec;
-pub mod mul;
 pub mod permute;
 pub mod pooling;
 pub mod provable;
