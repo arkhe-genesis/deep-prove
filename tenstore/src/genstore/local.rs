@@ -9,8 +9,6 @@ use std::{
 };
 use weight_lru::LruCache;
 
-use super::GenericStore;
-
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct Storage {
     file: PathBuf,
@@ -100,8 +98,8 @@ impl<P: AsRef<Path>> std::fmt::Debug for LocalStore<P> {
     }
 }
 
-impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
-    fn fetch<T>(&mut self, storage_key: &StorageKey<T>) -> Result<T, StoreError>
+impl<P: AsRef<Path>> LocalStore<P> {
+    pub(crate) fn fetch<T>(&mut self, storage_key: &StorageKey<T>) -> Result<T, StoreError>
     where
         T: for<'a> Deserialize<'a>,
     {
@@ -127,7 +125,11 @@ impl<P: AsRef<Path>> GenericStore for LocalStore<P> {
         }
     }
 
-    fn store<T>(&mut self, storage_key: &StorageKey<T>, data: &T) -> Result<(), StoreError>
+    pub(crate) fn store<T>(
+        &mut self,
+        storage_key: &StorageKey<T>,
+        data: &T,
+    ) -> Result<(), StoreError>
     where
         T: Serialize,
     {

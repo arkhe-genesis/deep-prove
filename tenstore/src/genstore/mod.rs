@@ -9,12 +9,12 @@ use crate::{StorageKey, StoreError};
 
 pub trait GenericStore {
     /// Fetches the data specified by `storage_key`.
-    fn fetch<T>(&mut self, storage_key: &StorageKey<T>) -> Result<T, StoreError>
+    fn fetch<T>(&self, storage_key: &StorageKey<T>) -> Result<T, StoreError>
     where
         T: for<'a> Deserialize<'a>;
 
     /// Saves the `data` under `storage_key`.
-    fn store<T>(&mut self, storage_key: &StorageKey<T>, data: &T) -> Result<(), StoreError>
+    fn store<T>(&self, storage_key: &StorageKey<T>, data: &T) -> Result<(), StoreError>
     where
         T: Serialize;
 }
@@ -95,7 +95,7 @@ impl Default for GenStore {
 }
 
 impl GenericStore for GenStore {
-    fn fetch<T>(&mut self, storage_key: &StorageKey<T>) -> Result<T, StoreError>
+    fn fetch<T>(&self, storage_key: &StorageKey<T>) -> Result<T, StoreError>
     where
         T: for<'a> Deserialize<'a>,
     {
@@ -105,7 +105,7 @@ impl GenericStore for GenStore {
         }
     }
 
-    fn store<T>(&mut self, storage_key: &StorageKey<T>, data: &T) -> Result<(), StoreError>
+    fn store<T>(&self, storage_key: &StorageKey<T>, data: &T) -> Result<(), StoreError>
     where
         T: Serialize,
     {

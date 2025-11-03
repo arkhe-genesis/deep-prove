@@ -414,7 +414,7 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
     }
 
     /// Hydrate this dry tensor from `store`, generating a [`Tensor`] from it.
-    pub(crate) fn hydrate(&self, mut store: GenStore) -> Result<Tensor<T>, StoreError> {
+    pub(crate) fn hydrate(&self, store: GenStore) -> Result<Tensor<T>, StoreError> {
         store.fetch(&self.storage_key).map(|data| {
             Tensor::new_with_unpadded_shape(self.shape.clone(), self.unpadded_shape.clone(), data)
         })
