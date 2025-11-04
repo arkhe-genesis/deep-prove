@@ -41,8 +41,13 @@ jobs:
     permissions:
       pull-requests: write
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ['nix']
     steps:
+      - name: Sanity check
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -60,11 +65,16 @@ jobs:
               - 'zkml/**'
               - '.github/workflows/pr-bench.yml'
 
-      - uses: bencherdev/bencher@main
+      - name: Install bencher bin
+        shell: devenv shell bash -- -e {0}
+        run: cargo install --git https://github.com/bencherdev/bencher --tag v0.5.7 --locked bencher_cli --debug
+
       - name: Track PR Benchmarks with Bencher
+        shell: devenv shell bash -- -e {0}
         run: |
           cd zkml && \
           bencher run \
+          --host https://api.bencher.dev \
           --project deep-prove-private-70c58ed-ejzl400nndqc0 \
           --token '${{ secrets.BENCHER_API_TOKEN }}' \
           --branch "$GITHUB_HEAD_REF" \
