@@ -1,6 +1,8 @@
 //! Multihead attention layer:
 //! The module performs all the operations inside the multi-head attention layer, relying on
 //! ConcatMatMul and Softmax layers as building blocks.
+use std::slice::from_ref;
+
 use crate::{
     Claim, Element, Number, Prover, ScalingFactor, Shape, Tensor,
     graph::NodeId,
@@ -416,6 +418,8 @@ impl QuantizeOp for Mha<f32> {
         node_id: NodeId,
         input_scaling: &[crate::ScalingFactor],
         unpadded_input_shapes: &[Shape],
+        observed_output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
             input_scaling.len() == 3,
@@ -442,9 +446,14 @@ impl QuantizeOp for Mha<f32> {
         let QuantizeOutput {
             quantized_op: mut quantised_mask,
             ..
-        } = self
-            .mask
-            .quantize_op::<S>(data, node_id, &[product_scaling], &updated_shapes)?;
+        } = self.mask.quantize_op::<S>(
+            data,
+            node_id,
+            from_ref(&product_scaling),
+            &updated_shapes,
+            from_ref(&product_scaling),
+            &updated_shapes,
+        )?;
 
         // quantize data for softmax
         let quantised_softmax = self
@@ -481,11 +490,15 @@ impl QuantizeOp for Mha<f32> {
             None,
         );
         let final_mul_input_shapes = vec![updated_shapes[0].clone(), reshaped_inputs[2].clone()];
+        let final_mul_output_shapes =
+            updated_final_mul.output_shapes(&final_mul_input_shapes, PaddingMode::NoPadding)?;
         let quantized_out = updated_final_mul.quantize_op::<S>(
             data,
             node_id,
             &final_mul_scalings,
             &final_mul_input_shapes,
+            observed_output_scalings,
+            &final_mul_output_shapes,
         )?;
 
         let quantized_mha = Self::QuantizedOp {

@@ -631,10 +631,12 @@ impl QuantizeOp for LayerNorm<f32> {
 
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
+        _data: &S::AuxData,
+        _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        observed_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
         // First check we have one input_scaling
         ensure!(
@@ -650,7 +652,6 @@ impl QuantizeOp for LayerNorm<f32> {
             self.quantise(input_scaling_factor, model_scaling)?;
         // We will use the `intermediate_scaling` to work out a suitable `output_scaling`. Ideally `output_scaling` is 2^-s where the fractional part of `s` is the same as the fractional part of `intermediate_scaling`
         // and the integer part is such that 2^-s is as close as possible to the observed scaling factor.
-        let observed_scalings = S::scaling_factors_for_node(data, node_id, 1);
         ensure!(
             observed_scalings.len() == 1,
             "Observed scaling factors for LayerNorm layer different from 1, observed {}",

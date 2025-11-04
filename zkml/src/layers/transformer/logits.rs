@@ -288,17 +288,14 @@ impl QuantizeOp for Logits {
 
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
-        input_scaling: &[ScalingFactor],
+        _data: &S::AuxData,
+        _node_id: NodeId,
+        _input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        // no need to quantize, we just propagate the scaling factors
-        let num_inputs = input_scaling.len();
-        let num_outputs = self.num_outputs(num_inputs)?;
-        let output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
-
-        Ok(QuantizeOutput::new(self, output_scalings))
+        Ok(QuantizeOutput::new(self, output_scalings.to_vec()))
     }
 }
 

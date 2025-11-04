@@ -599,6 +599,8 @@ impl QuantizeOp for AttentionMask<f32> {
         _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        _output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
         // Ensure we have some scaling factors
         ensure!(

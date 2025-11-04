@@ -430,18 +430,19 @@ impl QuantizeOp for QKV<f32> {
     /// Convert an operation into its quantized version
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
+        _data: &S::AuxData,
+        _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len())?;
-        let output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
         ensure!(
             output_scalings.len() == num_outputs,
             "Output scaling for QKV layer different from {num_outputs}"
         );
-        self.quantize_from_scalings(input_scaling, &output_scalings)
+        self.quantize_from_scalings(input_scaling, output_scalings)
     }
 }
 

@@ -327,6 +327,8 @@ impl QuantizeOp for Activation<f32> {
         node_id: NodeId,
         input_scaling: &[crate::ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        _output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         let num_outputs = self.num_outputs(input_scaling.len())?;
         match self {

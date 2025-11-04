@@ -112,16 +112,31 @@ impl Absolute<f32> {
         node_id: NodeId,
         input_scaling: ScalingFactor,
         unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Absolute<Element>>> {
         // quantize positional matrix
         let max = self.positional.max_abs_output();
         let pos_scaling = ScalingFactor::from_absolute_max(max, None);
+
+        ensure!(
+            output_scalings.len() == 1,
+            "Expected 1 output scaling factor for absolute positional layer, found {}",
+            output_scalings.len()
+        );
+        ensure!(
+            unpadded_output_shapes.len() == 1,
+            "Expected 1 output shape for absolute positional layer, found {}",
+            unpadded_output_shapes.len()
+        );
 
         let quantized_add = self.add_layer.quantize_op::<S>(
             data,
             node_id,
             &[input_scaling, pos_scaling],
             unpadded_input_shapes,
+            output_scalings,
+            unpadded_output_shapes,
         )?;
 
         let quantized_pos = Absolute {
@@ -307,6 +322,7 @@ mod tests {
     use std::{
         fmt::Debug,
         ops::Deref,
+        slice::from_ref,
         sync::{Arc, Mutex},
     };
 
@@ -432,8 +448,16 @@ mod tests {
             let layer = Absolute::<f32>::new(pos.clone());
             let input_sf = ScalingFactor::from_tensor(&input, None);
             let shape = crate::Shape::new(vec![seq_len, embedding_size]);
+            let output_sf = ScalingFactor::from_tensor(&input, None);
             let q = layer
-                .quantize::<AbsoluteMax>(&(), 0.into(), input_sf, &[shape])
+                .quantize::<AbsoluteMax>(
+                    &(),
+                    0.into(),
+                    input_sf,
+                    from_ref(&shape),
+                    from_ref(&output_sf),
+                    from_ref(&shape),
+                )
                 .expect("quantize absolute should succeed");
             let layer_q = q.quantized_op;
             let input_q = input.to_quantized(&input_sf);

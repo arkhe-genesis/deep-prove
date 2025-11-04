@@ -321,19 +321,19 @@ impl QuantizeOp for EinSum<f32> {
 
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
+        _data: &S::AuxData,
+        _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.mapping.output_count();
-        let output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
         ensure!(
             output_scalings.len() == self.mapping.output_count(),
             "Output scaling for EinSum layer different from {}",
             self.mapping.output_count()
         );
-        self.quantise(input_scaling, &output_scalings, unpadded_input_shapes)
+        self.quantise(input_scaling, output_scalings, unpadded_input_shapes)
     }
 }
 

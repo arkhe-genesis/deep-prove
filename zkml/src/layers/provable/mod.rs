@@ -273,6 +273,8 @@ pub trait QuantizeOp {
         node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
+        output_scaling: &[ScalingFactor],
+        unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>>;
 }
 

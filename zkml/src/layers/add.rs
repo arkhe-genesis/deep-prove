@@ -457,17 +457,18 @@ impl QuantizeOp for Add<f32> {
 
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
+        _data: &S::AuxData,
+        _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let mut output_scalings = S::scaling_factors_for_node(data, node_id, 1);
         ensure!(
             output_scalings.len() == 1,
             "Output scaling for convolution layer different from 1"
         );
-        self.quantize(input_scaling, output_scalings.pop().unwrap())
+        self.quantize(input_scaling, output_scalings[0])
     }
 }
 

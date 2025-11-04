@@ -660,13 +660,14 @@ impl QuantizeOp for ConcatMatMul {
 
     fn quantize_op<S: crate::ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
+        _data: &S::AuxData,
+        _node_id: NodeId,
         input_scaling: &[crate::ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        output_scalings: &[crate::ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<super::provable::QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len())?;
-        let output_scale = S::scaling_factors_for_node(data, node_id, num_outputs)[0];
+        let output_scale = output_scalings[0];
         // normally it's input_scaling * model_scaling / output_scaling, except in this case, we don't have a model_scaling
         // but we have the second matrix scaling, so we use that.
         let input_scale = input_scaling[0];

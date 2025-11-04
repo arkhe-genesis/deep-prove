@@ -270,18 +270,18 @@ impl QuantizeOp for Dense<f32> {
 
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
+        _data: &S::AuxData,
+        _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let num_outputs = self.num_outputs(input_scaling.len())?;
-        let mut output_scalings = S::scaling_factors_for_node(data, node_id, num_outputs);
         ensure!(
             output_scalings.len() == 1,
             "Output scaling for convolution layer different from 1"
         );
-        let output_scaling = output_scalings.pop().unwrap();
+        let output_scaling = output_scalings[0];
         self.quantize_from_scalings(input_scaling, output_scaling)
     }
 }

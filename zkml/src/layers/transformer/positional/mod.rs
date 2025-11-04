@@ -427,11 +427,23 @@ impl QuantizeOp for Positional<f32> {
         node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         ensure!(
             input_scaling.len() == 1,
             "Expected 1 input scaling factor for positional layer, found {}",
             input_scaling.len()
+        );
+        ensure!(
+            output_scalings.len() == 1,
+            "Expected 1 output scaling factor for positional layer, found {}",
+            output_scalings.len()
+        );
+        ensure!(
+            unpadded_output_shapes.len() == 1,
+            "Expected 1 output shape for positional layer, found {}",
+            unpadded_output_shapes.len()
         );
         // re-initialize the cache for quantized node, if the original node has a cache enabled
         let new_cache = self
@@ -440,8 +452,14 @@ impl QuantizeOp for Positional<f32> {
 
         let quantized_op = match self.variant {
             PositionalVariant::Absolute(abs) => {
-                let quantized_abs =
-                    abs.quantize::<S>(data, node_id, input_scaling[0], unpadded_input_shapes)?;
+                let quantized_abs = abs.quantize::<S>(
+                    data,
+                    node_id,
+                    input_scaling[0],
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput {
                     quantized_op: Positional {
                         cache: new_cache,

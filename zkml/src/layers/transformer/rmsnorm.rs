@@ -438,10 +438,12 @@ impl QuantizeOp for RMSNorm<f32> {
 
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
+        _data: &S::AuxData,
+        _node_id: NodeId,
         input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> Result<QuantizeOutput<Self::QuantizedOp>> {
         // First check we have one input_scaling
         ensure!(
@@ -460,12 +462,11 @@ impl QuantizeOp for RMSNorm<f32> {
         let (quantised_rmsnorm, intermediate_bit_size) =
             self.quantise(input_scaling_factor, model_scaling)?;
 
-        let mut output_scalings = S::scaling_factors_for_node(data, node_id, 1);
         ensure!(
             output_scalings.len() == 1,
             "Output scaling for RMSNorm layer different from 1"
         );
-        let output_scaling = output_scalings.pop().unwrap();
+        let output_scaling = output_scalings[0];
         // Make the requant layer
         let requant = Requant::from_scaling_factors(
             input_scaling_factor,

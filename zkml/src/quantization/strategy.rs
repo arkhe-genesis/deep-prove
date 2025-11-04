@@ -428,10 +428,20 @@ fn quantize_model<S: ScalingStrategy>(
                         .map(|feed| md.get_output_layer_scaling(feed.source))
                         .collect::<Result<Vec<_>>>()?;
 
-                    // Compute the quantization for this node
-                    let quantized_out =
-                        layer.quantize_op::<S>(&data, node_id, &input_scalings, &shape_info)?;
+                    let unpadded_output_shapes =
+                        layer.output_shapes(&shape_info, PaddingMode::NoPadding)?;
+                    let num_outputs = unpadded_output_shapes.len();
+                    let output_scalings = S::scaling_factors_for_node(&data, node_id, num_outputs);
 
+                    // Compute the quantization for this node
+                    let quantized_out = layer.quantize_op::<S>(
+                        &data,
+                        node_id,
+                        &input_scalings,
+                        &shape_info,
+                        &output_scalings,
+                        &unpadded_output_shapes,
+                    )?;
                     // Save this layer output scaling factors
                     md.insert_layer_scalings(
                         node_id,
@@ -449,7 +459,6 @@ fn quantize_model<S: ScalingStrategy>(
                             .enumerate()
                             .map(|(out_port, shape)| (NodeOutput::new(node_id, out_port), shape)),
                     );
-
                     if let Some(requant) = quantized_out.requant_layer {
                         requant_layers.push((node_id, requant));
                     }

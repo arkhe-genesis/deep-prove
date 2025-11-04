@@ -776,11 +776,19 @@ impl QuantizeOp for Layer<f32> {
         node_id: NodeId,
         input_scaling: &[ScalingFactor],
         unpadded_input_shapes: &[Shape],
+        output_scalings: &[ScalingFactor],
+        unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         Ok(match self {
             Layer::Dense(dense) => {
-                let output =
-                    dense.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                let output = dense.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput::new(Layer::Dense(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
@@ -791,6 +799,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(
                     Layer::Convolution(output.quantized_op),
@@ -800,22 +810,40 @@ impl QuantizeOp for Layer<f32> {
                 .maybe_transform(output.post_quant_rule)?
             }
             Layer::MatMul(mat) => {
-                let output =
-                    mat.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                let output = mat.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput::new(Layer::MatMul(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
             }
             Layer::QKV(qkv) => {
-                let output =
-                    qkv.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                let output = qkv.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput::new(Layer::QKV(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
             }
             Layer::Mha(mha) => {
-                let output =
-                    mha.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                let output = mha.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput::new(Layer::Mha(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
@@ -826,6 +854,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(
                     Layer::ConcatMatMul(output.quantized_op),
@@ -840,6 +870,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(
                     Layer::LayerNorm(output.quantized_op),
@@ -854,6 +886,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(Layer::RMSNorm(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
@@ -865,21 +899,35 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(Layer::Softmax(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
             }
             Layer::Add(add) => {
-                let output =
-                    add.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                let output = add.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput::new(Layer::Add(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
             }
             Layer::Logits(logits) => {
-                let output =
-                    logits.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                let output = logits.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput::new(Layer::Logits(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
@@ -890,6 +938,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(
                     Layer::Positional(output.quantized_op),
@@ -904,6 +954,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(
                     Layer::Embeddings(output.quantized_op),
@@ -918,6 +970,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(
                     Layer::Activation(output.quantized_op),
@@ -943,6 +997,8 @@ impl QuantizeOp for Layer<f32> {
                     node_id,
                     input_scaling,
                     unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
                 )?;
                 QuantizeOutput::new(
                     Layer::AttentionMask(output.quantized_op),
@@ -952,8 +1008,14 @@ impl QuantizeOp for Layer<f32> {
                 .maybe_transform(output.post_quant_rule)?
             }
             Layer::EinSum(einsum) => {
-                let output =
-                    einsum.quantize_op::<S>(data, node_id, input_scaling, unpadded_input_shapes)?;
+                let output = einsum.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
                 QuantizeOutput::new(Layer::EinSum(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?

@@ -746,11 +746,12 @@ mod norm_layer {
 mod positional_absolute_layer {
     use ff_ext::GoldilocksExt2;
     use zkml::{
-        ScalingFactor, Shape, Tensor,
+        ScalingFactor, ScalingStrategy, Shape, Tensor,
         layers::{
-            provable::{Evaluate, QuantizeOp},
+            provable::{Evaluate, OpInfo, QuantizeOp},
             transformer::positional::Positional,
         },
+        padding::PaddingMode,
         quantization::AbsoluteMax,
         tensor::{KeyedTensor, WrappedTensor},
     };
@@ -770,14 +771,28 @@ mod positional_absolute_layer {
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
         let input = WrappedTensor::try_from(&input_f32.to_quantized(&input_scaling)).unwrap();
 
+        let base_layer = Positional::<f32>::new_absolute(pos.clone());
+        let input_shapes = vec![Shape::new(vec![size, size])];
+        let unpadded_output_shapes = base_layer
+            .output_shapes(&input_shapes, PaddingMode::NoPadding)
+            .expect("positional absolute output shapes");
+        let node_id = 0usize.into();
+        let output_scalings =
+            AbsoluteMax::scaling_factors_for_node(&(), node_id, unpadded_output_shapes.len());
+
         bencher
             .with_inputs(|| {
+                let layer = base_layer.clone();
+                let input_scalings = vec![input_scaling];
+
                 QuantizeOp::quantize_op::<AbsoluteMax>(
-                    Positional::<f32>::new_absolute(pos.clone()),
+                    layer,
                     &(),
-                    0usize.into(),
-                    &[input_scaling],
-                    &[Shape::new(vec![context, size])],
+                    node_id,
+                    &input_scalings,
+                    &input_shapes,
+                    &output_scalings,
+                    &unpadded_output_shapes,
                 )
                 .expect("quantize positional absolute should succeed")
                 .quantized_op
@@ -814,11 +829,12 @@ mod positional_rope_layer {
     use ff_ext::GoldilocksExt2;
     use std::f32::consts::PI;
     use zkml::{
-        ScalingFactor, Shape, Tensor,
+        ScalingFactor, ScalingStrategy, Shape, Tensor,
         layers::{
-            provable::{Evaluate, QuantizeOp},
+            provable::{Evaluate, OpInfo, QuantizeOp},
             transformer::positional::Positional,
         },
+        padding::PaddingMode,
         quantization::AbsoluteMax,
         tensor::WrappedTensor,
     };
@@ -842,19 +858,30 @@ mod positional_rope_layer {
             .map(|i| ((i as f32) + 1.0) * (PI / (num_angles as f32 + 1.0)))
             .collect();
 
+        let base_layer =
+            Positional::<f32>::new_rope(angles, "rope_angles".to_string().into(), context)
+                .expect("new_rope");
+        let input_shapes = vec![Shape::new(vec![size, size])];
+        let unpadded_output_shapes = base_layer
+            .output_shapes(&input_shapes, PaddingMode::NoPadding)
+            .expect("positional rope output shapes");
+        let node_id = 0usize.into();
+        let output_scalings =
+            AbsoluteMax::scaling_factors_for_node(&(), node_id, unpadded_output_shapes.len());
+
         bencher
             .with_inputs(|| {
+                let layer = base_layer.clone();
+                let input_scalings = vec![input_scaling];
+
                 QuantizeOp::quantize_op::<AbsoluteMax>(
-                    Positional::<f32>::new_rope(
-                        angles.clone(),
-                        "rope_angles".to_string().into(),
-                        context,
-                    )
-                    .expect("new_rope"),
+                    layer,
                     &(),
-                    0usize.into(),
-                    &[input_scaling],
-                    &[Shape::new(vec![context, size])],
+                    node_id,
+                    &input_scalings,
+                    &input_shapes,
+                    &output_scalings,
+                    &unpadded_output_shapes,
                 )
                 .expect("quantize positional rope should succeed")
                 .quantized_op
