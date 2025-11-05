@@ -449,7 +449,7 @@ where
         let ready_node_ids = self
             .graph
             .edges()
-            .fold(HashMap::<NodeId, Vec<bool>>::new(), |mut acc, edge| {
+            .fold(HashMap::<NodeId, Vec<bool>>::new(), |mut acc, (_, edge)| {
                 acc.entry(edge.target())
                     .or_default()
                     .push(edge.weight.is_some());

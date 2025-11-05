@@ -282,7 +282,7 @@ where
         delegate!(self, div_scalar, other)
     }
 
-    /// Clamp element wise over a mimimum value.
+    /// Clamp element wise over a minimum value.
     pub fn clamp_min(self, min: T) -> Self {
         delegate!(self, clamp_min, min)
     }

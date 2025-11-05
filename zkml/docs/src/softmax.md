@@ -19,7 +19,7 @@ The Softmax layer is used to inside a transformer to map a tensor of weighted va
 
  ### Shift Invariance
 
- One of the key properties of Softmax which we make use of to both stabilise inference and to assist with proving is that is invariant under shifts. That is given a vector $`v\in\mathbb{R}^{d}`$ and a constant vector $`\emph{c}\in\mathbb{R}^{d}`$ then 
+ One of the key properties of Softmax which we make use of to both stabilise inference and to assist with proving is that is invariant under shifts. That is given a vector $`v\in\mathbb{R}^{d}`$ and a constant vector $c \in \mathbb{R}^{d}$ then 
 
  $$ \begin{align*}  \mathrm{Softmax}(v - c)_{i} &= \frac{\exp(v_{i}-c)}{\sum_{j=1}^{d}\exp(v_{j}-c)} \\ &=\frac{\exp(-c)\cdot\exp(v_{i})}{\exp(-c)\cdot\sum_{j=1}^{d}\exp(v_{j})}\\ &=\frac{\exp(v_{i})}{\sum_{j=1}^{d}\exp(v_{j})} \\ &= \mathrm{Softmax}(v)_{i}.\end{align*} $$
 

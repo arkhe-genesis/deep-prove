@@ -224,6 +224,7 @@ impl<F: ExtensionField> Fieldizer<F> for Element {
         }
     }
 }
+
 pub(crate) trait IntoElement {
     fn to_element(&self) -> Element;
 }

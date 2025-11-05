@@ -6,7 +6,10 @@
 
 use crate::{
     IO, Proof, Prover, ProverContext,
-    iop::context::VerifierContext,
+    iop::{
+        chunking::{ChunkingStrategy, DefaultChunkingStrategy},
+        context::VerifierContext,
+    },
     padding::PaddingMode,
     parser::{
         PipelineConfig, default_pipeline_config,
@@ -391,6 +394,33 @@ impl Driver<Element> {
             max_context: None,
         })
     }
+
+    pub fn distribute_prove<S, E, PCS>(
+        &self,
+        ctx: &LLMContext<E, PCS>,
+        trace: InferenceTrace<'_, E, Element>,
+        num_chunks: Option<usize>,
+        chunking_strategy: S,
+    ) -> anyhow::Result<LLMProof<E, PCS>>
+    where
+        S: ChunkingStrategy,
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
+        PCS::ProverParam: Send + Sync,
+    {
+        let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
+        let prover: Prover<'_, '_, E, _, _> = Prover::new(&ctx.prover_ctx, &mut tr);
+        let io = trace.to_verifier_io()?;
+        info!("Proving the trace");
+        let proof = prover
+            .distribute_prove(&trace, num_chunks, chunking_strategy)
+            .expect("unable to generate proof");
+        info!("Proof generated");
+        Ok(LLMProof { proof, io })
+    }
+
     pub fn prove<E, PCS>(
         &self,
         ctx: &LLMContext<E, PCS>,
@@ -403,13 +433,7 @@ impl Driver<Element> {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
-        let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
-        let prover: Prover<'_, '_, E, _, _> = Prover::new(&ctx.prover_ctx, &mut tr);
-        let io = trace.to_verifier_io()?;
-        info!("Proving the trace");
-        let proof = prover.prove(&trace).expect("unable to generate proof");
-        info!("Proof generated");
-        Ok(LLMProof { proof, io })
+        self.distribute_prove(ctx, trace, Some(1), DefaultChunkingStrategy::default())
     }
 }
 
@@ -422,9 +446,7 @@ where
 {
     pub fn verify(&self, proof: LLMProof<E, PCS>, user_input: Vec<Token>) -> anyhow::Result<()>
     where
-        E: ExtensionField + Serialize + DeserializeOwned + Number,
-        E::BaseField: Serialize + DeserializeOwned,
-        PCS: PolynomialCommitmentScheme<E>,
+        PCS::Commitment: PartialEq + Eq,
     {
         // 0. check the size of the output
         let output = proof.io.output[0].clone();
@@ -454,7 +476,7 @@ where
         let mut tr: BasicTranscript<E> = BasicTranscript::new(b"model");
         let prover_input = proof.io.input[0].clone();
         let prover_output = proof.io.output[0].clone();
-        verify::<_, _, _>(&self.verifier_ctx, proof.proof, proof.io, &mut tr)?;
+        verify(&self.verifier_ctx, proof.proof, proof.io, &mut tr)?;
         // 2. verify the sequentiality of the output: from the first newly generated token to the last
         // but without including the padding.
         // output is [seq_len] where []
@@ -523,6 +545,7 @@ where
 mod test {
     use crate::{
         Number, init_test_logging,
+        iop::chunking::LLMChunkingStrategy,
         model::llm::{Driver, LLMContext, LLMTokenizerObserver},
         parser::{
             file_cache,
@@ -536,19 +559,20 @@ mod test {
                 tokenizer::TokenizerLoader,
             },
         },
+        rng_from_env_or_random,
         testing::Pcs,
     };
     use anyhow::Context;
+    use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use tracing::info;
 
-    #[test]
-    fn test_llm_driver_prove_gpt2() -> anyhow::Result<()> {
+    fn test_llm_driver_generic_prove_gpt2<const DISTRIBUTE_PROVE: bool>() -> anyhow::Result<()> {
         const MAX_CONTEXT: usize = 10;
         init_test_logging("debug");
 
         // Load the model file
-        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
+        // let model_path = std::path::PathBuf::from("assets/scripts/llms/toy_gpt2.gguf");
         // Load the model file
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let cache_filename = {
@@ -576,7 +600,7 @@ mod test {
 
                 Ok((driver, ctx))
             })?;
-
+        driver.model.describe();
         // Generate the trace
         let sentence = "The sky is";
         let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path))?;
@@ -590,7 +614,13 @@ mod test {
         )?;
 
         // Prove the trace
-        let proof = driver.prove(&ctx, trace)?;
+        let num_provers = if DISTRIBUTE_PROVE {
+            Some(rng_from_env_or_random().gen_range(1..6))
+        } else {
+            Some(1) // equivalent to sequential proving
+        };
+        let proof =
+            driver.distribute_prove(&ctx, trace, num_provers, LLMChunkingStrategy::default())?;
 
         // Serialize the proof
         let proof_bytes =
@@ -603,6 +633,17 @@ mod test {
         // Verify the proof
         ctx.verify(proof, user_tokens)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_llm_driver_distributed_prove_gpt2() -> anyhow::Result<()> {
+        test_llm_driver_generic_prove_gpt2::<true>()
+    }
+
+    #[test]
+    #[ignore = "Sequential case covered already by distributed prove test, use this test only when checking performance to ensure sequential proving is used"]
+    fn test_llm_driver_prove_gpt2() -> anyhow::Result<()> {
+        test_llm_driver_generic_prove_gpt2::<false>()
     }
 
     #[test]
@@ -642,7 +683,7 @@ mod test {
     }
 
     #[test]
-    fn test_llm_driver_prove_gemma3() -> anyhow::Result<()> {
+    fn test_llm_driver_inference_gemma3() -> anyhow::Result<()> {
         init_test_logging("debug");
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
         let gguf = RawGGUF::new(model_path.clone());
@@ -674,9 +715,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    #[ignore = "Test requires large machine to run"]
-    fn test_prove_llm_gemma3() -> anyhow::Result<()> {
+    fn test_generic_prove_llm_gemma3<const DISTRIBUTE_PROVE: bool>() -> anyhow::Result<()> {
         init_test_logging("debug");
         const MAX_CONTEXT: usize = 8;
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
@@ -719,7 +758,9 @@ mod test {
         )?;
 
         // Prove the trace
-        let proof = driver.prove(&ctx, trace)?;
+        let num_provers = Some(rng_from_env_or_random().gen_range(1..6));
+        let proof =
+            driver.distribute_prove(&ctx, trace, num_provers, LLMChunkingStrategy::default())?;
 
         // Serialize the proof
         let proof_bytes =
@@ -732,5 +773,17 @@ mod test {
         // Verify the proof
         ctx.verify(proof, user_tokens)?;
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "Test requires large machine to run"]
+    fn test_distribute_prove_llm_gemma3() -> anyhow::Result<()> {
+        test_generic_prove_llm_gemma3::<true>()
+    }
+
+    #[test]
+    #[ignore = "Test requires large machine to run"]
+    fn test_prove_llm_gemma3() -> anyhow::Result<()> {
+        test_generic_prove_llm_gemma3::<false>()
     }
 }

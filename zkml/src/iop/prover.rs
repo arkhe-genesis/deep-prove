@@ -2,8 +2,17 @@ use super::{ChallengeStorage, Proof, TableProof};
 use crate::{
     Claim, Element, Tensor,
     commit::{compute_betas_eval, mmcs_context, same_poly},
-    graph::{Node, NodeId, NodeInput, PortId},
-    iop::{context::ProverContext, model_output_claims},
+    graph::{Node, NodeId, NodeInput, NodeOutput, PortId},
+    iop::{
+        ChunkProofData,
+        chunking::{
+            ChunkID, ChunkIOCommitments, ChunkingStrategy, DefaultChunkingStrategy, GroupIOClaims,
+            GroupType, ModelChunk,
+        },
+        claim::PolynomialEvaluation,
+        compute_claim,
+        context::ProverContext,
+    },
     layers::{
         LayerProof,
         provable::{OpInfo, ProvableOp},
@@ -13,6 +22,7 @@ use crate::{
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
     model::InferenceTrace,
+    quantization::TensorFielder,
     tensor::{CommitmentId, get_root_of_unity},
 };
 use anyhow::{Context as _, Result, anyhow, ensure};
@@ -492,43 +502,146 @@ where
         })
     }
 
-    pub fn prove<'d: 'a>(
-        mut self,
-        full_trace: &'d InferenceTrace<'d, E, Element>,
-    ) -> anyhow::Result<Proof<E, PCS>> {
-        debug!("== Instantiate witness context ==");
+    fn generate_chunk_commitments<'d>(
+        &mut self,
+        chunk: &ModelChunk,
+        chunk_trace: &'d InferenceTrace<'d, E, Element>,
+        group_type: GroupType,
+    ) -> anyhow::Result<BTreeMap<ChunkID, PCS::Commitment>> {
+        let commitments = chunk.commitments(&self.ctx.commitment_ctx, chunk_trace, group_type)?;
+        // add commitment witness to lookup_witness and convert them to pure commitments,
+        // which are provided to the verifier
+        let chunk_id = chunk.chunk_id;
+        commitments
+            .into_iter()
+            .map(|(group_id, commitment)| {
+                let comm = PCS::get_pure_commitment(&commitment);
+                let commitment_id =
+                    ModelChunk::compute_group_commitment_id(chunk_id, group_id, group_type);
+                ensure!(
+                    self.lookup_witness
+                        .insert(commitment_id.into(), commitment)
+                        .is_none(),
+                    "Commitment already exists in lookup witness for id {commitment_id}"
+                );
+                Ok((group_id, comm))
+            })
+            .collect()
+    }
 
-        let global_metrics = Metrics::new();
-        let metrics = Metrics::new();
-        self.ctx.write_to_transcript(self.transcript)?;
+    fn generate_chunk_io_commitments<'d>(
+        &mut self,
+        chunk: &ModelChunk,
+        chunk_trace: &'d InferenceTrace<'d, E, Element>,
+    ) -> anyhow::Result<ChunkIOCommitments<PCS::Commitment>> {
+        let input_commitments =
+            self.generate_chunk_commitments(chunk, chunk_trace, GroupType::Incoming)?;
+        let output_commitments =
+            self.generate_chunk_commitments(chunk, chunk_trace, GroupType::Outgoing)?;
+        let chunk_commitments = ChunkIOCommitments {
+            inputs: input_commitments,
+            outputs: output_commitments,
+        };
+        chunk_commitments.add_to_transcript::<E, PCS, T>(chunk.chunk_id, self.transcript)?;
+        Ok(chunk_commitments)
+    }
 
-        self.instantiate_witness_ctx(full_trace)?;
-
-        let span = metrics.to_span();
-        stream_metrics("Witness context", &span);
-        debug!("== Witness context metrics {} ==", span);
-
+    fn prove_chunk<'d>(
+        &mut self,
+        chunk: &ModelChunk,
+        chunk_trace: &'d InferenceTrace<'d, E, Element>,
+    ) -> anyhow::Result<HashMap<NodeOutput, Claim<E>>> {
         debug!("== Generating claims ==");
         let metrics = Metrics::new();
-        let trace = full_trace
+        let trace = chunk_trace
             .clone()
             .into_fields()
             .context("converting trace to fields")?;
-        // this is the random set of variables to fix at each step derived as the output of
-        // sumcheck.
-        // For the first step, so before the first sumcheck, we generate it from FS.
-        // The dimension is simply the number of variables needed to address all the space of the
-        // input vector.
-        let out_claims = model_output_claims(self.transcript, &trace.outputs()?);
-        let mut store = trace.store.clone();
 
-        // each layer generates claims about its inputs. Each claim is stored at
-        // the right position amongst all the "input ports" of the node, e.g. target_port when
+        // compute model output claims for this chunk
+        let mut store = trace.store.clone();
+        let chunk_id = chunk.chunk_id;
+        // compute the claims for the model outputs produced in this chunk, each identified by the
+        // model output port ID
+        let output_claims_by_port = chunk.model_outputs_in_chunk()?.into_iter()
+            .try_fold(
+                BTreeMap::new(), // we first collect all the output tensors, sorted by the output port ID
+                |mut outputs, edge_id| {
+                let output_edge = chunk.edge(&edge_id)?;
+                let target_node = chunk.subgraph.target_node(&edge_id)?;
+                let output_id = target_node.as_output().ok_or(
+                    anyhow!("Edge {edge_id} is not an output edge of the model")
+                )?;
+                let source_id = output_edge.source();
+                let trace_step = trace.get_step(source_id)
+                    .ok_or(
+                        anyhow!("Node {source_id} not found in trace for chunk {chunk_id}")
+                    )?;
+                ensure!(
+                    output_edge.ports().len() == 1,
+                    "Expected 1 port link for model output edge {edge_id} in chunk {chunk_id}, found {}",
+                    output_edge.ports().len()
+                );
+                let source_port = &output_edge.ports()[0].source_port;
+                let output_tensor = trace_step.output_tensor_at(
+                    **source_port,
+                    &mut store,
+                )?;
+                ensure!(
+                    outputs.insert(output_id, output_tensor).is_none(),
+                    "Found output tensor twice for output id {} in chunk {chunk_id}",
+                    output_id,
+                );
+                Ok(outputs)
+            })? // then, we compute the claims for each output
+            .into_iter()
+            .map(|(port_id, tensor)| {
+                // For the output, we manually evaluate the MLE and check if it's the same as what prover
+                // gave. Note prover could ellude that but it's simpler to avoid that special check right
+                // now.
+                (port_id, compute_claim(self.transcript, tensor))
+            }).collect::<HashMap<_,_>>();
+
+        // `chunk_output_claims` is a map storing claims related to the subset of input ports of layers in the model
+        // which are connected to an output port of a node found in the current chunk. Here, we initialize
+        // this map by claims about the input ports of layers that don't belong to this chunk, i.e., layers
+        // of other chunks that use the outputs produced by layers in the current chunk
+        let chunk_output_claims = chunk.outgoing_edges()?
+            .into_iter()
+            .try_fold(BTreeMap::new(), // we first collect all the tensors, sorted by the corresponding output port
+            |mut claims_map, edge_id| {
+                let edge = chunk.edge(&edge_id)?;
+                let source_node_id = edge.source();
+                let trace_step = chunk_trace.get_step(source_node_id)
+                    .ok_or(
+                        anyhow!("Trace step not found for node {source_node_id} in chunk {}", chunk.chunk_id)
+                    )?;
+                edge.ports().iter().try_for_each(|port| {
+                    let source_port = NodeOutput::new(*source_node_id, port.source_port);
+                    if let std::collections::btree_map::Entry::Vacant(e) = claims_map.entry(source_port) {
+                         // compute new claim and insert in cache
+                         let output_tensor = trace_step.output_tensor_at(
+                             port.source_port.into(),
+                             &mut store,
+                         )?;
+                         e.insert(output_tensor);
+                    }
+                    anyhow::Ok(())
+                })?;
+                anyhow::Ok(claims_map)
+            })?
+            .into_iter() // then, we compute the claims for each output
+            .map(|(port, tensor)| {
+                let claim = compute_claim(self.transcript, tensor.to_fields());
+                (port, claim)
+        }).collect();
+        // each layer generates claims about its inputs. Each claim is indexed by
+        // the id of the corresponding "input port" of the node, e.g. target_port when
         // considering incoming edges to this node.
         let mut claims: HashMap<NodeInput, Claim<E>> = HashMap::new();
-        for (node_id, node) in self.ctx.model_ctx.nodes.backward_iter() {
+        for (node_id, node) in chunk.subgraph.backward_iter() {
             match node {
-                Node::Inner(ctx) => {
+                Node::Inner(_) => {
                     let section = trace
                         .get_step(node_id)
                         .ok_or(anyhow!("Step in trace not found for node {node_id}"))?;
@@ -554,18 +667,8 @@ where
                     // port (on this node) number. Remember that the graph is
                     // traversed backwards, so output nodes are conceptually
                     // inputs, and vice-versa.
-                    let claims_for_node: BTreeMap<PortId, Vec<&Claim<E>>> = self
-                        .ctx
-                        .model_ctx
-                        .nodes
-                        .outgoing_feeds(node_id)
-                        .into_iter()
-                        .fold(BTreeMap::new(), |mut ax, feed| {
-                            ax.entry(feed.source.port)
-                                .or_default()
-                                .push(&claims[&feed.target]);
-                            ax
-                        });
+                    let claims_for_node =
+                        chunk.claims_for_node(node_id, &claims, &chunk_output_claims)?;
 
                     // Just like for verification, there might be claims to be
                     // merged if they are connected to the same output port for
@@ -577,6 +680,16 @@ where
                     )?;
 
                     // prove or propagate the claims
+                    let ctx = self
+                        .ctx
+                        .model_ctx
+                        .nodes
+                        .node(node_id)
+                        .ok_or(anyhow!("Node {node_id} not found in proving context"))?
+                        .as_inner()
+                        .ok_or(anyhow!(
+                            "Node {node_id} is not an inner node in proving context"
+                        ))?;
                     let my_claims = if section.op.is_provable() {
                         section
                             .op
@@ -585,7 +698,7 @@ where
                                 ctx,
                                 claims_for_prove.iter().collect::<Vec<_>>(),
                                 section,
-                                &mut self,
+                                self,
                                 &mut store,
                             )
                             .with_context(|| {
@@ -612,7 +725,7 @@ where
                 Node::Input(_) => {}
                 Node::Output(o) => {
                     // Seed the claim register.
-                    claims.insert(NodeInput::new(node_id, 0), out_claims[*o].clone());
+                    claims.insert(NodeInput::new(node_id, 0), output_claims_by_port[o].clone());
                 }
             }
         }
@@ -620,6 +733,121 @@ where
         let span = metrics.to_span();
         stream_metrics("Claims", &span);
         debug!("== Claims generation metrics {} ==", span);
+
+        // Now we need add the claims about the input and output of the chunk
+        chunk.outgoing_edges.keys().try_for_each(|group_id| {
+            let GroupIOClaims {
+                commitment_id,
+                claims: group_claims,
+            } = chunk.compute_outgoing_group_claims(group_id, &chunk_output_claims)?;
+            self.add_witness_claim(
+                commitment_id,
+                group_claims
+                    .into_iter()
+                    .map(|c| (c.point, vec![c.eval]))
+                    .collect(),
+            );
+            anyhow::Ok(())
+        })?;
+
+        chunk.incoming_edges.keys().try_for_each(|group_id| {
+            let GroupIOClaims {
+                commitment_id,
+                claims: group_claims,
+            } = chunk.compute_incoming_group_claims(&claims, group_id)?;
+            self.add_witness_claim(
+                commitment_id,
+                group_claims
+                    .into_iter()
+                    .map(|c| (c.point, vec![c.eval]))
+                    .collect(),
+            );
+            anyhow::Ok(())
+        })?;
+
+        Ok(chunk_output_claims)
+    }
+
+    /// Prove by splitting the proving computation into multiple chunks, employing the `ChunkingStrategy`
+    /// provided as input to build the chunks. The number of chunks can be specified as input, otherwise
+    /// the chunking strategy will decide how many chunks to build.
+    pub(crate) fn distribute_prove<'d: 'a, S: ChunkingStrategy>(
+        mut self,
+        full_trace: &'d InferenceTrace<'d, E, Element>,
+        num_chunks: Option<usize>,
+        chunking_strategy: S,
+    ) -> anyhow::Result<Proof<E, PCS>> {
+        debug!("== Instantiate witness context ==");
+        let global_metrics = Metrics::new();
+        let metrics = Metrics::new();
+        self.ctx.write_to_transcript(self.transcript)?;
+
+        self.instantiate_witness_ctx(full_trace)?;
+
+        let span = metrics.to_span();
+        stream_metrics("Witness context", &span);
+        debug!("== Witness context metrics {} ==", span);
+
+        // split in chunks
+        let chunks = self
+            .ctx
+            .model_ctx
+            .split_in_chunks(num_chunks, &chunking_strategy)?;
+
+        // split the trace in chunks
+        let chunk_traces = chunks
+            .iter()
+            .map(|chunk| chunk.chunk_trace(full_trace))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // add chunk splitting info to the transcript
+        chunks
+            .iter()
+            .try_for_each(|chunk| chunk.add_chunk_data_to_transcript(self.transcript))?;
+
+        // we need to compute commitments of the input/output wire of each chunk and add them
+        // to the transcript. This step will be moved inside `prove_chunk` logic, as we first need
+        // to split also the witness generation process among multiple chunks
+        let chunk_commitments = chunks
+            .iter()
+            .zip(&chunk_traces)
+            .map(|(chunk, chunk_trace)| self.generate_chunk_io_commitments(chunk, chunk_trace))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        debug!("== Challenge storage ==");
+        let metrics = Metrics::new();
+        // initialize challenge storgae for this chunk
+        self.challenge_storage = if self.ctx.lookup.is_empty() {
+            ChallengeStorage::<E>::default()
+        } else {
+            ChallengeStorage::<E>::initialise(&self.ctx.lookup, self.transcript)
+        };
+        debug!("== Challenge storage metrics {} ==", metrics.to_span());
+
+        let chunk_data = chunks
+            .into_iter()
+            .zip(chunk_commitments)
+            .zip(&chunk_traces)
+            .map(|((chunk, commitments), chunk_trace)| {
+                let output_claims = self.prove_chunk(&chunk, chunk_trace)?;
+                Ok(ChunkProofData {
+                    output_evals: output_claims
+                        .into_iter()
+                        .map(|(port, claim)| {
+                            (
+                                port,
+                                PolynomialEvaluation {
+                                    num_vars: claim.point.len(),
+                                    eval: claim.eval,
+                                },
+                            )
+                        })
+                        .collect(),
+                    commitments,
+                    model_chunk: chunk,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         // Now we have to make the table proofs
         debug!("== Generating Lookup Table claims ==");
@@ -642,6 +870,7 @@ where
             merge_claim_proofs: self.merge_claim_proofs,
             table_proofs: self.table_proofs,
             commit: commit_proof,
+            chunk_data,
         };
 
         let span = metrics.to_span();
@@ -652,6 +881,13 @@ where
         stream_metrics("Global", &global_metrics_span);
         debug!("== Global metrics {} ==", global_metrics_span);
         Ok(output_proof)
+    }
+
+    pub fn prove<'d: 'a>(
+        self,
+        full_trace: &'d InferenceTrace<'d, E, Element>,
+    ) -> anyhow::Result<Proof<E, PCS>> {
+        self.distribute_prove(full_trace, Some(1), DefaultChunkingStrategy::default())
     }
 
     /// Flattens all the claims to give to the proving logic of the node. If
@@ -665,7 +901,9 @@ where
         let mut merge_claim_proofs = HashMap::new();
         ensure!(
             claims.len() == outputs.len(),
-            "Number of claims and outputs must be the same"
+            "Number of claims and outputs is not the same for node {node_id}: {} vs {}",
+            claims.len(),
+            outputs.len(),
         );
         let claims = claims
             .into_iter()
@@ -709,11 +947,9 @@ where
         trace: &'d InferenceTrace<'d, E, Element>,
     ) -> anyhow::Result<()> {
         let LookupWitness {
-            challenge_storage,
             logup_witnesses,
             table_witnesses,
         } = generate_lookup_witnesses::<E, T, PCS>(trace, self.ctx, self.transcript)?;
-        self.challenge_storage = challenge_storage;
         self.lookup_witness = logup_witnesses;
 
         if let Some(commit) = table_witnesses {

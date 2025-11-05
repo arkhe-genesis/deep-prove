@@ -51,8 +51,7 @@ fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = new_transcript();
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript)
-            .expect("invalid proof");
+        verify(&verifier_ctx, proof, io, &mut verifier_transcript).expect("invalid proof");
     }
 }
 

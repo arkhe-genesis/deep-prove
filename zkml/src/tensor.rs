@@ -546,6 +546,10 @@ impl<T> Tensor<T> {
         self.data.len()
     }
 
+    pub fn num_vars(&self) -> usize {
+        self.shape.num_vars().iter().sum()
+    }
+
     /// Iterates over the data in the tensor
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.data.iter()

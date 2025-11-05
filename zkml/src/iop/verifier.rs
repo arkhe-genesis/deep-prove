@@ -1,11 +1,13 @@
-use super::{Proof, TableProof};
 use crate::{
-    Claim, Element,
+    Proof,
+    iop::{TableProof, chunking::GroupIOClaims, compute_claim, context::ShapeStep},
+};
+
+use crate::{
+    Claim, Element, VectorTranscript,
     commit::mmcs_context::CommitmentVerifier,
     graph::{Node, NodeId, NodeInput, PortId},
-    iop::{
-        ChallengeStorage, context::VerifierContext, model_output_claims, prover::MergeClaimsProof,
-    },
+    iop::{ChallengeStorage, context::VerifierContext, prover::MergeClaimsProof},
     layers::{
         LayerCtx, LayerProof,
         provable::{OpInfo, VerifiableCtx},
@@ -85,70 +87,78 @@ where
         }
     }
 
-    pub(crate) fn verify(
-        mut self,
+    pub(crate) fn verify_chunk(
+        &mut self,
         ctx: &VerifierContext<E, PCS>,
-        proof: Proof<E, PCS>,
-    ) -> anyhow::Result<()> {
-        // ===== Instantiate everything and append relevant info to the transcript =====
-        let mut numerators = Vec::<E>::new();
-        let mut denominators = Vec::<E>::new();
-        ctx.write_to_transcript(self.transcript)?;
+        proof: &Proof<E, PCS>,
+        shape_steps: &HashMap<NodeId, ShapeStep>,
+        num_chunk: usize,
+    ) -> anyhow::Result<()>
+    where
+        PCS::Commitment: PartialEq + Eq,
+    {
+        ensure!(
+            num_chunk < proof.chunk_data.len(),
+            "Verifying chunk {num_chunk}, but only {} chunk commitments are found in the proof",
+            proof.chunk_data.len()
+        );
+        let chunk = &proof.chunk_data[num_chunk].model_chunk;
+        let chunk_id = chunk.chunk_id;
+        let chunk_commitments = &proof.chunk_data[num_chunk].commitments;
+        // compute the claims for the model outputs produced in this chunk, each identified by the
+        // model output port ID
+        let output_claims_by_port = chunk.model_outputs_in_chunk()?.into_iter()
+            .try_fold(
+                BTreeMap::new(), // we first collect all the output tensors, sorted by the output port ID
+                |mut outputs, edge_id| {
+                let output_edge = chunk.edge(&edge_id)?;
+                 let target_node = chunk.subgraph.target_node(&edge_id)?;
+                let output_id = target_node.as_output().ok_or(
+                    anyhow!("Edge {edge_id} is not an output edge of the model")
+                )?;
+                ensure!(
+                    output_edge.ports().len() == 1,
+                    "Expected 1 port link for model output edge {edge_id} in chunk {chunk_id}, found {}",
+                    output_edge.ports().len()
+                );
+                ensure!(
+                    *output_id < self.io.output.len(),
+                    "No model output found for {output_id}, there are only {} outputs",
+                    outputs.len(),
+                );
+                let output_tensor = self.io.output[*output_id].clone();
+                ensure!(
+                    outputs.insert(output_id, output_tensor).is_none(),
+                    "Found output tensor twice for output port {output_id} in chunk {chunk_id}"
+                );
+                Ok(outputs)
+            })? // then, we compute the claims for each output
+            .into_iter()
+            .map(|(port_id, tensor)| {
+                // For the output, we manually evaluate the MLE and check if it's the same as what prover
+                // gave. Note prover could ellude that but it's simpler to avoid that special check right
+                // now.
+                (port_id, compute_claim(self.transcript, tensor))
+            }).collect::<HashMap<_,_>>();
 
-        // iterate over the step proofs in inference order
-        for (node_id, layer_ctx) in ctx.model.nodes.forward_inners() {
-            if !layer_ctx.has_proof() {
-                // if the current node is not provable, there is no proof, so we can skip it
-                continue;
-            }
-            let node_proof = proof
-                .steps
-                .get(&node_id)
-                .ok_or(anyhow!("Proof for node {node_id} not found"))?;
-            if let Some((num, denom)) = node_proof.get_lookup_data() {
-                numerators.extend(num.into_iter());
-                denominators.extend(denom.into_iter());
-            }
-            layer_ctx.write_proof_to_transcript(node_proof, self.transcript)?;
-        }
-
-        proof.table_proofs.iter().try_for_each(|proof| {
-            let (nums, denoms) = proof.lookup.fractional_outputs();
-            numerators.extend(nums);
-            denominators.extend(denoms);
-            proof.write_commitment(self.transcript)
-        })?;
-
-        // Here we generate and store all lookup related challenges
-        // TODO: make this part of verifier struct
-        self.challenge_storage = if ctx.lookup.is_empty() {
-            ChallengeStorage::<E>::default()
-        } else {
-            ChallengeStorage::<E>::initialise(ctx, self.transcript)
-        };
-
-        // ===== Derive output claims =====
-        //
-        // First, we bind each output to the node that computes it, so that we
-        // know whether we need to compute the output claim or not
-        let out_claims = model_output_claims(self.transcript, &self.io.output);
-        let shape_steps = ctx.model.shape_steps(
-            &ctx.unpadded_input_shapes,
-            &self
-                .io
-                .input
-                .iter()
-                .map(|t| t.shape().clone())
-                .collect_vec(),
-        )?;
+        let chunk_output_claims = proof.chunk_data[num_chunk]
+            .output_evals
+            .iter()
+            .map(|(port, poly_eval)| {
+                let point = self.transcript.read_challenges(poly_eval.num_vars);
+                (*port, Claim::new(point, poly_eval.eval))
+            })
+            .collect();
 
         // ===== Verify each proof sequentially =====
         //
         // always make sure the proof corresponds to the expected type of proof
         // in the context.
-        let _claims = ctx.model.nodes.backward_iter().try_fold(
+        let claims = chunk.subgraph.backward_iter().try_fold(
             HashMap::<NodeInput, Claim<E>>::new(),
-            |mut claims, (node_id, node)| -> anyhow::Result<HashMap<NodeInput, Claim<E>>> {
+            |mut claims, (node_id, _)| -> anyhow::Result<HashMap<NodeInput, Claim<E>>> {
+                let node = ctx.model.nodes.node(node_id).
+                    ok_or(anyhow!("Node {node_id} not found verifier context"))?;
                 match node {
                     Node::Inner(layer) => {
                         let node_proof = if layer.has_proof() {
@@ -188,16 +198,11 @@ where
                         // A will generate two claims, for its ports 1 and 2,
                         // computed from its incoming claim on output port 0,
                         // which is the claim generated by B on its input port 0.
-                        let claims_for_node: BTreeMap<PortId, Vec<&Claim<E>>> =
-                            ctx.model.nodes.outgoing_feeds(node_id).into_iter().fold(
-                                BTreeMap::new(),
-                                |mut ax, feed| {
-                                    ax.entry(feed.source.port)
-                                        .or_default()
-                                        .push(&claims[&feed.target]);
-                                    ax
-                                },
-                            );
+                        let claims_for_node = chunk.claims_for_node(
+                            node_id,
+                            &claims,
+                            &chunk_output_claims,
+                        )?;
 
                         // Merge claims that are redundant. If a node out port
                         // is fed to two distinct nodes, then this will result
@@ -215,7 +220,7 @@ where
                                     .verify(
                                         node_proof,
                                         &claims_for_verify.iter().collect_vec(),
-                                        &mut self,
+                                        self,
                                         shape_step,
                                     )
                                     .context(format!(
@@ -242,26 +247,36 @@ where
                         //
                         // evaluating the input at the random evaluation point
                         // from the sumcheck.
-                        let (inputs, input_claims) = ctx
-                            .model
-                            .nodes
-                            .incoming_feeds(node_id)
+                        let (inputs, input_claims) = chunk.model_inputs_in_chunk()?
                             .into_iter()
-                            .filter(|feed| ctx.model.nodes[feed.source.node_id].is_input())
-                            .fold(
+                            .map(|edge_id| {
+                                let edge = chunk.edge(&edge_id)?;
+                                Ok((edge_id, edge))
+                            })
+                            .filter_map_ok(|(edge_id, edge)| {
+                                (edge.target() == node_id).then_some((edge_id, edge))
+                            })
+                            .try_fold(
                                 (Vec::new(), Vec::new()),
-                                |(mut inputs, mut input_claims), feed| {
-                                    inputs.push(
-                                        &self.io.input[*ctx.model.nodes[feed.source.node_id]
-                                            .as_input()
-                                            .unwrap()],
-                                    );
-                                    input_claims
-                                        .push(&claims[&NodeInput::new(node_id, feed.target.port)]);
-                                    (inputs, input_claims)
-                                },
-                            );
-
+                                |(mut inputs, mut input_claims), res: anyhow::Result<_>| {
+                                    let (edge_id, edge) = res?;
+                                    let input_id = chunk
+                                        .subgraph
+                                        .source_node(&edge_id)?
+                                        .as_input()
+                                        .ok_or(anyhow!(
+                                            "Edge {edge_id} is not a model input edge in chunk {chunk_id}"
+                                        ))?;
+                                    edge.ports().iter().for_each(|port| {
+                                        inputs.push(
+                                            &self.io.input[*input_id],
+                                        );
+                                        input_claims
+                                            .push(&claims[&NodeInput::new(node_id, port.target_port)])
+                                    });
+                                    anyhow::Ok((inputs, input_claims))
+                                }
+                            )?;
                         if !inputs.is_empty() {
                             <LayerCtx<E> as VerifiableCtx<E, PCS>>::verify_input_claim(
                                 layer,
@@ -272,12 +287,150 @@ where
                     }
                     Node::Input(_) => {}
                     Node::Output(o) => {
-                        claims.insert(NodeInput::new(node_id, 0), out_claims[*o].clone());
+                        claims.insert(NodeInput::new(node_id, 0), output_claims_by_port[o].clone());
                     }
                 };
                 Ok(claims)
             },
         )?;
+
+        // Now we need add the claims about the input and output of the chunk
+        chunk.outgoing_edges.keys().try_for_each(|group_id| {
+            let GroupIOClaims {
+                commitment_id,
+                claims: group_claims,
+            } = chunk.compute_outgoing_group_claims(group_id, &chunk_output_claims)?;
+            let commitment = chunk_commitments.outputs.get(group_id).ok_or(anyhow!(
+                "No commitment found for output group {group_id} in chunk {chunk_id}"
+            ))?;
+            self.commit_verifier.add_witness_claim(
+                commitment_id,
+                commitment.clone(),
+                group_claims
+                    .into_iter()
+                    .map(|c| (c.point, vec![c.eval]))
+                    .collect(),
+            );
+            anyhow::Ok(())
+        })?;
+
+        chunk.incoming_edges.keys().try_for_each(|group_id| {
+            let GroupIOClaims {
+                commitment_id,
+                claims: group_claims,
+            } = chunk.compute_incoming_group_claims(&claims, group_id)?;
+            let commitment = chunk_commitments.inputs.get(group_id).ok_or(anyhow!(
+                "No commitment found for input group {group_id} in chunk {chunk_id}"
+            ))?;
+            self.commit_verifier.add_witness_claim(
+                commitment_id,
+                commitment.clone(),
+                group_claims
+                    .into_iter()
+                    .map(|c| (c.point, vec![c.eval]))
+                    .collect(),
+            );
+            anyhow::Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    pub(crate) fn verify(
+        mut self,
+        ctx: &VerifierContext<E, PCS>,
+        proof: Proof<E, PCS>,
+    ) -> anyhow::Result<()>
+    where
+        PCS::Commitment: PartialEq + Eq,
+    {
+        // 1. Instantiate everything and append relevant info to the transcript
+        let mut numerators = Vec::<E>::new();
+        let mut denominators = Vec::<E>::new();
+
+        ctx.write_to_transcript(self.transcript)?;
+
+        // iterate over the step proofs in inference order
+        for (node_id, layer_ctx) in ctx.model.nodes.forward_inners() {
+            if !layer_ctx.has_proof() {
+                // if the current node is not provable, there is no proof, so we can skip it
+                continue;
+            }
+            let node_proof = proof
+                .steps
+                .get(&node_id)
+                .ok_or(anyhow!("Proof for node {node_id} not found"))?;
+            if let Some((num, denom)) = node_proof.get_lookup_data() {
+                numerators.extend(num.into_iter());
+                denominators.extend(denom.into_iter());
+            }
+            layer_ctx.write_proof_to_transcript(node_proof, self.transcript)?;
+        }
+
+        proof.table_proofs.iter().try_for_each(|proof| {
+            let (nums, denoms) = proof.lookup.fractional_outputs();
+            numerators.extend(nums);
+            denominators.extend(denoms);
+            proof.write_commitment(self.transcript)
+        })?;
+
+        let shape_steps = ctx.model.shape_steps(
+            &ctx.unpadded_input_shapes,
+            &self
+                .io
+                .input
+                .iter()
+                .map(|t| t.shape().clone())
+                .collect_vec(),
+        )?;
+
+        // verify chunks are well defined
+        ctx.model.check_model_chunking(
+            proof
+                .chunk_data
+                .iter()
+                .map(|chunk_data| &chunk_data.model_chunk),
+        )?;
+
+        // add chunk splitting info to the transcript
+        proof.chunk_data.iter().try_for_each(|chunk_data| {
+            chunk_data
+                .model_chunk
+                .add_chunk_data_to_transcript(self.transcript)
+        })?;
+
+        // Add chunk commitments to the transcript
+        proof.chunk_data.iter().try_for_each(|chunk_data| {
+            chunk_data
+                .commitments
+                .add_to_transcript::<E, PCS, T>(chunk_data.model_chunk.chunk_id, self.transcript)
+        })?;
+
+        // verify consistency of commitments among chunks
+        let chunk_commitments_by_id = proof
+            .chunk_data
+            .iter()
+            .map(|chunk_data| (chunk_data.model_chunk.chunk_id, &chunk_data.commitments))
+            .collect();
+        proof.chunk_data.iter().try_for_each(|chunk_data| {
+            chunk_data
+                .model_chunk
+                .check_chunk_commitment_consistency::<E, PCS>(&chunk_commitments_by_id)
+        })?;
+
+        // Here we generate and store all lookup related challenges
+        // TODO: make this part of verifier struct
+        self.challenge_storage = if ctx.lookup.is_empty() {
+            ChallengeStorage::<E>::default()
+        } else {
+            ChallengeStorage::<E>::initialise(&ctx.lookup, self.transcript)
+        };
+
+        // verify each chunk
+        let num_chunks = proof.chunk_data.len();
+        (0..num_chunks)
+            .into_iter()
+            .try_for_each(|i| self.verify_chunk(ctx, &proof, &shape_steps, i))?;
 
         // ===== Verify the lookup table proofs =====
         if !proof.table_proofs.is_empty() {
@@ -291,7 +444,7 @@ where
             )?;
         }
 
-        // ===== Verify the opening of the accumulation of claims =====
+        // ===== Verify the lookup table proofs =====
         self.commit_verifier
             .verify(&ctx.commitment_ctx, proof.commit, self.transcript)?;
 
@@ -370,6 +523,7 @@ pub fn verify<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
+    PCS::Commitment: PartialEq + Eq,
 {
     let verifier = Verifier::new(transcript, io);
     verifier.verify(ctx, proof)

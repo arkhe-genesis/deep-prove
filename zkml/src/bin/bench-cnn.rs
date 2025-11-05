@@ -404,7 +404,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         let metrics = Metrics::new();
 
         let mut verifier_transcript = new_transcript();
-        verify::<_, _, _>(
+        verify(
             &ctx.as_ref().as_ref().unwrap().1,
             proof,
             io,

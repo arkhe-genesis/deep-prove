@@ -4153,7 +4153,7 @@ dependencies = [
 [[package]]
 name = "ff_ext"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "once_cell",
  "p3",
@@ -6173,7 +6173,7 @@ dependencies = [
 [[package]]
 name = "mpcs"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "aes",
  "bincode 1.3.3",
@@ -6204,7 +6204,7 @@ dependencies = [
 [[package]]
 name = "multilinear_extensions"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "either",
  "ff_ext",
@@ -6628,7 +6628,7 @@ checksum = "9c6901729fa79e91a0913333229e9ca5dc725089d1c363b2f4b4760709dc4a52"
 [[package]]
 name = "p3"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "p3-baby-bear",
  "p3-challenger",
@@ -7155,7 +7155,7 @@ dependencies = [
 [[package]]
 name = "poseidon"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "criterion 0.5.1",
  "ff_ext",
@@ -8820,7 +8820,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sumcheck"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "either",
  "ff_ext",
@@ -8838,7 +8838,7 @@ dependencies = [
 [[package]]
 name = "sumcheck_macro"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "itertools 0.13.0",
  "p3",
@@ -9808,7 +9808,7 @@ dependencies = [
 [[package]]
 name = "transcript"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "ff_ext",
  "itertools 0.13.0",
@@ -10484,7 +10484,7 @@ dependencies = [
 [[package]]
 name = "whir"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "bincode 1.3.3",
  "clap",
@@ -11006,7 +11006,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 [[package]]
 name = "witness"
 version = "0.1.0"
-source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#5f9f109078b5861b301eb908a3b4ba4c49a86641"
+source = "git+https://github.com/Lagrange-Labs/gkr-backend?branch=deep-prove-extra-features#24e8aced791d1879cd34ca999091fab161e020b7"
 dependencies = [
  "ff_ext",
  "multilinear_extensions",

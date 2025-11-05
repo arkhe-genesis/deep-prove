@@ -302,8 +302,7 @@ mod test {
         let proof = prover.prove(&trace).expect("unable to generate proof");
 
         let mut verifier_transcript = default_transcript();
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript)
-            .expect("invalid proof");
+        verify(&verifier_ctx, proof, io, &mut verifier_transcript).expect("invalid proof");
         println!("[+] Verify proof: valid");
         Ok(())
     }

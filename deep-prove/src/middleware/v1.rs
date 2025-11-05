@@ -2,12 +2,16 @@ use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
 pub use zkml::inputs::Input;
-use zkml::{Element, Proof as ProofG, Tensor, quantization::ScalingStrategyKind};
+use zkml::{
+    Element, Proof as ProofG, Tensor,
+    quantization::ScalingStrategyKind,
+};
 
 use super::v2::Provable;
 
 /// A type of the proof for the `v1` of the protocol
-pub type Proof = ProofG<GoldilocksExt2, Basefold<GoldilocksExt2, BasefoldRSParams>>;
+pub type Proof =
+    ProofG<GoldilocksExt2, Basefold<GoldilocksExt2, BasefoldRSParams>>;
 
 /// The `v1` proving request
 #[derive(Serialize, Deserialize)]

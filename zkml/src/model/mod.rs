@@ -20,11 +20,11 @@ use tenstore::{GenStore, GenericStore, StorageKey};
 use trace::Trace;
 use tracing::info;
 
-mod context;
+pub(crate) mod context;
 pub mod llm;
 pub(crate) mod trace;
 pub mod transform;
-pub use context::ModelCtx;
+pub use context::{ContextGraph, ModelCtx};
 pub use trace::{InferenceTrace, Step};
 
 pub trait ToStorageKey<N> {
@@ -225,8 +225,7 @@ where
         for (id, layer) in self.graph.forward_inners() {
             let edges = self
                 .graph
-                .neighbors(id, Direction::Any)
-                .map(|(_, edge)| edge)
+                .node_neighbors(id, Direction::Any)
                 .collect::<Vec<_>>();
             info!("\t- {}: {}", id, layer.describe());
             info!("\t\t- edges: {:?}", edges);
@@ -297,7 +296,7 @@ where
             .map(|(edge_id, _)| *edge_id)
             .collect::<Vec<_>>();
         for edge_id in edges_to_remove {
-            self.graph.remove_edge(edge_id)?;
+            self.graph.remove_edge(&edge_id)?;
         }
 
         let requant_nodes = source_edge_per_requant
@@ -448,28 +447,26 @@ where
     // This method assumes there is a node without routed output edges, and the outputs of
     // this node will be labelled as the output edges of the model
     pub fn automatic_output_labelling(&mut self) -> Result<Vec<NodeId>> {
+        ensure!(
+            self.graph.output_nodes().count() == 0,
+            "Model already has output nodes defined"
+        );
         // find the nodes with no output edges, which will be considered the output nodes
         let out_node_ids = self
             .graph
             .sink_nodes()
             .filter(|node_id| self.graph[*node_id].is_inner())
             .collect::<Vec<_>>();
-
-        let latest_output_idx = self.graph.output_nodes().count();
-        let node_outs = out_node_ids
-            .into_iter()
-            .flat_map(|out_node| {
-                // for each node, we collect how many outputs it will produce and
-                // set corresponding output edges
-                let num_outputs = self.num_outputs(out_node).unwrap();
-                (0..num_outputs).map(move |i| out_node.output_at(i))
-            })
-            .collect::<Vec<NodeOutput>>();
-
-        node_outs
-            .into_iter()
-            .enumerate()
-            .map(|(i, node_out)| self.add_output(node_out, latest_output_idx + i))
+        ensure!(
+            out_node_ids.len() == 1,
+            "`automatic_output_labelling` method called on model with more than 1 output node"
+        );
+        let out_node = out_node_ids[0];
+        // collect how many outputs it will produce and
+        // set corresponding output edges
+        let num_outputs = self.num_outputs(out_node).unwrap();
+        (0..num_outputs)
+            .map(move |i| self.add_output(out_node.output_at(i), i))
             .collect()
     }
 
@@ -765,6 +762,7 @@ pub(crate) mod test {
     use super::Model;
     use crate::{
         Element, Prover, ScalingFactor, ScalingStrategy, Shape, default_transcript,
+        graph::NodeOutput,
         init_test_logging, init_test_logging_default,
         layers::{
             Layer,
@@ -1163,7 +1161,7 @@ pub(crate) mod test {
         let prover = Prover::new(&prover_ctx, &mut tr);
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript = BasicTranscript::new(b"m2vec");
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 
     #[test]
@@ -1202,7 +1200,7 @@ pub(crate) mod test {
         let prover = Prover::new(&prover_ctx, &mut tr);
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript = BasicTranscript::<F>::new(b"matmul");
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 
     #[test]
@@ -1265,7 +1263,7 @@ pub(crate) mod test {
 
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
     }
 
     type E = GoldilocksExt2;
@@ -1396,7 +1394,7 @@ pub(crate) mod test {
         let proof = prover.prove(&trace).expect("unable to generate proof");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"model");
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript)?;
+        verify(&verifier_ctx, proof, io, &mut verifier_transcript)?;
         outputs
     }
 
@@ -1687,7 +1685,9 @@ pub(crate) mod test {
 
         model.add_edge(matmul1, matmul3, (0, 0)).unwrap();
 
-        model.automatic_output_labelling().unwrap();
+        // connect output of `matmul2` to the first output of the model
+        model.add_output(NodeOutput::new(matmul2, 0), 0).unwrap();
+        model.add_output(NodeOutput::new(matmul3, 0), 1).unwrap();
 
         prove_model(model, &mut Default::default()).unwrap();
     }

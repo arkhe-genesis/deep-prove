@@ -989,7 +989,6 @@ where
 
 #[derive(Debug)]
 pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
-    pub challenge_storage: ChallengeStorage<E>,
     pub logup_witnesses: HashMap<NodeId, PCS::CommitmentWithWitness>,
     pub table_witnesses: Option<PCS::CommitmentWithWitness>,
 }
@@ -997,7 +996,6 @@ pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWitness<E, PCS> {
     fn default() -> Self {
         LookupWitness {
-            challenge_storage: ChallengeStorage::default(),
             logup_witnesses: HashMap::default(),
             table_witnesses: None,
         }
@@ -1190,13 +1188,7 @@ where
     PCS::write_commitment(&table_comm, transcript)
         .map_err(|e| LogUpError::ParameterError(format!("{e:?}")))?;
 
-    debug!("== Challenge storage ==");
-    let metrics = Metrics::new();
-    let challenge_storage = initialise_from_table_set::<E, T, _>(ctx.lookup.iter(), transcript);
-    debug!("== Challenge storage metrics {} ==", metrics.to_span());
-
     Ok(LookupWitness {
-        challenge_storage,
         logup_witnesses: witness_gen
             .logup_witnesses
             .into_iter()
@@ -1204,29 +1196,4 @@ where
             .collect(),
         table_witnesses: Some(table_witness),
     })
-}
-
-fn initialise_from_table_set<
-    'a,
-    E: ExtensionField,
-    T: Transcript<E>,
-    I: Iterator<Item = &'a TableType>,
->(
-    set: I,
-    transcript: &mut T,
-) -> ChallengeStorage<E> {
-    let constant_challenge = transcript
-        .sample_and_append_challenge(b"table_constant")
-        .elements;
-    let challenge_map = set
-        .map(|table_type| {
-            let challenge = table_type.generate_challenge(transcript);
-
-            (table_type.name(), challenge)
-        })
-        .collect::<HashMap<String, E>>();
-    ChallengeStorage::<E> {
-        constant_challenge,
-        challenge_map,
-    }
 }

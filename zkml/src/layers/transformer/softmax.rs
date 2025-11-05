@@ -74,7 +74,7 @@ pub struct Softmax<N> {
     /// For the quantised version this should be 1 as the temperature will be absorbed into the rescaling factor.
     pub scalar: N,
     /// This is the maximum size of dimension that we will normalise over. For example in an Attention layer this would be the maximum context size.
-    max_size: usize,
+    pub(crate) max_size: usize,
     /// This is the extra information required to compute the quantised version, it defaults to [`None`].
     quant_info: Option<QuantisedSoftmaxData>,
 }

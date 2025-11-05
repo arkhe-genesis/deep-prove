@@ -8,11 +8,11 @@
 /// - It enforces that there is only one edge between two nodes.
 /// - Nodes can be indexed by a custom type. This allows backwards compatibility with other graph implementations
 ///   like `petgraph` or `onnx`.
-use anyhow::{Context, ensure};
+use anyhow::{Context, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fmt::Debug,
+    fmt::{Debug, Display},
     hash::Hash,
     ops::Index,
     sync::atomic::{AtomicUsize, Ordering},
@@ -93,67 +93,53 @@ impl<L> Node<L, (), ()> {
     }
 }
 
+/// Enum employed to specify whether a port of a node refers to an input or output edge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, derive_more::Display)]
+#[repr(u8)]
+enum PortType {
+    #[display("Input")]
+    Input,
+    #[display("Output")]
+    Output,
+}
+
+/// A global representation for a specific port of a specific node in a `Graph`.
+/// The `PORT_TYPE` constant specifies whether the port is meant to be an input port or
+/// an output port of the node, depending on `PortType` variant
 #[derive(
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    derive_more::Debug,
-    derive_more::Display,
-    Serialize,
-    Deserialize,
+    Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::Debug, Serialize, Deserialize,
 )]
-#[debug("{node_id}{port}")]
-#[display("{node_id}{port}")]
-/// Uniquely identifies an input port of a given node.
-pub struct NodeInput {
+pub struct NodePort<const PORT_TYPE: u8> {
     /// The referenced node.
     pub node_id: NodeId,
     /// The concerned port of the referenced node.
     pub port: PortId,
 }
-impl NodeInput {
+
+impl<const PORT_TYPE: u8> NodePort<PORT_TYPE> {
     pub fn new<N: Into<NodeId>, P: Into<PortId>>(node_id: N, port: P) -> Self {
-        NodeInput {
+        Self {
             node_id: node_id.into(),
             port: port.into(),
         }
     }
 }
 
-#[derive(
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    derive_more::Display,
-    derive_more::Debug,
-    Serialize,
-    Deserialize,
-)]
-#[debug("{node_id}{port}")]
-#[display("{node_id}{port}")]
-/// Uniquely identifies an output port of a given node.
-pub struct NodeOutput {
-    /// The referenced node.
-    pub node_id: NodeId,
-    /// The concerned port of the referenced node.
-    pub port: PortId,
-}
-impl NodeOutput {
-    pub fn new<N: Into<NodeId>, P: Into<PortId>>(node_id: N, port: P) -> Self {
-        NodeOutput {
-            node_id: node_id.into(),
-            port: port.into(),
-        }
+impl<const PORT_TYPE: u8> Display for NodePort<PORT_TYPE> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let port_type = match PORT_TYPE {
+            a if PortType::Input as u8 == a => PortType::Input,
+            a if PortType::Output as u8 == a => PortType::Output,
+            _ => unreachable!("Invalid port type: {PORT_TYPE}"),
+        };
+        f.write_fmt(format_args!("{port_type}: {}->{}", self.node_id, self.port))
     }
 }
+
+/// A global representation for a specific input port of a specific node in a `Graph`.
+pub type NodeInput = NodePort<{ PortType::Input as u8 }>;
+/// A global representation for a specific output port of a specific node in a `Graph`.
+pub type NodeOutput = NodePort<{ PortType::Output as u8 }>;
 
 /// Uniquely identifies a link between an output port of a node and an input
 /// port of another node.
@@ -274,6 +260,7 @@ impl NodeId {
     derive_more::Display,
     derive_more::From,
     derive_more::Into,
+    derive_more::Deref,
 )]
 pub struct EdgeId(usize);
 
@@ -457,7 +444,7 @@ pub struct Graph<N, I, O, W> {
     /// NOTE: currently O(n) to search but once API is stabilized, we can move
     /// to a multi key map indexed by both the source and the target node to
     /// search in O(1).
-    pub(crate) edges: Vec<(EdgeId, Edge<W>)>,
+    pub(crate) edges: BTreeMap<EdgeId, Edge<W>>,
 }
 
 impl<N, I, O, W> Graph<N, I, O, W>
@@ -604,6 +591,14 @@ where
         Ok(new_node_id)
     }
 
+    pub(crate) fn add_edge_raw_with_id(&mut self, id: EdgeId, edge: Edge<W>) -> anyhow::Result<()> {
+        ensure!(
+            self.edges.insert(id, edge).is_none(),
+            "Trying to insert an edge with an existing id {id}"
+        );
+        Ok(())
+    }
+
     pub fn add_edges_raw(&mut self, edges: Vec<Edge<W>>) -> anyhow::Result<Vec<EdgeId>> {
         let mut edge_ids = Vec::with_capacity(edges.len());
         for new_edge in edges {
@@ -638,7 +633,7 @@ where
             )?;
             let edge_id = next_edge_id();
             edge_ids.push(edge_id);
-            self.edges.push((edge_id, new_edge));
+            self.add_edge_raw_with_id(edge_id, new_edge)?;
         }
         Ok(edge_ids)
     }
@@ -656,15 +651,13 @@ where
     /// let edge_id = graph.add_edge(node1, node2, Ports::consecutive(), Some(())).unwrap();
     ///
     /// assert_eq!(graph.edges().count(), 1);
-    /// graph.remove_edge(edge_id).unwrap();
+    /// graph.remove_edge(&edge_id).unwrap();
     /// assert_eq!(graph.edges().count(), 0);
     /// ```
-    pub fn remove_edge(&mut self, edge_id: EdgeId) -> anyhow::Result<()> {
-        let curr_len = self.edges.len();
-        self.edges.retain(|(id, _)| *id != edge_id);
-        if self.edges.len() == curr_len {
-            anyhow::bail!("Edge with id {edge_id:?} not found");
-        }
+    pub fn remove_edge(&mut self, edge_id: &EdgeId) -> anyhow::Result<()> {
+        self.edges
+            .remove(edge_id)
+            .ok_or(anyhow!("Edge with id {edge_id:?} not found"))?;
         Ok(())
     }
 
@@ -719,6 +712,36 @@ where
     /// ```
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Returns the number of inner nodes in the graph
+    pub fn inner_nodes_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|(_, node)| node.is_inner())
+            .count()
+    }
+
+    /// Returns the source node of the given edge
+    pub fn source_node(&self, edge_id: &EdgeId) -> anyhow::Result<&Node<N, I, O>> {
+        let edge = self
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| anyhow::anyhow!("Edge with id {edge_id:?} not found"))?;
+        self.node(edge.source).ok_or_else(|| {
+            anyhow::anyhow!("Source node {:?} of edge {edge_id} not found", edge.source)
+        })
+    }
+
+    /// Returns the target node of the given edge
+    pub fn target_node(&self, edge_id: &EdgeId) -> anyhow::Result<&Node<N, I, O>> {
+        let edge = self
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| anyhow::anyhow!("Edge with id {edge_id:?} not found"))?;
+        self.node(edge.target).ok_or_else(|| {
+            anyhow::anyhow!("Target node {:?} of edge {edge_id} not found", edge.target)
+        })
     }
 
     /// Returns an iterator over all nodes in the graph as (node_id, node_data) pairs.
@@ -823,8 +846,8 @@ where
     /// let edges: Vec<_> = graph.edges().collect();
     /// assert_eq!(edges.len(), 1);
     /// ```
-    pub fn edges(&self) -> impl Iterator<Item = &Edge<W>> + use<'_, N, I, O, W> {
-        self.edges.iter().map(|(_id, edge)| edge)
+    pub fn edges(&self) -> impl Iterator<Item = (&EdgeId, &Edge<W>)> {
+        self.edges.iter()
     }
 
     /// Checks that no two target_port is assigned twice amongst all edges that have the same target node.
@@ -863,10 +886,11 @@ where
     }
 
     pub fn edge<'a>(&'a self, edge_id: &EdgeId) -> Option<&'a Edge<W>> {
-        self.edges
-            .iter()
-            .find(|(id, _)| id == edge_id)
-            .map(|(_, edge)| edge)
+        self.edges.get(edge_id)
+    }
+
+    pub fn edge_mut<'a>(&'a mut self, edge_id: &EdgeId) -> Option<&'a mut Edge<W>> {
+        self.edges.get_mut(edge_id)
     }
 
     /// Returns the edges touching the provided node, in `direction`.
@@ -875,14 +899,11 @@ where
         node_id: NodeId,
         direction: Direction,
     ) -> impl Iterator<Item = (&'a EdgeId, &'a Edge<W>)> + use<'a, N, I, O, W> {
-        self.edges
-            .iter()
-            .filter(move |(_, edge)| match direction {
-                Direction::Outgoing => edge.source == node_id,
-                Direction::Incoming => edge.target == node_id,
-                Direction::Any => edge.source == node_id || edge.target == node_id,
-            })
-            .map(|(id, edge)| (id, edge))
+        self.edges.iter().filter(move |(_, edge)| match direction {
+            Direction::Outgoing => edge.source == node_id,
+            Direction::Incoming => edge.target == node_id,
+            Direction::Any => edge.source == node_id || edge.target == node_id,
+        })
     }
 
     /// Returns mutable references to the edges touching the provided node, in `direction`.
@@ -1400,22 +1421,22 @@ pub(crate) mod tests {
         assert_eq!(graph.sink_nodes().count(), 1);
 
         // try removing an edge
-        graph.remove_edge(first_edge).unwrap();
+        graph.remove_edge(&first_edge).unwrap();
         assert_eq!(graph.neighbors(node1, Direction::Outgoing).count(), 0);
         assert_eq!(graph.neighbors(node2, Direction::Incoming).count(), 0);
         assert_eq!(graph.neighbors(node1, Direction::Any).count(), 1);
         assert_eq!(graph.neighbors(node2, Direction::Any).count(), 1);
 
         // try removing an input edge
-        graph.remove_edge(input_edge).unwrap();
+        graph.remove_edge(&input_edge).unwrap();
         assert_eq!(graph.neighbors(node1, Direction::Incoming).count(), 0);
 
         // try removing an output edge
-        graph.remove_edge(output_edge).unwrap();
+        graph.remove_edge(&output_edge).unwrap();
         assert_eq!(graph.neighbors(node2, Direction::Outgoing).count(), 0);
 
         // try removing a non-existing edge
-        assert!(graph.remove_edge(10.into()).is_err());
+        assert!(graph.remove_edge(&EdgeId::from(10)).is_err());
     }
 
     #[test]

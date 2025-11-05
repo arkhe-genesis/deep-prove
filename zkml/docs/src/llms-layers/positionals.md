@@ -64,7 +64,7 @@ More specifically, we build:
 
 The output tensor computed by rope is a tensor $O \in \mathbb{R}^{c \times e}$. The i-th row $O_i \in \mathbb{R}^e$ of $O$ is computed as follows. 
 
-- Given a row $X_i \in \mathbb{R}^e = [x_1, x_2, \dots, x_e]$ of input matrix $X$, define the permuted row $\tilde{X}_i \in \mathbb{R}^e = [-x_2, x_1, \dots, -x_d, x_{d-1}]$, that is $\tilde{x}_i$ is obtained from $x_i$ by swapping pairs of consecutive elements and chaning the sign of the first element in the pair after the swap.
+- Given a row $X_i \in \mathbb{R}^e = [x_1, x_2, \dots, x_e]$ of input matrix $X$, define the permuted row $\tilde{X}_i \in \mathbb{R}^e = [-x_2, x_1, \dots, -x_d, x_{d-1}]$, that is $\tilde{x}_i$ is obtained from $x_i$ by swapping pairs of consecutive elements and changing the sign of the first element in the pair after the swap.
 - Considering the corresponding rows $C_i$, $S_i$ of cosine matrix $C$ and sine matrix $S$, the row $O_i$ is computed as $O_i = X_i \otimes C_i + \tilde{X}_i \otimes S_i$, where $\otimes$ denotes the entry-wise tensor multiplication.
 
 Therefore, only the first $s$ rows of rotational matrices $C$ and $S$ are employed in the RoPE computation, as for the positional matrix in absolute encoding.

@@ -2,6 +2,15 @@ use ff_ext::ExtensionField;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+/// An evaluation of an polynomial, altogether with the number of variables.
+/// This data can be used by the verifier to reconstruct a specific claim about
+/// the polynomial itself
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct PolynomialEvaluation<E> {
+    pub(crate) num_vars: usize,
+    pub(crate) eval: E,
+}
+
 /// Claim type to accumulate in this protocol, for a certain polynomial, known in the context.
 /// f(point) = eval
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
