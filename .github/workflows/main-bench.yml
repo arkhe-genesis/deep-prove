@@ -106,7 +106,7 @@ jobs:
           --threshold-upper-boundary 0.20 \
           --threshold-max-sample-size 15 \
           --thresholds-reset \
-          --testbed ci-runner \
+          --testbed ci-gpu-runner \
           --err \
           --adapter rust_criterion \
           --github-actions '${{ secrets.GITHUB_TOKEN }}' \
