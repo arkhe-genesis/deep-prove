@@ -20,8 +20,8 @@ jobs:
               - 'mpcs/**'
               - '.github/workflows/main-bench.yml'
 
-  benchmark_master_branch:
-    name: Master Benchmarking
+  cpu_benchmark_master_branch:
+    name: Master CPU Benchmarking
     needs: changes
     if: ${{ needs.changes.outputs.should_run == 'true' }}
     permissions:
@@ -62,3 +62,52 @@ jobs:
           --adapter rust_criterion \
           --github-actions '${{ secrets.GITHUB_TOKEN }}' \
           "cargo bench --bench prove-model"
+
+  gpu_benchmark_master_branch:
+    name: Master GPU Benchmarking
+    needs: changes
+    if: ${{ needs.changes.outputs.should_run == 'true' }}
+    permissions:
+      checks: write
+      contents: read
+    runs-on: ['gpu']
+    steps:
+      - name: Sanity check
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+
+      - uses: actions/checkout@v4
+        with:
+          clean: "false"
+          submodules: "recursive"
+
+      - name: Install bencher bin
+        shell: devenv shell bash -- -e {0}
+        run: cargo install --git https://github.com/bencherdev/bencher --tag v0.5.7 --locked bencher_cli --debug
+
+      - name: Track PR Benchmarks with Bencher
+        shell: devenv shell bash -- -e {0}
+        # `LD_LIBRARY_PATH` is appended with path to pre-installed CUDA libs.
+        # The required libs are copied into `cuda`, because linking the whole
+        # /usr/lib messes up devenv
+        run: |
+          mkdir -p $HOME/cuda
+          cp /usr/lib/x86_64-linux-gnu/{libcuda.so,libnvrtc.so.12,libnvrtc-builtins.so.12.0,libnvidia-ptxjitcompiler.so,libnvidia-ptxjitcompiler.so.1,libnvidia-ptxjitcompiler.so.580.95.05} $HOME/cuda
+          cd zkml
+          LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda" \
+          bencher run \
+          --host https://api.bencher.dev \
+          --project deep-prove-private-70c58ed-ejzl400nndqc0 \
+          --token '${{ secrets.BENCHER_API_TOKEN }}' \
+          --branch master \
+          --threshold-measure latency \
+          --threshold-test percentage \
+          --threshold-upper-boundary 0.20 \
+          --threshold-max-sample-size 15 \
+          --thresholds-reset \
+          --testbed ci-runner \
+          --err \
+          --adapter rust_criterion \
+          --github-actions '${{ secrets.GITHUB_TOKEN }}' \
+          "cargo bench --bench prove-model --features cuda"
