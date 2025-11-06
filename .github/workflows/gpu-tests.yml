@@ -45,11 +45,16 @@ jobs:
   test:
     name: GPU Tests
     needs: changes
+    # Runs on:
+    # - PRs if path filter passes and PR is not draft
+    # - on master and tag push always
     if: |
-      github.event.pull_request.draft == false
-        && needs.changes.outputs.should_run == 'true'
-        && github.event_name == 'pull_request'
-        && github.event.pull_request.head.repo.full_name == github.repository
+        (github.event_name == 'pull_request'
+          && needs.changes.outputs.should_run == 'true'
+          && github.event.pull_request.draft == false
+          && github.event.pull_request.head.repo.full_name == github.repository)
+        || github.event_name == 'push'
+
     runs-on: ['gpu']
     steps:
       - name: Sanity check
