@@ -3,7 +3,7 @@ use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use tenstore::GenStore;
 use zkml::{
-    Element, Prover, default_transcript,
+    Element, Prover, Tensor, default_transcript,
     inputs::Input,
     model::Model,
     parser::onnx::FloatOnnxLoader,
@@ -27,22 +27,32 @@ fn parse_model(model_data: &[u8]) -> anyhow::Result<(Model<Element>, ModelMetada
         .build()
 }
 
-fn run_model<T: std::io::Read>(model_data: &[u8], inputs: T) {
+fn parse_model_and_inputs<T: std::io::Read>(
+    model_data: &[u8],
+    inputs: T,
+) -> (Model<Element>, Vec<Vec<Tensor<Element>>>) {
     let run_inputs = Input::from_reader(inputs).expect("failed to load inputs");
     let (model, md) = parse_model(model_data).expect("failed to parse model");
-    let inputs = run_inputs.to_elements(&md);
+    let inputs = run_inputs
+        .to_elements(&md)
+        .into_iter()
+        .map(|input| {
+            model
+                .load_input_flat(vec![input])
+                .expect("failed to call load_input_flat on the model")
+        })
+        .collect();
+    (model, inputs)
+}
 
+fn run_model(model: &Model<Element>, inputs: Vec<Vec<Tensor<i64>>>) {
     let (prover_ctx, verifier_ctx) = model
         .generate_contexts::<F, Pcs<F>>()
         .expect("unable to generate context");
 
-    for (i, input) in inputs.into_iter().enumerate() {
-        let input_tensor = model
-            .load_input_flat(vec![input])
-            .expect("failed to call load_input_flat on the model");
-
+    for (i, inputs) in inputs.into_iter().enumerate() {
         let trace = model
-            .run(input_tensor, &mut GenStore::default())
+            .run(inputs, &mut GenStore::default())
             .unwrap_or_else(|_| panic!("input #{i} failed"));
 
         let mut prover_transcript = new_transcript();
@@ -61,24 +71,30 @@ fn models(c: &mut Criterion) {
         .sample_size(20)
         .measurement_time(std::time::Duration::from_secs(80));
 
-    group.bench_function("mlp", |b| {
-        b.iter(|| {
-            run_model(
-                include_bytes!("../assets/scripts/MLP/mlp-iris-01.onnx"),
-                zstd::Decoder::new(&include_bytes!("../assets/scripts/MLP/input.json.zst")[..])
-                    .expect("failed to parse zstd"),
-            )
-        })
+    let model_data = include_bytes!("../assets/scripts/MLP/mlp-iris-01.onnx");
+    let inputs = zstd::Decoder::new(&include_bytes!("../assets/scripts/MLP/input.json.zst")[..])
+        .expect("failed to parse zstd");
+
+    let (model, inputs) = parse_model_and_inputs(model_data, inputs);
+    group.bench_with_input("mlp", &(model, inputs), |b, (model, inputs)| {
+        b.iter_batched(
+            || inputs.clone(),
+            |inputs| run_model(model, inputs),
+            criterion::BatchSize::SmallInput,
+        )
     });
 
-    group.bench_function("cnn", |b| {
-        b.iter(|| {
-            run_model(
-                include_bytes!("../assets/scripts/CNN/cnn-cifar-01.onnx"),
-                zstd::Decoder::new(&include_bytes!("../assets/scripts/CNN/input.json.zst")[..])
-                    .expect("failed to parse zstd"),
-            )
-        })
+    let model_data = include_bytes!("../assets/scripts/CNN/cnn-cifar-01.onnx");
+    let inputs = zstd::Decoder::new(&include_bytes!("../assets/scripts/CNN/input.json.zst")[..])
+        .expect("failed to parse zstd");
+
+    let (model, inputs) = parse_model_and_inputs(model_data, inputs);
+    group.bench_with_input("cnn", &(model, inputs), |b, (model, inputs)| {
+        b.iter_batched(
+            || inputs.clone(),
+            |inputs| run_model(model, inputs),
+            criterion::BatchSize::SmallInput,
+        )
     });
 
     // NOTE: disabling covid model, as it is /very/ memory-intensive
