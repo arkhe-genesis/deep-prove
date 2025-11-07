@@ -175,7 +175,7 @@ mod test {
         let (model, input) = Model::random_with_rng(4, &mut rng).unwrap();
 
         model.describe();
-        let trace = model.run(&input, &mut Default::default()).unwrap();
+        let trace = model.run(input, &mut Default::default()).unwrap();
         let io = trace.to_verifier_io().unwrap();
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -192,7 +192,7 @@ mod test {
         init_test_logging_default();
         let (model, input) = Model::random_pooling(4).unwrap();
         model.describe();
-        let trace = model.run(&input, &mut Default::default()).unwrap();
+        let trace = model.run(input, &mut Default::default()).unwrap();
         let io = trace.to_verifier_io().unwrap();
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -208,9 +208,9 @@ mod test {
     fn test_distribute_prove() {
         init_test_logging("debug");
         let num_dense_layers = 5;
-        let (model, input) = Model::random(num_dense_layers).unwrap();
+        let (model, inputs) = Model::random(num_dense_layers).unwrap();
         model.describe();
-        let trace = model.run(&input, &mut Default::default()).unwrap();
+        let trace = model.run(inputs, &mut Default::default()).unwrap();
         let io = trace.to_verifier_io().unwrap();
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()

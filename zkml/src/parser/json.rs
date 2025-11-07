@@ -189,7 +189,7 @@ pub mod test {
         let init_user_shape = Shape::from(vec![1]);
         let model = model.into_provable_model(&structure, init_user_shape)?;
         let input = Tensor::new(Shape::from(vec![1]), vec![512.0])?;
-        model.run_float(std::slice::from_ref(&input))?;
+        model.run_float(vec![input])?;
         Ok(())
     }
 }

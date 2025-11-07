@@ -49,7 +49,7 @@ impl GenStore {
     /// Create a new page of type `U` derived from `old_k` by mapping `f` on it.
     /// If it already exists, do nothing.
     pub fn cast<T, U, F>(
-        &mut self,
+        &self,
         storage_key: &StorageKey<T>,
         op: F,
     ) -> Result<StorageKey<U>, StoreError>
@@ -64,7 +64,7 @@ impl GenStore {
     /// Create and return a new page of type `U` derived from `old_k` by mapping
     /// `f` on it. If it already exists, do nothing.
     pub fn cast_and_fetch<T, U, F>(
-        &mut self,
+        &self,
         storage_key: &StorageKey<T>,
         op: F,
     ) -> Result<(StorageKey<U>, U), StoreError>

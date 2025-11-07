@@ -876,8 +876,8 @@ mod tests {
         let (model, md) = FloatOnnxLoader::new(filepath).build().unwrap();
         let input = crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0])
             .to_quantized(md.input_scaling(0));
-        let input = model.prepare_inputs(vec![input]).unwrap();
-        let trace = model.run::<F>(&input, &mut GenStore::default()).unwrap();
+        let inputs = model.prepare_inputs(vec![input]).unwrap();
+        let trace = model.run::<F>(inputs, &mut GenStore::default()).unwrap();
         println!("Result: {:?}", trace.outputs());
     }
 
@@ -915,23 +915,29 @@ mod tests {
                 crate::tensor::Tensor::<f32>::random(&shape).to_quantized(md.input_scaling(i))
             })
             .collect();
-        let input = model.prepare_inputs(inputs).unwrap();
+        let inputs = model.prepare_inputs(inputs).unwrap();
+
         info!("RUNNING MODEL...");
-        let trace = model.run::<F>(&input, &mut GenStore::default()).unwrap();
+        let trace = model.run::<F>(inputs, &mut GenStore::default()).unwrap();
+
         info!("RUNNING MODEL DONE...");
         println!("Result: {:?}", trace.outputs());
 
-        let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
+        let mut transcript: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
+
         info!("GENERATING CONTEXT...");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
             .expect("Unable to generate contexts");
+
         info!("GENERATING CONTEXT DONE...");
         let io = trace.to_verifier_io().unwrap();
+
         info!("GENERATING Proof...");
         let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
-            Prover::new(&prover_ctx, &mut tr);
+            Prover::new(&prover_ctx, &mut transcript);
         let proof = prover.prove(&trace).expect("unable to generate proof");
+
         info!("GENERATING Proof DONE...");
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"m2vec");
@@ -959,8 +965,8 @@ mod tests {
                 crate::tensor::Tensor::<f32>::random(&shape).to_quantized(md.input_scaling(i))
             })
             .collect();
-        let input = model.prepare_inputs(native_input).unwrap();
-        let trace = model.run::<F>(&input, &mut GenStore::default()).unwrap();
+        let inputs = model.prepare_inputs(native_input).unwrap();
+        let trace = model.run::<F>(inputs, &mut GenStore::default()).unwrap();
 
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
@@ -1046,7 +1052,7 @@ mod tests {
 
         let input_tensor = crate::tensor::Tensor::random(&input_shape);
         let trace = model
-            .run::<GoldilocksExt2>(&[input_tensor], &mut GenStore::default())
+            .run::<GoldilocksExt2>(vec![input_tensor], &mut GenStore::default())
             .unwrap();
         assert!(!trace.steps.is_empty());
     }

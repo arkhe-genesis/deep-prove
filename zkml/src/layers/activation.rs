@@ -23,7 +23,7 @@ use crate::{
     number::Number,
     padding::PaddingMode,
     quantization::{self, BIT_LEN, Fieldizer},
-    tensor::{DryTensor, Tensor, WrappedModuleFn, WrappedTensor},
+    tensor::{Tensor, TensorHandle, WrappedModuleFn, WrappedTensor},
 };
 use either::Either;
 use ff_ext::ExtensionField;
@@ -43,7 +43,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 use witness::RowMajorMatrix;
 
@@ -541,14 +540,13 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = &step_data.node_inputs;
         ensure!(
             !inputs.is_empty(),
             "Expected at least 1 input in inferece data for activation layer",
         );
-        self.prove_step(prover, last_claims[0], ctx, inputs, id, store)
+        self.prove_step(prover, last_claims[0], ctx, inputs, id)
     }
 
     fn gen_lookup_witness(
@@ -556,9 +554,8 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<E, Element, Element>,
-        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
-        let outputs = step_data.output_tensors(store)?;
+        let outputs = step_data.output_tensors()?;
         ensure!(
             outputs.len() == 1,
             "Found more than 1 output tensor in inference step of activation layer"
@@ -573,7 +570,7 @@ where
                 activation_layer.lookup_witness(
                     id,
                     ctx,
-                    &step_data.input_tensor_at(0, store)?,
+                    &step_data.input_tensor_at(0)?,
                     &outputs[0],
                 )
             }
@@ -588,7 +585,7 @@ where
                 activation_layer.lookup_witness(
                     id,
                     ctx,
-                    &step_data.input_tensor_at(0, store)?,
+                    &step_data.input_tensor_at(0)?,
                     &data.activation_output,
                 )
             }
@@ -652,9 +649,8 @@ impl Activation<Element> {
         prover: &mut Prover<'a, 'b, E, T, PCS>,
         last_claim: &Claim<E>,
         step: &ActivationCtx<E>,
-        inputs: &[DryTensor<E>],
+        inputs: &[TensorHandle<E>],
         node_id: NodeId,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -694,7 +690,11 @@ impl Activation<Element> {
         // fro the second input tensor, if present
         let input_mle = inputs
             .get(1)
-            .map(|input| anyhow::Ok(input.hydrate(store.clone())?.into_mle()))
+            .map(|handle| {
+                let tensor = handle.tensor()?;
+                let mle = tensor.clone().into_mle();
+                anyhow::Ok(mle)
+            })
             .unwrap_or(Ok(Default::default()))?;
 
         if let Activation::GLU(_) = self {

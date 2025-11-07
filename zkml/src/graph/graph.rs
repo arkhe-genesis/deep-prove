@@ -440,7 +440,7 @@ pub struct Graph<N, I, O, W> {
     /// which is usually equivalent to the order of insertion.
     nodes: BTreeMap<NodeId, Node<N, I, O>>,
     /// Contains all the edges in the graph.
-    //
+    ///
     /// NOTE: currently O(n) to search but once API is stabilized, we can move
     /// to a multi key map indexed by both the source and the target node to
     /// search in O(1).
@@ -991,6 +991,21 @@ where
             .collect::<Vec<_>>();
         outgoings.sort_by_key(|feed| feed.source.port);
         // TODO: check that all are consecutive
+        outgoings
+    }
+
+    /// Return an ordered list of all the outgoing ports of a given node.
+    ///
+    /// These are guaranteed to be ordered by the port from which they are
+    /// emerging from the node.
+    pub fn outgoing_ports(&self, n: NodeId) -> Vec<NodeOutput> {
+        let mut outgoings = self
+            .outgoings(n)
+            .flat_map(|(_, edge)| edge.ports().iter())
+            .map(|link| n.output_at(link.source_port))
+            .collect::<Vec<_>>();
+        outgoings.sort_by_key(|output| output.port);
+        outgoings.dedup();
         outgoings
     }
 

@@ -38,7 +38,7 @@ use sumcheck::{
     structs::{IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::{GenStore, StorageKey};
+use tenstore::StorageKey;
 use tracing::{info, warn};
 use transcript::Transcript;
 
@@ -1461,9 +1461,8 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let output_tensor = step_data.output_tensor_at(0, store)?;
+        let output_tensor = step_data.output_tensor_at(0)?;
 
         let fft_data = step_data.node_outputs.try_convdata().unwrap();
         let (_, conv_data) = self.fft(&fft_data.input)?;

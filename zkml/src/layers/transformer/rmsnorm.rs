@@ -57,7 +57,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use tracing::trace;
 use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
@@ -729,9 +728,8 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let input_tensors = step_data.input_tensors(store)?;
+        let input_tensors = step_data.input_tensors()?;
         // Check there is a single input
         ensure!(
             input_tensors.len() == 1,
@@ -752,9 +750,8 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<E, Element, Element>,
-        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
-        let output_tensors = step_data.output_tensors(store)?;
+        let output_tensors = step_data.output_tensors()?;
         ensure!(
             step_data.node_inputs.len() == 1,
             "Found more than 1 input in inference step of RMSNorm layer"
@@ -763,7 +760,7 @@ where
             output_tensors.len() == 1,
             "Found more than 1 output in inference step of RMSNorm layer"
         );
-        let input_tensor = step_data.input_tensor_at(0, store)?;
+        let input_tensor = step_data.input_tensor_at(0)?;
         self.lookup_witness(id, ctx, input_tensor)
     }
 }
@@ -1179,6 +1176,7 @@ where
 #[cfg(test)]
 mod tests {
     use ff_ext::GoldilocksExt2;
+    use tenstore::GenStore;
 
     use crate::{
         init_test_logging_default,

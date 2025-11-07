@@ -36,7 +36,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use tracing::debug;
 use transcript::Transcript;
 
@@ -712,10 +711,9 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let input_tensors = step_data.input_tensors(store)?;
-        let output_tensor = step_data.output_tensor_at(0, store)?;
+        let input_tensors = step_data.input_tensors()?;
+        let output_tensor = step_data.output_tensor_at(0)?;
 
         let (claims, proof) = self.prove_step(
             node_id,

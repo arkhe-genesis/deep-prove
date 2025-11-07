@@ -33,7 +33,7 @@ pub fn causal_mask(num_heads: usize, q_len: usize, seq_len: usize) -> Result<Ten
 
 #[cfg(test)]
 pub(crate) mod manual_attention {
-    use std::{fs::File, slice};
+    use std::fs::File;
 
     use crate::parser::{json::RawJSON, llm::models::gpt2::GPT2};
     use anyhow::{Context, ensure};
@@ -520,13 +520,13 @@ pub(crate) mod manual_attention {
         let max_token = rng_from_env_or_random().gen_range(0..config.embedding_size);
         let single_input = Tensor::new(vec![1].into(), vec![max_token as f32])?;
         model.describe();
-        model.run_float(slice::from_ref(&single_input))?;
+        model.run_float(vec![single_input])?;
         // Reset is needed here because the `llm_model` contains layer that contains some cache.
         // When we clone a layer, we just clone a Arc<Mutex<_>>, so the cache data itself is not cloned.
         model.reset();
 
         model.describe();
-        let output = model.run_float(slice::from_ref(&input))?[0].clone();
+        let output = model.run_float(vec![input])?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,
         // we take the last element of the model output
         let output = output.slice_last_dim().last().unwrap();

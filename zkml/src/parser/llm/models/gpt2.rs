@@ -280,7 +280,7 @@ pub mod tests {
         assert_eq!(config.vocab_size, 50257);
         assert_eq!(config.eos_token, 50256usize.into());
         let input = Tensor::new(vec![1].into(), vec![546.0]).unwrap();
-        model.run_float(&[input])?;
+        model.run_float(vec![input])?;
         Ok(())
     }
 }

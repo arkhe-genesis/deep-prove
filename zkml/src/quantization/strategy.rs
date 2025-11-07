@@ -139,7 +139,7 @@ impl ScalingStrategy for InferenceObserver {
                 })
                 .collect::<Result<Vec<_>>>()?;
             debug!("Running float inference with the {}-th input", nsamples + 1);
-            model.run_with_tracker::<GoldilocksExt2>(&input_tensors, Some(&mut tracker), store)?;
+            model.run_with_tracker::<GoldilocksExt2>(input_tensors, Some(&mut tracker), store)?;
             nsamples += 1;
         }
         info!("InferenceObserver: {} total samples observed", nsamples);

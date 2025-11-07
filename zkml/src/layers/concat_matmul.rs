@@ -46,7 +46,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use tracing::trace;
 use transcript::Transcript;
 
@@ -735,10 +734,9 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<crate::Claim<E>>> {
-        let input_tensors = step_data.input_tensors(store)?;
-        let output_tensors = step_data.output_tensors(store)?;
+        let input_tensors = step_data.input_tensors()?;
+        let output_tensors = step_data.output_tensors()?;
 
         ensure!(
             input_tensors.len() == 2,
@@ -917,15 +915,16 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{init_test_logging, number::Number};
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};
+    use tenstore::GenStore;
 
     use crate::{
-        Tensor,
+        Tensor, init_test_logging,
         layers::Layer,
         model::{Model, test::prove_model},
+        number::Number,
     };
 
     use super::*;

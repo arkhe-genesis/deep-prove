@@ -207,8 +207,8 @@ fn run_float_model(raw_inputs: &InputJSON, model: &Model<f32>) -> Result<f32> {
         .enumerate()
     {
         // Run the model in float mode
-        let input = model.load_input_flat(vec![input.clone()])?;
-        let output = &model.run_float(&input)?[0];
+        let inputs = model.load_input_flat(vec![input.clone()])?;
+        let output = &model.run_float(inputs)?[0];
         let accuracy = argmax_compare(expected, output.get_data());
         accuracies.push(accuracy);
         debug!(
@@ -318,9 +318,8 @@ fn run(args: Args) -> anyhow::Result<()> {
     for (i, (input, given_output)) in input_iter {
         info!("== Running model ==");
         let metrics = Metrics::new();
-        let input_tensor = model.load_input_flat(vec![input])?;
-
-        let trace_result = model.run(&input_tensor, &mut GenStore::default());
+        let input_tensors = model.load_input_flat(vec![input])?;
+        let trace_result = model.run(input_tensors, &mut GenStore::default());
 
         let span = metrics.to_span();
         stream_metrics(format!("Inference {i}"), &span);

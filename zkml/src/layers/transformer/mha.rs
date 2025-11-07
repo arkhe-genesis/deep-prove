@@ -39,7 +39,6 @@ use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tenstore::GenStore;
 use transcript::Transcript;
 
 /// Short name used to identify the MHA layer
@@ -751,10 +750,9 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
-        let input_tensors = step_data.input_tensors(store)?;
-        let output_tensors = step_data.output_tensors(store)?;
+        let input_tensors = step_data.input_tensors()?;
+        let output_tensors = step_data.output_tensors()?;
 
         ensure!(
             input_tensors.len() == 3,
@@ -874,7 +872,6 @@ where
         id: NodeId,
         ctx: &crate::ProverContext<E, PCS>,
         step_data: &Step<E, Element, Element>,
-        _store: &mut GenStore,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         let mha_data = step_data
             .node_outputs
@@ -1099,6 +1096,7 @@ mod test {
     use anyhow::Context;
     use ff_ext::GoldilocksExt2;
     use itertools::Itertools;
+    use tenstore::GenStore;
 
     use crate::{
         Element, init_test_logging,
@@ -1518,7 +1516,7 @@ mod test {
         // need to clone the model as subsequent calls expect seq_len = 1 due to caching
         // and the trace keeps an immutable reference so the cloned model lifetime still needs to be active
         let trace = quantized_model
-            .run::<GoldilocksExt2>(&quantized_input, &mut GenStore::default())
+            .run::<GoldilocksExt2>(quantized_input.clone(), &mut GenStore::default())
             .unwrap();
         let outputs = trace.outputs().unwrap();
 
@@ -1749,7 +1747,7 @@ mod test {
         }
         // run to get unpadded output
         let mut outputs = quantized_model
-            .run::<GoldilocksExt2>(&inputs, &mut GenStore::default())
+            .run::<GoldilocksExt2>(inputs.clone(), &mut GenStore::default())
             .unwrap()
             .outputs()
             .unwrap();
@@ -1766,7 +1764,7 @@ mod test {
 
         // compute padded evaluation, with garbage removal in matmul
         let mut outputs = padded_model
-            .run::<GoldilocksExt2>(&padded_inputs, &mut GenStore::default())
+            .run::<GoldilocksExt2>(padded_inputs, &mut GenStore::default())
             .unwrap()
             .outputs()
             .unwrap();

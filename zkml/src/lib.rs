@@ -2,6 +2,7 @@
 #![feature(iter_next_chunk)]
 #![feature(min_specialization)]
 #![feature(exact_size_is_empty)]
+#![feature(mapped_lock_guards)]
 
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
 use ff_ext::ExtensionField;
@@ -288,9 +289,9 @@ mod test {
         assert_eq!(shape.len(), 1);
         let input = Tensor::random(&vec![shape[0]].into());
         println!("input: {:?}", input.get_data());
-        let input = model.prepare_inputs(vec![input])?;
+        let inputs = model.prepare_inputs(vec![input])?;
 
-        let trace = model.run(&input, &mut GenStore::default()).unwrap();
+        let trace = model.run(inputs, &mut GenStore::default()).unwrap();
 
         let output = trace.output_at(0)?;
         println!("[+] Run inference. Result: {output:?}");

@@ -55,7 +55,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 use witness::RowMajorMatrix;
 
@@ -1298,7 +1297,6 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut crate::Prover<E, T, PCS>,
-        _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
             "Softmax LayerOut didn't have any ProvingData::Softmax"
@@ -1318,10 +1316,9 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<E, Element, Element>,
-        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
-        let input_tensors = step_data.input_tensors(store)?;
-        let output_tensors = step_data.output_tensors(store)?;
+        let input_tensors = step_data.input_tensors()?;
+        let output_tensors = step_data.output_tensors()?;
 
         ensure!(
             step_data.node_inputs.len() == 1,
@@ -1935,9 +1932,9 @@ where
 
 #[cfg(test)]
 mod tests {
-
     use core::f32;
     use ff_ext::GoldilocksExt2;
+    use tenstore::GenStore;
 
     use crate::{
         Tensor, init_test_logging,

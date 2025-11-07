@@ -44,7 +44,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 
 /// The short name used to identify the embeddings layer
@@ -408,7 +407,6 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         // we first construct the one hot encoding from the input indices and then we run
         // the matmul protocol.
@@ -421,7 +419,7 @@ where
             "embeddings only support 1 last claim"
         );
         let last_claim = last_claims[0];
-        let input_tensors = step_data.input_tensors(store)?;
+        let input_tensors = step_data.input_tensors()?;
         let input = &input_tensors[0];
 
         let (row_point, column_point) = Self::split_output_point(last_claim, self.emb_size)?;
@@ -674,6 +672,7 @@ mod tests {
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};
+    use tenstore::GenStore;
 
     use crate::{
         Element,

@@ -40,7 +40,6 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 
 pub(crate) mod absolute;
@@ -643,7 +642,6 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
             last_claims.len() == 1,
@@ -659,10 +657,10 @@ where
         let output_claim = last_claims[0];
         match &self.variant {
             PositionalVariant::Absolute(absolute) => {
-                absolute.prove_step(node_id, output_claim, step_data, prover, store)
+                absolute.prove_step(node_id, output_claim, step_data, prover)
             }
             PositionalVariant::Rope(rope) => {
-                rope.prove_step(node_id, output_claim, step_data, prover, store)
+                rope.prove_step(node_id, output_claim, step_data, prover)
             }
         }
     }

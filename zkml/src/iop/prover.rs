@@ -36,7 +36,10 @@ use multilinear_extensions::{
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
+};
 use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use timed::timed_instrument;
 use tracing::{debug, trace};
@@ -559,7 +562,6 @@ where
             .context("converting trace to fields")?;
 
         // compute model output claims for this chunk
-        let mut store = trace.store.clone();
         let chunk_id = chunk.chunk_id;
         // compute the claims for the model outputs produced in this chunk, each identified by the
         // model output port ID
@@ -585,7 +587,6 @@ where
                 let source_port = &output_edge.ports()[0].source_port;
                 let output_tensor = trace_step.output_tensor_at(
                     **source_port,
-                    &mut store,
                 )?;
                 ensure!(
                     outputs.insert(output_id, output_tensor).is_none(),
@@ -622,7 +623,6 @@ where
                          // compute new claim and insert in cache
                          let output_tensor = trace_step.output_tensor_at(
                              port.source_port.into(),
-                             &mut store,
                          )?;
                          e.insert(output_tensor);
                     }
@@ -651,13 +651,14 @@ where
                     );
 
                     // Hydrate all the output tensors of this node
-                    let tensors = section
+                    let handles = section
                         .node_outputs
                         .outputs
                         .iter()
-                        .map(|t| {
-                            t.hydrate(store.clone())
-                                .with_context(|| format!("hydrating tensor {}", t.storage_key()))
+                        .map(|handle| {
+                            handle.tensor().with_context(|| {
+                                format!("hydrating tensor {}", handle.storage_key())
+                            })
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -675,7 +676,7 @@ where
                     // this node.
                     let claims_for_prove = self.flatten_and_merge_claims(
                         claims_for_node,
-                        &tensors.iter().collect::<Vec<_>>(),
+                        &handles.iter().map(|v| v.deref()).collect::<Vec<_>>(),
                         node_id,
                     )?;
 
@@ -699,7 +700,6 @@ where
                                 claims_for_prove.iter().collect::<Vec<_>>(),
                                 section,
                                 self,
-                                &mut store,
                             )
                             .with_context(|| {
                                 format!("proving {}: {}", node_id, section.op.describe())

@@ -513,7 +513,7 @@ mod tests {
         let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
         let mut store = GenStore::default();
 
-        let trace = model.run::<F>(std::slice::from_ref(&tensor), &mut store)?;
+        let trace = model.run::<F>(vec![tensor.clone()], &mut store)?;
         // Get the final node of the Model, we will compare the inputs to this node before and after the transformation (we compare the inputs because the outputs of this layer are tokens
         // and it may be the case that we would get the same tokens out but the actual logits are different)
         let last_model_node_id = model
@@ -525,17 +525,17 @@ mod tests {
             .collect::<Vec<NodeId>>()[0];
         // Extract the input to the Logits layer before applying the transformation.
         let pre_transform_final_step = trace.get_step(last_model_node_id).unwrap();
-        let pre_transform_inputs = pre_transform_final_step.input_tensors(&mut store).unwrap();
+        let pre_transform_inputs = pre_transform_final_step.input_tensors().unwrap();
         // Rewrite the model by applying our transformation rule
         let model = LayerNormToRMSNorm.apply(model)?;
 
         // Now we generate the post-transformation trace and extract the logits step data
         let mut store = GenStore::default();
 
-        let new_trace = model.run::<F>(std::slice::from_ref(&tensor), &mut store)?;
+        let new_trace = model.run::<F>(vec![tensor], &mut store)?;
 
         let post_transform_final_step = new_trace.get_step(last_model_node_id).unwrap();
-        let post_transform_inputs = post_transform_final_step.input_tensors(&mut store).unwrap();
+        let post_transform_inputs = post_transform_final_step.input_tensors().unwrap();
         // Compare the pre and post transformation data
         for (pre, post) in pre_transform_inputs
             .iter()

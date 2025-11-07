@@ -173,7 +173,7 @@ impl Driver<f32> {
         let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
         let mut store = GenStore::default();
 
-        let trace = self.model.run::<E>(&[tensor], &mut store)?;
+        let trace = self.model.run::<E>(vec![tensor], &mut store)?;
 
         if let Some(ref obs) = observer {
             obs.observe(0, &trace);
@@ -259,12 +259,12 @@ where
             let trace = if let PaddingMode::NoPadding = self.padding_mode {
                 self.model
                     // TODO: make it re-usable at least for the static weights
-                    .run::<E>(&[tensor.clone()], &mut store)
+                    .run::<E>(vec![tensor.clone()], &mut store)
             } else {
                 let unpadded_shape = tensor.shape().clone();
                 let padded = tensor.pad_next_power_of_two();
                 info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
-                self.model.run::<E>(&[padded], &mut store)
+                self.model.run::<E>(vec![padded], &mut store)
             }
             .context(format!(
                 "runng the {} iteration loop",
@@ -312,7 +312,7 @@ where
         info!("Running last iteration (heavy) with {input_len} tokens");
 
         let mut store = GenStore::default();
-        let trace = self.model.run::<E>(&[tensor], &mut store)?;
+        let trace = self.model.run::<E>(vec![tensor], &mut store)?;
         for i in user_len..input_len {
             assert_eq!(
                 trace.outputs().unwrap()[0].get_data()[i - 1],
@@ -518,7 +518,7 @@ where
             .output
             .last()
             .unwrap()
-            .hydrate(trace.store.clone())
+            .tensor()
             .expect("hydration failed");
         let output_tokens_len = tensor.get_data().len();
         let input_tokens = self.tokenizer.tokenize(&self.input);

@@ -45,7 +45,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
@@ -346,15 +345,14 @@ where
         _last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
             step_data.node_inputs.len() == 1,
             "Expected 1 input tensor for Logits layer, found {}",
             step_data.node_inputs.len()
         );
-        let input = step_data.input_tensor_at(0, store)?;
-        let outputs = step_data.output_tensors(store)?;
+        let input = step_data.input_tensor_at(0)?;
+        let outputs = step_data.output_tensors()?;
         // We need the final dim size to build the less than polynomial
         let unpadded_dim_size =
             step_data.unpadded_input_shapes[0].dim(step_data.unpadded_input_shapes[0].rank() - 1);
@@ -502,7 +500,6 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<E, Element, Element>,
-        store: &mut GenStore,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         ensure!(
             step_data.node_inputs.len() == 1,
@@ -510,7 +507,7 @@ where
             step_data.node_inputs.len()
         );
 
-        let inputs = step_data.input_tensors(store)?;
+        let inputs = step_data.input_tensors()?;
         let input = &inputs[0];
 
         ensure!(
@@ -853,6 +850,7 @@ impl LogitsCtx {
 #[cfg(test)]
 mod test {
     use ff_ext::GoldilocksExt2;
+    use tenstore::GenStore;
 
     use super::*;
     use crate::{

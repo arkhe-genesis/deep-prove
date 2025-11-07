@@ -39,7 +39,6 @@ use std::{
     marker::PhantomData,
     sync::Arc,
 };
-use tenstore::GenStore;
 use tracing::{debug, warn};
 use transcript::Transcript;
 use utils::Metrics;
@@ -938,7 +937,6 @@ where
 {
     trace: &'a InferenceTrace<'a, E, Element>,
     ctx: &'b ProverContext<E, PCS>,
-    store: GenStore,
 }
 
 #[derive(Clone)]
@@ -961,6 +959,7 @@ where
 {
     type IO = GenerateWitnessIO<E, PCS>;
     type Context = GenerateWitnessContext<'a, 'b, E, PCS>;
+
     fn run(&self, ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Self::IO> {
         let input = input.first().context("expect only one node_id as input")?;
         let GenerateWitnessIO::Input(node_id) = input else {
@@ -974,7 +973,7 @@ where
 
         Ok(step
             .op
-            .gen_lookup_witness(*node_id, ctx.ctx, step, &mut ctx.store.clone())
+            .gen_lookup_witness(*node_id, ctx.ctx, step)
             .map_err(|e| {
                 LogUpError::ParameterError(format!(
                     "Error generating lookup witness for node {node_id:?} with error: {e:?}"
@@ -1024,7 +1023,6 @@ where
     debug!("== Witness poly commitments generation ==");
     let metrics = Metrics::new();
     let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
-    let store = trace.store.clone();
 
     // We create the graph here for showcasing the graph module. The end goal is
     // that we create the graph at the top level and every functionality of the
@@ -1063,7 +1061,7 @@ where
 
     // here for the moment there is not yet a "parent node" so it's a directed
     // graph ... but with no edges.
-    let graph_ctx = GenerateWitnessContext { ctx, store, trace };
+    let graph_ctx = GenerateWitnessContext { ctx, trace };
     let scheduler = GraphScheduler::<GenerateWitness<E, PCS>, usize>::new(graph);
     // NOTE: until https://github.com/Plonky3/Plonky3/pull/999 is fixed, we have
     // to use the sequential executor and not the threadpool executor.

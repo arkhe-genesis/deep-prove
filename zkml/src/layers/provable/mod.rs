@@ -28,7 +28,6 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::mle::IntoMLE;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, fmt::Debug};
-use tenstore::GenStore;
 use transcript::Transcript;
 
 /// Enum if the output of evaluating a layer returns extra data needed during proving.
@@ -92,6 +91,17 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
             proving_data: data,
             tracked_layer_data: self.tracked_layer_data,
         }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<WrappedTensor<T>>,
+        ProvingData<E>,
+        Option<HashMap<TrackedDataId, WrappedTensor<T>>>,
+    ) {
+        (self.outputs, self.proving_data, self.tracked_layer_data)
     }
 
     /// Add a set of intermediate data tensors to be tracked for quantization purposes;
@@ -308,7 +318,6 @@ where
         _last_claims: Vec<&Claim<E>>,
         _step_data: &Step<E, Element, E>,
         _prover: &mut Prover<'c, 'd, E, T, PCS>,
-        _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
         ensure!(
@@ -324,7 +333,6 @@ where
         _id: NodeId,
         _ctx: &ProverContext<E, PCS>,
         _step_data: &Step<E, Element, Element>,
-        _store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         Ok(Default::default())
     }

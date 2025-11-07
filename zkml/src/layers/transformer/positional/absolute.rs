@@ -26,7 +26,6 @@ use std::{
     ops::Deref,
     sync::{Arc, Mutex},
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 
 /// Data structure containing the proof data for the absolute variant of positional encoding layer
@@ -208,7 +207,6 @@ impl Absolute<Element> {
         output_claim: &Claim<E>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
@@ -218,14 +216,17 @@ impl Absolute<Element> {
 
         // derive sub-matrix to be added to input. ToDo: place it in proving data
         let matrix_slice = TensorSlice::from(self.positional.deref());
-        let input = input.hydrate(store.clone())?;
+        let input = input.tensor()?;
         let sub_pos = matrix_slice
             .slice_over_first_dim(0, input.shape()[0])
             .to_fields();
 
-        let (mut claims, add_proof) =
-            self.add_layer
-                .prove_step(node_id, vec![output_claim], &[&input, &sub_pos], prover)?;
+        let (mut claims, add_proof) = self.add_layer.prove_step(
+            node_id,
+            vec![output_claim],
+            &[input.deref(), &sub_pos],
+            prover,
+        )?;
 
         ensure!(
             claims.len() == 2,

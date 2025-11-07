@@ -24,7 +24,6 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{mle::IntoMLE, util::ceil_log2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{cmp::Ordering, collections::HashMap};
-use tenstore::GenStore;
 use transcript::Transcript;
 
 /// The short name used to identify the Add layer.
@@ -535,17 +534,12 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
         T: Transcript<E>,
     {
-        let (output_claims, proof) = self.prove_step(
-            node_id,
-            last_claims,
-            &step_data.input_tensors(store)?,
-            prover,
-        )?;
+        let (output_claims, proof) =
+            self.prove_step(node_id, last_claims, &step_data.input_tensors()?, prover)?;
 
         prover.push_proof(node_id, LayerProof::Add(proof));
         Ok(output_claims)
@@ -617,7 +611,7 @@ mod test {
     use std::{fmt::Debug, ops::Range};
 
     use ff_ext::GoldilocksExt2;
-    use tenstore::StorageKey;
+    use tenstore::{GenStore, StorageKey};
 
     use crate::{
         Element,

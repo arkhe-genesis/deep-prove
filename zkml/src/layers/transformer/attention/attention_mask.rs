@@ -40,7 +40,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 
 /// The short name used to identify the attention mask layer
@@ -756,9 +755,8 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let inputs = step_data.input_tensors(store)?;
+        let inputs = step_data.input_tensors()?;
 
         ensure!(
             inputs.len() == 1,
@@ -1268,6 +1266,7 @@ where
 #[cfg(test)]
 mod tests {
     use ark_std::rand::Rng;
+    use tenstore::GenStore;
 
     use crate::{
         layers::{Layer, concat_matmul::ConcatMatMul},
@@ -1412,7 +1411,7 @@ mod tests {
             let padded_input = input.pad_next_power_of_two();
             let mut store = GenStore::default();
             let output = model
-                .run::<F>(std::slice::from_ref(&padded_input), &mut store)
+                .run::<F>(vec![padded_input.clone()], &mut store)
                 .unwrap();
             let output_tensor = output.outputs().unwrap().pop().unwrap();
             assert_eq!(output_tensor.shape(), padded_input.shape());

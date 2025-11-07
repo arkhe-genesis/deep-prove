@@ -34,7 +34,6 @@ use multilinear_extensions::Expression;
 use prove::EinSumProofInfo;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sumcheck::structs::IOPProof;
-use tenstore::GenStore;
 use transcript::Transcript;
 use verify::EinSumVerifierInfo;
 
@@ -354,9 +353,8 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let inputs = step_data.input_tensors(store)?;
+        let inputs = step_data.input_tensors()?;
         let unpadded_input_shapes = &step_data.unpadded_input_shapes;
 
         let EinSumProofInfo {
@@ -527,6 +525,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use tenstore::GenStore;
 
     use crate::{
         layers::Layer,

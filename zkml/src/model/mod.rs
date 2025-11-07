@@ -1,8 +1,9 @@
+use itertools::izip;
+use std::ops::Deref;
+
 use crate::{
     Shape, Tensor,
-    graph::{
-        Direction, Edge, Feed, Graph, Node, NodeId, NodeInput, NodeOutput, PortId, PortLink, Ports,
-    },
+    graph::{Direction, Edge, Graph, Node, NodeId, NodeInput, NodeOutput, PortLink, Ports},
     layers::{
         Layer, NodeOut,
         provable::{Evaluate, OpInfo},
@@ -10,7 +11,7 @@ use crate::{
     },
     padding::PaddingMode,
     quantization::InferenceTracker,
-    tensor::{Conversion, DryTensor, TensorTypeParam, WrappedTensor},
+    tensor::{Conversion, TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
@@ -477,7 +478,7 @@ where
 }
 
 impl Model<f32> {
-    pub fn run_float(&self, input: &[Tensor<f32>]) -> anyhow::Result<Vec<Tensor<f32>>> {
+    pub fn run_float(&self, input: Vec<Tensor<f32>>) -> anyhow::Result<Vec<Tensor<f32>>> {
         self.run::<GoldilocksExt2>(input, &mut GenStore::default())?
             .outputs()
     }
@@ -486,7 +487,7 @@ impl Model<f32> {
 impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     pub(crate) fn run_with_tracker<E>(
         &self,
-        inputs: &[Tensor<N>],
+        inputs: Vec<Tensor<N>>,
         mut tracker: Option<&mut InferenceTracker>,
         store: &mut GenStore,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
@@ -503,54 +504,80 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         ensure!(unpadded_input_shapes.len() == inputs.len());
 
         // Seed the shape accumulators with the model inputs
-        let (mut shape_register, input_dry_tensors) = inputs.iter().enumerate().try_fold(
-            (HashMap::new(), Vec::new()),
-            #[allow(clippy::type_complexity)]
-            |(mut shape_register, mut dry_tensors),
-             (i, tensor)|
-             -> anyhow::Result<(
-                HashMap<StorageKey<Vec<N>>, (Shape, Shape)>,
-                Vec<DryTensor<N>>,
-            )> {
-                let input_node_id = self.graph.input_node_id(i)?;
-                let storage_key = input_node_id.output_at(0).to_storage_key();
-                let input_shape = tensor.shape().clone();
-                // save the tensor to the store
-                store.store(&storage_key, tensor.data_vec())?;
-                // save the key => shape relation
-                shape_register.insert(
-                    storage_key.clone(),
-                    (input_shape.clone(), tensor.unpadded_shape().clone()),
-                );
-                dry_tensors.push(DryTensor::new(
-                    storage_key,
-                    input_shape,
-                    tensor.unpadded_shape().clone(),
-                ));
+        let mut storagekey_to_handle = HashMap::new();
+        let mut input_handles = Vec::new();
+        for (i, tensor) in inputs.into_iter().enumerate() {
+            let input_node_id = self.graph.input_node_id(i)?;
+            let storage_key = input_node_id.output_at(0).to_storage_key();
+            let handle = TensorHandle::from_tensor(storage_key, store.clone(), tensor);
+            handle.store()?;
+            input_handles.push(handle.clone());
+            storagekey_to_handle.insert(handle.storage_key().clone(), handle);
+        }
 
-                Ok((shape_register, dry_tensors))
-            },
-        )?;
-        let mut trace = Trace::new(store.clone(), input_dry_tensors);
+        let mut handle_usage_count = HashMap::<StorageKey<Vec<N>>, _>::new();
+        for (_edge_id, edge) in self.graph.edges() {
+            let source = edge.source();
 
+            for link in edge.ports().iter() {
+                let storage_key = source.output_at(link.source_port).to_storage_key();
+                handle_usage_count
+                    .entry(storage_key)
+                    .and_modify(|curr| *curr += 1)
+                    .or_insert(1);
+            }
+        }
+
+        let mut trace = Trace::new(input_handles);
         for (node_id, layer) in self.graph.forward_inners() {
+            let input_storage_keys: Vec<StorageKey<Vec<N>>> = self
+                .graph
+                .incoming_feeds(node_id)
+                .iter()
+                .map(|feed| feed.source.to_storage_key())
+                .collect::<Vec<_>>();
+
+            let handles = input_storage_keys
+                .iter()
+                .map(|storage_key| {
+                    storagekey_to_handle
+                        .get(storage_key)
+                        .with_context(|| format!("Missing tensor handle for {}", storage_key))
+                        .cloned()
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            for storage_key in input_storage_keys {
+                let usages = handle_usage_count
+                    .entry(storage_key.clone())
+                    .and_modify(|curr| *curr -= 1)
+                    .or_insert(0);
+                if *usages == 0 {
+                    let handle = storagekey_to_handle
+                        .get(&storage_key)
+                        .with_context(|| format!("Missing tensor handle for {}", storage_key))?;
+                    handle.dry()
+                }
+            }
+
             let new_step = self
-                .run_layer(
-                    node_id,
-                    layer,
-                    &self.graph.incoming_feeds(node_id),
-                    &mut shape_register,
-                    &mut tracker,
-                    store.clone(),
-                )
+                .run_layer(node_id, layer, handles, &mut tracker, store.clone())
                 .context(format!("Error occurred at node ID: {node_id}"))?;
+
+            storagekey_to_handle.extend(
+                new_step
+                    .node_outputs
+                    .outputs
+                    .iter()
+                    .map(|handle| (handle.storage_key().clone(), handle.clone())),
+            );
 
             trace.new_step(node_id, new_step);
         }
 
         // compute the output tensor from the outputs of the output nodes
         let output_nodes = self.graph.output_nodes().map(|(node_id, _)| node_id);
-        let mut outputs = BTreeMap::<usize, DryTensor<N>>::new();
+        let mut outputs = BTreeMap::<usize, TensorHandle<N>>::new();
         for (output_node_id, in_feed) in output_nodes.into_iter().flat_map(|node_id| {
             self.graph
                 .incoming_feeds(node_id)
@@ -595,7 +622,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     /// trace
     pub fn run<E>(
         &self,
-        input: &[Tensor<N>],
+        inputs: Vec<Tensor<N>>,
         store: &mut GenStore,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
@@ -603,17 +630,16 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         E: ExtensionField + Serialize + DeserializeOwned,
         Layer<N>: Evaluate<N>,
     {
-        self.run_with_tracker(input, None, store)
+        self.run_with_tracker(inputs, None, store)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_layer<'a, E: ExtensionField>(
+    fn run_layer<'a, E: ExtensionField>(
         &self,
         node_id: NodeId,
         layer: &'a Layer<N>,
         // inputs are assumed to be sorted by source port, e.g. in the order defined by the ports
-        incomings: &[Feed],
-        shape_register: &mut HashMap<StorageKey<Vec<N>>, (Shape, Shape)>,
+        handles: Vec<TensorHandle<N>>,
         tracker: &mut Option<&mut InferenceTracker>,
         store: GenStore,
         // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
@@ -622,93 +648,83 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         N: TensorTypeParam,
         Layer<N>: Evaluate<N>,
     {
-        // TODO: make that whole thing Result-able
-        let prec_keys: Vec<StorageKey<_>> = incomings
-            .iter()
-            .map(|in_feed| in_feed.source.to_storage_key())
-            .collect();
+        let mut wrapped_tensors = Vec::with_capacity(handles.len());
+        let mut prec_unpadded_shapes = Vec::with_capacity(handles.len());
+        let expected_num_outputs = layer.num_outputs(handles.len())?;
 
-        let prec_dried_tensors: Vec<DryTensor<_>> = prec_keys
-            .iter()
-            .map(|key| {
-                DryTensor::new(
-                    key.clone(),
-                    shape_register[key].clone().0,
-                    shape_register[key].clone().1,
-                )
-            })
-            .collect();
+        for handle in &handles {
+            let wrapped_tensor = {
+                let tensor = handle.tensor().with_context(|| {
+                    format!("fetching tensor data for tensor {}", handle.storage_key())
+                })?;
+                WrappedTensor::try_from(tensor.deref())?
+            };
 
-        let (prec_tensors, prec_unpadded_shapes): (Vec<_>, Vec<_>) = prec_keys
-            .iter()
-            .zip(prec_dried_tensors.iter())
-            .map(|(key, dry_tensor)| {
-                let t = dry_tensor
-                    .hydrate(store.clone())
-                    .with_context(|| format!("fetching tensor data for tensor {key}"))
-                    .unwrap();
-                (
-                    WrappedTensor::try_from(&t).unwrap(),
-                    shape_register[key].1.clone(),
-                )
-            })
-            .unzip();
+            wrapped_tensors.push(wrapped_tensor);
+            prec_unpadded_shapes.push(handle.unpadded_shape().clone());
+        }
 
-        let expected_num_outputs = layer.num_outputs(prec_tensors.len())?;
+        let wrapped_tensor_refs = wrapped_tensors.iter().collect::<Vec<_>>();
+        let layer_out = layer.evaluate(wrapped_tensor_refs.as_slice())?;
+        let (layer_outputs, layer_proving_data, layer_tracked_data) = layer_out.into_parts();
 
-        // run the layer
-        let layer_out = layer.evaluate(prec_tensors.iter().collect::<Vec<_>>().as_slice())?;
-        ensure!(expected_num_outputs == layer_out.outputs.len());
+        // Outgoing ports are unique, so they are used to create the tensor's id.
+        let out_ports = self.graph.outgoing_ports(node_id);
+        let out_shapes = layer.output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?;
 
-        // the keys under which to save the output tensor of this layer. We save
-        // one tensor per source port so we index the output edges by the source
-        // port of the current node
-        let out_feeds = self.graph.outgoing_feeds(node_id);
         ensure!(
-            out_feeds.len() >= expected_num_outputs,
-            "Number of outputs ({}) does not match expected number of outputs ({}) for node {node_id}: {}",
-            out_feeds.len(),
+            expected_num_outputs == layer_outputs.len(),
+            "Unexpected number of output. expected {} got {} layer {}",
+            expected_num_outputs,
+            layer_outputs.len(),
+            layer.describe(),
+        );
+        ensure!(
+            out_ports.len() == expected_num_outputs,
+            "Unexpected number of output ports. ports {:?} expected {} layer {}",
+            out_ports,
             expected_num_outputs,
             layer.describe(),
         );
+        ensure!(
+            out_ports.len() == out_shapes.len(),
+            "Unexpected number of output shapes. ports {:?} shapes {:?} layer {}",
+            out_ports,
+            out_shapes,
+            layer.describe(),
+        );
 
-        // store each output to the store and return the corresponding dry tensor
-        let dry_output_tensors: BTreeMap<PortId, DryTensor<N>> = out_feeds
-            .iter()
-            .map(|feed| {
-                let key: StorageKey<Vec<N>> = feed.source.to_storage_key();
-                let tensor = &layer_out.outputs[feed.source.port];
-                store
-                    .clone()
-                    .store(
-                        &key,
-                        &tensor.clone().to_data().into_vec().map_err(|_| {
-                            anyhow::Error::msg("Retrieve tensor data from burn tensor")
-                        })?,
-                    )
-                    .with_context(|| format!("storing outputs for tensor {key}"))?;
-                Ok((
-                    feed.source.port,
-                    DryTensor::new(
-                        key,
-                        tensor.shape().clone().into(),
-                        tensor.unpadded_shape().clone().into(),
-                    ),
-                ))
-            })
-            .collect::<Result<_>>()?;
+        let mut output_handles = Vec::<TensorHandle<N>>::with_capacity(out_ports.len());
+        for (port, shape, tensor) in izip!(out_ports, out_shapes, layer_outputs) {
+            let storage_key: StorageKey<Vec<N>> = port.to_storage_key();
+            let data = tensor
+                .clone()
+                .to_data()
+                .into_vec()
+                .map_err(|_| anyhow::Error::msg("Retrieve tensor data from burn tensor"))?;
+            store
+                .store(&storage_key, &data)
+                .with_context(|| format!("storing outputs for tensor {storage_key}"))?;
 
-        // add output tensors to tracker, if any
-        if let Some(tracker) = tracker.as_mut() {
-            for out_feed in out_feeds.iter() {
+            if let Some(tracker) = tracker.as_mut() {
                 tracker.track(
                     node_id,
-                    *out_feed.source.port,
-                    Tensor::try_from(layer_out.outputs[*out_feed.source.port].clone().float())?,
+                    *port.port,
+                    Tensor::try_from(tensor.clone().float())?,
                 );
             }
-            // track intermediate data, if any
-            if let Some(tracked_data) = layer_out.tracked_layer_data {
+
+            let handle = TensorHandle::from_wrapped_tensor_with_unpadded_shape(
+                storage_key,
+                store.clone(),
+                tensor,
+                shape,
+            );
+            output_handles.push(handle);
+        }
+
+        if let Some(tracker) = tracker.as_mut() {
+            if let Some(tracked_data) = layer_tracked_data {
                 for (data_id, data) in tracked_data {
                     tracker.track_intermediate_data(
                         node_id,
@@ -719,37 +735,10 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
             }
         }
 
-        // update the shape registers with the shapes of the outputs of the node
-        // so next node can load its input from the input shape register
-        shape_register.extend(dry_output_tensors.values().map(|dry_tensor| {
-            (
-                dry_tensor.storage_key().to_owned(),
-                (
-                    dry_tensor.shape().to_owned(),
-                    dry_tensor.unpadded_shape().to_owned(),
-                ),
-            )
-        }));
-
-        for (i, shape) in layer
-            .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?
-            .into_iter()
-            .enumerate()
-        {
-            shape_register
-                .get_mut(&node_id.output_at(i).to_storage_key())
-                .unwrap()
-                .1 = shape;
-        }
-
-        // Record the step into the trace
         Ok(Step {
             op: layer,
-            node_inputs: prec_dried_tensors,
-            node_outputs: NodeOut::new(
-                dry_output_tensors.into_values().collect(),
-                layer_out.proving_data,
-            ),
+            node_inputs: handles,
+            node_outputs: NodeOut::new(output_handles, layer_proving_data),
             unpadded_output_shapes: layer
                 .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?,
             unpadded_input_shapes: prec_unpadded_shapes,
@@ -947,8 +936,8 @@ pub(crate) mod test {
 
     #[test]
     fn test_model_long() {
-        let (model, input) = Model::random(3).unwrap();
-        model.run::<F>(&input, &mut Default::default()).unwrap();
+        let (model, inputs) = Model::random(3).unwrap();
+        model.run::<F>(inputs, &mut Default::default()).unwrap();
     }
 
     fn random_vector_quant(n: usize) -> Vec<Element> {
@@ -987,10 +976,10 @@ pub(crate) mod test {
         // we can just do model.prepare_input(&input).
         // Here is not possible since we didnt run through the onnx loader
         let input = Tensor::random(&input_shape);
-        let input_padded = model.prepare_inputs(vec![input]).unwrap();
+        let inputs_padded = model.prepare_inputs(vec![input]).unwrap();
 
         let _ = model
-            .run::<F>(&input_padded, &mut Default::default())
+            .run::<F>(inputs_padded, &mut Default::default())
             .unwrap();
     }
 
@@ -1033,7 +1022,7 @@ pub(crate) mod test {
 
         let mut store = GenStore::default();
         let input = input.into_native();
-        let trace = model.run::<F>(&[input], &mut store).unwrap();
+        let trace = model.run::<F>(vec![input], &mut store).unwrap();
         assert_eq!(trace.steps.len(), 2);
         // Verify first step
 
@@ -1041,7 +1030,7 @@ pub(crate) mod test {
             trace
                 .get_step(first_id)
                 .unwrap()
-                .output_tensor_at(0, &mut store)
+                .output_tensor_at(0)
                 .unwrap(),
             output1.into_native()
         );
@@ -1051,7 +1040,7 @@ pub(crate) mod test {
             trace
                 .get_step(second_id)
                 .unwrap()
-                .output_tensor_at(0, &mut store)
+                .output_tensor_at(0)
                 .unwrap(),
             final_output.clone().into_native()
         );
@@ -1064,11 +1053,10 @@ pub(crate) mod test {
         let (model, input) = Model::random(1).unwrap();
         model.describe();
         let trace = model
-            .run::<F>(&input, &mut Default::default())
+            .run::<F>(input, &mut Default::default())
             .unwrap()
             .into_fields()
             .unwrap();
-        let mut store = trace.store.clone();
         let dense_layers = model
             .to_unstable_iterator()
             .filter_map(|(n_id, n)| n.as_inner().map(|l| (n_id, l)))
@@ -1086,7 +1074,7 @@ pub(crate) mod test {
         let computed_eval1 = trace
             .get_step(dense_layers[0].0)
             .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
-            .output_tensor_at(0, &mut store)
+            .output_tensor_at(0)
             .unwrap()
             .get_data()
             .to_vec()
@@ -1152,7 +1140,7 @@ pub(crate) mod test {
             .unwrap();
         model.automatic_output_labelling().unwrap();
         model.describe();
-        let trace = model.run::<F>(&[input], &mut store).unwrap();
+        let trace = model.run::<F>(vec![input], &mut store).unwrap();
         let mut tr: BasicTranscript<F> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1186,12 +1174,12 @@ pub(crate) mod test {
         model.describe();
 
         let input = random_vector_quant(input_shape[0] * input_shape[1]);
-        let input_tensor = model
+        let inputs = model
             .prepare_inputs(vec![Tensor::new(input_shape, input).unwrap()])
             .unwrap();
 
         let mut store = GenStore::default();
-        let trace = model.run::<F>(&input_tensor, &mut store).unwrap();
+        let trace = model.run::<F>(inputs, &mut store).unwrap();
         let mut tr = BasicTranscript::<F>::new(b"matmul");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1249,7 +1237,7 @@ pub(crate) mod test {
         model.automatic_output_labelling().unwrap();
         model.describe();
         let mut store = GenStore::default();
-        let trace = model.run::<F>(&[input], &mut store).unwrap();
+        let trace = model.run::<F>(vec![input], &mut store).unwrap();
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1324,7 +1312,7 @@ pub(crate) mod test {
         let input = random_vector(input_shape.iter().product());
         let input_tensor = Tensor::new(input_shape, input).unwrap();
         let trace = model
-            .run::<E>(&[input_tensor], &mut Default::default())
+            .run::<E>(vec![input_tensor], &mut Default::default())
             .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
@@ -1337,7 +1325,7 @@ pub(crate) mod test {
 
         let input_tensor = Tensor::random(&input_shape);
         let trace = model
-            .run::<E>(&[input_tensor], &mut Default::default())
+            .run::<E>(vec![input_tensor], &mut Default::default())
             .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
@@ -1383,7 +1371,7 @@ pub(crate) mod test {
 
         let input_tensors = model.prepare_inputs(inputs).unwrap();
 
-        let trace = model.run(&input_tensors, store)?;
+        let trace = model.run(input_tensors, store)?;
         let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"model");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1471,7 +1459,7 @@ pub(crate) mod test {
             .unwrap();
         model.add_edge(relu1, relu3, vec![(0, 0)]).unwrap();
 
-        let input_tensor = vec![
+        let input_tensors = vec![
             Tensor::random(&input_shapes[0]),
             Tensor::random(&input_shapes[1]),
         ];
@@ -1488,7 +1476,7 @@ pub(crate) mod test {
         model.add_edge(relu2, output_node_ids[1], (1, 0)).unwrap();
         model.add_edge(relu3, output_node_ids[2], (0, 0)).unwrap();
         model
-            .run::<GoldilocksExt2>(&input_tensor, &mut Default::default())
+            .run::<GoldilocksExt2>(input_tensors, &mut Default::default())
             .unwrap();
     }
 

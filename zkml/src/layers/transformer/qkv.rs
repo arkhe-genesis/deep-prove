@@ -38,7 +38,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use transcript::{Challenge, Transcript};
 
 /// Short name used to identify the QKV layer
@@ -634,10 +633,9 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let input_tensors = step_data.input_tensors(store)?;
-        let output_tensors = step_data.output_tensors(store)?;
+        let input_tensors = step_data.input_tensors()?;
+        let output_tensors = step_data.output_tensors()?;
 
         let expected_num_outputs = self.num_outputs(1)?;
         ensure!(
@@ -1150,6 +1148,7 @@ mod tests {
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range, slice};
+    use tenstore::GenStore;
 
     use crate::{
         Shape,

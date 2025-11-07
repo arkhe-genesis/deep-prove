@@ -119,12 +119,12 @@ async fn run_model_v1<S: Store>(
         let mut proofs = vec![];
         for (i, input) in inputs.into_iter().enumerate() {
             debug!("Running input #{i}");
-            let input_tensor = model
+            let input_tensors = model
                 .load_input_flat(vec![input])
                 .context("loading flat inputs")?;
 
             let trace_result = model.run(
-                &input_tensor,
+                input_tensors,
                 &mut tenstore::GenStore::new_temporary(1000 * 1024 * 1024)?,
             );
             // If model.run fails, print the error and continue to the next input

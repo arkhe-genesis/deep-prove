@@ -535,7 +535,7 @@ pub mod tests {
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.eos_token, 106usize.into());
         let input = Tensor::new(vec![1].into(), vec![1562_f32])?;
-        model.run_float(&[input])?;
+        model.run_float(vec![input])?;
         Ok(())
     }
 
@@ -578,8 +578,8 @@ pub mod tests {
             )?
             .pad_next_power_of_two();
             let mut store = GenStore::default();
-            let trace = model.run::<GoldilocksExt2>(&[input], &mut store)?;
-            let logits = trace.get_step(argmax_layer_id).unwrap().node_inputs[0].hydrate(store)?;
+            let trace = model.run::<GoldilocksExt2>(vec![input], &mut store)?;
+            let logits = trace.get_step(argmax_layer_id).unwrap().node_inputs[0].tensor()?;
             let computed_new_token = argmax(logits.get_data());
             let expected_new_token = argmax(&logit.logits);
             // CURRENTLY NOT WORKING BECAUSE GEMMA3 CONSTRUCTION IS INCORRECT
@@ -625,7 +625,7 @@ pub mod safe_tests {
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.eos_token, 1usize.into());
         let input = Tensor::new(vec![1].into(), vec![1562_f32])?;
-        model.run_float(&[input])?;
+        model.run_float(vec![input])?;
         Ok(())
     }
 }

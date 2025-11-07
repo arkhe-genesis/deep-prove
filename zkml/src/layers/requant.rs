@@ -49,7 +49,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use transcript::Transcript;
 use witness::RowMajorMatrix;
 
@@ -454,7 +453,6 @@ where
         last_claims: Vec<&Claim<E>>,
         _step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        _store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
         let claim = self.prove_step(prover, last_claims[0], ctx, id)?;
 
@@ -466,9 +464,8 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<E, Element, Element>,
-        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
-        let outputs = step_data.output_tensors(store)?;
+        let outputs = step_data.output_tensors()?;
         ensure!(
             step_data.node_inputs.len() == 1,
             "Found more than 1 input in inference step of requant layer"
@@ -492,7 +489,7 @@ where
         // that contributes to the output.
         let ((output_part, sign), shifted_part): ((Vec<Element>, Vec<Element>), Vec<Element>) =
             step_data.node_inputs[0]
-                .hydrate(store.clone())
+                .tensor()
                 .context("hydrating tensor")?
                 .get_data()
                 .iter()
@@ -1104,6 +1101,7 @@ impl<E: ExtensionField> RequantCtx<E> {
 mod tests {
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
+    use tenstore::GenStore;
 
     use crate::{
         layers::{Layer, matrix_mul::MatMul},

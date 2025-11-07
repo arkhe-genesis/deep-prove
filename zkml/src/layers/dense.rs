@@ -32,7 +32,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use tracing::warn;
 use transcript::Transcript;
 /// The short name used to identify a dense layer
@@ -304,10 +303,9 @@ where
         last_claims: Vec<&Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<Claim<E>>> {
-        let input_tensor = step_data.input_tensor_at(0, store)?;
-        let output_tensor = step_data.output_tensor_at(0, store)?;
+        let input_tensor = step_data.input_tensor_at(0)?;
+        let output_tensor = step_data.output_tensor_at(0)?;
 
         Ok(vec![self.prove_step(
             prover,
@@ -664,6 +662,7 @@ mod test {
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};
+    use tenstore::GenStore;
 
     use crate::{
         layers::{Layer, provable::evaluate_layer},

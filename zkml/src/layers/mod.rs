@@ -32,7 +32,7 @@ use crate::{
     model::Step,
     padding::{PaddingMode, ShapeInfo},
     quantization::{Fieldizer, ModelMetadata, ScalingFactor},
-    tensor::{DryTensor, TensorTypeParam, WrappedTensor},
+    tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use activation::ActivationCtx;
 use anyhow::{Context as _, Result, bail, ensure};
@@ -50,7 +50,7 @@ use provable::{
 use requant::RequantCtx;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, marker::PhantomData};
-use tenstore::{GenStore, StoreError};
+use tenstore::StoreError;
 use transcript::Transcript;
 use transformer::{
     layernorm::LayerNormData, logits::ArgmaxData, mha::MhaData, softmax::SoftmaxData,
@@ -288,33 +288,36 @@ impl<E: ExtensionField> LayerCtx<E> {
 #[derive(Clone)]
 pub(crate) struct NodeOut<T, E: ExtensionField> {
     _t: PhantomData<T>,
-    pub(crate) outputs: Vec<DryTensor<T>>,
+    pub(crate) outputs: Vec<TensorHandle<T>>,
     pub(crate) proving_data: ProvingData<E>,
 }
 impl<T, E: ExtensionField> NodeOut<T, E> {
-    pub(crate) fn new(outputs: Vec<DryTensor<T>>, proving_data: ProvingData<E>) -> Self {
+    pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingData<E>) -> Self {
         Self {
             _t: PhantomData,
             outputs,
             proving_data,
         }
     }
-    pub(crate) fn into_fields<U>(self, store: GenStore) -> anyhow::Result<NodeOut<U, E>>
+    pub(crate) fn into_fields<U>(self) -> anyhow::Result<NodeOut<U, E>>
     where
         T: Serialize + for<'a> Deserialize<'a>,
         U: Serialize + for<'a> Deserialize<'a>,
         T: Fieldizer<U> + Debug,
     {
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .cast(|x| x.to_field())
+                    .with_context(|| format!("converting {:?}", handle.storage_key()))
+            })
+            .collect::<anyhow::Result<Vec<TensorHandle<U>>>>()?;
+
         Ok(NodeOut::<U, E> {
             _t: PhantomData::<U>,
-            outputs: self
-                .outputs
-                .into_iter()
-                .map(|dry| {
-                    dry.dry_cast(store.clone(), |x| x.to_field())
-                        .with_context(|| format!("converting {:?}", dry.storage_key()))
-                })
-                .collect::<anyhow::Result<Vec<DryTensor<U>>>>()?,
+            outputs,
             proving_data: self.proving_data,
         })
     }
@@ -365,20 +368,19 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
 impl<E: ExtensionField> NodeOut<Element, E> {
     pub(crate) fn to_dequantize(
         &self,
-        md: &ModelMetadata,
-        store: GenStore,
+        model_metadata: &ModelMetadata,
         node_id: NodeId,
     ) -> Result<NodeOut<f32, E>, StoreError> {
+        let outputs = self
+            .outputs
+            .iter()
+            .zip(model_metadata.layer_output_scaling_factor(node_id))
+            .map(|(handle, scale_factor)| handle.cast(|x| scale_factor.dequantize(x)))
+            .collect::<Result<Vec<_>, StoreError>>()?;
+
         Ok(NodeOut {
             _t: PhantomData,
-            outputs: self
-                .outputs
-                .iter()
-                .zip(md.layer_output_scaling_factor(node_id))
-                .map(|(dry, scale_factor)| {
-                    dry.dry_cast(store.clone(), |x| scale_factor.dequantize(x))
-                })
-                .collect::<Result<Vec<_>, StoreError>>()?,
+            outputs,
             proving_data: self.proving_data.clone(),
         })
     }
@@ -647,65 +649,64 @@ where
         last_claims: Vec<&crate::Claim<E>>,
         step_data: &Step<E, Element, E>,
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
-        store: &mut GenStore,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {
             (Layer::Dense(dense), LayerCtx::Dense(info)) => {
-                dense.prove(node_id, info, last_claims, step_data, prover, store)
+                dense.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Convolution(convolution), LayerCtx::Convolution(info)) => {
-                convolution.prove(node_id, info, last_claims, step_data, prover, store)
+                convolution.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::MatMul(m), LayerCtx::MatMul(info)) => {
-                m.prove(node_id, info, last_claims, step_data, prover, store)
+                m.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::QKV(qkv), LayerCtx::QKV(info)) => {
-                qkv.prove(node_id, info, last_claims, step_data, prover, store)
+                qkv.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Mha(mha), LayerCtx::Mha(info)) => {
-                mha.prove(node_id, info, last_claims, step_data, prover, store)
+                mha.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::ConcatMatMul(concat_matmul), LayerCtx::ConcatMatMul(info)) => {
-                concat_matmul.prove(node_id, info, last_claims, step_data, prover, store)
+                concat_matmul.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Embeddings(embeddings), LayerCtx::Embeddings(ctx)) => {
-                embeddings.prove(node_id, ctx, last_claims, step_data, prover, store)
+                embeddings.prove(node_id, ctx, last_claims, step_data, prover)
             }
             (Layer::Positional(positional), LayerCtx::Positional(info)) => {
-                positional.prove(node_id, info, last_claims, step_data, prover, store)
+                positional.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Add(add), LayerCtx::Add(info)) => {
-                add.prove(node_id, info, last_claims, step_data, prover, store)
+                add.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Logits(logits), LayerCtx::Logits(info)) => {
-                logits.prove(node_id, info, last_claims, step_data, prover, store)
+                logits.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Activation(activation), LayerCtx::Activation(info)) => {
-                activation.prove(node_id, info, last_claims, step_data, prover, store)
+                activation.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Requant(requant), LayerCtx::Requant(info)) => {
-                requant.prove(node_id, info, last_claims, step_data, prover, store)
+                requant.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Pooling(pooling), LayerCtx::Pooling(info)) => {
-                pooling.prove(node_id, info, last_claims, step_data, prover, store)
+                pooling.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Flatten(_), LayerCtx::Flatten) => {
                 unreachable!("prove cannot be called for reshape")
             }
             (Layer::Softmax(softmax), LayerCtx::Softmax(info)) => {
-                softmax.prove(node_id, info, last_claims, step_data, prover, store)
+                softmax.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::LayerNorm(layernorm), LayerCtx::LayerNorm(info)) => {
-                layernorm.prove(node_id, info, last_claims, step_data, prover, store)
+                layernorm.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::RMSNorm(rmsnorm), LayerCtx::RMSNorm(info)) => {
-                rmsnorm.prove(node_id, info, last_claims, step_data, prover, store)
+                rmsnorm.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::AttentionMask(attention_mask), LayerCtx::AttentionMask(info)) => {
-                attention_mask.prove(node_id, info, last_claims, step_data, prover, store)
+                attention_mask.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::EinSum(einsum), LayerCtx::EinSum(info)) => {
-                einsum.prove(node_id, info, last_claims, step_data, prover, store)
+                einsum.prove(node_id, info, last_claims, step_data, prover)
             }
 
             _ => bail!(
@@ -722,35 +723,26 @@ where
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<E, Element, Element>,
-        store: &mut GenStore,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         match self {
-            Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::Convolution(convolution) => {
-                convolution.gen_lookup_witness(id, ctx, step_data, store)
-            }
-            Layer::MatMul(m) => m.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::QKV(qkv) => qkv.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::Mha(mha) => mha.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data),
+            Layer::Convolution(convolution) => convolution.gen_lookup_witness(id, ctx, step_data),
+            Layer::MatMul(m) => m.gen_lookup_witness(id, ctx, step_data),
+            Layer::QKV(qkv) => qkv.gen_lookup_witness(id, ctx, step_data),
+            Layer::Mha(mha) => mha.gen_lookup_witness(id, ctx, step_data),
             Layer::ConcatMatMul(concat_matmul) => {
-                concat_matmul.gen_lookup_witness(id, ctx, step_data, store)
+                concat_matmul.gen_lookup_witness(id, ctx, step_data)
             }
-            Layer::Add(add) => add.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::Softmax(softmax) => softmax.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::Logits(logits) => logits.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::LayerNorm(layernorm) => layernorm.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::RMSNorm(rmsnorm) => rmsnorm.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::Positional(positional) => {
-                positional.gen_lookup_witness(id, ctx, step_data, store)
-            }
-            Layer::Embeddings(embeddings) => {
-                embeddings.gen_lookup_witness(id, ctx, step_data, store)
-            }
-            Layer::Activation(activation) => {
-                activation.gen_lookup_witness(id, ctx, step_data, store)
-            }
-            Layer::Requant(requant) => requant.gen_lookup_witness(id, ctx, step_data, store),
-            Layer::Pooling(pooling) => pooling.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::Add(add) => add.gen_lookup_witness(id, ctx, step_data),
+            Layer::Softmax(softmax) => softmax.gen_lookup_witness(id, ctx, step_data),
+            Layer::Logits(logits) => logits.gen_lookup_witness(id, ctx, step_data),
+            Layer::LayerNorm(layernorm) => layernorm.gen_lookup_witness(id, ctx, step_data),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.gen_lookup_witness(id, ctx, step_data),
+            Layer::Positional(positional) => positional.gen_lookup_witness(id, ctx, step_data),
+            Layer::Embeddings(embeddings) => embeddings.gen_lookup_witness(id, ctx, step_data),
+            Layer::Activation(activation) => activation.gen_lookup_witness(id, ctx, step_data),
+            Layer::Requant(requant) => requant.gen_lookup_witness(id, ctx, step_data),
+            Layer::Pooling(pooling) => pooling.gen_lookup_witness(id, ctx, step_data),
             Layer::Reshape(r) => {
                 ensure!(!r.is_provable(), "reshape {r:?} is provable");
                 Ok(Default::default())
@@ -760,9 +752,9 @@ where
                 Ok(Default::default())
             }
             Layer::AttentionMask(attention_mask) => {
-                attention_mask.gen_lookup_witness(id, ctx, step_data, store)
+                attention_mask.gen_lookup_witness(id, ctx, step_data)
             }
-            Layer::EinSum(einsum) => einsum.gen_lookup_witness(id, ctx, step_data, store),
+            Layer::EinSum(einsum) => einsum.gen_lookup_witness(id, ctx, step_data),
         }
     }
 }

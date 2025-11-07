@@ -36,7 +36,6 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
-use tenstore::GenStore;
 use tracing::warn;
 use transcript::Transcript;
 
@@ -150,7 +149,6 @@ impl<N: TensorTypeParam> Rope<N> {
         output_claim: &Claim<E>,
         step_data: &Step<E, Element, E>,
         prover: &mut Prover<E, T, PCS>,
-        store: &mut GenStore,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
@@ -158,7 +156,7 @@ impl<N: TensorTypeParam> Rope<N> {
         N: Fieldizer<E>,
     {
         let input = &step_data.node_inputs[0];
-        let input = input.hydrate(store.clone())?;
+        let input = input.tensor()?;
         let input_shape = input.shape().clone();
         let cosine_matrix_slice = TensorSlice::from(self.cosine_matrix.deref());
         let sine_matrix_slice = TensorSlice::from(self.sine_matrix.deref());
@@ -190,7 +188,7 @@ impl<N: TensorTypeParam> Rope<N> {
         // the relationship `output = eq_poly * input * sub_cos_matrix + permuted_eq_poly * input * sub_sin_matrix`
 
         // compute MLEs of the tensors involved in the sum-check
-        let input_mle = input.into_mle();
+        let input_mle = input.clone().into_mle();
         let sub_cos_mle = sub_cos_matrix.into_mle();
         let sub_sin_mle = sub_sin_matrix.into_mle();
         let num_vars = input_mle.num_vars();

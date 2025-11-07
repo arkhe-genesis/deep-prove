@@ -31,6 +31,7 @@ use std::{
     cmp::{Ordering, PartialEq, min},
     fmt::{self, Debug},
     ops::{Deref, DerefMut, Range},
+    sync::{Arc, MappedRwLockReadGuard, RwLock, RwLockReadGuard},
 };
 use tenstore::{GenStore, GenericStore, StorageKey, StoreError};
 
@@ -385,86 +386,170 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) -> Resul
     Ok(())
 }
 
-/// A dry tensor only contain the meta-information required to build a tensor
-/// from a store.
+/// A handle to manage different representations of the same data.
+///
+/// Tensors are used in different contexts, each requiring a different
+/// representation / implementation. This struct wraps the necessary metadata to
+/// load, store, and transform the tensors to different representation.
 #[derive(Clone, Debug)]
-pub struct DryTensor<T> {
+pub struct TensorHandle<T> {
     /// A unique key for this tensor.
     storage_key: StorageKey<Vec<T>>,
+
+    /// Storage used to save or load the underlying data.
+    store: GenStore,
+
+    /// Tensor data, if available.
+    ///
+    /// If the tensor data is not available, the handler will try to hydrate it
+    /// by reading from the corresponding store.
+    tensor: Arc<RwLock<Option<Tensor<T>>>>,
 
     /// The shape of the tensor.
     shape: Shape,
     unpadded_shape: Shape,
 }
 
-impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
+impl<T> TensorHandle<T>
+where
+    T: Serialize + for<'a> Deserialize<'a>,
+{
     pub(crate) fn new(
         storage_key: StorageKey<Vec<T>>,
+        store: GenStore,
         shape: Shape,
         unpadded_shape: Shape,
     ) -> Self {
         Self {
             storage_key,
+            store,
+            tensor: Arc::new(RwLock::new(None)),
             shape,
             unpadded_shape,
         }
     }
 
-    /// Return a reference to this dry tensor key.
+    /// Creates a [TensorHandle] from a [Tensor].
+    pub(crate) fn from_tensor(
+        storage_key: StorageKey<Vec<T>>,
+        store: GenStore,
+        tensor: Tensor<T>,
+    ) -> Self {
+        let shape = tensor.shape().clone();
+        let unpadded_shape = tensor.unpadded_shape().clone();
+
+        Self {
+            storage_key,
+            store,
+            tensor: Arc::new(RwLock::new(Some(tensor))),
+            shape,
+            unpadded_shape,
+        }
+    }
+
+    /// Store the [Tensor] into the store.
+    pub(crate) fn store(&self) -> Result<(), StoreError> {
+        let guard = self.tensor.read().expect("Lock should not be posioned");
+
+        if let Some(ref tensor) = *guard {
+            self.store.store(&self.storage_key, tensor.data_vec())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns the [StorageKey] used to identify the data in the store.
     pub(crate) fn storage_key(&self) -> &StorageKey<Vec<T>> {
         &self.storage_key
     }
 
-    /// Return a reference to this dry tensor shape.
+    /// Returns a reference to the shape of this tensor.
     pub(crate) fn shape(&self) -> &Shape {
         &self.shape
     }
 
-    /// Return a reference to this dry tensor shape.
+    /// Returns a reference to the unpadded shape of this tensor.
     pub(crate) fn unpadded_shape(&self) -> &Shape {
         &self.unpadded_shape
     }
 
-    /// Hydrate this dry tensor from `store`, generating a [`Tensor`] from it.
-    pub(crate) fn hydrate(&self, store: GenStore) -> Result<Tensor<T>> {
-        store.fetch(&self.storage_key).map(|data| {
-            Tensor::new_with_unpadded_shape(self.shape.clone(), self.unpadded_shape.clone(), data)
-        })?
+    /// Returns a reference to the cached [`Tensor`] data.
+    ///
+    /// NOTE: If the [`Tensor`] is not cached, this will load the data from
+    /// the store.
+    pub(crate) fn tensor(&self) -> Result<MappedRwLockReadGuard<'_, Tensor<T>>> {
+        loop {
+            // Acquire the read lock and check if the data is initialised. Return it if yes
+            {
+                let guard = self.tensor.read().expect("Lock should not be poisoned");
+                if guard.is_some() {
+                    return Ok(RwLockReadGuard::map(guard, |v| match v {
+                        Some(ref v) => v,
+                        None => unreachable!(
+                            "The option was checked above, this is in a read only region"
+                        ),
+                    }));
+                }
+            }
+
+            // Otherwise try to acquire the write lock and initialise the data.
+            {
+                let mut guard = self.tensor.write().expect("Lock should not be poisioned");
+
+                // Handle a race with another writer.
+                if guard.is_none() {
+                    let tensor = self.store.fetch(&self.storage_key).map(|data| {
+                        Tensor::new_with_unpadded_shape(
+                            self.shape.clone(),
+                            self.unpadded_shape.clone(),
+                            data,
+                        )
+                    })??;
+                    *guard = Some(tensor);
+                }
+            }
+        }
     }
 
-    /// Ensure that the tensor under the key `self.key` exist.
+    /// Dries the current handle.
     ///
-    /// If it does not, allocate it, fill it by applying `f` over `self`, then
-    /// return its dried version.
-    pub(crate) fn dry_cast<S, F>(
-        &self,
-        mut store: GenStore,
-        f: F,
-    ) -> Result<DryTensor<S>, StoreError>
+    /// Drying a handle frees the cached values to free memory.
+    pub(crate) fn dry(&self) {
+        let mut guard = self.tensor.write().expect("Lock should not be poisioned");
+        *guard = None;
+    }
+
+    /// Ensure the transformed version of this tensor with type [S] exists in the store.
+    ///
+    /// If the transformed version does not exist yet, apply `f` over `self` and
+    /// save it to the store.
+    pub(crate) fn cast<S, F>(&self, f: F) -> Result<TensorHandle<S>, StoreError>
     where
         S: Serialize + for<'a> Deserialize<'a>,
         F: Fn(&T) -> S,
     {
-        let storage_key = store.cast(&self.storage_key, |xs| {
+        let storage_key = self.store.cast(&self.storage_key, |xs| {
             xs.iter().map(&f).collect::<Vec<S>>()
         })?;
-        Ok(DryTensor::<S>::new(
+        Ok(TensorHandle::<S>::new(
             storage_key,
+            self.store.clone(),
             self.shape.clone(),
             self.unpadded_shape.clone(),
         ))
     }
 
-    /// Fetch the tensor under the key `self.key`.
+    /// Loads the transformed version of this tensor with type [S].
     ///
-    /// If it does not exist, build it by mapping `f` over `self`, store it,
-    /// then return its data.
-    pub(crate) fn hydrated_cast<S, F>(&self, mut store: GenStore, f: F) -> Result<Tensor<S>>
+    /// If the transformed version does not yet exist, apply `f` over `self`,
+    /// save it to store and returns a copy.
+    pub(crate) fn hydrated_cast<S, F>(&self, f: F) -> Result<Tensor<S>>
     where
         S: Serialize + for<'a> Deserialize<'a>,
         F: Fn(&T) -> S,
     {
-        let result = store
+        let result = self
+            .store
             .cast_and_fetch(&self.storage_key, |xs| {
                 xs.iter().map(&f).collect::<Vec<S>>()
             })
@@ -477,6 +562,26 @@ impl<T: Serialize + for<'a> Deserialize<'a>> DryTensor<T> {
             })?;
 
         result
+    }
+}
+
+impl<T> TensorHandle<T>
+where
+    T: Serialize + for<'a> Deserialize<'a> + TensorTypeParam,
+{
+    pub(crate) fn from_wrapped_tensor_with_unpadded_shape(
+        storage_key: StorageKey<Vec<T>>,
+        store: GenStore,
+        tensor: WrappedTensor<T>,
+        unpadded_shape: Shape,
+    ) -> Self {
+        Self {
+            storage_key,
+            store,
+            tensor: Arc::new(RwLock::new(None)),
+            shape: Shape::from(tensor.shape()),
+            unpadded_shape,
+        }
     }
 }
 

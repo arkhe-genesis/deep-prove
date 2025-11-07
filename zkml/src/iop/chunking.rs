@@ -327,7 +327,6 @@ impl ModelChunk {
         E::BaseField: Serialize + DeserializeOwned,
     {
         let chunk_id = self.chunk_id;
-        let mut store = chunk_trace.store.clone();
         let rmms = edges.try_fold(vec![], |mut rmms, edge_id| {
             let edge = self.edge(edge_id)?;
             let node_id = match group_type {
@@ -339,12 +338,8 @@ impl ModelChunk {
             ))?;
             edge.ports().iter().try_for_each(|port| {
                 let tensor = match group_type {
-                    GroupType::Incoming => {
-                        step_data.input_tensor_at(port.target_port.into(), &mut store)?
-                    }
-                    GroupType::Outgoing => {
-                        step_data.output_tensor_at(port.source_port.into(), &mut store)?
-                    }
+                    GroupType::Incoming => step_data.input_tensor_at(port.target_port.into())?,
+                    GroupType::Outgoing => step_data.output_tensor_at(port.source_port.into())?,
                 };
                 let matrix_values = transpose(vec![to_base::<E, _>(tensor.get_data())]);
                 let rmm = RowMajorMatrix::new_by_inner_matrix(
@@ -497,7 +492,6 @@ impl ModelChunk {
         &self,
         full_trace: &'d InferenceTrace<'d, E, Element>,
     ) -> anyhow::Result<InferenceTrace<'d, E, Element>> {
-        let store = full_trace.store.clone();
         let steps = self
             .subgraph
             .inner_nodes()
@@ -513,7 +507,6 @@ impl ModelChunk {
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
         Ok(InferenceTrace {
-            store,
             steps,
             input: vec![],  // they are unused in a chunk prover
             output: vec![], // they are unused in a chunk prover
