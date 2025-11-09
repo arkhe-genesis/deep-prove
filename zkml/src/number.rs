@@ -20,6 +20,7 @@ pub trait Number:
     + std::ops::AddAssign<Self>
     + std::ops::Mul<Output = Self>
     + std::fmt::Debug
+    + std::fmt::Display
 {
     const MIN: Self;
     const MAX: Self;

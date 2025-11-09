@@ -1,6 +1,3 @@
-use itertools::izip;
-use std::ops::Deref;
-
 use crate::{
     Shape, Tensor,
     graph::{Direction, Edge, Graph, Node, NodeId, NodeInput, NodeOutput, PortLink, Ports},
@@ -15,13 +12,17 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
+use itertools::izip;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    ops::Deref,
+};
 use tenstore::{GenStore, GenericStore, StorageKey};
 use trace::Trace;
 use tracing::info;
 
-pub(crate) mod context;
+mod context;
 pub mod llm;
 pub(crate) mod trace;
 pub mod transform;
@@ -72,6 +73,11 @@ pub struct Model<N> {
 }
 
 impl<N> Model<N> {
+    /// Return an immutable reference to the underlying graph.
+    pub fn graph(&self) -> &ModelGraph<N> {
+        &self.graph
+    }
+
     /// Returns an iterator over the nodes in the model, in arbitrary order.
     /// It is more efficient then `ForwardIterator` and `BackwardIterator`, so it
     /// can be used to iterate over the nodes when the order does not matter
@@ -226,7 +232,8 @@ where
         for (id, layer) in self.graph.forward_inners() {
             let edges = self
                 .graph
-                .node_neighbors(id, Direction::Any)
+                .neighbors(id, Direction::Any)
+                .map(|(_, edge)| edge)
                 .collect::<Vec<_>>();
             info!("\t- {}: {}", id, layer.describe());
             info!("\t\t- edges: {:?}", edges);
@@ -478,14 +485,17 @@ where
 }
 
 impl Model<f32> {
-    pub fn run_float(&self, input: Vec<Tensor<f32>>) -> anyhow::Result<Vec<Tensor<f32>>> {
-        self.run::<GoldilocksExt2>(input, &mut GenStore::default())?
-            .outputs()
+    pub fn run_float(
+        &self,
+        input: Vec<Tensor<f32>>,
+        store: &mut GenStore,
+    ) -> anyhow::Result<Vec<Tensor<f32>>> {
+        self.run::<GoldilocksExt2>(input, store)?.outputs()
     }
 }
 
 impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
-    pub(crate) fn run_with_tracker<E>(
+    pub fn run_with_tracker<E>(
         &self,
         inputs: Vec<Tensor<N>>,
         mut tracker: Option<&mut InferenceTracker>,
@@ -708,9 +718,8 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
             if let Some(tracker) = tracker.as_mut() {
                 tracker.track(
-                    node_id,
-                    *port.port,
-                    Tensor::try_from(tensor.clone().float())?,
+                    node_id.output_at(port.port),
+                    &Tensor::try_from(tensor.clone().float())?,
                 );
             }
 

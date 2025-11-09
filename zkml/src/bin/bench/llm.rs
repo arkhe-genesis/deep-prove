@@ -4,6 +4,7 @@ use csv::WriterBuilder;
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use std::{collections::HashMap, fs::OpenOptions, path::Path, time};
+use tenstore::GenStore;
 use timed_core::Output;
 use tracing_subscriber::EnvFilter;
 use zkml::{
@@ -102,6 +103,7 @@ fn main() -> anyhow::Result<()> {
         let trace = bencher.r(HEADER_INFERENCE_TIME, || {
             driver.run::<GoldilocksExt2>(
                 user_tokens.clone(),
+                &mut GenStore::default(),
                 Some(LLMTokenizerObserver {
                     input: sentence.to_string(),
                     tokenizer: &tokenizer,

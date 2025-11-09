@@ -208,7 +208,7 @@ fn run_float_model(raw_inputs: &InputJSON, model: &Model<f32>) -> Result<f32> {
     {
         // Run the model in float mode
         let inputs = model.load_input_flat(vec![input.clone()])?;
-        let output = &model.run_float(inputs)?[0];
+        let output = &model.run_float(inputs, &mut GenStore::default())?[0];
         let accuracy = argmax_compare(expected, output.get_data());
         accuracies.push(accuracy);
         debug!(

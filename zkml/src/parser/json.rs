@@ -155,6 +155,8 @@ impl FileTensorLoader {
 
 #[cfg(test)]
 pub mod test {
+    use tenstore::GenStore;
+
     use crate::parser::llm::{LLMConfig, LLMModel, models::gpt2::gpt2_structure};
     use std::path::PathBuf;
 
@@ -189,7 +191,7 @@ pub mod test {
         let init_user_shape = Shape::from(vec![1]);
         let model = model.into_provable_model(&structure, init_user_shape)?;
         let input = Tensor::new(Shape::from(vec![1]), vec![512.0])?;
-        model.run_float(vec![input])?;
+        model.run_float(vec![input], &mut GenStore::default())?;
         Ok(())
     }
 }

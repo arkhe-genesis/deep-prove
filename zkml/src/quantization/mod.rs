@@ -14,8 +14,10 @@ use crate::{
     to_field,
 };
 pub use metadata::ModelMetadata;
-pub(crate) use strategy::InferenceTracker;
-pub use strategy::{AbsoluteMax, InferenceObserver, ScalingStrategy, ScalingStrategyKind};
+pub use strategy::{
+    AbsoluteMax, InferenceObserver, InferenceTracker, InferenceTrackingMode, ScalingStrategy,
+    ScalingStrategyKind,
+};
 
 // Get BIT_LEN from environment variable or use default value
 pub static BIT_LEN: LazyLock<usize> = LazyLock::new(|| {

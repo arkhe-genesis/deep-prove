@@ -16,7 +16,7 @@ use crate::{
         llm::{LLMConfig, LLMTokenizer, Token, models::LLMModelLoader},
         to_quantized,
     },
-    quantization::{InferenceObserver, IntoElement},
+    quantization::{InferenceObserver, InferenceTracker, IntoElement},
     tensor::TensorTypeParam,
     verify,
 };
@@ -39,17 +39,6 @@ use crate::{
 
 pub trait Observer<N: TensorTypeParam> {
     fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>);
-}
-
-/// The main struct responsible for generating the trace and the proof related
-/// to LLM proving. This requires a wrapper on top of the model to drive the
-/// auto regressive loop correctly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Driver<N> {
-    pub(crate) model: Model<N>,
-    config: LLMConfig,
-    max_context: Option<usize>,
-    padding_mode: PaddingMode,
 }
 
 /// The main struct responsible for verifying the proof related to the LLM proving.
@@ -94,6 +83,16 @@ where
     pub io: IO<E>,
 }
 
+/// The main struct responsible for generating the trace and the proof related
+/// to LLM proving. This requires a wrapper on top of the model to drive the
+/// auto regressive loop correctly.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Driver<N> {
+    pub model: Model<N>,
+    config: LLMConfig,
+    max_context: Option<usize>,
+    padding_mode: PaddingMode,
+}
 impl Driver<f32> {
     /// Loads a model from a gguf, safetensors, or json external file. It returns the raw model in float precision.
     /// NOTE: the max_context is only there to hack around the creation of Rope to avoid loading the full matrix if we don't need it. That should
@@ -152,8 +151,23 @@ impl Driver<f32> {
 
     pub fn run<E>(
         &self,
-        input: Vec<Token>,
+        input: &[Token],
+        store: &mut GenStore,
         observer: Option<impl Observer<f32>>,
+    ) -> anyhow::Result<InferenceTrace<'_, E, f32>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+    {
+        self.run_with_tracker(input, store, observer, None)
+    }
+
+    pub fn run_with_tracker<E>(
+        &self,
+        input: &[Token],
+        store: &mut GenStore,
+        observer: Option<impl Observer<f32>>,
+        tracker: Option<&mut InferenceTracker>,
     ) -> anyhow::Result<InferenceTrace<'_, E, f32>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -166,14 +180,14 @@ impl Driver<f32> {
             "Input sequence length must be less than the context length"
         );
         let input_tokens = input
-            .into_iter()
+            .iter()
             .map(|t| t.as_number::<f32>())
             .collect::<Vec<_>>();
 
         let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
-        let mut store = GenStore::default();
-
-        let trace = self.model.run::<E>(vec![tensor], &mut store)?;
+        let trace = self
+            .model
+            .run_with_tracker::<E>(vec![tensor], tracker, store)?;
 
         if let Some(ref obs) = observer {
             obs.observe(0, &trace);
@@ -212,12 +226,15 @@ where
             .collect()
     }
 
-    /// Runs take the _already_ tokenized input and run the model until the maximum sequence length is reached OR until a eos token is generated.
+    /// Runs take the _already_ tokenized input and run the model until the
+    /// maximum sequence length is reached OR until a eos token is generated.
     /// The returned trace contains the _whole_ sequence.
     fn run_internal<E>(
         &self,
         input: Vec<Token>,
+        store: &mut GenStore,
         observer: Option<impl Observer<N>>,
+        mut tracker: Option<&mut InferenceTracker>,
     ) -> anyhow::Result<InferenceTrace<'_, E, N>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -237,6 +254,12 @@ where
 
         let mut tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
         let max_window = self.max_context.unwrap_or(self.config.context_length);
+        ensure!(
+            input_tokens.len() < max_window,
+            "max window {} is smaller than prompt token count {}",
+            max_window,
+            input_tokens.len()
+        );
 
         ensure!(
             tensor
@@ -247,24 +270,43 @@ where
         );
         let mut full_tokens = tensor.get_data().to_vec();
         let mut unpadded_seq_len = user_len;
-        // convert the input to the correct number type and add a dimension to make it 2d, because the embeddings layer expects a 2d tensor
-        // This means we're padding the input to the right size (e.g. next power of two)
+        // convert the input to the correct number type and add a dimension to
+        // make it 2d, because the embeddings layer expects a 2d tensor This
+        // means we're padding the input to the right size (e.g. next power of
+        // two)
         while unpadded_seq_len <= max_window {
             info!(
                 "Running iteration {} with input tensor {:?}",
                 unpadded_seq_len,
                 tensor.shape()
             );
-            let mut store = GenStore::default();
             let trace = if let PaddingMode::NoPadding = self.padding_mode {
                 self.model
                     // TODO: make it re-usable at least for the static weights
-                    .run::<E>(vec![tensor.clone()], &mut store)
+                    .run_with_tracker::<E>(
+                        vec![tensor.clone()],
+                        // HACK: to not consume the option on repeated
+                        if let Some(ref mut t) = tracker {
+                            Some(*t)
+                        } else {
+                            None
+                        },
+                        store,
+                    )
             } else {
                 let unpadded_shape = tensor.shape().clone();
                 let padded = tensor.pad_next_power_of_two();
                 info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
-                self.model.run::<E>(vec![padded], &mut store)
+                self.model.run_with_tracker::<E>(
+                    vec![padded],
+                    // HACK: to not consume the option on repeated
+                    if let Some(ref mut t) = tracker {
+                        Some(*t)
+                    } else {
+                        None
+                    },
+                    store,
+                )
             }
             .context(format!(
                 "runng the {} iteration loop",
@@ -293,8 +335,9 @@ where
             }
             unpadded_seq_len += 1;
         }
-        // 1. input construction: we remove the last token since it's either the eos token or the max token
-        // we need to regenerate a full trace with the correct padding
+        // 1. input construction: we remove the last token since it's either the
+        // eos token or the max token we need to regenerate a full trace with
+        // the correct padding
         full_tokens.pop();
         // and we take only the part that corresponds to the _generated_ tokens
         full_tokens.splice(..user_len, input_tokens);
@@ -305,8 +348,9 @@ where
         if let PaddingMode::Padding = self.padding_mode {
             tensor.pad_to_shape(target_padded_shape)?
         };
-        // 3. model resetting: we need to _reset_ the cache of every QKV layer in the model - that's because we only
-        // expect 1 token to be generated at a time after the first inference.
+        // 3. model resetting: we need to _reset_ the cache of every QKV layer
+        // in the model - that's because we only expect 1 token to be generated
+        // at a time after the first inference.
         self.model.reset();
         // 4. rerun to have a "clean" trace
         info!("Running last iteration (heavy) with {input_len} tokens");
@@ -330,13 +374,28 @@ impl Driver<Element> {
     pub fn run<E>(
         &self,
         input: Vec<Token>,
+        store: &mut GenStore,
         observer: Option<impl Observer<Element>>,
     ) -> anyhow::Result<InferenceTrace<'_, E, Element>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
     {
-        self.run_internal::<E>(input, observer)
+        self.run_internal::<E>(input, store, observer, None)
+    }
+
+    pub fn run_with_tracker<E>(
+        &self,
+        input: Vec<Token>,
+        store: &mut GenStore,
+        observer: Option<impl Observer<Element>>,
+        tracker: &mut InferenceTracker,
+    ) -> anyhow::Result<InferenceTrace<'_, E, Element>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+    {
+        self.run_internal::<E>(input, store, observer, Some(tracker))
     }
 
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
@@ -565,6 +624,7 @@ mod test {
     use anyhow::Context;
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
+    use tenstore::GenStore;
     use tracing::info;
 
     fn test_llm_driver_generic_prove_gpt2<const DISTRIBUTE_PROVE: bool>() -> anyhow::Result<()> {
@@ -602,11 +662,13 @@ mod test {
             })?;
         driver.model.describe();
         // Generate the trace
+        let mut store = GenStore::default();
         let sentence = "The sky is";
         let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path))?;
         let user_tokens = tokenizer.tokenize(sentence);
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
+            &mut store,
             Some(LLMTokenizerObserver {
                 input: sentence.to_string(),
                 tokenizer: &tokenizer,
@@ -659,10 +721,12 @@ mod test {
         let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path.clone()))?;
         let user_tokens = tokenizer.tokenize(sentence);
         let detokenized = tokenizer.detokenize(&user_tokens);
+        let mut store = GenStore::default();
         assert_eq!(detokenized, sentence);
         println!("user input in tokens: {user_tokens:?}");
         let trace = driver.run::<GoldilocksExt2>(
-            user_tokens,
+            &user_tokens,
+            &mut store,
             Some(LLMTokenizerObserver {
                 input: sentence.to_string(),
                 tokenizer: &tokenizer,
@@ -684,18 +748,21 @@ mod test {
 
     #[test]
     fn test_llm_driver_inference_gemma3() -> anyhow::Result<()> {
+        const CONTEXT_SIZE: usize = 6;
         init_test_logging("debug");
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
         let gguf = RawGGUF::new(model_path.clone());
-        let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(6))?;
+        let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(CONTEXT_SIZE))?;
 
         println!("LLM DRIVER: config: {:?}", driver.config);
 
+        let mut store = GenStore::default();
         let sentence = "The sky is";
         let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let trace = driver.run::<GoldilocksExt2>(
-            user_tokens,
+            &user_tokens,
+            &mut store,
             Some(LLMTokenizerObserver {
                 input: sentence.to_string(),
                 tokenizer: &tokenizer,
@@ -744,6 +811,7 @@ mod test {
 
         println!("LLM DRIVER: config: {:?}", driver.config);
         // Generate the trace
+        let mut store = GenStore::default();
         let sentence = "The sky is";
         let loader = TensorLoader::from_path(model_path)?;
         let tokenizer = HFTokenizer::sentencepiece_from_gguf(&loader)?;
@@ -751,6 +819,7 @@ mod test {
 
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
+            &mut store,
             Some(LLMTokenizerObserver {
                 input: sentence.to_string(),
                 tokenizer: &tokenizer,

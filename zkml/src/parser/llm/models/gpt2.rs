@@ -246,6 +246,8 @@ impl FeedForward<f32> {
 
 #[cfg(test)]
 pub mod tests {
+    use tenstore::GenStore;
+
     use super::*;
     use crate::{
         Tensor,
@@ -280,7 +282,7 @@ pub mod tests {
         assert_eq!(config.vocab_size, 50257);
         assert_eq!(config.eos_token, 50256usize.into());
         let input = Tensor::new(vec![1].into(), vec![546.0]).unwrap();
-        model.run_float(vec![input])?;
+        model.run_float(vec![input], &mut GenStore::default())?;
         Ok(())
     }
 }

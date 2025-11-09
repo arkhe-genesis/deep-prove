@@ -353,16 +353,7 @@ impl<N: TensorTypeParam> OpInfo for Mha<N> {
     }
 
     fn describe(&self) -> String {
-        format!(
-            "MHA({}, {}): \t {} \t {} \t {}, \t {}",
-            self.num_heads,
-            self.head_dim,
-            self.qk.describe(),
-            self.mask.describe(),
-            self.softmax.describe(),
-            self.final_mul.describe(),
-        )
-        .to_string()
+        format!("MHA({}, {})", self.num_heads, self.head_dim,).to_string()
     }
 
     fn is_provable(&self) -> bool {

@@ -356,9 +356,11 @@ impl MatrixPermutations {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConcatMatMul {
     permutations: MatrixPermutations,
-    /// It tells what is the maximum bit size we ever expect the output of this layer to be.
-    /// NOTE: This is a config item normally but we need this information during quantization.
-    /// Best would be to rework quantization trait to include such config items.
+    /// It tells what is the maximum bit size we ever expect the output of this
+    /// layer to be.
+    /// NOTE: This is a config item normally but we need this information during
+    /// quantization. Best would be to rework quantization trait to include such
+    /// config items.
     pub(crate) intermediate_bit_size: usize,
 }
 

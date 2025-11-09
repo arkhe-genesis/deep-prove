@@ -571,6 +571,7 @@ mod tests {
         let driver = driver.into_provable_llm(Some(conf))?;
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
+            &mut GenStore::default(),
             Some(LLMTokenizerObserver {
                 input: sentence.to_string(),
                 tokenizer: &tokenizer,

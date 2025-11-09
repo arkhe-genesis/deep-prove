@@ -43,6 +43,14 @@ impl Input {
         Ok(())
     }
 
+    pub fn len(&self) -> usize {
+        self.input_data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_data.is_empty()
+    }
+
     pub fn filter(&self, indices: Option<&Vec<usize>>) -> Result<Self> {
         if let Some(indices) = indices {
             ensure!(
@@ -59,6 +67,10 @@ impl Input {
         } else {
             Ok(self.clone())
         }
+    }
+
+    pub fn as_floats(&self) -> &[Vec<f32>] {
+        &self.input_data
     }
 
     pub fn to_elements(self, md: &ModelMetadata) -> Vec<Vec<Element>> {

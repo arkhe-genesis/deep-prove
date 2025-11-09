@@ -84,12 +84,12 @@ impl<P: AsRef<Path>> LocalStore<P> {
 
 impl<P: AsRef<Path>> std::fmt::Debug for LocalStore<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "L {:50} {:12} Filename", "ID", "Size")?;
         for (k, s) in self.storage.iter() {
             writeln!(
                 f,
-                "{}{:?} {:12} {}",
+                "{} {k:50?} {:12} {}",
                 if self.cache.contains(k) { "*" } else { " " },
-                k,
                 s.file_size(),
                 s.file.display()
             )?;

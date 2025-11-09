@@ -40,6 +40,7 @@ pub(crate) mod manual_attention {
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
     use serde::Deserialize;
+    use tenstore::GenStore;
 
     use crate::{
         Tensor, init_test_logging,
@@ -520,13 +521,13 @@ pub(crate) mod manual_attention {
         let max_token = rng_from_env_or_random().gen_range(0..config.embedding_size);
         let single_input = Tensor::new(vec![1].into(), vec![max_token as f32])?;
         model.describe();
-        model.run_float(vec![single_input])?;
+        model.run_float(vec![single_input], &mut GenStore::default())?;
         // Reset is needed here because the `llm_model` contains layer that contains some cache.
         // When we clone a layer, we just clone a Arc<Mutex<_>>, so the cache data itself is not cloned.
         model.reset();
 
         model.describe();
-        let output = model.run_float(vec![input])?[0].clone();
+        let output = model.run_float(vec![input], &mut GenStore::default())?[0].clone();
         // since the expected output is only for one token, but our model generates logits for all tokens,
         // we take the last element of the model output
         let output = output.slice_last_dim().last().unwrap();

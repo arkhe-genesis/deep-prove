@@ -220,9 +220,7 @@ impl LLMModel {
             Some(final_proj),
         ))
     }
-    /// Creates a Model<f32> from the GPT2Model. Currently it does NOT support the embeddings and positional nor
-    /// multiple passes.
-    /// User input shape is the shape of the user input tensor.
+    /// Creates a Model<f32> from the GPT2Model.
     pub fn into_provable_model(
         self,
         c: &LLMStructure,

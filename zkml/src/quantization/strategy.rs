@@ -79,7 +79,7 @@ impl InferenceObserver {
 }
 
 // TODO: replace that with the actual input node ID
-const INPUT_TRACKING_ID: usize = 10_000;
+const INPUT_TRACKING_ID: NodeId = NodeId::make(10_000);
 
 impl ScalingStrategy for InferenceObserver {
     type AuxData = InferenceTracker;
@@ -132,10 +132,12 @@ impl ScalingStrategy for InferenceObserver {
                 .into_iter()
                 .zip(model.unpadded_input_shapes())
                 .enumerate()
-                .map(|(i, (inp, shape))| {
-                    let input_tensor = Tensor::new(shape, inp)?;
-                    tracker.track(INPUT_TRACKING_ID.into(), i, input_tensor.clone());
-                    Ok(input_tensor)
+                .map(|(input_id, (inp, shape))| {
+                    let input_tensor = Tensor::new(shape, inp);
+                    if let Ok(ref t) = input_tensor {
+                        tracker.track(INPUT_TRACKING_ID.output_at(input_id), t);
+                    }
+                    input_tensor
                 })
                 .collect::<Result<Vec<_>>>()?;
             debug!("Running float inference with the {}-th input", nsamples + 1);
@@ -147,7 +149,9 @@ impl ScalingStrategy for InferenceObserver {
         let num_model_inputs = unpadded_input_shapes.len();
         let input_scaling = (0..num_model_inputs)
             .map(|i| {
-                let (input_min, input_max) = tracker.scaling_range(INPUT_TRACKING_ID.into(), i);
+                let (input_min, input_max) = tracker
+                    .scaling_range(INPUT_TRACKING_ID.output_at(i))
+                    .unwrap();
                 ScalingFactor::from_absolute_max(input_min.abs().max(input_max.abs()), None)
             })
             .collect_vec();
@@ -161,7 +165,7 @@ impl ScalingStrategy for InferenceObserver {
     ) -> Vec<ScalingFactor> {
         (0..num_outputs)
             .map(|i| {
-                let (min, max) = tracker.scaling_range(node_id, i);
+                let (min, max) = tracker.scaling_range(node_id.output_at(i)).unwrap();
                 ScalingFactor::from_absolute_max(min.abs().max(max.abs()), None)
             })
             .collect()
@@ -183,13 +187,13 @@ pub struct InferenceTracker {
     mode: InferenceTrackingMode,
     /// Streaming estimator of the selected statistics for each output of each
     /// node.
-    accumulators: HashMap<(NodeId, usize), InferenceTrackingAccumulator>,
+    accumulators: HashMap<NodeOutput, InferenceTrackingAccumulator>,
     /// Streaming estimator of the selected statistics for given intermediate data of
     /// each node, if any
     intermediate_data_trackers: HashMap<(NodeId, TrackedDataId), InferenceTrackingAccumulator>,
 }
 /// Selects the statistic to use to generate the scaling range.
-enum InferenceTrackingMode {
+pub enum InferenceTrackingMode {
     /// Register the min. and max. values encountered for each node.
     MinMax,
     /// Estimate the p- and q-quantiles from the encountered distribution of values.
@@ -224,7 +228,7 @@ enum InferenceTrackingAccumulator {
     NSigmas(f32, Variance),
 }
 impl InferenceTrackingAccumulator {
-    fn scaling_range(&self) -> (f32, f32) {
+    fn range(&self) -> (f32, f32) {
         match self {
             InferenceTrackingAccumulator::MinMax(min, max) => (min.min() as f32, max.max() as f32),
             InferenceTrackingAccumulator::Quantiles(p, q) => {
@@ -254,19 +258,19 @@ impl InferenceTrackingAccumulator {
     }
 }
 impl InferenceTracker {
-    fn new(mode: InferenceTrackingMode) -> Self {
+    pub fn new(mode: InferenceTrackingMode) -> Self {
         Self {
             mode,
             accumulators: HashMap::new(),
             intermediate_data_trackers: HashMap::new(),
         }
     }
-    pub(crate) fn track(&mut self, node_id: NodeId, output_index: usize, output: Tensor<f32>) {
+    pub(crate) fn track(&mut self, output: NodeOutput, data: &Tensor<f32>) {
         let accumulator = self
             .accumulators
-            .entry((node_id, output_index))
+            .entry(output)
             .or_insert_with(|| self.mode.new_accumulator());
-        for x in output.get_data() {
+        for x in data.get_data() {
             accumulator.add(*x as f64);
         }
     }
@@ -286,11 +290,8 @@ impl InferenceTracker {
         }
     }
 
-    pub(crate) fn scaling_range(&self, node_id: NodeId, output_index: usize) -> (f32, f32) {
-        self.accumulators
-            .get(&(node_id, output_index))
-            .unwrap()
-            .scaling_range()
+    pub fn scaling_range(&self, output: NodeOutput) -> Option<(f32, f32)> {
+        self.accumulators.get(&output).map(|a| a.range())
     }
 
     pub(crate) fn scaling_factor_for_intermediate_data(
@@ -302,7 +303,7 @@ impl InferenceTracker {
             .intermediate_data_trackers
             .get(&(node_id, data_id))
             .unwrap()
-            .scaling_range();
+            .range();
         ScalingFactor::from_absolute_max(min.abs().max(max.abs()), None)
     }
 }

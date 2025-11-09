@@ -1,5 +1,5 @@
 [workspace]
-members = ["zkml", "deep-prove", "utils"]
+members = ["zkml", "deep-prove", "utils", "tenvis"]
 resolver = "2"
 
 [workspace.package]
@@ -12,36 +12,24 @@ repository = "https://github.com/LagrangeLabs/deep-prove"
 version = "0.2.0"
 
 [workspace.dependencies]
-aes = "0.8"
 anyhow = { version = "1.0", default-features = false }
 ark-std = "0.5"
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-marketplacemetering = "1.78"
 axum = { version = "0.8" }
-blake3 = { version = "1.4", features = ["serde"] }
 clap = "4"
-criterion = { version = "0.6", features = ["html_reports"] }
+compact_str = "0.9"
 csv = "1.3.1"
-ctr = "0.9"
 derive_more = "2.0.1"
 either = "1.15"
-ff = "0.13"
 hex = { version = "0.4" }
 itertools = "0.13"
-libm = "0.2.15"
 memmap2 = "0.9"
-num-bigint = "0.4"
-num-integer = "0.1"
 object_store = { version = "0.12", features = ["aws"] }
 p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "539bbc84085efb609f4f62cb03cf49588388abdb" }
 p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3", rev = "539bbc84085efb609f4f62cb03cf49588388abdb", features = [
   "nightly-features",
 ] }
-p3-poseidon2 = { git = "https://github.com/Plonky3/Plonky3", rev = "539bbc84085efb609f4f62cb03cf49588388abdb" }
-p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "539bbc84085efb609f4f62cb03cf49588388abdb" }
-plonky2 = "1.1"
-rand = "0.8.5"
-rand_chacha = { version = "0.3", features = ["serde"] }
 rayon = "1.10"
 rmp-serde = "1.3.0"
 semver = "1"
@@ -58,10 +46,8 @@ ureq = { version = "3.1.2", features = ["default", "json"] }
 
 ceno-p3 = { package = "p3", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 ff_ext = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
-gkr_iop = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 mpcs = { package = "mpcs", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 multilinear_extensions = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
-poseidon = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 sumcheck = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 transcript = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 witness = { package = "witness", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }

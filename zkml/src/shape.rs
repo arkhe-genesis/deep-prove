@@ -31,7 +31,6 @@ pub(crate) fn filter_size(shape: &Shape) -> usize {
 
 /// Structure that holds a shape of a tensor.
 #[derive(
-    Debug,
     Clone,
     derive_more::From,
     derive_more::Into,
@@ -40,12 +39,27 @@ pub(crate) fn filter_size(shape: &Shape) -> usize {
     derive_more::IndexMut,
     derive_more::Deref,
     derive_more::DerefMut,
+    derive_more::Display,
     Serialize,
     Deserialize,
     PartialEq,
     Eq,
 )]
+#[display("{_0:?}")]
 pub struct Shape(Vec<usize>);
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        let mut iter = self.0.iter().peekable();
+        while let Some(d) = iter.next() {
+            write!(f, "{d}")?;
+            if iter.peek().is_some() {
+                write!(f, "×")?;
+            }
+        }
+        write!(f, "]")
+    }
+}
 
 impl<const T: usize> From<[usize; T]> for Shape {
     fn from(value: [usize; T]) -> Self {

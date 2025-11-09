@@ -535,7 +535,7 @@ pub mod tests {
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.eos_token, 106usize.into());
         let input = Tensor::new(vec![1].into(), vec![1562_f32])?;
-        model.run_float(vec![input])?;
+        model.run_float(vec![input], &mut GenStore::default())?;
         Ok(())
     }
 
@@ -597,6 +597,8 @@ pub mod tests {
 
 #[cfg(test)]
 pub mod safe_tests {
+    use tenstore::GenStore;
+
     use super::*;
     use crate::parser::llm::LLMTokenizer;
 
@@ -625,7 +627,7 @@ pub mod safe_tests {
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.eos_token, 1usize.into());
         let input = Tensor::new(vec![1].into(), vec![1562_f32])?;
-        model.run_float(vec![input])?;
+        model.run_float(vec![input], &mut GenStore::default())?;
         Ok(())
     }
 }

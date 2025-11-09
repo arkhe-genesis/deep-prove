@@ -146,7 +146,7 @@ pub type NodeOutput = NodePort<{ PortType::Output as u8 }>;
 ///
 /// This is used to uniquely identify a feed living on an edge between two
 /// nodes.
-#[derive(derive_more::Debug)]
+#[derive(derive_more::Debug, Clone, Copy, PartialEq, Eq)]
 #[debug("{source} -> {target}")]
 pub struct Feed {
     /// The source port of the link between the two nodes.
@@ -242,6 +242,11 @@ impl NodeId {
     pub fn as_model_output(&self) -> NodeInput {
         NodeInput::new(self.0, 0)
     }
+
+    /// Const version of `from`.
+    pub const fn make(n: usize) -> Self {
+        NodeId(n)
+    }
 }
 
 /// Unique identifier of an edge. The edge identifier is mostly useful to identify a particular edge and
@@ -280,7 +285,7 @@ pub struct EdgeId(usize);
     derive_more::Debug,
     derive_more::Deref,
 )]
-#[display("@{_0}")]
+#[display(":{_0}")]
 #[debug("Port({_0})")]
 pub struct PortId(usize);
 

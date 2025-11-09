@@ -536,16 +536,24 @@ impl<N: TensorTypeParam> OpInfo for MatMul<N> {
 
     fn describe(&self) -> String {
         format!(
-            "Matrix multiplication: left = {:?}, right = {:?}, bias = {:?}",
-            self.left_matrix.get_actual_shape(),
+            "MatMul: {} × {}{}",
+            self.left_matrix
+                .get_actual_shape()
+                .map(|s| format!("{s}"))
+                .unwrap_or("?".to_string()),
             self.right_matrix
                 .get_actual_shape()
                 .map(|shape| if self.is_right_transposed() {
                     shape.into_vec().into_iter().rev().collect()
                 } else {
                     shape.clone()
-                }),
-            self.bias.as_ref().map(|bias| bias.shape().clone()),
+                })
+                .map(|s| format!("{s}"))
+                .unwrap_or("?".to_string()),
+            self.bias
+                .as_ref()
+                .map(|bias| format!(" + {}", bias.shape().clone()))
+                .unwrap_or_default(),
         )
     }
 

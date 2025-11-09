@@ -6,9 +6,13 @@
   packages = [
     # General dev.
     pkgs.git pkgs.git-lfs pkgs.openssl pkgs.cmake pkgs.git-cliff
+
     # Rust crates build deps
     pkgs.openssl pkgs.llvmPackages.libclang.lib pkgs.protobuf
     pkgs.cargo-nextest
+
+    # For tensor visualization
+    pkgs.gnuplot_qt pkgs.d2
   ];
 
   env = {
@@ -53,13 +57,12 @@
   };
 
   # https://devenv.sh/git-hooks/
-  # git-hooks.hooks.shellcheck.enable = true;
   git-hooks.hooks = {
     # actionlint.enable = true;
     check-merge-conflicts.enable = true;
     ripsecrets.enable = true;
     rustfmt = {
-      enable = false;
+      enable = true;
       settings.color = "auto";
     };
     black = {
