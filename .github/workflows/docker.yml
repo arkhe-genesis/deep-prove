@@ -103,7 +103,7 @@ jobs:
         run: docker images
 
       - name: Run Trivy vulnerability scanner on built image
-        uses: aquasecurity/trivy-action@0.33.0
+        uses: aquasecurity/trivy-action@0.33.1
         with:
           image-ref: '${{ matrix.image }}:${{ github.sha }}'
           output: 'trivy-results.txt'
