@@ -37,7 +37,9 @@ jobs:
     # DO NOT REMOVE: For handling Fork PRs see Pull Requests from Forks
     if: |
       needs.changes.outputs.should_run == 'true'
-        && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        && github.event_name == 'pull_request'
+        && github.event.pull_request.draft == false
+        && github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       pull-requests: write
       contents: read
@@ -93,7 +95,9 @@ jobs:
     # DO NOT REMOVE: For handling Fork PRs see Pull Requests from Forks
     if: |
       needs.changes.outputs.should_run == 'true'
-        && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        && github.event_name == 'pull_request'
+        && github.event.pull_request.draft == false
+        && github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       pull-requests: write
       contents: read
