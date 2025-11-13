@@ -138,63 +138,64 @@ jobs:
           name: ${{ matrix.image }}-${{ github.sha }}
           path: /tmp/${{ matrix.image }}-${{ github.sha }}.tar
 
-  private-push:
-    name: Push Docker Images to AWS
-    runs-on: ubuntu-latest
-    needs:
-      - changes
-      - build
-    strategy:
-      fail-fast: false
-      matrix:
-        environment: [ mainnet]
-        image:  ${{ fromJSON(needs.changes.outputs.images-to-build) }}
-        include:
-          - environment: mainnet
-            aws_account_id: ${{ vars.ZKMR_MAINNET_AWS_ACCOUNT_ID }}
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ matrix.aws_account_id }}:role/github-actions-ecr-access-role
-          role-session-name: github-actions-ecr-access-role
-          aws-region: ${{ vars.ZKMR_AWS_REGION }}
+  # private-push:
+  #   name: Push Docker Images to AWS
+  #   runs-on: ubuntu-latest
+  #   needs:
+  #     - changes
+  #     - build
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       environment: [ mainnet]
+  #       image:  ${{ fromJSON(needs.changes.outputs.images-to-build) }}
+  #       include:
+  #         - environment: mainnet
+  #           aws_account_id: ${{ vars.ZKMR_MAINNET_AWS_ACCOUNT_ID }}
+  #   steps:
+  #     - name: Configure AWS credentials
+  #       uses: aws-actions/configure-aws-credentials@v4
+  #       with:
+  #         role-to-assume: arn:aws:iam::${{ matrix.aws_account_id }}:role/github-actions-ecr-access-role
+  #         role-session-name: github-actions-ecr-access-role
+  #         aws-region: ${{ vars.ZKMR_AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+  #     - name: Login to Amazon ECR
+  #       id: login-ecr
+  #       uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Download Docker image from artifact
-        uses: actions/download-artifact@v6
-        with:
-          name: ${{ matrix.image }}-${{ github.sha }}
-          path: /tmp
+  #     - name: Download Docker image from artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: ${{ matrix.image }}-${{ github.sha }}
+  #         path: /tmp
 
-      - name: Load Docker image
-        run: |
-          IMAGE_NAME="${{ matrix.image }}"
-          docker load -i /tmp/$IMAGE_NAME-${{ github.sha }}.tar
+  #     - name: Load Docker image
+  #       run: |
+  #         IMAGE_NAME="${{ matrix.image }}"
+  #         docker load -i /tmp/$IMAGE_NAME-${{ github.sha }}.tar
 
-      - name: Push Docker image to ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-              IMAGE_NAME="${{ matrix.image }}"
-              TAG=$(echo ${{ github.ref_name }} | tr "[]/" -)
-              docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":${{ github.sha }}
-              docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
-              docker push "$ECR_REGISTRY"/"$IMAGE_NAME":${{ github.sha }}
-              docker push "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
+  #     - name: Push Docker image to ECR
+  #       env:
+  #         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+  #       run: |
+  #             IMAGE_NAME="${{ matrix.image }}"
+  #             TAG=$(echo ${{ github.ref_name }} | tr "[]/" -)
+  #             docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":${{ github.sha }}
+  #             docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
+  #             docker push "$ECR_REGISTRY"/"$IMAGE_NAME":${{ github.sha }}
+  #             docker push "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
 
-              if [[ ${{ github.ref }} == 'refs/heads/master' ]]; then
-                docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":latest
-                docker push "$ECR_REGISTRY"/"$IMAGE_NAME":latest
-              fi
+  #             if [[ ${{ github.ref }} == 'refs/heads/master' ]]; then
+  #               docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":latest
+  #               docker push "$ECR_REGISTRY"/"$IMAGE_NAME":latest
+  #             fi
 
-              if [[ ${{ github.ref }} == refs/tags/v* ]]; then
-                docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
-                docker push "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
-              fi
+  #             if [[ ${{ github.ref }} == refs/tags/v* ]]; then
+  #               docker tag "$IMAGE_NAME":${{ github.sha }} "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
+  #               docker push "$ECR_REGISTRY"/"$IMAGE_NAME":"$TAG"
+  #             fi
+
   public-push:
     name: Push Docker Images to Docker hub
     runs-on: ubuntu-latest
