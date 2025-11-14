@@ -260,7 +260,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -424,7 +424,7 @@ impl Pooling {
         // last random claim made
         last_claim: &Claim<E>,
         // input to the dense layer
-        input: &Tensor<E>,
+        input: &Tensor<Element>,
         info: &PoolingCtx,
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>

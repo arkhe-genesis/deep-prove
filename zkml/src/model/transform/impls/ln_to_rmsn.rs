@@ -524,7 +524,7 @@ mod tests {
             .map(|(id, _)| id)
             .collect::<Vec<NodeId>>()[0];
         // Extract the input to the Logits layer before applying the transformation.
-        let pre_transform_final_step = trace.get_step(last_model_node_id).unwrap();
+        let pre_transform_final_step = trace.get_step(&last_model_node_id).unwrap();
         let pre_transform_inputs = pre_transform_final_step.input_tensors().unwrap();
         // Rewrite the model by applying our transformation rule
         let model = LayerNormToRMSNorm.apply(model)?;
@@ -534,7 +534,7 @@ mod tests {
 
         let new_trace = model.run::<F>(vec![tensor], &mut store)?;
 
-        let post_transform_final_step = new_trace.get_step(last_model_node_id).unwrap();
+        let post_transform_final_step = new_trace.get_step(&last_model_node_id).unwrap();
         let post_transform_inputs = post_transform_final_step.input_tensors().unwrap();
         // Compare the pre and post transformation data
         for (pre, post) in pre_transform_inputs

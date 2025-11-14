@@ -1295,7 +1295,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut crate::Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
@@ -1305,7 +1305,7 @@ where
         let input_shape = step_data.node_inputs[0].shape();
         let (claims, proof) =
             self.prove_step(node_id, last_claims, ctx, softmax_data, input_shape, prover)?;
-        // Add the proof to the proof list
+
         prover.push_proof(node_id, LayerProof::<E, PCS>::Softmax(proof));
 
         Ok(claims)

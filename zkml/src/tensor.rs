@@ -477,7 +477,7 @@ where
     ///
     /// NOTE: If the [`Tensor`] is not cached, this will load the data from
     /// the store.
-    pub(crate) fn tensor(&self) -> Result<MappedRwLockReadGuard<'_, Tensor<T>>> {
+    pub fn tensor(&self) -> Result<MappedRwLockReadGuard<'_, Tensor<T>>> {
         loop {
             // Acquire the read lock and check if the data is initialised. Return it if yes
             {
@@ -945,7 +945,7 @@ impl<F: ExtensionField> Tensor<F> {
     ///
     /// - If the tensor is not 2D.
     /// - If either dimension is not a power-of-two.
-    fn into_mle_2d(self) -> Result<MultilinearExtension<'static, F>> {
+    pub fn into_mle_2d(self) -> Result<MultilinearExtension<'static, F>> {
         ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
         ensure!(
             self.nrows_2d()?.is_power_of_two(),
@@ -1866,6 +1866,13 @@ impl<'a, T> TensorSlice<'a, T> {
         }
     }
 }
+
+impl<'a, T: Clone> TensorSlice<'a, T> {
+    pub(crate) fn to_tensor(&self) -> Result<Tensor<T>> {
+        Tensor::new(self.shape.clone(), self.data.to_vec())
+    }
+}
+
 impl<T: Default + Clone + Copy> Tensor<T> {
     /// Permute a tensor.
     ///

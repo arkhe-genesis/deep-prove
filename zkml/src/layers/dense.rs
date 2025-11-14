@@ -22,9 +22,7 @@ use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
-    mle::{IntoMLE, MultilinearExtension},
-    util::ceil_log2,
-    virtual_polys::VirtualPolynomialsBuilder,
+    mle::MultilinearExtension, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{cmp::Ordering, collections::HashMap};
@@ -287,9 +285,8 @@ impl QuantizeOp for Dense<f32> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Dense<Element>
 where
-    E: ExtensionField,
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -301,7 +298,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensor = step_data.input_tensor_at(0)?;
@@ -442,8 +439,8 @@ impl Dense<Element> {
         &self,
         prover: &mut Prover<E, T, PCS>,
         last_claim: &Claim<E>,
-        input: &Tensor<E>,
-        output: &Tensor<E>,
+        input: &Tensor<Element>,
+        output: &Tensor<Element>,
         _info: &DenseCtx,
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
@@ -479,7 +476,7 @@ impl Dense<Element> {
                 bias.get_data().len().ilog2() as usize == last_claim.point.len(),
                 "something's wrong with the randomness"
             );
-            Some(bias.to_field::<E>().into_mle().evaluate(&last_claim.point))
+            Some(bias.to_field_mle().evaluate(&last_claim.point))
         } else {
             None
         };
@@ -490,7 +487,7 @@ impl Dense<Element> {
         // endian so (rows,cols) is actually given in (cols, rows)
         // mat_mle.fix_variables_in_place_parallel(partial_point);
         mat_mle.fix_high_variables_in_place(&last_claim.point);
-        let input_mle: MultilinearExtension<'_, E> = input.get_data().to_vec().into_mle();
+        let input_mle: MultilinearExtension<'_, E> = input.to_field_mle::<E>();
         let num_vars = input_mle.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
         let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);

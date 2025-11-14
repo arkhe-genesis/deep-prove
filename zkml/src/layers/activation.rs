@@ -38,7 +38,7 @@ use multilinear_extensions::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, marker::PhantomData};
+use std::{collections::HashMap, marker::PhantomData, ops::Deref};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -524,9 +524,8 @@ impl<N> PadOp for Activation<N> {}
 
 impl<E, PCS> ProvableOp<E, PCS> for Activation<Element>
 where
-    E: ExtensionField,
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -538,7 +537,7 @@ where
         id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = &step_data.node_inputs;
@@ -570,7 +569,7 @@ where
                 activation_layer.lookup_witness(
                     id,
                     ctx,
-                    &step_data.input_tensor_at(0)?,
+                    step_data.input_tensor_at(0)?.deref(),
                     &outputs[0],
                 )
             }
@@ -585,7 +584,7 @@ where
                 activation_layer.lookup_witness(
                     id,
                     ctx,
-                    &step_data.input_tensor_at(0)?,
+                    step_data.input_tensor_at(0)?.deref(),
                     &data.activation_output,
                 )
             }
@@ -649,7 +648,7 @@ impl Activation<Element> {
         prover: &mut Prover<'a, 'b, E, T, PCS>,
         last_claim: &Claim<E>,
         step: &ActivationCtx<E>,
-        inputs: &[TensorHandle<E>],
+        inputs: &[TensorHandle<Element>],
         node_id: NodeId,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
@@ -690,11 +689,7 @@ impl Activation<Element> {
         // fro the second input tensor, if present
         let input_mle = inputs
             .get(1)
-            .map(|handle| {
-                let tensor = handle.tensor()?;
-                let mle = tensor.clone().into_mle();
-                anyhow::Ok(mle)
-            })
+            .map(|handle| handle.tensor().map(|tensor| tensor.to_field_mle()))
             .unwrap_or(Ok(Default::default()))?;
 
         if let Activation::GLU(_) = self {

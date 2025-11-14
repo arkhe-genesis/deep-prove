@@ -40,7 +40,7 @@ pub enum ProvingData<E: ExtensionField> {
     /// Variant for extra data used to prove [Softmax][`crate::layers::transformer::softmax::Softmax`] that we compute anyway during quantised evaluation.
     Softmax(SoftmaxData),
     /// Variant for extra data used to prove Mha layer, computed during quantised evaluation
-    Mha(MhaData<E>),
+    Mha(MhaData),
     /// Variant used for extra data used to prove [LayerNorm][`crate::layers::transformer::layernorm::LayerNorm`]
     LayerNorm(LayerNormData),
     /// Variant used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
@@ -139,7 +139,7 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
         }
     }
 
-    pub fn try_mha_data(&self) -> Option<&MhaData<E>> {
+    pub fn try_mha_data(&self) -> Option<&MhaData> {
         match self.proving_data {
             ProvingData::Mha(ref mha_data) => Some(mha_data),
             _ => None,
@@ -301,9 +301,8 @@ pub trait PadOp {
 
 pub trait ProvableOp<E, PCS>: OpInfo + PadOp + ProveInfo
 where
-    E: ExtensionField,
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -316,7 +315,7 @@ where
         _node_id: NodeId,
         _ctx: &'b Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        _step_data: &Step<E, Element, E>,
+        _step_data: &Step<E, Element, Element>,
         _prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false

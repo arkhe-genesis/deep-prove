@@ -880,7 +880,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -890,14 +890,13 @@ where
             "LayerNorm step should only have one input, received {}",
             input_tensors.len()
         );
-        let input_mle: MultilinearExtension<E> = input_tensors[0].get_data().to_vec().into_mle();
+        let input_field = input_tensors[0].to_field();
         // We also make the MLE for the sum of each dim we perform layernorm on
         let last_dim = *input_tensors[0]
             .shape()
             .last()
             .ok_or(anyhow!("Step data input tensor had no shape in LayerNorm"))?;
-        let mean_mle = input_tensors[0]
-            .get_data()
+        let mean_mle = input_field
             .chunks(last_dim)
             .flat_map(|chunk| {
                 let sum = chunk.iter().copied().sum::<E>();
@@ -905,6 +904,7 @@ where
             })
             .collect::<Vec<E>>()
             .into_mle();
+        let input_mle: MultilinearExtension<E> = input_field.into_mle();
         let (claims, proof) =
             self.prove_step(node_id, last_claims, ctx, input_mle, mean_mle, prover)?;
         // Add the proof to the proof list
@@ -1003,12 +1003,12 @@ impl LayerNorm<Element> {
         let gamma_poly: MultilinearExtension<E> =
             std::iter::repeat_n(self.gamma.to_field::<E>(), 1 << logup_vars)
                 .flatten()
-                .collect::<Vec<E>>()
+                .collect::<Vec<_>>()
                 .into_mle();
         let beta_poly: MultilinearExtension<E> =
             std::iter::repeat_n(self.beta.to_field::<E>(), 1 << logup_vars)
                 .flatten()
-                .collect::<Vec<E>>()
+                .collect::<Vec<_>>()
                 .into_mle();
         let either_mles = [
             &input_poly,

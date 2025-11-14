@@ -527,9 +527,10 @@ pub(crate) mod manual_attention {
         model.reset();
 
         model.describe();
-        let output = model.run_float(vec![input], &mut GenStore::default())?[0].clone();
+        let output_handles = model.run_float(vec![input], &mut GenStore::default())?;
         // since the expected output is only for one token, but our model generates logits for all tokens,
         // we take the last element of the model output
+        let output = output_handles[0].tensor().unwrap();
         let output = output.slice_last_dim().last().unwrap();
         assert!(
             is_close(expected_output, output),

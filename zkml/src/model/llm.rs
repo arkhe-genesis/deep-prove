@@ -33,12 +33,12 @@ use transcript::BasicTranscript;
 use crate::{
     Element, Shape, Tensor,
     layers::{Layer, provable::Evaluate},
-    model::{InferenceTrace, Model},
+    model::{Model, Trace},
     number::Number,
 };
 
 pub trait Observer<N: TensorTypeParam> {
-    fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>);
+    fn observe<E: ExtensionField>(&self, step: usize, trace: &Trace<'_, E, N, N>);
 }
 
 /// The main struct responsible for verifying the proof related to the LLM proving.
@@ -154,7 +154,7 @@ impl Driver<f32> {
         input: &[Token],
         store: &mut GenStore,
         observer: Option<impl Observer<f32>>,
-    ) -> anyhow::Result<InferenceTrace<'_, E, f32>>
+    ) -> anyhow::Result<Trace<'_, E, f32, f32>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -168,7 +168,7 @@ impl Driver<f32> {
         store: &mut GenStore,
         observer: Option<impl Observer<f32>>,
         tracker: Option<&mut InferenceTracker>,
-    ) -> anyhow::Result<InferenceTrace<'_, E, f32>>
+    ) -> anyhow::Result<Trace<'_, E, f32, f32>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -235,7 +235,7 @@ where
         store: &mut GenStore,
         observer: Option<impl Observer<N>>,
         mut tracker: Option<&mut InferenceTracker>,
-    ) -> anyhow::Result<InferenceTrace<'_, E, N>>
+    ) -> anyhow::Result<Trace<'_, E, N, N>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -317,7 +317,9 @@ where
                 "expected 1 output, got {}",
                 trace.output.len()
             );
-            let output = trace.outputs().unwrap().into_iter().last().unwrap();
+            let output_handles = trace.outputs();
+            let output_handle = output_handles.last().unwrap();
+            let output = output_handle.tensor().unwrap();
             // We take the last token before the padding
             let output_tokens_len = output.get_data().len();
             let last_token = if output_tokens_len == 1 {
@@ -359,11 +361,11 @@ where
         let trace = self.model.run::<E>(vec![tensor], &mut store)?;
         for i in user_len..input_len {
             assert_eq!(
-                trace.outputs().unwrap()[0].get_data()[i - 1],
-                trace.inputs().unwrap()[0].get_data()[i],
+                trace.outputs()[0].tensor().unwrap().get_data()[i - 1],
+                trace.inputs()[0].tensor().unwrap().get_data()[i],
                 "Failed for {i}, input: {:?}, output: {:?}",
-                trace.inputs().unwrap()[0],
-                trace.outputs().unwrap()[0]
+                trace.inputs()[0].tensor().unwrap(),
+                trace.outputs()[0].tensor().unwrap(),
             );
         }
         Ok(trace)
@@ -376,7 +378,7 @@ impl Driver<Element> {
         input: Vec<Token>,
         store: &mut GenStore,
         observer: Option<impl Observer<Element>>,
-    ) -> anyhow::Result<InferenceTrace<'_, E, Element>>
+    ) -> anyhow::Result<Trace<'_, E, Element, Element>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -390,7 +392,7 @@ impl Driver<Element> {
         store: &mut GenStore,
         observer: Option<impl Observer<Element>>,
         tracker: &mut InferenceTracker,
-    ) -> anyhow::Result<InferenceTrace<'_, E, Element>>
+    ) -> anyhow::Result<Trace<'_, E, Element, Element>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -457,7 +459,7 @@ impl Driver<Element> {
     pub fn distribute_prove<S, E, PCS>(
         &self,
         ctx: &LLMContext<E, PCS>,
-        trace: InferenceTrace<'_, E, Element>,
+        trace: Trace<'_, E, Element, Element>,
         num_chunks: Option<usize>,
         chunking_strategy: S,
     ) -> anyhow::Result<LLMProof<E, PCS>>
@@ -483,7 +485,7 @@ impl Driver<Element> {
     pub fn prove<E, PCS>(
         &self,
         ctx: &LLMContext<E, PCS>,
-        trace: InferenceTrace<'_, E, Element>,
+        trace: Trace<'_, E, Element, Element>,
     ) -> anyhow::Result<LLMProof<E, PCS>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -572,7 +574,7 @@ impl<'a, N, T: LLMTokenizer> Observer<N> for LLMTokenizerObserver<'a, T>
 where
     N: TensorTypeParam + Serialize + for<'b> Deserialize<'b>,
 {
-    fn observe<E: ExtensionField>(&self, step: usize, trace: &InferenceTrace<'_, E, N>) {
+    fn observe<E: ExtensionField>(&self, step: usize, trace: &Trace<'_, E, N, N>) {
         let tensor = trace
             .output
             .last()
@@ -734,8 +736,9 @@ mod test {
         )?;
         let _output = trace
             .outputs()
-            .unwrap()
             .last()
+            .unwrap()
+            .tensor()
             .unwrap()
             .get_data()
             .iter()
@@ -770,8 +773,9 @@ mod test {
         )?;
         let output = trace
             .outputs()
-            .unwrap()
             .last()
+            .unwrap()
+            .tensor()
             .unwrap()
             .get_data()
             .iter()

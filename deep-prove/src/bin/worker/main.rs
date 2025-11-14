@@ -135,7 +135,11 @@ async fn run_model_v1<S: Store>(
                     let proof = prover
                         .prove(&trace)
                         .with_context(|| "unable to generate proof for {i}th input")?;
-                    let outputs = trace.outputs()?;
+                    let output_handles = trace.outputs();
+                    let outputs = output_handles
+                        .iter()
+                        .map(|handle| handle.tensor().map(|t| t.clone()))
+                        .collect::<Result<_, _>>()?;
 
                     proofs.push(v1::Output {
                         outputs,

@@ -17,7 +17,7 @@ use crate::{
     model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo, pad_matmul},
-    quantization::{self, bias_scaling_matmul},
+    quantization::{self, TensorFielder, bias_scaling_matmul},
     tensor::{CommitmentId, IntoBTensor, KeyedTensor, TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
 };
@@ -26,10 +26,7 @@ use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    mle::{IntoMLE, MultilinearExtension},
-    virtual_polys::VirtualPolynomialsBuilder,
-};
+use multilinear_extensions::{mle::MultilinearExtension, virtual_polys::VirtualPolynomialsBuilder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, ops::Deref};
 use sumcheck::{
@@ -703,9 +700,8 @@ impl PadOp for MatMul<Element> {
 
 impl<E, PCS> ProvableOp<E, PCS> for MatMul<Element>
 where
-    E: ExtensionField,
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -717,7 +713,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -799,8 +795,8 @@ impl MatMul<Element> {
         node_id: NodeId,
         prover: &mut Prover<E, T, PCS>,
         last_claim: &Claim<E>,
-        mut inputs: Vec<Tensor<E>>,
-        output: &Tensor<E>,
+        mut inputs: Vec<Tensor<Element>>,
+        output: &Tensor<Element>,
     ) -> Result<(Vec<Claim<E>>, MatMulProof<E>)>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -823,7 +819,7 @@ impl MatMul<Element> {
                 let matrix = inputs
                     .pop()
                     .ok_or(anyhow!("No input provided for right matrix"))?;
-                (matrix, None)
+                (matrix.to_fields(), None)
             }
         };
         let transposed = self.is_right_transposed();
@@ -836,7 +832,7 @@ impl MatMul<Element> {
                 let matrix = inputs
                     .pop()
                     .ok_or(anyhow!("No input provided for left matrix"))?;
-                (matrix, None)
+                (matrix.to_fields(), None)
             }
         };
         let is_left_constant = left_matrix_key.is_some();
@@ -897,7 +893,7 @@ impl MatMul<Element> {
         let (point_for_left, point_for_right) = Self::split_claim(&init_split, num_vars_2d);
 
         let bias_eval = self.bias.as_ref().map(|bias| {
-            let bias_eval = bias.to_field::<E>().into_mle().evaluate(point_for_right);
+            let bias_eval = bias.to_field_mle().evaluate(point_for_right);
             last_claim.eval -= bias_eval;
             common_claims.insert(
                 bias.commitment_id(),

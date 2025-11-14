@@ -29,13 +29,13 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeInfo},
 };
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use burn::tensor::{
     TensorPrimitive,
     ops::{FloatTensorOps, IntTensorOps},
 };
 use either::Either;
-use ff_ext::{ExtensionField, SmallField};
+use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::virtual_polys::VirtualPolynomialsBuilder;
@@ -391,9 +391,8 @@ impl QuantizeOp for Embeddings<f32> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Embeddings<Element>
 where
-    E: ExtensionField,
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -405,7 +404,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         // we first construct the one hot encoding from the input indices and then we run
@@ -436,14 +435,9 @@ where
         // we now build the `reduced_one_hot` vector as `reduced_one_hot[x[i]] += beta_vec[i]`
         let mut reduced_one_hot = vec![E::ZERO; vocab_size];
 
-        input.get_data().iter().enumerate().try_for_each(|(i, x)| {
-            let x = x
-                .as_base()
-                .ok_or(anyhow!("Input data at position {i} bigger than base field"))?
-                .to_canonical_u64() as usize;
-            reduced_one_hot[x] += beta_vec[i];
-            anyhow::Ok(())
-        })?;
+        for (i, x) in input.get_data().iter().enumerate() {
+            reduced_one_hot[*x as usize] += beta_vec[i];
+        }
 
         let reduced_one_hot = Tensor::new(vec![1, vocab_size].into(), reduced_one_hot)?;
 

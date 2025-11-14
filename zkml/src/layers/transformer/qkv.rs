@@ -16,7 +16,7 @@ use crate::{
     },
     model::Step,
     padding::{PaddingMode, ShapeInfo, pad_qkv},
-    quantization::model_scaling_factor_from_tensor_and_bias,
+    quantization::{TensorFielder, model_scaling_factor_from_tensor_and_bias},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     try_unzip, try_unzip_parallel,
     util::from_mle_list_dimensions,
@@ -27,9 +27,7 @@ use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{
-    Expression,
-    mle::{IntoMLE, MultilinearExtension},
-    virtual_polys::VirtualPolynomialsBuilder,
+    Expression, mle::MultilinearExtension, virtual_polys::VirtualPolynomialsBuilder,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -616,10 +614,10 @@ impl PadOp for QKV<Element> {
     }
 }
 
-impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for QKV<Element>
+impl<E, PCS> ProvableOp<E, PCS> for QKV<Element>
 where
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -631,7 +629,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -695,10 +693,7 @@ where
                             point_for_column.len() == bias_vector.get_data().len().ilog2() as usize
                         );
 
-                        let eval = bias_vector
-                            .to_field::<E>()
-                            .into_mle()
-                            .evaluate(point_for_column);
+                        let eval = bias_vector.to_field_mle().evaluate(point_for_column);
                         let bias_claim = Claim::new(point_for_column.to_vec(), eval);
                         // subtract the bias evals from output claims to get claims about the tensors before bias addition
                         let eval_pre_bias = claim.eval - eval;
@@ -713,7 +708,7 @@ where
         let challenges =
             Self::challenges_for_batched_sumcheck(prover.transcript, &last_claims, &evals_pre_bias);
 
-        let input_mle = input.to_mle_2d()?;
+        let input_mle = input.to_fields().to_mle_2d()?;
 
         // Number of variables involved in the sum-check corresponds to the number of columns of the input matrix
         let num_vars = input.shape().num_vars_2d().1;

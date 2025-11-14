@@ -216,12 +216,12 @@ where
 }
 
 impl Reshape {
-    pub fn evaluate_original<N: Clone, E: ExtensionField>(
+    pub(crate) fn evaluate_original<N: Clone>(
         &self,
         inputs: &[&Tensor<N>],
     ) -> anyhow::Result<Vec<Tensor<N>>> {
-        let output_shapes =
-            self.internal_output(&inputs.iter().map(|x| x.shape().clone()).collect::<Vec<_>>())?;
+        let input_shapes = inputs.iter().map(|x| x.shape().clone()).collect::<Vec<_>>();
+        let output_shapes = self.internal_output(&input_shapes)?;
         let mut out_tensors = inputs.iter().map(|&x| x.clone()).collect::<Vec<_>>();
         for (new_dim, input_tensor) in output_shapes.into_iter().zip(out_tensors.iter_mut()) {
             input_tensor.reshape(new_dim)?

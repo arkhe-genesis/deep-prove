@@ -18,7 +18,7 @@ use crate::{
     },
     model::Step,
     padding::{PaddingMode, ShapeInfo},
-    quantization::Fieldizer,
+    quantization::{Fieldizer, TensorFielder},
     tensor::{BShape, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, bail, ensure};
@@ -753,7 +753,7 @@ where
         node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = step_data.input_tensors()?;
@@ -840,7 +840,7 @@ impl<E: ExtensionField> MaskProvingData<E> {
 
     pub fn from_claims_and_input<T: Transcript<E>>(
         claims: &[&Claim<E>],
-        input: &Tensor<E>,
+        input: &Tensor<Element>,
         unpadded_input_shape: &Shape,
         unpadded_output_shapes: &[Shape],
         transcript: &mut T,
@@ -853,16 +853,26 @@ impl<E: ExtensionField> MaskProvingData<E> {
         let rank = input_shape.rank();
 
         match rank {
-            2 => Self::from_claims_rank_two(claims, input),
-            3 => Self::from_claims_rank_three(claims, input, unpadded_input_shape, transcript),
-            4 => Self::from_claims_rank_four(claims, input, unpadded_input_shape, transcript),
+            2 => Self::from_claims_rank_two(claims, input.to_fields()),
+            3 => Self::from_claims_rank_three(
+                claims,
+                input.to_fields(),
+                unpadded_input_shape,
+                transcript,
+            ),
+            4 => Self::from_claims_rank_four(
+                claims,
+                input.to_fields(),
+                unpadded_input_shape,
+                transcript,
+            ),
             other => {
                 bail!("Attention mask can only be applied to rank 2, 3 or 4 tensors, got {other}")
             }
         }
     }
 
-    fn from_claims_rank_two(claims: &[&Claim<E>], input: &Tensor<E>) -> Result<Self> {
+    fn from_claims_rank_two(claims: &[&Claim<E>], input: Tensor<E>) -> Result<Self> {
         // In this case there should be a single claim
         ensure!(
             claims.len() == 1,
@@ -878,13 +888,13 @@ impl<E: ExtensionField> MaskProvingData<E> {
             vec![E::ONE], // We include E::ONE so that the output claim is calculated correctly
             vec![],
             eq_evals,
-            vec![input.data().to_vec()],
+            vec![input.into_data()],
         ))
     }
 
     fn from_claims_rank_three<T: Transcript<E>>(
         claims: &[&Claim<E>],
-        input: &Tensor<E>,
+        input: Tensor<E>,
         unpadded_input_shape: &Shape,
         transcript: &mut T,
     ) -> Result<Self> {
@@ -949,7 +959,7 @@ impl<E: ExtensionField> MaskProvingData<E> {
 
     fn from_claims_rank_four<T: Transcript<E>>(
         claims: &[&Claim<E>],
-        input: &Tensor<E>,
+        input: Tensor<E>,
         unpadded_input_shape: &Shape,
         transcript: &mut T,
     ) -> Result<Self> {
@@ -1413,7 +1423,8 @@ mod tests {
             let output = model
                 .run::<F>(vec![padded_input.clone()], &mut store)
                 .unwrap();
-            let output_tensor = output.outputs().unwrap().pop().unwrap();
+            let output_tensor_handle = output.outputs().last().unwrap();
+            let output_tensor = output_tensor_handle.tensor().unwrap();
             assert_eq!(output_tensor.shape(), padded_input.shape());
             let (input_it, _) = padded_input.slice_on_dim(0);
             let (it, shape) = output_tensor.slice_on_dim(0);

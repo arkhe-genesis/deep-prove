@@ -21,7 +21,7 @@ use crate::{
         context::{LookupWitness, TableType, generate_lookup_witnesses},
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
-    model::InferenceTrace,
+    model::Trace,
     quantization::TensorFielder,
     tensor::{CommitmentId, get_root_of_unity},
 };
@@ -36,10 +36,7 @@ use multilinear_extensions::{
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    collections::{BTreeMap, HashMap},
-    ops::Deref,
-};
+use std::collections::{BTreeMap, HashMap};
 use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use timed::timed_instrument;
 use tracing::{debug, trace};
@@ -508,7 +505,7 @@ where
     fn generate_chunk_commitments<'d>(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &'d InferenceTrace<'d, E, Element>,
+        chunk_trace: &'d Trace<'d, E, Element, Element>,
         group_type: GroupType,
     ) -> anyhow::Result<BTreeMap<ChunkID, PCS::Commitment>> {
         let commitments = chunk.commitments(&self.ctx.commitment_ctx, chunk_trace, group_type)?;
@@ -535,7 +532,7 @@ where
     fn generate_chunk_io_commitments<'d>(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &'d InferenceTrace<'d, E, Element>,
+        chunk_trace: &'d Trace<'d, E, Element, Element>,
     ) -> anyhow::Result<ChunkIOCommitments<PCS::Commitment>> {
         let input_commitments =
             self.generate_chunk_commitments(chunk, chunk_trace, GroupType::Incoming)?;
@@ -552,14 +549,10 @@ where
     fn prove_chunk<'d>(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &'d InferenceTrace<'d, E, Element>,
+        chunk_trace: &'d Trace<'d, E, Element, Element>,
     ) -> anyhow::Result<HashMap<NodeOutput, Claim<E>>> {
         debug!("== Generating claims ==");
         let metrics = Metrics::new();
-        let trace = chunk_trace
-            .clone()
-            .into_fields()
-            .context("converting trace to fields")?;
 
         // compute model output claims for this chunk
         let chunk_id = chunk.chunk_id;
@@ -575,7 +568,7 @@ where
                     anyhow!("Edge {edge_id} is not an output edge of the model")
                 )?;
                 let source_id = output_edge.source();
-                let trace_step = trace.get_step(source_id)
+                let trace_step = chunk_trace.get_step(&source_id)
                     .ok_or(
                         anyhow!("Node {source_id} not found in trace for chunk {chunk_id}")
                     )?;
@@ -585,9 +578,12 @@ where
                     output_edge.ports().len()
                 );
                 let source_port = &output_edge.ports()[0].source_port;
-                let output_tensor = trace_step.output_tensor_at(
-                    **source_port,
-                )?;
+                let output_tensor ={
+                    let output_tensor_guard = trace_step.output_tensor_at(
+                        **source_port,
+                    )?;
+                    output_tensor_guard.to_fields()
+                };
                 ensure!(
                     outputs.insert(output_id, output_tensor).is_none(),
                     "Found output tensor twice for output id {} in chunk {chunk_id}",
@@ -613,7 +609,7 @@ where
             |mut claims_map, edge_id| {
                 let edge = chunk.edge(&edge_id)?;
                 let source_node_id = edge.source();
-                let trace_step = chunk_trace.get_step(source_node_id)
+                let trace_step = chunk_trace.get_step(&source_node_id)
                     .ok_or(
                         anyhow!("Trace step not found for node {source_node_id} in chunk {}", chunk.chunk_id)
                     )?;
@@ -642,23 +638,26 @@ where
         for (node_id, node) in chunk.subgraph.backward_iter() {
             match node {
                 Node::Inner(_) => {
-                    let section = trace
-                        .get_step(node_id)
+                    let section = chunk_trace
+                        .get_step(&node_id)
                         .ok_or(anyhow!("Step in trace not found for node {node_id}"))?;
                     trace!(
                         "Proving node with id {node_id}: {:?}",
                         section.op.describe()
                     );
 
-                    // Hydrate all the output tensors of this node
+                    // Load all output tensors and convert to target field
                     let handles = section
                         .node_outputs
                         .outputs
                         .iter()
                         .map(|handle| {
-                            handle.tensor().with_context(|| {
-                                format!("hydrating tensor {}", handle.storage_key())
-                            })
+                            handle
+                                .tensor()
+                                .with_context(|| {
+                                    format!("hydrating tensor {}", handle.storage_key())
+                                })
+                                .map(|tensor_guard| tensor_guard.to_fields())
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -676,7 +675,7 @@ where
                     // this node.
                     let claims_for_prove = self.flatten_and_merge_claims(
                         claims_for_node,
-                        &handles.iter().map(|v| v.deref()).collect::<Vec<_>>(),
+                        &handles.iter().collect::<Vec<_>>(),
                         node_id,
                     )?;
 
@@ -773,7 +772,7 @@ where
     /// the chunking strategy will decide how many chunks to build.
     pub(crate) fn distribute_prove<'d: 'a, S: ChunkingStrategy>(
         mut self,
-        full_trace: &'d InferenceTrace<'d, E, Element>,
+        full_trace: &'d Trace<'d, E, Element, Element>,
         num_chunks: Option<usize>,
         chunking_strategy: S,
     ) -> anyhow::Result<Proof<E, PCS>> {
@@ -885,7 +884,7 @@ where
 
     pub fn prove<'d: 'a>(
         self,
-        full_trace: &'d InferenceTrace<'d, E, Element>,
+        full_trace: &'d Trace<'d, E, Element, Element>,
     ) -> anyhow::Result<Proof<E, PCS>> {
         self.distribute_prove(full_trace, Some(1), DefaultChunkingStrategy::default())
     }
@@ -944,7 +943,7 @@ where
     #[timed_instrument]
     fn instantiate_witness_ctx<'d: 'a>(
         &mut self,
-        trace: &'d InferenceTrace<'d, E, Element>,
+        trace: &'d Trace<'d, E, Element, Element>,
     ) -> anyhow::Result<()> {
         let LookupWitness {
             logup_witnesses,

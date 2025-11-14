@@ -765,7 +765,7 @@ impl Convolution<Element> {
         last_claim: &Claim<E>,
         // Struct containing all necessary information
         // to generate a convolution proof
-        output: &Tensor<E>,
+        output: &Tensor<Element>,
         unpadded_output_shape: &Shape,
         proving_data: &ConvData<E>,
         id: NodeId,
@@ -808,7 +808,7 @@ impl Convolution<Element> {
             info!("PROVE: output.shape(): {:?}", output.shape());
             let cleared_out = conv_after_bias.to_flatten().mul(&clearing_tensor);
             let fielded: Tensor<E> = cleared_out.to_fields();
-            fielded.get_data().to_vec() == output.get_data()
+            fielded.get_data().to_vec() == output.to_field()
         });
         let clearing_proof = hadamard::prove(
             prover.transcript,
@@ -850,9 +850,9 @@ impl Convolution<Element> {
         }
         let mut bias_eval = E::ZERO;
         if !bias_point.is_empty() {
-            bias_eval = filter.bias.to_field::<E>().into_mle().evaluate(&bias_point);
+            bias_eval = filter.bias.to_field_mle().evaluate(&bias_point);
         } else if filter.bias.data().len() == 1 {
-            bias_eval = filter.bias.to_field::<E>()[0];
+            bias_eval = filter.bias.to_field()[0];
         }
 
         debug_assert!({
@@ -1040,7 +1040,7 @@ impl Convolution<Element> {
                 point[(2 * self.fft_filter_size()).ilog2() as usize..].to_vec(),
             ]
             .concat();
-            let y = tensor.to_field::<E>().into_mle().evaluate(&r);
+            let y = tensor.to_field_mle().evaluate(&r);
             ensure!(
                 y == partial_evals.clone().into_mle().evaluate(&weights_rand),
                 "Error in fft_weights eval"
@@ -1445,9 +1445,8 @@ pub fn check_cnn_input(input_shape: &Shape) -> Result<()> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Convolution<Element>
 where
-    E: ExtensionField,
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -1459,7 +1458,7 @@ where
         id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let output_tensor = step_data.output_tensor_at(0)?;

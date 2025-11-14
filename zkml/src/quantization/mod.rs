@@ -211,6 +211,13 @@ pub fn bias_scaling_matmul(input: &ScalingFactor, model: &ScalingFactor) -> Scal
     )
 }
 
+/// Trait to convert an element to its extension field.
+///
+/// The [From] and [Into] traits can not be used because of the orphan rules, it
+/// is not allowed to implement a foreign trait for a foreign type.
+///
+/// The trait is generic over `F` because there are more than one target field,
+/// e.g. baby bear and goldilocks.
 pub trait Fieldizer<F> {
     fn to_field(&self) -> F;
 }

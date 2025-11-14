@@ -30,12 +30,11 @@ use crate::{
     lookup::context::LookupWitnessGen,
     model::Step,
     padding::{GarbagePad, PaddingMode, ShapeInfo},
-    quantization::{Fieldizer, TensorFielder},
+    quantization::Fieldizer,
     tensor::{TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use ff_ext::{ExtensionField, FieldFrom};
-use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -45,13 +44,13 @@ use transcript::Transcript;
 pub const MHA_LAYER: &str = "MHDA";
 
 #[derive(Clone, Debug)]
-pub struct MhaData<E: ExtensionField> {
+pub struct MhaData {
     // Output tensor of Mha before final reshape
-    pre_reshaping_out: Tensor<E>,
+    pre_reshaping_out: Tensor<Element>,
     softmax_out: Tensor<Element>, // this needs to be an `Element` to call Softmax::lookup_witness
     softmax_data: SoftmaxData,
     softmax_in: Tensor<Element>,
-    mask_in: Tensor<E>,
+    mask_in: Tensor<Element>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -389,11 +388,11 @@ impl Evaluate<Element> for Mha<Element> {
             bail!("Softmax data not found while evaluating MhaLayer");
         };
         let data = MhaData {
-            pre_reshaping_out: Tensor::try_from(final_mul_out.outputs()[0].clone())?.to_fields(),
+            pre_reshaping_out: Tensor::try_from(final_mul_out.outputs()[0].clone())?,
             softmax_data,
             softmax_out: Tensor::try_from(outputs[0].clone())?,
             softmax_in: Tensor::try_from(mask_out.outputs[0].clone())?,
-            mask_in: Tensor::try_from(qk_out.outputs[0].clone())?.to_fields(),
+            mask_in: Tensor::try_from(qk_out.outputs[0].clone())?,
         };
         Ok(out.with_proving_data(ProvingData::Mha(data)))
     }
@@ -726,8 +725,9 @@ impl PadOp for Mha<Element> {
     }
 }
 
-impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for Mha<Element>
+impl<E, PCS> ProvableOp<E, PCS> for Mha<Element>
 where
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -739,7 +739,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -760,7 +760,7 @@ where
         // apply reshaping to input and output tensors before employing them in proving logic
         let reshaped_inputs = self
             .inputs_reshape
-            .evaluate_original::<E, E>(&input_tensors.iter().collect_vec())?;
+            .evaluate_original::<Element>(&input_tensors.iter().collect::<Vec<_>>())?;
 
         let reshaped_input_shapes = self
             .inputs_reshape
@@ -789,7 +789,7 @@ where
         let (mut claims, final_mul_proof) = self.final_mul.prove_step(
             last_claims,
             &mha_data.pre_reshaping_out,
-            &[&mha_data.softmax_out.to_fields(), &reshaped_inputs[2]],
+            &[&mha_data.softmax_out, &reshaped_inputs[2]],
             prover,
         )?;
 
@@ -832,7 +832,7 @@ where
         let (mut input_claims, qk_proof) = self.qk.prove_step(
             vec![&claims[0]],
             &mha_data.mask_in,
-            &reshaped_inputs[..2],
+            &reshaped_inputs[..2].iter().collect::<Vec<_>>(),
             prover,
         )?;
 
@@ -1509,11 +1509,11 @@ mod test {
         let trace = quantized_model
             .run::<GoldilocksExt2>(quantized_input.clone(), &mut GenStore::default())
             .unwrap();
-        let outputs = trace.outputs().unwrap();
+        let outputs = trace.outputs();
 
         assert_eq!(outputs.len(), 1);
 
-        let expected_output = outputs[0].clone();
+        let expected_output = outputs[0].tensor().unwrap();
         for (_, node) in quantized_model.graph.nodes() {
             if let Some(Layer::QKV(ref qkv)) = node.as_inner() {
                 qkv.reset_cache();
@@ -1529,9 +1529,7 @@ mod test {
 
         assert_eq!(outputs.len(), 1);
 
-        let output = &outputs[0];
-
-        let padded_output_shape = output.shape();
+        let padded_output_shape = outputs[0].shape();
 
         for i in 0..padded_output_shape[0] {
             for j in 0..padded_output_shape[1] {
@@ -1541,12 +1539,12 @@ mod test {
                         // it's an actual entry, so we check it's the same as the unpadded output
                         assert_eq!(
                             expected_output.get_2d(i, j),
-                            output.get_2d(i, j),
+                            outputs[0].tensor().unwrap().get_2d(i, j),
                             "Failed for {i} {j}"
                         );
                     } else {
                         // it's a padded entry, so check it's zero
-                        assert_eq!(0, output.get_2d(i, j));
+                        assert_eq!(0, outputs[0].tensor().unwrap().get_2d(i, j));
                     }
                 }
             }
@@ -1736,16 +1734,16 @@ mod test {
         for (node_id, node) in quantized_model.graph.forward_iter() {
             println!("node with id {node_id}, node name: {}", node.describe())
         }
+
         // run to get unpadded output
-        let mut outputs = quantized_model
+        let unpadded_trace = quantized_model
             .run::<GoldilocksExt2>(inputs.clone(), &mut GenStore::default())
-            .unwrap()
-            .outputs()
             .unwrap();
 
-        assert_eq!(outputs.len(), 1);
+        let unpadded_outputs = unpadded_trace.outputs();
+        assert_eq!(unpadded_outputs.len(), 1);
 
-        let unpadded_out = outputs.pop().unwrap();
+        let unpadded_out = unpadded_outputs.last().unwrap().clone();
 
         // pad model
         let padded_model = pad_model(quantized_model).unwrap();
@@ -1754,15 +1752,14 @@ mod test {
         let padded_inputs = padded_model.prepare_inputs(inputs).unwrap();
 
         // compute padded evaluation, with garbage removal in matmul
-        let mut outputs = padded_model
+        let padded_trace = padded_model
             .run::<GoldilocksExt2>(padded_inputs, &mut GenStore::default())
-            .unwrap()
-            .outputs()
             .unwrap();
 
-        assert_eq!(outputs.len(), 1);
+        let padded_outputs = padded_trace.outputs();
+        assert_eq!(padded_outputs.len(), 1);
 
-        let padded_out = outputs.pop().unwrap();
+        let padded_out = padded_outputs.last().unwrap();
 
         // check that non-garbabe entries in padded output are the same as corresponding entries
         // in unpadded_out, i.e., the padding didn't affect the results of MHA
@@ -1778,8 +1775,11 @@ mod test {
                     let original_matrix_index =
                         j / padded_head_dim * head_dim + j % padded_head_dim;
                     assert_eq!(
-                        unpadded_out.get_2d(i, original_matrix_index),
-                        padded_out.get_2d(i, j),
+                        unpadded_out
+                            .tensor()
+                            .unwrap()
+                            .get_2d(i, original_matrix_index),
+                        padded_out.tensor().unwrap().get_2d(i, j),
                         "Failed for {i} {j} {original_matrix_index}"
                     );
                 }

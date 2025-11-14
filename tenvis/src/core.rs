@@ -136,8 +136,9 @@ impl GlobalContext {
             let answer = tokenizer.detokenize(
                 trace_f32
                     .outputs()
-                    .unwrap()
                     .last()
+                    .unwrap()
+                    .tensor()
                     .unwrap()
                     .get_data()
                     .iter()
@@ -175,8 +176,9 @@ impl GlobalContext {
             let answer = tokenizer.detokenize(
                 trace_elt
                     .outputs()
-                    .unwrap()
                     .last()
+                    .unwrap()
+                    .tensor()
                     .unwrap()
                     .get_data()
                     .iter()

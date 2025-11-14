@@ -31,11 +31,11 @@ use crate::{
     lookup::context::LookupWitnessGen,
     model::Step,
     padding::{PaddingMode, ShapeInfo},
-    quantization::{Fieldizer, ModelMetadata, ScalingFactor},
+    quantization::{ModelMetadata, ScalingFactor},
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use activation::ActivationCtx;
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use convolution::{ConvCtx, ConvProof};
 use dense::{DenseCtx, DenseProof};
 use ff_ext::ExtensionField;
@@ -291,6 +291,7 @@ pub(crate) struct NodeOut<T, E: ExtensionField> {
     pub(crate) outputs: Vec<TensorHandle<T>>,
     pub(crate) proving_data: ProvingData<E>,
 }
+
 impl<T, E: ExtensionField> NodeOut<T, E> {
     pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingData<E>) -> Self {
         Self {
@@ -298,28 +299,6 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
             outputs,
             proving_data,
         }
-    }
-    pub(crate) fn into_fields<U>(self) -> anyhow::Result<NodeOut<U, E>>
-    where
-        T: Serialize + for<'a> Deserialize<'a>,
-        U: Serialize + for<'a> Deserialize<'a>,
-        T: Fieldizer<U> + Debug,
-    {
-        let outputs = self
-            .outputs
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .cast(|x| x.to_field())
-                    .with_context(|| format!("converting {:?}", handle.storage_key()))
-            })
-            .collect::<anyhow::Result<Vec<TensorHandle<U>>>>()?;
-
-        Ok(NodeOut::<U, E> {
-            _t: PhantomData::<U>,
-            outputs,
-            proving_data: self.proving_data,
-        })
     }
 
     pub fn try_convdata(&self) -> Option<&ConvFFTData> {
@@ -336,7 +315,7 @@ impl<T, E: ExtensionField> NodeOut<T, E> {
         }
     }
 
-    pub fn try_mha_data(&self) -> Option<&MhaData<E>> {
+    pub fn try_mha_data(&self) -> Option<&MhaData> {
         match self.proving_data {
             ProvingData::Mha(ref mha_data) => Some(mha_data),
             _ => None,
@@ -634,8 +613,8 @@ impl PadOp for Layer<Element> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Layer<Element>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
+    E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -647,7 +626,7 @@ where
         node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&crate::Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {

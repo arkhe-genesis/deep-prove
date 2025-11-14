@@ -293,7 +293,7 @@ mod test {
 
         let trace = model.run(inputs, &mut GenStore::default()).unwrap();
 
-        let output = trace.output_at(0)?;
+        let output = trace.outputs().first().unwrap();
         println!("[+] Run inference. Result: {output:?}");
 
         let io = trace.to_verifier_io()?;

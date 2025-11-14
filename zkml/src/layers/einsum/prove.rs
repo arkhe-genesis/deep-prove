@@ -12,7 +12,7 @@ use crate::{
     tensor::CommitmentId,
 };
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 
 use either::Either;
 use ff_ext::ExtensionField;
@@ -50,7 +50,7 @@ impl EinSum<Element> {
         &self,
         ctx: &EinSumContext<E>,
         last_claims: Vec<&Claim<E>>,
-        inputs: &[Tensor<E>],
+        inputs: &[Tensor<Element>],
         unpadded_input_shapes: &[Shape],
         transcript: &mut T,
     ) -> Result<EinSumProofInfo<E>>
@@ -69,29 +69,33 @@ impl EinSum<Element> {
         let mut inputs_iter = inputs.iter();
         let first_input = inputs_iter
             .next()
-            .ok_or_else(|| anyhow!("At least one input tensor must be provided"));
+            .context("At least one input tensor must be provided")?
+            .to_fields();
 
         let field_constants = self
             .constant_tensors
             .iter()
             .map(|t| t.as_ref().map(|tensor| tensor.tensor().to_fields()))
             .collect::<Vec<Option<Tensor<E>>>>();
-        let full_inputs = std::iter::once(first_input)
-            .chain(field_constants.iter().map(|t| {
-                if let Some(tensor) = t.as_ref() {
-                    Ok(tensor)
-                } else {
-                    inputs_iter
+
+        let mut full_inputs = Vec::with_capacity(field_constants.len() + 1);
+        full_inputs.push(first_input);
+        for tensor in field_constants {
+            match tensor {
+                Some(tensor) => full_inputs.push(tensor),
+                None => {
+                    let tensor = inputs_iter
                         .next()
-                        .ok_or_else(|| anyhow!("Not enough input tensors provided"))
+                        .context("Not enough input tensors provided")?;
+                    full_inputs.push(tensor.to_fields());
                 }
-            }))
-            .collect::<Result<Vec<&Tensor<E>>>>()?;
+            }
+        }
 
         ensure!(
             full_inputs.len() == expected_num_inputs,
             "Expected {expected_num_inputs} input tensors, got {}",
-            full_inputs.len()
+            full_inputs.len(),
         );
 
         let mut unpadded_inputs_iter = unpadded_input_shapes.iter();
@@ -245,7 +249,7 @@ impl EinSum<Element> {
             .collect::<HashMap<CommitmentId, Claim<E>>>();
 
         if let Some(agg_expr) = ctx.input_aggregation_expression.as_ref() {
-            let input_mle = inputs[0].to_mle();
+            let input_mle = inputs[0].to_field_mle();
             let num_vars = input_mle.num_vars();
             // In this case we have more than one claim about the LHS poly, so we need to build the eq_polys to aggregate the claims.
             let eq_polys = lhs_points

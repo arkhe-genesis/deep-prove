@@ -460,7 +460,7 @@ impl AxesMapping {
     pub fn fix_axes<'a, E: ExtensionField>(
         &self,
         claim_points: &[Vec<&'a [E]>],
-        full_inputs: &[&Tensor<E>],
+        full_inputs: &[Tensor<E>],
         unpadded_shapes: &[Shape],
     ) -> Result<FixedPolys<'a, E>> {
         ensure!(
@@ -955,7 +955,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
     /// That is if there are `r` RHS tensors and the stacking axis are of size `s`, the returned [`Vec`] will have length `r` and each inner [`Vec`] will have length `s`.
     pub fn rhs_fixes(
         &self,
-        rhs: &[&Tensor<E>],
+        rhs: &[Tensor<E>],
         unpadded_shapes: &[Shape],
     ) -> Result<Vec<Vec<MultilinearExtension<'static, E>>>> {
         ensure!(
@@ -1092,14 +1092,14 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
 
     fn into_fixed_polys<'b>(
         self,
-        tensors: &[&Tensor<E>],
+        tensors: &[Tensor<E>],
         unpadded_shapes: &[Shape],
     ) -> Result<FixedPolys<'b, E>>
     where
         E: ExtensionField,
         'a: 'b,
     {
-        let (lhs, stacking_coeffs) = self.lhs_fixes(tensors[0], &unpadded_shapes[0])?;
+        let (lhs, stacking_coeffs) = self.lhs_fixes(&tensors[0], &unpadded_shapes[0])?;
         let rhs = self.rhs_fixes(&tensors[1..], &unpadded_shapes[1..])?;
 
         let FixedAxesMapping {

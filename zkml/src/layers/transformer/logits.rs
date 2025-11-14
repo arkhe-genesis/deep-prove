@@ -330,8 +330,9 @@ impl PadOp for Logits {
     }
 }
 
-impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for Logits
+impl<E, PCS> ProvableOp<E, PCS> for Logits
 where
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -343,7 +344,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
@@ -362,12 +363,6 @@ where
             outputs.len()
         );
 
-        let output = outputs[0]
-            .get_data()
-            .iter()
-            .map(|out| out.to_element() as usize)
-            .collect_vec();
-
         let layer_commitment = prover.lookup_witness(node_id)?;
 
         let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
@@ -376,7 +371,7 @@ where
         let max_mle = layer_polys[0].as_ref();
         let logup_input = ctx.build_lookup_input(
             max_mle.get_base_field_vec(),
-            &input,
+            input.to_fields(),
             &prover.challenge_storage,
             unpadded_dim_size,
         )?;
@@ -422,7 +417,7 @@ where
             .collect::<Vec<E::BaseField>>();
         // `base_lt_evals` is the MLE evals on the boolean hypercube for one row, now we need to repeat this number of rows times
         let lt_mle = vec![base_lt_evals; 1 << num_row_vars].concat().into_mle();
-        let input_mle = input.to_mle_2d()?;
+        let input_mle = input.to_fields().into_mle_2d()?;
 
         let padded_max_evals = max_mle
             .get_base_field_vec()
@@ -432,10 +427,13 @@ where
             .into_mle();
         // build one-hot encoded output matrix
         let mut one_hot_output = vec![E::BaseField::ZERO; input_shape.product()];
-        output.iter().enumerate().for_each(|(i, out)| {
+
+        for (i, out) in outputs[0].iter().cloned().enumerate() {
+            let out = out as usize;
             let index = i * input_shape.dim(input_shape.rank() - 1) + out;
             one_hot_output[index] = E::BaseField::ONE;
-        });
+        }
+
         let one_hot_mle = one_hot_output.into_mle();
         // compute the beta evaluations over `input_claim.point`
         let input_eq_mle = compute_betas_eval(&input_claim.point).into_mle();
@@ -805,7 +803,7 @@ impl LogitsCtx {
     fn build_lookup_input<E: ExtensionField>(
         &self,
         max_evals: &[E::BaseField],
-        input: &Tensor<E>,
+        input: Tensor<E>,
         challenge_storage: &ChallengeStorage<E>,
         unpadded_dim_size: usize,
     ) -> anyhow::Result<LogUpInput<E>> {

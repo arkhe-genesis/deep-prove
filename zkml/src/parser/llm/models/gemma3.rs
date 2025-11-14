@@ -579,7 +579,7 @@ pub mod tests {
             .pad_next_power_of_two();
             let mut store = GenStore::default();
             let trace = model.run::<GoldilocksExt2>(vec![input], &mut store)?;
-            let logits = trace.get_step(argmax_layer_id).unwrap().node_inputs[0].tensor()?;
+            let logits = trace.get_step(&argmax_layer_id).unwrap().node_inputs[0].tensor()?;
             let computed_new_token = argmax(logits.get_data());
             let expected_new_token = argmax(&logit.logits);
             // CURRENTLY NOT WORKING BECAUSE GEMMA3 CONSTRUCTION IS INCORRECT

@@ -18,7 +18,7 @@ use crate::{
         },
     },
     lookup::logup_gkr::structs::{LogUpBatchVerifierClaim, LogUpInput},
-    model::InferenceTrace,
+    model::Trace,
     quantization::{self, Fieldizer},
     to_base,
 };
@@ -935,7 +935,7 @@ where
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
 {
-    trace: &'a InferenceTrace<'a, E, Element>,
+    trace: &'a Trace<'a, E, Element, Element>,
     ctx: &'b ProverContext<E, PCS>,
 }
 
@@ -968,7 +968,7 @@ where
 
         let step = ctx
             .trace
-            .get_step(*node_id)
+            .get_step(node_id)
             .with_context(|| format!("fetching trace for {node_id}"))?;
 
         Ok(step
@@ -1002,7 +1002,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWi
 }
 
 pub fn generate_lookup_witnesses<'a, 'b, E, T: Transcript<E>, PCS>(
-    trace: &'b InferenceTrace<'a, E, Element>,
+    trace: &'b Trace<'a, E, Element, Element>,
     ctx: &ProverContext<E, PCS>,
     transcript: &mut T,
 ) -> Result<LookupWitness<E, PCS>, LogUpError>

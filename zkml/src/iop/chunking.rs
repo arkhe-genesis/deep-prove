@@ -18,7 +18,7 @@ use crate::{
     commit::mmcs_context::CommitmentProverCtx,
     graph::{Direction, Edge, EdgeId, Graph, Node, NodeId, NodeInput, NodeOutput, PortId},
     layers::LayerCtx,
-    model::{InferenceTrace, ModelCtx},
+    model::{ModelCtx, Trace},
     to_base,
 };
 
@@ -319,7 +319,7 @@ impl ModelChunk {
         &self,
         mut edges: impl Iterator<Item = &'b EdgeId>,
         commitment_ctx: &CommitmentProverCtx<E, PCS>,
-        chunk_trace: &'d InferenceTrace<'d, E, Element>,
+        chunk_trace: &'d Trace<'d, E, Element, Element>,
         group_type: GroupType,
     ) -> anyhow::Result<PCS::CommitmentWithWitness>
     where
@@ -333,7 +333,7 @@ impl ModelChunk {
                 GroupType::Incoming => edge.target(),
                 GroupType::Outgoing => edge.source(),
             };
-            let step_data = &chunk_trace.get_step(node_id).ok_or(anyhow!(
+            let step_data = &chunk_trace.get_step(&node_id).ok_or(anyhow!(
                 "Node {node_id} not found in trace for chunk {chunk_id}"
             ))?;
             edge.ports().iter().try_for_each(|port| {
@@ -365,7 +365,7 @@ impl ModelChunk {
     pub(crate) fn commitments<'d, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         commitment_ctx: &CommitmentProverCtx<E, PCS>,
-        full_trace: &'d InferenceTrace<'d, E, Element>,
+        full_trace: &'d Trace<'d, E, Element, Element>,
         group_type: GroupType,
     ) -> anyhow::Result<BTreeMap<ChunkID, PCS::CommitmentWithWitness>>
     where
@@ -490,8 +490,8 @@ impl ModelChunk {
     // derive the trace for chunk `self` from `full_trace`
     pub(crate) fn chunk_trace<'d, E: ExtensionField>(
         &self,
-        full_trace: &'d InferenceTrace<'d, E, Element>,
-    ) -> anyhow::Result<InferenceTrace<'d, E, Element>> {
+        full_trace: &'d Trace<'d, E, Element, Element>,
+    ) -> anyhow::Result<Trace<'d, E, Element, Element>> {
         let steps = self
             .subgraph
             .inner_nodes()
@@ -506,7 +506,7 @@ impl ModelChunk {
                 ))
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
-        Ok(InferenceTrace {
+        Ok(Trace {
             steps,
             input: vec![],  // they are unused in a chunk prover
             output: vec![], // they are unused in a chunk prover

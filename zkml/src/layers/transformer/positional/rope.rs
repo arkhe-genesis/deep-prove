@@ -139,21 +139,20 @@ impl<N: TensorTypeParam> Rope<N> {
         claim.point.remove(0);
     }
 
-    pub(super) fn prove_step<
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    >(
+    pub(super) fn prove_step<E, T, PCS>(
         &self,
         node_id: NodeId,
         output_claim: &Claim<E>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
         N: Fieldizer<E>,
+        E: ExtensionField,
+        T: Transcript<E>,
+        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     {
         let input = &step_data.node_inputs[0];
         let input = input.tensor()?;
@@ -188,7 +187,7 @@ impl<N: TensorTypeParam> Rope<N> {
         // the relationship `output = eq_poly * input * sub_cos_matrix + permuted_eq_poly * input * sub_sin_matrix`
 
         // compute MLEs of the tensors involved in the sum-check
-        let input_mle = input.clone().into_mle();
+        let input_mle = input.deref().to_field_mle();
         let sub_cos_mle = sub_cos_matrix.into_mle();
         let sub_sin_mle = sub_sin_matrix.into_mle();
         let num_vars = input_mle.num_vars();

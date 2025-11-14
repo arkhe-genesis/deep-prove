@@ -451,7 +451,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        _step_data: &Step<E, Element, E>,
+        _step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let claim = self.prove_step(prover, last_claims[0], ctx, id)?;

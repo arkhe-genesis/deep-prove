@@ -14,7 +14,6 @@ use crate::{
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
     model::Step,
-    quantization::TensorFielder,
     tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
 use anyhow::ensure;
@@ -205,7 +204,7 @@ impl Absolute<Element> {
         &self,
         node_id: NodeId,
         output_claim: &Claim<E>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
@@ -219,7 +218,7 @@ impl Absolute<Element> {
         let input = input.tensor()?;
         let sub_pos = matrix_slice
             .slice_over_first_dim(0, input.shape()[0])
-            .to_fields();
+            .to_tensor()?;
 
         let (mut claims, add_proof) = self.add_layer.prove_step(
             node_id,

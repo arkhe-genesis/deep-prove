@@ -21,7 +21,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{mle::IntoMLE, util::ceil_log2};
+use multilinear_extensions::util::ceil_log2;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{cmp::Ordering, collections::HashMap};
 use transcript::Transcript;
@@ -76,7 +76,7 @@ impl<N: TensorTypeParam> Add<N> {
 }
 
 impl Add<Element> {
-    pub(crate) fn prove_step<A: AsRef<Tensor<E>>, E: ExtensionField, T: Transcript<E>, PCS>(
+    pub(crate) fn prove_step<A, E, T, PCS>(
         &self,
         node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
@@ -87,6 +87,9 @@ impl Add<Element> {
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
+        A: AsRef<Tensor<Element>>,
+        E: ExtensionField,
+        T: Transcript<E>,
     {
         ensure!(last_claims.len() == 1, "Add layer expects 1 claim");
         let last_claim = last_claims[0];
@@ -100,11 +103,7 @@ impl Add<Element> {
         // that x1(r) * M1 / 2^shift1 + x2(r) * M2 / 2^shift2 = y, so the prover outputs only x1(r) and x2(r)
         // and the verifier will "scale" the claims accordingly to check the equation.
         let left_input = inputs[0].as_ref();
-        let left_eval = left_input
-            .get_data()
-            .to_vec()
-            .into_mle()
-            .evaluate(&last_claim.point);
+        let left_eval = left_input.to_field_mle().evaluate(&last_claim.point);
         let mut output_claims = vec![Claim::new(last_claim.point.clone(), left_eval)];
         let right_eval = match &self.operand {
             Some((operand, _)) => {
@@ -127,9 +126,7 @@ impl Add<Element> {
             None => {
                 let right_eval = inputs[1]
                     .as_ref()
-                    .get_data()
-                    .to_vec()
-                    .into_mle()
+                    .to_field_mle()
                     .evaluate(&last_claim.point);
                 // this claims gets passed to the previous layer alongside the left one.
                 output_claims.push(Claim::new(last_claim.point.clone(), right_eval));
@@ -518,9 +515,8 @@ impl PadOp for Add<Element> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Add<Element>
 where
-    E: ExtensionField,
+    E: ExtensionField + Serialize + DeserializeOwned,
     E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -532,7 +528,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where

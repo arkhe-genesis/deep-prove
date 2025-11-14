@@ -5,12 +5,12 @@ use crate::{
     quantization::{Fieldizer, ModelMetadata},
     tensor::TensorHandle,
 };
-use anyhow::Context;
 use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::HashMap, sync::MappedRwLockReadGuard};
 use tenstore::StoreError;
 
+/// The trace produce by running the model during inference
 #[derive(Default, Clone)]
 pub struct Trace<'a, E: ExtensionField, N, D> {
     pub(crate) steps: HashMap<NodeId, Step<'a, E, N, D>>,
@@ -27,18 +27,14 @@ impl<'a, E: ExtensionField, N, D> Trace<'a, E, N, D> {
         }
     }
 }
-// The trace produce by running the model during inference
-pub type InferenceTrace<'a, E, N> = Trace<'a, E, N, N>;
-// The trace used to prove the model
-pub type ProvingTrace<'a, E, N> = Trace<'a, E, N, E>;
 
 impl<'a, E: ExtensionField, N, D> Trace<'a, E, N, D>
 where
     D: Clone + Serialize + for<'b> Deserialize<'b>,
 {
     /// Get the trace data for node `node_id`, if any
-    pub(crate) fn get_step(&self, node_id: NodeId) -> Option<&Step<'a, E, N, D>> {
-        self.steps.get(&node_id)
+    pub(crate) fn get_step(&self, node_id: &NodeId) -> Option<&Step<'a, E, N, D>> {
+        self.steps.get(node_id)
     }
 
     /// Insert the trace data `step` about node `node_id` in the trace
@@ -67,108 +63,18 @@ where
         Ok(IO::new(inputs, outputs))
     }
 
-    /// Convert an inference trace computed over integers to a trace over field elements, which is
-    /// needed to prove the inference
-    pub(crate) fn into_fields(self) -> anyhow::Result<ProvingTrace<'a, E, N>>
-    where
-        D: Fieldizer<E> + Serialize + for<'b> Deserialize<'b> + Debug,
-    {
-        let input = self
-            .input
-            .into_iter()
-            .map(|handle| handle.cast(|x: &D| x.to_field()))
-            .collect::<Result<Vec<TensorHandle<E>>, StoreError>>()
-            .context("converting input")?;
-        let output = self
-            .output
-            .into_iter()
-            .map(|handle| handle.cast(|x: &D| x.to_field()))
-            .collect::<Result<Vec<TensorHandle<E>>, StoreError>>()
-            .context("converting output")?;
-        let field_steps = self
-            .steps
-            .into_iter()
-            .map(|(id, step)| {
-                let node_inputs = step
-                    .node_inputs
-                    .into_iter()
-                    .map(|handle| {
-                        handle
-                            .cast(|x| x.to_field())
-                            .with_context(|| format!("converting `{:?}`", handle.storage_key()))
-                    })
-                    .collect::<anyhow::Result<Vec<TensorHandle<_>>>>()?;
-                let node_outputs = step
-                    .node_outputs
-                    .into_fields()
-                    .context("converting node_outputs")?;
-                Ok((
-                    id,
-                    Step {
-                        op: step.op,
-                        node_inputs,
-                        node_outputs,
-                        unpadded_output_shapes: step.unpadded_output_shapes,
-                        unpadded_input_shapes: step.unpadded_input_shapes,
-                    },
-                ))
-            })
-            .collect::<anyhow::Result<HashMap<_, _>>>()
-            .context("converting steps")?;
-
-        Ok(Trace {
-            steps: field_steps,
-            input,
-            output,
-        })
-    }
-
     /// Get the output tensors of the inference represented by this trace
-    pub fn outputs(&self) -> anyhow::Result<Vec<Tensor<D>>> {
-        self.output
-            .iter()
-            .map(|handle| handle.tensor().map(|v| (*v).clone()))
-            .collect()
+    pub fn outputs(&self) -> &[TensorHandle<D>] {
+        &self.output
     }
 
     /// Get the inputs tensors of the inference represented by this trace
-    pub fn inputs(&self) -> anyhow::Result<Vec<Tensor<D>>> {
-        self.input
-            .iter()
-            .map(|handle| handle.tensor().map(|v| (*v).clone()))
-            .collect()
-    }
-
-    /// Get the (hydrated) ith input tensor of the inference represented by
-    /// this trace
-    pub fn input_at(&self, i: usize) -> anyhow::Result<Tensor<D>> {
-        self.input
-            .get(i)
-            .context("invalid index")
-            .and_then(|handle| {
-                handle
-                    .tensor()
-                    .map(|v| (*v).clone())
-                    .context("failed to fetch from store")
-            })
-    }
-
-    /// Get the (hydrated) ith output tensor of the inference represented by
-    /// this trace
-    pub fn output_at(&self, i: usize) -> anyhow::Result<Tensor<D>> {
-        self.output
-            .get(i)
-            .context("invalid index")
-            .and_then(|handle| {
-                handle
-                    .tensor()
-                    .map(|v| (*v).clone())
-                    .context("failed to fetch from store")
-            })
+    pub fn inputs(&self) -> &[TensorHandle<D>] {
+        &self.input
     }
 }
 
-impl<'a, E: ExtensionField> InferenceTrace<'a, E, Element> {
+impl<'a, E: ExtensionField> Trace<'a, E, Element, Element> {
     /// Given as input a trace over quantized values, compute the equivalent
     /// trace with dequantized values
     pub fn dequantized(
@@ -245,10 +151,11 @@ where
     }
 
     /// Hydrate one of the input tensors of the node corresponding to this step.
-    pub(crate) fn input_tensor_at(&self, i: usize) -> anyhow::Result<Tensor<D>> {
-        self.node_inputs[i]
-            .tensor()
-            .map(|read_guard| (*read_guard).clone())
+    pub(crate) fn input_tensor_at(
+        &self,
+        i: usize,
+    ) -> anyhow::Result<MappedRwLockReadGuard<'_, Tensor<D>>> {
+        self.node_inputs[i].tensor()
     }
 
     /// Hydrate all the output tensors of the node corresponding to this step.
@@ -261,10 +168,11 @@ where
     }
 
     /// Hydrate one of the output tensors of the node corresponding to this step.
-    pub(crate) fn output_tensor_at(&self, i: usize) -> anyhow::Result<Tensor<D>> {
-        self.node_outputs.outputs[i]
-            .tensor()
-            .map(|read_guard| (*read_guard).clone())
+    pub(crate) fn output_tensor_at(
+        &self,
+        i: usize,
+    ) -> anyhow::Result<MappedRwLockReadGuard<'_, Tensor<D>>> {
+        self.node_outputs.outputs[i].tensor()
     }
 }
 

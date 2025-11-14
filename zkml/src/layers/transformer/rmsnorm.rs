@@ -52,7 +52,7 @@ use multilinear_extensions::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Deref};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -726,7 +726,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -736,7 +736,7 @@ where
             "RMSNorm step should only have one input, received {}",
             input_tensors.len()
         );
-        let input_mle: MultilinearExtension<E> = input_tensors[0].get_data().to_vec().into_mle();
+        let input_mle = input_tensors[0].to_field_mle();
 
         let (claims, proof) = self.prove_step(node_id, last_claims, ctx, input_mle, prover)?;
         // Add the proof to the proof list
@@ -761,7 +761,7 @@ where
             "Found more than 1 output in inference step of RMSNorm layer"
         );
         let input_tensor = step_data.input_tensor_at(0)?;
-        self.lookup_witness(id, ctx, input_tensor)
+        self.lookup_witness(id, ctx, input_tensor.deref())
     }
 }
 
@@ -929,7 +929,7 @@ impl RMSNorm<Element> {
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        input_tensor: Tensor<Element>,
+        input_tensor: &Tensor<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>>
     where
         E: ExtensionField,
@@ -950,7 +950,7 @@ impl RMSNorm<Element> {
             "Could not prove RMSNorm because it had no quantisation data"
         ))?;
         let (range_check, lookup_input): (Vec<Element>, Vec<Element>) = input_tensor
-            .get_data_into()
+            .get_data()
             .chunks(self.normalisation_dim_size().next_power_of_two())
             .map(|chunk| {
                 let sum_squares = chunk.iter().map(|x| *x * *x).sum::<Element>();

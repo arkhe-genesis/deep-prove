@@ -19,7 +19,6 @@ use std::{
     ops::Deref,
 };
 use tenstore::{GenStore, GenericStore, StorageKey};
-use trace::Trace;
 use tracing::info;
 
 mod context;
@@ -27,7 +26,7 @@ pub mod llm;
 pub(crate) mod trace;
 pub mod transform;
 pub use context::{ContextGraph, ModelCtx};
-pub use trace::{InferenceTrace, Step};
+pub use trace::{Step, Trace};
 
 pub trait ToStorageKey<N> {
     /// Return the key under which the data of the object referred to by the
@@ -489,8 +488,9 @@ impl Model<f32> {
         &self,
         input: Vec<Tensor<f32>>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Vec<Tensor<f32>>> {
-        self.run::<GoldilocksExt2>(input, store)?.outputs()
+    ) -> Result<Vec<TensorHandle<f32>>> {
+        self.run::<GoldilocksExt2>(input, store)
+            .map(|handle| handle.outputs().to_vec())
     }
 }
 
@@ -500,7 +500,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         inputs: Vec<Tensor<N>>,
         mut tracker: Option<&mut InferenceTracker>,
         store: &mut GenStore,
-    ) -> anyhow::Result<InferenceTrace<'_, E, N>>
+    ) -> anyhow::Result<Trace<'_, E, N, N>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -596,7 +596,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         }) {
             let output_idx = self.graph[output_node_id].as_output().unwrap();
             let node_outputs = trace
-                .get_step(in_feed.source.node_id)
+                .get_step(&in_feed.source.node_id)
                 .ok_or(anyhow!("{in_feed:?} not found in trace"))?
                 .outputs();
             ensure!(
@@ -634,7 +634,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         &self,
         inputs: Vec<Tensor<N>>,
         store: &mut GenStore,
-    ) -> anyhow::Result<InferenceTrace<'_, E, N>>
+    ) -> anyhow::Result<Trace<'_, E, N, N>>
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -757,6 +757,8 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
 #[cfg(test)]
 pub(crate) mod test {
+    use std::ops::Deref;
+
     use super::Model;
     use crate::{
         Element, Prover, ScalingFactor, ScalingStrategy, Shape, default_transcript,
@@ -773,9 +775,9 @@ pub(crate) mod test {
             requant::Requant,
         },
         padding::{PaddingMode, pad_model},
-        quantization::{self, InferenceObserver},
+        quantization::{self, Fieldizer, InferenceObserver},
         rng_from_env_or_random,
-        tensor::{KeyedTensor, Tensor, TensorTypeParam},
+        tensor::{KeyedTensor, Tensor, TensorHandle, TensorTypeParam},
         testing::{Pcs, random_bool_vector, random_vector},
         util::from_mle_list_dimensions,
         verify,
@@ -1037,21 +1039,23 @@ pub(crate) mod test {
 
         assert_eq!(
             trace
-                .get_step(first_id)
+                .get_step(&first_id)
                 .unwrap()
                 .output_tensor_at(0)
-                .unwrap(),
-            output1.into_native()
+                .unwrap()
+                .deref(),
+            &output1.into_native(),
         );
 
         // Verify second step
         assert_eq!(
             trace
-                .get_step(second_id)
+                .get_step(&second_id)
                 .unwrap()
                 .output_tensor_at(0)
-                .unwrap(),
-            final_output.clone().into_native()
+                .unwrap()
+                .deref(),
+            &final_output.clone().into_native(),
         );
         let (nrow, _) = (dense2.nrows().unwrap(), dense2.ncols());
         assert_eq!(final_output.get_data().len(), nrow);
@@ -1061,11 +1065,7 @@ pub(crate) mod test {
     fn test_model_sequential() {
         let (model, input) = Model::random(1).unwrap();
         model.describe();
-        let trace = model
-            .run::<F>(input, &mut Default::default())
-            .unwrap()
-            .into_fields()
-            .unwrap();
+        let trace = model.run::<F>(input, &mut Default::default()).unwrap();
         let dense_layers = model
             .to_unstable_iterator()
             .filter_map(|(n_id, n)| n.as_inner().map(|l| (n_id, l)))
@@ -1081,13 +1081,11 @@ pub(crate) mod test {
         assert_eq!(dense_layers.len(), 1);
         let point1 = random_bool_vector(dense_layers[0].1.nrows().unwrap().ilog2() as usize);
         let computed_eval1 = trace
-            .get_step(dense_layers[0].0)
+            .get_step(&dense_layers[0].0)
             .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
             .output_tensor_at(0)
             .unwrap()
-            .get_data()
-            .to_vec()
-            .into_mle()
+            .to_field_mle()
             .evaluate(&point1);
         let flatten_mat1 = matrices_mle[0].1.fix_high_variables(&point1);
         let bias_eval = dense_layers[0]
@@ -1095,15 +1093,23 @@ pub(crate) mod test {
             .bias
             .as_ref()
             .unwrap() // safe because we know there is a bias
-            .to_field::<F>()
-            .into_mle()
+            .to_field_mle()
             .evaluate(&point1);
         let computed_eval1_no_bias = computed_eval1 - bias_eval;
-        let input_vector = trace.input_at(0).unwrap();
         // since y = SUM M(j,i) x(i) + B(j)
         // then
         // y(r) - B(r) = SUM_i m(r,i) x(i)
-        let input_mle = input_vector.get_data().to_vec().into_mle();
+        let input_mle = trace
+            .inputs()
+            .first()
+            .unwrap()
+            .tensor()
+            .unwrap()
+            .get_data()
+            .iter()
+            .map(Fieldizer::<F>::to_field)
+            .collect::<Vec<_>>()
+            .into_mle();
 
         let num_vars = flatten_mat1.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
@@ -1373,7 +1379,7 @@ pub(crate) mod test {
         model: Model<Element>,
         inputs: Vec<Tensor<Element>>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Vec<Tensor<Element>>> {
+    ) -> anyhow::Result<Vec<TensorHandle<Element>>> {
         let model = pad_model(model)?;
 
         model.describe();
@@ -1392,14 +1398,14 @@ pub(crate) mod test {
         let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
             BasicTranscript::new(b"model");
         verify(&verifier_ctx, proof, io, &mut verifier_transcript)?;
-        outputs
+        Ok(outputs.to_vec())
     }
 
     pub(crate) fn prove_model_with(
         model: Model<f32>,
         float_inputs: Vec<Tensor<f32>>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Vec<Tensor<Element>>> {
+    ) -> anyhow::Result<Vec<TensorHandle<Element>>> {
         let (quantized_model, quantized_inputs) = quantize_model(model, float_inputs, None, store)?;
         prove_quantized_model(quantized_model, quantized_inputs, store)
     }
@@ -1407,7 +1413,7 @@ pub(crate) mod test {
     pub(crate) fn prove_model(
         model: Model<f32>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Vec<Tensor<Element>>> {
+    ) -> anyhow::Result<Vec<TensorHandle<Element>>> {
         let float_inputs = model
             .input_shapes()
             .into_iter()

@@ -145,7 +145,7 @@ impl InputMatrixDimensions {
     /// employed in proving
     fn input_mle_for_proving<'a, E: ExtensionField>(
         &self,
-        input: &'a Tensor<E>,
+        input: &'a Tensor<Element>,
         partial_point: &[E],
     ) -> Result<MultilinearExtension<'a, E>> {
         // determine if we need to permute the matrix for sum-check
@@ -157,12 +157,12 @@ impl InputMatrixDimensions {
                 self.mat_mul_dimension,
                 self.output_dimension,
             ];
-            let mut mle = input.permute3d(&permute)?.into_mle();
+            let mut mle = input.permute3d(&permute)?.to_field_mle();
             mle.fix_variables_in_place_parallel(partial_point);
             Ok(mle)
         } else {
             // no permutation needed, just compute the MLE
-            let mut mle = input.to_mle();
+            let mut mle = input.to_field_mle();
             if self.output_dimension == 0 {
                 // We need to fix the variables related to the first dimension, which are
                 // the most significant ones
@@ -473,21 +473,20 @@ impl ConcatMatMul {
         }
     }
 
-    pub(crate) fn prove_step<
-        R: AsRef<Tensor<E>>,
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-        T: Transcript<E>,
-    >(
+    pub(crate) fn prove_step<R, E, PCS, T>(
         &self,
         last_claims: Vec<&Claim<E>>,
-        output: &Tensor<E>,
+        output: R,
         inputs: &[R],
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<(Vec<crate::Claim<E>>, ConcatMatMulProof<E>)>
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
+        R: AsRef<Tensor<Element>>,
+        E: ExtensionField,
+        PCS: PolynomialCommitmentScheme<E>,
+        T: Transcript<E>,
     {
         let input_shapes = inputs
             .iter()
@@ -497,7 +496,7 @@ impl ConcatMatMul {
 
         let (point_for_concat, point_for_row, point_for_col) = self
             .permutations
-            .split_output_claim_point(output.shape().clone(), &last_claims[0].point)?;
+            .split_output_claim_point(output.as_ref().shape().clone(), &last_claims[0].point)?;
 
         // determine if we need to permute the left matrix for sum-check
         let left = self
@@ -720,8 +719,9 @@ impl PadOp for ConcatMatMul {
     }
 }
 
-impl<E: ExtensionField + DeserializeOwned, PCS> ProvableOp<E, PCS> for ConcatMatMul
+impl<E, PCS> ProvableOp<E, PCS> for ConcatMatMul
 where
+    E: ExtensionField + DeserializeOwned,
     E::BaseField: DeserializeOwned + Serialize,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
@@ -734,7 +734,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, E>,
+        step_data: &Step<E, Element, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<crate::Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -754,7 +754,12 @@ where
 
         let output = &output_tensors[0];
 
-        let (claims, proof) = self.prove_step(last_claims, output, &input_tensors, prover)?;
+        let (claims, proof) = self.prove_step(
+            last_claims,
+            output,
+            &input_tensors.iter().collect::<Vec<_>>(),
+            prover,
+        )?;
 
         prover.push_proof(node_id, LayerProof::ConcatMatMul(proof));
 
