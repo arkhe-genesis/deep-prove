@@ -110,4 +110,4 @@ jobs:
           --err \
           --adapter rust_criterion \
           --github-actions '${{ secrets.GITHUB_TOKEN }}' \
-          "cargo bench --bench prove-model --features cuda"
+          "cargo bench --bench prove-model --features cuda -- inference"
