@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use deep_prove::{
     middleware::{
         v1::{self, DeepProveRequest as DeepProveRequestV1},
@@ -32,15 +32,16 @@ async fn run_model_v1<S: Store>(
     info!("Proving inference");
     let DeepProveRequestV1 {
         model,
+        model_file_hash,
         input,
         scaling_strategy,
         scaling_input_hash,
     } = model;
 
-    let model_file_hash = {
+    let model_file_hash = model_file_hash.unwrap_or_else(|| {
         let hash = <sha2::Sha256 as sha2::Digest>::digest(&model);
         format!("{hash:X}")
-    };
+    });
 
     let params_key = store::ParamsKey {
         model_file_hash: model_file_hash.clone(),
@@ -63,10 +64,12 @@ async fn run_model_v1<S: Store>(
     } = store
         .clone()
         .get_or_init_model_with(&model_key, async move || {
-            let (model, model_metadata) = tokio::task::spawn_blocking(move || parse_model(&model))
-                .await
-                .context("running parsing model task")?
-                .context("parsing model")?;
+            let model_bytes = model.clone();
+            let (model, model_metadata) =
+                tokio::task::spawn_blocking(move || parse_model(model_bytes.as_ref()))
+                    .await
+                    .context("running parsing model task")?
+                    .context("parsing model")?;
             Ok(store::ScaledModel {
                 model,
                 model_metadata,
@@ -217,23 +220,25 @@ struct Args {
 
 #[derive(clap::Args)]
 struct S3Args {
-    #[arg(long, env, default_value = "us-east-2", requires = "s3_store")]
-    s3_region: Option<String>,
-    #[arg(long, env, requires = "s3_store")]
-    s3_bucket: Option<String>,
-    #[arg(long, env, requires = "s3_store")]
-    s3_endpoint: Option<String>,
-    #[arg(long, env, default_value = "1000", requires = "s3_store")]
-    s3_timeout_secs: Option<u64>,
-    #[arg(env, requires = "s3_store")]
-    s3_access_key_id: Option<String>,
-    #[arg(env, requires = "s3_store")]
-    s3_secret_access_key: Option<String>,
+    #[arg(long, env, default_value = "ap-northeast-2")]
+    s3_region: String,
+    #[arg(long, env, default_value = "dp-proofs")]
+    s3_params_bucket: Option<String>,
+    #[arg(long, env, default_value = "dp-models")]
+    s3_models_bucket: String,
+    #[arg(long, env, default_value = "http://localhost:9000")]
+    s3_endpoint: String,
+    #[arg(long, env, default_value = "1000")]
+    s3_timeout_secs: u64,
+    #[arg(env, default_value = "ma-clef-idiote")]
+    s3_access_key_id: String,
+    #[arg(env, default_value = "mon-suppose-secret")]
+    s3_secret_access_key: String,
     /// Enable local file-system cache for S3 data
-    #[arg(long, env, requires = "s3_store")]
+    #[arg(long, env, default_value_t = false)]
     fs_cache: bool,
     /// Set the path of the S3 store local cache.
-    #[arg(long, env, requires = "s3_store", default_value = "/var/cache")]
+    #[arg(long, env, default_value = "/var/cache")]
     fs_cache_dir: PathBuf,
 }
 
@@ -241,15 +246,13 @@ struct S3Args {
 #[derive(Subcommand)]
 enum RunMode {
     /// Connect to a LPN gateway to receive inference tasks.
-    #[command(
-        group(ArgGroup::new("s3_store")
-        .multiple(true)
-        .args(&["s3_region", "s3_bucket", "s3_endpoint", "s3_access_key_id", "s3_secret_access_key"])
-        .requires_all(&["s3_region", "s3_bucket", "s3_endpoint", "s3_access_key_id", "s3_secret_access_key"])
-    ))]
     Http {
         #[arg(long, env, default_value = "http://localhost:4000")]
         gw_url: Url,
+
+        /// Directory to cache downloaded models.
+        #[arg(long, env, default_value = "worker_cache/")]
+        model_cache_dir: PathBuf,
 
         /// This worker unique name. If not set, a UID will be tentatively built
         /// from the machine ID.

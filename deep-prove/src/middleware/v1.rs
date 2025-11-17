@@ -15,6 +15,10 @@ pub struct DeepProveRequest {
     /// The model
     pub model: Vec<u8>,
 
+    /// Optional precomputed hash of the model file.
+    #[serde(default)]
+    pub model_file_hash: Option<String>,
+
     /// An array of inputs to run proving for
     pub input: Input,
 

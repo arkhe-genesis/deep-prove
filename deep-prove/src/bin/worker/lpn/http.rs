@@ -1,12 +1,14 @@
-use super::instantiate_store;
+use super::{ModelFetcher, WorkerResources, instantiate_store};
 use crate::{RunMode, StoreKind};
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::{Engine, prelude::BASE64_STANDARD};
-use deep_prove::middleware::v2;
+use deep_prove::middleware::{v1, v2};
 use exponential_backoff::Backoff;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use url::Url;
+use zkml::quantization::ScalingStrategyKind;
 
 const ATTEMPTS: u32 = 5;
 const MIN_WAIT_MS: u64 = 1000;
@@ -160,14 +162,27 @@ impl ConnContext {
     }
 }
 
-async fn process_job(job: v2::GwToWorker, store: &mut StoreKind) -> anyhow::Result<Vec<u8>> {
+async fn process_job(
+    job: v2::GwToWorker,
+    store: &mut StoreKind,
+    fetcher: &ModelFetcher,
+) -> anyhow::Result<Vec<u8>> {
+    let model_mmap = fetcher
+        .fetch(&job.model_path)
+        .await
+        .context("downloading model artifact")?;
+    let model_file_hash = format!("{:X}", Sha256::digest(model_mmap.as_ref()));
+    let request = v1::DeepProveRequest {
+        model: model_mmap.as_ref().to_vec(),
+        model_file_hash: Some(model_file_hash),
+        input: job.input,
+        scaling_strategy: ScalingStrategyKind::AbsoluteMax,
+        scaling_input_hash: None,
+    };
+
     let result = match store {
-        StoreKind::S3(store) => {
-            crate::run_model_v1(job.try_into().context("parsing job")?, store.clone()).await
-        }
-        StoreKind::Mem(store) => {
-            crate::run_model_v1(job.try_into().context("parsing job")?, store.clone()).await
-        }
+        StoreKind::S3(store) => crate::run_model_v1(request, store.clone()).await,
+        StoreKind::Mem(store) => crate::run_model_v1(request, store.clone()).await,
     };
 
     match result {
@@ -185,6 +200,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
         address,
         json,
         worker_name,
+        model_cache_dir,
         s3_args,
     } = args
     else {
@@ -204,7 +220,11 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     info!("operator address: {address}");
     info!("worker unique name: {worker_name}");
 
-    let mut store = instantiate_store(s3_args).context("instantiating PPs store")?;
+    let WorkerResources {
+        mut store,
+        model_fetcher,
+    } = instantiate_store(&s3_args, model_cache_dir.clone())
+        .context("initializing worker resources")?;
     let conn = ConnContext::new(gw_url, worker_name, address);
 
     loop {
@@ -220,7 +240,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
             Err(err) => error!("failed to ACK job: {err:?}"),
         }
         // 3. Process job & submit proof
-        match process_job(job, &mut store).await {
+        match process_job(job, &mut store, &model_fetcher).await {
             Ok(proof) => {
                 conn.submit_proof(job_id, &proof)
                     .context("submitting proofs to gateway")?;

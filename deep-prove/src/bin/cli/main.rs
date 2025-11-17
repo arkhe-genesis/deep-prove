@@ -22,7 +22,7 @@ enum Executor {
     /// Interact with a LPN gateway with the HTTP.
     LpnHttp {
         /// The URL of the LPN gateway.
-        #[arg(short, long, env)]
+        #[arg(short, long, env, default_value = "http://localhost:4000")]
         gw_url: Url,
 
         /// The client ETH private key.

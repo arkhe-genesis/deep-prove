@@ -1,5 +1,3 @@
-use anyhow::Context;
-use base64::{Engine, prelude::BASE64_STANDARD};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
@@ -54,24 +52,20 @@ pub struct GwToWorker {
     /// The job ID to use when communicating with the gateway.
     pub job_id: i64,
 
-    /// The base64-encoded model - tests on random binary data show that base64
-    /// encoding is 30% the size of classic array-of-bytes serde_json encoding.
-    pub model: String,
+    /// Object path relative to the bucket root pointing to the uploaded model.
+    pub model_path: String,
 
     /// An array of inputs to run proving for
     pub input: Input,
 }
-impl TryFrom<GwToWorker> for super::v1::DeepProveRequest {
-    type Error = anyhow::Error;
-
-    fn try_from(r: GwToWorker) -> anyhow::Result<Self> {
-        Ok(Self {
-            model: BASE64_STANDARD
-                .decode(r.model)
-                .context("failed to base64-decode the model")?,
-            input: r.input,
+impl GwToWorker {
+    pub fn into_request(self, model: Vec<u8>) -> super::v1::DeepProveRequest {
+        super::v1::DeepProveRequest {
+            model,
+            model_file_hash: None,
+            input: self.input,
             scaling_strategy: ScalingStrategyKind::AbsoluteMax,
             scaling_input_hash: None,
-        })
+        }
     }
 }

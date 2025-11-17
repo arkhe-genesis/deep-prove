@@ -31,6 +31,7 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
 
     let request = crate::DeepProveRequestV1 {
         model,
+        model_file_hash: None,
         input,
         scaling_strategy,
         scaling_input_hash,

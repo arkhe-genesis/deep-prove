@@ -21,7 +21,7 @@ use itertools::Itertools;
 use mpcs::{Point, PolynomialCommitmentScheme};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap};
-use tracing::trace;
+use tracing::{info, trace};
 use transcript::Transcript;
 
 /// What the verifier must have besides the proof
@@ -466,6 +466,7 @@ where
             "Final denominator was zero, lookup arguments are invalid"
         );
 
+        info!("Proof verified successfully");
         Ok(())
     }
 
