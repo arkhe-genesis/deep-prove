@@ -286,13 +286,21 @@ impl<E: ExtensionField> LayerCtx<E> {
 }
 
 #[derive(Clone)]
-pub(crate) struct NodeOut<T, E: ExtensionField> {
+pub(crate) struct NodeOut<T, E>
+where
+    E: ExtensionField,
+    T: TensorTypeParam,
+{
     _t: PhantomData<T>,
     pub(crate) outputs: Vec<TensorHandle<T>>,
     pub(crate) proving_data: ProvingData<E>,
 }
 
-impl<T, E: ExtensionField> NodeOut<T, E> {
+impl<T, E> NodeOut<T, E>
+where
+    E: ExtensionField,
+    T: TensorTypeParam,
+{
     pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingData<E>) -> Self {
         Self {
             _t: PhantomData,

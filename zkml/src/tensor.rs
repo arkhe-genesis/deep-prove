@@ -392,7 +392,10 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) -> Resul
 /// representation / implementation. This struct wraps the necessary metadata to
 /// load, store, and transform the tensors to different representation.
 #[derive(Clone, Debug)]
-pub struct TensorHandle<T> {
+pub struct TensorHandle<T>
+where
+    T: TensorTypeParam,
+{
     /// A unique key for this tensor.
     storage_key: StorageKey<Vec<T>>,
 
@@ -405,6 +408,13 @@ pub struct TensorHandle<T> {
     /// by reading from the corresponding store.
     tensor: Arc<RwLock<Option<Tensor<T>>>>,
 
+    /// Accelerated tensor data, if available.
+    ///
+    /// If the tensor data is not available, the handler will try to hydrate it
+    /// by reading from the corresponding tensor, which might need to be read
+    /// from the store.
+    wrapped_tensor: Arc<RwLock<Option<WrappedTensor<T>>>>,
+
     /// The shape of the tensor.
     shape: Shape,
     unpadded_shape: Shape,
@@ -412,7 +422,7 @@ pub struct TensorHandle<T> {
 
 impl<T> TensorHandle<T>
 where
-    T: Serialize + for<'a> Deserialize<'a>,
+    T: TensorTypeParam + Serialize + for<'a> Deserialize<'a>,
 {
     pub(crate) fn new(
         storage_key: StorageKey<Vec<T>>,
@@ -424,6 +434,7 @@ where
             storage_key,
             store,
             tensor: Arc::new(RwLock::new(None)),
+            wrapped_tensor: Arc::new(RwLock::new(None)),
             shape,
             unpadded_shape,
         }
@@ -442,6 +453,7 @@ where
             storage_key,
             store,
             tensor: Arc::new(RwLock::new(Some(tensor))),
+            wrapped_tensor: Arc::new(RwLock::new(None)),
             shape,
             unpadded_shape,
         }
@@ -473,7 +485,7 @@ where
         &self.unpadded_shape
     }
 
-    /// Returns a reference to the cached [`Tensor`] data.
+    /// Returns a reference to the cached [`Tensor`].
     ///
     /// NOTE: If the [`Tensor`] is not cached, this will load the data from
     /// the store.
@@ -511,6 +523,46 @@ where
         }
     }
 
+    /// Returns a reference to the cached [`WrappedTensor`].
+    ///
+    /// NOTE: If the [`WrappedTensor`] is not cached, it will be created, to create
+    /// the tensor the corresponding [`Tensor`] must be available, if it is not, the
+    /// data will be loaded from the store.
+    pub fn wrapped_tensor(&self) -> Result<MappedRwLockReadGuard<'_, WrappedTensor<T>>> {
+        loop {
+            // Acquire the read lock and check if the data is initialised. Return it if yes
+            {
+                let guard = self
+                    .wrapped_tensor
+                    .read()
+                    .expect("Lock should not be poisoned");
+                if guard.is_some() {
+                    return Ok(RwLockReadGuard::map(guard, |v| match v {
+                        Some(ref v) => v,
+                        None => unreachable!(
+                            "The option was checked above, this is in a read only region"
+                        ),
+                    }));
+                }
+            }
+
+            // Otherwise try to acquire the write lock and initialise the data.
+            {
+                let mut guard = self
+                    .wrapped_tensor
+                    .write()
+                    .expect("Lock should not be poisioned");
+
+                // Handle a race with another writer.
+                if guard.is_none() {
+                    let tensor = self.tensor()?;
+                    let wrapped_tensor = WrappedTensor::try_from(tensor.deref())?;
+                    *guard = Some(wrapped_tensor);
+                }
+            }
+        }
+    }
+
     /// Dries the current handle.
     ///
     /// Drying a handle frees the cached values to free memory.
@@ -525,7 +577,7 @@ where
     /// save it to the store.
     pub(crate) fn cast<S, F>(&self, f: F) -> Result<TensorHandle<S>, StoreError>
     where
-        S: Serialize + for<'a> Deserialize<'a>,
+        S: TensorTypeParam + Serialize + for<'a> Deserialize<'a>,
         F: Fn(&T) -> S,
     {
         let storage_key = self.store.cast(&self.storage_key, |xs| {
@@ -572,14 +624,16 @@ where
     pub(crate) fn from_wrapped_tensor_with_unpadded_shape(
         storage_key: StorageKey<Vec<T>>,
         store: GenStore,
-        tensor: WrappedTensor<T>,
+        mut wrapped_tensor: WrappedTensor<T>,
         unpadded_shape: Shape,
     ) -> Self {
+        wrapped_tensor.set_unpadded_shape(unpadded_shape.clone().into());
         Self {
             storage_key,
             store,
             tensor: Arc::new(RwLock::new(None)),
-            shape: Shape::from(tensor.shape()),
+            shape: Shape::from(wrapped_tensor.shape()),
+            wrapped_tensor: Arc::new(RwLock::new(Some(wrapped_tensor))),
             unpadded_shape,
         }
     }

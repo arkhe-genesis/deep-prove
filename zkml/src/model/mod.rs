@@ -8,7 +8,7 @@ use crate::{
     },
     padding::PaddingMode,
     quantization::InferenceTracker,
-    tensor::{Conversion, TensorHandle, TensorTypeParam, WrappedTensor},
+    tensor::{Conversion, TensorHandle, TensorTypeParam},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
@@ -19,7 +19,7 @@ use std::{
     ops::Deref,
 };
 use tenstore::{GenStore, GenericStore, StorageKey};
-use tracing::info;
+use tracing::{info, warn};
 
 mod context;
 pub mod llm;
@@ -47,6 +47,106 @@ impl<N: TensorTypeParam> Node<Layer<N>> {
             Node::Input(i) => format!("Input#{i}"),
             Node::Output(o) => format!("Output#{o}"),
         }
+    }
+}
+
+/// Container for the [TensorHandle]s used throughout a model run.
+///
+/// This will keep track of how many usages a tensor has left, and automatically
+/// dry them once no longer needed to free memory.
+struct HandleTracker<T>
+where
+    T: TensorTypeParam,
+{
+    storagekey_to_handle: HashMap<StorageKey<Vec<T>>, TensorHandle<T>>,
+    handle_usage_count: HashMap<StorageKey<Vec<T>>, usize>,
+}
+
+impl<T> HandleTracker<T>
+where
+    T: TensorTypeParam,
+{
+    /// Counts tensor usages from `graph` and initialise a [Handles<T>] from that.
+    fn count_from_graph(graph: &ModelGraph<T>) -> Self {
+        // Counts how often a given tensor is used as an input to a layer.
+        //
+        // After each layer evaluation that uses the given tensor, the counter
+        // is decrement. The tensor's cached data is freed once the data is no
+        // longer needed.
+        let mut handle_usage_count = HashMap::<StorageKey<Vec<T>>, _>::new();
+        for (_edge_id, edge) in graph.edges() {
+            let source = edge.source();
+
+            for link in edge.ports().iter() {
+                let storage_key = source.output_at(link.source_port).to_storage_key();
+                handle_usage_count
+                    .entry(storage_key)
+                    .and_modify(|curr| *curr += 1)
+                    .or_insert(1);
+            }
+        }
+
+        Self {
+            storagekey_to_handle: Default::default(),
+            handle_usage_count,
+        }
+    }
+
+    /// Updates the state after a layer run.
+    ///
+    /// This will update the usage counter for the layer's inputs, and cache a
+    /// copy of the tensor handler for later use.
+    fn after_layer<'a>(
+        &mut self,
+        inputs_storage_keys: impl IntoIterator<Item = &'a StorageKey<Vec<T>>>,
+        output_handles: impl IntoIterator<Item = &'a TensorHandle<T>>,
+    ) -> Result<()> {
+        for storage_key in inputs_storage_keys.into_iter() {
+            let uses = self
+                .handle_usage_count
+                .entry(storage_key.clone())
+                .and_modify(|curr| *curr -= 1)
+                .or_default();
+
+            if *uses == 0 {
+                warn!("Unused output tensor");
+                self.get_by_storage_key(storage_key)?.dry();
+            }
+        }
+
+        self.storagekey_to_handle.extend(
+            output_handles
+                .into_iter()
+                .map(|handle| (handle.storage_key().clone(), handle.clone())),
+        );
+
+        Ok(())
+    }
+
+    /// Adds a [TensorHandle<T>] of a input tensor.
+    fn add_input(&mut self, handle: TensorHandle<T>) {
+        let uses = self
+            .handle_usage_count
+            .get(handle.storage_key())
+            .copied()
+            .unwrap_or_default();
+
+        // edge case: the input is not used by any layers
+        if uses == 0 {
+            warn!("Unused input tensor");
+            handle.dry();
+        }
+
+        self.storagekey_to_handle
+            .insert(handle.storage_key().clone(), handle);
+    }
+
+    /// Returns a copy of the [TensorHandle<T>] corresponding to `storage_key`.
+    fn get_by_storage_key(&self, storage_key: &StorageKey<Vec<T>>) -> Result<TensorHandle<T>> {
+        self.storagekey_to_handle
+            .get(storage_key)
+            .with_context(|| format!("Missing tensor handle for {}", storage_key))
+            .cloned()
     }
 }
 
@@ -513,29 +613,17 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
         ensure!(unpadded_input_shapes.len() == inputs.len());
 
-        // Seed the shape accumulators with the model inputs
-        let mut storagekey_to_handle = HashMap::new();
-        let mut input_handles = Vec::new();
+        // Allocated input tensors and key to handle map.
+        let mut handle_tracker = HandleTracker::count_from_graph(&self.graph);
+        let mut input_handles = Vec::with_capacity(inputs.len());
         for (i, tensor) in inputs.into_iter().enumerate() {
             let input_node_id = self.graph.input_node_id(i)?;
             let storage_key = input_node_id.output_at(0).to_storage_key();
+
             let handle = TensorHandle::from_tensor(storage_key, store.clone(), tensor);
             handle.store()?;
             input_handles.push(handle.clone());
-            storagekey_to_handle.insert(handle.storage_key().clone(), handle);
-        }
-
-        let mut handle_usage_count = HashMap::<StorageKey<Vec<N>>, _>::new();
-        for (_edge_id, edge) in self.graph.edges() {
-            let source = edge.source();
-
-            for link in edge.ports().iter() {
-                let storage_key = source.output_at(link.source_port).to_storage_key();
-                handle_usage_count
-                    .entry(storage_key)
-                    .and_modify(|curr| *curr += 1)
-                    .or_insert(1);
-            }
+            handle_tracker.add_input(handle);
         }
 
         let mut trace = Trace::new(input_handles);
@@ -549,39 +637,14 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
             let handles = input_storage_keys
                 .iter()
-                .map(|storage_key| {
-                    storagekey_to_handle
-                        .get(storage_key)
-                        .with_context(|| format!("Missing tensor handle for {}", storage_key))
-                        .cloned()
-                })
+                .map(|storage_key| handle_tracker.get_by_storage_key(storage_key))
                 .collect::<Result<Vec<_>>>()?;
-
-            for storage_key in input_storage_keys {
-                let usages = handle_usage_count
-                    .entry(storage_key.clone())
-                    .and_modify(|curr| *curr -= 1)
-                    .or_insert(0);
-                if *usages == 0 {
-                    let handle = storagekey_to_handle
-                        .get(&storage_key)
-                        .with_context(|| format!("Missing tensor handle for {}", storage_key))?;
-                    handle.dry()
-                }
-            }
 
             let new_step = self
                 .run_layer(node_id, layer, handles, &mut tracker, store.clone())
                 .context(format!("Error occurred at node ID: {node_id}"))?;
 
-            storagekey_to_handle.extend(
-                new_step
-                    .node_outputs
-                    .outputs
-                    .iter()
-                    .map(|handle| (handle.storage_key().clone(), handle.clone())),
-            );
-
+            handle_tracker.after_layer(&input_storage_keys, &new_step.node_outputs.outputs)?;
             trace.new_step(node_id, new_step);
         }
 
@@ -658,24 +721,25 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         N: TensorTypeParam,
         Layer<N>: Evaluate<N>,
     {
-        let mut wrapped_tensors = Vec::with_capacity(handles.len());
         let mut prec_unpadded_shapes = Vec::with_capacity(handles.len());
         let expected_num_outputs = layer.num_outputs(handles.len())?;
 
-        for handle in &handles {
-            let wrapped_tensor = {
-                let tensor = handle.tensor().with_context(|| {
-                    format!("fetching tensor data for tensor {}", handle.storage_key())
-                })?;
-                WrappedTensor::try_from(tensor.deref())?
-            };
+        let layer_out = {
+            // Scope to shorten the lifetime of the borrowed handles
+            let mut wrapped_tensors_guards = Vec::with_capacity(handles.len());
 
-            wrapped_tensors.push(wrapped_tensor);
-            prec_unpadded_shapes.push(handle.unpadded_shape().clone());
-        }
+            for handle in &handles {
+                wrapped_tensors_guards.push(handle.wrapped_tensor()?);
+                prec_unpadded_shapes.push(handle.unpadded_shape().clone());
+            }
 
-        let wrapped_tensor_refs = wrapped_tensors.iter().collect::<Vec<_>>();
-        let layer_out = layer.evaluate(wrapped_tensor_refs.as_slice())?;
+            let wrapped_tensors = wrapped_tensors_guards
+                .iter()
+                .map(|guard| guard.deref())
+                .collect::<Vec<_>>();
+
+            layer.evaluate(&wrapped_tensors)?
+        };
         let (layer_outputs, layer_proving_data, layer_tracked_data) = layer_out.into_parts();
 
         // Outgoing ports are unique, so they are used to create the tensor's id.
