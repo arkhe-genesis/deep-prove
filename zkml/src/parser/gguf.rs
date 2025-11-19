@@ -374,7 +374,7 @@ pub mod tests {
 
     use crate::parser::{
         file_cache,
-        llm::models::{gemma3::tests::GEMMA3_Q8, gpt2::tests::GPT2_Q8_0},
+        llm::models::{gemma3::tests::GEMMA3_Q8, gpt2::GPT2_Q8_0},
     };
 
     // download at https://huggingface.co/igorbkz/gpt2-Q8_0-GGUF

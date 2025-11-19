@@ -444,7 +444,7 @@ mod tests {
             gguf::RawGGUF,
             llm::{
                 LLMTokenizer,
-                models::gpt2::{GPT2, tests::GPT2_Q8_0},
+                models::gpt2::{GPT2, GPT2_Q8_0},
                 tokenizer::TokenizerLoader,
             },
         },

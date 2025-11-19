@@ -194,7 +194,7 @@ mod tests {
         gguf::RawGGUF,
         llm::models::{
             gemma3::{Gemma3, is_gemma3_model, tests::GEMMA3_Q8},
-            gpt2::{GPT2, is_gpt2_model, tests::GPT2_Q8_0},
+            gpt2::{GPT2, GPT2_Q8_0, is_gpt2_model},
         },
     };
     use std::path::PathBuf;

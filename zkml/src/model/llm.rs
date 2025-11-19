@@ -615,7 +615,7 @@ mod test {
                 HFTokenizer, LLMTokenizer, Token,
                 models::{
                     gemma3::{Gemma3, tests::GEMMA3_Q8},
-                    gpt2::{GPT2, tests::GPT2_Q8_0},
+                    gpt2::{GPT2, GPT2_Q8_0},
                 },
                 tokenizer::TokenizerLoader,
             },

@@ -2,11 +2,25 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use tenstore::GenStore;
+use transcript::BasicTranscript;
 use zkml::{
-    Element, Prover, Tensor, default_transcript,
+    Element, Prover, ProverContext, Tensor, default_transcript,
     inputs::Input,
-    model::{Model, Trace},
-    parser::onnx::FloatOnnxLoader,
+    iop::context::VerifierContext,
+    model::{
+        Model, Trace,
+        llm::{Driver, LLMTokenizerObserver},
+    },
+    parser::{
+        file_cache,
+        gguf::RawGGUF,
+        llm::{
+            LLMTokenizer,
+            models::gpt2::{GPT2, GPT2_Q8_0},
+            tokenizer::TokenizerLoader,
+        },
+        onnx::FloatOnnxLoader,
+    },
     quantization::{AbsoluteMax, ModelMetadata},
     verify,
 };
@@ -52,32 +66,35 @@ fn parse_model_and_inputs<T: std::io::Read>(
     (model, inputs)
 }
 
-fn prove_model(model: &Model<Element>, inputs: Vec<Vec<Tensor<i64>>>) {
-    let (prover_ctx, verifier_ctx) = model
-        .generate_contexts::<F, Pcs<F>>()
-        .expect("unable to generate context");
-
-    for (i, inputs) in inputs.into_iter().enumerate() {
-        let trace = model
-            .run(inputs, &mut GenStore::default())
-            .unwrap_or_else(|_| panic!("input #{i} failed"));
-
-        let mut prover_transcript = new_transcript();
-        let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
-        let io = trace.to_verifier_io().unwrap();
-        let proof = prover.prove(&trace).expect("unable to generate proof");
-
-        let mut verifier_transcript = new_transcript();
-        verify(&verifier_ctx, proof, io, &mut verifier_transcript).expect("invalid proof");
-    }
+fn random_input(inputs: &[Vec<Tensor<Element>>]) -> Vec<Tensor<Element>> {
+    let el = rand::random_range(0..inputs.len());
+    inputs[el].clone()
 }
 
-fn infer_model(model: &Model<Element>, inputs: Vec<Vec<Tensor<i64>>>) {
-    for (i, inputs) in inputs.into_iter().enumerate() {
-        let _trace: Trace<F, Element, Element> = model
-            .run(inputs, &mut GenStore::default())
-            .unwrap_or_else(|_| panic!("input #{i} failed"));
-    }
+fn random_prover_input(
+    inputs: &[Vec<Tensor<Element>>],
+) -> (Vec<Tensor<Element>>, BasicTranscript<F>, BasicTranscript<F>) {
+    let prover_transcript = new_transcript();
+    let verifier_transcript = new_transcript();
+    (random_input(inputs), prover_transcript, verifier_transcript)
+}
+
+fn prove_model<'a>(
+    model: &'a Model<Element>,
+    inputs: Vec<Tensor<i64>>,
+    mut prover_transcript: BasicTranscript<F>,
+    mut verifier_transcript: BasicTranscript<F>,
+    prover_ctx: &ProverContext<F, Pcs<F>>,
+    verifier_ctx: &VerifierContext<F, Pcs<F>>,
+) -> (Trace<'a, F, Element, Element>, BasicTranscript<F>) {
+    let trace = model.run(inputs, &mut GenStore::default()).unwrap();
+
+    let prover = Prover::<_, _, _>::new(prover_ctx, &mut prover_transcript);
+    let io = trace.to_verifier_io().unwrap();
+    let proof = prover.prove(&trace).expect("unable to generate proof");
+
+    verify(verifier_ctx, proof, io, &mut verifier_transcript).expect("invalid proof");
+    (trace, verifier_transcript)
 }
 
 fn prove(c: &mut Criterion) {
@@ -89,22 +106,46 @@ fn prove(c: &mut Criterion) {
 
     let inputs = zstd::Decoder::new(MLP_IRIS_INPUT).expect("failed to parse zstd");
     let (model, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
+    let (prover_ctx, verifier_ctx) = model
+        .generate_contexts::<F, Pcs<F>>()
+        .expect("unable to generate context");
 
     group.bench_with_input("mlp", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
-            || inputs.clone(),
-            |inputs| prove_model(model, inputs),
+            || random_prover_input(inputs),
+            |(inputs, prover_transcript, verifier_transcript)| {
+                prove_model(
+                    model,
+                    inputs,
+                    prover_transcript,
+                    verifier_transcript,
+                    &prover_ctx,
+                    &verifier_ctx,
+                )
+            },
             criterion::BatchSize::SmallInput,
         )
     });
 
     let inputs = zstd::Decoder::new(CNN_CIFAR_INPUT).expect("failed to parse zstd");
     let (model, inputs) = parse_model_and_inputs(CNN_CIFAR, inputs);
+    let (prover_ctx, verifier_ctx) = model
+        .generate_contexts::<F, Pcs<F>>()
+        .expect("unable to generate context");
 
     group.bench_with_input("cnn", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
-            || inputs.clone(),
-            |inputs| prove_model(model, inputs),
+            || random_prover_input(inputs),
+            |(inputs, prover_transcript, verifier_transcript)| {
+                prove_model(
+                    model,
+                    inputs,
+                    prover_transcript,
+                    verifier_transcript,
+                    &prover_ctx,
+                    &verifier_ctx,
+                )
+            },
             criterion::BatchSize::SmallInput,
         )
     });
@@ -135,8 +176,8 @@ fn inference(c: &mut Criterion) {
 
     group.bench_with_input("mlp", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
-            || inputs.clone(),
-            |inputs| infer_model(model, inputs),
+            || random_input(inputs),
+            |inputs| model.run::<F>(inputs, &mut GenStore::default()).unwrap(),
             criterion::BatchSize::SmallInput,
         )
     });
@@ -146,8 +187,8 @@ fn inference(c: &mut Criterion) {
 
     group.bench_with_input("cnn", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
-            || inputs.clone(),
-            |inputs| infer_model(model, inputs),
+            || random_input(inputs),
+            |inputs| model.run::<F>(inputs, &mut GenStore::default()).unwrap(),
             criterion::BatchSize::SmallInput,
         )
     });
@@ -162,6 +203,30 @@ fn inference(c: &mut Criterion) {
     //         criterion::BatchSize::SmallInput,
     //     )
     // });
+
+    // Setting the max context to `2` so that only a single run is performed.
+    let max_context = 2;
+
+    let model_path = file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
+    let format = RawGGUF::new(model_path);
+    let driver = Driver::load_from_model(GPT2, &format, Some(max_context))
+        .expect("failed to instatiate GPT2 driver");
+    let tokenizer = GPT2.load_tokenizer(&format).unwrap();
+    let user_tokens = driver.random_sequence(1);
+    let sentence = tokenizer.detokenize(&user_tokens);
+
+    group.bench_function("gpt2", |bencher| {
+        bencher.iter_with_large_drop(|| {
+            driver.run::<GoldilocksExt2>(
+                &user_tokens,
+                &mut GenStore::default(),
+                Some(LLMTokenizerObserver {
+                    input: sentence.to_string(),
+                    tokenizer: &tokenizer,
+                }),
+            )
+        });
+    });
 
     group.finish();
 }

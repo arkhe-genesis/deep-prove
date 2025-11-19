@@ -42,6 +42,7 @@ pub const GPT2_VARIANTS: &[&str] = &[
 
 pub const GPT2_NAME: &str = "gpt2";
 pub const GPT2_GGUF_NAME: &str = GPT2_NAME;
+pub const GPT2_Q8_0: &str = "gpt2.Q8_0.gguf";
 
 pub fn is_gpt2_model(names: &[String]) -> bool {
     names
@@ -253,8 +254,6 @@ pub mod tests {
         Tensor,
         parser::{file_cache, llm::LLMTokenizer},
     };
-
-    pub const GPT2_Q8_0: &str = "gpt2.Q8_0.gguf";
 
     #[test]
     fn test_gpt2_load_gguf_tokenizer() -> anyhow::Result<()> {

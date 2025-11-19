@@ -1107,7 +1107,7 @@ mod test {
             json::{self, test::TINY_GPT2_DEBUG_NAME},
             llm::{
                 Attention, LLMConfig, LLMModel,
-                models::gpt2::{GPT2_GGUF_NAME, gpt2_structure, tests::GPT2_Q8_0},
+                models::gpt2::{GPT2_GGUF_NAME, GPT2_Q8_0, gpt2_structure},
             },
         },
         quantization::{self, Fieldizer},

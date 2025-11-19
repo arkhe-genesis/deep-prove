@@ -1027,7 +1027,7 @@ mod test {
         parser::{
             file_cache,
             gguf::RawGGUF,
-            llm::models::gpt2::{GPT2, tests::GPT2_Q8_0},
+            llm::models::gpt2::{GPT2, GPT2_Q8_0},
         },
         testing::Pcs,
     };
