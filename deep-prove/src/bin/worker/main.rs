@@ -222,7 +222,7 @@ struct Args {
 struct S3Args {
     #[arg(long, env, default_value = "ap-northeast-2")]
     s3_region: String,
-    #[arg(long, env, default_value = "dp-proofs")]
+    #[arg(long, env)]
     s3_params_bucket: Option<String>,
     #[arg(long, env, default_value = "dp-models")]
     s3_models_bucket: String,
