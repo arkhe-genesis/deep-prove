@@ -431,6 +431,18 @@ impl<W> Edge<W> {
             None
         }
     }
+
+    pub fn try_into_map_weight<W2>(
+        self,
+        f: impl FnMut(W) -> anyhow::Result<W2>,
+    ) -> anyhow::Result<Edge<W2>> {
+        Ok(Edge {
+            source: self.source,
+            target: self.target,
+            ports: self.ports,
+            weight: self.weight.map(f).transpose()?,
+        })
+    }
 }
 
 /// Basic structure that contains a graph and a list of input nodes.
@@ -523,6 +535,8 @@ where
     /// ```rust
     /// # use zkml::graph::{Graph, Ports, PortLink};
     /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
     /// let node1 = graph.add_inner("first").unwrap();
     /// let node2 = graph.add_inner("second").unwrap();
     ///
@@ -764,6 +778,12 @@ where
     /// ```
     pub fn nodes(&self) -> impl Iterator<Item = (&NodeId, &Node<N, I, O>)> + use<'_, N, I, O, W> {
         self.nodes.iter()
+    }
+
+    pub fn nodes_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&NodeId, &mut Node<N, I, O>)> + use<'_, N, I, O, W> {
+        self.nodes.iter_mut()
     }
 
     /// Return the topologigl source nodes of this graph, i.e. the nodes without
@@ -1037,6 +1057,10 @@ where
     /// let node1 = graph.add_inner("first").unwrap();
     /// let node2 = graph.add_inner("second").unwrap();
     /// let node3 = graph.add_inner("third").unwrap();
+    /// let mut graph: Graph<&str, (), (), ()> = Graph::new();
+    /// let node1 = graph.add_inner("first").unwrap();
+    /// let node2 = graph.add_inner("second").unwrap();
+    /// let node3 = graph.add_inner("third").unwrap();
     ///
     /// graph.add_edge(node1, node2, zkml::graph::Ports::consecutive(), Some(())).unwrap();
     /// graph.add_edge(node2, node3, zkml::graph::Ports::consecutive(), Some(())).unwrap();
@@ -1140,6 +1164,25 @@ where
                 unvisited_nodes.remove(next_node);
             }
             next_node
+        })
+    }
+
+    pub fn try_map_weights<W2>(
+        self,
+        f: impl FnMut(W) -> anyhow::Result<W2> + Copy,
+    ) -> anyhow::Result<Graph<N, I, O, W2>> {
+        let new_edges = self
+            .edges
+            .into_iter()
+            .map(|(edge_id, edge)| {
+                edge.try_into_map_weight(f)
+                    .map(|new_edge| (edge_id, new_edge))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+
+        Ok(Graph {
+            nodes: self.nodes,
+            edges: new_edges,
         })
     }
 }

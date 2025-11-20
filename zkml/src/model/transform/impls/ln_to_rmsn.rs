@@ -438,7 +438,7 @@ mod tests {
 
     use crate::{
         init_test_logging,
-        model::llm::{Driver, LLMTokenizerObserver},
+        model::llm::{Driver, LLMTokenizerObserver, WithMaxContext},
         parser::{
             default_pipeline_config, file_cache,
             gguf::RawGGUF,
@@ -577,14 +577,14 @@ mod tests {
                 tokenizer: &tokenizer,
             }),
         )?;
-        let ctx = driver
+        let (prover_ctx, verifier_ctx) = driver
             .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
             .with_max_context(max_context);
-        let proof = driver.prove(&ctx, trace)?;
+        let proof = driver.prove(&prover_ctx, trace)?;
         let proof_bytes =
             bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
         tracing::info!("Proof size: {}", proof_bytes.len());
-        ctx.verify(proof, user_tokens)?;
+        verifier_ctx.verify(proof, user_tokens)?;
         Ok(())
     }
 }

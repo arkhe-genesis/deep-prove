@@ -130,6 +130,10 @@ name = "gpu"
 harness = false
 name = "tensor"
 
+[[example]]
+name = "chunk-prover"
+path = "examples/chunk_prover.rs"
+
 [lints.clippy]
 dbg_macro = "deny"
 print_stderr = "deny"

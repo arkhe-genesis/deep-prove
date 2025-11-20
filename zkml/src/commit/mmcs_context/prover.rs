@@ -1,10 +1,10 @@
 //! Module containing code for the model commitment prover
-use super::{CommitmentProverCtx, ModelOpeningProof};
+use super::{CommitmentProverCtx, OpeningProof};
 use crate::{
     Claim,
     commit::{
         compute_betas_eval,
-        mmcs_context::{build_sumcheck_expression, table_poly_id},
+        mmcs_context::{ModelClaims, build_sumcheck_expression, table_poly_id},
     },
     graph::NodeId,
     lookup::context::TableType,
@@ -85,7 +85,7 @@ where
     /// The `NodeId` is only employed to sort the claims related to the same
     /// static tensor, assuming that only one claim for a static tensor is
     /// produced in each node
-    model_claims: HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>>>,
+    pub(crate) model_claims: ModelClaims<E>,
     /// The list of claims about the witness
     witness_claims: BTreeMap<NodeId, BatchCommitmentClaim<E>>,
     _phantom: PhantomData<PCS>,
@@ -106,11 +106,12 @@ where
 {
     pub fn new() -> CommitmentProver<E, PCS> {
         CommitmentProver {
-            model_claims: HashMap::new(),
+            model_claims: ModelClaims::new(),
             witness_claims: BTreeMap::new(),
             _phantom: PhantomData,
         }
     }
+
     pub fn add_witness_claim(&mut self, node_id: NodeId, claim: Vec<(Point<E>, Vec<E>)>) {
         self.witness_claims
             .insert(node_id, BatchCommitmentClaim::<E>::new(claim));
@@ -118,17 +119,23 @@ where
 
     pub fn add_common_claims(&mut self, claims: HashMap<CommitmentId, Vec<(NodeId, Claim<E>)>>) {
         claims.into_iter().for_each(|(poly_id, claims)| {
-            let poly_claims = self.model_claims.entry(poly_id).or_default();
-            claims
-                .into_iter()
-                .for_each(|(node_id, claim)| assert!(poly_claims.insert(node_id, claim).is_none()));
+            let poly_claims = self.model_claims.entry(poly_id.clone()).or_default();
+            claims.into_iter().for_each(|(node_id, claim)| {
+                assert!(
+                    poly_claims.insert(node_id, claim).is_none(),
+                    "Failed for poly {poly_id} in node {node_id}"
+                )
+            });
         });
     }
 
     pub fn add_table_claim(&mut self, table_id: NodeId, table_type: &TableType, claim: Claim<E>) {
-        self.model_claims.insert(
-            table_poly_id(table_type.name()),
-            BTreeMap::from([(table_id, claim)]),
+        assert!(
+            self.model_claims
+                .entry(table_poly_id(table_type.name()))
+                .or_default()
+                .insert(table_id, claim)
+                .is_none()
         );
     }
 
@@ -156,7 +163,7 @@ where
         ctx: &CommitmentProverCtx<E, PCS>,
         witness_commitments: &HashMap<NodeId, PCS::CommitmentWithWitness>,
         transcript: &mut T,
-    ) -> Result<ModelOpeningProof<E, PCS>> {
+    ) -> Result<OpeningProof<E, PCS>> {
         // First we replace the `NodeId`s in the witness claims with the actual PCS::CommitmentWithWitness
         let mut rounds = self.prep_for_open(witness_commitments)?;
 
@@ -164,7 +171,8 @@ where
         // the first key value pair we visit.
         let mut model_claims = std::mem::take(&mut self.model_claims);
         let (sumcheck_proof, sumcheck_evals) =
-            if let Some(model_commitment) = ctx.model_commitment.as_ref() {
+            if ctx.model_commitment.is_some() && !model_claims.is_empty() {
+                let model_commitment = ctx.model_commitment.as_ref().unwrap();
                 let ModelSumcheckProof {
                     model_claim,
                     sumcheck_proof,
@@ -190,7 +198,7 @@ where
         )
         .map_err(|e| anyhow!("{e:?}"))?;
 
-        Ok(ModelOpeningProof {
+        Ok(OpeningProof {
             sumcheck_proof,
             sumcheck_evals,
             pcs_proof,
@@ -212,19 +220,26 @@ where
                     let (eqs, num_claims) = claim_keys.iter().try_fold(
                         (vec![], vec![]),
                         |(mut eq_polys, mut num_claims_per_poly), key| {
-                            let claims = model_claims
-                                .remove(key)
-                                .ok_or(anyhow!("No Claims found for mode poly {key}"))?;
-                            let num_claims = claims.len();
-                            let eqs = claims
-                                .into_values()
-                                .map(|claim| {
-                                    let Claim { point, eval } = claim;
-                                    // Append the evaluations to the transcript
-                                    transcript.append_field_element_ext(&eval);
-                                    compute_betas_eval(&point).into_mle()
-                                })
-                                .collect_vec();
+                            let eqs = if let Some(claims) = model_claims.remove(key) {
+                                claims
+                                    .into_values()
+                                    .map(|claim| {
+                                        let Claim { point, eval } = claim;
+                                        // Append the evaluations to the transcript
+                                        transcript.append_field_element_ext(&eval);
+                                        compute_betas_eval(&point).into_mle()
+                                    })
+                                    .collect_vec()
+                            } else {
+                                let precomputed_claim =
+                                    commit_ctx.precomputed_model_claims.get(key).ok_or(anyhow!(
+                                        "No precomputed claim found for model poly {key}"
+                                    ))?;
+                                // append the evaluations to the transcript
+                                transcript.append_field_element_ext(&precomputed_claim.claim.eval);
+                                vec![precomputed_claim.beta_evals.clone().into_mle()]
+                            };
+                            let num_claims = eqs.len();
                             eq_polys.extend(eqs);
                             num_claims_per_poly.push(num_claims);
                             anyhow::Result::<(Vec<MultilinearExtension<E>>, Vec<usize>)>::Ok((

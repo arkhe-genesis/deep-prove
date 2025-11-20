@@ -222,7 +222,7 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     ///
     /// Returns an error if:
     ///
-    /// - A previous thread paniced while loading data (internal lock is poisoned).
+    /// - A previous thread panicked while loading data (internal lock is poisoned).
     /// - Dequantization failed.
     pub fn get_tensor(&self, name: &str) -> anyhow::Result<KeyedTensor<f32>> {
         let (key, qtensor) = self.get_qtensor(name)?;

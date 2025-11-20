@@ -51,7 +51,7 @@ use witness::{InstancePaddingStrategy, RowMajorMatrix};
 /// The short name used to identify the logits layer.
 pub const LOGITS_LAYER: &str = "LGIT";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArgmaxData<E> {
     max_values: Vec<Tensor<E>>,
 }
@@ -63,7 +63,7 @@ pub struct ArgmaxDataNew<E: TensorTypeParam> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogitsCtx {
-    lookup_ctx: LayerLookupContext,
+    pub(crate) lookup_ctx: LayerLookupContext,
     node_id: NodeId,
 }
 
@@ -269,7 +269,6 @@ impl ProveInfo for Logits {
         );
 
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
-        aux.tables.insert(TableType::Range);
 
         let lookup_ctx = LayerLookupContext::new(vec![TableType::Range], vec![1]);
         Ok((
@@ -344,7 +343,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
@@ -497,7 +496,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         ensure!(
             step_data.node_inputs.len() == 1,

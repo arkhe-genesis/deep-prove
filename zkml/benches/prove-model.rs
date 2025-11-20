@@ -2,13 +2,12 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use tenstore::GenStore;
-use transcript::BasicTranscript;
 use zkml::{
-    Element, Prover, ProverContext, Tensor, default_transcript,
+    Element, Prover, ProverContext, Tensor,
     inputs::Input,
     iop::context::VerifierContext,
     model::{
-        Model, Trace,
+        Model,
         llm::{Driver, LLMTokenizerObserver},
     },
     parser::{
@@ -38,9 +37,7 @@ const CNN_CIFAR_INPUT: &[u8] = include_bytes!("../assets/scripts/CNN/input.json.
 // const CNN_COVID: &[u8] = include_bytes!("../assets/scripts/covid/cnn-covid.onnx");
 // const CNN_COVID_INPUT: &[u8] = include_bytes!("../assets/scripts/covid/input.json.zst");
 
-fn new_transcript() -> Transcript {
-    default_transcript()
-}
+type P<'a, 'b> = Prover<'a, 'b, F, Transcript, Pcs<F>>;
 
 fn parse_model(model_data: &[u8]) -> anyhow::Result<(Model<Element>, ModelMetadata)> {
     FloatOnnxLoader::from_bytes_with_scaling_strategy(model_data, AbsoluteMax::new())
@@ -71,30 +68,18 @@ fn random_input(inputs: &[Vec<Tensor<Element>>]) -> Vec<Tensor<Element>> {
     inputs[el].clone()
 }
 
-fn random_prover_input(
-    inputs: &[Vec<Tensor<Element>>],
-) -> (Vec<Tensor<Element>>, BasicTranscript<F>, BasicTranscript<F>) {
-    let prover_transcript = new_transcript();
-    let verifier_transcript = new_transcript();
-    (random_input(inputs), prover_transcript, verifier_transcript)
-}
-
-fn prove_model<'a>(
-    model: &'a Model<Element>,
+fn prove_model(
+    model: &Model<Element>,
     inputs: Vec<Tensor<i64>>,
-    mut prover_transcript: BasicTranscript<F>,
-    mut verifier_transcript: BasicTranscript<F>,
     prover_ctx: &ProverContext<F, Pcs<F>>,
     verifier_ctx: &VerifierContext<F, Pcs<F>>,
-) -> (Trace<'a, F, Element, Element>, BasicTranscript<F>) {
+) {
     let trace = model.run(inputs, &mut GenStore::default()).unwrap();
-
-    let prover = Prover::<_, _, _>::new(prover_ctx, &mut prover_transcript);
     let io = trace.to_verifier_io().unwrap();
-    let proof = prover.prove(&trace).expect("unable to generate proof");
 
-    verify(verifier_ctx, proof, io, &mut verifier_transcript).expect("invalid proof");
-    (trace, verifier_transcript)
+    let proof = P::prove(prover_ctx, trace, model).expect("unable to generate proof");
+
+    verify::<_, Transcript, _>(verifier_ctx, proof, io).expect("invalid proof");
 }
 
 fn prove(c: &mut Criterion) {
@@ -112,17 +97,8 @@ fn prove(c: &mut Criterion) {
 
     group.bench_with_input("mlp", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
-            || random_prover_input(inputs),
-            |(inputs, prover_transcript, verifier_transcript)| {
-                prove_model(
-                    model,
-                    inputs,
-                    prover_transcript,
-                    verifier_transcript,
-                    &prover_ctx,
-                    &verifier_ctx,
-                )
-            },
+            || random_input(inputs),
+            |inputs| prove_model(model, inputs, &prover_ctx, &verifier_ctx),
             criterion::BatchSize::SmallInput,
         )
     });
@@ -135,17 +111,8 @@ fn prove(c: &mut Criterion) {
 
     group.bench_with_input("cnn", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
-            || random_prover_input(inputs),
-            |(inputs, prover_transcript, verifier_transcript)| {
-                prove_model(
-                    model,
-                    inputs,
-                    prover_transcript,
-                    verifier_transcript,
-                    &prover_ctx,
-                    &verifier_ctx,
-                )
-            },
+            || random_input(inputs),
+            |inputs| prove_model(model, inputs, &prover_ctx, &verifier_ctx),
             criterion::BatchSize::SmallInput,
         )
     });
@@ -210,7 +177,7 @@ fn inference(c: &mut Criterion) {
     let model_path = file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
     let format = RawGGUF::new(model_path);
     let driver = Driver::load_from_model(GPT2, &format, Some(max_context))
-        .expect("failed to instatiate GPT2 driver");
+        .expect("failed to instantiate GPT2 driver");
     let tokenizer = GPT2.load_tokenizer(&format).unwrap();
     let user_tokens = driver.random_sequence(1);
     let sentence = tokenizer.detokenize(&user_tokens);

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use deep_prove::{
     middleware::{
-        v1::{self, DeepProveRequest as DeepProveRequestV1},
+        v1::{self, DeepProveRequest as DeepProveRequestV1, T},
         v2::Provable,
     },
     store::{self, MemStore, S3Store, Store},
@@ -12,7 +12,7 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt::format::FmtSpan};
 use url::Url;
 use zkml::{
-    Element, Prover, default_transcript,
+    Element, Prover,
     model::Model,
     parser::onnx::FloatOnnxLoader,
     quantization::{AbsoluteMax, ModelMetadata},
@@ -133,22 +133,20 @@ async fn run_model_v1<S: Store>(
             // If model.run fails, print the error and continue to the next input
             match trace_result {
                 Ok(trace) => {
-                    let mut prover_transcript = default_transcript();
-                    let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
-                    let proof = prover
-                        .prove(&trace)
-                        .with_context(|| "unable to generate proof for {i}th input")?;
                     let output_handles = trace.outputs();
                     let outputs = output_handles
                         .iter()
                         .map(|handle| handle.tensor().map(|t| t.clone()))
                         .collect::<Result<_, _>>()?;
+                    let io = trace.to_verifier_io().context("generating verifier IOs")?;
+                    let proof = Prover::<_, T, _>::prove(&prover_ctx, trace, &model)
+                        .with_context(|| "unable to generate proof for {i}th input")?;
 
                     proofs.push(v1::Output {
                         outputs,
                         proof: Provable {
                             proof,
-                            io: trace.to_verifier_io().context("generating verifier IOs")?,
+                            io,
                             ctx: verifier_ctx.clone(),
                         },
                     });

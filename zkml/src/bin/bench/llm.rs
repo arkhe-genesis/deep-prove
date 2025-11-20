@@ -8,7 +8,7 @@ use tenstore::GenStore;
 use timed_core::Output;
 use tracing_subscriber::EnvFilter;
 use zkml::{
-    model::llm::{LLMContext, LLMTokenizerObserver},
+    model::llm::{LLMProverContext, LLMTokenizerObserver, LLMVerifierContext},
     parser::{
         file_cache,
         gguf::RawGGUF,
@@ -90,7 +90,8 @@ fn main() -> anyhow::Result<()> {
         HEADER_MODEL_QUANT,
     ]);
     let driver = bencher.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
-    let ctx: LLMContext<F, Pcs<F>> = bencher.r(HEADER_CONTEXT_TIME, || driver.context())?;
+    let (prover_ctx, verifier_ctx): (LLMProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
+        bencher.r(HEADER_CONTEXT_TIME, || driver.context())?;
 
     bencher.set(HEADER_MODEL, args.model);
     bencher.set(HEADER_MAX_CONTEXT, args.max_context);
@@ -111,9 +112,11 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
 
-        let proof = bencher.r(HEADER_PROOF_TIME, || driver.prove(&ctx, trace))?;
+        let proof = bencher.r(HEADER_PROOF_TIME, || driver.prove(&prover_ctx, trace))?;
         bencher.r(HEADER_VERIFY_TIME, || {
-            ctx.verify(proof, user_tokens).expect("invalid proof")
+            verifier_ctx
+                .verify(proof, user_tokens)
+                .expect("invalid proof")
         });
         bencher.flush(&args.output)?;
     }

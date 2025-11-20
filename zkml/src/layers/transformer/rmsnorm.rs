@@ -516,7 +516,7 @@ pub struct RMSNormCtx<E: ExtensionField> {
     /// The base 2 logarithm of the multiplier for the most significant chunk we range check
     top_chunk_scalar_log: usize,
     /// The lookup info for the layer
-    lookup_ctx: LayerLookupContext,
+    pub(crate) lookup_ctx: LayerLookupContext,
     /// The sumcheck expression for verifying the lookup input and layer output are correctly calculated
     sumcheck_expression: Vec<Expression<E>>,
     alpha_key: Option<CommitmentId>,
@@ -590,10 +590,6 @@ impl ProveInfo for RMSNorm<Element> {
                 lut,
                 ..
             } = quant_info;
-
-            // Add the tables that RMSNorm requires
-            aux.tables.insert(TableType::Range);
-            aux.tables.insert(TableType::RMSTable(*lut));
 
             let num_range_checks = (*range_check_bits - 1) / *quantization::BIT_LEN + 1;
             let tables = vec![TableType::Range, TableType::RMSTable(*lut)];
@@ -726,7 +722,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -749,7 +745,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let output_tensors = step_data.output_tensors()?;
         ensure!(

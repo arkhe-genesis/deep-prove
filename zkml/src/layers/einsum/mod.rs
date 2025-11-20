@@ -351,7 +351,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = step_data.input_tensors()?;

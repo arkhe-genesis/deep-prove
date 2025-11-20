@@ -1,6 +1,7 @@
 use crate::{
-    Shape, Tensor,
+    Element, Shape, Tensor,
     graph::{Direction, Edge, Graph, Node, NodeId, NodeInput, NodeOutput, PortLink, Ports},
+    iop::prover::{ModelLayers, ModelLayersRef},
     layers::{
         Layer, NodeOut,
         provable::{Evaluate, OpInfo},
@@ -166,7 +167,7 @@ pub struct Model<N> {
     ///
     ///   - model global outputs are represented by their own
     ///     `Node::Output(output_id)`, and sample their value on input port 0;
-    pub(crate) graph: ModelGraph<N>,
+    pub graph: ModelGraph<N>,
     pub(crate) input_shapes: Vec<Shape>,
     pub(crate) unpadded_input_shapes: Vec<Shape>,
 }
@@ -275,7 +276,7 @@ impl<N> Model<N> {
             .input_node_id(input_idx)
             .with_context(|| format!("retrieving node for input {input_idx}"))?;
         self.graph
-            .add_edge(input_node_id, target.node_id, (0, *target.port), ())
+            .add_edge(input_node_id, target.node_id, (0, *target.port), None)
             .map(|_| ())
     }
 
@@ -499,7 +500,7 @@ where
                 let links = (0..num_outputs)
                     .map(|i| PortLink::new(i, i))
                     .collect::<Vec<_>>();
-                self.graph.add_edge(id, new_node_id, links, ())?;
+                self.graph.add_edge(id, new_node_id, links, None)?;
             }
             None => {
                 let input_node_ids = self
@@ -509,7 +510,7 @@ where
                     .collect::<Vec<_>>();
                 for (i, input_node_id) in input_node_ids.into_iter().enumerate() {
                     self.graph
-                        .add_edge(input_node_id, new_node_id, (0, i), ())?;
+                        .add_edge(input_node_id, new_node_id, (0, i), None)?;
                 }
             }
         };
@@ -526,7 +527,7 @@ where
 
         let new_node = self.graph.add_output(output_idx)?;
         self.graph
-            .add_edge(output.node_id, new_node, (*output.port, 0), ())?;
+            .add_edge(output.node_id, new_node, (*output.port, 0), None)?;
         Ok(new_node)
     }
 
@@ -536,7 +537,7 @@ where
         target: NodeId,
         ports: P,
     ) -> anyhow::Result<()> {
-        self.graph.add_edge(source, target, ports, ()).map(|_| ())
+        self.graph.add_edge(source, target, ports, None).map(|_| ())
     }
 
     pub fn add_raw_edge<S: Into<NodeId>, T: Into<NodeId>, P: Into<Ports>>(
@@ -600,7 +601,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         inputs: Vec<Tensor<N>>,
         mut tracker: Option<&mut InferenceTracker>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Trace<'_, E, N, N>>
+    ) -> anyhow::Result<Trace<E, N>>
     where
         E: ExtensionField + Serialize + DeserializeOwned,
         E::BaseField: Serialize + DeserializeOwned,
@@ -697,7 +698,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         &self,
         inputs: Vec<Tensor<N>>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Trace<'_, E, N, N>>
+    ) -> anyhow::Result<Trace<E, N>>
     where
         E::BaseField: Serialize + DeserializeOwned,
         E: ExtensionField + Serialize + DeserializeOwned,
@@ -707,16 +708,16 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_layer<'a, E: ExtensionField>(
+    fn run_layer<E: ExtensionField>(
         &self,
         node_id: NodeId,
-        layer: &'a Layer<N>,
+        layer: &Layer<N>,
         // inputs are assumed to be sorted by source port, e.g. in the order defined by the ports
         handles: Vec<TensorHandle<N>>,
         tracker: &mut Option<&mut InferenceTracker>,
         store: GenStore,
         // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
-    ) -> Result<Step<'a, E, N, N>>
+    ) -> Result<Step<E, N>>
     where
         N: TensorTypeParam,
         Layer<N>: Evaluate<N>,
@@ -809,13 +810,28 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         }
 
         Ok(Step {
-            op: layer,
             node_inputs: handles,
             node_outputs: NodeOut::new(output_handles, layer_proving_data),
             unpadded_output_shapes: layer
                 .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?,
             unpadded_input_shapes: prec_unpadded_shapes,
         })
+    }
+}
+
+impl<'a> From<&'a Model<Element>> for ModelLayersRef<'a> {
+    fn from(model: &'a Model<Element>) -> Self {
+        model.graph.inner_nodes().collect()
+    }
+}
+
+impl<'a> From<&'a Model<Element>> for ModelLayers {
+    fn from(model: &'a Model<Element>) -> Self {
+        model
+            .graph
+            .inner_nodes()
+            .map(|(node_id, node)| (node_id, node.clone()))
+            .collect()
     }
 }
 
@@ -864,6 +880,8 @@ pub(crate) mod test {
     const SELECTOR_RELU: usize = 1;
     const SELECTOR_POOLING: usize = 2;
     const MOD_SELECTOR: usize = 2;
+
+    type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs<F>>;
 
     impl Model<Element> {
         pub fn random(num_dense_layers: usize) -> Result<(Self, Vec<Tensor<Element>>)> {
@@ -1220,15 +1238,12 @@ pub(crate) mod test {
         model.automatic_output_labelling().unwrap();
         model.describe();
         let trace = model.run::<F>(vec![input], &mut store).unwrap();
-        let mut tr: BasicTranscript<F> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
             .expect("Unable to generate contexts");
         let io = trace.to_verifier_io().unwrap();
-        let prover = Prover::new(&prover_ctx, &mut tr);
-        let proof = prover.prove(&trace).expect("unable to generate proof");
-        let mut verifier_transcript = BasicTranscript::new(b"m2vec");
-        verify(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
 
     #[test]
@@ -1259,15 +1274,12 @@ pub(crate) mod test {
 
         let mut store = GenStore::default();
         let trace = model.run::<F>(inputs, &mut store).unwrap();
-        let mut tr = BasicTranscript::<F>::new(b"matmul");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
             .expect("Unable to generate contexts");
         let io = trace.to_verifier_io().unwrap();
-        let prover = Prover::new(&prover_ctx, &mut tr);
-        let proof = prover.prove(&trace).expect("unable to generate proof");
-        let mut verifier_transcript = BasicTranscript::<F>::new(b"matmul");
-        verify(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
 
     #[test]
@@ -1317,20 +1329,15 @@ pub(crate) mod test {
         model.describe();
         let mut store = GenStore::default();
         let trace = model.run::<F>(vec![input], &mut store).unwrap();
-        let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
             .expect("Unable to generate contexts");
 
         let io = trace.to_verifier_io().unwrap();
 
-        let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
-            Prover::new(&prover_ctx, &mut tr);
-        let proof = prover.prove(&trace).expect("unable to generate proof");
+        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
 
-        let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
-            BasicTranscript::new(b"m2vec");
-        verify(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
 
     type E = GoldilocksExt2;
@@ -1451,18 +1458,14 @@ pub(crate) mod test {
         let input_tensors = model.prepare_inputs(inputs).unwrap();
 
         let trace = model.run(input_tensors, store)?;
-        let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"model");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
             .expect("Unable to generate contexts");
-        let prover: Prover<'_, '_, E, T, _> = Prover::new(&prover_ctx, &mut tr);
         let io = trace.to_verifier_io().unwrap();
-        let outputs = trace.outputs();
-        let proof = prover.prove(&trace).expect("unable to generate proof");
-        let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
-            BasicTranscript::new(b"model");
-        verify(&verifier_ctx, proof, io, &mut verifier_transcript)?;
-        Ok(outputs.to_vec())
+        let outputs = trace.outputs().to_vec();
+        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        verify::<_, T, _>(&verifier_ctx, proof, io)?;
+        Ok(outputs)
     }
 
     pub(crate) fn prove_model_with(

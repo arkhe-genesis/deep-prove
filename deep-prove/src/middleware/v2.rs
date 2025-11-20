@@ -1,13 +1,15 @@
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
+use transcript::BasicTranscript;
 use zkml::{
-    IO, Proof as ZkmlProof, default_transcript, inputs::Input, iop::context::VerifierContext,
+    IO, Proof as ZkmlProof, inputs::Input, iop::context::VerifierContext,
     quantization::ScalingStrategyKind, verify,
 };
 
 /// The extension field the proving system is based on.
 pub type E = GoldilocksExt2;
+pub type T = BasicTranscript<E>;
 
 /// A wrapper for a proof and its ancillaries, required by the verifying process.
 #[derive(Serialize, Deserialize)]
@@ -18,7 +20,7 @@ pub struct Provable {
 }
 impl Provable {
     pub fn verify(self) -> anyhow::Result<()> {
-        verify(&self.ctx, self.proof, self.io, &mut default_transcript())
+        verify::<_, T, _>(&self.ctx, self.proof, self.io)
     }
 }
 

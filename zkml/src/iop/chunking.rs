@@ -14,11 +14,13 @@ use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 use crate::{
-    Claim, Element,
+    Claim, Element, InitTranscript,
     commit::mmcs_context::CommitmentProverCtx,
     graph::{Direction, Edge, EdgeId, Graph, Node, NodeId, NodeInput, NodeOutput, PortId},
+    iop::prover::ModelLayersRef,
     layers::LayerCtx,
-    model::{ModelCtx, Trace},
+    lookup::context::LookupContext,
+    model::{Model, ModelCtx, Trace},
     to_base,
 };
 
@@ -58,7 +60,7 @@ pub(crate) type ChunkedGraph = Graph<(), usize, usize, ()>;
 /// The `incoming_edges` and `outgoing_edges` are grouped according to the chunk where the source
 /// or target node belongs to, respectively.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct ModelChunk {
+pub struct ModelChunk {
     // set of nodes of the model in this chunk
     pub(crate) subgraph: ChunkedGraph,
     pub(crate) chunk_id: ChunkID,
@@ -319,7 +321,7 @@ impl ModelChunk {
         &self,
         mut edges: impl Iterator<Item = &'b EdgeId>,
         commitment_ctx: &CommitmentProverCtx<E, PCS>,
-        chunk_trace: &'d Trace<'d, E, Element, Element>,
+        chunk_trace: &'d Trace<E, Element>,
         group_type: GroupType,
     ) -> anyhow::Result<PCS::CommitmentWithWitness>
     where
@@ -362,10 +364,10 @@ impl ModelChunk {
     /// committed are the MLEs of the tensors propagated through the edges in the group.
     /// The `GroupType` parameter specifies whether the commitments are computed for incoming
     /// or outgoing edges
-    pub(crate) fn commitments<'d, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn commitments<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         commitment_ctx: &CommitmentProverCtx<E, PCS>,
-        full_trace: &'d Trace<'d, E, Element, Element>,
+        full_trace: &Trace<E, Element>,
         group_type: GroupType,
     ) -> anyhow::Result<BTreeMap<ChunkID, PCS::CommitmentWithWitness>>
     where
@@ -488,10 +490,10 @@ impl ModelChunk {
     }
 
     // derive the trace for chunk `self` from `full_trace`
-    pub(crate) fn chunk_trace<'d, E: ExtensionField>(
+    pub(crate) fn chunk_trace<E: ExtensionField>(
         &self,
-        full_trace: &'d Trace<'d, E, Element, Element>,
-    ) -> anyhow::Result<Trace<'d, E, Element, Element>> {
+        full_trace: &Trace<E, Element>,
+    ) -> anyhow::Result<Trace<E, Element>> {
         let steps = self
             .subgraph
             .inner_nodes()
@@ -511,6 +513,39 @@ impl ModelChunk {
             input: vec![],  // they are unused in a chunk prover
             output: vec![], // they are unused in a chunk prover
         })
+    }
+
+    pub(crate) fn chunk_layers<'a>(&self, model: &'a Model<Element>) -> ModelLayersRef<'a> {
+        model
+            .graph
+            .inner_nodes()
+            .filter_map(|(node_id, layer)| {
+                // retain the node if it is in the current chunk
+                self.subgraph.node(node_id).map(|_| (node_id, layer))
+            })
+            .collect()
+    }
+
+    // Returns the lookup context containing only the data relevant to the current subgraph / chunk.
+    pub(crate) fn chunk_lookup_ctx(&self, lookup_ctx: &LookupContext) -> LookupContext {
+        LookupContext {
+            tables: lookup_ctx
+                .tables
+                .iter()
+                .filter_map(|(table_type, node_ids)| {
+                    let chunk_node_ids = node_ids
+                        .iter()
+                        .filter(|node_id| self.subgraph.node(**node_id).is_some())
+                        .cloned()
+                        .collect_vec();
+                    if !chunk_node_ids.is_empty() {
+                        Some((*table_type, chunk_node_ids))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }
     }
 
     // check that the commitments for the input and output groups of `self` are equal
@@ -971,6 +1006,19 @@ impl ChunkingStrategy for LLMChunkingStrategy {
     }
 }
 
+/// Initialize the transcript to prove a given chunk, using the challenge squeezed from
+/// the initial shared transcript
+pub(crate) fn initialize_transcript_for_chunk<
+    E: ExtensionField,
+    T: Transcript<E> + InitTranscript,
+>(
+    challenge: E,
+) -> T {
+    let mut transcript = T::new(T::InitData::from(b"model_chunk_proving"));
+    transcript.append_field_element_ext(&challenge);
+    transcript
+}
+
 fn add_edges_to_chunk_subgraphs<E: ExtensionField>(
     model: &ModelCtx<E>,
     subgraphs: &mut [ChunkedGraph],
@@ -1023,7 +1071,10 @@ mod test {
     use crate::{
         init_test_logging,
         iop::chunking::{ChunkingStrategy, DefaultChunkingStrategy, LLMChunkingStrategy},
-        model::{Model, llm::Driver},
+        model::{
+            Model,
+            llm::{Driver, WithMaxContext},
+        },
         parser::{
             file_cache,
             gguf::RawGGUF,
@@ -1063,7 +1114,7 @@ mod test {
         };
 
         // Generate or load the prover & verifier contexts
-        let ctx = file_cache::deserialize_or_create_with(&cache_filename, || {
+        let (prover_ctx, _) = file_cache::deserialize_or_create_with(&cache_filename, || {
             let driver = Driver::load_from_model(
                 GPT2,
                 &RawGGUF::new(model_path.clone()),
@@ -1082,7 +1133,7 @@ mod test {
 
         for num_chunks in 1..50 {
             let chunks = strategy
-                .split(&ctx.prover_ctx.model_ctx, num_chunks)
+                .split(&prover_ctx.prover_ctx.model_ctx, num_chunks)
                 .unwrap();
 
             assert_eq!(chunks.len(), num_chunks);

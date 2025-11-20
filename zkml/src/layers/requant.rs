@@ -189,12 +189,9 @@ impl ProveInfo for Requant {
         id: NodeId,
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
-        aux.tables.insert(TableType::Range);
-
         // Add ZeroTable to the aux if needed
         let lookup_ctx = if self.number_of_zero_chunks() != 0 {
             let (number_shifted_chunks, _, _) = self.shifted_chunks_data();
-            aux.tables.insert(TableType::RequantZeroTable);
             let tables = vec![TableType::Range, TableType::RequantZeroTable];
             let instances_per_table = vec![number_shifted_chunks + 1, self.number_of_zero_chunks()];
             LayerLookupContext::new(tables, instances_per_table)
@@ -451,7 +448,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        _step_data: &Step<E, Element, Element>,
+        _step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let claim = self.prove_step(prover, last_claims[0], ctx, id)?;
@@ -463,7 +460,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors()?;
         ensure!(

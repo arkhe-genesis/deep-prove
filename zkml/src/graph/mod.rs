@@ -54,6 +54,125 @@ pub mod scheduler;
 // everything directly graph related export as top level
 pub use graph::*;
 
+/// Utility macro for extracting specific enum variants from vectors.
+///
+/// This macro is particularly useful when working with graph nodes that are represented
+/// as enum variants. It allows safe extraction of all instances of a specific variant
+/// from a vector, returning an error if any element doesn't match the expected variant.
+///
+/// # Examples
+///
+/// ```
+/// use anyhow::anyhow;
+///
+/// macro_rules! try_extract_variant_vec {
+///     ($variant:ident :: $name:ident ( $inner:ident ), $vec:expr) => {{
+///         let mut out: Vec<$inner> = Vec::with_capacity($vec.len());
+///         let mut err_i: usize = usize::MAX;
+///         for (i, e) in $vec.into_iter().enumerate() {
+///             match e {
+///                 $variant::$name(inner) => out.push(inner),
+///                 _ => {
+///                     err_i = i;
+///                     break;
+///                 }
+///             }
+///         }
+///         if err_i != usize::MAX {
+///             Err(anyhow!("Type mismatch at index {}", err_i))
+///         } else {
+///             Ok(out)
+///         }
+///     }};
+///     ($variant:ident :: $name:ident, $vec:expr) => {{
+///         let mut out: Vec<()> = Vec::with_capacity($vec.len());
+///         let mut err_i: usize = usize::MAX;
+///         for (i, e) in $vec.into_iter().enumerate() {
+///             match e {
+///                 $variant::$name => out.push(()),
+///                 _ => {
+///                     err_i = i;
+///                     break;
+///                 }
+///             }
+///         }
+///         if err_i != usize::MAX {
+///             Err(anyhow!("Type mismatch at index {}", err_i))
+///         } else {
+///             Ok(out)
+///         }
+///     }};
+/// }
+///
+/// #[derive(Debug, PartialEq)]
+/// enum Operation {
+///     Add(i32),
+///     Multiply(f64),
+///     Clear,
+/// }
+///
+/// // Extract variants with payload
+/// let ops = vec![Operation::Add(1), Operation::Add(2), Operation::Add(3)];
+/// let values = try_extract_variant_vec!(Operation::Add(i32), ops).unwrap();
+/// assert_eq!(values, vec![1, 2, 3]);
+///
+/// // Extract variants without payload
+/// let ops2 = vec![Operation::Clear, Operation::Clear];
+/// let values2 = try_extract_variant_vec!(Operation::Clear, ops2).unwrap();
+/// assert_eq!(values2, vec![(), ()]);
+///
+/// // Error case - type mismatch
+/// let ops3 = vec![Operation::Add(1), Operation::Multiply(2.0)];
+/// assert!(try_extract_variant_vec!(Operation::Add(i32), ops3).is_err());
+/// ```
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! try_extract_variant_vec {
+    // case: variant with payload
+    ($variant:ident :: $name:ident ( $inner:ident ), $vec:expr) => {{
+        let mut out: Vec<$inner> = Vec::with_capacity($vec.len());
+        let mut err_i: usize = usize::MAX;
+        for (i, e) in $vec.into_iter().enumerate() {
+            match e {
+                $variant::$name(inner) => out.push(inner),
+                _ => {
+                    println!(
+                        "Type mismatch in extracting variant: {:?}",
+                        std::any::type_name_of_val(&e)
+                    );
+                    err_i = i;
+                    break;
+                }
+            }
+        }
+        if err_i != usize::MAX {
+            Err(anyhow::anyhow!("Type mismatch at index {}", err_i))
+        } else {
+            Ok(out)
+        }
+    }};
+    // case: variant without payload
+    ($variant:ident :: $name:ident, $vec:expr) => {{
+        let mut out: Vec<()> = Vec::with_capacity($vec.len());
+        let mut err_i: usize = usize::MAX;
+        for (i, e) in $vec.into_iter().enumerate() {
+            match e {
+                $variant::$name => out.push(()),
+                _ => {
+                    println!("Type mismatch {:?}", e);
+                    err_i = i;
+                    break;
+                }
+            }
+        }
+        if err_i != usize::MAX {
+            Err(anyhow::anyhow!("Type mismatch at index {}", err_i))
+        } else {
+            Ok(out)
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use crate::graph::scheduler::{ExecGraph, ExecNode, IntoColor};
@@ -78,11 +197,11 @@ mod tests {
             }
             .to_string()
         }
-        fn run(&self, _ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Self::IO> {
+        fn run(&self, _ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Vec<Self::IO>> {
             match self {
-                TestOperation::Input => Ok(input[0].clone()),
-                TestOperation::Test1 => Ok(format!("Test1: {input:?}")),
-                TestOperation::Test2 => Ok(format!("Test2: {input:?}")),
+                TestOperation::Input => Ok(vec![input[0].clone()]),
+                TestOperation::Test1 => Ok(vec![format!("Test1: {input:?}")]),
+                TestOperation::Test2 => Ok(vec![format!("Test2: {input:?}")]),
             }
         }
     }

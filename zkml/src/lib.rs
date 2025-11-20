@@ -127,6 +127,20 @@ impl<T: Transcript<E>, E: ExtensionField> VectorTranscript<E> for T {
     }
 }
 
+pub trait InitTranscript {
+    type InitData: Default + From<&'static [u8]>;
+
+    fn new(init_data: Self::InitData) -> Self;
+}
+
+impl<E: ExtensionField> InitTranscript for BasicTranscript<E> {
+    type InitData = &'static [u8];
+
+    fn new(init_data: Self::InitData) -> Self {
+        Self::new(init_data)
+    }
+}
+
 pub fn argmax<T: PartialOrd>(v: &[T]) -> Option<usize> {
     if v.is_empty() {
         return None;
@@ -247,9 +261,9 @@ mod test {
     use itertools::Itertools;
     use multilinear_extensions::mle::IntoMLE;
     use tenstore::GenStore;
+    use transcript::BasicTranscript;
 
     use crate::{
-        default_transcript,
         iop::{prover::Prover, verifier::verify},
         parser::onnx::FloatOnnxLoader,
         rng_from_env_or_random,
@@ -259,6 +273,9 @@ mod test {
     };
 
     type E = GoldilocksExt2;
+    type T = BasicTranscript<E>;
+
+    type P<'a, 'b> = Prover<'a, 'b, E, T, Pcs<E>>;
 
     #[test]
     fn test_model_run() -> anyhow::Result<()> {
@@ -297,13 +314,10 @@ mod test {
         println!("[+] Run inference. Result: {output:?}");
 
         let io = trace.to_verifier_io()?;
-        let mut prover_transcript = default_transcript();
-        let prover = Prover::<_, _, _>::new(&prover_ctx, &mut prover_transcript);
         println!("[+] Run prover");
-        let proof = prover.prove(&trace).expect("unable to generate proof");
+        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
 
-        let mut verifier_transcript = default_transcript();
-        verify(&verifier_ctx, proof, io, &mut verifier_transcript).expect("invalid proof");
+        verify::<_, T, _>(&verifier_ctx, proof, io).expect("invalid proof");
         println!("[+] Verify proof: valid");
         Ok(())
     }

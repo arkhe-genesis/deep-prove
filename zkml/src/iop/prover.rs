@@ -1,10 +1,14 @@
 use super::{ChallengeStorage, Proof, TableProof};
 use crate::{
-    Claim, Element, Tensor,
+    Claim, Element, InitTranscript, Tensor,
     commit::{compute_betas_eval, mmcs_context, same_poly},
-    graph::{Node, NodeId, NodeInput, NodeOutput, PortId},
+    graph::{
+        Node, NodeId, NodeInput, NodeOutput, PortId,
+        executor::{Executor, SequentialExecutor},
+        scheduler::{GraphScheduler, IntoColor},
+    },
     iop::{
-        ChunkProofData,
+        ChunkProof, ChunkProofData,
         chunking::{
             ChunkID, ChunkIOCommitments, ChunkingStrategy, DefaultChunkingStrategy, GroupIOClaims,
             GroupType, ModelChunk,
@@ -12,20 +16,24 @@ use crate::{
         claim::PolynomialEvaluation,
         compute_claim,
         context::ProverContext,
+        prover_graph::{LocalProverCtx, ProverGraph, ProverGraphIO, ProverGraphNode, SplitNode},
     },
     layers::{
-        LayerProof,
+        Layer, LayerProof,
         provable::{OpInfo, ProvableOp},
     },
     lookup::{
-        context::{LookupWitness, TableType, generate_lookup_witnesses},
+        context::{
+            GenerateWitness, LookupContext, LookupWitness, TableType,
+            generate_lookup_witness_for_chunk,
+        },
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
-    model::Trace,
+    model::{Model, Trace},
     quantization::TensorFielder,
     tensor::{CommitmentId, get_root_of_unity},
 };
-use anyhow::{Context as _, Result, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -54,7 +62,6 @@ where
     ctx: &'a ProverContext<E, PCS>,
     // proofs for each layer being filled
     proofs: HashMap<NodeId, LayerProof<E, PCS>>,
-    table_proofs: Vec<TableProof<E, PCS>>,
     merge_claim_proofs: HashMap<NodeId, MergeClaimsProof<E>>,
     pub(crate) transcript: &'b mut T,
     /// Proves commitment openings
@@ -135,6 +142,12 @@ impl<E: ExtensionField> MergeClaimNodeProof<E> {
     }
 }
 
+pub(crate) type GenericModelLayers<M> = HashMap<NodeId, M>;
+/// Type alias for the set of layers in a model, indexed by its `NodeId`
+pub type ModelLayers = GenericModelLayers<Layer<Element>>;
+/// Type alias for the set of references to layers of a model, indexed by its `NodeId`
+pub type ModelLayersRef<'a> = GenericModelLayers<&'a Layer<Element>>;
+
 impl<'a, 'b, E, T, PCS> Prover<'a, 'b, E, T, PCS>
 where
     T: Transcript<E>,
@@ -150,7 +163,6 @@ where
             ctx,
             transcript,
             proofs: Default::default(),
-            table_proofs: Vec::default(),
             merge_claim_proofs: Default::default(),
             commit_prover: mmcs_context::CommitmentProver::<E, PCS>::new(),
             lookup_witness: HashMap::default(),
@@ -171,8 +183,13 @@ where
         )
     }
 
-    pub(crate) fn add_table_claim(&mut self, table_type: &TableType, claim: Claim<E>) {
-        let table_node_id = self.ctx.commitment_ctx.table_node_id();
+    pub(crate) fn add_table_claim(
+        &mut self,
+        table_type: &TableType,
+        chunk_id: ChunkID,
+        claim: Claim<E>,
+    ) {
+        let table_node_id = chunk_id.0.into();
         self.commit_prover
             .add_table_claim(table_node_id, table_type, claim);
     }
@@ -192,17 +209,19 @@ where
     }
 
     #[timed::timed_instrument(level = "debug")]
-    fn prove_tables(&mut self) -> anyhow::Result<()> {
-        if self.ctx.lookup.is_empty() {
-            Ok(())
+    fn prove_tables(
+        &mut self,
+        chunk_id: ChunkID,
+        lookup_ctx: &LookupContext,
+    ) -> anyhow::Result<Option<TableProof<E, PCS>>> {
+        if lookup_ctx.is_empty() {
+            Ok(None)
         } else {
             let table_node_id = self.ctx.commitment_ctx.table_node_id();
             let multiplicity_witness = self
                 .lookup_witness(table_node_id)
                 .context("No mutliplicity commitment found during table proving")?;
-            let logup_inputs = self
-                .ctx
-                .lookup
+            let logup_inputs = lookup_ctx
                 .create_logup_inputs::<PCS, E>(multiplicity_witness, &self.challenge_storage)?;
             let multiplicity_commit = PCS::get_pure_commitment(multiplicity_witness);
             // Run LogUp batch proving for all the tables at once
@@ -210,28 +229,30 @@ where
 
             // Now we takes the evals and append the correct values for commitment opening
             let all_claims = logup_batch_proof.output_claims();
-            let (mul_claims, commit_claims, _) = self.ctx.lookup.iter().fold(
-                (vec![], vec![], 0),
-                |(mut acc, mut claims_acc, skip), tt| {
+            let (mul_claims, commit_claims) = lookup_ctx
+                .iter()
+                .scan(0, |skip, tt| {
                     let take = 1 + tt.num_columns();
-                    let table_claims = all_claims
-                        .iter()
-                        .skip(skip)
-                        .take(take)
-                        .collect::<Vec<&Claim<E>>>();
-                    let mul_point = table_claims[0].point.clone();
-                    let mul_eval = table_claims[0].eval;
-                    if tt.has_committed_claims() {
-                        claims_acc.push((tt, table_claims[take - 1].clone()));
-                    }
-                    acc.push((mul_point, mul_eval));
-                    (acc, claims_acc, skip + take)
-                },
-            );
+                    let table_claims = &all_claims[*skip..*skip + take];
+                    *skip += take;
+                    Some((tt, table_claims))
+                })
+                .fold(
+                    (vec![], vec![]),
+                    |(mut acc, mut claims_acc), (tt, table_claims)| {
+                        let mul_point = table_claims[0].point.clone();
+                        let mul_eval = table_claims[0].eval;
+                        if tt.has_committed_claims() {
+                            claims_acc.push((tt, table_claims.last().unwrap().clone()));
+                        }
+                        acc.push((mul_point, mul_eval));
+                        (acc, claims_acc)
+                    },
+                );
 
             commit_claims
                 .into_iter()
-                .for_each(|(tt, claim)| self.add_table_claim(tt, claim));
+                .for_each(|(tt, claim)| self.add_table_claim(tt, chunk_id, claim));
             let grouped = mul_claims
                 .into_iter()
                 .into_group_map()
@@ -240,12 +261,10 @@ where
                 .collect::<Vec<(Point<E>, Vec<E>)>>();
             self.add_witness_claim(table_node_id, grouped);
 
-            self.table_proofs.push(TableProof {
+            Ok(Some(TableProof {
                 multiplicity_commit,
                 lookup: logup_batch_proof,
-            });
-
-            Ok(())
+            }))
         }
     }
 
@@ -502,10 +521,10 @@ where
         })
     }
 
-    fn generate_chunk_commitments<'d>(
+    fn generate_chunk_commitments(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &'d Trace<'d, E, Element, Element>,
+        chunk_trace: &Trace<E, Element>,
         group_type: GroupType,
     ) -> anyhow::Result<BTreeMap<ChunkID, PCS::Commitment>> {
         let commitments = chunk.commitments(&self.ctx.commitment_ctx, chunk_trace, group_type)?;
@@ -529,10 +548,10 @@ where
             .collect()
     }
 
-    fn generate_chunk_io_commitments<'d>(
+    fn generate_chunk_io_commitments(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &'d Trace<'d, E, Element, Element>,
+        chunk_trace: &Trace<E, Element>,
     ) -> anyhow::Result<ChunkIOCommitments<PCS::Commitment>> {
         let input_commitments =
             self.generate_chunk_commitments(chunk, chunk_trace, GroupType::Incoming)?;
@@ -546,16 +565,61 @@ where
         Ok(chunk_commitments)
     }
 
-    fn prove_chunk<'d>(
-        &mut self,
-        chunk: &ModelChunk,
-        chunk_trace: &'d Trace<'d, E, Element, Element>,
-    ) -> anyhow::Result<HashMap<NodeOutput, Claim<E>>> {
+    pub(crate) fn initialise_transcript(ctx: &ProverContext<E, PCS>) -> anyhow::Result<T>
+    where
+        T: InitTranscript,
+    {
+        let mut transcript = T::new(T::InitData::from(b"model_proving"));
+        ctx.write_to_transcript(&mut transcript)?;
+        Ok(transcript)
+    }
+
+    pub(crate) fn prove_chunk<'d>(
+        mut self,
+        chunk: ModelChunk,
+        chunk_trace: &Trace<E, Element>,
+        chunk_layers: &ModelLayersRef<'d>,
+    ) -> anyhow::Result<ChunkProof<E, PCS>> {
+        let chunk_id = chunk.chunk_id;
+        // add chunk splitting info to the transcript
+        chunk.add_chunk_data_to_transcript(self.transcript)?;
+
+        let lookup_ctx = chunk.chunk_lookup_ctx(&self.ctx.lookup);
+
+        debug!("== Instantiate witness context ==");
+        let metrics = Metrics::new();
+
+        // NOTE: until https://github.com/Plonky3/Plonky3/pull/999 is fixed, we have
+        // to use the sequential executor and not the threadpool executor.
+        self.instantiate_witness_ctx_for_chunk::<SequentialExecutor>(
+            &chunk,
+            chunk_trace,
+            &lookup_ctx,
+            chunk_layers,
+            &(),
+        )?;
+
+        // we need to compute commitments of the input/output edges of each chunk and add them
+        // to the transcript.
+        let chunk_commitments = self.generate_chunk_io_commitments(&chunk, chunk_trace)?;
+
+        let span = metrics.to_span();
+        stream_metrics("Witness context", &span);
+        debug!("== Witness context metrics {} ==", span);
+
+        debug!("== Challenge storage ==");
+        let metrics = Metrics::new();
+        // initialize challenge storgae for this chunk
+        self.challenge_storage = if lookup_ctx.is_empty() {
+            ChallengeStorage::<E>::default()
+        } else {
+            ChallengeStorage::<E>::initialise(&lookup_ctx, self.transcript)
+        };
+        debug!("== Challenge storage metrics {} ==", metrics.to_span());
+
         debug!("== Generating claims ==");
         let metrics = Metrics::new();
 
-        // compute model output claims for this chunk
-        let chunk_id = chunk.chunk_id;
         // compute the claims for the model outputs produced in this chunk, each identified by the
         // model output port ID
         let output_claims_by_port = chunk.model_outputs_in_chunk()?.into_iter()
@@ -641,10 +705,10 @@ where
                     let section = chunk_trace
                         .get_step(&node_id)
                         .ok_or(anyhow!("Step in trace not found for node {node_id}"))?;
-                    trace!(
-                        "Proving node with id {node_id}: {:?}",
-                        section.op.describe()
-                    );
+                    let op = chunk_layers
+                        .get(&node_id)
+                        .ok_or(anyhow!("Node {node_id} not found in model"))?;
+                    trace!("Proving node with id {node_id}: {:?}", op.describe());
 
                     // Load all output tensors and convert to target field
                     let handles = section
@@ -690,19 +754,15 @@ where
                         .ok_or(anyhow!(
                             "Node {node_id} is not an inner node in proving context"
                         ))?;
-                    let my_claims = if section.op.is_provable() {
-                        section
-                            .op
-                            .prove(
-                                node_id,
-                                ctx,
-                                claims_for_prove.iter().collect::<Vec<_>>(),
-                                section,
-                                self,
-                            )
-                            .with_context(|| {
-                                format!("proving {}: {}", node_id, section.op.describe())
-                            })?
+                    let my_claims = if op.is_provable() {
+                        op.prove(
+                            node_id,
+                            ctx,
+                            claims_for_prove.iter().collect::<Vec<_>>(),
+                            section,
+                            &mut self,
+                        )
+                        .with_context(|| format!("proving {}: {}", node_id, op.describe()))?
                     } else {
                         // we only propagate the claims, without changing them, as a non-provable layer
                         // shouldn't change the input values
@@ -764,94 +824,10 @@ where
             anyhow::Ok(())
         })?;
 
-        Ok(chunk_output_claims)
-    }
-
-    /// Prove by splitting the proving computation into multiple chunks, employing the `ChunkingStrategy`
-    /// provided as input to build the chunks. The number of chunks can be specified as input, otherwise
-    /// the chunking strategy will decide how many chunks to build.
-    pub(crate) fn distribute_prove<'d: 'a, S: ChunkingStrategy>(
-        mut self,
-        full_trace: &'d Trace<'d, E, Element, Element>,
-        num_chunks: Option<usize>,
-        chunking_strategy: S,
-    ) -> anyhow::Result<Proof<E, PCS>> {
-        debug!("== Instantiate witness context ==");
-        let global_metrics = Metrics::new();
-        let metrics = Metrics::new();
-        self.ctx.write_to_transcript(self.transcript)?;
-
-        self.instantiate_witness_ctx(full_trace)?;
-
-        let span = metrics.to_span();
-        stream_metrics("Witness context", &span);
-        debug!("== Witness context metrics {} ==", span);
-
-        // split in chunks
-        let chunks = self
-            .ctx
-            .model_ctx
-            .split_in_chunks(num_chunks, &chunking_strategy)?;
-
-        // split the trace in chunks
-        let chunk_traces = chunks
-            .iter()
-            .map(|chunk| chunk.chunk_trace(full_trace))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        // add chunk splitting info to the transcript
-        chunks
-            .iter()
-            .try_for_each(|chunk| chunk.add_chunk_data_to_transcript(self.transcript))?;
-
-        // we need to compute commitments of the input/output wire of each chunk and add them
-        // to the transcript. This step will be moved inside `prove_chunk` logic, as we first need
-        // to split also the witness generation process among multiple chunks
-        let chunk_commitments = chunks
-            .iter()
-            .zip(&chunk_traces)
-            .map(|(chunk, chunk_trace)| self.generate_chunk_io_commitments(chunk, chunk_trace))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        debug!("== Challenge storage ==");
-        let metrics = Metrics::new();
-        // initialize challenge storgae for this chunk
-        self.challenge_storage = if self.ctx.lookup.is_empty() {
-            ChallengeStorage::<E>::default()
-        } else {
-            ChallengeStorage::<E>::initialise(&self.ctx.lookup, self.transcript)
-        };
-        debug!("== Challenge storage metrics {} ==", metrics.to_span());
-
-        let chunk_data = chunks
-            .into_iter()
-            .zip(chunk_commitments)
-            .zip(&chunk_traces)
-            .map(|((chunk, commitments), chunk_trace)| {
-                let output_claims = self.prove_chunk(&chunk, chunk_trace)?;
-                Ok(ChunkProofData {
-                    output_evals: output_claims
-                        .into_iter()
-                        .map(|(port, claim)| {
-                            (
-                                port,
-                                PolynomialEvaluation {
-                                    num_vars: claim.point.len(),
-                                    eval: claim.eval,
-                                },
-                            )
-                        })
-                        .collect(),
-                    commitments,
-                    model_chunk: chunk,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
         // Now we have to make the table proofs
         debug!("== Generating Lookup Table claims ==");
         let metrics = Metrics::new();
-        self.prove_tables()?;
+        let table_proof = self.prove_tables(chunk_id, &lookup_ctx)?;
         let span = metrics.to_span();
         stream_metrics("Tables", &span);
         debug!("== Lookup Table claims generation metrics {} ==", span);
@@ -864,10 +840,27 @@ where
             &self.lookup_witness,
             self.transcript,
         )?;
-        let output_proof = Proof {
+        let chunk_data = ChunkProofData {
+            output_evals: chunk_output_claims
+                .into_iter()
+                .map(|(port, claim)| {
+                    (
+                        port,
+                        PolynomialEvaluation {
+                            num_vars: claim.point.len(),
+                            eval: claim.eval,
+                        },
+                    )
+                })
+                .collect(),
+            commitments: chunk_commitments,
+            model_chunk: chunk,
+        };
+
+        let chunk_proof = ChunkProof {
             steps: self.proofs,
             merge_claim_proofs: self.merge_claim_proofs,
-            table_proofs: self.table_proofs,
+            table_proof,
             commit: commit_proof,
             chunk_data,
         };
@@ -876,17 +869,148 @@ where
         stream_metrics("Proof", &span);
         debug!("== Generate proof metrics {} ==", span);
 
+        Ok(chunk_proof)
+    }
+
+    /// Build the execution graph to run the proving of chunks `chunks`.
+    /// It currently assigns one node per chunk, and the first node, with id 0,
+    /// is assigned as a coordinator, that starts the process (e.g. executes the first task)
+    /// and finishes it (outputs the final proof).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn build_execution_graph<'c>(
+        chunks: Vec<ModelChunk>,
+    ) -> anyhow::Result<ProverGraph<'a, 'c, E, T, PCS>>
+    where
+        T: InitTranscript,
+        PCS: 'static,
+    {
+        // add the input node of the graph, which is doing the preprocessing task, and the output node
+        // of the graph, which is doing the opening of the model claims
+        let mut exec_graph = ProverGraph::new();
+        let num_chunks = chunks.len();
+        let init_node_id = exec_graph
+            .add_inner(ProverGraphNode::ProverSplit(SplitNode::new(chunks)).colored(0))?;
+        let final_node_id = exec_graph.add_inner(ProverGraphNode::Final.colored(0))?;
+        // add one node in the graph for each chunk to be proven
+        for i in 0..num_chunks {
+            let color = i + 1;
+            let node_id = exec_graph.add_inner(ProverGraphNode::ChunkProver(i).colored(color))?;
+            // link initial node and final node to the current chunk node
+            exec_graph.add_edge(init_node_id, node_id, (i, 0), None)?;
+            exec_graph.add_edge(node_id, final_node_id, (0, i), None)?;
+        }
+        Ok(exec_graph)
+    }
+
+    /// Return the inputs to be provided to the execution graph `graph`
+    pub(crate) fn graph_inputs(
+        full_trace: Trace<E, Element>,
+        graph: &ProverGraph<E, T, PCS>,
+    ) -> anyhow::Result<HashMap<NodeInput, ProverGraphIO<E, PCS>>>
+    where
+        T: InitTranscript,
+        PCS: 'static,
+    {
+        let source_node = graph.source_nodes().exactly_one().map_err(|e| {
+            anyhow!(
+                "Expected 1 source node for execution graph, found {}",
+                e.count()
+            )
+        })?;
+        Ok([(
+            NodeInput::new(source_node, 0),
+            ProverGraphIO::ProverSplitInput(full_trace),
+        )]
+        .into())
+    }
+
+    fn run_execution_graph<'c, Ex>(
+        exec_graph: ProverGraph<'a, 'c, E, T, PCS>,
+        inputs: HashMap<NodeInput, ProverGraphIO<E, PCS>>,
+        context: &LocalProverCtx<'a, 'c, E, PCS>,
+        config: Ex::Config,
+    ) -> anyhow::Result<Proof<E, PCS>>
+    where
+        T: InitTranscript,
+        Ex: Executor<ProverGraphNode<'a, 'c, E, T, PCS>, usize>,
+        PCS: 'static,
+    {
+        let scheduler = GraphScheduler::new(exec_graph);
+        Ex::run(&config, scheduler, inputs, context)?
+            .into_values()
+            .exactly_one()
+            .map_err(|e| {
+                anyhow!(
+                    "Expected one output after running the graph, found {}",
+                    e.count()
+                )
+            })
+            .and_then(|output| {
+                if let ProverGraphIO::FinalProof(proof) = output {
+                    Ok(proof)
+                } else {
+                    bail!("Expected final proof as output of execution graph")
+                }
+            })
+    }
+
+    /// Prove by splitting the proving computation into multiple chunks, employing the `ChunkingStrategy`
+    /// provided as input to build the chunks. The number of chunks can be specified as input, otherwise
+    /// the chunking strategy will decide how many chunks to build.
+    pub fn chunked_prove_local<
+        'd,
+        S: ChunkingStrategy,
+        Ex: Executor<ProverGraphNode<'a, 'd, E, T, PCS>, usize>,
+    >(
+        ctx: &'a ProverContext<E, PCS>,
+        full_trace: Trace<E, Element>,
+        num_chunks: Option<usize>,
+        chunking_strategy: S,
+        model: &'d Model<Element>,
+        executor_conf: Ex::Config,
+    ) -> anyhow::Result<Proof<E, PCS>>
+    where
+        T: InitTranscript,
+        PCS: 'static,
+    {
+        // split in chunks
+        let chunks = ctx
+            .model_ctx
+            .split_in_chunks(num_chunks, &chunking_strategy)?;
+
+        let global_metrics = Metrics::new();
+
+        let output_proof = {
+            // build the computational graph to prove chunks
+            let graph = Self::build_execution_graph(chunks)?;
+            let inputs = Self::graph_inputs(full_trace, &graph)?;
+            let context = LocalProverCtx::new(ctx, model);
+            Self::run_execution_graph::<Ex>(graph, inputs, &context, executor_conf)?
+        };
+
         let global_metrics_span = global_metrics.to_span();
         stream_metrics("Global", &global_metrics_span);
         debug!("== Global metrics {} ==", global_metrics_span);
         Ok(output_proof)
     }
 
-    pub fn prove<'d: 'a>(
-        self,
-        full_trace: &'d Trace<'d, E, Element, Element>,
-    ) -> anyhow::Result<Proof<E, PCS>> {
-        self.distribute_prove(full_trace, Some(1), DefaultChunkingStrategy::default())
+    pub fn prove<'d>(
+        ctx: &'a ProverContext<E, PCS>,
+        full_trace: Trace<E, Element>,
+        model: &'d Model<Element>,
+    ) -> anyhow::Result<Proof<E, PCS>>
+    where
+        T: InitTranscript,
+        PCS: 'static,
+    {
+        Self::chunked_prove_local::<_, SequentialExecutor>(
+            ctx,
+            full_trace,
+            Some(1),
+            DefaultChunkingStrategy::default(),
+            model,
+            (),
+        )
     }
 
     /// Flattens all the claims to give to the proving logic of the node. If
@@ -941,14 +1065,30 @@ where
 
     /// Looks at all the individual polys to accumulate from the witnesses and create the context from that.
     #[timed_instrument]
-    fn instantiate_witness_ctx<'d: 'a>(
+    fn instantiate_witness_ctx_for_chunk<
+        'c,
+        'd,
+        Ex: Executor<GenerateWitness<'c, 'a, 'd, E, PCS>, usize>,
+    >(
         &mut self,
-        trace: &'d Trace<'d, E, Element, Element>,
+        chunk: &ModelChunk,
+        chunk_trace: &'c Trace<E, Element>,
+        lookup_ctx: &LookupContext,
+        chunk_layers: &'d ModelLayersRef<'d>,
+        executor_config: &Ex::Config,
     ) -> anyhow::Result<()> {
         let LookupWitness {
             logup_witnesses,
             table_witnesses,
-        } = generate_lookup_witnesses::<E, T, PCS>(trace, self.ctx, self.transcript)?;
+        } = generate_lookup_witness_for_chunk::<E, T, PCS, _, Ex>(
+            &chunk.subgraph,
+            lookup_ctx,
+            chunk_trace,
+            self.ctx,
+            self.transcript,
+            chunk_layers,
+            executor_config,
+        )?;
         self.lookup_witness = logup_witnesses;
 
         if let Some(commit) = table_witnesses {

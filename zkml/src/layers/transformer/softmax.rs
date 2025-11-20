@@ -1295,7 +1295,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut crate::Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
@@ -1315,7 +1315,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let input_tensors = step_data.input_tensors()?;
         let output_tensors = step_data.output_tensors()?;
@@ -1393,7 +1393,7 @@ pub struct SoftmaxCtx {
     /// This is the quantisation data for the [`Softmax`] op
     quant_info: QuantisedSoftmaxData,
     /// The data about the lookups that are performed in this layer
-    lookup_ctx: LayerLookupContext,
+    pub(crate) lookup_ctx: LayerLookupContext,
 }
 
 impl LayerLookupContext {
@@ -1539,18 +1539,9 @@ impl ProveInfo for Softmax<Element> {
             // Calculate the allowable error in normalisation as an Element
             let allowable_error = (error_bound * lut.output_sf()).round() as Element;
 
-            // Add the tables that Softmax requires
-            aux.tables.insert(TableType::Range);
-            aux.tables.insert(TableType::ExpTable(lut));
-            aux.tables.insert(TableType::ErrorTable(
-                lut.output_sf() as Element,
-                allowable_error,
-            ));
-
             // If there is one add the ZeroTable
             let number_zero_chunks = quant_info.number_of_zero_chunks();
             let number_of_range_checks = quant_info.number_of_range_checks();
-            aux.tables.insert(TableType::ZeroTable);
             let tables = vec![
                 TableType::Range,
                 TableType::ExpTable(lut),

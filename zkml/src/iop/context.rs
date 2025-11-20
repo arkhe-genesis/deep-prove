@@ -2,6 +2,7 @@ use crate::{
     Element, Shape,
     commit::mmcs_context::{CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext},
     graph::{Node, NodeId, NodeInput, NodeOutput, order_by_in_port},
+    iop::chunking::{ChunkingStrategy, ModelChunk},
     layers::{
         Layer, LayerCtx,
         provable::{OpInfo, ProveInfo},
@@ -12,10 +13,11 @@ use crate::{
     to_base,
 };
 use ff_ext::ExtensionField;
+use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, trace};
 use transcript::Transcript;
 use utils::Metrics;
@@ -48,6 +50,14 @@ where
     pub fn write_to_transcript<T: Transcript<E>>(&self, t: &mut T) -> anyhow::Result<()> {
         self.commitment_ctx.write_to_transcript(t)?;
         Ok(())
+    }
+
+    pub fn split_in_chunks<S: ChunkingStrategy>(
+        &self,
+        num_chunks: Option<usize>,
+        strategy: S,
+    ) -> anyhow::Result<Vec<ModelChunk>> {
+        self.model_ctx.split_in_chunks(num_chunks, &strategy)
     }
 }
 
@@ -90,14 +100,12 @@ impl Model<Element> {
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
-        let tables = BTreeSet::new();
         let mut max_poly_len = input_shapes
             .iter()
             .fold(0usize, |acc, shapes| acc.max(shapes.product()));
 
         // An accumulator used to carry information over while converting the graph
         let mut ctx_aux = ContextAux {
-            tables,
             last_output_shape: input_shapes.to_vec(),
             model_polys: None,
             max_poly_len,
@@ -105,6 +113,7 @@ impl Model<Element> {
 
         // TODO: refactor that management of polys
         let mut model_polys = HashMap::<CommitmentId, MultilinearExtension<E>>::new();
+        let mut tables = BTreeMap::<TableType, Vec<NodeId>>::new();
         // The shape register is filled along the traversal of the graph.
         let mut shapes: HashMap<NodeOutput, Shape> = HashMap::new();
         debug!("Context : layer info generation ...");
@@ -123,7 +132,12 @@ impl Model<Element> {
                         .collect();
                     let layer_ctx =
                         compute_layer_ctx::<E>(&mut ctx_aux, &mut model_polys, id, layer)?;
-
+                    if let Some(lookup_ctx) = layer_ctx.lookup_context() {
+                        lookup_ctx
+                            .tables
+                            .iter()
+                            .for_each(|table_type| tables.entry(*table_type).or_default().push(id));
+                    }
                     // NOTE: `ctx.last_output_shape` **will** have been modified
                     // by `compute_layer_ctx`, so these shapes are not the one
                     // that have been computed above.
@@ -155,7 +169,7 @@ impl Model<Element> {
             })
         })?;
         // Check to see if we use a lookup table larger than any of the individual polynomials
-        ctx_aux.tables.iter().for_each(|table_type| {
+        tables.keys().for_each(|table_type| {
             let inner_metrics = Metrics::new();
             let multiplicity_vars = table_type.multiplicity_poly_vars();
             max_poly_len = max_poly_len.max(1 << multiplicity_vars);
@@ -167,7 +181,7 @@ impl Model<Element> {
 
         let metrics = Metrics::new();
         debug!("Context: lookup generation ...");
-        let lookup_ctx = LookupContext::new(&ctx_aux.tables);
+        let lookup_ctx = LookupContext::new(&tables);
         debug!("{} lookup generated.", metrics.to_span());
 
         let metrics = Metrics::new();
@@ -175,7 +189,7 @@ impl Model<Element> {
         let commitment_ctx = GlobalCommitmentContext::<E, PCS>::new(
             max_poly_len,
             model_polys,
-            &lookup_ctx.tables,
+            &lookup_ctx.tables.keys().collect_vec(),
             graph_ctx.next_node_id(),
         )?;
         debug!("{} commitment generated.", metrics.to_span());
@@ -285,7 +299,6 @@ impl ShapeStep {
 /// Auxiliary information for the context creation
 #[derive(Clone, Debug)]
 pub struct ContextAux {
-    pub tables: BTreeSet<TableType>,
     pub last_output_shape: Vec<Shape>,
     pub model_polys: Option<HashMap<CommitmentId, Vec<Element>>>,
     /// This field is only used in macro layers like MHA

@@ -32,7 +32,8 @@ use transcript::Transcript;
 
 /// Enum if the output of evaluating a layer returns extra data needed during proving.
 /// This should only be implemented for quantised layers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 #[allow(clippy::large_enum_variant)]
 pub enum ProvingData<E: ExtensionField> {
     /// Variant for extra data used in proving that we compute during evalaution of quantised convolution.
@@ -315,7 +316,7 @@ where
         _node_id: NodeId,
         _ctx: &'b Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        _step_data: &Step<E, Element, Element>,
+        _step_data: &Step<E, Element>,
         _prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
@@ -331,7 +332,7 @@ where
         &self,
         _id: NodeId,
         _ctx: &ProverContext<E, PCS>,
-        _step_data: &Step<E, Element, Element>,
+        _step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         Ok(Default::default())
     }

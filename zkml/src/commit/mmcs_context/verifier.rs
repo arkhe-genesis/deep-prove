@@ -1,10 +1,10 @@
 //! Module containing code to verify a [`ModelOpeningProof`].
-use super::{CommitmentVerifierCtx, ModelOpeningProof};
+use super::{CommitmentVerifierCtx, OpeningProof};
 use crate::{
     Claim,
     commit::{
         identity_eval,
-        mmcs_context::{build_sumcheck_expression, table_poly_id},
+        mmcs_context::{ModelClaims, build_sumcheck_expression, table_poly_id},
     },
     graph::NodeId,
     lookup::context::TableType,
@@ -72,7 +72,7 @@ pub struct CommitmentVerifier<E: ExtensionField, PCS: PolynomialCommitmentScheme
     /// The `NodeId` is only employed to sort the claims related to the same
     /// static tensor, assuming that only one claim for a static tensor is
     /// produced in each node
-    model_claims: HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>>>,
+    pub(crate) model_claims: ModelClaims<E>,
     /// The list of claims about the witness
     witness_claims: BTreeMap<NodeId, VerifierClaim<E, PCS>>,
 }
@@ -80,10 +80,11 @@ pub struct CommitmentVerifier<E: ExtensionField, PCS: PolynomialCommitmentScheme
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E, PCS> {
     pub fn new() -> CommitmentVerifier<E, PCS> {
         CommitmentVerifier {
-            model_claims: HashMap::new(),
+            model_claims: ModelClaims::new(),
             witness_claims: BTreeMap::new(),
         }
     }
+
     pub fn add_witness_claim(
         &mut self,
         node_id: NodeId,
@@ -109,19 +110,22 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
         table_type: &TableType,
         claim: Claim<E>,
     ) {
-        self.model_claims.insert(
-            table_poly_id(table_type.name()),
-            BTreeMap::from([(table_node_id, claim)]),
+        assert!(
+            self.model_claims
+                .entry(table_poly_id(table_type.name()))
+                .or_default()
+                .insert(table_node_id, claim)
+                .is_none()
         );
     }
 
     pub fn verify<T: Transcript<E>>(
         &mut self,
         ctx: &CommitmentVerifierCtx<E, PCS>,
-        proof: ModelOpeningProof<E, PCS>,
+        proof: OpeningProof<E, PCS>,
         transcript: &mut T,
     ) -> Result<()> {
-        let ModelOpeningProof {
+        let OpeningProof {
             sumcheck_proof,
             sumcheck_evals,
             pcs_proof,
@@ -135,7 +139,8 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
 
         // First we verify the Sumcheck proof that allows us to open all of the model polynomials at the same point
         let mut model_claims = std::mem::take(&mut self.model_claims);
-        if let Some(model_commitment) = ctx.model_commitment.as_ref() {
+        if ctx.model_commitment.is_some() && !model_claims.is_empty() {
+            let model_commitment = ctx.model_commitment.as_ref().unwrap();
             let model_claim = Self::verify_model_sumcheck(
                 &mut model_claims,
                 sumcheck_proof,
@@ -180,9 +185,17 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
                     let (eq_points, inner_evals, num_claims) = claim_keys.iter().try_fold(
                         (vec![], vec![], vec![]),
                         |(mut point_acc, mut inner_evals_acc, mut num_claims_per_poly), key| {
-                            let claims = model_claims
-                                .remove(key)
-                                .ok_or(anyhow!("No Claim found for mode poly {key}"))?;
+                            let claims = if let Some(claims) = model_claims
+                                .remove(key) {
+                                    claims
+                                } else {
+                                    [(
+                                        0.into(), // we use a dummy node id since it will not be used anyhow 
+                                        commit_ctx.precomputed_model_claims.get(key)
+                                            .ok_or(anyhow!("No precomputed claim found for model poly {key}"))?
+                                            .clone()
+                                    )].into_iter().collect()
+                                };
                             num_claims_per_poly.push(claims.len());
                             claims.into_iter().for_each(|(_, claim)| {
                                 let Claim { point, eval } = claim;

@@ -2,10 +2,10 @@ use super::{
     NodeId,
     scheduler::{ExecNode, GraphScheduler, ReleasePolicy},
 };
-use crate::graph::NodeInput;
+use crate::graph::{NodeInput, NodeOutput};
 use crossbeam_channel::unbounded;
 use rayon::scope;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A trait defining execution strategies for computational graphs.
 ///
@@ -56,7 +56,7 @@ pub trait Executor<N: ExecNode, C> {
         scheduler: GraphScheduler<N, C>,
         input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
-    ) -> anyhow::Result<Vec<N::IO>>;
+    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>>;
 }
 
 /// An executor that runs nodes sequentially in dependency order.
@@ -100,19 +100,20 @@ where
         mut scheduler: GraphScheduler<N, C>,
         input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
-    ) -> anyhow::Result<Vec<N::IO>> {
+    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
         let mut ready_nodes = scheduler.init_nodes(input_data)?;
-        let mut outputs = Vec::new();
+        let mut outputs = HashMap::new();
         while !scheduler.is_done() {
-            outputs = ready_nodes
+            let node_outputs = ready_nodes
                 .iter_mut()
                 .map(|node| node.run(context))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             ready_nodes
                 .drain(..)
-                .zip(outputs.clone())
+                .zip(node_outputs)
                 .for_each(|(node, output)| {
-                    scheduler.mark_done(node.node_id, &output).unwrap();
+                    let graph_outputs = scheduler.mark_done(node.node_id, &output).unwrap();
+                    outputs.extend(graph_outputs);
                 });
             ready_nodes = scheduler.next_ready_nodes()?;
         }
@@ -174,12 +175,11 @@ where
         scheduler: GraphScheduler<N, C>,
         input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
-    ) -> anyhow::Result<Vec<N::IO>> {
+    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
         // we want to release all ready nodes all the time so that the threadpool is always busy
         let mut scheduler = scheduler.with_release_policy(ReleasePolicy::All);
-        let output_nodes: HashSet<_> = scheduler.output_nodes().into_iter().collect();
         // final vector to collect outputs on the main thread
-        let mut outputs = Vec::with_capacity(output_nodes.len());
+        let mut outputs = HashMap::new();
         //  channel to send results from task thread to the scoped logic
         let (result_sender, result_receiver) = unbounded();
         // channel to send results from scoped logic to main thread
@@ -194,9 +194,9 @@ where
                 // execute all ready tasks
                 for mut node in ready_nodes.drain(..) {
                     let result_sender_local = result_sender.clone();
+                    let node_id = node.node_id;
                     // we put the task in the rayon threadpool and it'll be executed as soon as possible
                     s.spawn(move |_| {
-                        let node_id = node.node_id;
                         match node.run(context) {
                             Ok(output) => result_sender_local.send((node_id, Ok(output))).unwrap(),
                             // transmit error back to the main thread
@@ -207,15 +207,14 @@ where
                 // wait for a result - there is always one result
                 // since we know the graph is not done yet and each time
                 // we have an output we check if the graph is done
-                let (node_idx, output): (NodeId, Result<N::IO, anyhow::Error>) =
+                let (node_idx, output): (NodeId, Result<Vec<N::IO>, anyhow::Error>) =
                     result_receiver.recv().unwrap();
                 match output {
                     Ok(output) => {
-                        if output_nodes.contains(&node_idx) {
-                            // signal the output to the main thread
-                            outputs_sender.clone().send(Ok(output.clone())).unwrap();
+                        let graph_outputs = scheduler.mark_done(node_idx, &output).unwrap();
+                        if !graph_outputs.is_empty() {
+                            outputs_sender.clone().send(Ok(graph_outputs)).unwrap()
                         }
-                        scheduler.mark_done(node_idx, &output).unwrap();
                         ready_nodes = scheduler.next_ready_nodes()?;
                     }
                     Err(e) => {
@@ -229,7 +228,7 @@ where
             Ok(())
         })?;
         for output in outputs_receiver.iter() {
-            outputs.push(output?);
+            outputs.extend(output?)
         }
         Ok(outputs)
     }
@@ -252,6 +251,7 @@ pub mod tests {
         Div,
         Sub,
         Pow2,
+        Sqrt,
     }
 
     impl ExecNode for MathAST {
@@ -265,19 +265,28 @@ pub mod tests {
                 MathAST::Div => "Div".to_string(),
                 MathAST::Sub => "Sub".to_string(),
                 MathAST::Pow2 => "Pow2".to_string(),
+                MathAST::Sqrt => "Sqrt".to_string(),
             }
         }
-        fn run(&self, _ctx: &Self::Context, inputs: Vec<Self::IO>) -> anyhow::Result<Self::IO> {
+        fn run(
+            &self,
+            _ctx: &Self::Context,
+            inputs: Vec<Self::IO>,
+        ) -> anyhow::Result<Vec<Self::IO>> {
             match self {
                 MathAST::Input(_) => {
                     assert_eq!(inputs.len(), 1);
-                    Ok(inputs[0])
+                    Ok(vec![inputs[0]])
                 }
-                MathAST::Add => Ok(inputs[0] + inputs[1]),
-                MathAST::Mul => Ok(inputs[0] * inputs[1]),
-                MathAST::Div => Ok(inputs[0] / inputs[1]),
-                MathAST::Sub => Ok(inputs[0] - inputs[1]),
-                MathAST::Pow2 => Ok(inputs[0] * inputs[0]),
+                MathAST::Add => Ok(vec![inputs[0] + inputs[1]]),
+                MathAST::Mul => Ok(vec![inputs[0] * inputs[1]]),
+                MathAST::Div => Ok(vec![inputs[0] / inputs[1]]),
+                MathAST::Sub => Ok(vec![inputs[0] - inputs[1]]),
+                MathAST::Pow2 => Ok(vec![inputs[0] * inputs[0]]),
+                MathAST::Sqrt => {
+                    let sqrt = (inputs[0] as f64).sqrt().round() as i32;
+                    Ok(vec![sqrt, -sqrt])
+                }
             }
         }
     }
@@ -319,8 +328,8 @@ pub mod tests {
             .collect();
         let output = SequentialExecutor::run(&(), scheduler.clone(), inputs.clone(), &()).unwrap();
         // (1+2) + ((1 + 2) * 3)  = 12
-        let expected_output = vec![12];
-        assert_eq!(output, expected_output);
+        let expected_output = 12;
+        assert_eq!(*output.values().next().unwrap(), expected_output);
 
         let thread_output = ThreadPoolExecutor::run(&(), scheduler.clone(), inputs, &()).unwrap();
         assert_eq!(thread_output, output);

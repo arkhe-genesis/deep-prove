@@ -68,6 +68,7 @@ tracing-subscriber = { workspace = true, features = [
   "json",
 ] }
 tract-onnx = { workspace = true }
+transcript.workspace = true
 ureq = { workspace = true }
 url = "2.5.4"
 uuid = "1.17.0"

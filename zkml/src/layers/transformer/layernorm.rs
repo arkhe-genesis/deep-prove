@@ -368,7 +368,7 @@ pub struct LayerNormCtx<E: ExtensionField> {
     /// The base 2 logarithm of the multiplier for the most significant chunk we range check
     top_chunk_scalar_log: usize,
     /// The lookup info for the layer
-    lookup_ctx: LayerLookupContext,
+    pub(crate) lookup_ctx: LayerLookupContext,
     /// The sumcheck expression for verifying the lookup input and layer output are correctly calculated
     first_sumcheck_expression: Vec<Expression<E>>,
     /// The sumcheck expression that verifies the mean has been calculated correctly
@@ -710,10 +710,6 @@ impl ProveInfo for LayerNorm<Element> {
                 ..
             } = quant_info;
 
-            // Add the tables that LayerNorm requires
-            aux.tables.insert(TableType::Range);
-            aux.tables.insert(TableType::InverseSQRT(*lut));
-
             let num_range_checks = (lut.range_check_bits() - 1) / *quantization::BIT_LEN + 1;
             let tables = vec![TableType::Range, TableType::InverseSQRT(*lut)];
             let instances_per_table = vec![num_range_checks, 1];
@@ -880,7 +876,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -917,7 +913,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let output_tensors = step_data.output_tensors()?;
         ensure!(

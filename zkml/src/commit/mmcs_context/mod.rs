@@ -1,10 +1,14 @@
 //! Module containing the logic to commit to instance and witness polynomials for a model using a MMCS
-use crate::{graph::NodeId, lookup::context::TableType, tensor::CommitmentId};
+use crate::{
+    Claim, VectorTranscript, commit::compute_betas_eval, graph::NodeId, lookup::context::TableType,
+    tensor::CommitmentId,
+};
 use anyhow::{Context, Result, anyhow};
 use either::Either;
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{Expression, mle::MultilinearExtension, util::transpose};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -12,7 +16,7 @@ use std::{
 };
 use sumcheck::structs::IOPProof;
 use tracing::debug;
-use transcript::Transcript;
+use transcript::{BasicTranscript, Transcript};
 use utils::Metrics;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
@@ -40,6 +44,9 @@ where
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
     model_comms_map: BTreeMap<usize, Vec<CommitmentId>>,
+    /// Set of precomputed claims for each model polynomial being committed.
+    /// These claims are employed when there is no claim to be opened for the corresponding model polynomial
+    precomputed_model_claims: HashMap<CommitmentId, Claim<E>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
@@ -57,6 +64,7 @@ where
             .field("prover_params", &self.prover_params)
             .field("verifier_params", &self.verifier_params)
             .field("model_comms_map", &self.model_comms_map)
+            .field("precomputed_model_claims", &self.precomputed_model_claims)
             .field("table_node_id", &self.table_node_id)
             .field("max_model_num_vars", &self.max_model_num_vars)
             .finish()
@@ -111,7 +119,7 @@ where
     pub fn new(
         witness_poly_size: usize,
         polys: HashMap<CommitmentId, MultilinearExtension<E>>,
-        lookup_ctx: &[TableType],
+        lookup_ctx: &[&TableType],
         max_node_id: NodeId,
     ) -> Result<GlobalCommitmentContext<E, PCS>> {
         // Find the maximum size so we can generate params
@@ -140,9 +148,11 @@ where
         // First we take all the model polys and sort them by the number of variables they have.
         // Then we do the same for any table commitments but here we set all of them to have `table_node_id`.
         let table_commitments_check = lookup_ctx.iter().any(|tt| tt.has_committed_claims());
-        let (model_commitment, model_comms_map) = if !polys.is_empty() || table_commitments_check {
+        let (model_commitment, model_comms_map, dummy_model_claims) = if !polys.is_empty()
+            || table_commitments_check
+        {
             let m = Metrics::new();
-            let map = polys
+            let (map, dummy_model_claims) = polys
                 .into_iter()
                 .map(|(poly_id, poly)| (poly.num_vars(), (poly_id, poly)))
                 .chain(lookup_ctx.iter().filter_map(|table_type| {
@@ -151,15 +161,19 @@ where
                         .map(|mle| (mle.num_vars(), (table_poly_id(table_type.name()), mle)))
                 }))
                 .fold(
-                    BTreeMap::new(),
-                    |mut map_acc, (num_vars, (poly_id, mle))| {
+                    (BTreeMap::new(), HashMap::new()),
+                    |(mut map_acc, mut dummy_claims), (num_vars, (poly_id, mle))| {
                         let (ids, polys): &mut (Vec<CommitmentId>, Vec<MultilinearExtension<E>>) =
                             map_acc
                                 .entry(num_vars)
                                 .or_insert_with(|| (Vec::new(), Vec::new()));
+                        dummy_claims.insert(
+                            poly_id.clone(),
+                            Self::precomputed_claim_for_poly(poly_id.clone(), &mle),
+                        );
                         ids.push(poly_id);
                         polys.push(mle);
-                        map_acc
+                        (map_acc, dummy_claims)
                     },
                 );
             debug!("{} map created", m.to_span());
@@ -199,9 +213,9 @@ where
                 .map_err(|e| anyhow!("{e:?}"))
                 .context("Batch Commitment")?;
             debug!("{} model commitment built", m.to_span());
-            (Some(model_commitment), model_comms_map)
+            (Some(model_commitment), model_comms_map, dummy_model_claims)
         } else {
-            (None, BTreeMap::new())
+            (None, BTreeMap::new(), HashMap::new())
         };
 
         let max_model_num_vars = model_comms_map.keys().max().copied().unwrap_or(0usize);
@@ -210,9 +224,22 @@ where
             prover_params,
             model_commitment,
             model_comms_map,
+            precomputed_model_claims: dummy_model_claims,
             table_node_id,
             max_model_num_vars,
         })
+    }
+
+    fn precomputed_claim_for_poly(
+        poly_id: CommitmentId,
+        mle: &MultilinearExtension<E>,
+    ) -> Claim<E> {
+        let mut transcript = BasicTranscript::new(b"dummy_model_claim");
+        transcript.append_message(String::from(poly_id).as_bytes());
+        // squeeze a random point to evaluate the `mle`
+        let point = transcript.read_challenges(mle.num_vars());
+        let eval = mle.evaluate(&point);
+        Claim::new(point, eval)
     }
 
     /// Generate a prover/verifier context for the `witness_poly_size` specified as input;
@@ -227,6 +254,7 @@ where
             verifier_params,
             model_commitment,
             model_comms_map,
+            precomputed_model_claims,
             table_node_id,
             max_model_num_vars,
             ..
@@ -238,6 +266,7 @@ where
             model_commitment: model_commitment
                 .as_ref()
                 .map(|commit_with_wit| PCS::get_pure_commitment(commit_with_wit)),
+            precomputed_model_claims: precomputed_model_claims.clone(),
             table_node_id,
             max_model_num_vars,
         };
@@ -245,6 +274,13 @@ where
         let prover_ctx = CommitmentProverCtx {
             prover_params,
             model_comms_map,
+            precomputed_model_claims: precomputed_model_claims
+                .into_par_iter()
+                .map(|(poly_id, claim)| {
+                    let beta_evals = compute_betas_eval(&claim.point);
+                    (poly_id, PrecomputedModelClaim { claim, beta_evals })
+                })
+                .collect(),
             model_commitment,
             table_node_id,
             max_model_num_vars,
@@ -252,6 +288,15 @@ where
 
         Ok((prover_ctx, verifier_ctx))
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PrecomputedModelClaim<E> {
+    /// The precomputed model claim
+    claim: Claim<E>,
+    /// The evaluation of the beta polynomials over claim.point, which is needed
+    /// in the opening proof
+    beta_evals: Vec<E>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -270,6 +315,9 @@ where
     model_commitment: Option<PCS::CommitmentWithWitness>,
     /// Map that stores the position of each individual polynomial in the batch commitment
     model_comms_map: BTreeMap<usize, Vec<CommitmentId>>,
+    /// Set of precomputed claims for each model polynomial being committed.
+    /// These claims are employed when there is no claim to be opened for the corresponding model polynomial
+    precomputed_model_claims: HashMap<CommitmentId, PrecomputedModelClaim<E>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
@@ -286,6 +334,7 @@ where
         f.debug_struct("CommitmentProverCtx")
             .field("prover_params", &self.prover_params)
             .field("model_comms_map", &self.model_comms_map)
+            .field("precomputed_model_claims", &self.precomputed_model_claims)
             .field("table_node_id", &self.table_node_id)
             .field("max_model_num_vars", &self.max_model_num_vars)
             .finish()
@@ -339,6 +388,9 @@ where
     model_commitment: Option<PCS::Commitment>,
     /// Map that stores the position of each individual polynomial in the batch commitment
     model_comms_map: BTreeMap<usize, Vec<CommitmentId>>,
+    /// Set of precomputed dummy claims for each model polynomial being committed.
+    /// These claims are employed when there is no claim to be opened for the corresponding model polynomial
+    precomputed_model_claims: HashMap<CommitmentId, Claim<E>>,
     /// This is the [`NodeId`] used for tables in this model
     table_node_id: NodeId,
     /// This is the largest number of variables of any of the polynomials in `model_commitment`
@@ -354,6 +406,7 @@ where
         f.debug_struct("CommitmentVerifierCtx")
             .field("verifier_params", &self.verifier_params)
             .field("model_comms_map", &self.model_comms_map)
+            .field("precomputed_model_claims", &self.precomputed_model_claims)
             .field("table_node_id", &self.table_node_id)
             .field("max_model_num_vars", &self.max_model_num_vars)
             .finish()
@@ -381,9 +434,12 @@ where
     }
 }
 
+// Type alias used to represent the set of claims of the model polys
+pub(crate) type ModelClaims<E> = HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>>>;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ModelOpeningProof<E, PCS: PolynomialCommitmentScheme<E>>
+pub struct OpeningProof<E, PCS: PolynomialCommitmentScheme<E>>
 where
     E: ExtensionField + Serialize + DeserializeOwned,
 {
@@ -391,6 +447,6 @@ where
     sumcheck_proof: IOPProof<E>,
     /// This is the list of evals for all the model commitments after the sumcheck.
     sumcheck_evals: Vec<E>,
-    /// The opening proof for the commitments
+    /// The opening proof for the commitments FOR the witness polynomials
     pcs_proof: PCS::Proof,
 }

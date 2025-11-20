@@ -734,7 +734,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<crate::Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;

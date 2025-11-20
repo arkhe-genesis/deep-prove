@@ -5,9 +5,9 @@ use super::{
 };
 use crate::{
     Deserialize, Serialize,
-    graph::{NodeId, NodeInput},
+    graph::{NodeId, NodeInput, NodeOutput},
 };
-use anyhow::{bail, ensure};
+use anyhow::{anyhow, bail, ensure};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
@@ -40,29 +40,29 @@ use std::{
 /// // Partitions are typically created through graph partitioning
 /// // See ExecGraph::partition_by_color for examples
 /// ```
-#[derive(Debug, Clone)]
-pub struct Partition<N: ExecNode, C> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Partition<N: ExecNode, C: Eq + Hash> {
     /// The color identifier for this partition - all nodes in the partition share this color
-    color: C,
+    pub color: C,
     /// The executable subgraph for this partition
     ///
     /// Uses Option to allow consuming the graph during execution without cloning.
     /// The graph contains only nodes with the same color as this partition.
-    graph: Option<ExecGraph<N, C>>,
-    /// The color of the parent partition that should receive this partition's output
+    pub graph: Option<ExecGraph<N, C>>,
+    /// The colors of the parent partitions that should receive this partition's output
     ///
     /// `None` if this partition produces the final output of the entire computation.
-    parent_partition: Option<C>,
+    pub parent_partitions: HashMap<C, NodeOutput>,
     /// Set of child partition colors whose outputs this partition depends on
     ///
     /// When this partition executes, it must wait for outputs from all child partitions.
     /// The ordering is maintained through the BTreeSet to ensure deterministic execution.
-    child_partition: HashMap<C, NodeInput>,
+    pub child_partition: HashMap<C, NodeInput>,
     /// Input data for source partitions
     ///
     /// Source partitions (those with no child partitions) receive external input data.
     /// Non-source partitions have empty inputs and wait for child partition outputs.
-    inputs: HashMap<NodeId, N::IO>,
+    pub inputs: HashMap<NodeId, N::IO>,
 }
 
 impl<N: ExecNode, C> Partition<N, C>
@@ -102,18 +102,16 @@ where
         graph: ExecGraph<N, C>,
         child_partition: HashMap<C, NodeInput>,
         inputs: HashMap<NodeId, N::IO>,
-        parent_partition: Option<C>,
+        parent_partitions: HashMap<C, NodeOutput>,
     ) -> anyhow::Result<Self> {
         ensure!(
             graph.sink_nodes().count() == 1,
             "graph should have exactly one output node"
         );
-        if let Some(ref parent_color) = parent_partition {
-            ensure!(
-                parent_color != &color,
-                "parent partition should not be the same as the current partition"
-            );
-        }
+        ensure!(
+            !parent_partitions.keys().any(|c| c == &color),
+            "parent partition should not be the same as the current partition"
+        );
         ensure!(
             !child_partition.contains_key(&color),
             "child partition should not contain the current partition"
@@ -132,7 +130,7 @@ where
             graph: Some(graph),
             child_partition,
             inputs,
-            parent_partition,
+            parent_partitions,
         })
     }
     /// Returns true if this is a source partition (has external inputs).
@@ -175,20 +173,20 @@ where
 /// // Outputs are typically created by the partition scheduler
 /// // during execution, not constructed manually
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionOutput<N: ExecNode, C> {
     /// The color of the partition that produced this output
-    from: C,
-    /// The color of the partition that should receive this output
+    pub from: C,
+    /// The colors of the partitions that should receive this output.
     ///
     /// `None` indicates this is a final output of the entire computation
-    to: Option<C>,
+    pub to: Option<C>,
     /// The actual output data produced by the partition
     ///
     /// Due to the partitioning constraint of at most one edge between partition pairs,
     /// each partition produces exactly one output. However, partitions can have
     /// multiple inputs from different child partitions.
-    output: N::IO,
+    pub output: N::IO,
 }
 
 impl<N: ExecNode, C> PartitionOutput<N, C> {
@@ -238,7 +236,7 @@ impl<N: ExecNode, C> PartitionOutput<N, C> {
 /// // Schedulers are typically created with partitions from graph partitioning
 /// // See the test cases for complete usage examples
 /// ```
-pub struct PartitionScheduler<N: ExecNode, C, E: Executor<N, C>> {
+pub struct PartitionScheduler<N: ExecNode, C: Eq + Hash, E: Executor<N, C>> {
     /// Queue of partitions to be executed in order
     ///
     /// Only one partition is active at a time. If multiple partitions could run
@@ -258,6 +256,8 @@ pub struct PartitionScheduler<N: ExecNode, C, E: Executor<N, C>> {
     pending_child_outputs: HashMap<C, N::IO>,
     /// Execution context shared across all partition executions
     context: N::Context,
+    /// The color of all partitions for this scheduler
+    pub color: C,
 }
 
 impl<N, C, E> PartitionScheduler<N, C, E>
@@ -308,11 +308,17 @@ where
                 .all(|p| p.graph.as_ref().unwrap().sink_nodes().count() == 1),
             "All partitions must have exactly one output node"
         );
+        let color = partitions.first().unwrap().color.clone();
+        ensure!(
+            partitions.iter().all(|p| p.color == color),
+            "All partitions must have the same color"
+        );
         Ok(Self {
             partitions,
             executor_config,
             pending_child_outputs: HashMap::new(),
             context,
+            color,
         })
     }
     /// Attempts to execute the next partition in the queue.
@@ -347,9 +353,9 @@ where
     /// //     }
     /// // }
     /// ```
-    pub fn try_run_partition(&mut self) -> anyhow::Result<Option<PartitionOutput<N, C>>> {
+    pub fn try_run_partition(&mut self) -> anyhow::Result<Vec<PartitionOutput<N, C>>> {
         if self.partitions.is_empty() {
-            return Ok(None);
+            return Ok(vec![]);
         }
         let next_partition = self.partitions.get_mut(0);
         let inputs: Option<HashMap<NodeInput, N::IO>> = match next_partition {
@@ -392,22 +398,52 @@ where
         };
         match inputs {
             // nothing to do for now
-            None => Ok(None),
+            None => Ok(vec![]),
             // we either are running the sink partition or any parent partition who has received all its inputs from other partitions.
             Some(inputs) => {
                 let mut partition = self.partitions.remove(0);
                 let scheduler = GraphScheduler::new(partition.graph.take().unwrap());
-                let mut outputs = E::run(&self.executor_config, scheduler, inputs, &self.context)?;
-                ensure!(
-                    outputs.len() == 1,
-                    "Expected exactly one output for each partition"
-                );
-                let partition_output = PartitionOutput {
-                    output: outputs.remove(0),
-                    from: partition.color,
-                    to: partition.parent_partition,
-                };
-                Ok(Some(partition_output))
+                let outputs = E::run(&self.executor_config, scheduler, inputs, &self.context)?;
+                // this set is used to determine the subset of `outputs` which are not linked
+                // to a node in another partition (i.e., they are output of the entire graph)
+                let mut graph_outputs: HashSet<_> = outputs.keys().collect();
+                let partition_outputs = partition
+                    .parent_partitions
+                    .into_iter()
+                    .map(|(parent_color, output_port)| {
+                        let output = outputs
+                            .get(&output_port)
+                            .ok_or(anyhow!(
+                                "Output {output_port} not found in partition graph outputs"
+                            ))?
+                            .clone();
+                        graph_outputs.remove(&output_port);
+                        Ok(PartitionOutput {
+                            output,
+                            from: partition.color.clone(),
+                            to: Some(parent_color),
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                // now, build the `PartitionOutput` for output ports which correspond to outputs of the
+                // whole graph
+                graph_outputs.into_iter().try_fold(
+                    partition_outputs,
+                    |mut partition_outputs, output_port| {
+                        let output = outputs
+                            .get(output_port)
+                            .ok_or(anyhow!(
+                                "Output {output_port} not found in partition graph outputs"
+                            ))?
+                            .clone();
+                        partition_outputs.push(PartitionOutput {
+                            output,
+                            from: partition.color.clone(),
+                            to: None,
+                        });
+                        Ok(partition_outputs)
+                    },
+                )
             }
         }
     }
@@ -738,20 +774,34 @@ where
                         subgraph.edges,
                     );
                     let partition_root = partition_root.remove(0);
-                    let parent_node = self
+                    let parent_nodes = self
                         .outgoings(partition_root)
-                        .next()
-                        .map(|(_, e)| e.target());
+                        .map(|(_, e)| {
+                            ensure!(
+                                e.ports().len() == 1,
+                                "Output edge of partition must have only one link, found {} links",
+                                e.ports().len()
+                            );
+                            Ok((e.target(), e.ports()[0].source_port))
+                        }).collect::<anyhow::Result<Vec<_>>>()?;
 
                     // check if the partition is the root partition
-                    let parent_partition = if graph_root != partition_root {
-                        let Some(parent_node) = parent_node else {
-                            bail!("any non root partition should have one parent partition");
-                        };
-                        let parent_color = self[parent_node].inner().color().clone();
-                        Some(parent_color)
+                    let parent_partitions = if graph_root != partition_root {
+                        ensure!(!parent_nodes.is_empty(), "any non root partition should have at least one parent partition");
+                        parent_nodes.into_iter().try_fold(
+                            HashMap::new(),
+                            |mut parent_partitions, (parent_node, out_port)| {
+                            let parent_color = self[parent_node].inner().color().clone();
+                            ensure!(
+                                parent_partitions
+                                    .insert(parent_color.clone(), NodeOutput::new(partition_root, out_port))
+                                    .is_none(),
+                                "Found multiple output edges from partition {color:?} to parent partition with color {parent_color:?}"
+                            );
+                            Ok(parent_partitions)
+                        })?
                     } else {
-                        None
+                        HashMap::new()
                     };
 
                     final_partitions.push(Partition::<N, C>::new(
@@ -759,7 +809,7 @@ where
                         subgraph,
                         child_partition_colors,
                         partition_inputs,
-                        parent_partition,
+                        parent_partitions,
                     )?);
                 }
                 Ok(final_partitions)
@@ -781,6 +831,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+    use rstest::rstest;
+
     use super::*;
     use crate::graph::{
         Graph, PortLink, Ports,
@@ -798,7 +851,9 @@ mod tests {
     /// and the inputs indices should be [1,2,5,6,3,4,7,8]
     /// Reason to choose sub and div is to test the non commutativity nature of the tasks, so the partitioning
     /// should dispatch the inputs to the correct partition in the right order and place.
-    fn create_graph() -> (ExecGraph<MathAST, usize>, NodeId) {
+    /// if `additional_output` is true, then we add an `Sqrt` node after `Pow_3` to have a
+    /// node with 2 outputs, with one of these outputs being an extra output for the graph
+    fn create_graph(additional_output: bool) -> (ExecGraph<MathAST, usize>, NodeId) {
         let mut graph = Graph::new();
         let input_node_ids = [
             graph.add_inner(MathAST::Input(0).colored(0)).unwrap(),
@@ -870,10 +925,25 @@ mod tests {
             .add_edge(agg2, agg3, PortLink::new(0, 1), None)
             .unwrap();
 
-        let agg33 = graph.add_inner(MathAST::Pow2.colored(2)).unwrap();
+        let mut agg33 = graph.add_inner(MathAST::Pow2.colored(2)).unwrap();
         graph
             .add_edge(agg3, agg33, Ports::consecutive(), None)
             .unwrap();
+
+        if additional_output {
+            // add an extra output to test multiple outputs for a graph
+            // We add an Sqrt node to have a node with 2 outputs
+            let sqrt = graph.add_inner(MathAST::Sqrt.colored(2)).unwrap();
+            // Link the node to the previous Pow2 node
+            graph
+                .add_edge(agg33, sqrt, Ports::consecutive(), None)
+                .unwrap();
+            // add another Pow2 node to recompute the same output of previous `agg33` node
+            agg33 = graph.add_inner(MathAST::Pow2.colored(2)).unwrap();
+            graph
+                .add_edge(sqrt, agg33, Ports::consecutive(), None)
+                .unwrap();
+        }
 
         let pow1 = graph.add_inner(MathAST::Pow2.colored(0)).unwrap();
         graph
@@ -885,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_partition_by_color() {
-        let (graph, agg33) = create_graph();
+        let (graph, agg33) = create_graph(false);
         assert_eq!(graph.sink_nodes().collect::<Vec<_>>(), vec![agg33]);
         let partitions = graph
             .partition_by_color(
@@ -926,18 +996,32 @@ mod tests {
                 .collect::<HashSet<_>>(),
             [0, 1].into_iter().collect()
         );
-        assert_eq!(partitions.get(&0).unwrap()[0].parent_partition, Some(2));
-        assert_eq!(partitions.get(&1).unwrap()[0].parent_partition, Some(2));
-        assert_eq!(partitions.get(&2).unwrap()[0].parent_partition, Some(0));
-        assert_eq!(partitions.get(&0).unwrap()[1].parent_partition, None);
+        assert!(
+            partitions.get(&0).unwrap()[0]
+                .parent_partitions
+                .contains_key(&2)
+        );
+        assert!(
+            partitions.get(&1).unwrap()[0]
+                .parent_partitions
+                .contains_key(&2)
+        );
+        assert!(
+            partitions.get(&2).unwrap()[0]
+                .parent_partitions
+                .contains_key(&0)
+        );
+        assert_eq!(partitions.get(&0).unwrap()[1].parent_partitions.len(), 0);
     }
 
     /// A simple test to check the different partition schedulers can drive the graph to completion.
     /// There is no implementation of a local partition executor since that would be pointless, as the
     /// only reason to have a partition is to run it in different machines.
-    #[test]
-    fn test_partition_scheduler() -> anyhow::Result<()> {
-        let (graph, _agg33) = create_graph();
+    #[rstest]
+    #[case::base(false)]
+    #[case::additional_output(true)]
+    fn test_partition_scheduler(#[case] additional_output: bool) -> anyhow::Result<()> {
+        let (graph, _agg33) = create_graph(additional_output);
         // add1[0,1] = 1+7
         // sub1[4,5] = 4-2
         // add2[2,3] = 3+4
@@ -947,6 +1031,7 @@ mod tests {
         // agg3 = agg1 - agg2 = 4 - 2 = 2
         // agg33 = pow2(agg3) = 2^2 = 4
         // final output = pow1 = pow2(agg33) = 4^2 = 16
+        // additional_output = -sqrt(agg33) = -2
         let partitions = graph.partition_by_color(
             [1, 7, 3, 4, 4, 2, 6, 3]
                 .into_iter()
@@ -966,63 +1051,81 @@ mod tests {
                     map
                 });
         let p1_outputs = schedulers.get_mut(&0).unwrap().try_run_partition()?;
-        ensure!(p1_outputs.is_some() && p1_outputs.as_ref().unwrap().to.unwrap() == 2);
+        ensure!(!p1_outputs.is_empty() && p1_outputs.first().unwrap().to.unwrap() == 2);
         let p2_outputs = schedulers.get_mut(&1).unwrap().try_run_partition()?;
-        ensure!(p2_outputs.is_some() && p2_outputs.as_ref().unwrap().to.unwrap() == 2);
+        ensure!(!p2_outputs.is_empty() && p2_outputs.first().unwrap().to.unwrap() == 2);
         schedulers
             .get_mut(&2)
             .unwrap()
-            .set_child_partition_output(p1_outputs.unwrap())?;
+            .set_child_partition_output(p1_outputs.first().unwrap().clone())?;
         // there should not be any computation possible on partition 2 since it doesn't have all its inputs
         ensure!(
             schedulers
                 .get_mut(&2)
                 .unwrap()
                 .try_run_partition()?
-                .is_none()
+                .is_empty()
         );
         schedulers
             .get_mut(&2)
             .unwrap()
-            .set_child_partition_output(p2_outputs.unwrap())?;
+            .set_child_partition_output(p2_outputs.first().unwrap().clone())?;
         let p3_outputs = schedulers.get_mut(&2).unwrap().try_run_partition()?;
         // goes back to partition 0
+        let num_expected_outputs = 1 + additional_output as usize;
         ensure!(
-            p3_outputs.is_some()
-                && p3_outputs.as_ref().unwrap().to.is_some()
-                && p3_outputs.as_ref().unwrap().to.unwrap() == 0
+            p3_outputs.len() == num_expected_outputs,
+            "invalid number of outputs found from partition 2: expected {num_expected_outputs}, found {}",
+            p3_outputs.len(),
         );
-        ensure!(p3_outputs.as_ref().unwrap().output == 4);
-        ensure!(p3_outputs.as_ref().unwrap().from == 2);
-        ensure!(!p3_outputs.as_ref().unwrap().is_final_output());
+        let p3_output = if num_expected_outputs == 1 {
+            p3_outputs.first().unwrap()
+        } else {
+            let (pos, p3_final_output) = p3_outputs.iter()
+                .find_position(|out|
+                    out.is_final_output()
+                ).ok_or(
+                    anyhow!("expected a final output from partition 2 in additional output test case, but none found")
+                )?;
+            ensure!(p3_final_output.output == -2);
+            ensure!(p3_final_output.from == 2);
+            // return the other output to be checked below
+            &p3_outputs[1 - pos]
+        };
+        ensure!(!p3_outputs.first().unwrap().is_final_output());
+        ensure!(p3_output.to.unwrap() == 0);
+        ensure!(p3_output.output == 4);
+        ensure!(p3_output.from == 2);
         schedulers
             .get_mut(&0)
             .unwrap()
-            .set_child_partition_output(p3_outputs.unwrap())?;
+            .set_child_partition_output(p3_outputs.first().unwrap().clone())?;
         let p0_final_outputs = schedulers.get_mut(&0).unwrap().try_run_partition()?;
-        ensure!(p0_final_outputs.is_some() && p0_final_outputs.as_ref().unwrap().is_final_output());
-        ensure!(p0_final_outputs.as_ref().unwrap().output == 16);
-        ensure!(p0_final_outputs.as_ref().unwrap().from == 0);
+        ensure!(
+            !p0_final_outputs.is_empty() && p0_final_outputs.first().unwrap().is_final_output()
+        );
+        ensure!(p0_final_outputs.first().unwrap().output == 16);
+        ensure!(p0_final_outputs.first().unwrap().from == 0);
         ensure!(
             schedulers
                 .get_mut(&0)
                 .unwrap()
                 .try_run_partition()?
-                .is_none()
+                .is_empty()
         );
         ensure!(
             schedulers
                 .get_mut(&1)
                 .unwrap()
                 .try_run_partition()?
-                .is_none()
+                .is_empty()
         );
         ensure!(
             schedulers
                 .get_mut(&2)
                 .unwrap()
                 .try_run_partition()?
-                .is_none()
+                .is_empty()
         );
         Ok(())
     }

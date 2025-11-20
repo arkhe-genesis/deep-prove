@@ -28,7 +28,7 @@ use crate::{
             softmax::{SOFTMAX_LAYER, Softmax, SoftmaxCtx, SoftmaxProof},
         },
     },
-    lookup::context::LookupWitnessGen,
+    lookup::context::{LayerLookupContext, LookupWitnessGen},
     model::Step,
     padding::{PaddingMode, ShapeInfo},
     quantization::{ModelMetadata, ScalingFactor},
@@ -49,7 +49,7 @@ use provable::{
 };
 use requant::RequantCtx;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{fmt::Debug, marker::PhantomData};
+use std::fmt::Debug;
 use tenstore::StoreError;
 use transcript::Transcript;
 use transformer::{
@@ -283,15 +283,43 @@ impl<E: ExtensionField> LayerCtx<E> {
             padded_output,
         ))
     }
+
+    pub(crate) fn lookup_context(&self) -> Option<&LayerLookupContext> {
+        match self {
+            LayerCtx::Dense(_) => None,
+            LayerCtx::MatMul(_) => None,
+            LayerCtx::Convolution(_) => None,
+            LayerCtx::Activation(activation_ctx) => Some(&activation_ctx.lookup_context),
+            LayerCtx::Requant(requant_ctx) => Some(&requant_ctx.lookup_ctx),
+            LayerCtx::Pooling(pooling_ctx) => Some(&pooling_ctx.lookup_ctx),
+            LayerCtx::EinSum(_) => None,
+            LayerCtx::QKV(_) => None,
+            LayerCtx::Mha(mha_ctx) => Some(mha_ctx.lookup_ctx()),
+            LayerCtx::ConcatMatMul(_) => None,
+            LayerCtx::LayerNorm(layer_norm_ctx) => Some(&layer_norm_ctx.lookup_ctx),
+            LayerCtx::RMSNorm(rmsnorm_ctx) => Some(&rmsnorm_ctx.lookup_ctx),
+            LayerCtx::Flatten => None,
+            LayerCtx::Add(_) => None,
+            LayerCtx::Softmax(softmax_ctx) => Some(&softmax_ctx.lookup_ctx),
+            LayerCtx::Reshape(_) => None,
+            LayerCtx::Embeddings(_) => None,
+            LayerCtx::Positional(_) => None,
+            LayerCtx::AttentionMask(_) => None,
+            LayerCtx::Logits(logits_ctx) => Some(&logits_ctx.lookup_ctx),
+        }
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "E: Serialize, T: Serialize",
+    deserialize = "E: DeserializeOwned, T: DeserializeOwned"
+))]
 pub(crate) struct NodeOut<T, E>
 where
     E: ExtensionField,
     T: TensorTypeParam,
 {
-    _t: PhantomData<T>,
     pub(crate) outputs: Vec<TensorHandle<T>>,
     pub(crate) proving_data: ProvingData<E>,
 }
@@ -303,7 +331,6 @@ where
 {
     pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingData<E>) -> Self {
         Self {
-            _t: PhantomData,
             outputs,
             proving_data,
         }
@@ -366,7 +393,6 @@ impl<E: ExtensionField> NodeOut<Element, E> {
             .collect::<Result<Vec<_>, StoreError>>()?;
 
         Ok(NodeOut {
-            _t: PhantomData,
             outputs,
             proving_data: self.proving_data.clone(),
         })
@@ -634,7 +660,7 @@ where
         node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&crate::Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {
@@ -709,7 +735,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         match self {
             Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data),

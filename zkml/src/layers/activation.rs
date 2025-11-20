@@ -457,22 +457,14 @@ impl ProveInfo for Activation<Element> {
         mut aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let lookup_context = match self.activation_type() {
-            ActivationLayer::Relu(_) => {
-                aux.tables.insert(TableType::Relu);
-                LayerLookupContext::new(vec![TableType::Relu], vec![1])
-            }
+            ActivationLayer::Relu(_) => LayerLookupContext::new(vec![TableType::Relu], vec![1]),
             // TODO: if we want to save on memory, we can use a pointer to the vector instead
-            ActivationLayer::Gelu(gelu) => {
-                aux.tables.insert(TableType::GELU(
+            ActivationLayer::Gelu(gelu) => LayerLookupContext::new(
+                vec![TableType::GELU(
                     gelu.quant_data.map(|q| q.table_data).unwrap(),
-                ));
-                LayerLookupContext::new(
-                    vec![TableType::GELU(
-                        gelu.quant_data.map(|q| q.table_data).unwrap(),
-                    )],
-                    vec![1],
-                )
-            }
+                )],
+                vec![1],
+            ),
         };
 
         // Set the model polys to be empty
@@ -537,7 +529,7 @@ where
         id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = &step_data.node_inputs;
@@ -552,7 +544,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors()?;
         ensure!(

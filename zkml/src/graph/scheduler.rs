@@ -1,5 +1,6 @@
-use crate::graph::{NodeId, NodeInput, PortId, graph::Graph};
+use crate::graph::{NodeId, NodeInput, NodeOutput, PortId, graph::Graph};
 use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
@@ -15,7 +16,7 @@ pub trait ExecNode {
     ///
     /// Must implement `Clone` to support data flow between nodes and potential
     /// caching/memoization strategies.
-    type IO: Clone;
+    type IO: Clone + Serialize + for<'a> Deserialize<'a>;
 
     /// The execution context type required by this node.
     ///
@@ -39,7 +40,7 @@ pub trait ExecNode {
     /// # Returns
     ///
     /// The result of the computation, or an error if execution fails.
-    fn run(&self, ctx: &Self::Context, inputs: Vec<Self::IO>) -> anyhow::Result<Self::IO>;
+    fn run(&self, ctx: &Self::Context, inputs: Vec<Self::IO>) -> anyhow::Result<Vec<Self::IO>>;
 }
 
 /// A computational graph where nodes are colored for execution scheduling and partitioning.
@@ -84,12 +85,12 @@ where
 ///
 /// * `N` - The executable node type implementing [`ExecNode`]
 /// * `C` - The color type (often `usize`, `String`, or custom enum)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Colored<N, C> {
     /// The executable node
-    node: N,
+    pub node: N,
     /// The color/partition identifier
-    color: C,
+    pub color: C,
 }
 
 impl<N, C> Colored<N, C> {
@@ -104,6 +105,10 @@ impl<N, C> Colored<N, C> {
     /// Returns a reference to the color of this node.
     pub fn color(&self) -> &C {
         &self.color
+    }
+
+    pub fn node_mut(&mut self) -> &mut N {
+        &mut self.node
     }
 }
 
@@ -153,7 +158,7 @@ impl<N: ExecNode, C> ExecNode for Colored<N, C> {
     type Context = N::Context;
 
     /// Executes the wrapped node's operation.
-    fn run(&self, ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Self::IO> {
+    fn run(&self, ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Vec<Self::IO>> {
         self.node.run(ctx, input)
     }
 
@@ -222,7 +227,11 @@ impl ReleasePolicy {
 /// * `N` - The executable node type implementing [`ExecNode`]
 /// * `C` - The color type used for scheduling
 /// * `NodeId` - The node identifier type (defaults to [`DefaultNodeId`])
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "N: Serialize, C: Serialize, N::IO: Serialize",
+    deserialize = "N: DeserializeOwned, C: DeserializeOwned, N::IO: DeserializeOwned"
+))]
 pub struct ReadyNode<N: ExecNode, C> {
     /// The colored node containing the operation to execute
     pub(crate) node: Colored<N, C>,
@@ -245,7 +254,7 @@ impl<N: ExecNode, C> ReadyNode<N, C> {
     /// # Returns
     ///
     /// The result of executing the node's operation.
-    pub fn run(&mut self, ctx: &N::Context) -> anyhow::Result<N::IO> {
+    pub fn run(&mut self, ctx: &N::Context) -> anyhow::Result<Vec<N::IO>> {
         self.node.run(ctx, self.inputs.drain(..).collect())
     }
 }
@@ -394,6 +403,8 @@ where
     /// This method updates the scheduler's internal state after a node has been executed.
     /// It removes the node from the running set, adds it to the completed set, and
     /// stores the output data on outgoing edges for successor nodes to consume.
+    /// Furthermore, it returns the subset of outputs which corresponds to outputs of the graph,
+    /// mapped with their output port in node `node_id`
     ///
     /// # Parameters
     ///
@@ -405,7 +416,11 @@ where
     /// Returns an error if:
     /// - The node was not in the running state
     /// - The node was already marked as done
-    pub fn mark_done(&mut self, node_id: NodeId, output: &N::IO) -> anyhow::Result<()> {
+    pub fn mark_done(
+        &mut self,
+        node_id: NodeId,
+        outputs: &[N::IO],
+    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
         ensure!(
             self.running_nodes.remove(&node_id),
             "{node_id} was not running"
@@ -414,6 +429,7 @@ where
             self.done_nodes.insert(node_id),
             "{node_id} was already done"
         );
+        let mut graph_outputs: HashSet<_> = (0..outputs.len()).collect();
         // now look at all the nodes that are ready to run and put them in pending
         for (_, edge) in self
             .graph
@@ -425,11 +441,19 @@ where
             })
         {
             // Set the data to the edge such that the successors may run afterwards
-            // safe unwrap since these indices have just been collected before.
-            // we can't iterate and modify at the same time
-            edge.weight = Some(output.clone());
+            // we fetch the output corresponding to the edge source port
+            ensure!(
+                edge.ports().len() == 1,
+                "Found an edge with more than one link, which is unsupported in execution graph"
+            );
+            let output_port = *edge.ports()[0].source_port;
+            graph_outputs.remove(&output_port);
+            edge.weight = Some(outputs[output_port].clone());
         }
-        Ok(())
+        Ok(graph_outputs
+            .into_iter()
+            .map(|i| (NodeOutput::new(node_id, i), outputs[i].clone()))
+            .collect())
     }
 
     /// Returns the next batch of nodes that are ready for execution.
@@ -537,7 +561,13 @@ mod tests {
             .pop()
             .unwrap();
         let output = ready_node.run(&()).unwrap();
-        scheduler.mark_done(ready_node.node_id, &output).unwrap();
+        assert_eq!(
+            scheduler
+                .mark_done(ready_node.node_id, &output)
+                .unwrap()
+                .len(),
+            0
+        );
         assert_eq!(scheduler.done_nodes.len(), 1);
         assert_eq!(scheduler.running_nodes.len(), 0);
 
@@ -545,10 +575,16 @@ mod tests {
         assert!(matches!(ready_node.node.node, TestOperation::Test1));
         let output = ready_node.run(&()).unwrap();
         assert_eq!(
-            output,
+            output[0],
             format!("Test1: {:?}", vec!["CommitData".to_string()])
         );
-        scheduler.mark_done(ready_node.node_id, &output).unwrap();
+        assert_eq!(
+            scheduler
+                .mark_done(ready_node.node_id, &output)
+                .unwrap()
+                .len(),
+            0
+        );
 
         let mut ready_node = scheduler.next_ready_nodes().unwrap().pop().unwrap();
         assert!(
@@ -558,13 +594,19 @@ mod tests {
         );
         let output = ready_node.run(&()).unwrap();
         assert_eq!(
-            output,
+            output[0],
             format!(
                 "Test2: {:?}",
                 vec![format!("Test1: {:?}", vec!["CommitData".to_string()])]
             )
         );
-        scheduler.mark_done(ready_node.node_id, &output).unwrap();
+        assert_eq!(
+            scheduler
+                .mark_done(ready_node.node_id, &output)
+                .unwrap()
+                .len(),
+            1
+        );
 
         println!("done_nodes: {:?}", scheduler.done_nodes);
         println!("running_nodes: {:?}", scheduler.running_nodes);

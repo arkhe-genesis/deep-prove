@@ -26,7 +26,7 @@ use rayon::{
     prelude::ParallelSlice,
     slice::ParallelSliceMut,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     cmp::{Ordering, PartialEq, min},
     fmt::{self, Debug},
@@ -391,7 +391,8 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) -> Resul
 /// Tensors are used in different contexts, each requiring a different
 /// representation / implementation. This struct wraps the necessary metadata to
 /// load, store, and transform the tensors to different representation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
 pub struct TensorHandle<T>
 where
     T: TensorTypeParam,
@@ -400,12 +401,14 @@ where
     storage_key: StorageKey<Vec<T>>,
 
     /// Storage used to save or load the underlying data.
+    #[serde(skip)]
     store: GenStore,
 
     /// Tensor data, if available.
     ///
     /// If the tensor data is not available, the handler will try to hydrate it
     /// by reading from the corresponding store.
+    #[serde(skip)]
     tensor: Arc<RwLock<Option<Tensor<T>>>>,
 
     /// Accelerated tensor data, if available.
@@ -413,6 +416,7 @@ where
     /// If the tensor data is not available, the handler will try to hydrate it
     /// by reading from the corresponding tensor, which might need to be read
     /// from the store.
+    #[serde(skip)]
     wrapped_tensor: Arc<RwLock<Option<WrappedTensor<T>>>>,
 
     /// The shape of the tensor.
@@ -461,7 +465,7 @@ where
 
     /// Store the [Tensor] into the store.
     pub(crate) fn store(&self) -> Result<(), StoreError> {
-        let guard = self.tensor.read().expect("Lock should not be posioned");
+        let guard = self.tensor.read().expect("Lock should not be poisoned");
 
         if let Some(ref tensor) = *guard {
             self.store.store(&self.storage_key, tensor.data_vec())
@@ -483,6 +487,10 @@ where
     /// Returns a reference to the unpadded shape of this tensor.
     pub(crate) fn unpadded_shape(&self) -> &Shape {
         &self.unpadded_shape
+    }
+
+    pub(crate) fn attach_store(&mut self, store: GenStore) {
+        self.store = store;
     }
 
     /// Returns a reference to the cached [`Tensor`].

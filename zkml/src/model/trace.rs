@@ -1,28 +1,41 @@
 use crate::{
     Element, IO, Shape, Tensor,
     graph::NodeId,
-    layers::{Layer, NodeOut},
+    layers::NodeOut,
     quantization::{Fieldizer, ModelMetadata},
     tensor::{TensorHandle, TensorTypeParam},
 };
 use ff_ext::ExtensionField;
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::MappedRwLockReadGuard};
-use tenstore::StoreError;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{collections::HashMap, fmt::Debug, sync::MappedRwLockReadGuard};
+use tenstore::{GenStore, StoreError};
 
 /// The trace produce by running the model during inference
-#[derive(Default, Clone)]
-pub struct Trace<'a, E, N, D>
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct Trace<E, D>
 where
     E: ExtensionField,
     D: TensorTypeParam,
 {
-    pub(crate) steps: HashMap<NodeId, Step<'a, E, N, D>>,
+    pub(crate) steps: HashMap<NodeId, Step<E, D>>,
     pub(crate) input: Vec<TensorHandle<D>>,
     pub(crate) output: Vec<TensorHandle<D>>,
 }
 
-impl<'a, E, N, D> Trace<'a, E, N, D>
+impl<E: ExtensionField, D: TensorTypeParam> Debug for Trace<E, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Trace{{ # steps: {:?}, # input: {:?}, # output: {:?} }}",
+            self.steps.len(),
+            self.input.len(),
+            self.output.len()
+        )
+    }
+}
+
+impl<E: ExtensionField, D> Trace<E, D>
 where
     E: ExtensionField,
     D: TensorTypeParam,
@@ -34,20 +47,32 @@ where
             output: Default::default(),
         }
     }
+
+    pub fn attach_store(&mut self, store: GenStore) {
+        self.input
+            .iter_mut()
+            .for_each(|handle| handle.attach_store(store.clone()));
+        self.output
+            .iter_mut()
+            .for_each(|handle| handle.attach_store(store.clone()));
+        self.steps
+            .values_mut()
+            .for_each(|step| step.attach_store(store.clone()));
+    }
 }
 
-impl<'a, E, N, D> Trace<'a, E, N, D>
+impl<E: ExtensionField, D> Trace<E, D>
 where
     E: ExtensionField,
     D: TensorTypeParam + Clone + Serialize + for<'b> Deserialize<'b>,
 {
     /// Get the trace data for node `node_id`, if any
-    pub(crate) fn get_step(&self, node_id: &NodeId) -> Option<&Step<'a, E, N, D>> {
+    pub(crate) fn get_step(&self, node_id: &NodeId) -> Option<&Step<E, D>> {
         self.steps.get(node_id)
     }
 
     /// Insert the trace data `step` about node `node_id` in the trace
-    pub(crate) fn new_step(&mut self, node_id: NodeId, step: Step<'a, E, N, D>) {
+    pub(crate) fn new_step(&mut self, node_id: NodeId, step: Step<E, D>) {
         assert!(!self.steps.contains_key(&node_id));
         self.steps.insert(node_id, step);
     }
@@ -83,13 +108,10 @@ where
     }
 }
 
-impl<'a, E: ExtensionField> Trace<'a, E, Element, Element> {
+impl<E: ExtensionField> Trace<E, Element> {
     /// Given as input a trace over quantized values, compute the equivalent
     /// trace with dequantized values
-    pub fn dequantized(
-        &self,
-        model_metadata: &ModelMetadata,
-    ) -> Result<Trace<'a, E, Element, f32>, StoreError> {
+    pub fn dequantized(&self, model_metadata: &ModelMetadata) -> Result<Trace<E, f32>, StoreError> {
         let inputs = self
             .input
             .iter()
@@ -128,14 +150,12 @@ impl<'a, E: ExtensionField> Trace<'a, E, Element, Element> {
 }
 
 /// Data found in the trace for each node of the model
-#[derive(Clone)]
-pub struct Step<'a, E, N, D>
-where
-    E: ExtensionField,
-    D: TensorTypeParam,
-{
-    /// The operation that generated this trace element.
-    pub(crate) op: &'a Layer<N>,
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "E: Serialize, D: Serialize",
+    deserialize = "E: DeserializeOwned, D: DeserializeOwned"
+))]
+pub struct Step<E: ExtensionField, D: TensorTypeParam> {
     /// Ordered by input port (e.g. target_port of the incoming edges)
     pub(crate) node_inputs: Vec<TensorHandle<D>>,
     /// Ordered by output port (e.g. source_port of the incoming edges)
@@ -146,7 +166,7 @@ where
     pub(crate) unpadded_input_shapes: Vec<Shape>,
 }
 
-impl<'a, E, N, D> Step<'a, E, N, D>
+impl<E: ExtensionField, D> Step<E, D>
 where
     E: ExtensionField,
     D: TensorTypeParam + Clone + Serialize + for<'b> Deserialize<'b>,
@@ -154,6 +174,16 @@ where
     /// Returns the output tensors of the node
     pub fn outputs(&self) -> &[TensorHandle<D>] {
         self.node_outputs.outputs.as_slice()
+    }
+
+    pub(crate) fn attach_store(&mut self, store: GenStore) {
+        self.node_inputs
+            .iter_mut()
+            .for_each(|handle| handle.attach_store(store.clone()));
+        self.node_outputs
+            .outputs
+            .iter_mut()
+            .for_each(|handle| handle.attach_store(store.clone()));
     }
 
     /// Hydrate all the input tensors of the node corresponding to this step.
@@ -190,12 +220,12 @@ where
     }
 }
 
-impl<'a, E: ExtensionField, N> Step<'a, E, N, Element> {
+impl<E: ExtensionField> Step<E, Element> {
     pub fn to_dequantize(
         &self,
         model_metadata: &ModelMetadata,
         node_id: NodeId,
-    ) -> Result<Step<'a, E, N, f32>, StoreError> {
+    ) -> Result<Step<E, f32>, StoreError> {
         let node_inputs = self
             .node_inputs
             .iter()
@@ -204,7 +234,6 @@ impl<'a, E: ExtensionField, N> Step<'a, E, N, Element> {
             .collect::<Result<Vec<_>, StoreError>>()?;
 
         Ok(Step {
-            op: self.op,
             node_inputs,
             node_outputs: self.node_outputs.to_dequantize(model_metadata, node_id)?,
             unpadded_output_shapes: self.unpadded_output_shapes.clone(),

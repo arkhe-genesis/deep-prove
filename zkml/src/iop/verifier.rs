@@ -1,6 +1,11 @@
 use crate::{
-    Proof,
-    iop::{TableProof, chunking::GroupIOClaims, compute_claim, context::ShapeStep},
+    InitTranscript, Proof,
+    iop::{
+        ChunkProof, TableProof,
+        chunking::{ChunkID, GroupIOClaims, initialize_transcript_for_chunk},
+        compute_claim,
+        context::ShapeStep,
+    },
 };
 
 use crate::{
@@ -25,7 +30,7 @@ use tracing::{info, trace};
 use transcript::Transcript;
 
 /// What the verifier must have besides the proof
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IO<E> {
     /// Input of the inference given to the model
     pub input: Vec<Tensor<E>>,
@@ -65,7 +70,7 @@ where
     E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    pub(crate) io: IO<E>,
+    pub(crate) io: &'a IO<E>,
     pub(crate) commit_verifier: CommitmentVerifier<E, PCS>,
     pub(crate) transcript: &'a mut T,
     pub(crate) challenge_storage: ChallengeStorage<E>,
@@ -77,7 +82,7 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     E: Serialize + DeserializeOwned,
 {
-    pub(crate) fn new(transcript: &'a mut T, io: IO<E>) -> Self {
+    pub(crate) fn new(transcript: &'a mut T, io: &'a IO<E>) -> Self {
         let commit_verifier = CommitmentVerifier::<E, PCS>::new();
         Self {
             io,
@@ -87,24 +92,80 @@ where
         }
     }
 
+    fn initialise_transcript(ctx: &VerifierContext<E, PCS>) -> anyhow::Result<T>
+    where
+        T: InitTranscript,
+    {
+        let mut transcript = T::new(T::InitData::from(b"model_proving"));
+        ctx.write_to_transcript(&mut transcript)?;
+        Ok(transcript)
+    }
+
     pub(crate) fn verify_chunk(
-        &mut self,
+        mut self,
         ctx: &VerifierContext<E, PCS>,
-        proof: &Proof<E, PCS>,
+        proof: ChunkProof<E, PCS>,
         shape_steps: &HashMap<NodeId, ShapeStep>,
-        num_chunk: usize,
     ) -> anyhow::Result<()>
     where
         PCS::Commitment: PartialEq + Eq,
     {
-        ensure!(
-            num_chunk < proof.chunk_data.len(),
-            "Verifying chunk {num_chunk}, but only {} chunk commitments are found in the proof",
-            proof.chunk_data.len()
-        );
-        let chunk = &proof.chunk_data[num_chunk].model_chunk;
+        let chunk = &proof.chunk_data.model_chunk;
         let chunk_id = chunk.chunk_id;
-        let chunk_commitments = &proof.chunk_data[num_chunk].commitments;
+        // Add chunk splitting info to the transcript
+        chunk.add_chunk_data_to_transcript(self.transcript)?;
+
+        let lookup_ctx = chunk.chunk_lookup_ctx(&ctx.lookup);
+
+        // Instantiate everything and append relevant info to the transcript
+        let mut numerators = Vec::<E>::new();
+        let mut denominators = Vec::<E>::new();
+
+        // iterate over the step proofs in inference order
+        for (node_id, _) in chunk.subgraph.forward_inners() {
+            let layer_ctx = ctx
+                .model
+                .nodes
+                .node(node_id)
+                .ok_or(anyhow!(
+                    "Node {node_id} of chunk {chunk_id} not found in model context"
+                ))?
+                .as_inner()
+                .unwrap_or_else(|| panic!("Node {node_id} must be an inner node in model context"));
+            if !layer_ctx.has_proof() {
+                // if the current node is not provable, there is no proof, so we can skip it
+                continue;
+            }
+            let node_proof = proof
+                .steps
+                .get(&node_id)
+                .ok_or(anyhow!("Proof for node {node_id} not found"))?;
+            if let Some((num, denom)) = node_proof.get_lookup_data() {
+                numerators.extend(num.into_iter());
+                denominators.extend(denom.into_iter());
+            }
+            layer_ctx.write_proof_to_transcript(node_proof, self.transcript)?;
+        }
+
+        if let Some(table_proof) = &proof.table_proof {
+            let (nums, denoms) = table_proof.lookup.fractional_outputs();
+            numerators.extend(nums);
+            denominators.extend(denoms);
+            table_proof.write_commitment(self.transcript)?;
+        }
+
+        // Add chunk commitments to the transcript
+        let chunk_commitments = &proof.chunk_data.commitments;
+        chunk_commitments.add_to_transcript::<E, PCS, T>(chunk_id, self.transcript)?;
+
+        // Here we generate and store all lookup related challenges
+        // TODO: make this part of verifier struct
+        self.challenge_storage = if lookup_ctx.is_empty() {
+            ChallengeStorage::<E>::default()
+        } else {
+            ChallengeStorage::<E>::initialise(&lookup_ctx, self.transcript)
+        };
+
         // compute the claims for the model outputs produced in this chunk, each identified by the
         // model output port ID
         let output_claims_by_port = chunk.model_outputs_in_chunk()?.into_iter()
@@ -141,7 +202,8 @@ where
                 (port_id, compute_claim(self.transcript, tensor))
             }).collect::<HashMap<_,_>>();
 
-        let chunk_output_claims = proof.chunk_data[num_chunk]
+        let chunk_output_claims = proof
+            .chunk_data
             .output_evals
             .iter()
             .map(|(port, poly_eval)| {
@@ -220,7 +282,7 @@ where
                                     .verify(
                                         node_proof,
                                         &claims_for_verify.iter().collect_vec(),
-                                        self,
+                                        &mut self,
                                         shape_step,
                                     )
                                     .context(format!(
@@ -333,110 +395,12 @@ where
             anyhow::Ok(())
         })?;
 
-        Ok(())
-    }
-
-    pub(crate) fn verify(
-        mut self,
-        ctx: &VerifierContext<E, PCS>,
-        proof: Proof<E, PCS>,
-    ) -> anyhow::Result<()>
-    where
-        PCS::Commitment: PartialEq + Eq,
-    {
-        // 1. Instantiate everything and append relevant info to the transcript
-        let mut numerators = Vec::<E>::new();
-        let mut denominators = Vec::<E>::new();
-
-        ctx.write_to_transcript(self.transcript)?;
-
-        // iterate over the step proofs in inference order
-        for (node_id, layer_ctx) in ctx.model.nodes.forward_inners() {
-            if !layer_ctx.has_proof() {
-                // if the current node is not provable, there is no proof, so we can skip it
-                continue;
-            }
-            let node_proof = proof
-                .steps
-                .get(&node_id)
-                .ok_or(anyhow!("Proof for node {node_id} not found"))?;
-            if let Some((num, denom)) = node_proof.get_lookup_data() {
-                numerators.extend(num.into_iter());
-                denominators.extend(denom.into_iter());
-            }
-            layer_ctx.write_proof_to_transcript(node_proof, self.transcript)?;
-        }
-
-        proof.table_proofs.iter().try_for_each(|proof| {
-            let (nums, denoms) = proof.lookup.fractional_outputs();
-            numerators.extend(nums);
-            denominators.extend(denoms);
-            proof.write_commitment(self.transcript)
-        })?;
-
-        let shape_steps = ctx.model.shape_steps(
-            &ctx.unpadded_input_shapes,
-            &self
-                .io
-                .input
-                .iter()
-                .map(|t| t.shape().clone())
-                .collect_vec(),
-        )?;
-
-        // verify chunks are well defined
-        ctx.model.check_model_chunking(
-            proof
-                .chunk_data
-                .iter()
-                .map(|chunk_data| &chunk_data.model_chunk),
-        )?;
-
-        // add chunk splitting info to the transcript
-        proof.chunk_data.iter().try_for_each(|chunk_data| {
-            chunk_data
-                .model_chunk
-                .add_chunk_data_to_transcript(self.transcript)
-        })?;
-
-        // Add chunk commitments to the transcript
-        proof.chunk_data.iter().try_for_each(|chunk_data| {
-            chunk_data
-                .commitments
-                .add_to_transcript::<E, PCS, T>(chunk_data.model_chunk.chunk_id, self.transcript)
-        })?;
-
-        // verify consistency of commitments among chunks
-        let chunk_commitments_by_id = proof
-            .chunk_data
-            .iter()
-            .map(|chunk_data| (chunk_data.model_chunk.chunk_id, &chunk_data.commitments))
-            .collect();
-        proof.chunk_data.iter().try_for_each(|chunk_data| {
-            chunk_data
-                .model_chunk
-                .check_chunk_commitment_consistency::<E, PCS>(&chunk_commitments_by_id)
-        })?;
-
-        // Here we generate and store all lookup related challenges
-        // TODO: make this part of verifier struct
-        self.challenge_storage = if ctx.lookup.is_empty() {
-            ChallengeStorage::<E>::default()
-        } else {
-            ChallengeStorage::<E>::initialise(&ctx.lookup, self.transcript)
-        };
-
-        // verify each chunk
-        let num_chunks = proof.chunk_data.len();
-        (0..num_chunks)
-            .into_iter()
-            .try_for_each(|i| self.verify_chunk(ctx, &proof, &shape_steps, i))?;
-
         // ===== Verify the lookup table proofs =====
-        if !proof.table_proofs.is_empty() {
+        if let Some(proof) = &proof.table_proof {
             verify_table::<_, _, _>(
-                &proof.table_proofs[0],
-                &ctx.lookup,
+                proof,
+                &lookup_ctx,
+                chunk_id,
                 ctx.commitment_ctx.table_node_id(),
                 &mut self.commit_verifier,
                 self.transcript,
@@ -444,7 +408,7 @@ where
             )?;
         }
 
-        // ===== Verify the lookup table proofs =====
+        // ===== Verify the opening of the accumulation of claims =====
         self.commit_verifier
             .verify(&ctx.commitment_ctx, proof.commit, self.transcript)?;
 
@@ -467,6 +431,67 @@ where
         );
 
         info!("Proof verified successfully");
+        Ok(())
+    }
+
+    pub(crate) fn verify(
+        ctx: &VerifierContext<E, PCS>,
+        io: &IO<E>,
+        proof: Proof<E, PCS>,
+    ) -> anyhow::Result<()>
+    where
+        PCS::Commitment: PartialEq + Eq,
+        T: InitTranscript,
+    {
+        let mut transcript = Self::initialise_transcript(ctx)?;
+        let verifier = Verifier::<'_, E, T, PCS>::new(&mut transcript, io);
+
+        let shape_steps = ctx.model.shape_steps(
+            &ctx.unpadded_input_shapes,
+            &verifier
+                .io
+                .input
+                .iter()
+                .map(|t| t.shape().clone())
+                .collect_vec(),
+        )?;
+
+        // verify chunks are well defined
+        ctx.model.check_model_chunking(
+            proof
+                .chunk_proofs
+                .iter()
+                .map(|chunk_proof| &chunk_proof.chunk_data.model_chunk),
+        )?;
+
+        // verify consistency of commitments among chunks
+        let chunk_commitments_by_id = proof
+            .chunk_proofs
+            .iter()
+            .map(|chunk_proof| {
+                let chunk_data = &chunk_proof.chunk_data;
+                (chunk_data.model_chunk.chunk_id, &chunk_data.commitments)
+            })
+            .collect();
+        proof.chunk_proofs.iter().try_for_each(|chunk_proof| {
+            chunk_proof
+                .chunk_data
+                .model_chunk
+                .check_chunk_commitment_consistency::<E, PCS>(&chunk_commitments_by_id)
+        })?;
+
+        // verify chunks
+        // there is a distinct proof for model claims, so we need to verify each chunk
+        // and then verify the model opening proof
+        // first, squeeze the common challenge to initialize the transcript for each cbunk
+        let challenge = verifier.transcript.read_challenge();
+        proof.chunk_proofs.into_iter().try_for_each(|proof| {
+            // initialise a verifier for the given chunk
+            let mut transcript: T = initialize_transcript_for_chunk(challenge.elements);
+            let verifier = Verifier::new(&mut transcript, verifier.io);
+            verifier.verify_chunk(ctx, proof, &shape_steps)
+        })?;
+
         Ok(())
     }
 
@@ -515,24 +540,23 @@ where
 }
 
 /// Verifies an inference proof given a context, a proof and the input / output of the model.
-pub fn verify<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+pub fn verify<E, T: Transcript<E> + InitTranscript, PCS: PolynomialCommitmentScheme<E>>(
     ctx: &VerifierContext<E, PCS>,
     proof: Proof<E, PCS>,
     io: IO<E>,
-    transcript: &mut T,
 ) -> anyhow::Result<()>
 where
     E::BaseField: Serialize + DeserializeOwned,
     E: ExtensionField + Serialize + DeserializeOwned,
     PCS::Commitment: PartialEq + Eq,
 {
-    let verifier = Verifier::new(transcript, io);
-    verifier.verify(ctx, proof)
+    Verifier::<E, T, PCS>::verify(ctx, &io, proof)
 }
 
 fn verify_table<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
     proof: &TableProof<E, PCS>,
     lookup_ctx: &LookupContext,
+    chunk_id: ChunkID,
     table_node_id: NodeId,
     witness_verifier: &mut CommitmentVerifier<E, PCS>,
     t: &mut T,
@@ -574,7 +598,7 @@ where
             if tt.has_committed_claims() {
                 column_evals.push(evals[take - 1]);
                 witness_verifier.add_table_claim(
-                    table_node_id,
+                    chunk_id.0.into(),
                     tt,
                     Claim::<E>::new(point[point_len - nv..].to_vec(), evals[take - 1]),
                 );

@@ -210,8 +210,6 @@ impl ProveInfo for Pooling {
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         let info = match self {
             Pooling::Maxpool2D(info) => {
-                aux.tables.insert(TableType::Range);
-
                 aux.last_output_shape =
                     self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
 
@@ -260,7 +258,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -278,7 +276,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let input_tensors = step_data.input_tensors()?;
         let output_tensors = step_data.output_tensors()?;

@@ -17,7 +17,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use zkml::parser::onnx::FloatOnnxLoader;
 
 use serde::{Deserialize, Serialize};
-use zkml::{Element, Prover, argmax, default_transcript, verify};
+use zkml::{Element, Prover, argmax, verify};
 
 use rmp_serde::encode::to_vec_named;
 
@@ -26,11 +26,6 @@ type F = GoldilocksExt2;
 type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
 type Transcript = transcript::basic::BasicTranscript<F>;
-
-// Create a new transcript instance
-fn new_transcript() -> Transcript {
-    default_transcript()
-}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -382,10 +377,12 @@ fn run(args: Args) -> anyhow::Result<()> {
         let metrics = Metrics::new();
 
         let io = trace.to_verifier_io()?;
-        let mut prover_transcript = new_transcript();
-        let prover =
-            Prover::<_, _, _>::new(&ctx.as_ref().as_ref().unwrap().0, &mut prover_transcript);
-        let proof = prover.prove(&trace).expect("unable to generate proof");
+        let proof = Prover::<F, Transcript, Pcs<F>>::prove(
+            &ctx.as_ref().as_ref().unwrap().0,
+            trace,
+            &model,
+        )
+        .expect("unable to generate proof");
 
         // Serialize proof using MessagePack and calculate size in KB
         let proof_bytes = to_vec_named(&proof)?;
@@ -402,14 +399,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         info!("== Verifying ==");
         let metrics = Metrics::new();
 
-        let mut verifier_transcript = new_transcript();
-        verify(
-            &ctx.as_ref().as_ref().unwrap().1,
-            proof,
-            io,
-            &mut verifier_transcript,
-        )
-        .expect("invalid proof");
+        verify::<_, Transcript, _>(&ctx.as_ref().as_ref().unwrap().1, proof, io)
+            .expect("invalid proof");
 
         info!("[+] Verify proof: valid");
 

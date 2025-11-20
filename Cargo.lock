@@ -3526,6 +3526,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tract-onnx",
+ "transcript",
  "ureq",
  "url",
  "uuid 1.18.1",

@@ -860,6 +860,9 @@ mod tests {
     use transcript::BasicTranscript;
 
     type F = GoldilocksExt2;
+    type T = BasicTranscript<F>;
+
+    type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs<F>>;
 
     #[test]
     fn test_load_mlp() {
@@ -923,8 +926,6 @@ mod tests {
         info!("RUNNING MODEL DONE...");
         println!("Result: {:?}", trace.outputs());
 
-        let mut transcript: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
-
         info!("GENERATING CONTEXT...");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -934,15 +935,9 @@ mod tests {
         let io = trace.to_verifier_io().unwrap();
 
         info!("GENERATING Proof...");
-        let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
-            Prover::new(&prover_ctx, &mut transcript);
-        let proof = prover.prove(&trace).expect("unable to generate proof");
-
+        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
         info!("GENERATING Proof DONE...");
-        let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
-            BasicTranscript::new(b"m2vec");
-
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
 
     #[test]
@@ -968,18 +963,13 @@ mod tests {
         let inputs = model.prepare_inputs(native_input).unwrap();
         let trace = model.run::<F>(inputs, &mut GenStore::default()).unwrap();
 
-        let mut tr: BasicTranscript<GoldilocksExt2> = BasicTranscript::new(b"m2vec");
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
             .expect("Unable to generate contexts");
 
-        let prover: Prover<'_, '_, GoldilocksExt2, BasicTranscript<GoldilocksExt2>, _> =
-            Prover::new(&prover_ctx, &mut tr);
         let io = trace.to_verifier_io().unwrap();
-        let proof = prover.prove(&trace).expect("unable to generate proof");
-        let mut verifier_transcript: BasicTranscript<GoldilocksExt2> =
-            BasicTranscript::new(b"m2vec");
-        verify::<_, _, _>(&verifier_ctx, proof, io, &mut verifier_transcript).unwrap();
+        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
 
     #[test]

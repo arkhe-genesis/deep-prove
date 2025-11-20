@@ -127,7 +127,7 @@ where
 }
 
 /// Caries the data needed to perform the FFT convolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvFFTData {
     pub input: Tensor<Element>,
 }
@@ -1458,7 +1458,7 @@ where
         id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let output_tensor = step_data.output_tensor_at(0)?;

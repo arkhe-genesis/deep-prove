@@ -27,7 +27,7 @@ use crate::{
             softmax::{Softmax, SoftmaxCtx, SoftmaxData, SoftmaxProof},
         },
     },
-    lookup::context::LookupWitnessGen,
+    lookup::context::{LayerLookupContext, LookupWitnessGen},
     model::Step,
     padding::{GarbagePad, PaddingMode, ShapeInfo},
     quantization::Fieldizer,
@@ -43,7 +43,7 @@ use transcript::Transcript;
 /// Short name used to identify the MHA layer
 pub const MHA_LAYER: &str = "MHDA";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MhaData {
     // Output tensor of Mha before final reshape
     pre_reshaping_out: Tensor<Element>,
@@ -63,6 +63,12 @@ pub struct MhaCtx<E: ExtensionField> {
     mask: AttentionMaskCtx<E>,
     qk: ConcatMatMulCtx,
     final_reshape: ReshapeCtx,
+}
+
+impl<E: ExtensionField> MhaCtx<E> {
+    pub(crate) fn lookup_ctx(&self) -> &LayerLookupContext {
+        &self.softmax.lookup_ctx
+    }
 }
 
 struct MhaOutputShaper<'a> {
@@ -535,7 +541,6 @@ impl ProveInfo for Mha<Element> {
         let v_shape = reshaped_aux.last_output_shape.pop().unwrap();
 
         let qk_aux = ContextAux {
-            tables: reshaped_aux.tables,
             last_output_shape: reshaped_aux.last_output_shape[..2].to_vec(),
             model_polys: reshaped_aux.model_polys,
             max_poly_len: reshaped_aux.max_poly_len,
@@ -739,7 +744,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -862,7 +867,7 @@ where
         &self,
         id: NodeId,
         ctx: &crate::ProverContext<E, PCS>,
-        step_data: &Step<E, Element, Element>,
+        step_data: &Step<E, Element>,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         let mha_data = step_data
             .node_outputs
