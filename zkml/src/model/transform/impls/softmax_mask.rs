@@ -4,7 +4,7 @@ use crate::{
     graph::NodeId,
     layers::{
         Layer,
-        transformer::{attention::attention_mask::ATTENTION_MASK_LAYER, softmax::SOFTMAX_LAYER},
+        transformer::{attention_mask::ATTENTION_MASK_LAYER, softmax::SOFTMAX_LAYER},
     },
     model::{Model, transform::ModelTransform},
 };

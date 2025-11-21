@@ -212,6 +212,11 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
         Ok((CommitmentId::from(full_name), Arc::new(qtensor)))
     }
 
+    /// Retrieves the current prefix used for tensor name scoping.
+    pub fn current_prefix(&self) -> &str {
+        &self.current_prefix
+    }
+
     /// Retrieves and dequantizes a tensor by its name relative to the current scope.
     ///
     /// # Arguments

@@ -263,10 +263,14 @@ pub trait TensorFielder<F> {
 
 impl<F: ExtensionField, T> TensorFielder<F> for &Tensor<T>
 where
-    T: Fieldizer<F>,
+    T: Fieldizer<F> + Clone,
 {
     fn to_fields(self) -> Tensor<F> {
-        TensorSlice::from(self).to_fields()
+        let shape = self.shape();
+        let unpadded_shape = self.unpadded_shape();
+        let data = to_field::<T, F, _>(self.get_data());
+        Tensor::new_with_unpadded_shape(shape.clone(), unpadded_shape.clone(), data)
+            .expect("The data length hasn't changed so this should never fail")
     }
 }
 

@@ -23,8 +23,8 @@ pub trait ModelNameProvider {
 pub struct PipelineConfig<'a, S> {
     float_rules: Vec<Box<dyn ModelTransform<f32>>>,
     quantized_rules: Vec<Box<dyn ModelTransform<Element>>>,
-    input_shapes: Option<Vec<Shape>>,
-    quant_strategy: Option<S>,
+    pub(crate) input_shapes: Option<Vec<Shape>>,
+    pub(crate) quant_strategy: Option<S>,
     store: Option<&'a mut GenStore>,
 }
 
@@ -67,6 +67,16 @@ pub trait ModelLoader<DataFormat> {
     /// ready to proven.
     fn parse(&self, raw: &DataFormat) -> anyhow::Result<(Model<f32>, Self::ModelConfig)>;
     fn model_name(&self) -> String;
+}
+
+/// Trait used to specify that a struct can be loaded from a given loader.
+pub trait Load<Loader> {
+    /// Any additional configuration needed to load the struct.
+    type Config;
+
+    fn from_loader(loader: &Loader, config: &Self::Config) -> anyhow::Result<Self>
+    where
+        Self: Sized;
 }
 
 /// Convert a float model into a quantized model using the given pipeline configuration.

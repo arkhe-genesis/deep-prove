@@ -268,58 +268,56 @@ impl RMSNorm<f32> {
         trace!("from_json: current path: {:?}", l.prefix);
         let alpha = l.get_tensor("norm.weight")?;
         let eps = l.metadata_to_f32("norm_epsilon")?;
-        Self::new(Some(alpha), eps, None)
+
+        // If alpha is all ones we can just set it to None
+        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0);
+
+        if trivial_alpha {
+            Self::new(None, eps, Some(alpha.shape().dim(-1)))
+        } else {
+            Self::new(Some(alpha), eps, None)
+        }
     }
 
-    fn hack_stack_gqa(alpha: KeyedTensor<f32>, c: &LLMConfig) -> anyhow::Result<KeyedTensor<f32>> {
-        alpha.try_map_tensor(|alpha| {
-            let (it, _) = alpha.slice_on_dim(0);
-            let data = it
-                .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut shape = alpha.shape().clone();
-            let new_dim = shape.dim(-1) * c.num_heads;
-            shape.set_dim(-1, new_dim);
-            Tensor::new(shape, data)
-        })
-    }
     // Replaces from_var_builder and from_tensor_loader
     // The 'loader' passed here is expected to be pre-scoped by the caller
     // (e.g., loader.pp("attn_") or loader.pp("ffn_"))
-    // HACK NOTE: "stack" is a temporary measure to counter the fact we dont have full GQA support yet
-    // so we stack K and V and therefore we need to stack the norms as well
-    pub fn from_gguf(
-        loader: &gguf::FileTensorLoader,
-        c: &LLMConfig,
-        stack: bool,
-    ) -> anyhow::Result<Self> {
-        let mut alpha = loader.get_tensor("norm.weight")?;
-        if stack {
-            alpha = Self::hack_stack_gqa(alpha, c)?;
-        }
+    pub fn from_gguf(loader: &gguf::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
+        let alpha = loader.get_tensor("norm.weight")?;
+
         // we can have any checks on the shape alpha here since it depends of the context
         // a RMSNorm after  Q doesn't have the same shape as a RMSNorm after K or inside FeedForward etc
         let eps = loader
             .metadata::<f32>(&loader.norm_epsilon_key(&c.model_name, NormType::RMSNorm))
             .unwrap_or_default();
-        Self::new(Some(alpha), eps, None)
+
+        // If alpha is all ones or zeroes we can just set it to None
+        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0 || x == 0.0f32);
+
+        if trivial_alpha {
+            Self::new(None, eps, Some(alpha.shape().dim(-1)))
+        } else {
+            Self::new(Some(alpha), eps, None)
+        }
     }
 
     pub fn from_safetensors(
         loader: &safe::FileTensorLoader,
         config: &safe::ConfigJSON,
-        c: &LLMConfig,
-        stack: bool,
     ) -> anyhow::Result<Self> {
-        let mut alpha = loader.get_tensor("norm.weight")?;
-        if stack {
-            alpha = Self::hack_stack_gqa(alpha, c)?;
-        }
+        let alpha = loader.get_tensor("norm.weight")?;
+
         let eps = config
             .get::<f32, _>("rms_norm_eps")
             .context("norm_epsilon not found")?;
-        Self::new(Some(alpha), eps, None)
+        // If alpha is all ones or zeroes we can just set it to None
+        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0 || x == 0.0f32);
+
+        if trivial_alpha {
+            Self::new(None, eps, Some(alpha.shape().dim(-1)))
+        } else {
+            Self::new(Some(alpha), eps, None)
+        }
     }
 }
 
@@ -353,22 +351,27 @@ impl Evaluate<f32> for RMSNorm<f32> {
     ) -> anyhow::Result<LayerOut<f32, E>> {
         ensure!(inputs.len() == 1);
         let input = inputs[0];
+        // Check that the final dimension of the input matches the expected dim_size
+        let final_dim_size = input.dim(-1)?;
         ensure!(
-            input.rank() == 2,
-            "RMSNorm input must have shape [seq_len, embedding_size]: found {:?}",
+            final_dim_size == self.dim_size,
+            "RMSNorm input must have final dimension of {}: found {:?}",
+            self.dim_size,
             input.shape(),
         );
-        let embedding_size = input.shape().dims[1];
-        let alpha = WrappedTensor::try_from(
-            &self
-                .alpha
-                .clone()
-                .map(|alpha| alpha.tensor())
-                .unwrap_or(Tensor::<f32>::one(Shape::new(vec![embedding_size]))),
-        )?;
 
-        let output =
-            WrappedTensor::rms_norm_forward(input.clone(), embedding_size, self.eps as f64, alpha)?;
+        let alpha_opt = self
+            .alpha
+            .as_ref()
+            .map(WrappedTensor::try_from)
+            .transpose()?;
+
+        let output = WrappedTensor::rms_norm_forward(
+            input.clone(),
+            self.dim_size,
+            self.eps as f64,
+            alpha_opt,
+        )?;
         Ok(LayerOut::from_tensor(output))
     }
 }

@@ -1,30 +1,29 @@
-//! Definition of the [`RewriteRule`] to replace [`LayerNorm`] with [`RMSNorm`]
+//! Definition of the [`RewriteRule`] to replace [`LayerNorm`] with [`RMSNorm`] in a GPT2 model.
 use crate::{
     Tensor,
     graph::{Direction, NodeId},
     layers::{
         Layer,
         add::ADD_LAYER,
-        matrix_mul::{Config, MATMUL_LAYER, MatMul, OperandMatrix},
+        einsum::{EINSUM_LAYER, EinSum, axis::Dimension},
         transformer::{
             embeddings::Embeddings,
             layernorm::LayerNorm,
             positional::{POSITIONAL_LAYER, Positional, PositionalVariant, absolute::Absolute},
-            qkv::QKV,
             rmsnorm::RMSNorm,
         },
     },
     model::{Model, transform::ModelTransform},
     shape::Shape,
-    tensor::KeyedTensor,
+    tensor::{KeyedTensor, WrappedTensor},
 };
 use anyhow::{Result, anyhow, bail, ensure};
 
 #[derive(Debug)]
 /// Rewrite rule to replace LayerNorm with RMSNorm, currently this transformation should only be used with GPT2 Models.
-pub struct LayerNormToRMSNorm;
+pub struct GPT2RMSNorm;
 
-impl ModelTransform<f32> for LayerNormToRMSNorm {
+impl ModelTransform<f32> for GPT2RMSNorm {
     fn apply(&self, mut model: Model<f32>) -> Result<Model<f32>> {
         // Iterate over the nodes in `eval_order`
         // NOTE: collecting here because then inside the loop we're mutating the graph
@@ -120,7 +119,7 @@ impl ModelTransform<f32> for LayerNormToRMSNorm {
 }
 
 /// Function used when the layer prior to [`LayerNorm`] was an Add. Checks the inputs of the Add to ensure they are
-/// either Add, [`Positional`] or [`MatMul`] and that there is at least one [`MatMul`].
+/// either Add, [`Positional`] or [`EinSum`] and that there is at least one [`EinSum`].
 fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) -> Result<()> {
     let input_ids = model
         .graph
@@ -129,27 +128,27 @@ fn add_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) -> Resu
         .filter(|n_id| model.graph[*n_id].as_inner().is_some())
         .collect::<Vec<_>>();
 
-    let seen_a_matmul = input_ids
+    let seen_an_einsum = input_ids
         .into_iter()
-        .try_fold(false, |seen_a_matmul, input_id| {
+        .try_fold(false, |seen_an_einsum, input_id| {
             // safe unwrap since it's guaranteed to be a node because we used node_neighbors
             let Some(input_node) = model.graph.node_mut(input_id).unwrap().as_inner_mut() else {
                 unreachable!("filtered above")
             };
             let add_input_op_name = input_node.short_name();
             match add_input_op_name {
-                MATMUL_LAYER => {
+                EINSUM_LAYER => {
                     // Found a LayerNorm node with an Add layer as input, which has a linear layer as input
                     modify_matrix_subtract_mean(input_node)?;
                     Ok(true)
                 }
-                ADD_LAYER | POSITIONAL_LAYER => Ok(seen_a_matmul),
+                ADD_LAYER | POSITIONAL_LAYER => Ok(seen_an_einsum),
                 _ => bail!("Expected MatMul or Add layer, found {add_input_op_name}"),
             }
         })?;
     ensure!(
-        seen_a_matmul,
-        "Expected to find a MatMul layer as input to the Add {} layer before LayerNorm, found none",
+        seen_an_einsum,
+        "Expected to find a Einsum layer as input to the Add {} layer before LayerNorm, found none",
         input_node_id
     );
     Ok(())
@@ -194,9 +193,9 @@ fn positional_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) 
 /// a square matrix with `(row_size - 1) / row_size` along the diagonal and `-1 / row_size` everywhere else.
 fn modify_matrix_subtract_mean(node: &mut Layer<f32>) -> Result<()> {
     match node {
-        Layer::<f32>::MatMul(mat_mul) => modify_matmul(mat_mul),
         Layer::<f32>::Positional(positional) => modify_positional(positional),
         Layer::<f32>::Embeddings(embeddings) => modify_embeddings(embeddings),
+        Layer::<f32>::EinSum(einsum) => modify_einsum(einsum),
         other => bail!(
             "Expected MatMul, Positional or Embeddings operation, found {}",
             other.short_name()
@@ -204,57 +203,58 @@ fn modify_matrix_subtract_mean(node: &mut Layer<f32>) -> Result<()> {
     }
 }
 
-/// Modify the constant matrix in a [`MatMul`] layer so that the output has rows with mean 0.
-fn modify_matmul(mat_mul: &mut MatMul<f32>) -> Result<()> {
-    match (&mat_mul.left_matrix, &mat_mul.right_matrix) {
-        (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => Err(anyhow!(
-            "Found layer with 2 constant matrices, which is useless as the
-                product can be directly used instead"
-        )),
-        (OperandMatrix::Weight(..), OperandMatrix::Input) => Err(anyhow!(
-            "Found MatMul with constant left matrix, this is not supported"
-        )),
-        (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-            let new_mat = mat.tensor.try_new_map_tensor(|t| {
-                if let Some(Config::TransposeB) = &mat_mul.config {
-                    Ok(mean_subtracted_matrix(&t.transpose()?)?)
-                } else {
-                    Ok(mean_subtracted_matrix(t)?)
-                }
+/// Modify the constant tensors in an [`EinSum`] layer so that the output has rows with mean 0.
+fn modify_einsum(einsum: &mut EinSum<f32>) -> Result<()> {
+    let axes = einsum.mapping.get_final_output_axes();
+
+    let dims_to_modify = axes
+        .iter()
+        .enumerate()
+        .map(|(i, axis)| {
+            if let Dimension::Present(rhs_dim) = axis.rhs_inputs[i] {
+                Ok(rhs_dim)
+            } else {
+                Err(anyhow!("Expected RHS dimension to be present in Einsum"))
+            }
+        })
+        .collect::<Result<Vec<usize>>>()?;
+
+    einsum
+        .constant_tensors
+        .iter_mut()
+        .zip(dims_to_modify)
+        .try_for_each(|(opt_tensor, dim)| {
+            if let Some(tensor) = opt_tensor {
+                let new_tensor = mean_subtracted_tensor(&tensor.tensor, dim)?;
+                *tensor = tensor.new_map_tensor(|_| new_tensor);
+                Result::<()>::Ok(())
+            } else {
+                bail!("Expected constant tensor in Einsum to modify")
+            }
+        })?;
+
+    einsum.biases.iter_mut().try_for_each(|opt_tensor| {
+        if let Some(tensor) = opt_tensor {
+            *tensor = tensor.try_new_map_tensor(|bias_tensor| {
+                let bias_shape = bias_tensor.shape();
+                let bias_sum = bias_tensor.iter().sum::<f32>();
+                let bias_mean = bias_sum / bias_shape.numel() as f32;
+                let new_bias_data = bias_tensor
+                    .iter()
+                    .map(|x| x - bias_mean)
+                    .collect::<Vec<f32>>();
+                Tensor::new(bias_shape.clone(), new_bias_data)
             })?;
-
-            let weight_matrix = OperandMatrix::new_weight_matrix(new_mat);
-            // Now we subtract the bias mean from each element of the bias
-            let new_bias = mat_mul
-                .bias
-                .as_ref()
-                .map(|old_bias| {
-                    old_bias.try_new_map_tensor(|bias_tensor| {
-                        let bias_shape = bias_tensor.shape();
-                        let bias_sum = bias_tensor.iter().sum::<f32>();
-                        let bias_mean = bias_sum / bias_shape.dim(0) as f32;
-                        let new_bias_data = bias_tensor
-                            .iter()
-                            .map(|x| x - bias_mean)
-                            .collect::<Vec<f32>>();
-                        Tensor::new(bias_shape.clone(), new_bias_data)
-                    })
-                })
-                .transpose()?;
-
-            // No config now because we have transposed the matrix,
-            *mat_mul = MatMul::new_internal(OperandMatrix::Input, weight_matrix, new_bias, None)?;
-            Ok(())
         }
-        (OperandMatrix::Input, OperandMatrix::Input) => Err(anyhow::anyhow!(
-            "Found MatMul with 2 input matrices, this is not supported"
-        )),
-    }
+        Ok(())
+    })
 }
+
 /// Modify the embeddings in an [`Embeddings`] layer so that the output has rows with mean 0.
 fn modify_embeddings(embeddings: &mut Embeddings<f32>) -> Result<()> {
     // The embedding is just a wrapper around a MatMul with extra info so we call modify_matmul
-    modify_matmul(&mut embeddings.mat)
+    embeddings.mat = embeddings.mat.new_map_tensor(mean_subtracted_matrix);
+    Ok(())
 }
 
 /// Modify the positional encodings in a [`Positional`] layer so that the output has rows with mean 0.
@@ -263,7 +263,7 @@ fn modify_positional(positional_layer: &mut Positional<f32>) -> Result<()> {
     *positional_layer = match &positional_layer.variant {
         PositionalVariant::Absolute(absolute) => {
             let Absolute::<f32> { positional, .. } = absolute;
-            let new_mat = positional.try_new_map_tensor(mean_subtracted_matrix)?;
+            let new_mat = positional.new_map_tensor(mean_subtracted_matrix);
             Positional::new_absolute(new_mat)
         }
         PositionalVariant::Rope(_) => {
@@ -277,21 +277,73 @@ fn modify_positional(positional_layer: &mut Positional<f32>) -> Result<()> {
 
 /// This function calculates the mean subtraction matrix so that all the output rows have mean 0.
 /// It takes as input the final dimension size of the layer.
-fn mean_subtracted_matrix(matrix: &Tensor<f32>) -> Result<Tensor<f32>> {
+fn mean_subtracted_matrix(matrix: &Tensor<f32>) -> Tensor<f32> {
     let matrix_shape = matrix.shape();
-    let row_size = matrix_shape.dim(matrix_shape.rank() - 1);
+    let row_size = matrix_shape.dim(-1);
 
     let subtract_mean_matrix = (0..row_size)
         .flat_map(|i| (0..row_size).map(move |j| if i == j { row_size as f32 - 1.0 } else { -1.0 }))
         .collect::<Vec<f32>>();
 
     let subtract_mean_tensor =
-        Tensor::new(Shape::new(vec![row_size, row_size]), subtract_mean_matrix)?;
-    let mut modified_matrix = matrix.matmul(&subtract_mean_tensor)?;
+        Tensor::new(Shape::new(vec![row_size, row_size]), subtract_mean_matrix)
+            .expect("Failed to create mean subtraction tensor");
+    let mut modified_matrix = matrix
+        .matmul(&subtract_mean_tensor)
+        .expect("Failed to right-multiply by mean subtraction matrix");
     modified_matrix
         .iter_mut()
         .for_each(|x| *x /= row_size as f32);
-    Ok(modified_matrix)
+    modified_matrix
+}
+
+fn mean_subtracted_tensor(tensor: &Tensor<f32>, dim: usize) -> Result<Tensor<f32>> {
+    ensure!(
+        dim < tensor.rank(),
+        "Dimension {dim} out of bounds for tensor of rank {}",
+        tensor.rank()
+    );
+    let shape = tensor.shape();
+    let dim_size = shape.dim(dim);
+
+    let subtract_mean_matrix = (0..dim_size)
+        .flat_map(|i| {
+            (0..dim_size).map(move |j| {
+                if i == j {
+                    (dim_size as f32 - 1.0) / dim_size as f32
+                } else {
+                    -1.0 / dim_size as f32
+                }
+            })
+        })
+        .collect::<Vec<f32>>();
+
+    let mut input_chars = ('a'..).take(shape.rank()).collect::<Vec<char>>();
+    input_chars[dim] = 'm';
+
+    let mut output_chars = input_chars.clone();
+    output_chars[dim] = 'n';
+
+    let input_dims = input_chars.iter().collect::<String>();
+    let output_dims = output_chars.iter().collect::<String>();
+
+    let equation = format!("I({input_dims})@M(mn)->O({output_dims})");
+
+    let subtract_mean_tensor =
+        Tensor::new(Shape::new(vec![dim_size, dim_size]), subtract_mean_matrix)?;
+
+    let einsum = EinSum::<f32>::new(equation, vec![None], vec![None])?;
+    let wrapped = WrappedTensor::try_from(tensor)?;
+    let wrapped_mean = WrappedTensor::try_from(&subtract_mean_tensor)?;
+    let mut output = einsum.evaluate_internal(&[&wrapped, &wrapped_mean])?;
+
+    let out = output.remove(0);
+    let data: Vec<f32> = out
+        .to_data()
+        .to_vec()
+        .map_err(|e| anyhow!("Couldn't extract data from tensor: {e:?}"))?;
+
+    Tensor::new(shape.clone(), data)
 }
 
 /// This function is used to modify a [`MatMul`] or [`QKV`] layer to absorb the weights and biases from the preceding [`LayerNorm`].
@@ -301,8 +353,7 @@ fn modify_subsequent_linear_layer(
     bias: &KeyedTensor<f32>,
 ) -> Result<()> {
     *node = match &node {
-        Layer::<f32>::MatMul(mat_mul) => Layer::MatMul(rescale_matmul(mat_mul, weights, bias)?),
-        Layer::<f32>::QKV(qkv) => Layer::QKV(rescale_qkv_layer(qkv, weights, bias)?),
+        Layer::<f32>::EinSum(einsum) => Layer::EinSum(rescale_einsum(einsum, weights, bias)?),
         other => bail!(
             "Expected MatMul or QKV operation, found {}",
             other.short_name()
@@ -311,124 +362,124 @@ fn modify_subsequent_linear_layer(
     Ok(())
 }
 
-/// Function that rescales the weight matrix and modifies the bias of a [`MatMul`] layer.
-fn rescale_matmul(
-    mat_mul: &MatMul<f32>,
+fn rescale_einsum(
+    einsum: &EinSum<f32>,
     scales: &Tensor<f32>,
     bias: &KeyedTensor<f32>,
-) -> Result<MatMul<f32>> {
-    // The matmul should have the right matrix as the constant one
-    match (&mat_mul.left_matrix, &mat_mul.right_matrix) {
-        (OperandMatrix::Weight(_), OperandMatrix::Weight(_)) => Err(anyhow!(
-            "Found layer with 2 constant matrices, which is useless as the
-                product can be directly used instead"
-        )),
-        (OperandMatrix::Weight(..), OperandMatrix::Input) => Err(anyhow!(
-            "Found MatMul with constant left matrix, this is not supported"
-        )),
-        (OperandMatrix::Input, OperandMatrix::Weight(mat)) => {
-            let inner_mat = if let Some(Config::TransposeB) = mat_mul.config {
-                mat.tensor.transpose()?
+) -> Result<EinSum<f32>> {
+    einsum.reset_caches();
+
+    let wrapped_bias = WrappedTensor::try_from(&bias.tensor())?.unsqueeze_dim(0)?;
+
+    let new_biases = einsum.evaluate_internal(&[&wrapped_bias])?;
+    let biases = einsum
+        .biases
+        .iter()
+        .zip(new_biases.into_iter())
+        .map(|(old_bias, new_bias)| {
+            if let Some(old_bias) = old_bias {
+                let shape: Shape = old_bias
+                    .shape()
+                    .iter()
+                    .filter_map(|&d| if d != 1 { Some(d) } else { None })
+                    .collect::<Vec<usize>>()
+                    .into();
+                let new_bias_data: Vec<f32> = new_bias.to_data().to_vec().map_err(|e| {
+                    anyhow!("Couldn't extract data from new einsum bias tensor: {e:?}")
+                })?;
+                let new_tensor = Tensor::new(shape, new_bias_data)?;
+                Ok(Some(old_bias.new_map_tensor(|_| new_tensor)))
             } else {
-                mat.tensor.tensor()
-            };
-            // We transform the bias so it is a `1 x bias_size` matrix
-            let new_bias = bias.try_new_map_tensor(|bias| {
-                let mut matrix_bias = bias.clone();
-                matrix_bias.reshape(Shape::new(vec![1, bias.shape().dim(0)]))?;
-                let new_bias_shape = Shape::new(vec![inner_mat.ncols_2d()?]);
-                let mut new_bias = matrix_bias.matmul(&inner_mat)?;
-                new_bias.reshape(new_bias_shape)?;
-                Ok(new_bias)
-            })?;
+                // This case only arises when modifying the final projection in GPT2 which has no bias
+                // so we can safely squeeze the leading 1 dimension here
+                let new_bias = new_bias.squeeze(0)?;
+                let shape = new_bias.shape();
+                let new_bias_data: Vec<f32> = new_bias.to_data().to_vec().map_err(|e| {
+                    anyhow!("Couldn't extract data from new einsum bias tensor: {e:?}")
+                })?;
+                let new_tensor = Tensor::new(shape.into(), new_bias_data)?;
+                Ok(Some(bias.new_map_tensor(|_| new_tensor)))
+            }
+        })
+        .collect::<Result<Vec<Option<KeyedTensor<f32>>>>>()?;
 
-            let new_mat_data = inner_mat
-                .slice_last_dim()
-                .zip(scales.iter())
-                .flat_map(|(row, scale)| row.iter().map(|x| x * scale).collect::<Vec<f32>>())
-                .collect::<Vec<f32>>();
-            let new_mat = KeyedTensor::new(
-                mat.tensor.key.clone(),
-                Tensor::new(inner_mat.shape().clone(), new_mat_data)?,
-            );
-            let new_bias = mat_mul
-                .bias
-                .as_ref()
-                .map(|old_bias| old_bias.new_map_tensor(|bias| bias.add(&new_bias)))
-                .unwrap_or(new_bias);
+    let rescaled_axis = einsum.mapping.get_lhs_axis_at_dim(-1)?;
 
-            let weight_matrix = OperandMatrix::new_weight_matrix(new_mat);
-            // No config now because we have transposed the matrix, and we no longer need a bias because this would be eliminated when
-            // we subtract the mean
-            MatMul::new_internal(OperandMatrix::Input, weight_matrix, Some(new_bias), None)
+    let dims_to_slice_on = rescaled_axis
+        .rhs_inputs
+        .iter()
+        .map(|dim_enum| {
+            if let Dimension::Present(dim) = dim_enum {
+                Ok(*dim)
+            } else {
+                Err(anyhow!("Expected RHS dimension to be present in Einsum"))
+            }
+        })
+        .collect::<Result<Vec<usize>>>()?;
+
+    let mut new_constant_tensors = einsum
+        .constant_tensors
+        .iter()
+        .zip(dims_to_slice_on)
+        .map(|(opt_tensor, dim)| {
+            if let Some(tensor) = opt_tensor {
+                let new_tensor = tensor.try_new_map_tensor(|t| {
+                    let wrapped_t = WrappedTensor::try_from(t)?;
+                    let to_cat = wrapped_t
+                        .iter_dim(dim)
+                        .zip(scales.iter())
+                        .map(|(dim_chunk, &scale)| dim_chunk.mul_scalar(scale))
+                        .collect::<Vec<WrappedTensor<f32>>>();
+                    let cat_tensor = WrappedTensor::cat(to_cat, dim)?;
+                    let data: Vec<f32> = cat_tensor.to_data().to_vec().map_err(|e| {
+                        anyhow!("Couldn't extract data from tensor during Einsum rescaling: {e:?}")
+                    })?;
+
+                    Tensor::new(t.shape().clone(), data)
+                })?;
+                Ok(Some(new_tensor))
+            } else {
+                bail!("Need all RHS to be constant tensors in order to rescale Einsum")
+            }
+        })
+        .collect::<Result<Vec<Option<KeyedTensor<f32>>>>>()?;
+
+    let is_final_proj = einsum.constant_tensors.iter().any(|t| {
+        if let Some(tensor) = t {
+            // GPT2 vocab size is 50257 so we can use this to identify the final projection
+            tensor.shape().dim(0) == 50257
+        } else {
+            false
         }
-        (OperandMatrix::Input, OperandMatrix::Input) => Err(anyhow::anyhow!(
-            "Found MatMul with 2 input matrices, this is not supported"
-        )),
-    }
-}
+    });
+    let equation = if einsum
+        .constant_tensors
+        .iter()
+        .map(|t| t.is_some() as usize)
+        .sum::<usize>()
+        == 3
+    {
+        "X(se)@WQ(ehd):WK(ehd):WV(ehd)->Q(hsd)+BIAS(hd):K(hsd)+BIAS(hd):V(hsd)+BIAS(hd)".to_string()
+    } else if is_final_proj {
+        // In this case we also have to change the key on the constant tensor because its no longer the same as the initial embedding matrix
+        new_constant_tensors.iter_mut().for_each(|opt_tensor| {
+            if let Some(tensor) = opt_tensor {
+                tensor.key = "final_proj.weight".into();
+            }
+        });
+        "X(se)@WE(ve)->O(sv)+BIAS(v)".to_string()
+    } else {
+        "X(se)@WU(ep)->U(sp)+BIAS(p)".to_string()
+    };
+    let concatenation_dims = einsum
+        .caches
+        .iter()
+        .map(|c| c.clone().map(|cache| cache.lock().unwrap().cache_info().1))
+        .collect::<Vec<Option<usize>>>();
 
-/// Function to rescale a QKV layer that comes after a LayerNorm
-fn rescale_qkv_layer(
-    qkv: &QKV<f32>,
-    scales: &Tensor<f32>,
-    bias: &KeyedTensor<f32>,
-) -> Result<QKV<f32>> {
-    let QKV {
-        q,
-        q_bias,
-        k,
-        k_bias,
-        v,
-        v_bias,
-        num_heads,
-        num_groups,
-        ..
-    } = qkv;
-
-    // We transform the bias so it is a `1 x bias_size` matrix
-    let mut matrix_bias = bias.tensor();
-
-    matrix_bias.reshape(Shape::new(vec![1, bias.shape().dim(0)]))?;
-
-    let mut weights_and_biases = vec![];
-    for (old_matrix, old_bias) in [(q, q_bias), (k, k_bias), (v, v_bias)] {
-        let matrix_tensor = old_matrix;
-        let new_bias_shape = Shape::new(vec![matrix_tensor.ncols_2d()?]);
-        let mut new_bias = matrix_bias.matmul(matrix_tensor)?;
-        new_bias.reshape(new_bias_shape)?;
-        let new_bias = KeyedTensor::new(bias.key.clone(), new_bias);
-
-        let new_mat_data = matrix_tensor
-            .slice_last_dim()
-            .zip(scales.iter())
-            .flat_map(|(row, scale)| row.iter().map(|x| x * scale).collect::<Vec<f32>>())
-            .collect::<Vec<f32>>();
-        let new_mat = KeyedTensor::new(
-            old_matrix.key.clone(),
-            Tensor::new(old_matrix.shape().clone(), new_mat_data)?,
-        );
-        // If QKV does not have any bias, then we just take the one given
-        let new_bias = old_bias
-            .as_ref()
-            .map(|bias| bias.new_map_tensor(|bias| bias.add(&new_bias)))
-            .unwrap_or(new_bias);
-        weights_and_biases.push((new_mat, new_bias));
-    }
-    let (new_v_mat, new_v_bias) = weights_and_biases.pop().unwrap();
-    let (new_k_mat, new_k_bias) = weights_and_biases.pop().unwrap();
-    let (new_q_mat, new_q_bias) = weights_and_biases.pop().unwrap();
-
-    QKV::new(
-        new_q_mat,
-        Some(new_q_bias),
-        new_k_mat,
-        Some(new_k_bias),
-        new_v_mat,
-        Some(new_v_bias),
-        *num_heads,
-        *num_groups,
-    )
+    let mut output = EinSum::new(equation, new_constant_tensors, biases)?;
+    output.with_caches(concatenation_dims)?;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -467,7 +518,7 @@ mod tests {
         let const_shape = Shape::new(vec![const_col_size, const_row_size]);
         let const_matrix = Tensor::<f32>::random(&const_shape);
         // Make the mean subtraction matrix
-        let modified_const = mean_subtracted_matrix(&const_matrix).unwrap();
+        let modified_const = mean_subtracted_matrix(&const_matrix);
 
         for _ in 0..5 {
             let input_num_cols: usize = rng.gen_range(4..20);
@@ -488,6 +539,57 @@ mod tests {
                     });
                 })
         }
+    }
+
+    #[test]
+    fn test_mean_subtracted_tensor() -> anyhow::Result<()> {
+        let mut rng = rng_from_env_or_random();
+        for dim in 0..3 {
+            let shape = Shape::new(vec![
+                rng.gen_range(4..10),
+                rng.gen_range(4..10),
+                rng.gen_range(4..10),
+            ]);
+            let tensor = Tensor::<f32>::random(&shape);
+            let modified_tensor = mean_subtracted_tensor(&tensor, dim)?;
+
+            let iter_shape = shape.clone();
+            let mut indices = vec![0; shape.rank()];
+            let total_iters = shape.numel() / shape.dim(dim);
+            for _ in 0..total_iters {
+                let mut sum = 0.0;
+                for i in 0..shape.dim(dim) {
+                    indices[dim] = i;
+                    sum += tensor.get(indices.clone())?;
+                }
+                let mean = sum / shape.dim(dim) as f32;
+                for i in 0..shape.dim(dim) {
+                    indices[dim] = i;
+                    let modified_value = modified_tensor.get(indices.clone())?;
+                    let original_value = tensor.get(indices.clone())?;
+                    let expected_value = original_value - mean;
+                    let diff = modified_value - expected_value;
+                    assert!(
+                        diff.abs() < 1e-6,
+                        "Difference is too large at index {:?}: {diff}",
+                        indices
+                    );
+                }
+                // Increment indices for next iteration
+                for i in (0..shape.rank()).rev() {
+                    if i == dim {
+                        continue;
+                    }
+                    indices[i] += 1;
+                    if indices[i] < iter_shape.dim(i) {
+                        break;
+                    } else {
+                        indices[i] = 0;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -527,12 +629,12 @@ mod tests {
         let pre_transform_final_step = trace.get_step(&last_model_node_id).unwrap();
         let pre_transform_inputs = pre_transform_final_step.input_tensors().unwrap();
         // Rewrite the model by applying our transformation rule
-        let model = LayerNormToRMSNorm.apply(model)?;
+        let model = GPT2RMSNorm.apply(model)?;
 
         // Now we generate the post-transformation trace and extract the logits step data
         let mut store = GenStore::default();
 
-        let new_trace = model.run::<F>(vec![tensor], &mut store)?;
+        let new_trace = model.run::<F>(vec![tensor.clone()], &mut store)?;
 
         let post_transform_final_step = new_trace.get_step(&last_model_node_id).unwrap();
         let post_transform_inputs = post_transform_final_step.input_tensors().unwrap();
@@ -546,7 +648,9 @@ mod tests {
             let post_data = post.data();
             assert!(
                 is_close_with_tolerance(pre_data, post_data, 0.0, 1e-4),
-                "Transformed Model output was not close to the original"
+                "Transformed Model output was not close to the original, first 10 pre data: {:?}, first 10 post data: {:?}",
+                &pre_data[..10],
+                &post_data[..10],
             );
         }
         Ok(())
@@ -566,9 +670,10 @@ mod tests {
         let user_tokens = tokenizer.tokenize(sentence);
 
         // Rewrite the model by applying our transformation rule
-        let conf = default_pipeline_config().with_float_rules(vec![Box::new(LayerNormToRMSNorm)]);
+        let conf = default_pipeline_config().with_float_rules(vec![Box::new(GPT2RMSNorm)]);
 
         let driver = driver.into_provable_llm(Some(conf))?;
+        // driver.model.describe();
         let trace = driver.run::<GoldilocksExt2>(
             user_tokens.clone(),
             &mut GenStore::default(),

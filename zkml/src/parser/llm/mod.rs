@@ -1,12 +1,12 @@
 pub mod config;
-pub mod ffn;
+
 pub mod models;
 pub mod tokenizer;
 pub mod transformer;
 pub use crate::parser::{
-    gguf::{self},
-    json,
-    llm::{ffn::FeedForward, transformer::Attention},
+    gguf::{self, FileTensorLoader as GGUFLoader},
+    json::{self, FileTensorLoader as JSONLoader},
+    safe::{ConfigJSON, FileTensorLoader as SafeLoader},
 };
 pub use config::LLMConfig;
 use serde::{Deserialize, Serialize};
@@ -16,17 +16,17 @@ use crate::{
     Shape,
     layers::{
         Layer,
-        matrix_mul::MatMul,
+        einsum::EinSum,
         transformer::{
             embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, positional::Positional,
         },
     },
-    model::Model,
+    model::{LayerInsertion, Model},
     number::Number,
     padding::PaddingMode,
-    parser::llm::{
-        config::{LLMStructure, PositionalConfig},
-        transformer::Norm,
+    parser::{
+        Load,
+        llm::{config::LLMStructure, transformer::Norm},
     },
     tensor::TensorTypeParam,
 };
@@ -93,166 +93,191 @@ impl Token {
 }
 
 #[derive(Debug, Clone)]
-pub struct LLMModel {
+pub struct LLMModel<T> {
     pub embeddings: Embeddings<f32>,
-    pub positional: Positional<f32>,
-    pub blocks: Vec<Attention<f32>>,
+    pub global_positional: Option<Positional<f32>>,
+    pub blocks: Vec<T>,
     /// Final LayerNorm applied after all transformer blocks (ln_f in GPT-2)
     pub final_norm: Norm<f32>,
     /// final projection on token sizes to before selecting next token
-    pub final_proj: Option<MatMul<f32>>,
+    pub final_proj: EinSum<f32>,
 }
 
-impl LLMModel {
+impl<T> LLMModel<T> {
     pub fn new(
         embeddings: Embeddings<f32>,
-        positional: Positional<f32>,
-        blocks: Vec<Attention<f32>>,
+        global_positional: Option<Positional<f32>>,
+        blocks: Vec<T>,
         final_norm: Norm<f32>,
-        final_proj: Option<MatMul<f32>>,
+        final_proj: EinSum<f32>,
     ) -> Self {
         Self {
             embeddings,
-            positional,
+            global_positional,
             blocks,
             final_norm,
             final_proj,
         }
     }
+}
 
-    pub fn from_safetensors_loader(
-        loader: &crate::parser::safe::FileTensorLoader,
-        config: &crate::parser::safe::ConfigJSON,
-        structure: &LLMStructure,
-        attention_factory: fn(
-            &crate::parser::safe::FileTensorLoader,
-            &LLMStructure,
-        ) -> anyhow::Result<Attention<f32>>,
-    ) -> anyhow::Result<Self> {
-        let embeddings = Embeddings::from_safetensors_loader(loader)?;
-        let positional = Positional::from_safetensors_loader(loader, config, structure)?;
-
-        let num_layers = structure.generic.num_block;
-        let blocks = (0..num_layers)
-            .map(|i| attention_factory(&loader.pp(&format!("model.layers.{i}.")), structure))
-            .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
-        let blocks = blocks
-            .into_iter()
-            .zip(structure.attention_config.spans())
-            .map(|(attention, span)| attention.with_span(span))
-            .collect();
-        let final_norm = structure.norm_type.from_safetensors(
-            &loader.pp("model."),
-            config,
-            &structure.generic,
-            false,
-        )?;
-        let final_proj = if structure.final_proj {
-            //  there might or not be a bias
-            let proj_weights = loader.get_tensor("output.weight")?;
-            let proj_bias = loader.get_tensor("output.bias").ok();
-            Some(MatMul::new_constant(proj_weights, proj_bias)?)
-        } else {
-            None
-        };
-        Ok(Self::new(
-            embeddings, positional, blocks, final_norm, final_proj,
-        ))
-    }
-
-    pub fn from_gguf(
-        loader: &gguf::FileTensorLoader,
-        config: &LLMStructure,
-        attention_factory: fn(
-            &gguf::FileTensorLoader,
-            &LLMStructure,
-        ) -> anyhow::Result<Attention<f32>>,
-    ) -> anyhow::Result<Self> {
-        let embeddings = Embeddings::from_loader(loader)?;
-        let positional = Positional::from_gguf(loader, config)?;
-
-        let num_layers = config.generic.num_block;
-        let blocks = (0..num_layers)
-            .map(|i| attention_factory(&loader.pp(&format!("blk.{i}.")), config))
-            .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
-        let blocks = blocks
-            .into_iter()
-            .zip(config.attention_config.spans())
-            .map(|(attention, span)| attention.with_span(span))
-            .collect();
-        let final_norm =
-            config
-                .norm_type
-                .from_gguf(&loader.pp("output_"), &config.generic, false)?;
-        let final_proj = if config.final_proj {
-            //  there might or not be a bias
-            let proj_weights = loader
-                .get_tensor("output.weight")?
-                .try_map_tensor(|t| t.transpose())?;
-            let proj_bias = loader.get_tensor("output.bias").ok();
-            Some(MatMul::new_constant(proj_weights, proj_bias)?)
-        } else {
-            None
-        };
-        Ok(Self::new(
-            embeddings, positional, blocks, final_norm, final_proj,
-        ))
-    }
-
-    pub fn from_json(l: &json::FileTensorLoader, config: &LLMConfig) -> anyhow::Result<Self> {
-        let embeddings = Embeddings::from_json(l)?;
-        let positional = Positional::from_json(l, config)?;
-        let num_layers = config.num_block;
-        let blocks = (0..num_layers)
-            .map(|i| Attention::from_json(&l.pp(&format!("blk.{i}.")), config))
-            .collect::<anyhow::Result<Vec<Attention<f32>>>>()?;
-        let final_norm = Norm::LayerNorm(LayerNorm::from_json(&l.pp("output_"), config)?);
-        let proj_weights = l
-            .get_tensor("output.weight")?
-            .try_map_tensor(|t| t.transpose())?;
-        let proj_bias = l.get_tensor("output.bias").ok();
-        let final_proj = MatMul::new_constant(proj_weights, proj_bias)?;
-        Ok(Self::new(
-            embeddings,
-            positional,
-            blocks,
-            final_norm,
-            Some(final_proj),
-        ))
-    }
-    /// Creates a Model<f32> from the GPT2Model.
-    pub fn into_provable_model(
-        self,
-        c: &LLMStructure,
-        user_input_shape: Shape,
-    ) -> anyhow::Result<Model<f32>> {
+impl<T: LayerInsertion> LLMModel<T> {
+    /// Creates a Model<f32> from the [`LLMModel`].
+    pub fn into_provable_model(self, user_input_shape: Shape) -> anyhow::Result<Model<f32>> {
         let mut model =
             Model::new_from_input_shapes(vec![user_input_shape], PaddingMode::NoPadding);
 
         let mut last_node_id =
             Some(model.add_consecutive_layer(Layer::Embeddings(self.embeddings), None)?);
-        if let PositionalConfig::FixedPositional = &c.positional_config {
+        if let Some(positional) = self.global_positional {
             last_node_id =
-                Some(model.add_consecutive_layer(
-                    Layer::Positional(self.positional.clone()),
-                    last_node_id,
-                )?);
+                Some(model.add_consecutive_layer(Layer::Positional(positional), last_node_id)?);
         }
         for block in self.blocks {
-            let pos = if let PositionalConfig::Rope(_) = &c.positional_config {
-                Some(self.positional.clone())
-            } else {
-                None
-            };
-            last_node_id = Some(block.write_to_model(&mut model, last_node_id, c, pos)?);
+            last_node_id = Some(block.add_to_model(&mut model, last_node_id)?);
         }
         last_node_id = Some(model.add_consecutive_layer(self.final_norm.to_layer(), last_node_id)?);
-        if let Some(final_proj) = self.final_proj {
-            last_node_id =
-                Some(model.add_consecutive_layer(Layer::MatMul(final_proj), last_node_id)?);
-        }
+
+        last_node_id =
+            Some(model.add_consecutive_layer(Layer::EinSum(self.final_proj), last_node_id)?);
+
         model.add_consecutive_layer(Layer::Logits(Logits::Argmax), last_node_id)?;
         model.automatic_output_labelling()?;
         Ok(model)
+    }
+}
+
+impl<T> Load<GGUFLoader> for LLMModel<T>
+where
+    T: Load<GGUFLoader, Config = LLMStructure> + LayerInsertion,
+{
+    type Config = LLMStructure;
+
+    fn from_loader(loader: &GGUFLoader, config: &Self::Config) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        let embeddings = Embeddings::from_loader(loader)?;
+        let global_positional = config
+            .global_positional
+            .as_ref()
+            .map(|p| Positional::from_gguf(loader, config, p))
+            .transpose()?;
+
+        let num_layers = config.generic.num_block;
+        let blocks = (0..num_layers)
+            .map(|i| T::from_loader(&loader.pp(&format!("blk.{i}.")), config))
+            .collect::<anyhow::Result<Vec<T>>>()?;
+
+        let final_norm = config
+            .norm_type
+            .from_gguf(&loader.pp("output_"), &config.generic)?;
+
+        // Now we work out the final projection
+        // there may or may not be a bias
+        let input_terms = "X(se)@WE(ve)";
+        let proj_bias = loader.get_tensor("output.bias").ok();
+        let output_terms = if proj_bias.is_some() {
+            "O(sv)+BIAS(v)"
+        } else {
+            "O(sv)"
+        };
+        let equation = format!("{input_terms}->{output_terms}");
+        let proj_weights = embeddings.mat.clone();
+        let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
+
+        Ok(Self::new(
+            embeddings,
+            global_positional,
+            blocks,
+            final_norm,
+            final_proj,
+        ))
+    }
+}
+
+impl<T> Load<SafeLoader> for LLMModel<T>
+where
+    T: Load<SafeLoader, Config = (LLMStructure, ConfigJSON)> + LayerInsertion,
+{
+    type Config = (LLMStructure, ConfigJSON);
+    fn from_loader(loader: &SafeLoader, loader_config: &Self::Config) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        let (structure, config) = loader_config;
+        let embeddings = Embeddings::from_safetensors_loader(loader)?;
+        let global_positional = structure
+            .global_positional
+            .as_ref()
+            .map(|p| Positional::from_safetensors_loader(loader, structure, p))
+            .transpose()?;
+
+        let num_layers = structure.generic.num_block;
+        let blocks = (0..num_layers)
+            .map(|i| T::from_loader(&loader.pp(&format!("model.layers.{i}.")), loader_config))
+            .collect::<anyhow::Result<Vec<T>>>()?;
+
+        let final_norm = structure.norm_type.from_safetensors(
+            &loader.pp("model."),
+            config,
+            &structure.generic,
+        )?;
+        // Now we work out the final projection
+        // there may or may not be a bias
+        let input_terms = "X(se)@WE(ve)";
+        let proj_bias = loader.get_tensor("output.bias").ok();
+        let output_terms = if proj_bias.is_some() {
+            "O(sv)+BIAS(v)"
+        } else {
+            "O(sv)"
+        };
+        let equation = format!("{input_terms}->{output_terms}");
+        let proj_weights = embeddings.mat.clone();
+        let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
+
+        Ok(Self::new(
+            embeddings,
+            global_positional,
+            blocks,
+            final_norm,
+            final_proj,
+        ))
+    }
+}
+
+impl<T> Load<JSONLoader> for LLMModel<T>
+where
+    T: Load<JSONLoader, Config = LLMConfig> + LayerInsertion,
+{
+    type Config = LLMConfig;
+
+    fn from_loader(l: &JSONLoader, config: &Self::Config) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        let embeddings = Embeddings::from_json(l)?;
+        let positional = Some(Positional::from_json(l, config)?);
+        let num_layers = config.num_block;
+        let blocks = (0..num_layers)
+            .map(|i| T::from_loader(&l.pp(&format!("blk.{i}.")), config))
+            .collect::<anyhow::Result<Vec<T>>>()?;
+        let final_norm = Norm::LayerNorm(LayerNorm::from_json(&l.pp("output_"), config)?);
+
+        // Now we work out the final projection
+        // there may or may not be a bias
+        let input_terms = "X(se)@WE(ve)";
+        let proj_bias = l.get_tensor("output.bias").ok();
+        let output_terms = if proj_bias.is_some() {
+            "O(sv)+BIAS(v)"
+        } else {
+            "O(sv)"
+        };
+        let equation = format!("{input_terms}->{output_terms}");
+        let proj_weights = embeddings.mat.clone();
+        let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
+        Ok(Self::new(
+            embeddings, positional, blocks, final_norm, final_proj,
+        ))
     }
 }

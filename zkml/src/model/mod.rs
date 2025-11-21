@@ -643,7 +643,10 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
             let new_step = self
                 .run_layer(node_id, layer, handles, &mut tracker, store.clone())
-                .context(format!("Error occurred at node ID: {node_id}"))?;
+                .context(format!(
+                    "Error occurred at node ID: {node_id}, Operation: {}",
+                    layer.as_kind_str()
+                ))?;
 
             handle_tracker.after_layer(&input_storage_keys, &new_step.node_outputs.outputs)?;
             trace.new_step(node_id, new_step);
@@ -725,7 +728,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         let mut prec_unpadded_shapes = Vec::with_capacity(handles.len());
         let expected_num_outputs = layer.num_outputs(handles.len())?;
 
-        let layer_out = {
+        let (layer_out, out_shapes) = {
             // Scope to shorten the lifetime of the borrowed handles
             let mut wrapped_tensors_guards = Vec::with_capacity(handles.len());
 
@@ -739,13 +742,17 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
                 .map(|guard| guard.deref())
                 .collect::<Vec<_>>();
 
-            layer.evaluate(&wrapped_tensors)?
+            // We calculate the unpadded output shapes before running the layer in case the layer uses a concatenation cache.
+            // This ensures that the shapes are computed correctly without interfering with the layer's internal state during evaluation.
+            let out_shapes = layer.output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?;
+
+            (layer.evaluate(&wrapped_tensors)?, out_shapes)
         };
+
         let (layer_outputs, layer_proving_data, layer_tracked_data) = layer_out.into_parts();
 
         // Outgoing ports are unique, so they are used to create the tensor's id.
         let out_ports = self.graph.outgoing_ports(node_id);
-        let out_shapes = layer.output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?;
 
         ensure!(
             expected_num_outputs == layer_outputs.len(),
@@ -770,7 +777,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         );
 
         let mut output_handles = Vec::<TensorHandle<N>>::with_capacity(out_ports.len());
-        for (port, shape, tensor) in izip!(out_ports, out_shapes, layer_outputs) {
+        for (port, shape, tensor) in izip!(out_ports, out_shapes.clone(), layer_outputs) {
             let storage_key: StorageKey<Vec<N>> = port.to_storage_key();
             let data = tensor
                 .clone()
@@ -812,8 +819,7 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         Ok(Step {
             node_inputs: handles,
             node_outputs: NodeOut::new(output_handles, layer_proving_data),
-            unpadded_output_shapes: layer
-                .output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?,
+            unpadded_output_shapes: out_shapes,
             unpadded_input_shapes: prec_unpadded_shapes,
         })
     }
@@ -835,43 +841,59 @@ impl<'a> From<&'a Model<Element>> for ModelLayers {
     }
 }
 
+/// Trait used to define an operation, or sequence of operations that can be added to a [`Model`].
+pub trait LayerInsertion {
+    /// Adds the layer to the provided model, connecting it to the previous node if provided.
+    /// Returns the [`NodeId`] of the last layer added.
+    fn add_to_model(
+        self,
+        model: &mut Model<f32>,
+        previous_node_id: Option<NodeId>,
+    ) -> anyhow::Result<NodeId>;
+}
+
+impl Model<f32> {
+    pub fn insert_layer<L: LayerInsertion>(
+        &mut self,
+        layer: L,
+        previous_node_id: Option<NodeId>,
+    ) -> anyhow::Result<NodeId> {
+        layer.add_to_model(self, previous_node_id)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test {
     use std::ops::Deref;
 
     use super::Model;
     use crate::{
-        Element, Prover, ScalingFactor, ScalingStrategy, Shape, default_transcript,
+        Element, Prover, ScalingFactor, ScalingStrategy, Shape,
         graph::NodeOutput,
         init_test_logging, init_test_logging_default,
         layers::{
             Layer,
             activation::Activation,
             convolution::{ConvCtx, Convolution},
-            dense::Dense,
-            matrix_mul::{Config, MatMul, OperandMatrix},
+            einsum::EinSum,
+            flatten::Flatten,
             pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
             provable::{OpInfo, evaluate_layer},
             requant::Requant,
         },
         padding::{PaddingMode, pad_model},
-        quantization::{self, Fieldizer, InferenceObserver},
+        quantization::InferenceObserver,
         rng_from_env_or_random,
         tensor::{KeyedTensor, Tensor, TensorHandle, TensorTypeParam},
-        testing::{Pcs, random_bool_vector, random_vector},
-        util::from_mle_list_dimensions,
+        testing::{Pcs, random_vector},
         verify,
     };
     use anyhow::{Ok, Result};
     use ark_std::rand::{Rng, RngCore};
-    use either::Either;
+
     use ff_ext::GoldilocksExt2;
     use itertools::Itertools;
-    use multilinear_extensions::{mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
-    use sumcheck::{
-        structs::{IOPProverState, IOPVerifierState},
-        util::optimal_sumcheck_threads,
-    };
+
     use tenstore::GenStore;
     use transcript::BasicTranscript;
 
@@ -895,8 +917,8 @@ pub(crate) mod test {
             rng: &mut R,
         ) -> Result<(Self, Vec<Tensor<Element>>)> {
             let mut last_row: usize = rng.gen_range(3..15);
-            let mut model = Self::new_from_input_shapes(
-                vec![vec![last_row.next_power_of_two()].into()],
+            let mut model = Model::<f32>::new_from_input_shapes(
+                vec![vec![last_row].into()],
                 PaddingMode::NoPadding,
             );
 
@@ -907,41 +929,13 @@ pub(crate) mod test {
                     // last row becomes new column
                     let (nrows, ncols): (usize, usize) = (rng.gen_range(3..15), last_row);
                     last_row = nrows;
-                    let dense = Dense::random(
-                        vec![nrows.next_power_of_two(), ncols.next_power_of_two()].into(),
+                    let dense = EinSum::<f32>::random_dense(
+                        vec![nrows, ncols].into(),
                         Some(format!("dense_{selector}").into()),
-                    )?;
-                    // Figure out the requant information such that output is still within range
-                    let (min_output_range, max_output_range) =
-                        dense.output_range(*quantization::MIN, *quantization::MAX)?;
-                    let output_scaling_factor = ScalingFactor::from_scale(
-                        ((max_output_range - min_output_range) as f64
-                            / (*quantization::MAX - *quantization::MIN) as f64)
-                            as f32,
-                        None,
-                    );
-                    let input_scaling_factor = ScalingFactor::from_scale(1.0, None);
-                    let max_model = dense.matrix.max_value().max(
-                        dense
-                            .bias
-                            .as_ref()
-                            .map(|b| b.max_value())
-                            .unwrap_or(f32::MIN as i64),
-                    ) as f32;
-                    let model_scaling_factor = ScalingFactor::from_absolute_max(max_model, None);
-
-                    let intermediate_bit_size = dense.output_bitsize()?;
-                    let requant = Requant::from_scaling_factors(
-                        input_scaling_factor,
-                        model_scaling_factor,
-                        output_scaling_factor,
-                        intermediate_bit_size,
                     );
 
                     last_node_id =
-                        Some(model.add_consecutive_layer(Layer::Dense(dense), last_node_id)?);
-                    last_node_id =
-                        Some(model.add_consecutive_layer(Layer::Requant(requant), last_node_id)?);
+                        Some(model.add_consecutive_layer(Layer::EinSum(dense), last_node_id)?);
                 } else if selector % MOD_SELECTOR == SELECTOR_RELU {
                     last_node_id = Some(model.add_consecutive_layer(
                         Layer::Activation(Activation::new_relu()),
@@ -963,7 +957,10 @@ pub(crate) mod test {
             }
             model.automatic_output_labelling().unwrap();
             let inputs = model.input_shapes().iter().map(Tensor::random).collect();
-            Ok((model, inputs))
+            let (model, inputs) = quantize_model(model, inputs, None, &mut GenStore::default())?;
+            let model = pad_model(model)?;
+            let prepped_inputs = model.prepare_inputs(inputs)?;
+            Ok((model, prepped_inputs))
         }
 
         /// Returns a model that only contains pooling and relu layers.
@@ -992,14 +989,15 @@ pub(crate) mod test {
                 })
                 .collect::<Shape>();
 
-            let mut model =
-                Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
-
-            let inputs = model.input_shapes().iter().map(Tensor::random).collect();
+            let mut model = Model::<f32>::new_from_input_shapes(
+                vec![input_shape.clone()],
+                PaddingMode::NoPadding,
+            );
 
             let info = Maxpool2D::default();
             let mut last_node_id = None;
             for _ in 0..num_layers {
+                println!("last node id: {:?}", last_node_id);
                 input_shape
                     .iter_mut()
                     .skip(1)
@@ -1012,18 +1010,22 @@ pub(crate) mod test {
 
             let (nrows, ncols): (usize, usize) =
                 (rng.gen_range(3..15), input_shape.iter().product::<usize>());
-
+            println!("Adding final dense layer of shape {nrows} x {ncols}");
+            println!("Input shape before dense: {:?}", input_shape);
+            println!("last node id: {:?}", last_node_id);
+            last_node_id =
+                Some(model.add_consecutive_layer(Layer::Flatten(Flatten(false)), last_node_id)?);
             model.add_consecutive_layer(
-                Layer::Dense(Dense::random(
-                    vec![nrows.next_power_of_two(), ncols.next_power_of_two()].into(),
-                    None,
-                )?),
+                Layer::EinSum(EinSum::random_dense(vec![nrows, ncols].into(), None)),
                 last_node_id,
             )?;
 
             model.automatic_output_labelling()?;
-
-            Ok((model, inputs))
+            let inputs = model.input_shapes().iter().map(Tensor::random).collect();
+            let (model, inputs) = quantize_model(model, inputs, None, &mut GenStore::default())?;
+            let model = pad_model(model)?;
+            let prepped_inputs = model.prepare_inputs(inputs)?;
+            Ok((model, prepped_inputs))
         }
     }
 
@@ -1031,10 +1033,6 @@ pub(crate) mod test {
     fn test_model_long() {
         let (model, inputs) = Model::random(3).unwrap();
         model.run::<F>(inputs, &mut Default::default()).unwrap();
-    }
-
-    fn random_vector_quant(n: usize) -> Vec<Element> {
-        random_vector(n)
     }
 
     #[test]
@@ -1078,21 +1076,15 @@ pub(crate) mod test {
 
     #[test]
     fn test_model_manual_run() {
-        let dense1 = Dense::<Element>::random(
+        let dense1 = EinSum::<Element>::random_dense(
             vec![10usize.next_power_of_two(), 11usize.next_power_of_two()].into(),
             Some("dense_1".to_string().into()),
-        )
-        .unwrap();
-        let dense2 = Dense::<Element>::random(
-            vec![
-                7usize.next_power_of_two(),
-                dense1.ncols().unwrap().next_power_of_two(),
-            ]
-            .into(),
+        );
+        let dense2 = EinSum::<Element>::random_dense(
+            vec![7usize.next_power_of_two(), 10usize.next_power_of_two()].into(),
             Some("dense_2".to_string().into()),
-        )
-        .unwrap();
-        let input_shape = vec![dense1.ncols().unwrap()].into();
+        );
+        let input_shape = vec![11usize.next_power_of_two()].into();
         let input = Tensor::<Element>::random(&input_shape).into_wrapped();
         let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &[&input])
             .unwrap()
@@ -1106,10 +1098,10 @@ pub(crate) mod test {
         let mut model =
             Model::<Element>::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
         let first_id = model
-            .add_consecutive_layer(Layer::Dense(dense1.clone()), None)
+            .add_consecutive_layer(Layer::EinSum(dense1.clone()), None)
             .unwrap();
         let second_id = model
-            .add_consecutive_layer(Layer::Dense(dense2.clone()), Some(first_id))
+            .add_consecutive_layer(Layer::EinSum(dense2.clone()), Some(first_id))
             .unwrap();
         model.automatic_output_labelling().unwrap();
 
@@ -1139,147 +1131,8 @@ pub(crate) mod test {
                 .deref(),
             &final_output.clone().into_native(),
         );
-        let (nrow, _) = (dense2.nrows().unwrap(), dense2.ncols());
-        assert_eq!(final_output.get_data().len(), nrow);
-    }
 
-    #[test]
-    fn test_model_sequential() {
-        let (model, input) = Model::random(1).unwrap();
-        model.describe();
-        let trace = model.run::<F>(input, &mut Default::default()).unwrap();
-        let dense_layers = model
-            .to_unstable_iterator()
-            .filter_map(|(n_id, n)| n.as_inner().map(|l| (n_id, l)))
-            .flat_map(|(id, l)| match l {
-                Layer::Dense(ref dense) => Some((*id, dense.clone())),
-                _ => None,
-            })
-            .collect_vec();
-        let matrices_mle = dense_layers
-            .iter()
-            .map(|(id, d)| (*id, d.matrix.to_2d_mle::<F>().unwrap()))
-            .collect_vec();
-        assert_eq!(dense_layers.len(), 1);
-        let point1 = random_bool_vector(dense_layers[0].1.nrows().unwrap().ilog2() as usize);
-        let computed_eval1 = trace
-            .get_step(&dense_layers[0].0)
-            .unwrap_or_else(|| panic!("Node with id {} not found", dense_layers[0].0))
-            .output_tensor_at(0)
-            .unwrap()
-            .to_field_mle()
-            .evaluate(&point1);
-        let flatten_mat1 = matrices_mle[0].1.fix_high_variables(&point1);
-        let bias_eval = dense_layers[0]
-            .1
-            .bias
-            .as_ref()
-            .unwrap() // safe because we know there is a bias
-            .to_field_mle()
-            .evaluate(&point1);
-        let computed_eval1_no_bias = computed_eval1 - bias_eval;
-        // since y = SUM M(j,i) x(i) + B(j)
-        // then
-        // y(r) - B(r) = SUM_i m(r,i) x(i)
-        let input_mle = trace
-            .inputs()
-            .first()
-            .unwrap()
-            .tensor()
-            .unwrap()
-            .get_data()
-            .iter()
-            .map(Fieldizer::<F>::to_field)
-            .collect::<Vec<_>>()
-            .into_mle();
-
-        let num_vars = flatten_mat1.num_vars();
-        let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
-        let expr = expr_builder.lift(Either::Left(&flatten_mat1))
-            * expr_builder.lift(Either::Left(&input_mle));
-        let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
-        let (proof, _state) = IOPProverState::prove(virtual_poly, &mut default_transcript());
-
-        let given_eval1 = proof.extract_sum();
-
-        assert_eq!(computed_eval1_no_bias, given_eval1);
-
-        let aux_info = from_mle_list_dimensions(&[vec![num_vars, num_vars]]);
-        let _subclaim = IOPVerifierState::<F>::verify(
-            computed_eval1_no_bias,
-            &proof,
-            &aux_info,
-            &mut default_transcript(),
-        );
-    }
-
-    #[test]
-    #[ignore = "This test should be deleted since there is no requant and it is not testing much"]
-    fn test_single_matvec_prover() {
-        let mut store = GenStore::default();
-        let w1 = random_vector_quant(1024 * 1024);
-        let conv1 = KeyedTensor::new(
-            "matvec_weight",
-            Tensor::new(vec![1024, 1024].into(), w1.clone()).unwrap(),
-        );
-        let w2 = random_vector_quant(1024);
-        let conv2 = KeyedTensor::new(
-            "matvec_bias",
-            Tensor::new(vec![1024].into(), w2.clone()).unwrap(),
-        );
-        let input_shape = vec![1024].into();
-
-        let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::Padding);
-        let input = Tensor::random(&model.input_shapes()[0]);
-        model
-            .add_consecutive_layer(Layer::Dense(Dense::new(conv1, conv2).unwrap()), None)
-            .unwrap();
-        model.automatic_output_labelling().unwrap();
-        model.describe();
-        let trace = model.run::<F>(vec![input], &mut store).unwrap();
-        let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<F, Pcs<F>>()
-            .expect("Unable to generate contexts");
-        let io = trace.to_verifier_io().unwrap();
-        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
-        verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
-    }
-
-    #[test]
-    fn test_single_matmul_prover() {
-        // layer matrix shape
-        let m_shape: Shape = vec![100, 200].into();
-        let m = random_vector_quant(m_shape[0] * m_shape[1]);
-        let tensor_m = KeyedTensor::new("matmul_weight", Tensor::new(m_shape, m).unwrap());
-        let input_shape: Shape = vec![5, tensor_m.nrows_2d().unwrap()].into();
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::Padding);
-        let matmul_layer = MatMul::new(
-            OperandMatrix::Input,
-            OperandMatrix::new_weight_matrix(tensor_m),
-        )
-        .unwrap();
-        let padded_layer = matmul_layer.pad_next_power_of_two().unwrap();
-        model
-            .add_consecutive_layer(Layer::MatMul(padded_layer), None)
-            .unwrap();
-        model.automatic_output_labelling().unwrap();
-        model.describe();
-
-        let input = random_vector_quant(input_shape[0] * input_shape[1]);
-        let inputs = model
-            .prepare_inputs(vec![Tensor::new(input_shape, input).unwrap()])
-            .unwrap();
-
-        let mut store = GenStore::default();
-        let trace = model.run::<F>(inputs, &mut store).unwrap();
-        let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<F, Pcs<F>>()
-            .expect("Unable to generate contexts");
-        let io = trace.to_verifier_io().unwrap();
-        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
-        verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
+        assert_eq!(final_output.get_data().len(), 7usize.next_power_of_two());
     }
 
     #[test]
@@ -1352,17 +1205,17 @@ pub(crate) mod test {
         // generate random dense matrix
         let ncols = input_shape[0];
         let nrows = 42;
-        let dense = Dense::random(
+        let dense = EinSum::<N>::random_dense(
             vec![nrows, ncols].into(),
             Some("dense_1".to_string().into()),
-        )
-        .unwrap();
+        );
+
         let dense_out_shape = &dense
             .output_shapes(&model.unpadded_input_shapes(), PaddingMode::NoPadding)
             .unwrap()[0];
         let input_node = model
             .add_consecutive_layer(
-                Layer::Dense(dense),
+                Layer::EinSum(dense),
                 None, // it's connected to the inputs of the model
             )
             .unwrap();
@@ -1374,13 +1227,12 @@ pub(crate) mod test {
         // add another dense layer as output
         let nrows = 37;
         let ncols = dense_out_shape[0]; // it's a vector, so it has only one dimension
-        let dense = Dense::random(
+        let dense = EinSum::<N>::random_dense(
             vec![nrows, ncols].into(),
             Some("dense_2".to_string().into()),
-        )
-        .unwrap();
+        );
         let _ = model
-            .add_consecutive_layer(Layer::Dense(dense), Some(relu_node))
+            .add_consecutive_layer(Layer::EinSum(dense), Some(relu_node))
             .unwrap();
         let out_ids = model.automatic_output_labelling().unwrap();
 
@@ -1576,18 +1428,17 @@ pub(crate) mod test {
         // generate random dense matrix
         let ncols = FIRST_INPUT_SIZE;
         let nrows = 42;
-        let dense = Dense::random(
+        let dense = EinSum::<f32>::random_dense(
             vec![nrows, ncols].into(),
             Some("dense_1".to_string().into()),
-        )
-        .unwrap();
+        );
         let first_dense_out_shape = &dense
             .output_shapes(
                 &[model.unpadded_input_shapes()[0].clone()],
                 PaddingMode::NoPadding,
             )
             .unwrap()[0];
-        let first_input_dense = model.graph.add_inner(Layer::Dense(dense)).unwrap();
+        let first_input_dense = model.graph.add_inner(Layer::EinSum(dense)).unwrap();
         // set that it will consume the first input
         model
             .connect_model_input(0, first_input_dense.input_at(0))
@@ -1596,18 +1447,17 @@ pub(crate) mod test {
         // add second input dense layer
         let ncols = SECOND_INPUT_SIZE;
         let nrows = 47;
-        let dense = Dense::random(
+        let dense = EinSum::<f32>::random_dense(
             vec![nrows, ncols].into(),
             Some("dense_2".to_string().into()),
-        )
-        .unwrap();
+        );
         let second_dense_out_shape = &dense
             .output_shapes(
                 &[model.unpadded_input_shapes()[1].clone()],
                 PaddingMode::NoPadding,
             )
             .unwrap()[0];
-        let second_input_dense = model.graph.add_inner(Layer::Dense(dense)).unwrap();
+        let second_input_dense = model.graph.add_inner(Layer::EinSum(dense)).unwrap();
         model
             .connect_model_input(1, second_input_dense.input_at(0))
             .unwrap();
@@ -1623,23 +1473,21 @@ pub(crate) mod test {
         // add other dense nodes
         let nrows = 52;
         let ncols = second_dense_out_shape[0]; // it's a vector, so it has only one dimension
-        let dense = Dense::random(
+        let dense = EinSum::<f32>::random_dense(
             vec![nrows, ncols].into(),
             Some("dense_out_1".to_string().into()),
-        )
-        .unwrap();
+        );
         let dense1 = model
-            .add_consecutive_layer(Layer::Dense(dense), Some(second_relu_node))
+            .add_consecutive_layer(Layer::EinSum(dense), Some(second_relu_node))
             .unwrap();
         let nrows = 17;
         let ncols = first_dense_out_shape[0];
-        let dense = Dense::random(
+        let dense = EinSum::<f32>::random_dense(
             vec![nrows, ncols].into(),
             Some("dense_out_2".to_string().into()),
-        )
-        .unwrap();
+        );
         let dense2 = model
-            .add_consecutive_layer(Layer::Dense(dense), Some(first_relu_node))
+            .add_consecutive_layer(Layer::EinSum(dense), Some(first_relu_node))
             .unwrap();
 
         let (first_output_node, second_output_node) = (
@@ -1671,8 +1519,8 @@ pub(crate) mod test {
         // Add an input MatMul layer multiplying second with third input
         let first_input_node = model
             .graph
-            .add_inner(Layer::MatMul(
-                MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap(),
+            .add_inner(Layer::EinSum(
+                EinSum::new_matmul(None, None, false, None).unwrap(),
             ))
             .unwrap();
         model
@@ -1682,8 +1530,8 @@ pub(crate) mod test {
         // Add another input MatMul layer multiplying second with first input
         let second_input_node = model
             .graph
-            .add_inner(Layer::MatMul(
-                MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap(),
+            .add_inner(Layer::EinSum(
+                EinSum::new_matmul(None, None, false, None).unwrap(),
             ))
             .unwrap();
         model
@@ -1693,14 +1541,8 @@ pub(crate) mod test {
         // multiply the previous nodes
         let third = model
             .graph
-            .add_inner(Layer::MatMul(
-                MatMul::new_with_config(
-                    OperandMatrix::Input,
-                    OperandMatrix::Input,
-                    None,
-                    crate::layers::matrix_mul::Config::TransposeB,
-                )
-                .unwrap(),
+            .add_inner(Layer::EinSum(
+                EinSum::new_matmul(None, None, true, None).unwrap(),
             ))
             .unwrap();
         model.add_edge(first_input_node, third, (0, 0)).unwrap();
@@ -1719,32 +1561,36 @@ pub(crate) mod test {
 
         let matmul1 = model
             .graph
-            .add_inner(Layer::MatMul(
-                MatMul::new(OperandMatrix::Input, OperandMatrix::Input).unwrap(),
+            .add_inner(Layer::EinSum(
+                EinSum::new_matmul(None, None, false, None).unwrap(),
             ))
             .unwrap();
         let matmul2 = model
             .graph
-            .add_inner(Layer::MatMul(
-                MatMul::new(
-                    OperandMatrix::Input,
-                    OperandMatrix::new_weight_matrix(KeyedTensor::new(
+            .add_inner(Layer::EinSum(
+                EinSum::new_matmul(
+                    None,
+                    Some(KeyedTensor::new(
                         "first_out_weight",
                         Tensor::random(&vec![13, 9].into()),
                     )),
+                    false,
+                    None,
                 )
                 .unwrap(),
             ))
             .unwrap();
         let matmul3 = model
             .graph
-            .add_inner(Layer::MatMul(
-                MatMul::new(
-                    OperandMatrix::Input,
-                    OperandMatrix::new_weight_matrix(KeyedTensor::new(
+            .add_inner(Layer::EinSum(
+                EinSum::new_matmul(
+                    None,
+                    Some(KeyedTensor::new(
                         "second_out_weight",
                         Tensor::random(&vec![13, 13].into()),
                     )),
+                    false,
+                    None,
                 )
                 .unwrap(),
             ))
@@ -1773,21 +1619,16 @@ pub(crate) mod test {
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
         let first_layer_id = model
             .add_consecutive_layer(
-                Layer::MatMul(MatMul::new_constant(matmul_weight.clone(), Some(bias)).unwrap()),
+                Layer::EinSum(
+                    EinSum::new_matmul(None, Some(matmul_weight.clone()), false, Some(bias))
+                        .unwrap(),
+                ),
                 None,
             )
             .unwrap();
         let _ = model
             .add_consecutive_layer(
-                Layer::MatMul(
-                    MatMul::new_with_config(
-                        OperandMatrix::Input,
-                        OperandMatrix::new_weight_matrix(matmul_weight),
-                        None,
-                        Config::TransposeB,
-                    )
-                    .unwrap(),
-                ),
+                Layer::EinSum(EinSum::new_matmul(None, Some(matmul_weight), true, None).unwrap()),
                 Some(first_layer_id),
             )
             .unwrap();

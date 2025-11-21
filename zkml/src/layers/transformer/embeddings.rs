@@ -6,6 +6,7 @@ use crate::{
         LayerProof,
         provable::{QuantizeOp, QuantizeOutput},
     },
+    padding::ShapeData,
     parser::{gguf, json},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
@@ -22,16 +23,15 @@ use crate::{
     },
     layers::{
         LayerCtx,
-        matrix_mul::{MatMul, OperandMatrix},
         provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
     },
     model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo},
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use burn::tensor::{
-    TensorPrimitive,
+    Shape as BShape, TensorPrimitive,
     ops::{FloatTensorOps, IntTensorOps},
 };
 use either::Either;
@@ -51,7 +51,7 @@ pub const EMBEDDINGS_LAYER: &str = "EMBD";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Embeddings<N> {
-    pub(crate) mat: MatMul<N>,
+    pub(crate) mat: KeyedTensor<N>,
     pub(crate) emb_size: usize,
     pub(crate) vocab_size: usize,
 }
@@ -79,30 +79,20 @@ impl<N: Number> Embeddings<N> {
     pub fn new(emb: KeyedTensor<N>) -> anyhow::Result<Self> {
         let emb_size = emb.shape()[1];
         let vocab_size = emb.shape()[0];
-        // left side is one hot input tensor, and right side
-        // is the embedding matrix
-        let left = OperandMatrix::Input;
-        let right = OperandMatrix::new_weight_matrix(emb);
-        let matmul = MatMul::new(left, right)?;
+
         Ok(Self {
-            mat: matmul,
+            mat: emb,
             emb_size,
             vocab_size,
         })
     }
 
     fn embedding_matrix_key(&self) -> CommitmentId {
-        let OperandMatrix::Weight(embedding_matrix) = &self.mat.right_matrix else {
-            unreachable!()
-        };
-        embedding_matrix.tensor.commitment_id()
+        self.mat.commitment_id()
     }
 
     pub(crate) fn embedding_matrix(&self) -> &Tensor<N> {
-        let OperandMatrix::Weight(embedding_matrix) = &self.mat.right_matrix else {
-            unreachable!()
-        };
-        &embedding_matrix.tensor
+        &self.mat.tensor
     }
 
     /// Split the point over which the 2d output tensor is evaluated into 2 sub-points:
@@ -217,16 +207,10 @@ impl Evaluate<f32> for Embeddings<f32> {
             inputs.iter().map(|x| x.shape()).collect::<Vec<_>>()
         );
         ensure!(inputs.len() == 1, "embeddings only support 1 input tensor");
-        // we still uses this evaluation for inference as it's quicker
-        // than doing the matmul with one hot encoding. Proving however will generate
-        // the one hot encoding and do the matmul.
-        let OperandMatrix::Weight(ref w) = self.mat.right_matrix else {
-            bail!("right matrix is not a weight matrix");
-        };
-        let input = inputs[0];
-        let emb = &w.tensor;
 
-        let weights = WrappedTensor::try_from(emb)?;
+        let input = inputs[0];
+
+        let weights = WrappedTensor::try_from(self.embedding_matrix())?;
         let indices = input.clone().int();
 
         let res = Backend::float_select(
@@ -257,21 +241,35 @@ impl Evaluate<Element> for Embeddings<Element> {
         // we still uses this evaluation for inference as it's quicker
         // than doing the matmul with one hot encoding. Proving however will generate
         // the one hot encoding and do the matmul.
-        let OperandMatrix::Weight(ref w) = self.mat.right_matrix else {
-            bail!("right matrix is not a weight matrix");
-        };
+
         let input = inputs[0];
-        let emb = &w.tensor;
 
-        let weights = emb.clone().to_btensor::<2>();
-        let indices = input.clone();
+        let weights = self.embedding_matrix().clone().to_btensor::<2>();
+        let is_padded = input.is_padded();
+        let indices = if is_padded {
+            input.clone().reduce_to_unpadded_shape()?
+        } else {
+            input.clone()
+        };
 
+        // The unpadded shape for the output is [seq_len, emb_size]
+        let emb_size = self.embedding_matrix().unpadded_shape().dim(-1);
+
+        let output_unpadded_shape = BShape::from(vec![input.unpadded_shape()[0], emb_size]);
         let res = Backend::int_select(weights.into_primitive(), 0, indices.into_primitive());
+        let out = if is_padded {
+            WrappedTensor::Rank2(
+                burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res),
+                output_unpadded_shape,
+            )
+            .pad_next_power_of_two()
+        } else {
+            WrappedTensor::Rank2(
+                burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res),
+                output_unpadded_shape,
+            )
+        };
 
-        let out = WrappedTensor::Rank2(
-            burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res),
-            input.unpadded_shape().clone(),
-        );
         Ok(LayerOut::from_tensor(out))
     }
 }
@@ -286,23 +284,28 @@ impl PadOp for Embeddings<Element> {
             "embeddings only support 1 input tensor"
         );
         // we need to give the shapes that the one hot encoding will have
-        let shape_data = si.shapes.get_mut(0).unwrap();
+        let shape_data = si.shapes.first().unwrap();
         ensure!(
             shape_data.input_shape_og.rank() == 1,
             "embeddings only support 1d tensors"
         );
-        shape_data.input_shape_og = one_hot_shape(
-            &shape_data.input_shape_og,
-            self.vocab_size,
-            PaddingMode::NoPadding,
-        );
-        shape_data.input_shape_padded = one_hot_shape(
-            &shape_data.input_shape_padded,
-            self.vocab_size,
-            PaddingMode::Padding,
-        );
-        let r = self.mat.pad_node(si).map(|mat| Self { mat, ..self })?;
-        Ok(r)
+        // Need the unpadded_output_shape
+        let emb_size = self.embedding_matrix().unpadded_shape().dim(-1);
+        let output_unpadded_shape = Shape::new(vec![shape_data.input_shape_og[0], emb_size]);
+        let padded_output_shape = output_unpadded_shape.next_power_of_two();
+
+        si.shapes = vec![ShapeData {
+            input_shape_og: output_unpadded_shape,
+            input_shape_padded: padded_output_shape,
+            ignore_garbage_pad: None,
+        }];
+
+        let padded_emb = self.mat.map_tensor(|t| t.pad_next_power_of_two());
+
+        Ok(Self {
+            mat: padded_emb,
+            ..self
+        })
     }
 }
 
@@ -365,27 +368,29 @@ impl QuantizeOp for Embeddings<f32> {
 
     fn quantize_op<S: ScalingStrategy>(
         self,
-        data: &S::AuxData,
-        node_id: NodeId,
-        input_scaling: &[ScalingFactor],
-        unpadded_input_shapes: &[Shape],
-        output_scalings: &[ScalingFactor],
-        unpadded_output_shapes: &[Shape],
+        _data: &S::AuxData,
+        _node_id: NodeId,
+        _input_scaling: &[ScalingFactor],
+        _unpadded_input_shapes: &[Shape],
+        _output_scaling: &[ScalingFactor],
+        _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        let quantized_mat = self.mat.quantize_op::<S>(
-            data,
-            node_id,
-            input_scaling,
-            unpadded_input_shapes,
-            output_scalings,
-            unpadded_output_shapes,
-        )?;
-        let qmatmul = quantized_mat.quantized_op;
-        let OperandMatrix::Weight(w) = qmatmul.right_matrix else {
-            bail!("right matrix is not a weight matrix");
+        let Embeddings {
+            mat,
+            emb_size,
+            vocab_size,
+        } = self;
+
+        let scale_factor = ScalingFactor::from_absolute_max(mat.max_abs_output(), None);
+
+        let quantised_mat = mat.map_tensor(|t| t.to_quantized(&scale_factor));
+
+        let qemb = Embeddings {
+            mat: quantised_mat,
+            emb_size,
+            vocab_size,
         };
-        let qemb = Embeddings::new(w.tensor)?;
-        Ok(QuantizeOutput::new(qemb, quantized_mat.output_scalings))
+        Ok(QuantizeOutput::new(qemb, vec![scale_factor]))
     }
 }
 
@@ -420,6 +425,7 @@ where
         let last_claim = last_claims[0];
         let input_tensors = step_data.input_tensors()?;
         let input = &input_tensors[0];
+        let unpadded_length = input.unpadded_shape().numel();
 
         let (row_point, column_point) = Self::split_output_point(last_claim, self.emb_size)?;
 
@@ -435,9 +441,14 @@ where
         // we now build the `reduced_one_hot` vector as `reduced_one_hot[x[i]] += beta_vec[i]`
         let mut reduced_one_hot = vec![E::ZERO; vocab_size];
 
-        for (i, x) in input.get_data().iter().enumerate() {
-            reduced_one_hot[*x as usize] += beta_vec[i];
-        }
+        input
+            .get_data()
+            .iter()
+            .take(unpadded_length)
+            .enumerate()
+            .for_each(|(i, &x)| {
+                reduced_one_hot[x as usize] += beta_vec[i];
+            });
 
         let reduced_one_hot = Tensor::new(vec![1, vocab_size].into(), reduced_one_hot)?;
 
@@ -592,6 +603,7 @@ where
         ensure!(inputs.len() == 1, "embeddings only support 1 input tensor");
         ensure!(claims.len() == 1, "embeddings only support 1 claim");
         let input = inputs[0].as_ref();
+        let unpadded_length = input.unpadded_shape().numel();
         let one_hot_claim = &claims[0];
         let vocab_nv = self.vocab_size.next_power_of_two().ilog2();
         let seq_len_nv = input.shape().dim(0).next_power_of_two().ilog2();
@@ -602,18 +614,17 @@ where
         );
         let (r1, r2) = one_hot_claim.point.split_at(vocab_nv as usize);
         let b1 = compute_betas_eval(r2);
-        let sum = input
-            .get_data()
-            .iter()
-            .zip(b1)
-            .fold(E::ZERO, |sum, (token, beta)| {
+        let sum = input.get_data().iter().take(unpadded_length).zip(b1).fold(
+            E::ZERO,
+            |sum, (token, beta)| {
                 let token_value = token.to_canonical_u64_vec()[0] as usize;
                 let token_le_bits = to_bit_sequence_le(token_value, r1.len())
                     .map(|b| E::from_canonical_usize(b))
                     .collect_vec();
                 let selector = beta * identity_eval(r1, &token_le_bits);
                 sum + selector
-            });
+            },
+        );
         ensure!(
             sum == one_hot_claim.eval,
             "one hot encoding claim is incorrect"
@@ -649,13 +660,6 @@ impl Embeddings<f32> {
             .or_else(|_| loader.get_tensor("token_embd.weight"))
             .or_else(|_| loader.get_tensor("tok_embeddings.weight"))?;
         Embeddings::new(emb_tensor)
-    }
-}
-
-fn one_hot_shape(input_shape: &Shape, vocab_size: usize, mode: PaddingMode) -> Shape {
-    match mode {
-        PaddingMode::NoPadding => input_shape.insert(1, vocab_size),
-        PaddingMode::Padding => input_shape.insert(1, vocab_size.next_power_of_two()),
     }
 }
 

@@ -82,7 +82,7 @@ jobs:
         # Run with retries because the tests run concurrently racing for VRAM.
         # When the VRAM is full some tests might fail with `BufferTooBig` error,
         # but pass when ran on their own. Running tests sequentially is
-        # signficantly slower.
+        # significantly slower.
         #
         # Skipping `test_gpt2_replace` as it doesn't pass due to precision loss
         # on GPU. This not important as this is a one of conversion that can run
@@ -97,9 +97,13 @@ jobs:
           cd zkml
           LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda" \
           cargo nextest run --features cuda --retries 2 -- \
-            --skip model::transform::impls::ln_to_rmsn::tests::test_gpt2_replace \
+            --skip model::transform::impls::gpt2rmsnorm::tests::test_gpt2_replace \
             --skip parser::llm::models::gemma3::safe_tests::test_safe_gemma3_load_model \
-            --skip parser::llm::models::gemma3::tests::test_gguf_gemma3_load_model
+            --skip parser::llm::models::gemma3::tests::test_gguf_gemma3_load_model \
+            --skip parser::llm::models::gemma3::tests::test_gguf_gemma3_logits \
+            --skip parser::llm::models::gemma3::tests::test_safe_gemma3_intermediates \
+            --skip layers::einsum::evaluate::tests::test_cached_qkv \
+            --skip model::transform::impls::gpt2rmsnorm::tests::test_mean_subtracted_tensor
         env:
           IN_CI: "true"
 

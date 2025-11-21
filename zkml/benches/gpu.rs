@@ -78,60 +78,6 @@ mod add_layer {
 }
 
 #[divan::bench_group]
-mod dense_layer {
-    use ff_ext::GoldilocksExt2;
-    use zkml::{
-        Element, Shape, Tensor,
-        layers::{dense::Dense, provable::Evaluate},
-        tensor::{KeyedTensor, WrappedTensor},
-    };
-
-    use crate::{Args, default_sizes};
-
-    #[divan::bench(args = default_sizes())]
-    fn element(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let matrix = Tensor::<Element>::random(&Shape::new(vec![size, size]));
-        let bias = Tensor::<Element>::random(&Shape::new(vec![size]));
-
-        let input = WrappedTensor::<Element>::random(&Shape::new(vec![size]));
-
-        let layer = Dense::<Element>::new(
-            KeyedTensor::new("dense_weight", matrix.clone()),
-            KeyedTensor::new("dense_bias", bias.clone()),
-        )
-        .unwrap();
-
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Dense should succeed")
-        });
-    }
-
-    #[divan::bench(args = default_sizes())]
-    fn f32(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let matrix = Tensor::<f32>::random(&Shape::new(vec![size, size]));
-        let bias = Tensor::<f32>::random(&Shape::new(vec![size]));
-
-        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
-
-        let layer = Dense::<f32>::new(
-            KeyedTensor::new("dense_weight", matrix.clone()),
-            KeyedTensor::new("dense_bias", bias.clone()),
-        )
-        .unwrap();
-
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Dense should succeed")
-        });
-    }
-}
-
-#[divan::bench_group]
 mod convolution_layer {
     use std::ops::Range;
 
@@ -291,7 +237,7 @@ mod flatten_layer {
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<Element>::random(&Shape::new([size].repeat(args.rank)));
-        let layer = Flatten;
+        let layer = Flatten::default();
         bencher.bench(|| {
             layer
                 .evaluate::<GoldilocksExt2>(&[&input])
@@ -303,7 +249,7 @@ mod flatten_layer {
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<f32>::random(&Shape::new([size].repeat(args.rank)));
-        let layer = Flatten;
+        let layer = Flatten::default();
         bencher.bench(|| {
             layer
                 .evaluate::<GoldilocksExt2>(&[&input])
@@ -332,243 +278,6 @@ mod gelu_layer {
             layer
                 .evaluate::<GoldilocksExt2>(&[&input])
                 .expect("GeLU should succeed")
-        });
-    }
-}
-
-#[divan::bench_group]
-mod matmul_layer {
-
-    use std::ops::Range;
-
-    use ff_ext::GoldilocksExt2;
-    use zkml::{
-        Element, Tensor,
-        layers::{
-            matrix_mul::{self, MatMul},
-            provable::Evaluate,
-        },
-        tensor::{KeyedTensor, WrappedTensor},
-    };
-
-    use crate::{Args, default_sizes, sizes};
-
-    // XXX: beyond these sizes the benchmarks for elements are extremely slow.
-    //
-    //                   fastest | slowest | median  | mean    | samples │ iters
-    // Args { pow2: 11 } 10.26 s | 10.87 s | 10.44 s | 10.52 s | 3       | 3
-    // Args { pow2: 12 } 1.357 m | 1.357 m | 1.357 m | 1.357 m | 1       | 1
-    // Args { pow2: 13 }  1.67 h |  1.67 h |  1.67 h |  1.67 h | 1       | 1
-    const ELEMENT_SIZES: Range<i32> = 7..10;
-
-    #[divan::bench(args = sizes(ELEMENT_SIZES))]
-    fn element(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let left = WrappedTensor::<Element>::random(&vec![size, size].into());
-        let right = WrappedTensor::<Element>::random(&vec![size, size].into());
-        let bias = KeyedTensor::new("matmul_bias", Tensor::<Element>::random(&vec![size].into()));
-        let config = matrix_mul::Config::TransposeB;
-
-        let layer = MatMul::<Element>::new_with_config(
-            matrix_mul::OperandMatrix::Input,
-            matrix_mul::OperandMatrix::Input,
-            Some(bias),
-            config,
-        )
-        .unwrap();
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("MatMul should succeed")
-        });
-    }
-
-    #[divan::bench(args = default_sizes())]
-    fn f32(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let left = WrappedTensor::<f32>::random(&vec![size, size].into());
-        let right = WrappedTensor::<f32>::random(&vec![size, size].into());
-        let bias = KeyedTensor::new("matmul_bias", Tensor::<f32>::random(&vec![size].into()));
-        let config = matrix_mul::Config::TransposeB;
-
-        let layer = MatMul::<f32>::new_with_config(
-            matrix_mul::OperandMatrix::Input,
-            matrix_mul::OperandMatrix::Input,
-            Some(bias),
-            config,
-        )
-        .unwrap();
-
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("MatMul should succeed")
-        });
-    }
-}
-
-#[divan::bench_group]
-mod concat_matmul_layer {
-
-    use std::ops::Range;
-
-    use ff_ext::GoldilocksExt2;
-    use zkml::{
-        Element, Shape,
-        layers::{
-            concat_matmul::{ConcatMatMul, InputMatrixDimensions, Permutation},
-            provable::Evaluate,
-        },
-        tensor::WrappedTensor,
-    };
-
-    use crate::{Args, sizes};
-
-    // XXX: beyond this point benchmarks for elements are too slow, see matmul
-    // benches for measurements.
-    //
-    // Args { pow2: 11 } 3.206 m | 3.206 m | 3.206 m | 3.206 m | 1 | 1
-    const ELEMENT_SIZES: Range<i32> = 7..10;
-    const CONCATS: usize = 8;
-
-    #[divan::bench(args = sizes(ELEMENT_SIZES))]
-    fn element(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let left_perm = InputMatrixDimensions::new(1, 2, 0);
-        let right_perm = InputMatrixDimensions::new(1, 0, 2);
-        let out_perm = Permutation::new(vec![2, 1, 0]).unwrap();
-
-        // concat dim must match the `left_perm` and `right_perm` config
-        let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = WrappedTensor::<Element>::random(&shape);
-        let right = WrappedTensor::<Element>::random(&shape);
-
-        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
-
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("ConcatMatMul should succeed")
-        });
-    }
-
-    // NOTE Upper limit set to 2^12 as 2^13 would make a tensor with 2GiB size
-    // that fails to allocate in Vulkan (the limit is `2GiB - 31`, determined
-    // from `Max Storage Buffer Binding Size` limit determined by wgpu)
-    const F32_SIZES: Range<i32> = 7..13;
-    #[divan::bench(args = sizes(F32_SIZES))]
-    fn f32(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let left_perm = InputMatrixDimensions::new(1, 2, 0);
-        let right_perm = InputMatrixDimensions::new(1, 0, 2);
-        let out_perm = Permutation::new(vec![2, 1, 0]).unwrap();
-
-        // concat dim must match the `left_perm` and `right_perm` config
-        let shape = Shape::new(vec![size, CONCATS, size]);
-        let left = WrappedTensor::<f32>::random(&shape);
-        let right = WrappedTensor::<f32>::random(&shape);
-        let layer = ConcatMatMul::new_with_permute(left_perm, right_perm, out_perm);
-
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("ConcantMatMul should succeed")
-        });
-    }
-}
-
-#[divan::bench_group]
-mod qkv_layer {
-    use std::ops::Range;
-
-    use ff_ext::GoldilocksExt2;
-    use zkml::{
-        Element, Shape, Tensor,
-        layers::{provable::Evaluate, transformer::qkv::QKV},
-        tensor::{KeyedTensor, WrappedTensor},
-    };
-
-    use crate::{Args, default_sizes, sizes};
-
-    // XXX: beyond this point benchmarks for elements are too slow, see matmul
-    // benches for measurements.
-    //
-    //                   fastest | slowest | median  | mean    | samples │ iters
-    // Args { pow2: 11 } 2.36 m  | 2.36 m  | 2.36 m  | 2.36 m  | 1       | 1
-    const ELEMENT_SIZES: Range<i32> = 7..10;
-
-    #[divan::bench(args = sizes(ELEMENT_SIZES))]
-    fn element(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-
-        let num_heads = 1;
-        let q = KeyedTensor::new(
-            "qkv_weight.q",
-            Tensor::<Element>::random(&vec![size, size].into()),
-        );
-        let q_bias = KeyedTensor::new("qkv_bias.q", Tensor::random(&vec![size].into()));
-        let k = KeyedTensor::new("qkv_weight.k", Tensor::random(&vec![size, size].into()));
-        let k_bias = KeyedTensor::new("qkv_bias.k", Tensor::random(&vec![size].into()));
-        let v = KeyedTensor::new("qkv_weight.v", Tensor::random(&vec![size, size].into()));
-        let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
-
-        let input = WrappedTensor::<Element>::random(&Shape::new(vec![size, size]));
-
-        bencher
-            .with_inputs(|| {
-                // The Element QKV layer has a cache and it works only on first evaluation
-                QKV::<Element>::new(
-                    q.clone(),
-                    Some(q_bias.clone()),
-                    k.clone(),
-                    Some(k_bias.clone()),
-                    v.clone(),
-                    Some(v_bias.clone()),
-                    num_heads,
-                    num_heads,
-                )
-                .unwrap()
-            })
-            .bench_refs(|layer| {
-                layer
-                    .evaluate::<GoldilocksExt2>(&[&input])
-                    .expect("QKV should succeed");
-            });
-    }
-
-    #[divan::bench(args = default_sizes())]
-    fn f32(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-
-        let num_heads = 1;
-        let q = KeyedTensor::new(
-            "qkv_weight.q",
-            Tensor::<f32>::random(&vec![size, size].into()),
-        );
-        let q_bias = KeyedTensor::new("qkv_bias.q", Tensor::random(&vec![size].into()));
-        let k = KeyedTensor::new("qkv_weight.k", Tensor::random(&vec![size, size].into()));
-        let k_bias = KeyedTensor::new("qkv_bias.k", Tensor::random(&vec![size].into()));
-        let v = KeyedTensor::new("qkv_weight.v", Tensor::random(&vec![size, size].into()));
-        let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![size].into()));
-
-        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
-
-        let layer = QKV::<f32>::new(
-            q,
-            Some(q_bias),
-            k,
-            Some(k_bias),
-            v,
-            Some(v_bias),
-            num_heads,
-            num_heads,
-        )
-        .unwrap();
-
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("QKV should succeed")
         });
     }
 }
@@ -832,20 +541,41 @@ mod positional_rope_layer {
         ScalingFactor, ScalingStrategy, Shape, Tensor,
         layers::{
             provable::{Evaluate, OpInfo, QuantizeOp},
-            transformer::positional::Positional,
+            transformer::positional::{Positional, RopeLayout},
         },
         padding::PaddingMode,
         quantization::AbsoluteMax,
         tensor::WrappedTensor,
     };
 
-    use crate::{Args, default_sizes};
+    use crate::DATA_SIZE_POWS;
+
+    #[derive(Debug, Copy, Clone)]
+    struct RopeArgs {
+        pow2: i32,
+        layout: RopeLayout,
+    }
+
+    fn default_sizes() -> impl Iterator<Item = RopeArgs> {
+        DATA_SIZE_POWS.flat_map(|pow2| {
+            [
+                RopeArgs {
+                    pow2,
+                    layout: RopeLayout::Adjacent,
+                },
+                RopeArgs {
+                    pow2,
+                    layout: RopeLayout::RotateHalf,
+                },
+            ]
+        })
+    }
 
     #[divan::bench(args = default_sizes())]
-    fn element(bencher: divan::Bencher, args: Args) {
+    fn element(bencher: divan::Bencher, args: RopeArgs) {
         let size: usize = 1 << args.pow2;
         let context = size * 2;
-        if size < 2 || !size.is_multiple_of(2) {
+        if size < 2 || !size.is_power_of_two() {
             return;
         }
 
@@ -858,9 +588,13 @@ mod positional_rope_layer {
             .map(|i| ((i as f32) + 1.0) * (PI / (num_angles as f32 + 1.0)))
             .collect();
 
-        let base_layer =
-            Positional::<f32>::new_rope(angles, "rope_angles".to_string().into(), context)
-                .expect("new_rope");
+        let base_layer = Positional::<f32>::new_rope(
+            angles,
+            "rope_angles".to_string().into(),
+            context,
+            args.layout,
+        )
+        .expect("new_rope");
         let input_shapes = vec![Shape::new(vec![size, size])];
         let unpadded_output_shapes = base_layer
             .output_shapes(&input_shapes, PaddingMode::NoPadding)
@@ -893,10 +627,10 @@ mod positional_rope_layer {
             });
     }
     #[divan::bench(args = default_sizes())]
-    fn f32(bencher: divan::Bencher, args: Args) {
+    fn f32(bencher: divan::Bencher, args: RopeArgs) {
         let size: usize = 1 << args.pow2;
         let context = size * 2;
-        if size < 2 || !size.is_multiple_of(2) {
+        if size < 2 || !size.is_power_of_two() {
             return;
         }
 
@@ -912,6 +646,7 @@ mod positional_rope_layer {
                     angles.clone(),
                     "rope_angles".to_string().into(),
                     context,
+                    args.layout,
                 )
                 .expect("new_rope")
             })

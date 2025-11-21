@@ -3,8 +3,7 @@
 use std::{collections::HashSet, ops::Index, sync::OnceLock};
 
 use crate::{
-    Claim, Shape, Tensor, commit::compute_betas_eval, layers::transformer::mha::eval_zeroifier_mle,
-    to_bit_sequence_le,
+    Claim, Shape, Tensor, commit::compute_betas_eval, eval_zeroifier_mle, to_bit_sequence_le,
 };
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -734,16 +733,88 @@ impl AxesMapping {
                     let current_dim = dim_size.get_or_init(|| *size);
                     ensure!(
                         *current_dim == *size,
-                        "Mismatched dimension sizes for axis {}: input tensor {} has size {}, previous size was {}",
+                        "Mismatched dimension sizes for axis {}: input tensor {i} has size {size}, previous size was {current_dim}",
                         axis.repr,
-                        i,
-                        size,
-                        current_dim
                     );
                 }
                 Ok(())
             })
         })
+    }
+
+    pub(crate) fn output_ranks(&self) -> Vec<usize> {
+        let mut ranks = vec![0usize; self.output_count];
+        for axis in &self.axes {
+            for (output_id, out_dim) in axis.outputs.iter().enumerate() {
+                if let Dimension::Present(_) = out_dim {
+                    ranks[output_id] += 1;
+                }
+            }
+        }
+        ranks
+    }
+
+    pub(crate) fn input_ranks(&self) -> Vec<usize> {
+        let mut ranks = vec![0usize; self.input_count];
+        for axis in &self.axes {
+            // LHS input
+            if let Dimension::Present(_) = axis.lhs_input {
+                ranks[0] += 1;
+            }
+            // RHS inputs
+            for (input_id, in_dim) in axis.rhs_inputs.iter().enumerate() {
+                if let Dimension::Present(_) = in_dim {
+                    ranks[input_id + 1] += 1;
+                }
+            }
+        }
+        ranks
+    }
+
+    pub(crate) fn get_final_output_axes(&self) -> Vec<Axis> {
+        let output_ranks = self.output_ranks();
+        output_ranks
+            .iter()
+            .enumerate()
+            .map(|(i, &rank)| {
+                // Unwrap is safe because each output must have at least one axis present
+                self.axes
+                    .iter()
+                    .find(|axis| {
+                        if let Dimension::Present(dim) = axis.outputs[i] {
+                            dim == rank - 1
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap()
+                    .clone()
+            })
+            .collect()
+    }
+
+    pub(crate) fn get_lhs_axis_at_dim(&self, dim: isize) -> Result<Axis> {
+        let input_ranks = self.input_ranks();
+        let bound = input_ranks[0] as isize;
+        ensure!(
+            dim >= -bound && dim < bound,
+            "Dimension {dim} out of bounds (len = {bound})"
+        );
+        let index = if dim.is_negative() {
+            (bound + dim) as usize
+        } else {
+            dim as usize
+        };
+        self.axes()
+            .find(|axis| {
+                if let Dimension::Present(pos) = axis.lhs_input {
+                    pos == index
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .ok_or(anyhow!("No axis found at dimension {dim} in LHS tensor"))
     }
 }
 
@@ -1006,7 +1077,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
         // Now we can construct the multilinear extensions that has been fixed at the correct locations
         let (evaluations, _, contraction_size) =
             fixed_axes.iter().zip(unpadded_shape.iter()).rev().fold(
-                (unpadded_data, 1usize, 0usize),
+                (unpadded_data, 1usize, 1usize),
                 |(mut current_evals, chunk_size, contraction_acc), (fixed_axis, dim_size)| {
                     match fixed_axis {
                         FixedAxis::Outer(beta_evals) => {
@@ -1062,7 +1133,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                             // If this is a contracted axis we don't fix these variables
                             // so we update the chunk size and the contraction size
                             let new_chunk_size = chunk_size * dim_size;
-                            let new_contraction_acc = contraction_acc + dim_size;
+                            let new_contraction_acc = contraction_acc * dim_size;
                             (current_evals, new_chunk_size, new_contraction_acc)
                         }
                     }

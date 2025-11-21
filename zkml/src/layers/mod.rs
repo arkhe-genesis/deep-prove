@@ -5,25 +5,20 @@ use crate::{
     layers::{
         activation::{ACTIVATION_LAYER, Activation, ActivationData, ActivationProof},
         add::{ADD_LAYER, Add, AddCtx, AddProof},
-        concat_matmul::{CONCAT_MATMUL_LAYER, ConcatMatMul, ConcatMatMulCtx, ConcatMatMulProof},
         convolution::{CONVOLUTION_LAYER, ConvFFTData, Convolution},
-        dense::{DENSE_LAYER, Dense},
         einsum::{EINSUM_LAYER, EinSum, EinSumContext, EinSumProof},
         flatten::FLATTEN_LAYER,
-        matrix_mul::MATMUL_LAYER,
         pooling::{POOLING_LAYER, Pooling},
         requant::{REQUANT_LAYER, Requant, RequantProof},
         reshape::{RESHAPE_LAYER, Reshape, ReshapeCtx},
         transformer::{
-            attention::attention_mask::{
+            attention_mask::{
                 ATTENTION_MASK_LAYER, AttentionMask, AttentionMaskCtx, AttentionMaskProof,
             },
             embeddings::{EMBEDDINGS_LAYER, Embeddings, EmbeddingsCtx, EmbeddingsProof},
             layernorm::{LAYERNORM_LAYER, LayerNorm, LayerNormCtx, LayerNormProof},
             logits::{LOGITS_LAYER, Logits, LogitsCtx, LogitsProof},
-            mha::{MHA_LAYER, Mha, MhaCtx, MhaProof},
             positional::{POSITIONAL_LAYER, Positional, PositionalCtx, PositionalProof},
-            qkv::{QKV, QKV_LAYER, QKVCtx, QKVProof},
             rmsnorm::{RMSNORM_LAYER, RMSNorm, RMSNormCtx, RMSNormProof},
             softmax::{SOFTMAX_LAYER, Softmax, SoftmaxCtx, SoftmaxProof},
         },
@@ -37,10 +32,8 @@ use crate::{
 use activation::ActivationCtx;
 use anyhow::{Result, bail, ensure};
 use convolution::{ConvCtx, ConvProof};
-use dense::{DenseCtx, DenseProof};
 use ff_ext::ExtensionField;
 use flatten::Flatten;
-use matrix_mul::{MatMul, MatMulCtx, MatMulProof};
 use mpcs::PolynomialCommitmentScheme;
 use pooling::{PoolingCtx, PoolingProof};
 use provable::{
@@ -52,20 +45,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 use tenstore::StoreError;
 use transcript::Transcript;
-use transformer::{
-    layernorm::LayerNormData, logits::ArgmaxData, mha::MhaData, softmax::SoftmaxData,
-};
+use transformer::{layernorm::LayerNormData, logits::ArgmaxData, softmax::SoftmaxData};
 
 pub mod activation;
 pub mod add;
-pub mod concat_matmul;
 pub mod convolution;
-pub mod dense;
 pub mod einsum;
 pub mod flatten;
 pub mod hadamard;
-pub mod matrix_mul;
-pub mod matvec;
 pub mod permute;
 pub mod pooling;
 pub mod provable;
@@ -76,8 +63,6 @@ pub mod transformer;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum Layer<T> {
-    Dense(Dense<T>),
-    MatMul(MatMul<T>),
     Convolution(Convolution<T>),
     Activation(Activation<T>),
     // this is the output quant info. Since we always do a requant layer after each dense,
@@ -87,9 +72,6 @@ pub enum Layer<T> {
     // TODO: so far it's only flattening the input tensor, e.g. new_shape = vec![shape.iter().product()]
     Flatten(Flatten),
     EinSum(EinSum<T>),
-    QKV(QKV<T>),
-    Mha(Mha<T>),
-    ConcatMatMul(ConcatMatMul),
     LayerNorm(LayerNorm<T>),
     RMSNorm(RMSNorm<T>),
     Softmax(Softmax<T>),
@@ -103,16 +85,11 @@ pub enum Layer<T> {
 impl<T> Layer<T> {
     pub fn short_name(&self) -> &str {
         let r = match self {
-            Layer::Dense(_) => DENSE_LAYER,
-            Layer::MatMul(_) => MATMUL_LAYER,
             Layer::Convolution(_) => CONVOLUTION_LAYER,
             Layer::Activation(_) => ACTIVATION_LAYER,
             Layer::Requant(_) => REQUANT_LAYER,
             Layer::Pooling(_) => POOLING_LAYER,
             Layer::Flatten(_) => FLATTEN_LAYER,
-            Layer::QKV(_) => QKV_LAYER,
-            Layer::Mha(_) => MHA_LAYER,
-            Layer::ConcatMatMul(_) => CONCAT_MATMUL_LAYER,
             Layer::LayerNorm(_) => LAYERNORM_LAYER,
             Layer::RMSNorm(_) => RMSNORM_LAYER,
             Layer::Softmax(_) => SOFTMAX_LAYER,
@@ -132,10 +109,10 @@ impl<T> Layer<T> {
 impl<T: TensorTypeParam> Layer<T> {
     /// Resets the internal state of the layer if any
     pub fn reset(&self) {
-        if let Layer::QKV(qkv) = self {
-            qkv.reset_cache();
-        } else if let Layer::Positional(pos) = self {
+        if let Layer::Positional(pos) = self {
             pos.reset_cache();
+        } else if let Layer::EinSum(einsum) = self {
+            einsum.reset_caches();
         }
     }
 }
@@ -148,16 +125,11 @@ impl<T: TensorTypeParam> Layer<T> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub enum LayerCtx<E: ExtensionField> {
-    Dense(DenseCtx),
-    MatMul(MatMulCtx),
     Convolution(ConvCtx),
     Activation(ActivationCtx<E>),
     Requant(RequantCtx<E>),
     Pooling(PoolingCtx),
     EinSum(EinSumContext<E>),
-    QKV(QKVCtx),
-    Mha(MhaCtx<E>),
-    ConcatMatMul(ConcatMatMulCtx),
     LayerNorm(LayerNormCtx<E>),
     RMSNorm(RMSNormCtx<E>),
     Flatten,
@@ -178,16 +150,11 @@ where
     E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
-    Dense(DenseProof<E>),
-    MatMul(MatMulProof<E>),
     Convolution(Box<ConvProof<E>>),
     Activation(ActivationProof<E, PCS>),
     Requant(RequantProof<E, PCS>),
     Pooling(PoolingProof<E, PCS>),
     EinSum(EinSumProof<E>),
-    QKV(QKVProof<E>),
-    Mha(MhaProof<E, PCS>),
-    ConcatMatMul(ConcatMatMulProof<E>),
     Add(AddProof<E>),
     LayerNorm(LayerNormProof<E, PCS>),
     RMSNorm(RMSNormProof<E, PCS>),
@@ -203,17 +170,12 @@ impl<T> Layer<T> {
     /// Convert a layer to a string only containing its kind
     pub fn as_kind_str(&self) -> &'static str {
         match self {
-            Layer::Dense(_) => "dense",
             Layer::Convolution(_) => "convolution",
             Layer::Activation(_) => "activation",
             Layer::Requant(_) => "requant",
             Layer::Pooling(_) => "pooling",
             Layer::Flatten(_) => "flatten",
             Layer::EinSum(_) => "einsum",
-            Layer::QKV(_) => "qkv",
-            Layer::Mha(_) => "mha-qk",
-            Layer::MatMul(_) => "mat-mul",
-            Layer::ConcatMatMul(_) => "concat-mat-mul",
             Layer::LayerNorm(_) => "layer-norm",
             Layer::RMSNorm(_) => "rms-norm",
             Layer::Softmax(_) => "softmax",
@@ -230,12 +192,7 @@ impl<T> Layer<T> {
 impl<E: ExtensionField> LayerCtx<E> {
     pub fn variant_name(&self) -> String {
         match self {
-            Self::Dense(_) => "Dense".to_string(),
-            Self::MatMul(_) => "Matrix Multiplication".to_string(),
             Self::EinSum(_) => "EinSum".to_string(),
-            Self::QKV(_) => "QKV".to_string(),
-            Self::Mha(_) => "MHA".to_string(),
-            Self::ConcatMatMul(_) => "ConcatMatMul".to_string(),
             Self::LayerNorm(_) => "LayerNorm".to_string(),
             Self::RMSNorm(_) => "RMSNorm".to_string(),
             Self::Softmax(_) => "Softmax".to_string(),
@@ -286,16 +243,11 @@ impl<E: ExtensionField> LayerCtx<E> {
 
     pub(crate) fn lookup_context(&self) -> Option<&LayerLookupContext> {
         match self {
-            LayerCtx::Dense(_) => None,
-            LayerCtx::MatMul(_) => None,
             LayerCtx::Convolution(_) => None,
             LayerCtx::Activation(activation_ctx) => Some(&activation_ctx.lookup_context),
             LayerCtx::Requant(requant_ctx) => Some(&requant_ctx.lookup_ctx),
             LayerCtx::Pooling(pooling_ctx) => Some(&pooling_ctx.lookup_ctx),
             LayerCtx::EinSum(_) => None,
-            LayerCtx::QKV(_) => None,
-            LayerCtx::Mha(mha_ctx) => Some(mha_ctx.lookup_ctx()),
-            LayerCtx::ConcatMatMul(_) => None,
             LayerCtx::LayerNorm(layer_norm_ctx) => Some(&layer_norm_ctx.lookup_ctx),
             LayerCtx::RMSNorm(rmsnorm_ctx) => Some(&rmsnorm_ctx.lookup_ctx),
             LayerCtx::Flatten => None,
@@ -350,13 +302,6 @@ where
         }
     }
 
-    pub fn try_mha_data(&self) -> Option<&MhaData> {
-        match self.proving_data {
-            ProvingData::Mha(ref mha_data) => Some(mha_data),
-            _ => None,
-        }
-    }
-
     pub fn try_argmax_data(&self) -> Option<&ArgmaxData<E>> {
         match self.proving_data {
             ProvingData::ArgMax(ref argmax_data) => Some(argmax_data),
@@ -406,16 +351,9 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
         padding_mode: PaddingMode,
     ) -> Result<Vec<Shape>> {
         match self {
-            Layer::Dense(dense) => dense.output_shapes(input_shapes, padding_mode),
             Layer::Convolution(convolution) => {
                 convolution.output_shapes(input_shapes, padding_mode)
             }
-            Layer::MatMul(mat) => mat.output_shapes(input_shapes, padding_mode),
-            Layer::Mha(mha) => mha.output_shapes(input_shapes, padding_mode),
-            Layer::ConcatMatMul(concat_matmul) => {
-                concat_matmul.output_shapes(input_shapes, padding_mode)
-            }
-            Layer::QKV(qkv) => qkv.output_shapes(input_shapes, padding_mode),
             Layer::Add(add) => add.output_shapes(input_shapes, padding_mode),
             Layer::Logits(logits) => logits.output_shapes(input_shapes, padding_mode),
             Layer::Positional(positional) => positional.output_shapes(input_shapes, padding_mode),
@@ -437,12 +375,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
 
     fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         match self {
-            Layer::Dense(dense) => dense.num_outputs(num_inputs),
             Layer::Convolution(convolution) => convolution.num_outputs(num_inputs),
-            Layer::MatMul(mat) => mat.num_outputs(num_inputs),
-            Layer::QKV(qkv) => qkv.num_outputs(num_inputs),
-            Layer::Mha(mha) => mha.num_outputs(num_inputs),
-            Layer::ConcatMatMul(concat_matmul) => concat_matmul.num_outputs(num_inputs),
             Layer::LayerNorm(layernorm) => layernorm.num_outputs(num_inputs),
             Layer::RMSNorm(rmsnorm) => rmsnorm.num_outputs(num_inputs),
             Layer::Softmax(softmax) => softmax.num_outputs(num_inputs),
@@ -462,12 +395,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
 
     fn describe(&self) -> String {
         match self {
-            Layer::Dense(dense) => dense.describe(),
             Layer::Convolution(convolution) => convolution.describe(),
-            Layer::MatMul(mat) => mat.describe(),
-            Layer::QKV(qkv) => qkv.describe(),
-            Layer::Mha(mha) => mha.describe(),
-            Layer::ConcatMatMul(concat_matmul) => concat_matmul.describe(),
             Layer::LayerNorm(layernorm) => layernorm.describe(),
             Layer::RMSNorm(rmsnorm) => rmsnorm.describe(),
             Layer::Softmax(softmax) => softmax.describe(),
@@ -487,12 +415,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
 
     fn is_provable(&self) -> bool {
         match self {
-            Layer::Dense(dense) => dense.is_provable(),
             Layer::Convolution(convolution) => convolution.is_provable(),
-            Layer::MatMul(mat) => mat.is_provable(),
-            Layer::QKV(qkv) => qkv.is_provable(),
-            Layer::Mha(mha) => mha.is_provable(),
-            Layer::ConcatMatMul(concat_matmul) => concat_matmul.is_provable(),
             Layer::LayerNorm(layernorm) => layernorm.is_provable(),
             Layer::RMSNorm(rmsnorm) => rmsnorm.is_provable(),
             Layer::Softmax(softmax) => softmax.is_provable(),
@@ -517,12 +440,7 @@ impl Evaluate<f32> for Layer<f32> {
         inputs: &[&WrappedTensor<f32>],
     ) -> Result<LayerOut<f32, E>> {
         match self {
-            Layer::Dense(dense) => dense.evaluate(inputs),
             Layer::Convolution(convolution) => convolution.evaluate(inputs),
-            Layer::MatMul(mat) => mat.evaluate(inputs),
-            Layer::QKV(qkv) => qkv.evaluate(inputs),
-            Layer::Mha(mha) => mha.evaluate(inputs),
-            Layer::ConcatMatMul(concat_matmul) => concat_matmul.evaluate(inputs),
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
             Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs),
             Layer::Softmax(softmax) => softmax.evaluate(inputs),
@@ -547,12 +465,7 @@ impl Evaluate<Element> for Layer<Element> {
         inputs: &[&WrappedTensor<Element>],
     ) -> Result<LayerOut<Element, E>> {
         let output = match self {
-            Layer::Dense(dense) => dense.evaluate(inputs),
             Layer::Convolution(convolution) => convolution.evaluate(inputs),
-            Layer::MatMul(mat) => mat.evaluate(inputs),
-            Layer::QKV(qkv) => qkv.evaluate(inputs),
-            Layer::Mha(mha) => mha.evaluate(inputs),
-            Layer::ConcatMatMul(concat_matmul) => concat_matmul.evaluate(inputs),
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
             Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs),
             Layer::Softmax(softmax) => softmax.evaluate(inputs),
@@ -589,10 +502,6 @@ impl ProveInfo for Layer<Element> {
         aux: ContextAux,
     ) -> Result<(LayerCtx<E>, ContextAux)> {
         match self {
-            Layer::Dense(dense) => dense.step_info(id, aux),
-            Layer::QKV(qkv) => qkv.step_info(id, aux),
-            Layer::Mha(mha) => mha.step_info(id, aux),
-            Layer::ConcatMatMul(concat_matmul) => concat_matmul.step_info(id, aux),
             Layer::Add(add) => add.step_info(id, aux),
             Layer::LayerNorm(layernorm) => layernorm.step_info(id, aux),
             Layer::RMSNorm(rmsnorm) => rmsnorm.step_info(id, aux),
@@ -601,7 +510,6 @@ impl ProveInfo for Layer<Element> {
             Layer::Positional(positional) => positional.step_info(id, aux),
             Layer::Embeddings(embeddings) => embeddings.step_info(id, aux),
             Layer::Reshape(reshape) => reshape.step_info(id, aux),
-            Layer::MatMul(mat) => mat.step_info(id, aux),
             Layer::Convolution(conv) => conv.step_info(id, aux),
             Layer::Activation(activation) => activation.step_info(id, aux),
             Layer::Requant(requant) => requant.step_info(id, aux),
@@ -619,11 +527,7 @@ impl PadOp for Layer<Element> {
         Self: Sized,
     {
         Ok(match self {
-            Layer::Dense(dense) => Layer::Dense(dense.pad_node(si)?),
             Layer::Convolution(convolution) => Layer::Convolution(convolution.pad_node(si)?),
-            Layer::QKV(qkv) => Layer::QKV(qkv.pad_node(si)?),
-            Layer::Mha(mha) => Layer::Mha(mha.pad_node(si)?),
-            Layer::ConcatMatMul(concat_matmul) => Layer::ConcatMatMul(concat_matmul.pad_node(si)?),
             Layer::Add(add) => Layer::Add(add.pad_node(si)?),
             Layer::LayerNorm(layernorm) => Layer::LayerNorm(layernorm.pad_node(si)?),
             Layer::RMSNorm(rmsnorm) => Layer::RMSNorm(rmsnorm.pad_node(si)?),
@@ -631,7 +535,6 @@ impl PadOp for Layer<Element> {
             Layer::Logits(logits) => Layer::Logits(logits.pad_node(si)?),
             Layer::Positional(positional) => Layer::Positional(positional.pad_node(si)?),
             Layer::Embeddings(embeddings) => Layer::Embeddings(embeddings.pad_node(si)?),
-            Layer::MatMul(mat) => Layer::MatMul(mat.pad_node(si)?),
             Layer::Activation(activation) => Layer::Activation(activation.pad_node(si)?),
             Layer::Requant(requant) => Layer::Requant(requant.pad_node(si)?),
             Layer::Pooling(pooling) => Layer::Pooling(pooling.pad_node(si)?),
@@ -664,23 +567,8 @@ where
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {
-            (Layer::Dense(dense), LayerCtx::Dense(info)) => {
-                dense.prove(node_id, info, last_claims, step_data, prover)
-            }
             (Layer::Convolution(convolution), LayerCtx::Convolution(info)) => {
                 convolution.prove(node_id, info, last_claims, step_data, prover)
-            }
-            (Layer::MatMul(m), LayerCtx::MatMul(info)) => {
-                m.prove(node_id, info, last_claims, step_data, prover)
-            }
-            (Layer::QKV(qkv), LayerCtx::QKV(info)) => {
-                qkv.prove(node_id, info, last_claims, step_data, prover)
-            }
-            (Layer::Mha(mha), LayerCtx::Mha(info)) => {
-                mha.prove(node_id, info, last_claims, step_data, prover)
-            }
-            (Layer::ConcatMatMul(concat_matmul), LayerCtx::ConcatMatMul(info)) => {
-                concat_matmul.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Embeddings(embeddings), LayerCtx::Embeddings(ctx)) => {
                 embeddings.prove(node_id, ctx, last_claims, step_data, prover)
@@ -738,14 +626,7 @@ where
         step_data: &Step<E, Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         match self {
-            Layer::Dense(dense) => dense.gen_lookup_witness(id, ctx, step_data),
             Layer::Convolution(convolution) => convolution.gen_lookup_witness(id, ctx, step_data),
-            Layer::MatMul(m) => m.gen_lookup_witness(id, ctx, step_data),
-            Layer::QKV(qkv) => qkv.gen_lookup_witness(id, ctx, step_data),
-            Layer::Mha(mha) => mha.gen_lookup_witness(id, ctx, step_data),
-            Layer::ConcatMatMul(concat_matmul) => {
-                concat_matmul.gen_lookup_witness(id, ctx, step_data)
-            }
             Layer::Add(add) => add.gen_lookup_witness(id, ctx, step_data),
             Layer::Softmax(softmax) => softmax.gen_lookup_witness(id, ctx, step_data),
             Layer::Logits(logits) => logits.gen_lookup_witness(id, ctx, step_data),
@@ -785,19 +666,6 @@ impl QuantizeOp for Layer<f32> {
         unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
         Ok(match self {
-            Layer::Dense(dense) => {
-                let output = dense.quantize_op::<S>(
-                    data,
-                    node_id,
-                    input_scaling,
-                    unpadded_input_shapes,
-                    output_scalings,
-                    unpadded_output_shapes,
-                )?;
-                QuantizeOutput::new(Layer::Dense(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)?
-                    .maybe_transform(output.post_quant_rule)?
-            }
             Layer::Convolution(convolution) => {
                 let output = convolution.quantize_op::<S>(
                     data,
@@ -809,61 +677,6 @@ impl QuantizeOp for Layer<f32> {
                 )?;
                 QuantizeOutput::new(
                     Layer::Convolution(output.quantized_op),
-                    output.output_scalings,
-                )
-                .maybe_requants(output.requant_layer)?
-                .maybe_transform(output.post_quant_rule)?
-            }
-            Layer::MatMul(mat) => {
-                let output = mat.quantize_op::<S>(
-                    data,
-                    node_id,
-                    input_scaling,
-                    unpadded_input_shapes,
-                    output_scalings,
-                    unpadded_output_shapes,
-                )?;
-                QuantizeOutput::new(Layer::MatMul(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)?
-                    .maybe_transform(output.post_quant_rule)?
-            }
-            Layer::QKV(qkv) => {
-                let output = qkv.quantize_op::<S>(
-                    data,
-                    node_id,
-                    input_scaling,
-                    unpadded_input_shapes,
-                    output_scalings,
-                    unpadded_output_shapes,
-                )?;
-                QuantizeOutput::new(Layer::QKV(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)?
-                    .maybe_transform(output.post_quant_rule)?
-            }
-            Layer::Mha(mha) => {
-                let output = mha.quantize_op::<S>(
-                    data,
-                    node_id,
-                    input_scaling,
-                    unpadded_input_shapes,
-                    output_scalings,
-                    unpadded_output_shapes,
-                )?;
-                QuantizeOutput::new(Layer::Mha(output.quantized_op), output.output_scalings)
-                    .maybe_requants(output.requant_layer)?
-                    .maybe_transform(output.post_quant_rule)?
-            }
-            Layer::ConcatMatMul(concat_matmul) => {
-                let output = concat_matmul.quantize_op::<S>(
-                    data,
-                    node_id,
-                    input_scaling,
-                    unpadded_input_shapes,
-                    output_scalings,
-                    unpadded_output_shapes,
-                )?;
-                QuantizeOutput::new(
-                    Layer::ConcatMatMul(output.quantized_op),
                     output.output_scalings,
                 )
                 .maybe_requants(output.requant_layer)?
@@ -1037,11 +850,6 @@ where
 {
     pub fn variant_name(&self) -> String {
         match self {
-            Self::Dense(_) => "Dense".to_string(),
-            Self::MatMul(_) => "Matmul".to_string(),
-            Self::QKV(_) => "QKV".to_string(),
-            Self::Mha(_) => "MHA".to_string(),
-            Self::ConcatMatMul(..) => "ConcatMatMul".to_string(),
             Self::LayerNorm(_) => "LayerNorm".to_string(),
             Self::RMSNorm(_) => "RMSNorm".to_string(),
             Self::Softmax(_) => "Softmax".to_string(),
@@ -1061,11 +869,6 @@ where
 
     pub fn get_lookup_data(&self) -> Option<(Vec<E>, Vec<E>)> {
         match self {
-            LayerProof::Dense(..) => None,
-            LayerProof::MatMul(..) => None,
-            LayerProof::QKV(..) => None,
-            LayerProof::Mha(proof) => Some(proof.get_lookup_data()),
-            LayerProof::ConcatMatMul(..) => None,
             LayerProof::Add(_) => None,
             LayerProof::LayerNorm(proof) => Some(proof.get_lookup_data()),
             LayerProof::RMSNorm(proof) => Some(proof.get_lookup_data()),

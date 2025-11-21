@@ -180,12 +180,17 @@ impl Driver<f32> {
             .collect::<Vec<_>>();
         let quantization_strategy =
             InferenceObserver::new_with_representative_input(vec![representative_inputs]);
-        let conf = pipeline_config.take().unwrap_or_else(|| {
+        let mut conf = pipeline_config.take().unwrap_or_else(|| {
             // override the shapes to adhere to the expected input shape of the representative inputs
             default_pipeline_config()
-                .with_strategy(quantization_strategy)
-                .with_input_shapes(vec![Shape::from(vec![numel])])
         });
+
+        if conf.input_shapes.is_none() {
+            conf = conf.with_input_shapes(vec![Shape::from(vec![numel])]);
+        }
+        if conf.quant_strategy.is_none() {
+            conf = conf.with_strategy(quantization_strategy);
+        }
         let mut quantized_model = to_quantized(self.model, conf)?;
         // just set to one because we run one token after another to derive the full trace.
         quantized_model.input_shapes = vec![Shape::from(vec![1])];
@@ -828,8 +833,10 @@ mod test {
         init_test_logging("debug");
         const PRUNED_GPT2: &str = "gpt2.Q2_K.gguf";
         let model_path = file_cache::from_cache(PRUNED_GPT2)?;
+
         // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
-        let driver = Driver::load_from_model(GPT2, &RawGGUF::new(model_path.clone()), Some(6))?;
+        let driver = Driver::load_from_model(GPT2, &RawGGUF::new(model_path.clone()), Some(10))?
+            .into_provable_llm(None)?;
         let sentence = "The sky is";
 
         // Best to load the tokenizer from the gguf file if it's available.
@@ -840,14 +847,14 @@ mod test {
         assert_eq!(detokenized, sentence);
         println!("user input in tokens: {user_tokens:?}");
         let trace = driver.run::<GoldilocksExt2>(
-            &user_tokens,
+            user_tokens,
             &mut store,
             Some(LLMTokenizerObserver {
                 input: sentence.to_string(),
                 tokenizer: &tokenizer,
             }),
         )?;
-        let _output = trace
+        let output = trace
             .outputs()
             .last()
             .unwrap()
@@ -857,8 +864,8 @@ mod test {
             .iter()
             .map(|t| Token::from(t.to_usize()))
             .collect::<Vec<_>>();
-        // let output = detokenize(&tokenizer, &output);
-        // println!("{}", output);
+        let output = tokenizer.detokenize(&output);
+        println!("{}", output);
         Ok(())
     }
 

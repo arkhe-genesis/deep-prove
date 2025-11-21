@@ -332,7 +332,7 @@ fn load_reshape<'a, I: Iterator<Item = &'a usize> + Sized>(
     );
     let zkml_node_id = model
         .graph
-        .add_inner(Layer::Flatten(crate::layers::flatten::Flatten))?;
+        .add_inner(Layer::Flatten(crate::layers::flatten::Flatten(false)))?;
     model.add_edge(
         node_mapping[&node.inputs[0].node],
         zkml_node_id,
@@ -357,7 +357,7 @@ fn load_flatten<'a, I: Iterator<Item = &'a usize> + Sized>(
     );
     let zkml_node_id = model
         .graph
-        .add_inner(Layer::Flatten(crate::layers::flatten::Flatten))?;
+        .add_inner(Layer::Flatten(crate::layers::flatten::Flatten(false)))?;
     model.add_edge(
         node_mapping[&node.inputs[0].node],
         zkml_node_id,
@@ -683,9 +683,10 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         })
         .transpose()?;
 
-    let dense = crate::layers::dense::Dense::new_with(weight, bias_tensor)?;
+    let dense = crate::layers::einsum::EinSum::new_dense(weight, bias_tensor)?;
+
     // we put the bias id if present so next layers refer to it and not the gemm node
-    let zkml_node_id = model.graph.add_inner(Layer::Dense(dense))?;
+    let zkml_node_id = model.graph.add_inner(Layer::EinSum(dense))?;
     model.add_edge(
         node_mapping[&input_link.node],
         zkml_node_id,

@@ -1,6 +1,7 @@
 use crate::{
     Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
+    eval_zeroifier_mle,
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -33,7 +34,7 @@ use crate::{
     },
     quantization::{self, Fieldizer},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
-    to_base,
+    to_base, to_bit_sequence_le,
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use ark_std::Zero;
@@ -473,6 +474,9 @@ impl Evaluate<Element> for LayerNorm<Element> {
             inputs.len(),
         );
         let input = inputs[0].clone();
+        let shape = input.shape();
+        let unpadded_shape = input.unpadded_shape();
+        let is_padded = shape.as_slice() != unpadded_shape.as_slice();
 
         assert_eq!(self.gamma.rank(), 1, "Gamma must be 1D");
         assert_eq!(self.beta.rank(), 1, "Beta must be 1D");
@@ -508,6 +512,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
         );
 
         let shape = input.shape();
+        let unpadded_shape = input.unpadded_shape();
 
         let sum = input.clone().sum_dim(1);
         let square_sum = sum.clone().mul(sum.clone())?;
@@ -540,8 +545,15 @@ impl Evaluate<Element> for LayerNorm<Element> {
             .expand([shape.dims[0] as i32, -1])?;
 
         let beta = WrappedTensor::try_from(&self.beta)?
+            .reduce_to_unpadded_shape()?
             .unsqueeze_dim_2()
-            .expand([shape.dims[0] as i32, -1])?;
+            .expand([unpadded_shape.dims[0] as i32, -1])?;
+
+        let beta = if is_padded {
+            beta.pad_next_power_of_two()
+        } else {
+            beta
+        };
 
         let denominator = inv_sqrt
             .clone()
@@ -550,7 +562,7 @@ impl Evaluate<Element> for LayerNorm<Element> {
 
         let output = input
             .mul_scalar(*dim_size as Element)
-            .sub(sum)?
+            .sub(sum.clone())?
             .mul(gamma)?
             .mul(denominator)?
             .add(beta)?;
@@ -568,6 +580,22 @@ impl Evaluate<Element> for LayerNorm<Element> {
             lookup_output,
             full_value,
         };
+
+        #[cfg(test)]
+        {
+            let out_clone = output.clone();
+            let reduced_output = out_clone.reduce_to_unpadded_shape()?;
+            let padded_output = reduced_output.pad_next_power_of_two();
+            let repadded_data: Vec<Element> = padded_output.to_data().into_vec().unwrap();
+            let og_data: Vec<Element> = output.clone().to_data().into_vec().unwrap();
+            let sum_native = sum.to_native();
+            if is_padded {
+                ensure!(
+                    repadded_data == og_data,
+                    "LayerNorm Padded and unpadded output data do not match! Sum: {sum_native}"
+                );
+            }
+        }
 
         Ok(LayerOut::from_tensor(output).with_proving_data(ProvingData::LayerNorm(layernorm_data)))
     }
@@ -782,9 +810,8 @@ fn build_sumcheck_expressions<E: ExtensionField>(
         * Expression::WitIn(0)
         - Expression::WitIn(1) * Expression::WitIn(1);
     // `inv_sqrt_out` (so the output of the inverse square root lookup) has WitnessId 2
-    // so we skip this Id and use 3 and 4 for the gamma and beta polys that are applied row-wise.
+    // so we skip this Id and use 3 for the gamma poly that is applied row-wise.
     let gamma_expression = Expression::WitIn(3);
-    let beta_expression = Expression::WitIn(4);
 
     // Multiply the variance expression by `multiplier_field` so that it has the correct scaling factor to be used in the lookup.
     let first_part = Expression::Constant(Either::Right(multiplier_field)) * variance_expr;
@@ -792,11 +819,11 @@ fn build_sumcheck_expressions<E: ExtensionField>(
     let second_part = gamma_expression
         * Expression::WitIn(2)
         * (Expression::Constant(Either::Right(dim_size_field)) * Expression::WitIn(0)
-            - Expression::WitIn(1))
-        + beta_expression;
+            - Expression::WitIn(1));
+
     // The `eq_polys` will always be the last polynomials registered.
-    let input_eq = Expression::WitIn(5);
-    let last_claim_eq = Expression::WitIn(6);
+    let input_eq = Expression::WitIn(4);
+    let last_claim_eq = Expression::WitIn(5);
     // This is the expression linking inputs and outputs to the next layer/last_claim
     let first_expr = input_eq
         * (first_part + Expression::Challenge(0, 1, E::ONE, E::ZERO) * Expression::WitIn(2))
@@ -827,6 +854,8 @@ where
     pub(crate) mean_proof: IOPProof<E>,
     /// The claimed evaluations of the commitments
     pub(crate) io_evaluations: Vec<E>,
+    /// The bias evaluation
+    pub(crate) bias_eval: E,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LayerNormProof<E, PCS> {
@@ -1001,17 +1030,11 @@ impl LayerNorm<Element> {
                 .flatten()
                 .collect::<Vec<_>>()
                 .into_mle();
-        let beta_poly: MultilinearExtension<E> =
-            std::iter::repeat_n(self.beta.to_field::<E>(), 1 << logup_vars)
-                .flatten()
-                .collect::<Vec<_>>()
-                .into_mle();
         let either_mles = [
             &input_poly,
             &mean_poly,
             &inv_sqrt_poly,
             &gamma_poly,
-            &beta_poly,
             &input_eq,
             &last_claim_eq,
         ]
@@ -1029,7 +1052,7 @@ impl LayerNorm<Element> {
             .iter()
             .map(|c| c.elements)
             .collect::<Vec<E>>();
-        let io_evaluations = state.get_mle_flatten_final_evaluations()[..5].to_vec();
+        let io_evaluations = state.get_mle_flatten_final_evaluations()[..4].to_vec();
 
         // Now we perform the sumcheck for the mean
         let input_io_eq_poly = compute_betas_eval(&io_point).into_mle();
@@ -1074,18 +1097,25 @@ impl LayerNorm<Element> {
 
         prover.add_witness_claim(node_id, vec![first_commit_claims, second_commit_claim]);
 
-        let common_claims = {
+        let (common_claims, bias_eval) = {
             let point = io_point.iter().take(diff).copied().collect::<Vec<E>>();
+            let bias_point = last_claim
+                .point()
+                .iter()
+                .take(diff)
+                .copied()
+                .collect::<Vec<E>>();
             let mut claims = HashMap::new();
             claims.insert(
                 self.gamma.commitment_id(),
-                Claim::<E>::new(point.clone(), io_evaluations[3]),
+                Claim::<E>::new(point, io_evaluations[3]),
             );
+            let beta_eval = self.beta.to_field::<E>().into_mle().evaluate(&bias_point);
             claims.insert(
                 self.beta.commitment_id(),
-                Claim::<E>::new(point, io_evaluations[4]),
+                Claim::<E>::new(bias_point, beta_eval),
             );
-            claims
+            (claims, beta_eval)
         };
         prover.add_common_claims(node_id, common_claims);
 
@@ -1095,6 +1125,7 @@ impl LayerNorm<Element> {
             io_proof,
             mean_proof,
             io_evaluations,
+            bias_eval,
         };
 
         Ok((vec![input_claim], proof))
@@ -1220,7 +1251,7 @@ where
         proof: &Self::Proof,
         last_claims: &[&Claim<E>],
         verifier: &mut Verifier<E, T, PCS>,
-        _shape_step: &ShapeStep,
+        shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         // First we check that we only have one claim in `last_claims`
         ensure!(
@@ -1237,10 +1268,27 @@ where
             io_proof,
             mean_proof,
             io_evaluations,
+            bias_eval,
         } = proof;
 
         // Verify the lookup proof
         let batch_claim = verify_logup_proof_multiple_sizes(logup_proof, verifier.transcript)?;
+        // First we compute the bias contribution and subtract it from the last claim
+        let last_claim_point = last_claims[0].point();
+        let batch_claim_point_len = batch_claim.point().len();
+        let diff = last_claim_point.len() - batch_claim_point_len;
+
+        // We only want to subtract the bias contribution from the places corresponding to the unpadded part of the tensor.
+        // So we multiply the bias evaluation by evaluation of the MLE that is 1 on the unpadded part and 0 on the padded part.
+        let unpadded_dim = shape_step.unpadded_output_shape[0][0];
+        let (bias_eval_point, lt_eval_point) = last_claim_point.split_at(diff);
+
+        let dim_size_bits = to_bit_sequence_le(unpadded_dim - 1, lt_eval_point.len())
+            .map(E::from_canonical_usize)
+            .collect::<Vec<E>>();
+        let lt_eval = eval_zeroifier_mle(lt_eval_point, &dim_size_bits);
+
+        let last_claim_eval = last_claims[0].eval - lt_eval * (*bias_eval);
         self.lookup_ctx
             .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
 
@@ -1268,7 +1316,7 @@ where
 
         let claimed_sum = partial_eval
             + *range_evals.last().unwrap() * top_chunk_scalar_inv * power_two
-            + alpha * (inv_sqrt_output_eval + alpha * last_claim.eval);
+            + alpha * (inv_sqrt_output_eval + alpha * last_claim_eval);
         let aux_info = VPAuxInfo {
             max_num_variables: last_claim.point.len(),
             max_degree: 4,
@@ -1353,11 +1401,11 @@ where
             let mut claims = HashMap::new();
             claims.insert(
                 self.gamma_key.clone(),
-                Claim::<E>::new(point.clone(), io_evaluations[3]),
+                Claim::<E>::new(point, io_evaluations[3]),
             );
             claims.insert(
                 self.beta_key.clone(),
-                Claim::<E>::new(point, io_evaluations[4]),
+                Claim::<E>::new(bias_eval_point.to_vec(), *bias_eval),
             );
             claims
         };
@@ -1441,9 +1489,9 @@ mod tests {
 
     #[test]
     fn test_quantise_layernorm() {
-        let layernorm = LayerNorm::random(100, None);
+        let layernorm = LayerNorm::random(10, None);
         // Make a random float input tensor and derive the input ScalingFactor
-        let input_tensor = Tensor::<f32>::random(&vec![2, 100].into());
+        let input_tensor = Tensor::<f32>::random(&vec![3, 10].into());
         let input_scaling = ScalingFactor::from_tensor(&input_tensor, None);
         // We quantise the float input to obtain `quant_tensor` and then we dequantise to obtain `dequant_input`
         // this lets us run quantised evaluation and floating point evaluation and compare the outputs.
@@ -1478,9 +1526,9 @@ mod tests {
     fn test_layernorm_proving() {
         init_test_logging_default();
 
-        let layernorm = LayerNorm::random(100, None);
+        let layernorm = LayerNorm::random(10, None);
         let mut model =
-            Model::new_from_input_shapes(vec![vec![15, 100].into()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![vec![3, 10].into()], PaddingMode::NoPadding);
 
         let _ = model
             .add_consecutive_layer(Layer::LayerNorm(layernorm), None)

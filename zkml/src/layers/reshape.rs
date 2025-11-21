@@ -16,8 +16,6 @@ use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
-use crate::Tensor;
-
 /// The short name used to identify the Reshape layer
 pub const RESHAPE_LAYER: &str = "RSHP";
 
@@ -215,21 +213,6 @@ where
     }
 }
 
-impl Reshape {
-    pub(crate) fn evaluate_original<N: Clone>(
-        &self,
-        inputs: &[&Tensor<N>],
-    ) -> anyhow::Result<Vec<Tensor<N>>> {
-        let input_shapes = inputs.iter().map(|x| x.shape().clone()).collect::<Vec<_>>();
-        let output_shapes = self.internal_output(&input_shapes)?;
-        let mut out_tensors = inputs.iter().map(|&x| x.clone()).collect::<Vec<_>>();
-        for (new_dim, input_tensor) in output_shapes.into_iter().zip(out_tensors.iter_mut()) {
-            input_tensor.reshape(new_dim)?
-        }
-        Ok(out_tensors)
-    }
-}
-
 impl QuantizeOp for Reshape {
     type QuantizedOp = Reshape;
 
@@ -309,7 +292,7 @@ impl PadOp for Reshape {
 mod tests {
     use ff_ext::GoldilocksExt2;
 
-    use crate::Element;
+    use crate::{Element, Tensor};
 
     use super::*;
 

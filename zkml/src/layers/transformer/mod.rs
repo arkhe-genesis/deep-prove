@@ -1,544 +1,117 @@
-use crate::Tensor;
+use crate::{
+    Shape,
+    padding::PaddingMode,
+    tensor::{TensorTypeParam, WrappedTensor},
+};
 
-pub mod attention;
+use burn::tensor::TensorData;
+use serde::{Deserialize, Serialize};
+
+pub mod attention_mask;
 pub mod embeddings;
 pub mod layernorm;
 pub mod logits;
-pub mod mha;
 pub mod positional;
-pub mod qkv;
 pub mod rmsnorm;
 pub mod softmax;
 
-use anyhow::Result;
-
-/// Normally q_len == seq_len when the input is contains multiple tokens.
-/// However, if the input contains 1 token, (e.g. with caching for example) then
-/// q_len == 1 and seq_len > 1 if we are down multiple inference steps.
-pub fn causal_mask(num_heads: usize, q_len: usize, seq_len: usize) -> Result<Tensor<f32>> {
-    assert!(q_len == 1 || q_len == seq_len);
-    let mask_len = num_heads * q_len * seq_len;
-    let mut mask = vec![0.0; mask_len];
-    for h in 0..num_heads {
-        for i in 0..q_len {
-            for j in 0..seq_len {
-                if j > i {
-                    mask[h * q_len * seq_len + i * seq_len + j] = -1e9;
-                }
-            }
-        }
-    }
-    Tensor::new(vec![num_heads, q_len, seq_len].into(), mask)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConcatenationCache {
+    cached_tensor: Option<TensorData>,
+    rank: usize,
+    concatenation_dim: usize,
+    padding_mode: PaddingMode,
 }
 
-#[cfg(test)]
-pub(crate) mod manual_attention {
-    use std::fs::File;
-
-    use crate::parser::{json::RawJSON, llm::models::gpt2::GPT2};
-    use anyhow::{Context, ensure};
-    use ark_std::rand::Rng;
-    use ff_ext::GoldilocksExt2;
-    use serde::Deserialize;
-    use tenstore::GenStore;
-
-    use crate::{
-        Tensor, init_test_logging,
-        layers::{
-            activation::GELU,
-            add::{self, Add},
-            concat_matmul::ConcatMatMul,
-            matrix_mul::{MatMul, OperandMatrix},
-            provable::Evaluate,
-        },
-        number::Number,
-        parser::{
-            json::test::{TINY_GPT2_DEBUG_NAME, TINY_GPT2_NAME},
-            llm::{Attention, FeedForward, LLMConfig, transformer::Norm},
-        },
-        rng_from_env_or_random,
-        tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor, is_close},
-    };
-
-    use super::{layernorm, mha, qkv};
-
-    struct FlatFFN<N> {
-        up: MatMul<N>,
-        activation: GELU<N>,
-        down: MatMul<N>,
-        add: Add<N>,
+impl ConcatenationCache {
+    pub fn new(rank: usize, concatenation_dim: usize, padding_mode: PaddingMode) -> Self {
+        Self {
+            cached_tensor: None,
+            rank,
+            concatenation_dim,
+            padding_mode,
+        }
+    }
+    pub fn reset(&mut self) {
+        self.cached_tensor = None;
+    }
+    pub fn is_initialized(&self) -> bool {
+        self.cached_tensor.is_some()
     }
 
-    impl FlatFFN<f32> {
-        #[allow(dead_code)]
-        pub fn new_from_gguf(_c: &LLMConfig, ffn: FeedForward<f32>) -> Self {
-            let up = {
-                // normally we would do this
-                // Dense::new(ffn.up, ffn.up_bias);
-                // but since we are multiplying this matrix FOR EACH TOKEN in the sequence,
-                // this becomes a matrix multiplication in practice.
-                MatMul::new_constant(ffn.up, ffn.up_bias).expect("failed to create MatMul")
-            };
-            let activation = GELU::new();
-            let down = {
-                // normally we would do this
-                // Dense::new(ffn.down, ffn.down_bias);
-                MatMul::new_constant(ffn.down, ffn.down_bias).expect("failed to create MatMul")
-            };
-            let add = add::Add::new();
+    pub fn concatenate<N: TensorTypeParam>(
+        &mut self,
+        new_tensor: WrappedTensor<N>,
+    ) -> anyhow::Result<WrappedTensor<N>> {
+        let reduced = if let PaddingMode::NoPadding = self.padding_mode {
+            new_tensor
+        } else {
+            let unpadded_shape = new_tensor.unpadded_shape().clone();
+            new_tensor.reduce_to_shape(&unpadded_shape)?
+        };
 
-            Self {
-                up,
-                activation,
-                down,
-                add,
-            }
-        }
+        let output = if self.is_initialized() {
+            let mut placeholder = None;
+            std::mem::swap(&mut placeholder, &mut self.cached_tensor);
 
-        pub fn evaluate(
-            &mut self,
-            input: &Tensor<f32>,
-            output: Option<&GPT2LayerOutput>,
-        ) -> anyhow::Result<Tensor<f32>> {
-            let up = self.up.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
-            if let Some(gpt2_output) = output {
-                let outputs: Vec<_> = up
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                assert!(gpt2_output.is_ffn_up_close(outputs));
-            }
-            let act = self.activation.evaluate::<GoldilocksExt2>(&up.outputs())?;
-            if let Some(gpt2_output) = output {
-                let outputs: Vec<_> = act
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                assert!(gpt2_output.is_ffn_after_gelu_close(outputs));
-            }
-            let down = self.down.evaluate::<GoldilocksExt2>(&act.outputs())?;
-            if let Some(gpt2_output) = output {
-                let outputs: Vec<_> = down
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                assert!(gpt2_output.is_ffn_after_down_close(outputs));
-            }
-            let out = self
-                .add
-                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), down.outputs()[0]])?;
-            Ok(out.outputs()[0].clone().to_native())
+            // Unwrap is safe because we are initialised
+            let cached_tensor = WrappedTensor::from_data(placeholder.unwrap())?;
+            let catted = WrappedTensor::cat(vec![cached_tensor, reduced], self.concatenation_dim)?;
+            self.cached_tensor = Some(catted.clone().to_data());
+            catted
+        } else {
+            self.cached_tensor = Some(reduced.clone().to_data());
+            reduced
+        };
+
+        match self.padding_mode {
+            PaddingMode::NoPadding => Ok(output),
+            PaddingMode::Padding => Ok(output.pad_next_power_of_two()),
         }
     }
 
-    impl<N: Number + TensorTypeParam> FlatFFN<N> {
-        pub fn random(hidden_size: usize, up_size: usize) -> Self {
-            let up = {
-                let weight = OperandMatrix::new_weight_matrix(KeyedTensor::new(
-                    "ffn_up_weight",
-                    Tensor::random(&vec![up_size, hidden_size].into()),
-                ));
-                let left = OperandMatrix::Input;
-                MatMul::new(left, weight).expect("failed to create MatMul")
-            };
-            let activation = GELU::new();
-            let down = {
-                // Dense::random(vec![up_size, hidden_size]);
-                let weight = OperandMatrix::new_weight_matrix(KeyedTensor::new(
-                    "ffn_down_weight",
-                    Tensor::random(&vec![hidden_size, up_size].into()),
-                ));
-                let left = OperandMatrix::Input;
-                MatMul::new(left, weight).expect("failed to create MatMul")
-            };
-            let add = add::Add::new();
-            Self {
-                up,
-                activation,
-                down,
-                add,
-            }
+    /// Given a [`Shape`], returns the next shape after concatenation.
+    /// Here `padding_mode` determines whether to pad the new shape to the next power of two.
+    pub fn next_shape(&self, shape: Shape, padding_mode: PaddingMode) -> Shape {
+        let mut new_shape = shape;
+        new_shape[self.concatenation_dim] += self.current_sequence_length();
+        if let PaddingMode::Padding = padding_mode {
+            new_shape = new_shape.next_power_of_two();
+        }
+        new_shape
+    }
+
+    pub fn get_cached<N: TensorTypeParam>(&self) -> anyhow::Result<WrappedTensor<N>> {
+        if let PaddingMode::NoPadding = self.padding_mode {
+            let inner_data = self
+                .cached_tensor
+                .clone()
+                .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))?;
+            WrappedTensor::from_data(inner_data)
+        } else {
+            let inner_data = self
+                .cached_tensor
+                .clone()
+                .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))?;
+            WrappedTensor::from_data(inner_data).map(|t| t.pad_next_power_of_two())
         }
     }
 
-    // Test structure to just have a flat forward pass for the attention layer.
-    // Goal is to move that structure to the graph structure once this produces the same
-    // output as candle or burn with the same config and weights.
-    // Once this flat impl is consistent, then we can compare with the graph version.
-    // Once that is consistent too, we can delete.
-    struct FlatAttention<N> {
-        #[allow(dead_code)]
-        num_heads: usize,
-        #[allow(dead_code)]
-        head_dim: usize,
-        #[allow(dead_code)]
-        hidden_size: usize,
-        qkv: qkv::QKV<N>,
-        layernorm: layernorm::LayerNorm<N>,
-        mha: mha::Mha<N>,
-        out: MatMul<N>,
-        add: add::Add<N>,
-        pre_ffn_norm: layernorm::LayerNorm<N>,
-        ffn: FlatFFN<N>,
+    pub fn set_padding_mode(&mut self, padding_mode: PaddingMode) {
+        // We reset the cache when we change the padding mode
+        self.reset();
+        self.padding_mode = padding_mode;
     }
 
-    impl FlatAttention<f32> {
-        #[allow(dead_code)]
-        pub fn new_from_parser(c: &LLMConfig, att: Attention<f32>) -> anyhow::Result<Self> {
-            let qkv = qkv::QKV::new(
-                att.q,
-                att.q_bias,
-                att.k,
-                att.k_bias,
-                att.v,
-                att.v_bias,
-                c.num_heads,
-                c.num_heads,
-            )?;
-            let mha = mha::Mha::new(c.context_length, c.num_heads, c.head_size)?;
-            let ffn = FlatFFN::new_from_gguf(c, att.feedforward);
-
-            let out = {
-                let weight = OperandMatrix::new_weight_matrix(att.out);
-                let left = OperandMatrix::Input;
-                MatMul::new(left, weight).expect("failed to create MatMul")
-            };
-
-            let Norm::LayerNorm(layernorm) = att.pre_norm else {
-                panic!("layernorm is not a LayerNorm while it's json");
-            };
-            let Norm::LayerNorm(pre_ffn_norm) = att.pre_ffn_norm else {
-                panic!("layernorm is not a LayerNorm while it's json");
-            };
-            Ok(Self {
-                out,
-                hidden_size: c.hidden_size,
-                num_heads: c.num_heads,
-                head_dim: c.head_size,
-                pre_ffn_norm,
-                qkv,
-                layernorm,
-                mha,
-                add: Add::new(),
-                ffn,
-            })
-        }
-
-        /// currently hardcoded for f32 - need to implement layernorm and softmax in quantized world to be generic over N
-        pub fn forward(
-            &mut self,
-            input: &Tensor<f32>,
-            gpt2_output: Option<&GPT2LayerOutput>,
-        ) -> anyhow::Result<Tensor<f32>> {
-            ensure!(input.rank() == 2);
-
-            let normed = self
-                .layernorm
-                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
-
-            if let Some(gpt2_output) = gpt2_output {
-                let outputs: Vec<_> = normed
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                ensure!(gpt2_output.is_layernorm_close(outputs));
-            }
-            let qkv = self.qkv.evaluate::<GoldilocksExt2>(&normed.outputs())?;
-
-            if let Some(gpt2_output) = gpt2_output {
-                let outputs: Vec<_> = qkv
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                ensure!(gpt2_output.is_qkv_close(outputs));
-            }
-            let (mha, _, _, softmax_out, _) = self
-                .mha
-                .evaluate_with_intermediate_outputs::<GoldilocksExt2>(&qkv.outputs())?;
-
-            if let Some(gpt2_output) = gpt2_output {
-                assert!(
-                    gpt2_output.is_attention_weights_close(&softmax_out.outputs()[0].to_native()),
-                    "attention_weights_close given {:?} vs computed {:?}",
-                    gpt2_output.attn_weights,
-                    softmax_out.outputs()[0].get_data()
-                );
-            }
-
-            if let Some(gpt2_output) = gpt2_output {
-                let outputs: Vec<_> = mha
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                ensure!(
-                    gpt2_output.is_attention_mha_output_close(outputs),
-                    "attention_mha_outputcomputed: {:?} vs  expected {:?}",
-                    mha.outputs(),
-                    gpt2_output.attn_output
-                );
-            }
-            // now we do the final projection - still [seq_len,hidden_size]
-            let projected = self.out.evaluate::<GoldilocksExt2>(&mha.outputs())?;
-            if let Some(gpt2_output) = gpt2_output {
-                let outputs: Vec<_> = projected
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                ensure!(gpt2_output.is_attention_output_proj_close(outputs));
-            }
-
-            // and then residual connection, [1, hidden_size]
-            let out = self
-                .add
-                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), projected.outputs()[0]])?;
-
-            if let Some(gpt2_output) = gpt2_output {
-                let outputs: Vec<_> = out
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                ensure!(gpt2_output.is_residual_attn_close(outputs));
-            }
-
-            let normed = self
-                .pre_ffn_norm
-                .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
-            if let Some(gpt2_output) = gpt2_output {
-                let outputs: Vec<_> = normed
-                    .outputs()
-                    .into_iter()
-                    .map(WrappedTensor::to_native)
-                    .collect();
-                let outputs = outputs.iter().collect();
-                gpt2_output.is_prefnn_layernorm_close(outputs);
-            }
-            // and then FFN
-            let ffn_out = self
-                .ffn
-                .evaluate(&normed.outputs()[0].to_native(), gpt2_output)?;
-            Ok(ffn_out)
+    pub fn current_sequence_length(&self) -> usize {
+        if let Some(tensor) = &self.cached_tensor {
+            tensor.shape[self.concatenation_dim]
+        } else {
+            0
         }
     }
 
-    impl<N> FlatAttention<N>
-    where
-        N: TensorTypeParam + Number,
-        ConcatMatMul: Evaluate<N>,
-    {
-        pub fn random(
-            emb_size: usize,
-            num_heads: usize,
-            layer_name: Option<CommitmentId>,
-        ) -> anyhow::Result<Self> {
-            // Note in LLM, it's always the case that hidden_size = emb_size so we can apply residual
-            let hidden_size = emb_size;
-            let head_size = hidden_size / num_heads;
-            let context_length = 1024;
-            let layer_name = layer_name.unwrap_or("attention".to_string().into());
-            let qkv = qkv::QKV::random(
-                num_heads,
-                emb_size,
-                hidden_size,
-                true,
-                Some(format!("{layer_name}_qkv").into()),
-            )?;
-            let mha = mha::Mha::new(context_length, num_heads, head_size)?;
-            let layernorm = layernorm::LayerNorm::random(
-                emb_size,
-                Some(format!("{layer_name}_layernorm").into()),
-            );
-            // let out = Dense::random(vec![hidden_size, hidden_size]);
-            let out = {
-                let weight = OperandMatrix::new_weight_matrix(KeyedTensor::new(
-                    "attention_out_weight",
-                    Tensor::random(&vec![hidden_size, hidden_size].into()),
-                ));
-                let left = OperandMatrix::Input;
-                MatMul::new(left, weight).expect("failed to create MatMul")
-            };
-
-            let ffn = FlatFFN::random(hidden_size, hidden_size);
-            let pre_ffn_norm = layernorm::LayerNorm::random(
-                hidden_size,
-                Some(format!("{layer_name}_preffn_norm").into()),
-            );
-            Ok(Self {
-                out,
-                hidden_size,
-                num_heads,
-                head_dim: head_size,
-                qkv,
-                layernorm,
-                mha,
-                pre_ffn_norm,
-                add: Add::new(),
-                ffn,
-            })
-        }
-    }
-
-    #[test]
-    fn test_flat_attention_random() {
-        let emb_size = 10;
-        let num_heads = 2;
-        let mut att = FlatAttention::random(emb_size, num_heads, None).unwrap();
-        let input = Tensor::<f32>::random(&vec![1, emb_size].into());
-        let output = att.forward(&input, None).unwrap();
-        println!("output shape: {:?}", output.shape());
-    }
-
-    #[derive(Debug, Deserialize)]
-    pub(crate) struct GPT2Output {
-        #[allow(dead_code)]
-        token: String,
-        pub(crate) input_ids: Vec<u32>,
-        // flattened input embeddings
-        #[allow(dead_code)]
-        pub(crate) inputs_embeds: Vec<f32>,
-        #[allow(dead_code)]
-        layers: Vec<GPT2LayerOutput>,
-        // output of final projection before logits selection
-        logits: Vec<f32>,
-        // the new token generated for this input
-        next_token_id: u32,
-    }
-
-    impl GPT2Output {
-        pub fn final_output(&self) -> Vec<f32> {
-            // self.logits.clone()
-            vec![self.next_token_id as f32]
-            // self.layers
-            //    .last()
-            //    .unwrap()
-            //    .manual_output_with_final_ln
-            //    .as_ref(
-            //    .unwrap()
-        }
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GPT2LayerOutput {
-        ln1_out: Vec<f32>,
-        ln2_out: Vec<f32>,
-        q: Vec<f32>,
-        k: Vec<f32>,
-        v: Vec<f32>,
-        attn_output: Vec<f32>,
-        attn_weights: Vec<f32>,
-        attn_output_proj: Vec<f32>,
-        residual_attn: Vec<f32>,
-        ffn_up: Vec<f32>,
-        #[allow(dead_code)]
-        manual_output: Vec<f32>,
-        // Optional field for the final layer with LayerNorm applied
-        #[allow(dead_code)]
-        manual_output_with_final_ln: Option<Vec<f32>>,
-        ffn_after_gelu: Vec<f32>,
-        ffn_after_down: Vec<f32>,
-    }
-
-    impl GPT2LayerOutput {
-        pub fn is_qkv_close(&self, qkv: Vec<&Tensor<f32>>) -> bool {
-            let q = qkv[0];
-            let k = qkv[1];
-            let v = qkv[2];
-            let q_close = is_close(q.get_data(), &self.q);
-            let k_close = is_close(k.get_data(), &self.k);
-            let v_close = is_close(v.get_data(), &self.v);
-            q_close && k_close && v_close
-        }
-
-        pub fn is_attention_weights_close(&self, attention_weights: &Tensor<f32>) -> bool {
-            is_close(attention_weights.get_data(), &self.attn_weights)
-        }
-        pub fn is_layernorm_close(&self, layernorm: Vec<&Tensor<f32>>) -> bool {
-            is_close(layernorm[0].get_data(), &self.ln1_out)
-        }
-        pub fn is_attention_mha_output_close(&self, mha_output: Vec<&Tensor<f32>>) -> bool {
-            is_close(mha_output[0].get_data(), &self.attn_output)
-        }
-        pub fn is_attention_output_proj_close(&self, output_proj: Vec<&Tensor<f32>>) -> bool {
-            is_close(output_proj[0].get_data(), &self.attn_output_proj)
-        }
-        pub fn is_residual_attn_close(&self, residual_attn: Vec<&Tensor<f32>>) -> bool {
-            is_close(residual_attn[0].get_data(), &self.residual_attn)
-        }
-        pub fn is_prefnn_layernorm_close(&self, ln2_out: Vec<&Tensor<f32>>) -> bool {
-            is_close(ln2_out[0].get_data(), &self.ln2_out)
-        }
-        pub fn is_ffn_up_close(&self, ffn_up: Vec<&Tensor<f32>>) -> bool {
-            is_close(ffn_up[0].get_data(), &self.ffn_up)
-        }
-        pub fn is_ffn_after_gelu_close(&self, output: Vec<&Tensor<f32>>) -> bool {
-            is_close(output[0].get_data(), &self.ffn_after_gelu)
-        }
-        pub fn is_ffn_after_down_close(&self, output: Vec<&Tensor<f32>>) -> bool {
-            is_close(output[0].get_data(), &self.ffn_after_down)
-        }
-    }
-
-    use crate::parser::{ModelLoader, json};
-
-    /// Compares the graph implementation vs the output of the pytorch model over
-    /// all passes including to the final logits selection.
-    #[test]
-    fn test_gpt2_model_full_pass() -> anyhow::Result<()> {
-        init_test_logging("INFO");
-        let model_weights_path = json::test::get_json_file(TINY_GPT2_NAME)?;
-        let debug_output_path = json::test::get_json_file(TINY_GPT2_DEBUG_NAME)?;
-        // too big to run in JSON mode - need to switch format
-        // let model_weights_path = json::test::get_json_file(DISTIL_GPT2_NAME)?;
-        // let debug_output_path = json::test::get_json_file(DISTIL_GPT2_DEBUG_NAME)?;
-        let (model, config) = GPT2.parse(&RawJSON::new(model_weights_path))?;
-        let gpt2_output = serde_json::from_reader::<_, GPT2Output>(
-            File::open(debug_output_path.clone())
-                .context(format!("failed to open file {}", debug_output_path.clone()))?,
-        )?;
-        let expected_output = &&gpt2_output.final_output();
-        let input = Tensor::new(
-            // setup 1 as last dimension since embeddings iterate over last dimension
-            // or call unsqueeze
-            vec![gpt2_output.input_ids.len()].into(),
-            gpt2_output.input_ids.iter().map(|x| *x as f32).collect(),
-        )?;
-        // also test on a single random token
-        let max_token = rng_from_env_or_random().gen_range(0..config.embedding_size);
-        let single_input = Tensor::new(vec![1].into(), vec![max_token as f32])?;
-        model.describe();
-        model.run_float(vec![single_input], &mut GenStore::default())?;
-        // Reset is needed here because the `llm_model` contains layer that contains some cache.
-        // When we clone a layer, we just clone a Arc<Mutex<_>>, so the cache data itself is not cloned.
-        model.reset();
-
-        model.describe();
-        let output_handles = model.run_float(vec![input], &mut GenStore::default())?;
-        // since the expected output is only for one token, but our model generates logits for all tokens,
-        // we take the last element of the model output
-        let output = output_handles[0].tensor().unwrap();
-        let output = output.slice_last_dim().last().unwrap();
-        assert!(
-            is_close(expected_output, output),
-            "graph output differs: {:?} vs {:?}: LOGITS {:?}",
-            expected_output,
-            output,
-            &gpt2_output.logits[0..5]
-        );
-        Ok(())
+    pub fn cache_info(&self) -> (usize, usize) {
+        (self.rank, self.concatenation_dim)
     }
 }

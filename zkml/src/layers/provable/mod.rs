@@ -12,9 +12,7 @@ use crate::{
         verifier::Verifier,
     },
     layers::{
-        activation::ActivationData,
-        convolution::ConvFFTData,
-        transformer::{logits::ArgmaxData, mha::MhaData},
+        activation::ActivationData, convolution::ConvFFTData, transformer::logits::ArgmaxData,
     },
     lookup::context::LookupWitnessGen,
     model::{trace::Step, transform::ModelTransform},
@@ -40,8 +38,6 @@ pub enum ProvingData<E: ExtensionField> {
     Convolution(ConvFFTData),
     /// Variant for extra data used to prove [Softmax][`crate::layers::transformer::softmax::Softmax`] that we compute anyway during quantised evaluation.
     Softmax(SoftmaxData),
-    /// Variant for extra data used to prove Mha layer, computed during quantised evaluation
-    Mha(MhaData),
     /// Variant used for extra data used to prove [LayerNorm][`crate::layers::transformer::layernorm::LayerNorm`]
     LayerNorm(LayerNormData),
     /// Variant used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
@@ -136,13 +132,6 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
     pub fn try_softmax_data(&self) -> Option<&SoftmaxData> {
         match self.proving_data {
             ProvingData::Softmax(ref softmax_data) => Some(softmax_data),
-            _ => None,
-        }
-    }
-
-    pub fn try_mha_data(&self) -> Option<&MhaData> {
-        match self.proving_data {
-            ProvingData::Mha(ref mha_data) => Some(mha_data),
             _ => None,
         }
     }
@@ -485,12 +474,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
         padding_mode: PaddingMode,
     ) -> Result<Vec<Shape>> {
         match self {
-            LayerCtx::Dense(dense_ctx) => dense_ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Convolution(conv_ctx) => conv_ctx.output_shapes(input_shapes, padding_mode),
-            LayerCtx::MatMul(mat_ctx) => mat_ctx.output_shapes(input_shapes, padding_mode),
-            LayerCtx::QKV(qkv_ctx) => qkv_ctx.output_shapes(input_shapes, padding_mode),
-            LayerCtx::Mha(mha_ctx) => mha_ctx.output_shapes(input_shapes, padding_mode),
-            LayerCtx::ConcatMatMul(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Positional(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Add(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::LayerNorm(ctx) => ctx.output_shapes(input_shapes, padding_mode),
@@ -505,7 +489,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Requant(requant_ctx) => requant_ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Flatten => {
-                <Flatten as OpInfo>::output_shapes(&Flatten, input_shapes, padding_mode)
+                <Flatten as OpInfo>::output_shapes(&Flatten(true), input_shapes, padding_mode)
             }
             LayerCtx::AttentionMask(attention_mask_ctx) => {
                 attention_mask_ctx.output_shapes(input_shapes, padding_mode)
@@ -516,12 +500,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
 
     fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
         match self {
-            LayerCtx::Dense(dense_ctx) => dense_ctx.num_outputs(num_inputs),
             LayerCtx::Convolution(conv_ctx) => conv_ctx.num_outputs(num_inputs),
-            LayerCtx::MatMul(mat_ctx) => mat_ctx.num_outputs(num_inputs),
-            LayerCtx::QKV(qkv_ctx) => qkv_ctx.num_outputs(num_inputs),
-            LayerCtx::Mha(mha_ctx) => mha_ctx.num_outputs(num_inputs),
-            LayerCtx::ConcatMatMul(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::Positional(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::Add(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::LayerNorm(ctx) => ctx.num_outputs(num_inputs),
@@ -533,7 +512,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Activation(activation_ctx) => activation_ctx.num_outputs(num_inputs),
             LayerCtx::Requant(requant_ctx) => requant_ctx.num_outputs(num_inputs),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.num_outputs(num_inputs),
-            LayerCtx::Flatten => <Flatten as OpInfo>::num_outputs(&Flatten, num_inputs),
+            LayerCtx::Flatten => <Flatten as OpInfo>::num_outputs(&Flatten(true), num_inputs),
             LayerCtx::AttentionMask(attention_mask_ctx) => {
                 attention_mask_ctx.num_outputs(num_inputs)
             }
@@ -543,12 +522,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
 
     fn describe(&self) -> String {
         match self {
-            LayerCtx::Dense(dense_ctx) => dense_ctx.describe(),
             LayerCtx::Convolution(conv_ctx) => conv_ctx.describe(),
-            LayerCtx::MatMul(mat_ctx) => mat_ctx.describe(),
-            LayerCtx::QKV(qkv_ctx) => qkv_ctx.describe(),
-            LayerCtx::Mha(mha_ctx) => mha_ctx.describe(),
-            LayerCtx::ConcatMatMul(ctx) => ctx.describe(),
             LayerCtx::Add(ctx) => ctx.describe(),
             LayerCtx::Positional(ctx) => ctx.describe(),
             LayerCtx::LayerNorm(ctx) => ctx.describe(),
@@ -560,7 +534,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Activation(activation_ctx) => activation_ctx.describe(),
             LayerCtx::Requant(requant_ctx) => requant_ctx.describe(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.describe(),
-            LayerCtx::Flatten => Flatten.describe(),
+            LayerCtx::Flatten => Flatten(true).describe(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.describe(),
             LayerCtx::EinSum(einsum_ctx) => einsum_ctx.describe(),
         }
@@ -568,12 +542,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
 
     fn is_provable(&self) -> bool {
         match self {
-            LayerCtx::Dense(dense_ctx) => dense_ctx.is_provable(),
             LayerCtx::Convolution(conv_ctx) => conv_ctx.is_provable(),
-            LayerCtx::MatMul(mat_ctx) => mat_ctx.is_provable(),
-            LayerCtx::QKV(qkv_ctx) => qkv_ctx.is_provable(),
-            LayerCtx::Mha(mha_ctx) => mha_ctx.is_provable(),
-            LayerCtx::ConcatMatMul(ctx) => ctx.is_provable(),
             LayerCtx::Activation(activation_ctx) => activation_ctx.is_provable(),
             LayerCtx::Positional(ctx) => ctx.is_provable(),
             LayerCtx::Add(ctx) => ctx.is_provable(),
@@ -585,7 +554,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Reshape(ctx) => ctx.is_provable(),
             LayerCtx::Requant(requant_ctx) => requant_ctx.is_provable(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_provable(),
-            LayerCtx::Flatten => Flatten.is_provable(),
+            LayerCtx::Flatten => Flatten(true).is_provable(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.is_provable(),
             LayerCtx::EinSum(einsum_ctx) => einsum_ctx.is_provable(),
         }
@@ -607,23 +576,8 @@ where
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
         match (self, proof) {
-            (LayerCtx::Dense(dense_ctx), LayerProof::Dense(proof)) => {
-                dense_ctx.verify(proof, last_claims, verifier, shape_step)
-            }
             (LayerCtx::Convolution(conv_ctx), LayerProof::Convolution(proof)) => {
                 conv_ctx.verify(proof, last_claims, verifier, shape_step)
-            }
-            (LayerCtx::MatMul(matmul_ctx), LayerProof::MatMul(proof)) => {
-                matmul_ctx.verify(proof, last_claims, verifier, shape_step)
-            }
-            (LayerCtx::QKV(qkv_ctx), LayerProof::QKV(proof)) => {
-                qkv_ctx.verify(proof, last_claims, verifier, shape_step)
-            }
-            (LayerCtx::ConcatMatMul(matmul_ctx), LayerProof::ConcatMatMul(proof)) => {
-                matmul_ctx.verify(proof, last_claims, verifier, shape_step)
-            }
-            (LayerCtx::Mha(mha_ctx), LayerProof::Mha(proof)) => {
-                mha_ctx.verify(proof, last_claims, verifier, shape_step)
             }
             (LayerCtx::Embeddings(ctx), LayerProof::Embeddings(proof)) => {
                 ctx.verify(proof, last_claims, verifier, shape_step)
@@ -678,18 +632,10 @@ where
         claims: &[&Claim<E>],
     ) -> anyhow::Result<()> {
         match self {
-            LayerCtx::Dense(dense_ctx) => {
-                verify_input_claim::<E, PCS, _, _>(dense_ctx, inputs, claims)
-            }
             LayerCtx::Convolution(conv_ctx) => {
                 verify_input_claim::<E, PCS, _, _>(conv_ctx, inputs, claims)
             }
-            LayerCtx::MatMul(mat_ctx) => {
-                verify_input_claim::<E, PCS, _, A>(mat_ctx, inputs, claims)
-            }
-            LayerCtx::QKV(qkv_ctx) => verify_input_claim::<E, PCS, _, A>(qkv_ctx, inputs, claims),
-            LayerCtx::Mha(ctx) => verify_input_claim::<E, PCS, _, A>(ctx, inputs, claims),
-            LayerCtx::ConcatMatMul(ctx) => verify_input_claim::<E, PCS, _, A>(ctx, inputs, claims),
+
             LayerCtx::Activation(activation_ctx) => {
                 verify_input_claim::<E, PCS, _, A>(activation_ctx, inputs, claims)
             }
@@ -710,7 +656,7 @@ where
                 verify_input_claim::<E, PCS, _, _>(pooling_ctx, inputs, claims)
             }
             LayerCtx::Flatten => verify_input_claim::<E, PCS, _, _>(
-                &NonProvableVerifierCtx(&Flatten),
+                &NonProvableVerifierCtx(&Flatten(true)),
                 inputs,
                 claims,
             ),
@@ -725,24 +671,10 @@ where
         transcript: &mut T,
     ) -> anyhow::Result<()> {
         match (self, proof) {
-            (LayerCtx::Dense(ctx), LayerProof::Dense(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
-            }
             (LayerCtx::Convolution(ctx), LayerProof::Convolution(p)) => {
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }
-            (LayerCtx::MatMul(ctx), LayerProof::MatMul(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
-            }
-            (LayerCtx::QKV(ctx), LayerProof::QKV(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
-            }
-            (LayerCtx::Mha(ctx), LayerProof::Mha(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
-            }
-            (LayerCtx::ConcatMatMul(ctx), LayerProof::ConcatMatMul(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
-            }
+
             (LayerCtx::Activation(ctx), LayerProof::Activation(p)) => {
                 write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
             }

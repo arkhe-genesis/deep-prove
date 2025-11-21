@@ -1203,7 +1203,6 @@ impl Evaluate<f32> for Convolution<f32> {
                 groups: 1,
             },
         )?;
-
         Ok(LayerOut::from_vec(vec![res]))
     }
 }

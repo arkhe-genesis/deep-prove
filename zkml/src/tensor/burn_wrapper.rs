@@ -7,7 +7,7 @@ use crate::{
     NextPowerOfTwo, Number,
     backend::{Backend, Conv2dConfig, Maxpool2dConfig, zkml_conv2d_i, zkml_max_pool2d_i},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use burn::{
     module::Param,
     nn::{LayerNormConfig, RmsNormConfig},
@@ -139,10 +139,20 @@ where
         }
     }
 
+    pub fn is_padded(&self) -> bool {
+        self.unpadded_shape() != &self.shape()
+    }
+
     /// Reshape the tensor to have the given shape.
     pub fn reshape(self, shape: burn::tensor::Shape) -> Result<WrappedTensor<T>> {
         let rank = shape.num_dims();
-        let unpadded_shape = self.unpadded_shape().clone();
+        let old_unpadded_shape = self.unpadded_shape().clone();
+        let old_shape = self.shape();
+        let unpadded_shape = if old_unpadded_shape == old_shape {
+            shape.clone()
+        } else {
+            old_unpadded_shape
+        };
 
         let out = match rank {
             1 => WrappedTensor::Rank1(
@@ -171,6 +181,32 @@ where
         delegate_plain!(self, to_data)
     }
 
+    /// Creates a tensor from [`TensorData`].
+    pub fn from_data(data: TensorData) -> Result<Self> {
+        let rank = data.shape.len();
+        let burn_shape = burn::tensor::Shape::from(data.shape.clone());
+        let out = match rank {
+            1 => WrappedTensor::Rank1(
+                BTensor::<Backend, 1, T::Kind>::from_data(data, &Default::default()),
+                burn_shape,
+            ),
+            2 => WrappedTensor::Rank2(
+                BTensor::<Backend, 2, T::Kind>::from_data(data, &Default::default()),
+                burn_shape,
+            ),
+            3 => WrappedTensor::Rank3(
+                BTensor::<Backend, 3, T::Kind>::from_data(data, &Default::default()),
+                burn_shape,
+            ),
+            4 => WrappedTensor::Rank4(
+                BTensor::<Backend, 4, T::Kind>::from_data(data, &Default::default()),
+                burn_shape,
+            ),
+            _ => bail!("Unexpected tensor rank: {rank}."),
+        };
+        Ok(out)
+    }
+
     /// Returns a copy of the tensor data.
     #[cfg(test)]
     pub fn get_data(&self) -> Vec<T> {
@@ -188,8 +224,10 @@ where
         let mut to_concat_r3 = Vec::with_capacity(tensors.len());
         let mut to_concat_r4 = Vec::with_capacity(tensors.len());
         let mut rank = None;
-        // TODO: which unpadded shape to take here?
-        let unpadded_shape = tensors[0].unpadded_shape().clone();
+
+        let mut unpadded_shape = tensors[0].unpadded_shape().clone();
+        let summed_concat_dim = tensors.iter().map(|t| t.shape().dims[dim]).sum::<usize>();
+        unpadded_shape.dims[dim] = summed_concat_dim;
 
         for tensor in tensors.into_iter() {
             if let Some(rank) = rank {
@@ -229,6 +267,58 @@ where
         } else {
             bail!("Cannot concat empty vec of tensors")
         }
+    }
+
+    pub fn chunk(self, chunks: usize, dim: usize) -> Result<Vec<Self>> {
+        ensure!(
+            dim < self.rank(),
+            "Chunk dimension {dim} out of bounds for tensor of rank {}",
+            self.rank()
+        );
+
+        let out = match self {
+            WrappedTensor::Rank1(tensor, _) => {
+                let chunks = tensor.chunk(chunks, dim);
+                chunks
+                    .into_iter()
+                    .map(|t| {
+                        let shape = t.shape();
+                        WrappedTensor::Rank1(t, shape)
+                    })
+                    .collect()
+            }
+            WrappedTensor::Rank2(tensor, _) => {
+                let chunks = tensor.chunk(chunks, dim);
+                chunks
+                    .into_iter()
+                    .map(|t| {
+                        let shape = t.shape();
+                        WrappedTensor::Rank2(t, shape)
+                    })
+                    .collect()
+            }
+            WrappedTensor::Rank3(tensor, _) => {
+                let chunks = tensor.chunk(chunks, dim);
+                chunks
+                    .into_iter()
+                    .map(|t| {
+                        let shape = t.shape();
+                        WrappedTensor::Rank3(t, shape)
+                    })
+                    .collect()
+            }
+            WrappedTensor::Rank4(tensor, _) => {
+                let chunks = tensor.chunk(chunks, dim);
+                chunks
+                    .into_iter()
+                    .map(|t| {
+                        let shape = t.shape();
+                        WrappedTensor::Rank4(t, shape)
+                    })
+                    .collect()
+            }
+        };
+        Ok(out)
     }
 
     /// Find the maximum absolute value.
@@ -293,7 +383,7 @@ where
     }
 
     /// Aggregate all elements along the given dimension or axis in the tensor with the sum operation.
-    pub fn sum_dim(self, dim: usize) -> Self {
+    pub fn sum_dim(self, dim: isize) -> Self {
         delegate!(self, sum_dim, dim)
     }
 
@@ -308,6 +398,11 @@ where
 
         let out = delegate_plain!(self, flatten, start_dim, end_dim);
         Self::Rank2(out, unpadded_shape)
+    }
+
+    /// Find the maximum value along the given dimension.
+    pub fn max_dim(self, dim: isize) -> Self {
+        delegate!(self, max_dim, dim)
     }
 
     ///  Find the maximum value along the given dimension.
@@ -408,6 +503,10 @@ where
                     "Unexpected permutation axes length. Expected 1, got {}",
                     axes.len(),
                 ))?;
+                let shape_axes = axes.map(|d| d as usize);
+                let unpadded_shape = unpadded_shape
+                    .permute(shape_axes.as_slice())
+                    .map_err(|e| anyhow::anyhow!("Could not permute unpadded shape: permutation: {shape_axes:?}, inner error:{e:?}"))?;
                 Self::Rank1(tensor.permute(axes), unpadded_shape)
             }
             Self::Rank2(tensor, unpadded_shape) => {
@@ -415,6 +514,10 @@ where
                     "Unexpected permutation axes length. Expected 2, got {}",
                     axes.len(),
                 ))?;
+                let shape_axes = axes.map(|d| d as usize);
+                let unpadded_shape = unpadded_shape
+                    .permute(shape_axes.as_slice())
+                    .map_err(|e| anyhow::anyhow!("Could not permute unpadded shape: permutation: {shape_axes:?}, inner error:{e:?}"))?;
                 Self::Rank2(tensor.permute(axes), unpadded_shape)
             }
             Self::Rank3(tensor, unpadded_shape) => {
@@ -422,6 +525,10 @@ where
                     "Unexpected permutation axes length. Expected 3, got {}",
                     axes.len(),
                 ))?;
+                let shape_axes = axes.map(|d| d as usize);
+                let unpadded_shape = unpadded_shape
+                    .permute(shape_axes.as_slice())
+                    .map_err(|e| anyhow::anyhow!("Could not permute unpadded shape: permutation: {shape_axes:?}, inner error:{e:?}"))?;
                 Self::Rank3(tensor.permute(axes), unpadded_shape)
             }
             Self::Rank4(tensor, unpadded_shape) => {
@@ -429,6 +536,10 @@ where
                     "Unexpected permutation axes length. Expected 4, got {}",
                     axes.len(),
                 ))?;
+                let shape_axes = axes.map(|d| d as usize);
+                let unpadded_shape = unpadded_shape
+                    .permute(shape_axes.as_slice())
+                    .map_err(|e| anyhow::anyhow!("Could not permute unpadded shape: permutation: {shape_axes:?}, inner error:{e:?}"))?;
                 Self::Rank4(tensor.permute(axes), unpadded_shape)
             }
         };
@@ -551,6 +662,11 @@ where
         Ok(out)
     }
 
+    pub fn reduce_to_unpadded_shape(self) -> Result<Self> {
+        let unpadded_shape = self.unpadded_shape().clone();
+        self.reduce_to_shape(&unpadded_shape)
+    }
+
     /// Update the given tensor with the value where the mask is true.
     pub fn mask_fill_4d(
         self,
@@ -565,6 +681,38 @@ where
             input.mask_fill(mask, value),
             unpadded_shape,
         ))
+    }
+
+    pub fn mask_fill(
+        self,
+        mask: BTensor<Backend, 2, burn::tensor::Bool>,
+        value: T,
+    ) -> Result<Self> {
+        match self {
+            WrappedTensor::Rank1(..) => {
+                bail!("mask_fill only works for rank 2 or higher tensors")
+            }
+            WrappedTensor::Rank2(tensor, unpadded_shape) => Ok(WrappedTensor::Rank2(
+                tensor.mask_fill(mask, value),
+                unpadded_shape,
+            )),
+            WrappedTensor::Rank3(tensor, unpadded_shape) => {
+                // We expand the mask to rank 3 by unsqueezing a new leading dimension.
+                let mask = mask.unsqueeze::<3>().expand(tensor.shape());
+                Ok(WrappedTensor::Rank3(
+                    tensor.mask_fill(mask, value),
+                    unpadded_shape,
+                ))
+            }
+            WrappedTensor::Rank4(tensor, unpadded_shape) => {
+                // We expand the mask to rank 4 by unsqueezing a new leading dimension.
+                let mask = mask.unsqueeze::<4>().expand(tensor.shape());
+                Ok(WrappedTensor::Rank4(
+                    tensor.mask_fill(mask, value),
+                    unpadded_shape,
+                ))
+            }
+        }
     }
 
     /// Flatten the tensor into 1D.
@@ -645,6 +793,50 @@ where
     pub fn to_native(&self) -> Tensor<T> {
         Tensor::try_from(self.clone()).unwrap()
     }
+
+    pub fn equal_elem<const D: usize>(
+        self,
+        elem: T,
+    ) -> Result<BTensor<Backend, D, burn::tensor::Bool>> {
+        anyhow::ensure!(
+            self.rank() == D,
+            "Unexpected tensor rank: {}, expected {}",
+            self.rank(),
+            D
+        );
+        let shape = self.shape();
+        match D {
+            1 => {
+                let Self::Rank1(tensor, ..) = self else {
+                    unreachable!()
+                };
+                let result = tensor.equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            2 => {
+                let Self::Rank2(tensor, ..) = self else {
+                    unreachable!()
+                };
+                let result = tensor.equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            3 => {
+                let Self::Rank3(tensor, ..) = self else {
+                    unreachable!()
+                };
+                let result = tensor.equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            4 => {
+                let Self::Rank4(tensor, ..) = self else {
+                    unreachable!()
+                };
+                let result = tensor.equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl<T> WrappedTensor<T>
@@ -701,6 +893,16 @@ impl WrappedTensor<f32> {
     /// Returns a new tensor with the same shape and device as the current tensor and the data cast to Integer.
     pub fn int(self) -> WrappedTensor<Element> {
         delegate!(self, int)
+    }
+
+    /// Performs exp element-wise on the tensor.
+    pub fn exp(self) -> Self {
+        delegate!(self, exp)
+    }
+
+    /// Performs ln (natural logarithm) element-wise on the tensor.
+    pub fn log(self) -> Self {
+        delegate!(self, log)
     }
 
     /// Applies the Gaussian Error Linear Units function as described in the paper
@@ -798,39 +1000,72 @@ impl WrappedTensor<f32> {
     }
 
     pub fn softmax(tensor: Self, dim: usize) -> Result<Self> {
-        let tensor_rank = tensor.rank();
-        let Self::Rank2(tensor, unpadded_shape) = tensor else {
-            bail!("Unexpected tensor rank: {tensor_rank}, expected 2.")
-        };
-        Ok(Self::Rank2(
-            activation::softmax(tensor, dim),
-            unpadded_shape,
-        ))
+        anyhow::ensure!(
+            dim < tensor.rank(),
+            "Softmax dimension {dim} out of bounds, (tensor rank: {}).",
+            tensor.rank()
+        );
+        match tensor {
+            Self::Rank1(tensor, unpadded_shape) => Ok(Self::Rank1(
+                activation::softmax(tensor, dim),
+                unpadded_shape,
+            )),
+            Self::Rank2(tensor, unpadded_shape) => Ok(Self::Rank2(
+                activation::softmax(tensor, dim),
+                unpadded_shape,
+            )),
+            Self::Rank3(tensor, unpadded_shape) => Ok(Self::Rank3(
+                activation::softmax(tensor, dim),
+                unpadded_shape,
+            )),
+            Self::Rank4(tensor, unpadded_shape) => Ok(Self::Rank4(
+                activation::softmax(tensor, dim),
+                unpadded_shape,
+            )),
+        }
     }
 
     pub fn rms_norm_forward(
         input: Self,
         embedding_size: usize,
         epsilon: f64,
-        gamma: Self,
+        gamma: Option<Self>,
     ) -> Result<Self> {
         // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
         // instead of re-implementing everything ourselves.
         // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/rms.rs.html#71
-        let input_rank = input.rank();
-        let Self::Rank2(input, unpadded_shape) = input else {
-            bail!("Unexpected input rank: {input_rank}, expected 2.")
-        };
-        let gamma_rank = gamma.rank();
-        let Self::Rank1(gamma, ..) = gamma else {
-            bail!("Unexpected gamma rank: {gamma_rank}, expected 1.")
-        };
         let config = RmsNormConfig::new(embedding_size).with_epsilon(epsilon);
         let device = Default::default();
-        let mut norm = config.init(&device);
-        norm.gamma = Param::from_tensor(gamma);
-        let output = norm.forward(input);
-        Ok(Self::Rank2(output, unpadded_shape))
+        let norm = if let Some(gamma) = gamma {
+            let mut norm = config.init(&device);
+            let gamma_rank = gamma.rank();
+            let Self::Rank1(gamma, ..) = gamma else {
+                bail!("Unexpected gamma rank: {gamma_rank}, expected 1.")
+            };
+            norm.gamma = Param::from_tensor(gamma);
+            norm
+        } else {
+            config.init(&device)
+        };
+
+        match input {
+            WrappedTensor::Rank1(input, unpadded_shape) => {
+                let output = norm.forward(input);
+                Ok(Self::Rank1(output, unpadded_shape))
+            }
+            WrappedTensor::Rank2(input, unpadded_shape) => {
+                let output = norm.forward(input);
+                Ok(Self::Rank2(output, unpadded_shape))
+            }
+            WrappedTensor::Rank3(input, unpadded_shape) => {
+                let output = norm.forward(input);
+                Ok(Self::Rank3(output, unpadded_shape))
+            }
+            WrappedTensor::Rank4(input, unpadded_shape) => {
+                let output = norm.forward(input);
+                Ok(Self::Rank4(output, unpadded_shape))
+            }
+        }
     }
 }
 
@@ -1043,19 +1278,19 @@ pub trait TensorTypeParam:
 
         let out = match rank {
             1 => {
-                let input = tensor.clone().to_btensor::<1>();
+                let input = tensor.to_btensor::<1>();
                 WrappedTensor::Rank1(input, unpadded_shape)
             }
             2 => {
-                let input = tensor.clone().to_btensor::<2>();
+                let input = tensor.to_btensor::<2>();
                 WrappedTensor::Rank2(input, unpadded_shape)
             }
             3 => {
-                let input = tensor.clone().to_btensor::<3>();
+                let input = tensor.to_btensor::<3>();
                 WrappedTensor::Rank3(input, unpadded_shape)
             }
             4 => {
-                let input = tensor.clone().to_btensor::<4>();
+                let input = tensor.to_btensor::<4>();
                 WrappedTensor::Rank4(input, unpadded_shape)
             }
             _ => {

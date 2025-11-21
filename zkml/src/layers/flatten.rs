@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 /// Short name used to identify the flatten layer
 pub const FLATTEN_LAYER: &str = "FLTT";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Flatten;
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+/// The inner bool indicates whether the flattening is padded or not
+pub struct Flatten(pub(crate) bool);
+
 /// Even if empty, we need a context such that it implements the default
 /// methods of `VerifiableCtx``
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,12 +27,26 @@ impl OpInfo for Flatten {
     fn output_shapes(
         &self,
         input_shapes: &[Shape],
-        _padding_mode: PaddingMode,
+        padding_mode: PaddingMode,
     ) -> Result<Vec<Shape>> {
-        Ok(input_shapes
-            .iter()
-            .map(|s| Shape::new(vec![s.product()]))
-            .collect())
+        match (self, padding_mode) {
+            (Flatten(true), PaddingMode::NoPadding) => {
+                // In this case we cannot flattening the unpadded shape normally may lead to issues
+                // during proving because shape.pad_next_power_of_two().flatten() != shape.flatten().pad_next_power_of_two()
+                // So the unpadded shapes must be padded first and then flattened
+                Ok(input_shapes
+                    .iter()
+                    .map(|s| Shape::new(vec![s.next_power_of_two().product()]))
+                    .collect())
+            }
+            _ => {
+                // Flatten(false) or PaddingMode::Padding
+                Ok(input_shapes
+                    .iter()
+                    .map(|s| Shape::new(vec![s.product()]))
+                    .collect())
+            }
+        }
     }
 
     fn num_outputs(&self, num_inputs: usize) -> Result<usize> {
@@ -98,7 +114,7 @@ mod tests {
         fn test_flatten_with_f32(input in any_input::<f32>(1..5, 1..8)) {
             let expected = input.to_flatten();
 
-            let layer = Flatten;
+            let layer = Flatten(false);
                 let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).expect("flatten evaluation must be successful");
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
@@ -108,7 +124,7 @@ mod tests {
         fn test_flatten_with_element(input in any_input::<Element>(1..5, 1..8)) {
             let expected = input.to_flatten();
 
-            let layer = Flatten;
+            let layer = Flatten(false);
             let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).expect("flatten evaluation must be successful");
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());

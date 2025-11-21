@@ -1,5 +1,5 @@
 use crate::{
-    layers::transformer::attention::attention_mask::AttentionSpan,
+    layers::transformer::{attention_mask::AttentionSpan, positional::rope::RopeLayout},
     parser::{
         gguf::FileTensorLoader,
         json,
@@ -49,19 +49,28 @@ pub struct LLMStructure {
     pub(crate) norm_type: NormType,
     /// what's the span of the attention and what kind of attention is used
     pub(crate) attention_config: AttentionConfig,
-    /// is the positional set after embeddings or after QK
-    pub(crate) positional_config: PositionalConfig,
-    /// Whether we apply a final projection or not after all attention layers are applied
-    pub(crate) final_proj: bool,
+    /// Global positional encoding after embeddings.
+    pub(crate) global_positional: Option<PositionalConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PositionalConfig {
     /// Positional encoding is applied after the embeddings are computed.
     FixedPositional,
     /// Rope positional encoding is applied after the QK attention. The argument is
     /// the maximum sequence length of the model we wanna support.
-    Rope(usize),
+    Rope(RopeConfig),
+}
+
+/// Config items for RoPe
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RopeConfig {
+    /// HACK for now to avoid committing to the full length of Rope if we dont need to
+    pub max_seq_length: usize,
+    /// base frequency to use to construct the sin and cos matrices
+    pub base_frequency: f32,
+    /// The different ways to compute rope
+    pub layout: RopeLayout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

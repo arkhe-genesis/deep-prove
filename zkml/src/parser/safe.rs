@@ -380,6 +380,10 @@ impl FileTensorLoader {
         (meta_keys, tensor_keys)
     }
 
+    pub fn current_prefix(&self) -> &str {
+        &self.current_prefix
+    }
+
     fn full_name(&self, name: &str) -> String {
         format!("{}{}", self.current_prefix, name)
     }
@@ -511,31 +515,21 @@ impl RMSNorm<f32> {
     /// Build an RMSNorm layer from a SafeTensors loader scoped to a `..._` prefix
     /// similar to the GGUF loader. If `stack` is true, the alpha vector is stacked
     /// across heads (temporary hack used by Gemma3 GQA emulation).
-    pub fn from_safe(
-        loader: &FileTensorLoader,
-        c: &LLMConfig,
-        stack: bool,
-    ) -> anyhow::Result<Self> {
+    pub fn from_safe(loader: &FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         // Try common HF naming first ("weight"); fall back to our GGUF-style ("norm.weight")
 
-        let mut alpha = loader
+        let alpha = loader
             .get_tensor("weight")
             .or_else(|_| loader.get_tensor("norm.weight"))?;
-        if stack {
-            alpha = alpha.try_map_tensor(|alpha| {
-                let (it, _) = alpha.slice_on_dim(0);
-                let data = it
-                    .flat_map(|t| std::iter::repeat_n(t, c.num_heads).flatten())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut shape = alpha.shape().clone();
-                let new_dim = shape.dim(-1) * c.num_heads;
-                shape.set_dim(-1, new_dim);
-                Tensor::new(shape, data)
-            })?;
-        }
         let eps = c.norm_epsilon;
-        RMSNorm::new(Some(alpha), eps, None)
+        // If alpha is all ones or zeroes we can just set it to None
+        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0 || x == 0.0f32);
+
+        if trivial_alpha {
+            RMSNorm::new(None, eps, Some(alpha.shape().dim(-1)))
+        } else {
+            RMSNorm::new(Some(alpha), eps, None)
+        }
     }
 }
 

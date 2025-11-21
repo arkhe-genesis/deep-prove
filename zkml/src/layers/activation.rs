@@ -116,6 +116,10 @@ where
 pub struct GeGlu<N>(Activation<N>);
 
 impl<N> Activation<N> {
+    /// The port index for the "up" projection input when used in a GLU.
+    pub const UP_INPUT_INDEX: usize = 0;
+    /// The port index for the "gate" input when used in a GLU.
+    pub const GATE_INPUT_INDEX: usize = 1;
     pub fn new_relu() -> Self {
         Self::Plain(ActivationLayer::Relu(Relu))
     }
@@ -127,6 +131,11 @@ impl<N> Activation<N> {
     /// Instantiate a new Activation layer configured to be used in a GLU.
     pub fn new_for_glu(activation_type: ActivationLayer<N>) -> Self {
         Self::GLU(activation_type)
+    }
+
+    /// Instantiate a new Activation layer configured to be used as a plain activation function.
+    pub fn new_plain(activation_type: ActivationLayer<N>) -> Self {
+        Self::Plain(activation_type)
     }
 
     pub fn new_geglu() -> GeGlu<N> {

@@ -9,6 +9,7 @@
 //! It is important to note that the LHS tensor "A" cannot be a constant tensor. In addition the contraction axes in the LHS and RHS tensors must appear in the same order
 //! (i.e. if the contraction axes in the LHS are "ik" then the contraction axes in the RHS must also be "ik", not "ki").
 //! This is to ensure that the einsum operation can be proven via Sumcheck.
+
 use crate::{
     Claim, Element, Number, Shape, Tensor,
     graph::NodeId,
@@ -19,9 +20,10 @@ use crate::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
         },
+        transformer::ConcatenationCache,
     },
     model::Step,
-    padding::{PaddingMode, ShapeData},
+    padding::{PaddingMode, pad_einsum},
     quantization::{ScalingFactor, ScalingStrategy},
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
 };
@@ -33,11 +35,13 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::Expression;
 use prove::EinSumProofInfo;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::sync::{Arc, Mutex};
 use sumcheck::structs::IOPProof;
 use transcript::Transcript;
 use verify::EinSumVerifierInfo;
 
 pub mod axis;
+pub(crate) mod constructor;
 pub(crate) mod evaluate;
 pub(crate) mod op_info;
 pub(crate) mod prove;
@@ -50,7 +54,7 @@ pub(crate) const EINSUM_LAYER: &str = "EINS";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EinSum<T> {
     /// The equation describing the einsum operation.
-    equation: String,
+    pub(crate) equation: String,
     /// The parsed mapping of axes from the equation.
     pub mapping: AxesMapping,
     /// The evaluation info for the einsum operation, this is derived from the mapping.
@@ -66,6 +70,8 @@ pub struct EinSum<T> {
     pub bias_unpadded_shapes: Vec<Option<Shape>>,
     /// Tells us if we are running padded or unpadded
     pub(crate) padded: bool,
+    /// used if the outputs of the einsum need to be cached
+    pub caches: Vec<Option<Arc<Mutex<ConcatenationCache>>>>,
 }
 
 impl<T> EinSum<T> {
@@ -161,7 +167,57 @@ impl<T> EinSum<T> {
             biases,
             bias_unpadded_shapes,
             padded: false,
+            caches: vec![None; output_count],
         })
+    }
+
+    pub fn with_caches(&mut self, concatenation_dims: Vec<Option<usize>>) -> Result<()> {
+        ensure!(
+            concatenation_dims.len() == self.mapping.output_count(),
+            "Number of caches to use ({}) does not match number of outputs in equation {} (expected: {} outputs)",
+            concatenation_dims.len(),
+            self.equation,
+            self.mapping.output_count()
+        );
+
+        let output_ranks = self.mapping.output_ranks();
+        let padding_mode = if self.padded {
+            PaddingMode::Padding
+        } else {
+            PaddingMode::NoPadding
+        };
+
+        self.caches = concatenation_dims
+            .into_iter()
+            .zip(output_ranks.into_iter())
+            .map(|(concat_dim_opt, output_rank)| {
+                if let Some(concat_dim) = concat_dim_opt {
+                    ensure!(
+                        concat_dim < output_rank,
+                        "Concatenation dimension ({}) must be less than output rank ({})",
+                        concat_dim,
+                        output_rank
+                    );
+                    Ok(Some(Arc::new(Mutex::new(ConcatenationCache::new(
+                        output_rank,
+                        concat_dim,
+                        padding_mode,
+                    )))))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(())
+    }
+
+    pub fn reset_caches(&self) {
+        self.caches.iter().for_each(|cache| {
+            if let Some(c) = cache {
+                let mut c_lock = c.lock().unwrap();
+                c_lock.reset();
+            }
+        });
     }
 }
 
@@ -180,60 +236,7 @@ impl PadOp for EinSum<Element> {
     where
         Self: Sized,
     {
-        // Update the shape data
-        let unpadded_input_shapes = si.unpadded_input_shapes();
-        let padded_input_shapes = si.padded_input_shapes();
-
-        let unpadded_output_shapes =
-            self.output_shapes(&unpadded_input_shapes, PaddingMode::NoPadding)?;
-        let padded_output_shapes =
-            self.output_shapes(&padded_input_shapes, PaddingMode::Padding)?;
-
-        // We must pad any constant tensors and bias tensors to ensure they are compatible with the padded inputs.
-        // However, we do not need to change the equation or mapping, as the padding is handled by the input shapes.
-        let EinSum::<Element> {
-            equation,
-            mapping,
-            evaluation_info,
-            constant_tensors,
-            constant_unpadded_shapes,
-            biases,
-            bias_unpadded_shapes,
-            ..
-        } = self;
-
-        let padded_constant_tensors = constant_tensors
-            .into_iter()
-            .map(|opt| opt.map(|tensor| tensor.map_tensor(|t| t.pad_next_power_of_two())))
-            .collect::<Vec<_>>();
-
-        let padded_biases = biases
-            .into_iter()
-            .map(|opt| opt.map(|tensor| tensor.map_tensor(|t| t.pad_next_power_of_two())))
-            .collect::<Vec<_>>();
-
-        // Currently we do not support garbage padding for einsum outputs, this is because we are in the process
-        // of removing garbage padding from the library, so we do not want to add it here.
-        si.shapes = unpadded_output_shapes
-            .into_iter()
-            .zip(padded_output_shapes)
-            .map(|(input_shape_og, input_shape_padded)| ShapeData {
-                input_shape_padded,
-                ignore_garbage_pad: None,
-                input_shape_og,
-            })
-            .collect();
-
-        Ok(EinSum {
-            equation,
-            mapping,
-            evaluation_info,
-            constant_tensors: padded_constant_tensors,
-            constant_unpadded_shapes,
-            biases: padded_biases,
-            bias_unpadded_shapes,
-            padded: true,
-        })
+        pad_einsum(self, si)
     }
 }
 
@@ -285,10 +288,21 @@ impl<N: Number> OpInfo for EinSum<N> {
             }
         };
 
-        Ok(self
-            .mapping
-            .output_shapes(&full_input_shapes)
-            .expect("Failed to compute output shapes for EinSum"))
+        let output_shapes = self.mapping.output_shapes(&full_input_shapes)?;
+
+        let with_caching = output_shapes
+            .into_iter()
+            .zip(self.caches.iter())
+            .map(|(shape, cache_opt)| {
+                if let Some(cache) = cache_opt {
+                    let c_lock = cache.lock().unwrap();
+                    c_lock.next_shape(shape, padding_mode)
+                } else {
+                    shape
+                }
+            })
+            .collect::<Vec<Shape>>();
+        Ok(with_caching)
     }
 
     fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {

@@ -23,14 +23,13 @@ use crate::{
         gguf, json,
         llm::{
             LLMConfig,
-            config::{AttentionHeadType, LLMStructure, PositionalConfig},
-            transformer::expand,
+            config::{LLMStructure, PositionalConfig, RopeConfig},
         },
     },
     quantization::{Fieldizer, TensorFielder},
     tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
-use anyhow::{Context, Ok, Result, bail, ensure};
+use anyhow::{Ok, Result, bail, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
@@ -44,6 +43,7 @@ use transcript::Transcript;
 
 pub(crate) mod absolute;
 pub(crate) mod rope;
+pub use rope::RopeLayout;
 
 /// The short name used to identify the positional layer.
 pub const POSITIONAL_LAYER: &str = "POSI";
@@ -123,6 +123,9 @@ impl<N: TensorTypeParam> Positional<N> {
         if let Some(cache) = &self.cache {
             cache.lock().unwrap().reset();
         }
+        if let PositionalVariant::Rope(rope) = &self.variant {
+            rope.reset_cache();
+        }
     }
 
     pub(crate) fn new_from_variant(variant: PositionalVariant<N>) -> Self {
@@ -130,6 +133,31 @@ impl<N: TensorTypeParam> Positional<N> {
         Self {
             cache: Some(cache),
             variant,
+        }
+    }
+
+    pub(crate) fn with_cache(self) -> Self {
+        let cache = Arc::new(Mutex::new(PositionalCache::new()));
+        Self {
+            cache: Some(cache),
+            ..self
+        }
+    }
+
+    /// Adds a concatenation cache if the [`PositionalVariant`] is RoPE, otherwise returns self.
+    pub(crate) fn with_rope_cache(self, rank: usize, dim: usize) -> Result<Self> {
+        match self.variant {
+            PositionalVariant::Absolute(abs) => Ok(Self {
+                cache: self.cache,
+                variant: PositionalVariant::Absolute(abs),
+            }),
+            PositionalVariant::Rope(rope) => {
+                let cached_rope = rope.with_concatenation_cache(rank, dim)?;
+                Ok(Self {
+                    cache: self.cache,
+                    variant: PositionalVariant::Rope(cached_rope),
+                })
+            }
         }
     }
 
@@ -141,9 +169,10 @@ impl<N: TensorTypeParam> Positional<N> {
         angles: Vec<f32>,
         base_frequency_id: CommitmentId,
         max_content_length: usize,
+        layout: RopeLayout,
     ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(
-            Rope::build_from_angles(angles, base_frequency_id, max_content_length)?,
+            Rope::build_from_angles(angles, base_frequency_id, max_content_length, layout)?,
         )))
     }
 
@@ -152,6 +181,7 @@ impl<N: TensorTypeParam> Positional<N> {
         base_frequency_id: CommitmentId,
         head_size: usize,
         max_content_length: usize,
+        layout: RopeLayout,
     ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(
             Rope::build_from_frequency(
@@ -159,6 +189,7 @@ impl<N: TensorTypeParam> Positional<N> {
                 base_frequency_id,
                 head_size,
                 max_content_length,
+                layout,
             )?,
         )))
     }
@@ -166,18 +197,24 @@ impl<N: TensorTypeParam> Positional<N> {
     pub fn new_rope_from_matrices(
         cosine_matrix: KeyedTensor<N>,
         sine_matrix: KeyedTensor<N>,
+        layout: RopeLayout,
     ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(Rope::new(
             cosine_matrix,
             sine_matrix,
+            layout,
         )?)))
     }
 
     /// Disable caching for `self` positional layer
     pub fn with_no_cache(self) -> Self {
+        let variant = match self.variant {
+            PositionalVariant::Absolute(abs) => PositionalVariant::Absolute(abs),
+            PositionalVariant::Rope(rope) => PositionalVariant::Rope(rope.with_no_cache()),
+        };
         Self {
             cache: None,
-            ..self
+            variant,
         }
     }
 
@@ -326,16 +363,16 @@ where
             "Positional layer expects 1 input, got {}",
             inputs.len()
         );
-        ensure!(
-            inputs.iter().all(|x| x.rank() == 2),
-            "positional embeddings only support 2d tensors"
-        );
 
         // default cache to be provided in case the layer was not initialized with a cache
         let new_cache = Arc::new(Mutex::new(PositionalCache::new()));
 
         match &self.variant {
             PositionalVariant::Absolute(absolute) => {
+                ensure!(
+                    inputs.iter().all(|x| x.rank() == 2),
+                    "Absolute positional embeddings only support 2d tensors"
+                );
                 absolute.evaluate(inputs[0], self.cache.as_ref().unwrap_or(&new_cache))
             }
             PositionalVariant::Rope(rope) => {
@@ -356,9 +393,9 @@ fn output_shapes(
     };
 
     input_shapes.iter().for_each(|s| {
-        assert!(s.is_matrix());
-        assert!(s[0] <= pos_shape[0]);
-        assert_eq!(s[1], pos_shape[1])
+        let s_rank = s.rank();
+        assert!(s[s_rank - 2] <= pos_shape[0]);
+        assert_eq!(s[s_rank - 1], pos_shape[1])
     });
     input_shapes.to_vec()
 }
@@ -495,13 +532,13 @@ impl PadOp for Positional<Element> {
         let cache = self
             .cache
             .map(|_| Arc::new(Mutex::new(PositionalCache::new())));
+
         let padded_variant = match self.variant {
             PositionalVariant::Absolute(pos) => PositionalVariant::Absolute(pos.pad_node(si)?),
             PositionalVariant::Rope(rope) => PositionalVariant::Rope(rope.pad_node(si)?),
         };
 
         // no need to change `si` since the layer doesn't change the input shapes
-
         Ok(Self {
             cache,
             variant: padded_variant,
@@ -510,42 +547,27 @@ impl PadOp for Positional<Element> {
 }
 
 impl Positional<f32> {
-    /// HACK: Currently since we don't support GQA officially, we emulate it by stacking the tensors multiple times
-    /// This is a temporary solution to allow GQA to work, and will be removed once we support GQA officially.
-    fn hack_stack_gqa(p: Self, c: &LLMStructure) -> anyhow::Result<Self> {
-        if let AttentionHeadType::GQA(_) = c.attention_config.head {
-            let PositionalVariant::Rope(mut rope) = p.variant else {
-                bail!("Expected Rope variant for gemma3");
-            };
-            rope.cosine_matrix = rope
-                .cosine_matrix
-                .try_map_tensor(|t| expand(t, c.generic.num_heads))?;
-            rope.sine_matrix = rope
-                .sine_matrix
-                .try_map_tensor(|t| expand(t, c.generic.num_heads))?;
-            rope.unpadded_shape
-                .set_dim(-1, rope.unpadded_shape.dim(-1) * c.generic.num_heads);
-            Ok(Positional::new_from_variant(PositionalVariant::Rope(rope)))
-        } else {
-            Ok(p)
-        }
-    }
-    pub fn from_gguf(loader: &gguf::FileTensorLoader, c: &LLMStructure) -> anyhow::Result<Self> {
-        match c.positional_config {
-            PositionalConfig::Rope(max_ctx_length) => {
+    pub fn from_gguf(
+        loader: &gguf::FileTensorLoader,
+        c: &LLMStructure,
+        positional_config: &PositionalConfig,
+    ) -> anyhow::Result<Self> {
+        match positional_config {
+            PositionalConfig::Rope(rope_config) => {
+                let RopeConfig {
+                    base_frequency,
+                    max_seq_length,
+                    layout,
+                } = *rope_config;
                 let base_freq_id = format!("{}.rope.freq_base", c.generic.model_name);
-                let freq_base = loader
-                    .metadata::<f32>(&base_freq_id)
-                    .ok_or(anyhow::anyhow!("rope.freq_base not found"))?;
                 let head_size = c.generic.head_size;
-                let p = Self::new_rope_from_frequency(
-                    freq_base,
+                Self::new_rope_from_frequency(
+                    base_frequency,
                     base_freq_id.to_string().into(),
                     head_size,
-                    max_ctx_length,
-                )?;
-                // HACK: right now we emulate GQA by stacking tensors multiple times.
-                Self::hack_stack_gqa(p, c)
+                    max_seq_length,
+                    layout,
+                )
             }
             PositionalConfig::FixedPositional => {
                 let position_embd = loader.get_tensor("position_embd.weight")?;
@@ -585,24 +607,26 @@ impl Positional<f32> {
     }
     pub fn from_safetensors_loader(
         loader: &crate::parser::safe::FileTensorLoader,
-        safe_config: &crate::parser::safe::ConfigJSON,
-        c: &LLMStructure,
+        structure: &LLMStructure,
+        positional_config: &PositionalConfig,
     ) -> anyhow::Result<Self> {
-        match c.positional_config {
-            PositionalConfig::Rope(max_ctx_length) => {
+        match positional_config {
+            PositionalConfig::Rope(rope_config) => {
                 // Build angles per head and repeat across heads (no theta in safetensors header here)
-                let head_size = c.generic.head_size;
-                let base_freq_id = "rope_local_base_freq".to_string();
-                let base_freq = safe_config
-                    .get::<f32, _>(&base_freq_id)
-                    .context("rope_local_base_freq not found")?;
-                let p = Self::new_rope_from_frequency(
-                    base_freq,
-                    base_freq_id.into(),
+                let head_size = structure.generic.head_size;
+                let RopeConfig {
+                    base_frequency,
+                    max_seq_length,
+                    layout,
+                } = *rope_config;
+
+                Self::new_rope_from_frequency(
+                    base_frequency,
+                    format!("rope.freq.{base_frequency}").into(),
                     head_size,
-                    max_ctx_length,
-                )?;
-                Self::hack_stack_gqa(p, c)
+                    max_seq_length,
+                    layout,
+                )
             }
             PositionalConfig::FixedPositional => {
                 let position_embd = loader
@@ -610,15 +634,15 @@ impl Positional<f32> {
                     .or_else(|_| loader.get_tensor("transformer.wpe.weight"))?;
                 let shape = position_embd.shape();
                 ensure!(
-                    shape[0] == c.generic.context_length,
+                    shape[0] == structure.generic.context_length,
                     "position_embd must have shape [{}] vs given {:?}",
-                    c.generic.context_length,
+                    structure.generic.context_length,
                     position_embd.shape()
                 );
                 ensure!(
-                    shape[1] == c.generic.embedding_size,
+                    shape[1] == structure.generic.embedding_size,
                     "position_embd must have shape [{}] vs given {:?}",
-                    c.generic.embedding_size,
+                    structure.generic.embedding_size,
                     position_embd.shape()
                 );
                 Ok(Self::new_absolute(position_embd))

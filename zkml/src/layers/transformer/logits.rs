@@ -1,6 +1,7 @@
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
+    eval_zeroifier_mle,
     graph::NodeId,
     iop::{
         ChallengeStorage,
@@ -13,7 +14,6 @@ use crate::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
             QuantizeOutput, VerifiableCtx,
         },
-        transformer::mha::eval_zeroifier_mle,
     },
     lookup::{
         context::{LayerLookupContext, LookupWitnessGen, TableType},

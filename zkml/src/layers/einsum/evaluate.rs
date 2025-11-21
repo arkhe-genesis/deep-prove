@@ -2,9 +2,9 @@
 
 use super::*;
 
-use crate::{Shape, layers::concat_matmul::Permutation};
+use crate::Shape;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use burn::prelude::Shape as BShape;
 use itertools::{Itertools, izip};
 
@@ -32,11 +32,7 @@ where
         // Prepare the input tensors, applying permutations and reshaping as needed
         let mut unpadded_inputs_iter = inputs
             .iter()
-            .map(|&input_tens| {
-                input_tens
-                    .clone()
-                    .reduce_to_shape(input_tens.unpadded_shape())
-            })
+            .map(|&input_tens| input_tens.clone().reduce_to_unpadded_shape())
             .collect::<Result<Vec<WrappedTensor<N>>>>()?
             .into_iter();
         // The LHS is never a constant tensor, so we take it from the inputs
@@ -44,23 +40,25 @@ where
             .next()
             .ok_or(anyhow!("No input tensors provided"));
 
+        let const_tens_map = match self.padded {
+            true => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
+                WrappedTensor::try_from(const_tensor)?.reduce_to_unpadded_shape()
+            },
+            false => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
+                WrappedTensor::try_from(const_tensor)
+            },
+        };
+
         let unpadded_inputs = std::iter::once(lhs_input)
-            .chain(
-                self.constant_tensors
-                    .iter()
-                    .zip(self.constant_unpadded_shapes.iter())
-                    .map(|(opt_const, unpadded_shape)| {
-                        if let (Some(const_tensor), Some(unpadded_shape)) =
-                            (opt_const, unpadded_shape)
-                        {
-                            WrappedTensor::try_from(&const_tensor.reduce_to_shape(unpadded_shape)?)
-                        } else {
-                            unpadded_inputs_iter
-                                .next()
-                                .ok_or_else(|| anyhow!("Not enough input tensors provided"))
-                        }
-                    }),
-            )
+            .chain(self.constant_tensors.iter().map(|opt_const| {
+                if let Some(const_tensor) = opt_const {
+                    const_tens_map(const_tensor)
+                } else {
+                    unpadded_inputs_iter
+                        .next()
+                        .ok_or_else(|| anyhow!("Not enough input tensors provided"))
+                }
+            }))
             .collect::<Result<Vec<WrappedTensor<N>>>>()?;
 
         // If the stack_axes_size is 1 and the lhs has rank 2 then we can make 2D matmuls instead of 3D batched matmuls
@@ -71,29 +69,23 @@ where
                 Shape::new(dims)
             })
             .collect::<Vec<_>>();
-        let stack_axes_size = self.mapping.axes_sizes(&unpadded_shapes)?[AxisType::Stacked];
-        let lhs_rank = unpadded_shapes[0].rank();
-        if lhs_rank <= 2 && stack_axes_size == 1 {
-            self.burn_evaluation::<2>(unpadded_inputs, &unpadded_shapes)
-        } else {
-            self.burn_evaluation::<3>(unpadded_inputs, &unpadded_shapes)
-        }
+
+        self.burn_evaluation(unpadded_inputs, &unpadded_shapes)
     }
 
     /// Internal method that performs the [`EinSum`] operation using the Burn library.
-    /// The const generic parameter `D` represents the rank of the tensors being processed (either 2 or 3).
-    fn burn_evaluation<const D: usize>(
+    fn burn_evaluation(
         &self,
         inputs: Vec<WrappedTensor<N>>,
         shapes: &[Shape],
     ) -> Result<Vec<WrappedTensor<N>>> {
-        // Ensure that D is either 2 or 3
-        ensure!(
-            D == 2 || D == 3,
-            "EinSum Burn evaluation only supports rank 2 or 3 tensors"
-        );
         // Check that the input shapes are compatible with the einsum equation
-        self.mapping.check_shapes(shapes)?;
+        self.mapping.check_shapes(shapes).context(format!(
+            "Error occurred during shape checking of Einsum with equation {}",
+            self.equation
+        ))?;
+
+        let stack_axes_size = self.mapping.axes_sizes(shapes)?[AxisType::Stacked];
 
         let mut prepped_inputs = izip!(
             inputs,
@@ -110,11 +102,11 @@ where
             let permuted_shape = permuted.shape();
 
             let mut skip = 0;
-            let mut reshape_array = [0usize; D];
+            let mut reshape_array = [0usize; 3];
 
             reshape_array
                 .iter_mut()
-                .zip(reshape[3 - D..].iter())
+                .zip(reshape.iter())
                 .for_each(|(new_dim, to_take)| {
                     *new_dim = permuted_shape
                         .dims
@@ -124,7 +116,22 @@ where
                         .product();
                     skip += *to_take;
                 });
-            permuted.reshape(BShape::from(reshape_array))
+            match (stack_axes_size, permuted.rank()) {
+                (1, 2) => {
+                    // In this case just return the permuted tensor as is
+                    Ok(permuted)
+                }
+                (1, _) => {
+                    // In this case we remove the first element of reshape_array and then reshape the tensor
+                    let reshape_shape = BShape::from([reshape_array[1], reshape_array[2]]);
+                    permuted.reshape(reshape_shape)
+                }
+                _ => {
+                    // Normal case, reshape to 3D
+                    let reshape_shape = BShape::from(reshape_array);
+                    permuted.reshape(reshape_shape)
+                }
+            }
         })
         .collect::<Result<Vec<WrappedTensor<N>>>>()?;
 
@@ -134,30 +141,46 @@ where
         // Iterate through the RHS inputs and perform batched matmuls
         let intermediate_results = prepped_inputs
             .into_iter()
-            .map(|rhs| lhs_burn.clone().matmul(rhs))
+            .map(|rhs| {
+                // The matmul doesn't update the unpadded shape so we need to do it here manually
+                let mut intermediate = lhs_burn.clone().matmul(rhs)?;
+                let shape = intermediate.shape();
+                intermediate.set_unpadded_shape(shape);
+                Ok(intermediate)
+            })
             .collect::<Result<Vec<WrappedTensor<N>>>>()?;
 
         // Now that we have the intermediate outputs as tensors from batched matmuls, we need to reshape them to their intermediate forms
         // and then permute if required
         let intermediate_shapes = self.mapping.intermediate_shapes(shapes)?;
 
+        let const_tens_map = match self.padded {
+            true => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
+                WrappedTensor::try_from(const_tensor)?.reduce_to_unpadded_shape()
+            },
+            false => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
+                WrappedTensor::try_from(const_tensor)
+            },
+        };
+
         izip!(
             intermediate_results,
             intermediate_shapes,
             self.evaluation_info.output_permutations(),
-            self.biases
-                .iter()
-                .zip(self.bias_unpadded_shapes.iter())
-                .map(|(b, shape)| if let (Some(bias), Some(s)) = (b, shape) {
-                    Some(bias.reduce_to_shape(s))
-                } else {
-                    None
-                })
+            self.biases.iter(),
+            self.caches.iter(),
         )
         .map(
-            |(intermediate, intermediate_shape, output_permutation, bias)| {
+            |(intermediate, intermediate_shape, output_permutation, bias, cache_opt)| {
                 // Reshape the burn tensor to the target rank
-                let reshaped = intermediate.reshape(BShape::from(intermediate_shape.into_vec()))?;
+                let intermediate_rank = intermediate.rank();
+                let reshape_len = intermediate_shape.len();
+
+                let reshaped = if intermediate_rank != reshape_len {
+                    intermediate.reshape(BShape::from(intermediate_shape.into_vec()))?
+                } else {
+                    intermediate
+                };
 
                 // Apply the output permutation if provided
                 let permuted = if let Some(perm) = output_permutation {
@@ -167,17 +190,23 @@ where
                 };
                 // Add the bias if provided
                 let with_bias = if let Some(bias_tensor) = bias {
-                    let wrapped_bias = WrappedTensor::try_from(&bias_tensor?)?;
+                    let wrapped_bias = const_tens_map(bias_tensor)?;
                     permuted.add(wrapped_bias)?
                 } else {
                     permuted
                 };
-
-                Ok(if self.padded {
-                    with_bias.pad_next_power_of_two()
-                } else {
-                    with_bias
-                })
+                // Cache the result if a cache is provided
+                match cache_opt {
+                    Some(cache) => {
+                        let mut cache = cache.lock().unwrap();
+                        cache.concatenate::<N>(with_bias)
+                    }
+                    None => Ok(if self.padded {
+                        with_bias.pad_next_power_of_two()
+                    } else {
+                        with_bias
+                    }),
+                }
             },
         )
         .collect()
@@ -252,7 +281,7 @@ impl DimensionSorter {
                 Ok((None, reshape))
             } else {
                 Ok((
-                    Some(Permutation::new(new_order.into_iter().copied().collect())?),
+                    Some(Permutation::new(new_order.into_iter().copied().collect())),
                     reshape,
                 ))
             }
@@ -281,7 +310,7 @@ impl DimensionSorter {
                 Ok((None, reshape))
             } else {
                 Ok((
-                    Some(Permutation::new(new_order.into_iter().copied().collect())?),
+                    Some(Permutation::new(new_order.into_iter().copied().collect())),
                     reshape,
                 ))
             }
@@ -332,7 +361,7 @@ impl OutputDimensionSorter {
                 .into_iter()
                 .map(|o| o.expect("Output dimension not found, should be impossible"))
                 .collect::<Vec<usize>>();
-            Ok(Some(Permutation::new(output_order)?))
+            Ok(Some(Permutation::new(output_order)))
         }
     }
 }
@@ -463,6 +492,27 @@ impl EvaluationInformation3D {
     /// Get the input reshapes as an iterator
     pub fn input_reshapes(&self) -> impl Iterator<Item = [usize; 3]> + '_ {
         std::iter::once(self.lhs_reshape).chain(self.rhs_reshape.iter().copied())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Permutation(pub(crate) Vec<usize>);
+
+impl Permutation {
+    pub fn new(perm: Vec<usize>) -> Self {
+        assert!(
+            perm.len() > 1,
+            "Permutation must have at least two elements"
+        );
+        assert!(
+            perm.iter().all(|&x| x < perm.len()),
+            "Permutation indices must be less than the length of the permutation"
+        );
+        Self(perm)
+    }
+
+    pub fn apply(&self, shape: &Shape) -> Shape {
+        shape.permute(&self.0)
     }
 }
 
@@ -810,6 +860,80 @@ mod tests {
                         "Failed for output {name} shapes X: {x_shape:?}, WQ: {wq_shape:?}, WK: {wk_shape:?}, WV: {wv_shape:?}, Calculated: {output}, Expected: {expected}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cached_qkv() {
+        test_cached_qkv_helper::<f32>();
+        test_cached_qkv_helper::<Element>();
+    }
+
+    fn test_cached_qkv_helper<N>()
+    where
+        N: TensorTypeParam,
+    {
+        let mut rng = rng_from_env_or_random();
+
+        for _ in 0..10 {
+            let groups: usize = rng.gen_range(1..3);
+            let heads_per_group: usize = rng.gen_range(2..4);
+            let seq_len: usize = rng.gen_range(3..15);
+            let embedding_dim = rng.gen_range(1..15);
+            let head_dim: usize = rng.gen_range(1..15);
+
+            let wq_shape = Shape::new(vec![embedding_dim, groups, heads_per_group, head_dim]);
+            let wk_shape = Shape::new(vec![embedding_dim, groups, head_dim]);
+            let wv_shape = Shape::new(vec![embedding_dim, groups, head_dim]);
+
+            let wq = Tensor::<N>::random(&wq_shape);
+            let wk = Tensor::<N>::random(&wk_shape);
+            let wv = Tensor::<N>::random(&wv_shape);
+
+            let keyed_wq = KeyedTensor::new("WQ".to_string(), wq.clone());
+            let keyed_wk = KeyedTensor::new("WK".to_string(), wk.clone());
+            let keyed_wv = KeyedTensor::new("WV".to_string(), wv.clone());
+
+            let mut einsum: EinSum<N> = EinSum::new(
+                "X(se)@WQ(ehgd):WK(ehd):WV(ehd)->Q(ghsd):K(hsd):V(hsd)".to_string(),
+                vec![Some(keyed_wq), Some(keyed_wk), Some(keyed_wv)],
+                vec![None, None, None],
+            )
+            .expect("Failed to create EinSum layer");
+
+            einsum
+                .with_caches(vec![None, Some(1), Some(1)])
+                .expect("Failed to add caches");
+
+            let mut xs = vec![];
+            let mut cached_output = Vec::new();
+            for _ in 0..seq_len {
+                let x_shape = Shape::new(vec![1, embedding_dim]);
+                let x = WrappedTensor::<N>::random(&x_shape);
+                println!("processing token with shape: {:?}", x.shape());
+                xs.push(x.clone());
+
+                cached_output = einsum
+                    .evaluate_internal(&[&x])
+                    .expect("Failed to evaluate EinSum layer");
+            }
+
+            // Verify the cached output against non-cached computation
+            einsum.reset_caches();
+
+            let full_x = WrappedTensor::<N>::cat(xs, 0).unwrap();
+            let full_output = einsum
+                .evaluate_internal(&[&full_x])
+                .expect("Failed to evaluate EinSum layer");
+
+            for (cached, full) in cached_output.iter().zip(full_output.iter()).skip(1) {
+                let cached_data = cached.clone().into_native().into_data();
+                let full_data = full.clone().into_native().into_data();
+                assert_eq!(
+                    cached_data, full_data,
+                    "Cached output does not match full sequence output"
+                );
             }
         }
     }

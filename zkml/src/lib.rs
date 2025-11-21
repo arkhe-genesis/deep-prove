@@ -5,11 +5,11 @@
 #![feature(mapped_lock_guards)]
 
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
-use ff_ext::ExtensionField;
+use ff_ext::{ExtensionField, FieldFrom};
 use itertools::Itertools;
 use multilinear_extensions::mle::PointAndEval;
 use quantization::Fieldizer;
-use rayon::iter::ParallelIterator;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{borrow::Borrow, env, str::FromStr};
 use transcript::{BasicTranscript, Transcript};
@@ -94,6 +94,32 @@ pub(crate) fn to_bit_sequence_le(
     (0..bit_length).map(move |i| (num >> i) & 1)
 }
 
+/// Method to efficiency evaluate the MLE of the zeroifier matrix over a random
+/// point. The point is provided already split between coordinates referring to the
+/// columns and coordinates referring to the rows of the matrix.
+/// Currently, it works only for a square zeroifier matrix
+pub fn eval_zeroifier_mle<F: ExtensionField>(column_point: &[F], row_point: &[F]) -> F {
+    column_point
+        .iter()
+        .zip(row_point)
+        .fold(F::ONE, |acc, (&c, &r)| {
+            acc * (F::ONE - c - r + F::from_canonical_u64(2) * c * r) + (F::ONE - c) * r
+        })
+}
+
+/// Method to efficiency evaluate the MLE of the infinitizer matrix over a random
+/// point. The point is provided already split between coordinates referring to the
+/// columns and coordinates referring to the rows of the matrix.
+/// Currently, it works only for a square infinitizer matrix
+pub fn eval_infinitizer_mle<F: ExtensionField + FieldFrom<u64>>(
+    column_point: &[F],
+    row_point: &[F],
+    minus_infinity: Element,
+) -> F {
+    <Element as Fieldizer<F>>::to_field(&minus_infinity)
+        * (F::ONE - eval_zeroifier_mle(column_point, row_point))
+}
+#[allow(dead_code)]
 pub(crate) fn try_unzip<I, C, T, E>(iter: I) -> Result<C, E>
 where
     I: IntoIterator<Item = Result<T, E>>,
@@ -104,7 +130,7 @@ where
         Ok(c)
     })
 }
-
+#[allow(dead_code)]
 pub(crate) fn try_unzip_parallel<I, C, T, E>(iter: I) -> Result<C, E>
 where
     I: ParallelIterator<Item = Result<T, E>>,

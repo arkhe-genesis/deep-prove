@@ -157,7 +157,10 @@ impl FileTensorLoader {
 pub mod test {
     use tenstore::GenStore;
 
-    use crate::parser::llm::{LLMConfig, LLMModel, models::gpt2::gpt2_structure};
+    use crate::parser::{
+        Load,
+        llm::{LLMConfig, LLMModel, models::gpt2::decoder::GPT2Decoder},
+    };
     use std::path::PathBuf;
 
     use super::*;
@@ -186,10 +189,9 @@ pub mod test {
         println!("loader keys: {:?}", loader.content.metadata.keys());
         let config = LLMConfig::from_json(&loader)?;
         println!("tiny gpt2 config: {config:?}");
-        let model = LLMModel::from_json(&loader, &config)?;
-        let structure = gpt2_structure(&config);
+        let model = LLMModel::<GPT2Decoder>::from_loader(&loader, &config)?;
         let init_user_shape = Shape::from(vec![1]);
-        let model = model.into_provable_model(&structure, init_user_shape)?;
+        let model = model.into_provable_model(init_user_shape)?;
         let input = Tensor::new(Shape::from(vec![1]), vec![512.0])?;
         model.run_float(vec![input], &mut GenStore::default())?;
         Ok(())

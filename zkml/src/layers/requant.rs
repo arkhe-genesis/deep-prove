@@ -863,6 +863,7 @@ impl Requant {
             .transcript
             .sample_and_append_challenge(b"batching")
             .elements;
+
         let (number_shifted_chunks, _, _) = self.shifted_chunks_data();
         let either_mles = layer_polys
             .iter()
@@ -1101,7 +1102,7 @@ mod tests {
     use tenstore::GenStore;
 
     use crate::{
-        layers::{Layer, matrix_mul::MatMul},
+        layers::{Layer, einsum::EinSum},
         model::{Model, test::prove_model},
         tensor::KeyedTensor,
     };
@@ -1125,9 +1126,10 @@ mod tests {
             "requant_matmul_bias",
             Tensor::<f32>::random(&vec![d].into()),
         );
-        let matmul = MatMul::new_constant(mat, Some(bias)).unwrap();
+        let einsum = EinSum::new_matmul(None, Some(mat), false, Some(bias)).unwrap();
+
         let _ = model
-            .add_consecutive_layer(Layer::MatMul(matmul), None)
+            .add_consecutive_layer(Layer::EinSum(einsum), None)
             .unwrap();
         model.automatic_output_labelling().unwrap();
         model.describe();

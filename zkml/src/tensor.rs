@@ -181,7 +181,7 @@ impl KeyedTensor<f32> {
 /// This value should be a multiple of the target's cache line (taking into
 /// consideration the number of bytes, including padding, of the data being
 /// iterated over). To support multiple architectures this should be the least
-/// common multiple of all target archictures.
+/// common multiple of all target architectures.
 ///
 /// This value is also used to increase utilisation when utilising rayon,
 /// reducing the overhead cost of the rayon framework for super cheap operation.
@@ -480,6 +480,7 @@ where
     }
 
     /// Returns a reference to the shape of this tensor.
+    #[allow(dead_code)]
     pub(crate) fn shape(&self) -> &Shape {
         &self.shape
     }
@@ -1147,6 +1148,10 @@ impl<T: Clone> Tensor<T> {
             new_shape,
             new_shape.product()
         );
+        // If the tensor has not yet been padded also update the unpadded shape
+        if self.shape == self.unpadded_shape {
+            self.unpadded_shape = new_shape.clone();
+        }
         self.shape = new_shape;
 
         Ok(())
@@ -1831,7 +1836,7 @@ where
             .collect();
         Tensor::new_with_unpadded_shape(
             mat_shp_pad.to_vec().into(),
-            self.unpadded_shape.clone(),
+            vec![self.unpadded_shape[0], mat_shp_pad[1]].into(),
             new_data,
         )
     }
@@ -2106,6 +2111,28 @@ impl<T: Copy + Default> Tensor<T> {
         new_tensor
     }
 
+    /// Pads the tensor to the next power-of-two using the specified value for padding.
+    pub fn pad_next_power_of_two_with_value(&self, value: T) -> Self {
+        let new_shape = self.shape().next_power_of_two();
+
+        // Pre allocate the necessary capacity
+        let mut new_data = Vec::with_capacity(new_shape.numel());
+        new_data.extend(&self.data);
+
+        // Create the new tensor and use the in-place implementation to change the shape
+        let mut new_tensor = Tensor {
+            data: new_data,
+            shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
+        };
+        new_tensor.pad_to_shape_with_value(new_shape, value).expect(
+            "padding within pad_to_next_power_of_two always \
+            creates a new shape of correct rank; qed",
+        );
+
+        new_tensor
+    }
+
     /// Changes the shape of the current [Tensor] to `target_shape`.
     ///
     /// This method will modify the current tensor in place, extending it
@@ -2116,6 +2143,19 @@ impl<T: Copy + Default> Tensor<T> {
     /// If the `target_shape` differs in rank or has a dimension smaller than
     /// the current tensor.
     pub fn pad_to_shape(&mut self, target_shape: Shape) -> Result<()> {
+        self.pad_to_shape_with_value(target_shape, T::default())
+    }
+
+    /// Changes the shape of the current [Tensor] to `target_shape` by padding with the specified value.
+    ///
+    /// This method will modify the current tensor in place, extending it
+    /// to comply with the new shape.
+    ///
+    /// # Panics
+    ///
+    /// If the `target_shape` differs in rank or has a dimension smaller than
+    /// the current tensor.
+    pub fn pad_to_shape_with_value(&mut self, target_shape: Shape, value: T) -> Result<()> {
         ensure!(
             target_shape.rank() == self.shape.rank(),
             "Target shape must have the same rank as the current tensor. current {:?} target {:?}",
@@ -2149,7 +2189,7 @@ impl<T: Copy + Default> Tensor<T> {
         // And at least one of the dimensions has a non-zero distance
 
         // First expand the underlying storage vector to the new size
-        self.data.resize(target_shape.product(), T::default());
+        self.data.resize(target_shape.product(), value);
 
         // Walks the shapes in reverse and count number of equal dimensions, if any.
         //
@@ -2218,7 +2258,7 @@ impl<T: Copy + Default> Tensor<T> {
             dest -= chunk;
 
             self.data.copy_within(start_pos..end_pos, dest); // copy data to new position
-            self.data[start_pos..min(end_pos, dest)].fill(T::default()); // write the padding
+            self.data[start_pos..min(end_pos, dest)].fill(value); // write the padding
 
             end_pos = start_pos;
 

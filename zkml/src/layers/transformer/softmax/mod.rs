@@ -1,8 +1,8 @@
 //! This layer applies the softmax function to the last dimension of the input tensor
 use crate::{
     Claim, Element, Number, ScalingStrategy, Shape, Tensor,
-    backend::Backend,
     commit::{compute_betas_eval, identity_eval},
+    eval_zeroifier_mle,
     graph::NodeId,
     iop::{
         ChallengeStorage,
@@ -31,10 +31,10 @@ use crate::{
     padding::PaddingMode,
     quantization::{self, Fieldizer, ScalingFactor},
     tensor::{TensorTypeParam, WrappedTensor},
-    to_base,
+    to_base, to_bit_sequence_le,
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use burn::tensor::{Int as BInt, Tensor as BTensor, TensorData};
+use burn::tensor::TensorData;
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
@@ -57,6 +57,11 @@ use sumcheck::{
 };
 use transcript::Transcript;
 use witness::RowMajorMatrix;
+
+pub mod evaluate;
+pub mod lookup;
+pub mod prove;
+pub mod verify;
 
 /// The short name used to identify the Softmax layer
 pub const SOFTMAX_LAYER: &str = "SFTM";
@@ -294,7 +299,7 @@ impl<N: TensorTypeParam> Softmax<N> {
         // Now we need to convert this rescaling multiplier into a fixed point multiplier and a right shift.
         let log_m = rescaling_mult.log2();
         // This is the right shift
-        let int_part = log_m.trunc().abs() as usize;
+        let int_part = log_m.trunc() as isize;
         // This is used to calculate the fixed point multiplier
         let float_part = log_m.fract();
 
@@ -313,7 +318,7 @@ impl<N: TensorTypeParam> Softmax<N> {
         let lut = ExpTable::new(input_sf, output_sf, table_bit_size);
 
         let quant_info = QuantisedSoftmaxData {
-            right_shift: int_part + FIXED_POINT_SCALE,
+            right_shift: (FIXED_POINT_SCALE as isize - int_part) as usize,
             fixed_point_multiplier,
             fp_scale,
             multiplier: rescaling_mult,
@@ -448,47 +453,6 @@ impl<N: TensorTypeParam> Softmax<N> {
     }
 }
 
-impl Softmax<Element> {
-    /// Method that given a quantised input [`Tensor`] calculates the `shift` we apply along each dim and returns the result as the `bias` field of
-    /// as [`AttentionMask`].
-    pub(crate) fn calculate_shift_data(
-        &self,
-        binput: &BTensor<Backend, 2, BInt>,
-        shift_shape: Shape,
-    ) -> Result<(Tensor<Element>, BTensor<Backend, 2, BInt>)> {
-        let QuantisedSoftmaxData {
-            input_scaling_factor,
-            temperature,
-            ..
-        } = self.quant_info().ok_or(anyhow!("Attempted to calculate shift data for quantised Softmax with no QuantisedSoftmaxData present"))?;
-        // Unwrap is safe here because previous line would have errored if quant_info was None
-        let negative_infinity = self.quant_info().unwrap().quantised_negative_infinity();
-
-        let scalar = input_scaling_factor.scale() / temperature;
-        let binput_mask = binput.clone().equal_elem(negative_infinity);
-
-        let dim_maxes = binput.clone().max_dim(1);
-        let log_sum_exp = (binput.clone() - dim_maxes.clone())
-            .float()
-            .mul_scalar(scalar)
-            .mask_fill(binput_mask.clone(), f32::NEG_INFINITY)
-            .exp()
-            .sum_dim(1)
-            .log();
-
-        let quantising_scalar = temperature / input_scaling_factor.scale();
-        let shift_btensor = log_sum_exp.mul_scalar(-quantising_scalar).round().int() - dim_maxes;
-        let shift_data: Vec<Element> = shift_btensor
-            .to_data()
-            .into_vec()
-            .map_err(|e| anyhow!("Could not convert burn Softmax shift data to Element: {e:?}"))?;
-
-        let shift_tensor = Tensor::<Element>::new(shift_shape, shift_data)?;
-
-        Ok((shift_tensor, shift_btensor))
-    }
-}
-
 impl Evaluate<f32> for Softmax<f32> {
     fn evaluate<E: ExtensionField>(
         &self,
@@ -539,746 +503,11 @@ impl Evaluate<Element> for Softmax<Element> {
         &self,
         inputs: &[&WrappedTensor<Element>],
     ) -> Result<LayerOut<Element, E>> {
-        // First we check that we have some quantisation info.
-        ensure!(
-            self.quant_info.is_some(),
-            "Could not evaluate quantised softmax because the operation has not been quantised"
-        );
-        // Check that we only have one input
-        ensure!(
-            inputs.len() == 1,
-            "Expected a single input to quantised softmax, got: {}",
-            inputs.len()
-        );
-
-        // Since we have checked that quant info exists this unwrap is safe
-        let QuantisedSoftmaxData {
-            lut,
-            right_shift,
-            fixed_point_multiplier,
-            ..
-        } = self.quant_info().unwrap();
-
-        // We expect the input tensor to have rank 2 or 3, if it has rank 2 we will treat it as having shape [1, shape[0], shape[1]]
-        let input_rank = inputs[0].rank();
-        ensure!(
-            input_rank == 2 || input_rank == 3,
-            "Expected input to quantised softmax to have rank 2 or 3, got: {input_rank}",
-        );
-
-        let unpadded_input_shape: Shape = inputs[0].unpadded_shape().clone().into();
-
-        let (input, unpadded_input_shape) = if input_rank == 2 {
-            (
-                inputs[0].clone().unsqueeze_dim_3(),
-                unpadded_input_shape.insert(0, 1),
-            )
-        } else {
-            (inputs[0].clone(), inputs[0].unpadded_shape().clone().into())
-        };
-
-        let shift_shape = Shape::new(vec![unpadded_input_shape[0], input.shape().dims[1], 1]);
-
-        // We work over 2D chunks (skipping any padding chunks)
-        let nshape = Shape::from(input.shape());
-        let full_input_size = nshape.numel();
-        let strides = nshape.strides();
-        let rounding: Element = 1 << (*right_shift - 1);
-
-        let data_to_take = strides[0] * unpadded_input_shape[0];
-        // Now we flatten the input to 2D and take only the data that corresponds to 2D sub-tensors that don't arise from padding.
-        let flat_data: Vec<Element> = input.clone().to_data().iter().take(data_to_take).collect();
-        let b_input = BTensor::<Backend, 2, BInt>::from_data(
-            TensorData::new(
-                flat_data,
-                vec![
-                    unpadded_input_shape[0] * input.shape().dims[1],
-                    input.shape().dims[2],
-                ],
-            ),
-            &Default::default(),
-        );
-        let (shift_tensor, shift_btensor) = self.calculate_shift_data(&b_input, shift_shape)?;
-
-        let multiplied_b_input = (b_input + shift_btensor)
-            .mul_scalar(*fixed_point_multiplier)
-            .add_scalar(rounding)
-            .bitwise_right_shift_scalar(*right_shift as Element);
-
-        let multiplied_b_input_data: Vec<Element> =
-            multiplied_b_input.into_data().to_vec().map_err(|e| {
-                anyhow!("Failed to convert multiplied_b_input to Vec<Element> in Softmax: {e:?}")
-            })?;
-        let output_data = multiplied_b_input_data
-            .into_iter()
-            .map(|intermediate| {
-                if intermediate <= -(1 << lut.table_bit_size()) {
-                    0
-                } else {
-                    lut.table_output(intermediate)
-                }
-            })
-            .chain(std::iter::repeat(0))
-            .take(full_input_size)
-            .collect::<Vec<Element>>();
-
-        // Make the output tensor
-        let output = if input_rank == 2 {
-            WrappedTensor::try_from(&Tensor::<Element>::new(
-                inputs[0].shape().into(),
-                output_data,
-            )?)?
-        } else {
-            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data)?)?
-        };
-
-        Ok(LayerOut {
-            outputs: vec![output],
-            proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
-            tracked_layer_data: None,
-        })
+        self.evaluate_internal(inputs)
     }
 }
 
 impl PadOp for Softmax<Element> {}
-
-struct RangeChecks {
-    number_of_chunks: usize,
-    chunks: Vec<Vec<Element>>,
-}
-
-impl RangeChecks {
-    fn new(number_of_chunks: usize) -> Self {
-        Self {
-            number_of_chunks,
-            chunks: vec![vec![]; number_of_chunks],
-        }
-    }
-
-    fn push(&mut self, value: Element) {
-        let bit_len_mask: Element = (1 << *quantization::BIT_LEN) - 1;
-        (0..self.number_of_chunks).for_each(|j| {
-            let shift = j * *quantization::BIT_LEN;
-            let chunk_val = (value >> shift) & bit_len_mask;
-            self.chunks[j].push(chunk_val);
-        });
-    }
-
-    fn merge(&mut self, other: RangeChecks) -> Result<()> {
-        ensure!(
-            self.number_of_chunks == other.number_of_chunks,
-            "RangeChecks::merge failed to merge unequal number of chunkcs self: {} other {}",
-            self.number_of_chunks,
-            other.number_of_chunks
-        );
-        let RangeChecks { chunks, .. } = other;
-        self.chunks
-            .iter_mut()
-            .zip(chunks)
-            .for_each(|(a, b)| a.extend(b));
-
-        Ok(())
-    }
-
-    fn count_iterator(&self) -> Vec<Element> {
-        self.chunks.concat()
-    }
-}
-
-struct ExpLookup {
-    input: Vec<Element>,
-    output: Vec<Element>,
-}
-
-impl ExpLookup {
-    fn new() -> Self {
-        Self {
-            input: Vec::<Element>::new(),
-            output: Vec::<Element>::new(),
-        }
-    }
-
-    fn push(&mut self, input: Element, output: Element) {
-        self.input.push(input);
-        self.output.push(output);
-    }
-
-    fn merge(&mut self, other: ExpLookup) {
-        let ExpLookup { input, output } = other;
-        self.input.extend(input);
-        self.output.extend(output);
-    }
-
-    fn count_iterator(&self) -> Vec<Element> {
-        self.input
-            .iter()
-            .zip(self.output.iter())
-            .map(|(a, b)| a + COLUMN_SEPARATOR * b)
-            .collect::<Vec<Element>>()
-    }
-}
-
-struct ZeroChecks {
-    number_of_chunks: usize,
-    input_chunks: Vec<Vec<Element>>,
-    output_chunks: Vec<Vec<Element>>,
-}
-
-impl ZeroChecks {
-    fn new(number_of_chunks: usize) -> Self {
-        Self {
-            number_of_chunks,
-            input_chunks: vec![vec![]; number_of_chunks],
-            output_chunks: vec![vec![]; number_of_chunks],
-        }
-    }
-
-    fn push(&mut self, input: Element) {
-        let bit_len_mask: Element = (1 << *quantization::BIT_LEN) - 1;
-        (0..self.number_of_chunks).for_each(|j| {
-            let shift = j * *quantization::BIT_LEN;
-            let in_val = (input >> shift) & bit_len_mask;
-
-            self.input_chunks[j].push(in_val);
-
-            if in_val != 0 {
-                self.output_chunks[j].push(0);
-            } else {
-                self.output_chunks[j].push(1);
-            }
-        });
-    }
-
-    fn merge(&mut self, other: ZeroChecks) -> Result<()> {
-        ensure!(
-            self.number_of_chunks == other.number_of_chunks,
-            "RangeChecks::merge failed to merge unequal number of chunkcs self: {} other {}",
-            self.number_of_chunks,
-            other.number_of_chunks
-        );
-        let ZeroChecks {
-            input_chunks,
-            output_chunks,
-            ..
-        } = other;
-        self.input_chunks
-            .iter_mut()
-            .zip(input_chunks)
-            .for_each(|(a, b)| a.extend(b));
-        self.output_chunks
-            .iter_mut()
-            .zip(output_chunks)
-            .for_each(|(a, b)| a.extend(b));
-
-        Ok(())
-    }
-
-    fn count_iterator(&self) -> Vec<Element> {
-        self.input_chunks
-            .iter()
-            .zip(self.output_chunks.iter())
-            .flat_map(|(input_chunk, output_chunk)| {
-                input_chunk
-                    .iter()
-                    .zip(output_chunk.iter())
-                    .map(|(a, b)| a + COLUMN_SEPARATOR * b)
-                    .collect::<Vec<Element>>()
-            })
-            .collect::<Vec<Element>>()
-    }
-}
-
-impl Softmax<Element> {
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn prove_step<
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        T: transcript::Transcript<E>,
-    >(
-        &self,
-        node_id: NodeId,
-        last_claims: Vec<&Claim<E>>,
-        ctx: &SoftmaxCtx,
-        softmax_data: &SoftmaxData,
-        input_shape: &Shape,
-        prover: &mut crate::Prover<E, T, PCS>,
-    ) -> Result<(Vec<Claim<E>>, SoftmaxProof<E, PCS>)>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
-    {
-        // Check number of claims
-        ensure!(
-            last_claims.len() == 1,
-            "Softmax only produces one output claim but got: {}",
-            last_claims.len()
-        );
-        let last_claim = last_claims[0];
-
-        let shift_shape = softmax_data.shift_tensor.shape();
-        let final_dim_size = input_shape
-            .last()
-            .ok_or(anyhow!("Shifted input has no shape"))?
-            .next_power_of_two();
-        let first_dim = shift_shape[0];
-        // Retrieve all the witness data
-        let number_of_range_checks = ctx.quant_info.number_of_range_checks();
-        let number_of_zero_chunks = ctx.quant_info.number_of_zero_chunks();
-        let layer_commitment = prover.lookup_witness(node_id)?;
-        // Prepare the lookup inputs from the layer commitment
-        let logup_inputs = ctx.lookup_ctx.create_logup_inputs_softmax::<PCS, E>(
-            layer_commitment,
-            &prover.challenge_storage,
-            final_dim_size,
-            number_of_range_checks,
-            number_of_zero_chunks,
-            first_dim,
-        )?;
-        let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
-        let commitment = PCS::get_pure_commitment(layer_commitment);
-        // Run the logup proving
-        let logup_batch_proof = batch_multiple_sizes_prove(&logup_inputs, prover.transcript)?;
-
-        let logup_point = &logup_batch_proof.output_claims()[0].point;
-        // We need to know how many variables it takes to represent the normalisation dimension
-        let dim_vars = ceil_log2(final_dim_size);
-        let two = E::from_canonical_u64(2u64);
-        let two_inv = two.inverse();
-
-        // The error lookup is performed over the output summed on the final dimension so we need to extend the point used with correct number
-        // of 2^-1 entries
-        let full_error_point = std::iter::repeat_n(two_inv, dim_vars)
-            .chain(logup_point.iter().skip(dim_vars).copied())
-            .collect::<Vec<E>>();
-        // Here we split the last claim point up according to input shape
-        let split = input_shape.split_point(last_claim.point())?;
-        // The batch challenge point is the first part of the split, the rest are the last claim points
-        let batch_chal_point = split[0];
-        let lc_eq_point = split
-            .iter()
-            .skip(1)
-            .rev()
-            .flat_map(|&v| v)
-            .copied()
-            .collect::<Vec<E>>();
-
-        // Make all the eq polys
-        let error_eq = compute_betas_eval(&full_error_point).into_mle();
-        let logup_eq = compute_betas_eval(logup_point).into_mle();
-        let last_claim_eq = compute_betas_eval(&lc_eq_point).into_mle();
-
-        // We split the layer polys up here, all polys related to decomposition of the input come first
-        // and there will be first_dim * (number_of_range_checks + 1 + number_of_zero_chunks) in total.
-        // After we have split these of the next first_dim * (1 + number_of_zero_chunks) are used to calculate the output.
-        let number_input_polys = first_dim * (number_of_range_checks + 1 + number_of_zero_chunks);
-        let number_output_polys = first_dim * (number_of_zero_chunks + 1);
-        let (_, rest) = layer_polys.split_at(number_input_polys);
-        let (sumcheck_polys, shift_polys) = rest.split_at(number_output_polys);
-
-        // Transform the polys into Either::Left so they can be passed to the VirtualPolynomialsBuilder
-        let either_mles = [&last_claim_eq, &error_eq, &logup_eq]
-            .into_iter()
-            .map(Either::Left)
-            .chain(sumcheck_polys.iter().map(|p| Either::Left(p.as_ref())))
-            .collect::<Vec<Either<_, _>>>();
-
-        // Squeeze a batching challenge from the transcript, powers of these challenges will be used to
-        // link the MLEs used in the lookup to this sumcheck
-        let alphas = (0..first_dim)
-            .map(|_| {
-                prover
-                    .transcript
-                    .sample_and_append_challenge(b"batching_challenge")
-                    .elements
-            })
-            .collect::<Vec<E>>();
-
-        let batching_evals = compute_betas_eval(batch_chal_point);
-        let challenges = batching_evals
-            .iter()
-            .zip(alphas)
-            .flat_map(|(&a, b)| [a, b])
-            .collect::<Vec<E>>();
-        // Make the VirtualPolynomials and run the sumcheck
-        let num_vars = logup_point.len();
-        let num_threads = optimal_sumcheck_threads(num_vars);
-        let expr_builder =
-            VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
-
-        let sumcheck_expression = build_softmax_sumcheck_expression::<E>(
-            number_of_zero_chunks,
-            first_dim,
-            final_dim_size,
-        );
-
-        let virtual_poly = expr_builder.to_virtual_polys(&sumcheck_expression, &challenges);
-        let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
-        let sumcheck_point = state
-            .challenges
-            .iter()
-            .map(|c| c.elements)
-            .collect::<Vec<E>>();
-        let all_evals = state.get_mle_flatten_final_evaluations();
-
-        // We have all the range claims, then the exp claims, then zero claims, then error claims
-        let logup_claims = logup_batch_proof.output_claims();
-        let (range_claims, rest) = logup_claims.split_at(first_dim * number_of_range_checks);
-        let (exp_claims, rest) = rest.split_at(2 * first_dim);
-        let (zero_claims, _) = rest.split_at(first_dim * 2 * number_of_zero_chunks);
-
-        // We evaluate the shift polys at the logup point (skipping the variables relating to the normalisation dimension entries)
-        let shift_eval_point = logup_point[dim_vars..].to_vec();
-        let shift_evals = shift_polys
-            .iter()
-            .map(|p| p.evaluate(&shift_eval_point))
-            .collect::<Vec<E>>();
-
-        // These constants are used to recombine the chunks from the lookups
-        let base_multiplier = E::from_canonical_u64(1u64 << *quantization::BIT_LEN);
-        let right_shift_field = E::from_canonical_u64(1u64 << ctx.quant_info.right_shift);
-        let rounding = E::from_canonical_u64(1u64 << (ctx.quant_info.right_shift - 1));
-        let fpm_field: E = ctx.quant_info.fixed_point_multiplier.to_field();
-        let fpm_inv = fpm_field.inverse();
-        let zero_offset = E::from_canonical_u64(
-            1 << (ctx.quant_info.right_shift + ctx.quant_info.lut.table_bit_size()),
-        );
-
-        // Combine the range claims for each chunk
-        let (low_parts, stacked_range_evals): (Vec<E>, Vec<Vec<E>>) = range_claims
-            .chunks(number_of_range_checks)
-            .map(|chunk| {
-                let range_evals = chunk.iter().map(|c| c.evaluation()).collect::<Vec<E>>();
-                let input_part = range_evals
-                    .iter()
-                    .fold((E::ZERO, E::ONE), |(acc, pow_two), &b| {
-                        (acc + pow_two * b, pow_two * base_multiplier)
-                    })
-                    .0;
-                (input_part, range_evals)
-            })
-            .unzip();
-        // Combine the exp claims
-        let (exp_parts, stacked_exp_evals): (Vec<E>, Vec<E>) = exp_claims
-            .iter()
-            .step_by(2)
-            .map(|c| (c.evaluation() * right_shift_field, c.evaluation()))
-            .unzip();
-        // Combine the zero claims
-        let (high_parts, stacked_high_evals): (Vec<E>, Vec<Vec<E>>) = zero_claims
-            .chunks(2 * number_of_zero_chunks)
-            .map(|chunk| {
-                let high_evals = chunk
-                    .iter()
-                    .step_by(2)
-                    .map(|c| c.evaluation())
-                    .collect::<Vec<E>>();
-                let input_part = high_evals
-                    .iter()
-                    .fold((E::ZERO, zero_offset), |(acc, pow_two), &b| {
-                        (acc + pow_two * b, pow_two * base_multiplier)
-                    })
-                    .0;
-                (input_part, high_evals)
-            })
-            .unzip();
-
-        // Calculate the input evaluation
-        let input_eval = izip!(
-            low_parts,
-            exp_parts,
-            high_parts,
-            shift_evals.iter(),
-            batching_evals
-        )
-        .map(|(l, e, h, &shift, batch)| ((l + e - h - rounding) * fpm_inv - shift) * batch)
-        .sum::<E>();
-        // The first commitment is the range checks, then the exp inputs, then the zero inputs
-        let first_commit_evals = izip!(stacked_range_evals, stacked_exp_evals, stacked_high_evals)
-            .flat_map(|(mut rs, e, zs)| {
-                rs.push(e);
-                rs.extend(zs);
-                rs
-            })
-            .collect::<Vec<E>>();
-
-        let first_commit_point = logup_point.to_vec();
-
-        // The second commitment is the exp output and the zero outputs
-        let second_commit_evals = all_evals[3..].to_vec();
-        let second_commit_point = sumcheck_point.clone();
-        // Combine them all in the correct order and add them to the claim prover
-        let layer_claims = vec![
-            (first_commit_point, first_commit_evals),
-            (second_commit_point, second_commit_evals),
-            (shift_eval_point, shift_evals.clone()),
-        ];
-        prover.add_witness_claim(node_id, layer_claims);
-
-        let input_claim = Claim::<E>::new(
-            logup_point
-                .iter()
-                .chain(batch_chal_point.iter())
-                .copied()
-                .collect::<Vec<E>>(),
-            input_eval,
-        );
-
-        let softmax_proof = SoftmaxProof {
-            logup_proof: logup_batch_proof,
-            commitment,
-            sumcheck_proof,
-            evaluations: [&all_evals[3..], shift_evals.as_slice()].concat(),
-        };
-
-        Ok((vec![input_claim], softmax_proof))
-    }
-
-    pub(crate) fn lookup_witness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
-        &self,
-        id: NodeId,
-        ctx: &ProverContext<E, PCS>,
-        input: &Tensor<Element>,
-        output: &Tensor<Element>,
-        softmax_data: &SoftmaxData,
-    ) -> Result<LookupWitnessGen<E, PCS>>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
-    {
-        // Get the data generated during quantised evaluation
-        let SoftmaxData { shift_tensor } = softmax_data;
-
-        // We need to work out how many chunks to split the normalisation into to be range checked.
-        let quant_info = self.quant_info().ok_or(anyhow!(
-            "Could not prove Softmax because it had no quantisation data"
-        ))?;
-        let QuantisedSoftmaxData {
-            right_shift,
-            fixed_point_multiplier,
-            error_bound,
-            lut,
-            ..
-        } = quant_info;
-        let allowable_error = (*error_bound * lut.output_sf()).round() as Element;
-
-        // Now we construct the polynomials used in the lookups
-        // To do this we need the size of the last dimension
-        let final_dim_size = *output
-            .shape()
-            .last()
-            .ok_or(anyhow!("Softmax output tensor did not have a shape"))?;
-
-        let input_shape = input.shape();
-        let input_rank = input_shape.rank();
-        // We need to chunk the input into its 2D sub-tensors, we will ignore any 2D sub-tensors that arise from padding
-        let chunk_size = if input_rank == 2 {
-            input_shape.numel()
-        } else {
-            let strides = input_shape.strides();
-            strides[0]
-        };
-
-        let shift_shape = shift_tensor.shape();
-        let shift_chunk_size = shift_shape.strides()[0];
-        // These are the sums of the rows after Softmax, we check that these are all within the allowable error of quantised 1.0.
-        let normalisation_lookups = output
-            .get_data()
-            .chunks(chunk_size)
-            .take(shift_shape[0])
-            .map(|outer_chunk| {
-                outer_chunk
-                    .chunks(final_dim_size)
-                    .map(|chunk| chunk.iter().sum::<Element>())
-                    .collect::<Vec<Element>>()
-            })
-            .collect::<Vec<Vec<Element>>>();
-
-        // This is the rounding constant used during the fixed point multiplication and right shift
-        let rounding: Element = 1 << (*right_shift - 1);
-        // This is the bit mask used to extract the bits used in the lookup table for exp after performing the
-        // fixed point multiplication and right shift
-        let exp_bit_mask = lut.full_table_size() - 1;
-
-        let (chunked_range_checks, chunked_exp_lookup, chunked_zero_checks) = input
-            .get_data()
-            .par_chunks(chunk_size)
-            .zip(shift_tensor.get_data().par_chunks(shift_chunk_size))
-            .fold(
-                || (vec![], vec![], vec![]),
-                |(mut range, mut exp, mut zero), (outer_input_chunk, outer_shift_chunk)| {
-                    // For each outer chunk we have to decompose it as we did during inference
-                    let (chunk_range_checks, chunk_exp_lookup, chunk_zero_checks) =
-                        outer_input_chunk
-                            .chunks(final_dim_size)
-                            .zip(outer_shift_chunk)
-                            .fold(
-                                (
-                                    RangeChecks::new(quant_info.number_of_range_checks()),
-                                    ExpLookup::new(),
-                                    ZeroChecks::new(quant_info.number_of_zero_chunks()),
-                                ),
-                                |(mut outer_range, mut outer_exp, mut outer_zero),
-                                 (input_chunk, shift)| {
-                                    let (inner_range, inner_exp, inner_zero) =
-                                        input_chunk.iter().fold(
-                                            (
-                                                RangeChecks::new(
-                                                    quant_info.number_of_range_checks(),
-                                                ),
-                                                ExpLookup::new(),
-                                                ZeroChecks::new(quant_info.number_of_zero_chunks()),
-                                            ),
-                                            |(
-                                                mut range_checks,
-                                                mut exp_lookups,
-                                                mut zero_checks,
-                                            ),
-                                             elem| {
-                                                // Add the normalisation shift
-                                                let shifted = elem + shift;
-                                                // Perform fixed point multiplication and add the rounding constant
-                                                let scaled =
-                                                    shifted * fixed_point_multiplier + rounding;
-
-                                                let intermediate = scaled >> *right_shift;
-                                                // Extract the low bits to be range checked
-                                                let low = scaled - (intermediate << *right_shift);
-                                                // Extract the bits to be used in the exp lookup
-                                                let exp_in = intermediate.abs() & exp_bit_mask;
-                                                // If any of the remaining high bits are non-zero we will be out of range for the exp table
-                                                // so we check these are zero
-                                                let high =
-                                                    intermediate.abs() >> lut.table_bit_size();
-
-                                                range_checks.push(low);
-                                                exp_lookups
-                                                    .push(-exp_in, lut.table_output(-exp_in));
-                                                zero_checks.push(high);
-                                                (range_checks, exp_lookups, zero_checks)
-                                            },
-                                        );
-                                    // TODO: refactor this iterator and propagate errors.
-                                    outer_range.merge(inner_range).unwrap();
-                                    outer_exp.merge(inner_exp);
-                                    outer_zero.merge(inner_zero).unwrap();
-                                    (outer_range, outer_exp, outer_zero)
-                                },
-                            );
-                    range.push(chunk_range_checks);
-                    exp.push(chunk_exp_lookup);
-                    zero.push(chunk_zero_checks);
-                    (range, exp, zero)
-                },
-            )
-            .reduce(
-                || (vec![], vec![], vec![]),
-                |(mut range_acc, mut exp_acc, mut zero_acc), (range, exp, zero)| {
-                    range_acc.extend(range);
-                    exp_acc.extend(exp);
-                    zero_acc.extend(zero);
-                    (range_acc, exp_acc, zero_acc)
-                },
-            );
-
-        let range_elements_count =
-            count_elements(chunked_range_checks.iter().flat_map(|c| c.count_iterator()));
-        let exp_elements_count =
-            count_elements(chunked_exp_lookup.iter().flat_map(|c| c.count_iterator()));
-        let zero_table_elements_count =
-            count_elements(chunked_zero_checks.iter().flat_map(|c| c.count_iterator()));
-
-        // We create 3 separate RMMs here, the first corresponds to the lookup inputs, for each chunk the polys are in order
-        // range_checks, exp_in, zero_checks_in
-        // The second RMM is to do with lookup outputs and the ordering is
-        // exp_out, zero_chunks_out
-        // The third and final RMM is the shift for each chunk
-
-        let (rmm1_polys, rmm2_polys) = izip!(
-            chunked_range_checks,
-            chunked_exp_lookup,
-            chunked_zero_checks
-        )
-        .fold(
-            (vec![], vec![]),
-            |(mut rmm1_acc, mut rmm2_acc), (range_checks, exp_lookup, zero_checks)| {
-                let RangeChecks { chunks, .. } = range_checks;
-                let ExpLookup { input, output } = exp_lookup;
-                let ZeroChecks {
-                    input_chunks,
-                    output_chunks,
-                    ..
-                } = zero_checks;
-                rmm1_acc.extend(
-                    chunks
-                        .into_iter()
-                        .chain(std::iter::once(input))
-                        .chain(input_chunks),
-                );
-                rmm2_acc.extend(std::iter::once(output).chain(output_chunks));
-                (rmm1_acc, rmm2_acc)
-            },
-        );
-
-        // The width of the first rmm is the number of chunks we decomopose into (given by `quant_info.number_of_range_checks() + 1 + quant_info.number_of_zero_chunks()`)
-        // multiplied by the number of 2D tensors we have (given by shift_shape[0])
-        let width_one = shift_shape[0]
-            * (quant_info.number_of_range_checks() + 1 + quant_info.number_of_zero_chunks());
-        let transposed_one = transpose(rmm1_polys);
-        let rmm1 = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
-            ceno_p3::matrix::dense::DenseMatrix::new(
-                to_base::<E, _>(transposed_one.into_iter().flatten()),
-                width_one,
-            ),
-            witness::InstancePaddingStrategy::Default,
-        );
-        // The width of the second rmm is the number of output polys we have (given by 1 + quant_info.number_of_zero_chunks())
-        // multiplied by the number of 2D tensors we have (given by shift_shape[0])
-        let width_two = shift_shape[0] * (1 + quant_info.number_of_zero_chunks());
-        let transposed_two = transpose(rmm2_polys);
-        let rmm2 = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
-            ceno_p3::matrix::dense::DenseMatrix::new(
-                to_base::<E, _>(transposed_two.into_iter().flatten()),
-                width_two,
-            ),
-            witness::InstancePaddingStrategy::Default,
-        );
-        // The final rmm is the shift values, its width is just shift_shape[0]
-        let shift_evals = shift_tensor
-            .get_data()
-            .chunks(shift_chunk_size)
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let shift_transposed = transpose(shift_evals);
-        let rmm3 = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
-            ceno_p3::matrix::dense::DenseMatrix::new(
-                to_base::<E, _>(shift_transposed.into_iter().flatten()),
-                shift_shape[0],
-            ),
-            witness::InstancePaddingStrategy::Default,
-        );
-
-        let layer_commit = ctx.commitment_ctx.batch_commit(vec![rmm1, rmm2, rmm3])?;
-
-        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
-
-        // Add the looked up values to the generator so we can make multiplicity polys later
-        gen_w.insert_element_count(TableType::Range, range_elements_count);
-
-        // Need to recreate the parameters for the Softmax table
-        gen_w.insert_element_count(TableType::ExpTable(*lut), exp_elements_count);
-
-        let quant_one = lut.output_sf() as Element;
-        gen_w.insert_element_count(
-            TableType::ErrorTable(quant_one, allowable_error),
-            count_elements(normalisation_lookups.into_iter().flatten()),
-        );
-
-        gen_w.insert_element_count(TableType::ZeroTable, zero_table_elements_count);
-
-        gen_w.insert_logup_witness(id, layer_commit);
-        Ok(gen_w)
-    }
-}
 
 impl<E, PCS> ProvableOp<E, PCS> for Softmax<Element>
 where
@@ -1298,14 +527,15 @@ where
         step_data: &Step<E, Element>,
         prover: &mut crate::Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
-        let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
-            "Softmax LayerOut didn't have any ProvingData::Softmax"
-        ))?;
+        let (claims, proof) = self.prove_internal(
+            node_id,
+            last_claims,
+            ctx,
+            &step_data.unpadded_input_shapes[0],
+            prover,
+        )?;
 
-        let input_shape = step_data.node_inputs[0].shape();
-        let (claims, proof) =
-            self.prove_step(node_id, last_claims, ctx, softmax_data, input_shape, prover)?;
-
+        // Add the proof to the proof list
         prover.push_proof(node_id, LayerProof::<E, PCS>::Softmax(proof));
 
         Ok(claims)
@@ -1354,7 +584,9 @@ impl QuantizeOp for Softmax<f32> {
             input_scaling.len()
         );
         // We can work out the intermediate bit size (for now we assume we are using Softmax in an Attention layer)
-        let intermediate_bit_size = 2 * (*quantization::BIT_LEN - 1) + ceil_log2(self.max_size);
+        // let intermediate_bit_size = 2 * (*quantization::BIT_LEN - 1) + ceil_log2(self.max_size);
+        let (input_min, input_max) = input_scaling[0].domain();
+        let intermediate_bit_size = ceil_log2(input_max.abs().max(input_min.abs()) as usize);
 
         let quantised_op = self.quantise(input_scaling[0], intermediate_bit_size)?;
         let output_sf = quantised_op
@@ -1645,271 +877,7 @@ where
         verifier: &mut Verifier<E, T, PCS>,
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>> {
-        // First we check that we only have one claim in `last_claims`
-        ensure!(
-            last_claims.len() == 1,
-            "Softmax only outputs 1 claim, received {} while verifying Softmax step",
-            last_claims.len()
-        );
-        // First dim is the number of 2D sub-tensors we have (without padding)
-        let first_dim = shape_step.unpadded_input_shape[0][0];
-        let input_shape = &shape_step.padded_input_shape[0];
-        let final_dim_size = *input_shape
-            .last()
-            .ok_or(anyhow!("Couldn't verify Softmax, had no input shape"))?;
-        let last_claim = last_claims[0];
-        let split_point = input_shape.split_point::<E>(last_claim.point())?;
-
-        let dim_vars = ceil_log2(final_dim_size);
-        let two = E::from_canonical_u64(2u64);
-        let two_inv = two.inverse();
-
-        let SoftmaxProof {
-            logup_proof,
-            commitment,
-            sumcheck_proof,
-            evaluations,
-        } = proof;
-
-        // Verify the lookup proof
-        let batch_claim = verify_logup_proof_multiple_sizes(logup_proof, verifier.transcript)?;
-
-        // Since the lookup ctx is built without knowing the unpadded first dim of the input shpe, here
-        // we make a new one in order to verify the proof
-        let LayerLookupContext {
-            tables,
-            instances_per_table,
-        } = &self.lookup_ctx;
-        let instances_per_table = instances_per_table
-            .iter()
-            .map(|&n| n * first_dim)
-            .collect::<Vec<usize>>();
-        let new_lookup_ctx = LayerLookupContext::new(tables.clone(), instances_per_table);
-        new_lookup_ctx.verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
-
-        // Now we squeeze the batching challenge
-        // Squeeze a batching challenge from the transcript
-        let alphas = (0..first_dim)
-            .map(|_| {
-                verifier
-                    .transcript
-                    .sample_and_append_challenge(b"batching_challenge")
-                    .elements
-            })
-            .collect::<Vec<E>>();
-
-        // poly_evals will be in the order range_evals, exp_evals, zero_evals then error_evals
-        let poly_evals = batch_claim.poly_evals();
-
-        let number_of_range_checks = self.quant_info.number_of_range_checks();
-        let number_of_zero_chunks = self.quant_info.number_of_zero_chunks();
-        // Split the poly_evals into their respective sections
-        let (range_evals, rest) = poly_evals.split_at(number_of_range_checks * first_dim);
-        let (exp_evals, rest) = rest.split_at(2 * first_dim);
-        let (zero_evals, error_evals) = rest.split_at(first_dim * 2 * number_of_zero_chunks);
-        // We need to unzip the exp and zero evals into their input and output components
-        let (exp_in_evals, exp_out_evals): (Vec<E>, Vec<E>) = exp_evals
-            .chunks(2)
-            .map(|chunk| (chunk[0], chunk[1]))
-            .unzip();
-        let (zero_in_evals, zero_out_evals): (Vec<E>, Vec<E>) = zero_evals
-            .chunks(2)
-            .map(|chunk| (chunk[0], chunk[1]))
-            .unzip();
-
-        let batch_chal_point = split_point[0];
-        let batching_evals = compute_betas_eval(batch_chal_point);
-        // Now we can compute the initial claim for the sumcheck, this should be a random linear combination of
-        // `last_claim.evaluation()`, the error lookup evaluation and the evaluations of the exp and zero lookups
-        let initial_claim = izip!(
-            alphas.iter(),
-            error_evals.iter(),
-            exp_out_evals.iter(),
-            zero_out_evals.chunks(number_of_zero_chunks),
-            batching_evals.iter()
-        )
-        .fold(
-            last_claim.evaluation(),
-            |acc, (&alpha, &error, &exp_out, zero_chunk, &batch)| {
-                let sum_part = zero_chunk
-                    .iter()
-                    .fold(
-                        (exp_out * alpha, alpha * alpha),
-                        |(eval_acc, chal_acc), &e| (eval_acc + chal_acc * e, chal_acc * alpha),
-                    )
-                    .0;
-                let error_part = batch * batch * error;
-                acc + sum_part + error_part
-            },
-        );
-
-        let last_claim_eq_point = split_point
-            .iter()
-            .skip(1)
-            .rev()
-            .flat_map(|s| *s)
-            .copied()
-            .collect::<Vec<E>>();
-
-        // The error lookup is performed over the output summed on the final dimension so we need to extend the point used with correct number
-        // of 2^-1 entries
-        let full_error_point = std::iter::repeat_n(two_inv, dim_vars)
-            .chain(batch_claim.point().iter().skip(dim_vars).copied())
-            .collect::<Vec<E>>();
-
-        let max_degree = 2 + number_of_zero_chunks;
-
-        let aux_info = VPAuxInfo {
-            max_num_variables: last_claim_eq_point.len(),
-            max_degree,
-            ..Default::default()
-        };
-        // Verify the Sumcheck proof
-        let subclaim = IOPVerifierState::<E>::verify(
-            initial_claim,
-            sumcheck_proof,
-            &aux_info,
-            verifier.transcript,
-        );
-        let sumcheck_point = subclaim
-            .point
-            .iter()
-            .map(|c| c.elements)
-            .collect::<Vec<E>>();
-
-        let last_claim_eq = identity_eval(&last_claim_eq_point, &sumcheck_point);
-        let logup_eq = identity_eval(batch_claim.point(), &sumcheck_point);
-        let error_eq = identity_eval(&full_error_point, &sumcheck_point);
-
-        let all_sumcheck_evals = [last_claim_eq, error_eq, logup_eq]
-            .into_iter()
-            .chain(
-                evaluations
-                    .iter()
-                    .take(first_dim * (1 + number_of_zero_chunks))
-                    .copied(),
-            )
-            .collect::<Vec<E>>();
-
-        let challenges = batching_evals
-            .iter()
-            .zip(alphas)
-            .flat_map(|(&a, b)| [a, b])
-            .collect::<Vec<E>>();
-        // Check that the provided evaluation matches the expected evaluation from the sumcheck
-        let sumcheck_expression = build_softmax_sumcheck_expression::<E>(
-            number_of_zero_chunks,
-            first_dim,
-            final_dim_size,
-        );
-        let calc_subclaim = sumcheck_expression.iter().fold(E::ZERO, |acc, expr| {
-            eval_by_expr_with_instance(&[], &all_sumcheck_evals, &[], &[], &challenges, expr)
-                .right()
-                .unwrap()
-                + acc
-        });
-
-        ensure!(
-            subclaim.expected_evaluation == calc_subclaim,
-            "Softmax sumcheck subclaim evaluation did not match expected evaluation"
-        );
-
-        let shift_eval_point = batch_claim.point()[dim_vars..].to_vec();
-        let shift_evals = evaluations
-            .iter()
-            .skip(first_dim * (1 + number_of_zero_chunks))
-            .copied()
-            .collect::<Vec<E>>();
-        // Constants used to recombine the claims
-        let base_multiplier = E::from_canonical_u64(1u64 << *quantization::BIT_LEN);
-        let right_shift_field = E::from_canonical_u64(1u64 << self.quant_info.right_shift);
-        let rounding = E::from_canonical_u64(1u64 << (self.quant_info.right_shift - 1));
-        let fpm_field: E = self.quant_info.fixed_point_multiplier.to_field();
-        let fpm_inv = fpm_field.inverse();
-        let table_size_field: E = self.quant_info.lut.full_table_size().to_field();
-        let zero_offset = table_size_field * right_shift_field;
-
-        // Combine the range claims for each chunk
-        let (low_parts, stacked_range_evals): (Vec<E>, Vec<Vec<E>>) = range_evals
-            .chunks(number_of_range_checks)
-            .map(|chunk| {
-                let input_part = chunk
-                    .iter()
-                    .fold((E::ZERO, E::ONE), |(acc, pow_two), &b| {
-                        (acc + pow_two * b, pow_two * base_multiplier)
-                    })
-                    .0;
-                (input_part, chunk.to_vec())
-            })
-            .unzip();
-        // Combine the exp claims
-        let (exp_parts, stacked_exp_evals): (Vec<E>, Vec<E>) = exp_in_evals
-            .iter()
-            .map(|&e| (e * right_shift_field, e))
-            .unzip();
-        // Combine the zero claims for each chunk
-        let (high_parts, stacked_high_evals): (Vec<E>, Vec<Vec<E>>) = zero_in_evals
-            .chunks(number_of_zero_chunks)
-            .map(|chunk| {
-                let input_part = chunk
-                    .iter()
-                    .fold((E::ZERO, zero_offset), |(acc, pow_two), &b| {
-                        (acc + pow_two * b, pow_two * base_multiplier)
-                    })
-                    .0;
-                (input_part, chunk.to_vec())
-            })
-            .unzip();
-        // Now we can recombine everything to get the input eval
-        let input_eval = izip!(
-            low_parts,
-            exp_parts,
-            high_parts,
-            shift_evals.iter(),
-            batching_evals
-        )
-        .map(|(l, e, h, &shift, batch)| ((l + e - h - rounding) * fpm_inv - shift) * batch)
-        .sum::<E>();
-
-        let first_commit_evals = izip!(stacked_range_evals, stacked_exp_evals, stacked_high_evals)
-            .flat_map(|(mut rs, e, zs)| {
-                rs.push(e);
-                rs.extend(zs);
-                rs
-            })
-            .collect::<Vec<E>>();
-
-        let first_commit_point = batch_claim.point().to_vec();
-
-        // The second commitment is the exp output and the zero outputs
-        let second_commit_evals = evaluations
-            .iter()
-            .take(first_dim * (1 + number_of_zero_chunks))
-            .copied()
-            .collect::<Vec<E>>();
-        let second_commit_point = sumcheck_point.clone();
-        // Combine them all in the correct order and add them to the claim prover
-        let layer_claims = vec![
-            (first_commit_point, first_commit_evals),
-            (second_commit_point, second_commit_evals),
-            (shift_eval_point, shift_evals.clone()),
-        ];
-
-        verifier
-            .commit_verifier
-            .add_witness_claim(self.node_id, commitment.clone(), layer_claims);
-
-        let input_claim = Claim::<E>::new(
-            batch_claim
-                .point()
-                .iter()
-                .chain(batch_chal_point.iter())
-                .copied()
-                .collect::<Vec<E>>(),
-            input_eval,
-        );
-
-        Ok(vec![input_claim])
+        self.verify_internal(proof, last_claims, verifier, shape_step)
     }
 
     fn write_proof_to_transcript<T: Transcript<E>>(
@@ -1921,6 +889,61 @@ where
     }
 }
 
+/// Calculates the batching challenges for the given point and shape.
+pub(crate) fn calculate_batching_challenges<E: ExtensionField>(
+    point: &[E],
+    shape: &Shape,
+    unpadded_shape: &Shape,
+) -> Result<Vec<E>> {
+    // For now we only support up to rank 4 tensors
+    ensure!(
+        shape.rank() <= 4,
+        "Unsupported tensor rank {}",
+        shape.rank()
+    );
+    let split_point = shape.split_point(point)?;
+    // The batching challenges are the eq_poly evals that correspond to the non-padded dimensions, up to the last two dims
+    let batching_points = &split_point[..shape.rank() - 2];
+    let unpadded_dims_slice = &unpadded_shape[..shape.rank() - 2];
+    let batching_challenges = batching_points.iter().zip(unpadded_dims_slice.iter()).fold(
+        vec![E::ONE],
+        |mut chal_acc, (dim_point, unpadded_dim)| {
+            let dim_evals = compute_betas_eval(dim_point);
+            chal_acc = chal_acc
+                .into_iter()
+                .flat_map(|c| {
+                    dim_evals[..*unpadded_dim]
+                        .iter()
+                        .map(|&d| c * d)
+                        .collect::<Vec<E>>()
+                })
+                .collect();
+            chal_acc
+        },
+    );
+
+    Ok(batching_challenges)
+}
+
+/// Evaluates the row less than polynomial at the given row point for the given unpadded sequence length.
+pub(crate) fn evaluate_row_lt_poly<E: ExtensionField>(
+    row_point: &[E],
+    unpadded_seq_len: usize,
+) -> Result<E> {
+    let bit_len = ceil_log2(unpadded_seq_len);
+    ensure!(
+        row_point.len() == bit_len,
+        "Row point length {} does not match unpadded seq len log2 {bit_len}",
+        row_point.len(),
+    );
+
+    let seq_len_bits = to_bit_sequence_le(unpadded_seq_len - 1, bit_len)
+        .map(E::from_canonical_usize)
+        .collect::<Vec<E>>();
+    let row_eval = eval_zeroifier_mle(row_point, &seq_len_bits);
+    Ok(row_eval)
+}
+
 #[cfg(test)]
 mod tests {
     use core::f32;
@@ -1929,7 +952,7 @@ mod tests {
 
     use crate::{
         Tensor, init_test_logging,
-        layers::{Layer, transformer::attention::attention_mask::AttentionMask},
+        layers::{Layer, transformer::attention_mask::AttentionMask},
         model::{Model, test::prove_model},
         padding::PaddingMode,
         tensor::is_close_with_tolerance,
@@ -2001,7 +1024,7 @@ mod tests {
             {
                 for (&q, f) in q_chunk.iter().zip(f_chunk.iter()) {
                     let float_q = q as f32 / lut.output_sf();
-                    // println!("quant, {q}, float_q {float_q}, dequant {f}");
+
                     let quant_dequant_diff = (float_q - f).abs();
                     assert!(
                         is_close_with_tolerance(&[float_q], &[*f], out_error, rel_error),
@@ -2020,7 +1043,6 @@ mod tests {
                     let row_sum = chunk.iter().sum::<Element>();
 
                     let diff_from_one = (row_sum - lut.output_sf() as Element).abs();
-                    // println!("diff: {diff_from_one}, lut output sf {}", lut.output_sf());
                     assert!(diff_from_one <= max_error.round_ties_even() as Element, "Row sum diff was larger than expected got: {diff_from_one}, expected less than {max_error}, error_bound {error_bound}");
                 });
         }
