@@ -381,6 +381,27 @@ impl<N: TensorTypeParam> Rope<N> {
         }
     }
 
+    /// Gets the output shape after applying RoPE to an input of given shape.
+    /// If using a [`ConcatenationCache`], the output shape will account for the concatenation but should be called
+    /// BEFORE evaluating the layer.
+    pub fn output_shapes(
+        &self,
+        input_shapes: &[Shape],
+        padding_mode: PaddingMode,
+    ) -> Result<Vec<Shape>> {
+        let input_shapes = if let Some(concatenation_cache) = self.concatenation_cache.as_ref() {
+            let cache = concatenation_cache.lock().unwrap();
+
+            input_shapes
+                .iter()
+                .map(|shape| cache.next_shape(shape.clone(), padding_mode))
+                .collect::<Vec<Shape>>()
+        } else {
+            input_shapes.to_vec()
+        };
+        Ok(input_shapes)
+    }
+
     /// Since cosine and since matrix are committed with one variable less, we need to drop a point coordinate in the
     /// claims for such matrices; this variable changes depending on the layout strategy. If Adjacent is used we drop the
     /// first variable, which corresponds to the lowest bit of the row index; if RotateHalf is used we drop the variable

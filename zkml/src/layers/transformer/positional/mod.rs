@@ -412,11 +412,7 @@ impl<N: TensorTypeParam> OpInfo for Positional<N> {
                 &absolute.unpadded_shape,
                 padding_mode,
             )),
-            PositionalVariant::Rope(rope) => Ok(output_shapes(
-                input_shapes,
-                &rope.unpadded_shape,
-                padding_mode,
-            )),
+            PositionalVariant::Rope(rope) => rope.output_shapes(input_shapes, padding_mode),
         }
     }
 

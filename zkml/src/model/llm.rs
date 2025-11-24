@@ -901,8 +901,44 @@ mod test {
             .iter()
             .map(|t| Token::from(t.to_usize()))
             .collect::<Vec<_>>();
-        let output = tokenizer.detokenize(&output);
-        println!("detokenized output: {output}");
+        let _output = tokenizer.detokenize(&output);
+        Ok(())
+    }
+
+    #[test]
+    fn test_llm_driver_int_inference_gemma3() -> anyhow::Result<()> {
+        const CONTEXT_SIZE: usize = 10;
+        init_test_logging("debug");
+        let model_path = file_cache::from_cache(GEMMA3_Q8)?;
+        let gguf = RawGGUF::new(model_path.clone());
+        let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(CONTEXT_SIZE))?
+            .into_provable_llm(None)?;
+
+        println!("LLM DRIVER: config: {:?}", driver.config);
+
+        let mut store = GenStore::default();
+        let sentence = "The sky is";
+        let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
+        let user_tokens = tokenizer.tokenize(sentence);
+        let trace = driver.run::<GoldilocksExt2>(
+            user_tokens,
+            &mut store,
+            Some(LLMTokenizerObserver {
+                input: sentence.to_string(),
+                tokenizer: &tokenizer,
+            }),
+        )?;
+        let output = trace
+            .outputs()
+            .last()
+            .unwrap()
+            .tensor()
+            .unwrap()
+            .get_data()
+            .iter()
+            .map(|t| Token::from(t.to_usize()))
+            .collect::<Vec<_>>();
+        let _output = tokenizer.detokenize(&output);
         Ok(())
     }
 
