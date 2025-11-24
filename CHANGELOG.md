@@ -1,8 +1,8 @@
 # Changelog
 
-## [1.0.0] - 2025-11-24
+## [1.0.1] - 2025-11-24
 
-[Compare 136d905 ... 5b26d84](https://github.com/Lagrange-Labs/deep-prove-private/compare/136d9055325274d54ba038be114bbc90fa8a69ab...5b26d84cd7eba9167964841f73c7f9f5fd25064f)
+[Compare 136d905 ... 49ac7f8](https://github.com/Lagrange-Labs/deep-prove-private/compare/136d9055325274d54ba038be114bbc90fa8a69ab...49ac7f89d06ed8eb9dae69f1f9db7ab38c0a8aa1)
 
 ### Features
 
@@ -48,6 +48,8 @@
 - Remove default value for s3_params_bucket ([dfb2c19](https://github.com/Lagrange-Labs/deep-prove-private/commit/dfb2c19994a633c34089a2c613764fb575e99054))
 
 - Rope outputs shapes with cache ([5b26d84](https://github.com/Lagrange-Labs/deep-prove-private/commit/5b26d84cd7eba9167964841f73c7f9f5fd25064f))
+
+- Change release action to use master branch ([49ac7f8](https://github.com/Lagrange-Labs/deep-prove-private/commit/49ac7f89d06ed8eb9dae69f1f9db7ab38c0a8aa1))
 
 
 ### Refactor
@@ -132,6 +134,8 @@
 
 - Remove proving trace ([8cb3c4b](https://github.com/Lagrange-Labs/deep-prove-private/commit/8cb3c4b199068606edd36e9705d3d416482d0013))
 
+- Rename path to s3_key in job struct ([61ac162](https://github.com/Lagrange-Labs/deep-prove-private/commit/61ac16273908d08f8547fb83172c39d0826047fb))
+
 
 ### Security
 
@@ -155,6 +159,13 @@
 - Add feature for CUDA on linux ([02813e9](https://github.com/Lagrange-Labs/deep-prove-private/commit/02813e95c1b068184402ca1ef378b6471508f6c4))
 
 - Update docker pipeline comment push to ECR ([19fe8de](https://github.com/Lagrange-Labs/deep-prove-private/commit/19fe8de4d7909207a1e92fa98cdc41131383686a))
+
+
+### Release
+
+
+
+- V1.0.0 ([36938bd](https://github.com/Lagrange-Labs/deep-prove-private/commit/36938bd5242d667aa011623855cf9c1e230f751e))
 
 ## [0.2.0] - 2025-10-08
 
