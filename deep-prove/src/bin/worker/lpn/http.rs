@@ -168,7 +168,7 @@ async fn process_job(
     fetcher: &ModelFetcher,
 ) -> anyhow::Result<Vec<u8>> {
     let model_mmap = fetcher
-        .fetch(&job.model_path)
+        .fetch(&job.s3_key)
         .await
         .context("downloading model artifact")?;
     let model_file_hash = format!("{:X}", Sha256::digest(model_mmap.as_ref()));

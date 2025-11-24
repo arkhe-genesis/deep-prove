@@ -54,8 +54,8 @@ pub struct GwToWorker {
     /// The job ID to use when communicating with the gateway.
     pub job_id: i64,
 
-    /// Object path relative to the bucket root pointing to the uploaded model.
-    pub model_path: String,
+    /// S3 key of the uploaded model.
+    pub s3_key: String,
 
     /// An array of inputs to run proving for
     pub input: Input,

@@ -111,8 +111,8 @@ impl ModelFetcher {
         }
     }
 
-    pub async fn fetch(&self, model_path: &str) -> anyhow::Result<Mmap> {
-        let key = model_path.trim();
+    pub async fn fetch(&self, s3_key: &str) -> anyhow::Result<Mmap> {
+        let key = s3_key.trim();
         ensure!(!key.is_empty(), "model path is empty");
 
         let cache_path = self.model_cache_dir.join(&self.bucket).join(Path::new(key));
