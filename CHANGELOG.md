@@ -1,5 +1,161 @@
 # Changelog
 
+## [1.0.0] - 2025-11-24
+
+[Compare 136d905 ... 5b26d84](https://github.com/Lagrange-Labs/deep-prove-private/compare/136d9055325274d54ba038be114bbc90fa8a69ab...5b26d84cd7eba9167964841f73c7f9f5fd25064f)
+
+### Features
+
+
+
+- Added EinSum Layer ([fc4f852](https://github.com/Lagrange-Labs/deep-prove-private/commit/fc4f8523544a666884ce1b6eb74b8933ba2d9a0f))
+
+- Refactor parser logic and add safetensors format for Gemma3 ([0882ab8](https://github.com/Lagrange-Labs/deep-prove-private/commit/0882ab8974018200c97d0b8a3236fd21defaa6a4))
+
+- Store interior mutability ([a8c7a0e](https://github.com/Lagrange-Labs/deep-prove-private/commit/a8c7a0e6beccb548ed7797d6417ea18052a5f96e))
+
+- Chunking claims proving ([234ad53](https://github.com/Lagrange-Labs/deep-prove-private/commit/234ad534f1e3155dd2af7225b22509dd1b480133))
+
+- Introduce tensor handle ([a9f9fc8](https://github.com/Lagrange-Labs/deep-prove-private/commit/a9f9fc80aeeb04ba69003251d3ce75d2012c51bf))
+
+- Introduce a tensor visualization tool ([fbe2fd0](https://github.com/Lagrange-Labs/deep-prove-private/commit/fbe2fd0f2acf032e18d63aa95bea2bbf44f44f66))
+
+- Bench inference alone ([857b2ba](https://github.com/Lagrange-Labs/deep-prove-private/commit/857b2ba9f0f0e29f634bfe4106185c98990802fd))
+
+- Pull models from s3 for worker ([bf36683](https://github.com/Lagrange-Labs/deep-prove-private/commit/bf36683c41eb15dc3ae3004ea7caf829e13cd2c2))
+
+- Handler w/ wrapped tensor ([23ab050](https://github.com/Lagrange-Labs/deep-prove-private/commit/23ab050eab7f198a1069436322962de13c320b17))
+
+- Isolate inference run; add gpt2 ([f8e7759](https://github.com/Lagrange-Labs/deep-prove-private/commit/f8e775987a99fddbed6a52ba76e01e37fb08596e))
+
+- Chunking commitments ([46e6564](https://github.com/Lagrange-Labs/deep-prove-private/commit/46e6564b2eec507190e5c196c6178a6a15bfaf76))
+
+- Replace all linear with einsum ([5d648f6](https://github.com/Lagrange-Labs/deep-prove-private/commit/5d648f6aadc67866542e45ae86b4e6df8a0d0b0f))
+
+- Expose the git hash the library was built from ([9295690](https://github.com/Lagrange-Labs/deep-prove-private/commit/9295690f338f5056bc3de9783f0089a2e49c20f3))
+
+
+### Bug Fixes
+
+
+
+- Einsum wrapped tensor ([eb0b664](https://github.com/Lagrange-Labs/deep-prove-private/commit/eb0b664d00303238cf7fca0e30378c5bc0617d42))
+
+- Update burn to latest ([df95ca9](https://github.com/Lagrange-Labs/deep-prove-private/commit/df95ca9ddeb4cf25c6780a588ecc60c3efcbeb76))
+
+- Update burn to latest ([7656710](https://github.com/Lagrange-Labs/deep-prove-private/commit/7656710e2133d5a2062992fb9ba7176981565b29))
+
+- Remove default value for s3_params_bucket ([dfb2c19](https://github.com/Lagrange-Labs/deep-prove-private/commit/dfb2c19994a633c34089a2c613764fb575e99054))
+
+- Rope outputs shapes with cache ([5b26d84](https://github.com/Lagrange-Labs/deep-prove-private/commit/5b26d84cd7eba9167964841f73c7f9f5fd25064f))
+
+
+### Refactor
+
+
+
+- Convert `DryTensor` to use `KeyTensor` ([62d0675](https://github.com/Lagrange-Labs/deep-prove-private/commit/62d0675a1e93c82d4b2003a8b246f45387280c3f))
+
+- Homogeneize graph traversal ([30db79a](https://github.com/Lagrange-Labs/deep-prove-private/commit/30db79af34b4cbc813965d17168df830a393ccdb))
+
+- Store padded unpadded shapes in tensor ([3f0eff7](https://github.com/Lagrange-Labs/deep-prove-private/commit/3f0eff71c6e81c38d818f4d9fbc1f2910d3b6620))
+
+- Decommission `TensorKey` in favor of `StorageKey` ([c865d94](https://github.com/Lagrange-Labs/deep-prove-private/commit/c865d94064ef7a45f4d51ad0f58e83d8a4f45b7d))
+
+- Flatten trace step structure ([cadfc1d](https://github.com/Lagrange-Labs/deep-prove-private/commit/cadfc1d7e99f5a699fba5632724dd5f4ac229b7a))
+
+- Replace asserts with ensure macros in prod code  ([03eb3a1](https://github.com/Lagrange-Labs/deep-prove-private/commit/03eb3a1cbee442f73fddcd560b53090bc6e16222))
+
+
+### Documentation
+
+
+
+- Rope specs ([69b6611](https://github.com/Lagrange-Labs/deep-prove-private/commit/69b661116b8bee6ecd9241aa9a978a5f313776d9))
+
+
+### Performance
+
+
+
+- Burnify reshape and mha (composite) layer ([796b7db](https://github.com/Lagrange-Labs/deep-prove-private/commit/796b7dbcd5dd4aa62e076ac05f58c6d438b41a28))
+
+- Implement activation int gelu in burn ([39c85bc](https://github.com/Lagrange-Labs/deep-prove-private/commit/39c85bc7dc38d577f658a8b5486fa93177dedf58))
+
+- Add and use pad_next_power_of_two to wrapped tensor ([d2e8cf4](https://github.com/Lagrange-Labs/deep-prove-private/commit/d2e8cf42aa15baea22ebf4dec338b78b21fbb107))
+
+
+### Testing
+
+
+
+- Add some tolerance to einum eval f32 tests ([b463537](https://github.com/Lagrange-Labs/deep-prove-private/commit/b463537319ef6666fb93b6fb25b9809cb50d5898))
+
+- Fix gemma3 test ([d6a37c1](https://github.com/Lagrange-Labs/deep-prove-private/commit/d6a37c180e32d3b08a65f0b2a51f9dc2efa2d4d2))
+
+- Passable tests on CUDA ([597ae63](https://github.com/Lagrange-Labs/deep-prove-private/commit/597ae6337c24f34e053daadcfb4d7ae10d1f571b))
+
+- Improve prove-model benches ([9105db5](https://github.com/Lagrange-Labs/deep-prove-private/commit/9105db5885334d9046440a62715f9d2cb278145d))
+
+
+### Miscellaneous Tasks
+
+
+
+- Remove dead code get_real_weights ([aded4a0](https://github.com/Lagrange-Labs/deep-prove-private/commit/aded4a079c0d7084350eee70b1ed4415b38bccc4))
+
+- Manually run LFS ([e90738a](https://github.com/Lagrange-Labs/deep-prove-private/commit/e90738a3b78efb7e2971acc676de3d7575578a91))
+
+- Remove `~/.gitconfig` if it exists ([a8e9b5f](https://github.com/Lagrange-Labs/deep-prove-private/commit/a8e9b5f5d69b1c72c8b5b2b3315b77bb4c67f99e))
+
+- Gguf cleanup ([61c754f](https://github.com/Lagrange-Labs/deep-prove-private/commit/61c754f1953b0925d97b62ba28fa254ef1809aaa))
+
+- Move conv related elements from tensor.rs ([57353b6](https://github.com/Lagrange-Labs/deep-prove-private/commit/57353b67ba19b06f06ccaec2dd660e304d035b3b))
+
+- Remove mul layer ([8f58734](https://github.com/Lagrange-Labs/deep-prove-private/commit/8f587349be975b7a73cfa719cbe745d3d4f48385))
+
+- Update quantization methods to include output scaling factors and shapes ([c88e314](https://github.com/Lagrange-Labs/deep-prove-private/commit/c88e314f40494c8a7fec2e7853eef852e464e188))
+
+- Bench on nix machines ([5aad242](https://github.com/Lagrange-Labs/deep-prove-private/commit/5aad242d97e3fdfc4703246737d9633413b92c28))
+
+- Add GPU tests ([e7d5046](https://github.com/Lagrange-Labs/deep-prove-private/commit/e7d50468a8b048b729cca2a9043b2912d1b0c21d))
+
+- Improve the run conditions on gpu tests ([b21dfe0](https://github.com/Lagrange-Labs/deep-prove-private/commit/b21dfe0111e7fbc7becdc07b5cca06d67f62d157))
+
+- Add GPU bench ([4f9ce19](https://github.com/Lagrange-Labs/deep-prove-private/commit/4f9ce197405482260f01c0bdb94f618a517737b4))
+
+- Fix the name of gpu testbed on master bench ([f78b329](https://github.com/Lagrange-Labs/deep-prove-private/commit/f78b329212a73b30de64c2fd2f0a6596bbc606f8))
+
+- Bump actions/download-artifact from 4 to 6 ([b9cec01](https://github.com/Lagrange-Labs/deep-prove-private/commit/b9cec01c2a9d5eaa623e36af02dcbc7f285889eb))
+
+- Don't run benches on PR in draft mode ([5f6230f](https://github.com/Lagrange-Labs/deep-prove-private/commit/5f6230f411886599ef8f59530b156d5d76181776))
+
+- Remove proving trace ([8cb3c4b](https://github.com/Lagrange-Labs/deep-prove-private/commit/8cb3c4b199068606edd36e9705d3d416482d0013))
+
+
+### Security
+
+
+
+- Bump actions/upload-artifact from 4 to 5 ([91b40bf](https://github.com/Lagrange-Labs/deep-prove-private/commit/91b40bfb8fac9ac2fac5013b12d3349dce5ab264))
+
+- Bump aquasecurity/trivy-action from 0.33.0 to 0.33.1 ([391b7c6](https://github.com/Lagrange-Labs/deep-prove-private/commit/391b7c60882ba6c11c3ea8a08e2b0276a1b743e3))
+
+
+### Build
+
+
+
+- Push CLI client to Docker Hub as well ([2fb9b39](https://github.com/Lagrange-Labs/deep-prove-private/commit/2fb9b39826c11d5ccca5ee7205a1f45f0d3d64eb))
+
+- Upgrade Ubuntu dockerfiles to 24.04 ([bf8e393](https://github.com/Lagrange-Labs/deep-prove-private/commit/bf8e393ba2bdbd81c6f49b392f24129db32000dc))
+
+- Add trivy action to scan docker image for vulnerabilities ([d5cf528](https://github.com/Lagrange-Labs/deep-prove-private/commit/d5cf52886859bc2ed3f3b73b296f73080e891a42))
+
+- Add feature for CUDA on linux ([02813e9](https://github.com/Lagrange-Labs/deep-prove-private/commit/02813e95c1b068184402ca1ef378b6471508f6c4))
+
+- Update docker pipeline comment push to ECR ([19fe8de](https://github.com/Lagrange-Labs/deep-prove-private/commit/19fe8de4d7909207a1e92fa98cdc41131383686a))
+
 ## [0.2.0] - 2025-10-08
 
 ### Features
@@ -465,6 +621,8 @@
 - Set initial version ([3906f29](https://github.com/Lagrange-Labs/deep-prove-private/commit/3906f293eb52c0e4e42248842fd790ce4a9adad8))
 
 - `touch` initial CHANGELOG.md ([ecb7fc4](https://github.com/Lagrange-Labs/deep-prove-private/commit/ecb7fc4c02885d006cf22420de681f38a072bff4))
+
+- Release v0.2.0 ([136d905](https://github.com/Lagrange-Labs/deep-prove-private/commit/136d9055325274d54ba038be114bbc90fa8a69ab))
 
 
 ### BaseFold
