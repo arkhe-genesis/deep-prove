@@ -22,7 +22,7 @@ jobs:
 
       - name: Set version as tag
         id: set-tag
-        run: echo "tag=${{ steps.version.outputs.metadata }}" >> $GITHUB_OUTPUT
+        run: echo "tag=v${{ steps.version.outputs.metadata }}" >> $GITHUB_OUTPUT
 
       - uses: ncipollo/release-action@v1
         with:
