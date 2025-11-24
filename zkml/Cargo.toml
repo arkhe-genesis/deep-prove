@@ -60,6 +60,7 @@ either = { workspace = true }
 ff_ext = { workspace = true }
 get-size2 = "0.6.2"
 gguf-rs = "0.1.4"
+git-version = "0.3.9"
 half = "2.4.1"
 hex = { workspace = true }
 humansize = "2.1.3"

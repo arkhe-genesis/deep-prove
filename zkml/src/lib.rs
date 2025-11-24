@@ -48,6 +48,11 @@ pub mod capture;
 mod testing;
 pub(crate) mod util;
 
+pub const GIT_VERSION: &str = git_version::git_version!(args = ["--abbrev=6", "--always"]);
+pub fn version() -> String {
+    GIT_VERSION.to_string()
+}
+
 /// We allow higher range to account for overflow. Since we do a requant after each layer, we
 /// can support with i128 with 8 bits quant:
 /// 16 + log(c) = 64 => c = 2^48 columns in a dense layer
