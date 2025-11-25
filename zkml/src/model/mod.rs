@@ -110,16 +110,27 @@ where
                 .or_default();
 
             if *uses == 0 {
-                warn!("Unused output tensor");
                 self.get_by_storage_key(storage_key)?.dry();
             }
         }
 
-        self.storagekey_to_handle.extend(
-            output_handles
-                .into_iter()
-                .map(|handle| (handle.storage_key().clone(), handle.clone())),
-        );
+        for handle in output_handles.into_iter() {
+            let uses = self
+                .handle_usage_count
+                .get(handle.storage_key())
+                .cloned()
+                .unwrap_or_default();
+
+            if uses == 0 {
+                warn!("Unused output tensor");
+                handle.dry();
+            }
+
+            let older = self
+                .storagekey_to_handle
+                .insert(handle.storage_key().clone(), handle.clone());
+            assert!(older.is_none(), "Duplicate handle");
+        }
 
         Ok(())
     }
