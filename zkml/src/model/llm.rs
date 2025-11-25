@@ -871,7 +871,7 @@ mod test {
 
     #[test]
     fn test_llm_driver_inference_gemma3() -> anyhow::Result<()> {
-        const CONTEXT_SIZE: usize = 6;
+        const CONTEXT_SIZE: usize = 10;
         init_test_logging("debug");
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
         let gguf = RawGGUF::new(model_path.clone());

@@ -49,17 +49,17 @@ impl LayerInsertion for FeedForwardNetwork {
                 // If a gate tensor is provided we use a GLU EinSum
                 // Here we use `s` to represent the sequence length dimension, `e` for embedding dimension and
                 // `p` for the projection/intermediate dimension
-                let input_terms = "X(se)@WU(ep):WG(ep)";
+                let input_terms = "X(se)@WG(ep):WU(ep)";
                 let output_terms = if up_bias.is_some() {
-                    "U(sp)+BIAS(p):G(sp)"
+                    "G(sp):U(sp)+BIAS(p)"
                 } else {
-                    "U(sp):G(sp)"
+                    "G(sp):U(sp)"
                 };
 
                 let glu_einsum = EinSum::<f32>::new(
                     format!("{}->{}", input_terms, output_terms),
-                    vec![Some(up), Some(gate_tensor)],
-                    vec![up_bias, None],
+                    vec![Some(gate_tensor), Some(up)],
+                    vec![None, up_bias],
                 )?;
                 model.add_consecutive_layer(Layer::EinSum(glu_einsum), previous_node_id)?
             }
@@ -93,8 +93,8 @@ impl LayerInsertion for FeedForwardNetwork {
                     up_einsum_id,
                     glu_id,
                     vec![
-                        (0, Activation::<f32>::UP_INPUT_INDEX),
-                        (1, Activation::<f32>::GATE_INPUT_INDEX),
+                        (0, Activation::<f32>::GATE_INPUT_INDEX),
+                        (1, Activation::<f32>::UP_INPUT_INDEX),
                     ],
                 )?;
                 glu_id

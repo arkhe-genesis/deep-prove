@@ -483,7 +483,6 @@ pub mod tests {
         let logits: Vec<GemmaLogits> =
             serde_json::from_reader(BufReader::new(File::open(logits_path)?))?;
         for logit in logits.iter() {
-            println!("input_token: {:?}", logit.input_text);
             let input_shape = Shape::from(vec![logit.input_token.len()]);
             // let padded_shape = input_shape.next_power_of_two();
             let input = Tensor::new(
@@ -492,18 +491,22 @@ pub mod tests {
             )?;
             let mut store = GenStore::default();
             let trace = model.run::<GoldilocksExt2>(vec![input], &mut store)?;
-            let logits = trace
+            let deep_prove_logits = trace
                 .get_step(&argmax_layer_id)
                 .ok_or(anyhow::anyhow!(
                     "Failed to get logits at step: {argmax_layer_id}"
                 ))?
                 .input_tensors()?[0]
                 .clone();
-            let computed_new_token = argmax(logits.get_data());
+            let vocab_size = logit.logits.len();
+            let total_logits = deep_prove_logits.dim(0);
+            let skip = (total_logits - 1) * vocab_size;
+            // We only care about the logits of the final token
+            let computed_new_token = argmax(&deep_prove_logits.get_data()[skip..]);
             let expected_new_token = argmax(&logit.logits);
             // CURRENTLY NOT WORKING BECAUSE GEMMA3 CONSTRUCTION IS INCORRECT
             assert!(
-                computed_new_token != expected_new_token,
+                computed_new_token == expected_new_token,
                 "computed_new_token: {:?}, expected_new_token: {:?}; for input: {:?}",
                 computed_new_token,
                 expected_new_token,

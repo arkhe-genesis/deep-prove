@@ -117,9 +117,9 @@ pub struct GeGlu<N>(Activation<N>);
 
 impl<N> Activation<N> {
     /// The port index for the "up" projection input when used in a GLU.
-    pub const UP_INPUT_INDEX: usize = 0;
+    pub const UP_INPUT_INDEX: usize = 1;
     /// The port index for the "gate" input when used in a GLU.
-    pub const GATE_INPUT_INDEX: usize = 1;
+    pub const GATE_INPUT_INDEX: usize = 0;
     pub fn new_relu() -> Self {
         Self::Plain(ActivationLayer::Relu(Relu))
     }
