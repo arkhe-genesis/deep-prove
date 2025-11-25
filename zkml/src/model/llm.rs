@@ -15,7 +15,7 @@ use crate::{
     padding::PaddingMode,
     parser::{
         PipelineConfig, default_pipeline_config,
-        llm::{LLMConfig, LLMTokenizer, Token, models::LLMModelLoader},
+        llm::{LLMConfig, Token, models::LLMModelLoader},
         to_quantized,
     },
     quantization::{InferenceObserver, InferenceTracker, IntoElement},
@@ -39,17 +39,12 @@ use crate::{
     number::Number,
 };
 
-pub trait Observer<N: TensorTypeParam> {
-    fn observe<E: ExtensionField>(&self, step: usize, trace: &Trace<E, N>);
-}
-
 /// The main struct responsible for LLM proving.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct LLMProverContext<E, PCS>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
@@ -64,8 +59,7 @@ pub trait WithMaxContext {
 
 impl<E, PCS> WithMaxContext for LLMProverContext<E, PCS>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
@@ -80,8 +74,7 @@ where
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct LLMVerifierContext<E, PCS>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
@@ -92,8 +85,7 @@ where
 
 impl<E, PCS> WithMaxContext for LLMVerifierContext<E, PCS>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
@@ -105,8 +97,7 @@ where
 
 impl<E, PCS> WithMaxContext for (LLMProverContext<E, PCS>, LLMVerifierContext<E, PCS>)
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
@@ -122,8 +113,7 @@ where
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct LLMProof<E, PCS>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
     pub proof: Proof<E, PCS>,
@@ -202,29 +192,21 @@ impl Driver<f32> {
         })
     }
 
-    pub fn run<E>(
-        &self,
-        input: &[Token],
-        store: &mut GenStore,
-        observer: Option<impl Observer<f32>>,
-    ) -> anyhow::Result<Trace<E, f32>>
+    pub fn run<E>(&self, input: &[Token], store: &mut GenStore) -> anyhow::Result<Trace<E, f32>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
     {
-        self.run_with_tracker(input, store, observer, None)
+        self.run_with_tracker(input, store, None)
     }
 
     pub fn run_with_tracker<E>(
         &self,
         input: &[Token],
         store: &mut GenStore,
-        observer: Option<impl Observer<f32>>,
         tracker: Option<&mut InferenceTracker>,
     ) -> anyhow::Result<Trace<E, f32>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
     {
         let user_len = input.len();
 
@@ -241,10 +223,6 @@ impl Driver<f32> {
         let trace = self
             .model
             .run_with_tracker::<E>(vec![tensor], tracker, store)?;
-
-        if let Some(ref obs) = observer {
-            obs.observe(0, &trace);
-        }
 
         Ok(trace)
     }
@@ -286,12 +264,10 @@ where
         &self,
         input: Vec<Token>,
         store: &mut GenStore,
-        observer: Option<impl Observer<N>>,
         mut tracker: Option<&mut InferenceTracker>,
     ) -> anyhow::Result<Trace<E, N>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
     {
         let eos_token: N = self.config.eos_token.as_tensor_type_param();
         let user_len = input.len();
@@ -361,10 +337,7 @@ where
                     store,
                 )
             }
-            .context(format!(
-                "runng the {} iteration loop",
-                unpadded_seq_len - user_len
-            ))?;
+            .with_context(|| format!("runng the {} iteration loop", unpadded_seq_len - user_len))?;
             ensure!(
                 trace.output.len() == 1,
                 "expected 1 output, got {}",
@@ -384,9 +357,6 @@ where
             full_tokens.push(last_token);
             if last_token == eos_token {
                 break;
-            }
-            if let Some(ref obs) = observer {
-                obs.observe(unpadded_seq_len - user_len, &trace);
             }
             unpadded_seq_len += 1;
         }
@@ -430,27 +400,23 @@ impl Driver<Element> {
         &self,
         input: Vec<Token>,
         store: &mut GenStore,
-        observer: Option<impl Observer<Element>>,
     ) -> anyhow::Result<Trace<E, Element>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
     {
-        self.run_internal::<E>(input, store, observer, None)
+        self.run_internal::<E>(input, store, None)
     }
 
     pub fn run_with_tracker<E>(
         &self,
         input: Vec<Token>,
         store: &mut GenStore,
-        observer: Option<impl Observer<Element>>,
         tracker: &mut InferenceTracker,
     ) -> anyhow::Result<Trace<E, Element>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
     {
-        self.run_internal::<E>(input, store, observer, Some(tracker))
+        self.run_internal::<E>(input, store, Some(tracker))
     }
 
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
@@ -461,8 +427,7 @@ impl Driver<Element> {
         &self,
     ) -> anyhow::Result<(LLMProverContext<E, PCS>, LLMVerifierContext<E, PCS>)>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
@@ -500,8 +465,7 @@ impl Driver<Element> {
         &self,
     ) -> anyhow::Result<(LLMProverContext<E, PCS>, LLMVerifierContext<E, PCS>)>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
@@ -535,8 +499,7 @@ impl Driver<Element> {
     ) -> anyhow::Result<LLMProof<E, PCS>>
     where
         S: ChunkingStrategy,
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
@@ -568,8 +531,7 @@ impl Driver<Element> {
     ) -> anyhow::Result<LLMProof<E, PCS>>
     where
         S: ChunkingStrategy,
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
@@ -591,8 +553,7 @@ impl Driver<Element> {
         trace: Trace<E, Element>,
     ) -> anyhow::Result<LLMProof<E, PCS>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
@@ -609,8 +570,7 @@ impl Driver<Element> {
 
 impl<E, PCS> LLMVerifierContext<E, PCS>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
@@ -673,51 +633,12 @@ where
     }
 }
 
-pub struct LLMTokenizerObserver<'a, T: LLMTokenizer> {
-    pub input: String,
-    pub tokenizer: &'a T,
-}
-
-impl<'a, N, T: LLMTokenizer> Observer<N> for LLMTokenizerObserver<'a, T>
-where
-    N: TensorTypeParam + Serialize + for<'b> Deserialize<'b>,
-{
-    fn observe<E: ExtensionField>(&self, step: usize, trace: &Trace<E, N>) {
-        let tensor = trace
-            .output
-            .last()
-            .unwrap()
-            .tensor()
-            .expect("hydration failed");
-        let output_tokens_len = tensor.get_data().len();
-        let input_tokens = self.tokenizer.tokenize(&self.input);
-        let new_token = if output_tokens_len == 1 {
-            *tensor.get_data().last().expect("last token must exist")
-        } else {
-            tensor.get_data()[input_tokens.len() + step - 1]
-        };
-
-        // let new_token = tensor.get_data().last().unwrap();
-        let new_token = Token::from(Number::to_usize(&new_token));
-        let new_text = self.tokenizer.detokenize(&[new_token]);
-        debug!(
-            "seq_len {}: new token: {:?}\n\t-{}", //\n\t-{:?}",
-            step,
-            &new_token,
-            (self.input.clone() + &new_text).trim(),
-            // tensor.get_data()
-        );
-    }
-}
-
 #[cfg(test)]
 mod test {
     use crate::{
         Number, init_test_logging,
         iop::chunking::LLMChunkingStrategy,
-        model::llm::{
-            Driver, LLMProverContext, LLMTokenizerObserver, LLMVerifierContext, WithMaxContext,
-        },
+        model::llm::{Driver, LLMProverContext, LLMVerifierContext, WithMaxContext},
         parser::{
             file_cache,
             gguf::{RawGGUF, TensorLoader},
@@ -782,14 +703,7 @@ mod test {
         let sentence = "The sky is";
         let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path))?;
         let user_tokens = tokenizer.tokenize(sentence);
-        let trace = driver.run::<GoldilocksExt2>(
-            user_tokens.clone(),
-            &mut store,
-            Some(LLMTokenizerObserver {
-                input: sentence.to_string(),
-                tokenizer: &tokenizer,
-            }),
-        )?;
+        let trace = driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut store)?;
 
         // Prove the trace
         let num_provers = if DISTRIBUTE_PROVE {
@@ -846,14 +760,7 @@ mod test {
         let mut store = GenStore::default();
         assert_eq!(detokenized, sentence);
         println!("user input in tokens: {user_tokens:?}");
-        let trace = driver.run::<GoldilocksExt2>(
-            user_tokens,
-            &mut store,
-            Some(LLMTokenizerObserver {
-                input: sentence.to_string(),
-                tokenizer: &tokenizer,
-            }),
-        )?;
+        let trace = driver.run::<GoldilocksExt2>(user_tokens, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -883,14 +790,7 @@ mod test {
         let sentence = "The sky is";
         let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
-        let trace = driver.run::<GoldilocksExt2>(
-            &user_tokens,
-            &mut store,
-            Some(LLMTokenizerObserver {
-                input: sentence.to_string(),
-                tokenizer: &tokenizer,
-            }),
-        )?;
+        let trace = driver.run::<GoldilocksExt2>(&user_tokens, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -920,14 +820,7 @@ mod test {
         let sentence = "The sky is";
         let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
-        let trace = driver.run::<GoldilocksExt2>(
-            user_tokens,
-            &mut store,
-            Some(LLMTokenizerObserver {
-                input: sentence.to_string(),
-                tokenizer: &tokenizer,
-            }),
-        )?;
+        let trace = driver.run::<GoldilocksExt2>(user_tokens, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -981,14 +874,7 @@ mod test {
         let tokenizer = HFTokenizer::sentencepiece_from_gguf(&loader)?;
         let user_tokens = tokenizer.tokenize(sentence);
 
-        let trace = driver.run::<GoldilocksExt2>(
-            user_tokens.clone(),
-            &mut store,
-            Some(LLMTokenizerObserver {
-                input: sentence.to_string(),
-                tokenizer: &tokenizer,
-            }),
-        )?;
+        let trace = driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut store)?;
 
         // Prove the trace
         let num_provers = Some(rng_from_env_or_random().gen_range(1..6));

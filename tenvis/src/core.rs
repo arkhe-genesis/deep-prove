@@ -8,10 +8,7 @@ use zkml::{
     Element, Number, Shape,
     graph::NodeId,
     inputs::Input,
-    model::{
-        Model,
-        llm::{Driver, LLMTokenizerObserver},
-    },
+    model::{Model, llm::Driver},
     parser::{
         gguf::{RawGGUF, TensorLoader},
         llm::{HFTokenizer, LLMTokenizer, Token, models::gpt2::GPT2},
@@ -127,10 +124,6 @@ impl GlobalContext {
             let trace_f32 = driver_f32.run_with_tracker::<F>(
                 &user_tokens,
                 &mut store_f32,
-                Some(LLMTokenizerObserver {
-                    input: prompt.to_string(),
-                    tokenizer: &tokenizer,
-                }),
                 Some(&mut min_max_tracker_f32),
             )?;
             let answer = tokenizer.detokenize(
@@ -167,10 +160,6 @@ impl GlobalContext {
             let trace_elt = driver_elt.run_with_tracker::<F>(
                 user_tokens,
                 &mut store_elt,
-                Some(LLMTokenizerObserver {
-                    input: prompt.to_string(),
-                    tokenizer: &tokenizer,
-                }),
                 &mut min_max_tracker_elt,
             )?;
             let answer = tokenizer.detokenize(

@@ -37,7 +37,7 @@ where
         .create(true)
         .append(true)
         .open(&file)
-        .context(format!("opening file {:?}", file.as_ref()))?;
+        .with_context(|| format!("opening file {:?}", file.as_ref()))?;
 
     *lock = Some(StreamingRecorder::csv_streaming(additional_columns, file)?);
     Ok(())

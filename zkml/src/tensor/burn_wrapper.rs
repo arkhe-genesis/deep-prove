@@ -499,10 +499,12 @@ where
     pub fn permute(self, axes: &[isize]) -> Result<Self> {
         let out = match self {
             Self::Rank1(tensor, unpadded_shape) => {
-                let axes: [isize; 1] = TryFrom::try_from(axes).context(format!(
-                    "Unexpected permutation axes length. Expected 1, got {}",
-                    axes.len(),
-                ))?;
+                let axes: [isize; 1] = TryFrom::try_from(axes).with_context(|| {
+                    format!(
+                        "Unexpected permutation axes length. Expected 1, got {}",
+                        axes.len(),
+                    )
+                })?;
                 let shape_axes = axes.map(|d| d as usize);
                 let unpadded_shape = unpadded_shape
                     .permute(shape_axes.as_slice())
@@ -510,10 +512,12 @@ where
                 Self::Rank1(tensor.permute(axes), unpadded_shape)
             }
             Self::Rank2(tensor, unpadded_shape) => {
-                let axes: [isize; 2] = TryFrom::try_from(axes).context(format!(
-                    "Unexpected permutation axes length. Expected 2, got {}",
-                    axes.len(),
-                ))?;
+                let axes: [isize; 2] = TryFrom::try_from(axes).with_context(|| {
+                    format!(
+                        "Unexpected permutation axes length. Expected 2, got {}",
+                        axes.len(),
+                    )
+                })?;
                 let shape_axes = axes.map(|d| d as usize);
                 let unpadded_shape = unpadded_shape
                     .permute(shape_axes.as_slice())
@@ -521,10 +525,12 @@ where
                 Self::Rank2(tensor.permute(axes), unpadded_shape)
             }
             Self::Rank3(tensor, unpadded_shape) => {
-                let axes: [isize; 3] = TryFrom::try_from(axes).context(format!(
-                    "Unexpected permutation axes length. Expected 3, got {}",
-                    axes.len(),
-                ))?;
+                let axes: [isize; 3] = TryFrom::try_from(axes).with_context(|| {
+                    format!(
+                        "Unexpected permutation axes length. Expected 3, got {}",
+                        axes.len(),
+                    )
+                })?;
                 let shape_axes = axes.map(|d| d as usize);
                 let unpadded_shape = unpadded_shape
                     .permute(shape_axes.as_slice())
@@ -532,10 +538,12 @@ where
                 Self::Rank3(tensor.permute(axes), unpadded_shape)
             }
             Self::Rank4(tensor, unpadded_shape) => {
-                let axes: [isize; 4] = TryFrom::try_from(axes).context(format!(
-                    "Unexpected permutation axes length. Expected 4, got {}",
-                    axes.len(),
-                ))?;
+                let axes: [isize; 4] = TryFrom::try_from(axes).with_context(|| {
+                    format!(
+                        "Unexpected permutation axes length. Expected 4, got {}",
+                        axes.len(),
+                    )
+                })?;
                 let shape_axes = axes.map(|d| d as usize);
                 let unpadded_shape = unpadded_shape
                     .permute(shape_axes.as_slice())

@@ -291,8 +291,7 @@ pub trait PadOp {
 
 pub trait ProvableOp<E, PCS>: OpInfo + PadOp + ProveInfo
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -330,8 +329,6 @@ where
 pub trait VerifiableCtx<E, PCS>: Debug + OpInfo
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof: Sized;
@@ -561,11 +558,7 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx<E> {
     type Proof = LayerProof<E, PCS>;
 
     fn verify<T: Transcript<E>>(

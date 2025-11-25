@@ -326,7 +326,6 @@ impl ModelChunk {
     ) -> anyhow::Result<PCS::CommitmentWithWitness>
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
     {
         let chunk_id = self.chunk_id;
         let rmms = edges.try_fold(vec![], |mut rmms, edge_id| {
@@ -372,7 +371,6 @@ impl ModelChunk {
     ) -> anyhow::Result<BTreeMap<ChunkID, PCS::CommitmentWithWitness>>
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
     {
         self.grouped_edges(group_type)
             .iter()

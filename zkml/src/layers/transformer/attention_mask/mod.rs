@@ -320,8 +320,7 @@ impl<E: ExtensionField> OpInfo for AttentionMaskCtx<E> {
 
 impl<E, PCS> ProvableOp<E, PCS> for AttentionMask<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -367,8 +366,7 @@ where
 
 impl<E, PCS> VerifiableCtx<E, PCS> for AttentionMaskCtx<E>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = AttentionMaskProof<E>;

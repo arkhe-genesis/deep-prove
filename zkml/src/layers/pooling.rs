@@ -65,10 +65,7 @@ pub struct PoolingCtx {
 /// Contains proof material related to one step of the inference
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct PoolingProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
+pub struct PoolingProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// the actual sumcheck proof proving that the product of correct terms is always zero
     pub(crate) sumcheck: IOPProof<E>,
     /// The lookup proof showing that the diff is always in the correct range
@@ -245,8 +242,7 @@ impl PadOp for Pooling {
 
 impl<E, PCS> ProvableOp<E, PCS> for Pooling
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -356,8 +352,7 @@ impl OpInfo for PoolingCtx {
 
 impl<E, PCS> VerifiableCtx<E, PCS> for PoolingCtx
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = PoolingProof<E, PCS>;
@@ -427,8 +422,7 @@ impl Pooling {
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
-        E::BaseField: Serialize + DeserializeOwned,
-        E: ExtensionField + Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
@@ -593,8 +587,7 @@ impl PoolingCtx {
         shape_step: &ShapeStep,
     ) -> anyhow::Result<Claim<E>>
     where
-        E::BaseField: Serialize + DeserializeOwned,
-        E: ExtensionField + Serialize + DeserializeOwned,
+        E: ExtensionField,
     {
         // 1. Verify the lookup proof
         let batch_claim = verify_logup_proof_multiple_sizes(&proof.lookup, verifier.transcript)?;

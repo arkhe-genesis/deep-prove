@@ -80,10 +80,12 @@ where
         shapes: &[Shape],
     ) -> Result<Vec<WrappedTensor<N>>> {
         // Check that the input shapes are compatible with the einsum equation
-        self.mapping.check_shapes(shapes).context(format!(
-            "Error occurred during shape checking of Einsum with equation {}",
-            self.equation
-        ))?;
+        self.mapping.check_shapes(shapes).with_context(|| {
+            format!(
+                "Error occurred during shape checking of Einsum with equation {}",
+                self.equation
+            )
+        })?;
 
         let stack_axes_size = self.mapping.axes_sizes(shapes)?[AxisType::Stacked];
 

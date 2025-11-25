@@ -10,8 +10,7 @@ impl SoftmaxCtx {
         shape_step: &ShapeStep,
     ) -> Result<Vec<Claim<E>>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E>,
         T: transcript::Transcript<E>,
     {

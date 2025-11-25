@@ -306,8 +306,7 @@ pub struct CommitmentProverCtx<E, PCS>
 where
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
+    E: ExtensionField,
 {
     /// Prover parameters for the [`PolynomialCommitmentScheme`]
     prover_params: PCS::ProverParam,
@@ -344,8 +343,7 @@ where
 impl<E, PCS> CommitmentProverCtx<E, PCS>
 where
     PCS: PolynomialCommitmentScheme<E>,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     /// Helper method to commit to polynomial.
@@ -379,8 +377,7 @@ where
 pub struct CommitmentVerifierCtx<E, PCS>
 where
     PCS: PolynomialCommitmentScheme<E>,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
+    E: ExtensionField,
 {
     /// Verifier parameters for the [`PolynomialCommitmentScheme`]
     verifier_params: PCS::VerifierParam,
@@ -416,8 +413,7 @@ where
 impl<E, PCS> CommitmentVerifierCtx<E, PCS>
 where
     PCS: PolynomialCommitmentScheme<E>,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
+    E: ExtensionField,
 {
     pub fn write_to_transcript<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
         if let Some(model_comm) = self.model_commitment.as_ref() {
@@ -441,7 +437,7 @@ pub(crate) type ModelClaims<E> = HashMap<CommitmentId, BTreeMap<NodeId, Claim<E>
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct OpeningProof<E, PCS: PolynomialCommitmentScheme<E>>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
+    E: ExtensionField,
 {
     /// This is the sumcheck proof that is used so that all model polynomials are evaluated at the same point.
     sumcheck_proof: IOPProof<E>,

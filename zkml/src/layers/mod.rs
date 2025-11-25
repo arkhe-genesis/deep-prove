@@ -53,7 +53,6 @@ pub mod convolution;
 pub mod einsum;
 pub mod flatten;
 pub mod hadamard;
-pub mod permute;
 pub mod pooling;
 pub mod provable;
 pub mod requant;
@@ -147,7 +146,6 @@ pub enum LayerCtx<E: ExtensionField> {
 pub enum LayerProof<E, PCS>
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
     Convolution(Box<ConvProof<E>>),
@@ -550,8 +548,7 @@ impl PadOp for Layer<Element> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Layer<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -845,7 +842,6 @@ impl QuantizeOp for Layer<f32> {
 impl<E, PCS> LayerProof<E, PCS>
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
     pub fn variant_name(&self) -> String {

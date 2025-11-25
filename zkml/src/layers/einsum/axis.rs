@@ -1295,9 +1295,8 @@ mod tests {
             expected_axis_count,
             expected_dim_order,
         } = test_case;
-        let mut axes_mapping = AxesMapping::from_string(equation.clone()).context(format!(
-            "Failed to parse axes mapping from equation {equation}"
-        ))?;
+        let mut axes_mapping = AxesMapping::from_string(equation.clone())
+            .with_context(|| format!("Failed to parse axes mapping from equation {equation}"))?;
         assert_eq!(
             axes_mapping.input_count, expected_input_count,
             "Input count mismatch for equation: {equation}, expected {expected_input_count}, got {}",

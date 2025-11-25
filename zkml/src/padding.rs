@@ -144,7 +144,7 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
                     let desc = layer.describe();
                     let padded_layer = layer
                         .pad_node(&mut si)
-                        .context(format!("padding layer {:?}: {}", node_id, desc))?;
+                        .with_context(|| format!("padding layer {:?}: {}", node_id, desc))?;
 
                     shape_infos.extend(
                         si.shapes

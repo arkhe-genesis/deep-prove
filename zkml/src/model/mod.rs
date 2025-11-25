@@ -14,7 +14,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
 use itertools::izip;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::Deref,
@@ -595,7 +595,7 @@ impl Model<f32> {
     }
 }
 
-impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
+impl<N: TensorTypeParam> Model<N> {
     pub fn run_with_tracker<E>(
         &self,
         inputs: Vec<Tensor<N>>,
@@ -603,17 +603,9 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         store: &mut GenStore,
     ) -> anyhow::Result<Trace<E, N>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         Layer<N>: Evaluate<N>,
     {
-        // Concretize the unpadded input shapes, either from the provided shapes
-        // or from the ones already stored in the [`Graph`].
-        let unpadded_input_shapes: Vec<_> =
-            inputs.iter().map(|i| i.unpadded_shape().clone()).collect();
-
-        ensure!(unpadded_input_shapes.len() == inputs.len());
-
         // Allocated input tensors and key to handle map.
         let mut handle_tracker = HandleTracker::count_from_graph(&self.graph);
         let mut input_handles = Vec::with_capacity(inputs.len());
@@ -643,10 +635,12 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
 
             let new_step = self
                 .run_layer(node_id, layer, handles, &mut tracker, store.clone())
-                .context(format!(
-                    "Error occurred at node ID: {node_id}, Operation: {}",
-                    layer.as_kind_str()
-                ))?;
+                .with_context(|| {
+                    format!(
+                        "Error occurred at node ID: {node_id}, Operation: {}",
+                        layer.as_kind_str()
+                    )
+                })?;
 
             handle_tracker.after_layer(&input_storage_keys, &new_step.node_outputs.outputs)?;
             trace.new_step(node_id, new_step);
@@ -703,23 +697,19 @@ impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Model<N> {
         store: &mut GenStore,
     ) -> anyhow::Result<Trace<E, N>>
     where
-        E::BaseField: Serialize + DeserializeOwned,
-        E: ExtensionField + Serialize + DeserializeOwned,
+        E: ExtensionField,
         Layer<N>: Evaluate<N>,
     {
         self.run_with_tracker(inputs, None, store)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_layer<E: ExtensionField>(
         &self,
         node_id: NodeId,
         layer: &Layer<N>,
-        // inputs are assumed to be sorted by source port, e.g. in the order defined by the ports
         handles: Vec<TensorHandle<N>>,
         tracker: &mut Option<&mut InferenceTracker>,
         store: GenStore,
-        // all outputs are associated with the corresponding source port of outgoing edges, e.g. the "output port"
     ) -> Result<Step<E, N>>
     where
         N: TensorTypeParam,

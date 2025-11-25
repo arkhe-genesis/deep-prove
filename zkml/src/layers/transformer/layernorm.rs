@@ -892,8 +892,7 @@ impl PadOp for LayerNorm<Element> {
 
 impl<E, PCS> ProvableOp<E, PCS> for LayerNorm<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -1240,8 +1239,7 @@ impl LayerNorm<Element> {
 
 impl<E, PCS> VerifiableCtx<E, PCS> for LayerNormCtx<E>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = LayerNormProof<E, PCS>;

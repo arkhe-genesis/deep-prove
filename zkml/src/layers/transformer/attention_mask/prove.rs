@@ -11,8 +11,7 @@ impl AttentionMask<Element> {
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<(AttentionMaskProof<E>, Vec<Claim<E>>)>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,

@@ -952,7 +952,6 @@ impl<'a, 'b, 'c, E: ExtensionField, PCS: PolynomialCommitmentScheme<E> + Send + 
 pub(crate) struct GenerateWitnessContext<'a, 'b, 'c, E, PCS>
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
 {
@@ -976,7 +975,6 @@ where
 impl<'a, 'b, 'c, E, PCS> ExecNode for GenerateWitness<'a, 'b, 'c, E, PCS>
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'b,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -1038,8 +1036,7 @@ pub(crate) fn generate_lookup_witness_for_chunk<'a, 'b, 'c, E, T, PCS, N, Ex>(
     executor_config: &Ex::Config,
 ) -> Result<LookupWitness<E, PCS>, LogUpError>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -1233,8 +1230,7 @@ pub fn generate_lookup_witnesses<'a, E, T: Transcript<E>, PCS>(
     layers: &ModelLayersRef<'a>,
 ) -> Result<LookupWitness<E, PCS>, LogUpError>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,

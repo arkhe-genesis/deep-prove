@@ -352,8 +352,7 @@ impl QuantizeOp for EinSum<f32> {
 
 impl<E, PCS> ProvableOp<E, PCS> for EinSum<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -500,9 +499,6 @@ pub struct EinSumProof<E: ExtensionField> {
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS>
     for EinSumContext<E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
 {
     type Proof = EinSumProof<E>;
 

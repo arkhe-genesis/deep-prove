@@ -712,8 +712,7 @@ fn build_sumcheck_expression<E: ExtensionField>(
 
 impl<E, PCS> ProvableOp<E, PCS> for RMSNorm<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -1034,8 +1033,7 @@ impl RMSNorm<Element> {
 
 impl<E, PCS> VerifiableCtx<E, PCS> for RMSNormCtx<E>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = RMSNormProof<E, PCS>;

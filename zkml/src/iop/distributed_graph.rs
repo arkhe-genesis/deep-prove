@@ -24,7 +24,6 @@ use crate::{
 /// Context for the execution graph used for distributed proving
 pub struct ExecGraphCtx<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub(crate) serializable_ctx: SerializableGraphCtx<E, PCS>,
@@ -34,7 +33,6 @@ where
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> AsRef<SerializableGraphCtx<E, PCS>>
     for ExecGraphCtx<E, PCS>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     fn as_ref(&self) -> &SerializableGraphCtx<E, PCS> {
@@ -49,7 +47,6 @@ where
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct SerializableGraphCtx<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub(crate) ctx: ProverContext<E, PCS>,
@@ -58,7 +55,6 @@ where
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SerializableGraphCtx<E, PCS>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub fn new(ctx: ProverContext<E, PCS>, model: Model<Element>) -> Self {
@@ -77,7 +73,6 @@ where
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Deref for ExecGraphCtx<E, PCS>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     type Target = SerializableGraphCtx<E, PCS>;

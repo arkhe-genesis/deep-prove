@@ -6,18 +6,11 @@ use zkml::{
     Element, Prover, ProverContext, Tensor,
     inputs::Input,
     iop::context::VerifierContext,
-    model::{
-        Model,
-        llm::{Driver, LLMTokenizerObserver},
-    },
+    model::{Model, llm::Driver},
     parser::{
         file_cache,
         gguf::RawGGUF,
-        llm::{
-            LLMTokenizer,
-            models::gpt2::{GPT2, GPT2_Q8_0},
-            tokenizer::TokenizerLoader,
-        },
+        llm::models::gpt2::{GPT2, GPT2_Q8_0},
         onnx::FloatOnnxLoader,
     },
     quantization::{AbsoluteMax, ModelMetadata},
@@ -178,20 +171,11 @@ fn inference(c: &mut Criterion) {
     let format = RawGGUF::new(model_path);
     let driver = Driver::load_from_model(GPT2, &format, Some(max_context))
         .expect("failed to instantiate GPT2 driver");
-    let tokenizer = GPT2.load_tokenizer(&format).unwrap();
     let user_tokens = driver.random_sequence(1);
-    let sentence = tokenizer.detokenize(&user_tokens);
 
     group.bench_function("gpt2", |bencher| {
         bencher.iter_with_large_drop(|| {
-            driver.run::<GoldilocksExt2>(
-                &user_tokens,
-                &mut GenStore::default(),
-                Some(LLMTokenizerObserver {
-                    input: sentence.to_string(),
-                    tokenizer: &tokenizer,
-                }),
-            )
+            driver.run::<GoldilocksExt2>(&user_tokens, &mut GenStore::default())
         });
     });
 

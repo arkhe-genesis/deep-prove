@@ -12,8 +12,7 @@ impl AttentionMask<Element> {
         verifier: &mut Verifier<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E>,
         T: Transcript<E>,
     {

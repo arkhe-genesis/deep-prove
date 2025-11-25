@@ -489,7 +489,7 @@ mod tests {
 
     use crate::{
         init_test_logging,
-        model::llm::{Driver, LLMTokenizerObserver, WithMaxContext},
+        model::llm::{Driver, WithMaxContext},
         parser::{
             default_pipeline_config, file_cache,
             gguf::RawGGUF,
@@ -673,15 +673,7 @@ mod tests {
         let conf = default_pipeline_config().with_float_rules(vec![Box::new(GPT2RMSNorm)]);
 
         let driver = driver.into_provable_llm(Some(conf))?;
-        // driver.model.describe();
-        let trace = driver.run::<GoldilocksExt2>(
-            user_tokens.clone(),
-            &mut GenStore::default(),
-            Some(LLMTokenizerObserver {
-                input: sentence.to_string(),
-                tokenizer: &tokenizer,
-            }),
-        )?;
+        let trace = driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut GenStore::default())?;
         let (prover_ctx, verifier_ctx) = driver
             .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
             .with_max_context(max_context);

@@ -149,7 +149,7 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
-        .context(format!("listening on port {port}"))?;
+        .with_context(|| format!("listening on port {port}"))?;
     axum::serve(listener, app)
         .await
         .context("setting up HTTP server")?;

@@ -95,10 +95,7 @@ pub struct RequantCtx<E: ExtensionField> {
 /// Struct holding all the information needed to verify requantisation was performed correctly.
 /// This includes both lookup proofs and an additional sumcheck proof that we use so that all evaluations are at the same point.
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct RequantProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
+pub struct RequantProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// proof for the accumulation of the claim from activation + claim from lookup for the same poly
     /// e.g. the "link" between an activation and requant layer
     pub(crate) io_accumulation: IOPProof<E>,
@@ -435,8 +432,7 @@ impl PadOp for Requant {}
 
 impl<E, PCS> ProvableOp<E, PCS> for Requant
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -632,8 +628,7 @@ impl<E: ExtensionField> OpInfo for RequantCtx<E> {
 
 impl<E, PCS> VerifiableCtx<E, PCS> for RequantCtx<E>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = RequantProof<E, PCS>;
@@ -823,8 +818,7 @@ impl Requant {
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
@@ -942,8 +936,7 @@ impl<E: ExtensionField> RequantCtx<E> {
         proof: &RequantProof<E, PCS>,
     ) -> anyhow::Result<Claim<E>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
     {
         // 1. Verify the lookup proofs
         let RequantProof {

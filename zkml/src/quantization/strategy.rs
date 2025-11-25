@@ -103,19 +103,15 @@ impl ScalingStrategy for InferenceObserver {
         let inputs = if self.inputs.is_empty() {
             let mut rng = rng_from_env_or_random();
             warn!("No representative inputs provided, generating random ones");
-            (0..1)
-                .map(|_| {
-                    input_shapes
-                        .iter()
-                        .map(|shape| {
-                            let size = shape.product();
-                            (0..size)
-                                .map(|_| <f32 as Number>::random(&mut rng))
-                                .collect_vec()
-                        })
-                        .collect_vec()
+            let inputs = input_shapes
+                .iter()
+                .map(|shape| {
+                    (0..shape.product())
+                        .map(|_| <f32 as Number>::random(&mut rng))
+                        .collect()
                 })
-                .collect()
+                .collect();
+            vec![inputs]
         } else {
             info!(
                 "Using the {} provided representative inputs to quantize model",

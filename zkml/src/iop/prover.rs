@@ -54,8 +54,6 @@ use utils::{Metrics, stream_metrics};
 /// Prover generates a series of sumcheck proofs to prove the inference of a model
 pub struct Prover<'a, 'b, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>
 where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     PCS::ProverParam: Send + Sync,
 {
@@ -152,8 +150,6 @@ impl<'a, 'b, E, T, PCS> Prover<'a, 'b, E, T, PCS>
 where
     T: Transcript<E>,
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,

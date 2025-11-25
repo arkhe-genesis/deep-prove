@@ -26,7 +26,6 @@ use utils::Metrics;
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct ProverContext<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     /// Information about each steps of the model. That's the information that the verifier
@@ -43,8 +42,6 @@ where
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProverContext<E, PCS>
 where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub fn write_to_transcript<T: Transcript<E>>(&self, t: &mut T) -> anyhow::Result<()> {
@@ -63,11 +60,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct VerifierContext<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+pub struct VerifierContext<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// Information about each steps of the model. That's the information that the verifier
     /// needs to know from the setup to avoid the prover being able to cheat.
     /// in REVERSED order already since proving goes from last layer to first layer.
@@ -80,11 +73,7 @@ where
     pub unpadded_input_shapes: Vec<Shape>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifierContext<E, PCS>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifierContext<E, PCS> {
     pub fn write_to_transcript<T: Transcript<E>>(&self, t: &mut T) -> anyhow::Result<()> {
         self.commitment_ctx.write_to_transcript(t)?;
         Ok(())

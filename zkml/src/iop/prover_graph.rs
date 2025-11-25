@@ -105,7 +105,6 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProverGraphIO<E, PCS
 /// Global context for each chunk prover
 pub struct LocalProverCtx<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub(crate) ctx: &'a ProverContext<E, PCS>,
@@ -114,7 +113,6 @@ where
 
 impl<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LocalProverCtx<'a, 'b, E, PCS>
 where
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub fn new(ctx: &'a ProverContext<E, PCS>, model: &'b Model<Element>) -> Self {
@@ -127,7 +125,6 @@ where
     E: ExtensionField,
     T: Transcript<E> + InitTranscript,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
-    E::BaseField: Serialize + DeserializeOwned,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
 {

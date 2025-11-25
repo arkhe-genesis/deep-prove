@@ -58,8 +58,6 @@ pub struct Prover<'a, E: ExtensionField> {
 impl<'a, E> Prover<'a, E>
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
 {
     /// The polynomial over which the claims are to be accumulated and proven
     /// Note the prover also _commits_ to this polynomial.
@@ -113,20 +111,12 @@ where
     }
 }
 
-pub struct Verifier<'a, E: ExtensionField>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+pub struct Verifier<'a, E: ExtensionField> {
     claims: Vec<Claim<E>>,
     ctx: &'a Context<E>,
 }
 
-impl<'a, E: ExtensionField> Verifier<'a, E>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
-{
+impl<'a, E: ExtensionField> Verifier<'a, E> {
     pub fn new(ctx: &'a Context<E>) -> Self {
         Self {
             claims: Default::default(),

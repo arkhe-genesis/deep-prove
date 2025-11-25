@@ -8,15 +8,8 @@ use tenstore::GenStore;
 use timed_core::Output;
 use tracing_subscriber::EnvFilter;
 use zkml::{
-    model::llm::{LLMProverContext, LLMTokenizerObserver, LLMVerifierContext},
-    parser::{
-        file_cache,
-        gguf::RawGGUF,
-        llm::{
-            models::gpt2::GPT2,
-            tokenizer::{LLMTokenizer, TokenizerLoader},
-        },
-    },
+    model::llm::{LLMProverContext, LLMVerifierContext},
+    parser::{file_cache, gguf::RawGGUF, llm::models::gpt2::GPT2},
 };
 
 type F = GoldilocksExt2;
@@ -72,11 +65,9 @@ fn main() -> anyhow::Result<()> {
     let model_path = file_cache::from_cache(&args.gguf)?;
     let format = RawGGUF::new(model_path);
 
-    let (driver, tokenizer) = match args.model.to_lowercase().as_str() {
+    let driver = match args.model.to_lowercase().as_str() {
         zkml::parser::llm::models::gpt2::GPT2_NAME => {
-            let driver = Driver::load_from_model(GPT2, &format, Some(args.max_context))?;
-            let tokenizer = GPT2.load_tokenizer(&format)?;
-            (driver, tokenizer)
+            Driver::load_from_model(GPT2, &format, Some(args.max_context))?
         }
         _ => bail!("Model {:?} not supported", args.model),
     };
@@ -100,16 +91,8 @@ fn main() -> anyhow::Result<()> {
 
     for _ in 0..args.num_samples {
         let user_tokens = driver.random_sequence(args.min_user_len);
-        let sentence = tokenizer.detokenize(&user_tokens);
         let trace = bencher.r(HEADER_INFERENCE_TIME, || {
-            driver.run::<GoldilocksExt2>(
-                user_tokens.clone(),
-                &mut GenStore::default(),
-                Some(LLMTokenizerObserver {
-                    input: sentence.to_string(),
-                    tokenizer: &tokenizer,
-                }),
-            )
+            driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut GenStore::default())
         })?;
 
         let proof = bencher.r(HEADER_PROOF_TIME, || driver.prove(&prover_ctx, trace))?;

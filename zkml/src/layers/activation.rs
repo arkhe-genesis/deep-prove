@@ -78,7 +78,7 @@ pub struct ActivationData {
 /// Currently holds the poly info for the output polynomial of the RELU
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ActivationCtx<E: ExtensionField + Serialize + DeserializeOwned> {
+pub struct ActivationCtx<E: ExtensionField> {
     pub op: Activation<Element>,
     pub lookup_context: LayerLookupContext,
     pub sumcheck_expression: Vec<Expression<E>>,
@@ -87,10 +87,7 @@ pub struct ActivationCtx<E: ExtensionField + Serialize + DeserializeOwned> {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ActivationProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-{
+pub struct ActivationProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     /// proof for the accumulation of the claim from m2v + claim from lookup for the same poly
     /// e.g. the "link" between a m2v and relu layer
     pub(crate) io_accumulation: IOPProof<E>,
@@ -525,8 +522,7 @@ impl<N> PadOp for Activation<N> {}
 
 impl<E, PCS> ProvableOp<E, PCS> for Activation<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -618,8 +614,6 @@ impl<E: ExtensionField> OpInfo for ActivationCtx<E> {
 impl<E, PCS> VerifiableCtx<E, PCS> for ActivationCtx<E>
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = ActivationProof<E, PCS>;
@@ -653,8 +647,7 @@ impl Activation<Element> {
         node_id: NodeId,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
-        E: ExtensionField + Serialize + DeserializeOwned,
-        E::BaseField: Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
@@ -761,11 +754,7 @@ impl<E: ExtensionField> ActivationCtx<E> {
         verifier: &mut Verifier<E, T, PCS>,
         last_claim: &Claim<E>,
         proof: &ActivationProof<E, PCS>,
-    ) -> anyhow::Result<Vec<Claim<E>>>
-    where
-        E::BaseField: Serialize + DeserializeOwned,
-        E: Serialize + DeserializeOwned,
-    {
+    ) -> anyhow::Result<Vec<Claim<E>>> {
         let ActivationProof {
             io_accumulation,
             evaluations,

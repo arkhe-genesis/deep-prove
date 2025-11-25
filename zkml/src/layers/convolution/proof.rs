@@ -416,8 +416,6 @@ impl ConvCtx {
 impl<E, PCS> VerifiableCtx<E, PCS> for ConvCtx
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = ConvProof<E>;

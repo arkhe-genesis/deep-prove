@@ -515,8 +515,7 @@ impl PadOp for Add<Element> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Add<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
@@ -545,8 +544,6 @@ where
 impl<E, PCS> VerifiableCtx<E, PCS> for AddCtx
 where
     E: ExtensionField,
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
     type Proof = AddProof<E>;

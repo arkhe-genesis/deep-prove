@@ -24,7 +24,7 @@ use anyhow::{Context as _, anyhow, ensure};
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::{Point, PolynomialCommitmentScheme};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{info, trace};
 use transcript::Transcript;
@@ -66,8 +66,6 @@ impl<E: ExtensionField> IO<E> {
 
 pub struct Verifier<'a, E: ExtensionField, T: Transcript<E>, PCS>
 where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
     PCS: PolynomialCommitmentScheme<E>,
 {
     pub(crate) io: &'a IO<E>,
@@ -78,9 +76,6 @@ where
 
 impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>
     Verifier<'a, E, T, PCS>
-where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: Serialize + DeserializeOwned,
 {
     pub(crate) fn new(transcript: &'a mut T, io: &'a IO<E>) -> Self {
         let commit_verifier = CommitmentVerifier::<E, PCS>::new();
@@ -285,7 +280,7 @@ where
                                         &mut self,
                                         shape_step,
                                     )
-                                    .context(format!(
+                                    .with_context(|| format!(
                                         "Verification failed for node with ID {node_id}"
                                     ))?
                             } else {
@@ -546,8 +541,7 @@ pub fn verify<E, T: Transcript<E> + InitTranscript, PCS: PolynomialCommitmentSch
     io: IO<E>,
 ) -> anyhow::Result<()>
 where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS::Commitment: PartialEq + Eq,
 {
     Verifier::<E, T, PCS>::verify(ctx, &io, proof)
@@ -563,8 +557,7 @@ fn verify_table<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
     challenge_storage: &ChallengeStorage<E>,
 ) -> anyhow::Result<()>
 where
-    E::BaseField: Serialize + DeserializeOwned,
-    E: ExtensionField + Serialize + DeserializeOwned,
+    E: ExtensionField,
 {
     // 1. Verify the lookup proof
     let TableProof {

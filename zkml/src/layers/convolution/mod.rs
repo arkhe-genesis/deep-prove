@@ -675,8 +675,7 @@ impl Convolution<Element> {
         r: Vec<E>,
     ) -> BatchFFTWeightsProof<E>
     where
-        E::BaseField: Serialize + DeserializeOwned,
-        E: ExtensionField + Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
@@ -771,8 +770,7 @@ impl Convolution<Element> {
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
     where
-        E::BaseField: Serialize + DeserializeOwned,
-        E: ExtensionField + Serialize + DeserializeOwned,
+        E: ExtensionField,
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
         PCS::ProverParam: Send + Sync,
@@ -1444,8 +1442,7 @@ pub fn check_cnn_input(input_shape: &Shape) -> Result<()> {
 
 impl<E, PCS> ProvableOp<E, PCS> for Convolution<Element>
 where
-    E: ExtensionField + Serialize + DeserializeOwned,
-    E::BaseField: Serialize + DeserializeOwned,
+    E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,

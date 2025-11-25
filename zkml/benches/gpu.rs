@@ -659,54 +659,6 @@ mod positional_rope_layer {
 }
 
 #[divan::bench_group]
-mod permute_layer {
-    use std::ops::Range;
-
-    use ff_ext::GoldilocksExt2;
-    use zkml::{
-        Element, Shape,
-        layers::{permute::Permute, provable::Evaluate},
-        tensor::WrappedTensor,
-    };
-
-    use crate::{Args, sizes};
-
-    // XXX: 2**10 fails with `BufferTooBig(8589934592)`
-    const SIZES: Range<i32> = 7..10;
-
-    #[divan::bench(args = sizes(SIZES))]
-    fn element(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let shape = Shape::new(vec![size, size, size]);
-
-        let input = WrappedTensor::<Element>::random(&shape);
-
-        let layer = Permute::new(vec![2, 1, 0]).unwrap();
-
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Permute should succeed")
-        });
-    }
-
-    #[divan::bench(args = sizes(SIZES))]
-    fn f32(bencher: divan::Bencher, args: Args) {
-        let size = 1 << args.pow2;
-        let shape = Shape::new(vec![size, size, size]);
-
-        let input = WrappedTensor::<f32>::random(&shape);
-
-        let layer = Permute::new(vec![2, 1, 0]).unwrap();
-        bencher.bench(|| {
-            layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Permute should succeed")
-        });
-    }
-}
-
-#[divan::bench_group]
 mod softmax_layer {
     use ff_ext::GoldilocksExt2;
     use zkml::{
