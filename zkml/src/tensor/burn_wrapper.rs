@@ -177,7 +177,7 @@ where
     }
 
     /// Converts the data of the current tensor.
-    pub fn to_data(self) -> TensorData {
+    pub fn to_data(&self) -> TensorData {
         delegate_plain!(self, to_data)
     }
 
@@ -208,7 +208,6 @@ where
     }
 
     /// Returns a copy of the tensor data.
-    #[cfg(test)]
     pub fn get_data(&self) -> Vec<T> {
         self.clone().to_data().into_vec().unwrap()
     }
@@ -1333,6 +1332,22 @@ where
 
     fn try_from(value: &Tensor<T>) -> Result<Self> {
         <T as TensorTypeParam>::wrap(value)
+    }
+}
+
+impl<T> TryFrom<&WrappedTensor<T>> for Tensor<T>
+where
+    T: TensorTypeParam,
+{
+    type Error = anyhow::Error;
+
+    fn try_from(tensor: &WrappedTensor<T>) -> Result<Self, Self::Error> {
+        let shape = tensor.shape().into();
+        let data = tensor
+            .to_data()
+            .into_vec()
+            .map_err(|e| anyhow::format_err!("{e:?}"))?;
+        Tensor::<T>::new(shape, data)
     }
 }
 

@@ -4,12 +4,12 @@ use crate::{
     iop::prover::{ModelLayers, ModelLayersRef},
     layers::{
         Layer, NodeOut,
-        provable::{Evaluate, OpInfo},
+        provable::{Evaluate, OpInfo, ProvingData},
         requant::Requant,
     },
     padding::PaddingMode,
-    quantization::InferenceTracker,
-    tensor::{Conversion, TensorHandle, TensorTypeParam},
+    quantization::{InferenceTracker, InferenceTrackingMode},
+    tensor::{Conversion, TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use ff_ext::{ExtensionField, GoldilocksExt2};
@@ -610,7 +610,7 @@ impl<N: TensorTypeParam> Model<N> {
     pub fn run_with_tracker<E>(
         &self,
         inputs: Vec<Tensor<N>>,
-        mut tracker: Option<&mut InferenceTracker>,
+        tracker: &mut InferenceTracker,
         store: &mut GenStore,
     ) -> anyhow::Result<Trace<E, N>>
     where
@@ -619,18 +619,19 @@ impl<N: TensorTypeParam> Model<N> {
     {
         // Allocated input tensors and key to handle map.
         let mut handle_tracker = HandleTracker::count_from_graph(&self.graph);
-        let mut input_handles = Vec::with_capacity(inputs.len());
+        let mut input_handles_original = Vec::with_capacity(inputs.len());
         for (i, tensor) in inputs.into_iter().enumerate() {
             let input_node_id = self.graph.input_node_id(i)?;
             let storage_key = input_node_id.output_at(0).to_storage_key();
 
             let handle = TensorHandle::from_tensor(storage_key, store.clone(), tensor);
-            handle.store()?;
-            input_handles.push(handle.clone());
-            handle_tracker.add_input(handle);
+            handle.save_to_store()?;
+
+            input_handles_original.push(handle.clone());
+            handle_tracker.add_input(handle.into_wrapped_tensor()?);
         }
 
-        let mut trace = Trace::new(input_handles);
+        let mut trace = Trace::new(input_handles_original);
         for (node_id, layer) in self.graph.forward_inners() {
             let input_storage_keys: Vec<StorageKey<Vec<N>>> = self
                 .graph
@@ -639,13 +640,20 @@ impl<N: TensorTypeParam> Model<N> {
                 .map(|feed| feed.source.to_storage_key())
                 .collect::<Vec<_>>();
 
-            let handles = input_storage_keys
+            let input_handles = input_storage_keys
                 .iter()
                 .map(|storage_key| handle_tracker.get_by_storage_key(storage_key))
                 .collect::<Result<Vec<_>>>()?;
+            let prec_unpadded_shapes: Vec<_> = input_handles
+                .iter()
+                .map(|handle| handle.unpadded_shape().clone())
+                .collect();
+            // We calculate the unpadded output shapes before running the layer in case the layer uses a concatenation cache.
+            // This ensures that the shapes are computed correctly without interfering with the layer's internal state during evaluation.
+            let out_shapes = layer.output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?;
 
-            let new_step = self
-                .run_layer(node_id, layer, handles, &mut tracker, store.clone())
+            let (layer_outputs, layer_proving_data) = self
+                .run_layer(node_id, layer, &input_handles, tracker, store.clone())
                 .with_context(|| {
                     format!(
                         "Error occurred at node ID: {node_id}, Operation: {}",
@@ -653,7 +661,43 @@ impl<N: TensorTypeParam> Model<N> {
                     )
                 })?;
 
-            handle_tracker.after_layer(&input_storage_keys, &new_step.node_outputs.outputs)?;
+            let out_ports = self.graph.outgoing_ports(node_id);
+            let mut output_handles = Vec::with_capacity(out_shapes.len());
+            for (port, shape, tensor) in izip!(out_ports, out_shapes.clone(), layer_outputs) {
+                let storage_key: StorageKey<Vec<N>> = port.to_storage_key();
+                let handle = TensorHandle::from_wrapped_tensor_with_unpadded_shape(
+                    storage_key,
+                    store.clone(),
+                    tensor,
+                    shape,
+                );
+                output_handles.push(handle);
+            }
+
+            ensure!(
+                output_handles.len() == out_shapes.len(),
+                "Unexpected number of output handles. handles {:?} shapes {:?} layer {}",
+                output_handles,
+                out_shapes,
+                layer.describe(),
+            );
+
+            handle_tracker.after_layer(&input_storage_keys, &output_handles)?;
+
+            let converted_input_handles = input_handles
+                .iter()
+                .map(|handle| handle.clone().into_tensor())
+                .collect::<Result<_, _>>()?;
+            let converted_output_handles = output_handles
+                .iter()
+                .map(|handle| handle.clone().into_tensor())
+                .collect::<Result<_, _>>()?;
+            let new_step = Step {
+                node_inputs: converted_input_handles,
+                node_outputs: NodeOut::new(converted_output_handles, layer_proving_data),
+                unpadded_output_shapes: out_shapes,
+                unpadded_input_shapes: prec_unpadded_shapes,
+            };
             trace.new_step(node_id, new_step);
         }
 
@@ -711,31 +755,30 @@ impl<N: TensorTypeParam> Model<N> {
         E: ExtensionField,
         Layer<N>: Evaluate<N>,
     {
-        self.run_with_tracker(inputs, None, store)
+        let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
+        self.run_with_tracker(inputs, &mut tracker, store)
     }
 
     fn run_layer<E: ExtensionField>(
         &self,
         node_id: NodeId,
         layer: &Layer<N>,
-        handles: Vec<TensorHandle<N>>,
-        tracker: &mut Option<&mut InferenceTracker>,
+        handles: &[TensorHandle<N>],
+        tracker: &mut InferenceTracker,
         store: GenStore,
-    ) -> Result<Step<E, N>>
+    ) -> anyhow::Result<(Vec<WrappedTensor<N>>, ProvingData<E>)>
     where
         N: TensorTypeParam,
         Layer<N>: Evaluate<N>,
     {
-        let mut prec_unpadded_shapes = Vec::with_capacity(handles.len());
         let expected_num_outputs = layer.num_outputs(handles.len())?;
 
-        let (layer_out, out_shapes) = {
+        let layer_out = {
             // Scope to shorten the lifetime of the borrowed handles
             let mut wrapped_tensors_guards = Vec::with_capacity(handles.len());
 
-            for handle in &handles {
+            for handle in handles {
                 wrapped_tensors_guards.push(handle.wrapped_tensor()?);
-                prec_unpadded_shapes.push(handle.unpadded_shape().clone());
             }
 
             let wrapped_tensors = wrapped_tensors_guards
@@ -743,11 +786,7 @@ impl<N: TensorTypeParam> Model<N> {
                 .map(|guard| guard.deref())
                 .collect::<Vec<_>>();
 
-            // We calculate the unpadded output shapes before running the layer in case the layer uses a concatenation cache.
-            // This ensures that the shapes are computed correctly without interfering with the layer's internal state during evaluation.
-            let out_shapes = layer.output_shapes(&prec_unpadded_shapes, PaddingMode::NoPadding)?;
-
-            (layer.evaluate(&wrapped_tensors)?, out_shapes)
+            layer.evaluate(&wrapped_tensors)?
         };
 
         let (layer_outputs, layer_proving_data, layer_tracked_data) = layer_out.into_parts();
@@ -769,17 +808,11 @@ impl<N: TensorTypeParam> Model<N> {
             expected_num_outputs,
             layer.describe(),
         );
-        ensure!(
-            out_ports.len() == out_shapes.len(),
-            "Unexpected number of output shapes. ports {:?} shapes {:?} layer {}",
-            out_ports,
-            out_shapes,
-            layer.describe(),
-        );
 
-        let mut output_handles = Vec::<TensorHandle<N>>::with_capacity(out_ports.len());
-        for (port, shape, tensor) in izip!(out_ports, out_shapes.clone(), layer_outputs) {
+        for (port, tensor) in out_ports.iter().zip(&layer_outputs) {
             let storage_key: StorageKey<Vec<N>> = port.to_storage_key();
+            tracker.track(node_id.output_at(port.port), tensor);
+
             let data = tensor
                 .clone()
                 .to_data()
@@ -788,41 +821,13 @@ impl<N: TensorTypeParam> Model<N> {
             store
                 .store(&storage_key, &data)
                 .with_context(|| format!("storing outputs for tensor {storage_key}"))?;
-
-            if let Some(tracker) = tracker.as_mut() {
-                tracker.track(
-                    node_id.output_at(port.port),
-                    &Tensor::try_from(tensor.clone().float())?,
-                );
-            }
-
-            let handle = TensorHandle::from_wrapped_tensor_with_unpadded_shape(
-                storage_key,
-                store.clone(),
-                tensor,
-                shape,
-            );
-            output_handles.push(handle);
         }
 
-        if let Some(tracker) = tracker.as_mut() {
-            if let Some(tracked_data) = layer_tracked_data {
-                for (data_id, data) in tracked_data {
-                    tracker.track_intermediate_data(
-                        node_id,
-                        data_id,
-                        Tensor::try_from(data.float())?,
-                    );
-                }
-            }
+        for (data_id, data) in layer_tracked_data {
+            tracker.track_intermediate_data(node_id, data_id, Tensor::try_from(data.float())?);
         }
 
-        Ok(Step {
-            node_inputs: handles,
-            node_outputs: NodeOut::new(output_handles, layer_proving_data),
-            unpadded_output_shapes: out_shapes,
-            unpadded_input_shapes: prec_unpadded_shapes,
-        })
+        Ok((layer_outputs, layer_proving_data))
     }
 }
 

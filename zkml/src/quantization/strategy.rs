@@ -8,6 +8,7 @@ use crate::{
     padding::PaddingMode,
     quantization::{self, ModelMetadata, metadata::MetadataBuilder},
     rng_from_env_or_random,
+    tensor::{TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, anyhow, ensure};
 use average::{Estimate, Max, Min, Quantile, Variance};
@@ -60,7 +61,8 @@ pub enum ScalingStrategyKind {
 /// requantization afterwards.
 #[derive(Debug)]
 pub struct InferenceObserver {
-    inputs: Vec<Vec<Vec<f32>>>,
+    /// A collection of inputs.
+    input_samples: Vec<Vec<Vec<f32>>>,
 }
 
 impl Default for InferenceObserver {
@@ -70,16 +72,15 @@ impl Default for InferenceObserver {
 }
 
 impl InferenceObserver {
-    pub fn new_with_representative_input(inputs: Vec<Vec<Vec<f32>>>) -> Self {
-        Self { inputs }
+    pub fn new_with_representative_input(input_samples: Vec<Vec<Vec<f32>>>) -> Self {
+        Self { input_samples }
     }
     pub fn new() -> Self {
-        Self { inputs: vec![] }
+        Self {
+            input_samples: vec![],
+        }
     }
 }
-
-// TODO: replace that with the actual input node ID
-const INPUT_TRACKING_ID: NodeId = NodeId::make(10_000);
 
 impl ScalingStrategy for InferenceObserver {
     type AuxData = InferenceTracker;
@@ -100,7 +101,7 @@ impl ScalingStrategy for InferenceObserver {
         let mut tracker = InferenceTracker::new(tracking_mode);
         let input_shapes = model.input_shapes();
         let unpadded_input_shapes = model.unpadded_input_shapes();
-        let inputs = if self.inputs.is_empty() {
+        let input_samples = if self.input_samples.is_empty() {
             let mut rng = rng_from_env_or_random();
             warn!("No representative inputs provided, generating random ones");
             let inputs = input_shapes
@@ -115,29 +116,29 @@ impl ScalingStrategy for InferenceObserver {
         } else {
             info!(
                 "Using the {} provided representative inputs to quantize model",
-                self.inputs.len()
+                self.input_samples.len()
             );
-            self.inputs.clone()
+            self.input_samples.clone()
         };
         // 1. Run the inference multiple times with different inputs
         // TODO: integrate that within model.rs in a more elegant way with inference step - currently problematic
         // because of the generics and FFT requirement to take a field
         let mut nsamples = 0;
-        for input in inputs.into_iter() {
-            let input_tensors = input
+        for inputs in input_samples.into_iter() {
+            let input_tensors = inputs
                 .into_iter()
                 .zip(model.unpadded_input_shapes())
                 .enumerate()
-                .map(|(input_id, (inp, shape))| {
-                    let input_tensor = Tensor::new(shape, inp);
-                    if let Ok(ref t) = input_tensor {
-                        tracker.track(INPUT_TRACKING_ID.output_at(input_id), t);
-                    }
-                    input_tensor
+                .map(|(i, (input, shape))| {
+                    let input_node_id = model.graph.input_node_id(i)?;
+                    let input_tensor = Tensor::new(shape, input)?;
+                    let wrapped_tensor = WrappedTensor::try_from(&input_tensor)?;
+                    tracker.track(input_node_id.output_at(0), &wrapped_tensor);
+                    Ok(input_tensor)
                 })
                 .collect::<Result<Vec<_>>>()?;
             debug!("Running float inference with the {}-th input", nsamples + 1);
-            model.run_with_tracker::<GoldilocksExt2>(input_tensors, Some(&mut tracker), store)?;
+            model.run_with_tracker::<GoldilocksExt2>(input_tensors, &mut tracker, store)?;
             nsamples += 1;
         }
         info!("InferenceObserver: {} total samples observed", nsamples);
@@ -145,12 +146,15 @@ impl ScalingStrategy for InferenceObserver {
         let num_model_inputs = unpadded_input_shapes.len();
         let input_scaling = (0..num_model_inputs)
             .map(|i| {
-                let (input_min, input_max) = tracker
-                    .scaling_range(INPUT_TRACKING_ID.output_at(i))
-                    .unwrap();
-                ScalingFactor::from_absolute_max(input_min.abs().max(input_max.abs()), None)
+                let input_node_id = model.graph.input_node_id(i)?;
+                let (input_min, input_max) =
+                    tracker.scaling_range(input_node_id.output_at(0)).unwrap();
+                Ok(ScalingFactor::from_absolute_max(
+                    input_min.abs().max(input_max.abs()),
+                    None,
+                ))
             })
-            .collect_vec();
+            .collect::<Result<Vec<_>>>()?;
         quantize_model::<InferenceObserver>(model, tracker, input_scaling)
     }
 
@@ -261,13 +265,16 @@ impl InferenceTracker {
             intermediate_data_trackers: HashMap::new(),
         }
     }
-    pub(crate) fn track(&mut self, output: NodeOutput, data: &Tensor<f32>) {
+    pub(crate) fn track<N>(&mut self, output: NodeOutput, tensor: &WrappedTensor<N>)
+    where
+        N: TensorTypeParam,
+    {
         let accumulator = self
             .accumulators
             .entry(output)
             .or_insert_with(|| self.mode.new_accumulator());
-        for x in data.get_data() {
-            accumulator.add(*x as f64);
+        for el in N::tensor_to_float(tensor.clone()).get_data() {
+            accumulator.add(el as f64);
         }
     }
 

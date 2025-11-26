@@ -70,7 +70,7 @@ pub struct TrackedDataId(String);
 pub struct LayerOut<T: TensorTypeParam, E: ExtensionField> {
     pub(crate) outputs: Vec<WrappedTensor<T>>,
     pub(crate) proving_data: ProvingData<E>,
-    pub(crate) tracked_layer_data: Option<HashMap<TrackedDataId, WrappedTensor<T>>>,
+    pub(crate) tracked_layer_data: HashMap<TrackedDataId, WrappedTensor<T>>,
 }
 
 impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
@@ -78,7 +78,7 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
         Self {
             outputs: out,
             proving_data: ProvingData::None,
-            tracked_layer_data: None,
+            tracked_layer_data: Default::default(),
         }
     }
 
@@ -96,7 +96,7 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
     ) -> (
         Vec<WrappedTensor<T>>,
         ProvingData<E>,
-        Option<HashMap<TrackedDataId, WrappedTensor<T>>>,
+        HashMap<TrackedDataId, WrappedTensor<T>>,
     ) {
         (self.outputs, self.proving_data, self.tracked_layer_data)
     }
@@ -110,7 +110,7 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
         Self {
             outputs: self.outputs,
             proving_data: self.proving_data,
-            tracked_layer_data: Some(data),
+            tracked_layer_data: data,
         }
     }
 

@@ -18,7 +18,7 @@ use crate::{
         llm::{LLMConfig, Token, models::LLMModelLoader},
         to_quantized,
     },
-    quantization::{InferenceObserver, InferenceTracker, IntoElement},
+    quantization::{InferenceObserver, InferenceTracker, InferenceTrackingMode, IntoElement},
     tensor::TensorTypeParam,
     verify,
 };
@@ -196,14 +196,15 @@ impl Driver<f32> {
     where
         E: ExtensionField,
     {
-        self.run_with_tracker(input, store, None)
+        let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
+        self.run_with_tracker(input, store, &mut tracker)
     }
 
     pub fn run_with_tracker<E>(
         &self,
         input: &[Token],
         store: &mut GenStore,
-        tracker: Option<&mut InferenceTracker>,
+        tracker: &mut InferenceTracker,
     ) -> anyhow::Result<Trace<E, f32>>
     where
         E: ExtensionField,
@@ -264,7 +265,7 @@ where
         &self,
         input: Vec<Token>,
         store: &mut GenStore,
-        mut tracker: Option<&mut InferenceTracker>,
+        tracker: &mut InferenceTracker,
     ) -> anyhow::Result<Trace<E, N>>
     where
         E: ExtensionField,
@@ -312,30 +313,13 @@ where
             let trace = if let PaddingMode::NoPadding = self.padding_mode {
                 self.model
                     // TODO: make it re-usable at least for the static weights
-                    .run_with_tracker::<E>(
-                        vec![tensor.clone()],
-                        // HACK: to not consume the option on repeated
-                        if let Some(ref mut t) = tracker {
-                            Some(*t)
-                        } else {
-                            None
-                        },
-                        store,
-                    )
+                    .run_with_tracker::<E>(vec![tensor.clone()], tracker, store)
             } else {
                 let unpadded_shape = tensor.shape().clone();
                 let padded = tensor.pad_next_power_of_two();
                 info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
-                self.model.run_with_tracker::<E>(
-                    vec![padded],
-                    // HACK: to not consume the option on repeated
-                    if let Some(ref mut t) = tracker {
-                        Some(*t)
-                    } else {
-                        None
-                    },
-                    store,
-                )
+                self.model
+                    .run_with_tracker::<E>(vec![padded], tracker, store)
             }
             .with_context(|| format!("runng the {} iteration loop", unpadded_seq_len - user_len))?;
             ensure!(
@@ -404,7 +388,8 @@ impl Driver<Element> {
     where
         E: ExtensionField,
     {
-        self.run_internal::<E>(input, store, None)
+        let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
+        self.run_internal::<E>(input, store, &mut tracker)
     }
 
     pub fn run_with_tracker<E>(
@@ -416,7 +401,7 @@ impl Driver<Element> {
     where
         E: ExtensionField,
     {
-        self.run_internal::<E>(input, store, Some(tracker))
+        self.run_internal::<E>(input, store, tracker)
     }
 
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.

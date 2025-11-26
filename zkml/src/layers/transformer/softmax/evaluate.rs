@@ -124,13 +124,13 @@ impl Softmax<Element> {
             Ok(LayerOut {
                 outputs: vec![output_tensor.pad_next_power_of_two()],
                 proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
-                tracked_layer_data: None,
+                tracked_layer_data: Default::default(),
             })
         } else {
             Ok(LayerOut {
                 outputs: vec![output_tensor],
                 proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
-                tracked_layer_data: None,
+                tracked_layer_data: Default::default(),
             })
         }
     }
