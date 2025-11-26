@@ -1,11 +1,15 @@
-#![allow(clippy::print_stdout)]
-use anyhow::{anyhow, ensure};
+use anyhow::{ensure};
+use zkml::ProverContext;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use std::collections::HashMap;
 use tenstore::GenStore;
 use transcript::BasicTranscript;
+use zkml::iop::chunking::ChunkingStrategy;
+use crate::Tensor;
+use zkml::Proof;
+use zkml::IO;
 use zkml::{
     Element,
     graph::{
@@ -13,58 +17,41 @@ use zkml::{
         partition::{Partition, PartitionScheduler},
         scheduler::ExecGraph,
     },
-    inputs::Input,
-    iop::{
-        chunking::DefaultChunkingStrategy,
-        distributed_graph::{
-            ExecGraphNode, SerializableGraphCtx, build_execution_graph, extract_graph_outputs,
-            graph_inputs,
+    model::{
+        exec_graph::{
+            ExecGraphNode, InferenceEngine, SerializableGraphCtx, build_execution_graph,
+            extract_graph_outputs, graph_inputs,
         },
     },
-    model::Model,
-    parser::onnx::FloatOnnxLoader,
-    quantization::InferenceObserver,
-    verify,
 };
 
-type F = GoldilocksExt2;
+pub type F = GoldilocksExt2;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
-type Pcs = Basefold<F, BasefoldRSParams>;
+pub type Pcs = Basefold<F, BasefoldRSParams>;
 
-type T = BasicTranscript<F>;
+pub type T = BasicTranscript<F>;
 
 // Type of nodes of the graph to execute
-type Node<'a, 'b> = ExecGraphNode<'a, 'b, F, T, Pcs>;
+pub type Node<'a, 'b> = ExecGraphNode<'a, 'b, F, T, Pcs>;
 
 // Type of execution graph to be partitioned and executed in the workers
-type Graph<'a, 'b> = ExecGraph<Node<'a, 'b>, Color>;
+pub type Graph<'a, 'b> = ExecGraph<Node<'a, 'b>, Color>;
 
 // Color is used to create the partitions, assign different nodes to different workers.
 // It can be usize or any other type such as IP address etc.
-type Color = usize;
+pub type Color = usize;
 
 /// What a partition scheduler outputs
-type PartitionOutput<'a, 'b> = zkml::graph::partition::PartitionOutput<Node<'a, 'b>, Color>;
+pub type PartitionOutput<'a, 'b> = zkml::graph::partition::PartitionOutput<Node<'a, 'b>, Color>;
 
-type SerializableCtx = SerializableGraphCtx<F, Pcs>;
+pub type SerializableCtx = SerializableGraphCtx<F, Pcs>;
 
-// Implement a serializer for the chunk data structures.
-// We need to implement `ToBytes` and `FromBytes` traits
-// for types that implement `Serialize/DeserializeOwned`,
-// employing the desired serialization library.
-// In this example, we use bincode.
-// struct BincodeSerializer;
-
-fn build_model<T: std::io::Read>(
-    model_data: &[u8],
-    inputs: T,
-) -> anyhow::Result<(Model<Element>, Vec<Vec<Element>>)> {
-    let run_inputs = Input::from_reader(inputs).expect("failed to load inputs");
-    let (model, md) =
-        FloatOnnxLoader::from_bytes_with_scaling_strategy(model_data, InferenceObserver::new())
-            .with_keep_float(true)
-            .build()?;
-    Ok((model, run_inputs.to_elements(&md)))
+pub trait GraphRuner {
+    type ChunkingStrategy: ChunkingStrategy;
+    #[allow(clippy::type_complexity)]
+    fn setup(&mut self) -> anyhow::Result<(ProverContext<F, Pcs>,InferenceEngine, Vec<Tensor<Element>>)>;
+    fn chunk_strategy(&self) -> Self::ChunkingStrategy;
+    fn verify_proof(&self, proof: Proof<F,Pcs>, io: IO<F>) -> anyhow::Result<()>;
 }
 
 #[allow(clippy::type_complexity)]
@@ -130,43 +117,30 @@ pub fn run_node(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    let num_workers = 6;
+pub fn main_loop<R: GraphRuner>(num_workers: usize,mut runner: R) -> anyhow::Result<()> 
+{
     use tracing_subscriber::EnvFilter;
-
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     // ------------------------------
     //          COORDINATOR
     // ------------------------------
-    let (model, mut inputs) = build_model(
-        include_bytes!("../assets/scripts/CNN/cnn-cifar-01.onnx"),
-        zstd::Decoder::new(&include_bytes!("../assets/scripts/CNN/input.json.zst")[..])
-            .expect("failed to parse zstd"),
-    )?;
-    println!("model: # nodes: {}", model.graph.inner_nodes_count());
-
-    let input = inputs.pop().ok_or(anyhow!("Expected at least one input"))?;
-
-    let (prover_ctx, verifier_ctx) = model
-        .generate_contexts::<F, Pcs>()
-        .expect("unable to generate context");
-
-    let input_tensor = model.load_input_flat(vec![input])?;
+    let (pk, engine, inputs) = runner.setup()?;
+    println!("model: # nodes: {}", engine.model().graph.inner_nodes_count());
 
     let store = GenStore::default();
 
     // build the context for the executor
     // THIS should be loaded from the disk / local file / with some custom creation logic
     //  e.g. to instantiate the trace over the network for example
-    let deserialized_ctx = SerializableGraphCtx::new(prover_ctx, model);
+    let deserialized_ctx = SerializableGraphCtx::new(pk, engine);
     // the full context is not deserializable since it contains the store, so we need to build it
     // from the deserialized context by attaching the store
     let ctx = deserialized_ctx.to_full_ctx(store.clone());
     let graph: Graph =
-        build_execution_graph(&ctx, Some(num_workers), DefaultChunkingStrategy::default())?;
+        build_execution_graph(&ctx, Some(num_workers), runner.chunk_strategy())?;
 
-    let inputs = graph_inputs(input_tensor, store.clone(), &graph)?;
+    let inputs = graph_inputs(inputs, store.clone(), &graph)?;
 
     ensure!(
         inputs.len() == 1,
@@ -245,7 +219,7 @@ fn main() -> anyhow::Result<()> {
         outputs.len()
     );
     let (proof, io) = extract_graph_outputs(outputs)?;
-    verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
+    runner.verify_proof(proof, io).unwrap();
     println!("Done");
     Ok(())
 }

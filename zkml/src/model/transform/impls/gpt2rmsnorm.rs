@@ -677,11 +677,12 @@ mod tests {
         let (prover_ctx, verifier_ctx) = driver
             .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
             .with_max_context(max_context);
+        let io = trace.to_verifier_io()?;
         let proof = driver.prove(&prover_ctx, trace)?;
         let proof_bytes =
             bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
         tracing::info!("Proof size: {}", proof_bytes.len());
-        verifier_ctx.verify(proof, user_tokens)?;
+        verifier_ctx.verify(proof, user_tokens, io)?;
         Ok(())
     }
 }

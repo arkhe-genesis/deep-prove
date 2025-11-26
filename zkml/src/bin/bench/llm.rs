@@ -8,7 +8,8 @@ use tenstore::GenStore;
 use timed_core::Output;
 use tracing_subscriber::EnvFilter;
 use zkml::{
-    model::llm::{LLMProverContext, LLMVerifierContext},
+    ProverContext,
+    model::llm::LLMVerifierContext,
     parser::{file_cache, gguf::RawGGUF, llm::models::gpt2::GPT2},
 };
 
@@ -81,7 +82,7 @@ fn main() -> anyhow::Result<()> {
         HEADER_MODEL_QUANT,
     ]);
     let driver = bencher.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
-    let (prover_ctx, verifier_ctx): (LLMProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
+    let (prover_ctx, verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
         bencher.r(HEADER_CONTEXT_TIME, || driver.context())?;
 
     bencher.set(HEADER_MODEL, args.model);
@@ -94,11 +95,11 @@ fn main() -> anyhow::Result<()> {
         let trace = bencher.r(HEADER_INFERENCE_TIME, || {
             driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut GenStore::default())
         })?;
-
+        let io = trace.to_verifier_io()?;
         let proof = bencher.r(HEADER_PROOF_TIME, || driver.prove(&prover_ctx, trace))?;
         bencher.r(HEADER_VERIFY_TIME, || {
             verifier_ctx
-                .verify(proof, user_tokens)
+                .verify(proof, user_tokens, io)
                 .expect("invalid proof")
         });
         bencher.flush(&args.output)?;

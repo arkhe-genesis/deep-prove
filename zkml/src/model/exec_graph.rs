@@ -18,7 +18,8 @@ use crate::{
         chunking::ChunkingStrategy,
         prover_graph::{LocalProverCtx, ProverGraphIO, ProverGraphNode},
     },
-    model::Model,
+    model::{Model, Trace, llm::Driver},
+    quantization::{InferenceTracker, InferenceTrackingMode},
 };
 
 /// Context for the execution graph used for distributed proving
@@ -40,6 +41,45 @@ where
     }
 }
 
+/// This crate supports running generic models (CNNs, MLPs, etc) and auto regressive models (LLMs).
+/// This enum reflects the different types of inference required to support these use cases.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum InferenceEngine {
+    Generic(Model<Element>),
+    LLM(Driver<Element>),
+}
+
+impl InferenceEngine {
+    pub fn run<E: ExtensionField>(
+        &self,
+        mut input: Vec<Tensor<Element>>,
+        store: &mut GenStore,
+    ) -> anyhow::Result<Trace<E, Element>> {
+        match self {
+            InferenceEngine::Generic(model) => model.run(input, store),
+            InferenceEngine::LLM(driver) => {
+                ensure!(
+                    input.len() == 1,
+                    "LLM inference only supports one sequnce of tokens - batch inference is not supported"
+                );
+                let input = input.pop().unwrap().into_data();
+                // just because we always run with a tracker
+                let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
+                driver.run_elements(input, store, &mut tracker)
+            }
+        }
+    }
+
+    /// Necessary to return the raw model when doing the proving - as proving is the same
+    /// for both generic and LLM models
+    pub fn model(&self) -> &Model<Element> {
+        match self {
+            InferenceEngine::Generic(model) => model,
+            InferenceEngine::LLM(driver) => &driver.model,
+        }
+    }
+}
+
 /// Serializable version of the execution graph context.
 /// Once deserialized, this structure can be converted to the full `ExecGraphCtx` to
 /// be used to run the execution graph
@@ -50,15 +90,15 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub(crate) ctx: ProverContext<E, PCS>,
-    pub(crate) model: Model<Element>,
+    pub(crate) engine: InferenceEngine,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SerializableGraphCtx<E, PCS>
 where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
-    pub fn new(ctx: ProverContext<E, PCS>, model: Model<Element>) -> Self {
-        Self { ctx, model }
+    pub fn new(ctx: ProverContext<E, PCS>, engine: InferenceEngine) -> Self {
+        Self { ctx, engine }
     }
 
     /// Build the full execution graph context from `SerializableGraphCtx`,
@@ -180,7 +220,7 @@ where
                 let ExecGraphIO::InferenceInput(mut input) = inputs.pop().unwrap() else {
                     bail!("Expected tensors as input for inference task")
                 };
-                let trace = ctx.model.run(input.input_tensors, &mut input.store)?;
+                let trace = ctx.engine.run(input.input_tensors, &mut input.store)?;
                 let io = trace.to_verifier_io()?;
                 Ok(vec![
                     ExecGraphIO::Prover(ProverGraphIO::ProverSplitInput(trace)),
@@ -188,7 +228,7 @@ where
                 ])
             }
             ExecGraphNode::Prover(generic_exec_graph_node) => {
-                let local_ctx = LocalProverCtx::new(&ctx.ctx, &ctx.model);
+                let local_ctx = LocalProverCtx::new(&ctx.ctx, ctx.engine.model());
                 Ok(generic_exec_graph_node
                     .run(
                         &local_ctx,
@@ -335,14 +375,14 @@ mod tests {
             executor::Executor,
             scheduler::{ExecNode, GraphScheduler, ReadyNode, ReleasePolicy},
         },
-        iop::{
-            chunking::DefaultChunkingStrategy,
-            distributed_graph::{
-                ExecGraphCtx, SerializableGraphCtx, build_execution_graph, extract_graph_outputs,
-                graph_inputs,
+        iop::chunking::DefaultChunkingStrategy,
+        model::{
+            Model,
+            exec_graph::{
+                ExecGraphCtx, InferenceEngine, SerializableGraphCtx, build_execution_graph,
+                extract_graph_outputs, graph_inputs,
             },
         },
-        model::Model,
         testing::Pcs,
         verify,
     };
@@ -485,7 +525,10 @@ mod tests {
         let store: GenStore = Default::default();
         let num_chunks = Some(3);
         let ctx = ExecGraphCtx {
-            serializable_ctx: SerializableGraphCtx::new(prover_ctx, model),
+            serializable_ctx: SerializableGraphCtx::new(
+                prover_ctx,
+                InferenceEngine::Generic(model),
+            ),
             store: store.clone(),
         };
         let graph = build_execution_graph::<_, T, _, _>(

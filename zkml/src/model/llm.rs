@@ -39,34 +39,8 @@ use crate::{
     number::Number,
 };
 
-/// The main struct responsible for LLM proving.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct LLMProverContext<E, PCS>
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    pub prover_ctx: ProverContext<E, PCS>,
-    pub config: LLMConfig,
-    pub max_context: Option<usize>,
-}
-
 pub trait WithMaxContext {
     fn with_max_context(self, max_context: usize) -> Self;
-}
-
-impl<E, PCS> WithMaxContext for LLMProverContext<E, PCS>
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    fn with_max_context(mut self, max_context: usize) -> Self {
-        self.max_context = Some(max_context);
-        self
-    }
 }
 
 /// The main struct responsible to verify an LLM proof.
@@ -95,17 +69,14 @@ where
     }
 }
 
-impl<E, PCS> WithMaxContext for (LLMProverContext<E, PCS>, LLMVerifierContext<E, PCS>)
+impl<E, PCS> WithMaxContext for (ProverContext<E, PCS>, LLMVerifierContext<E, PCS>)
 where
     E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     fn with_max_context(self, max_context: usize) -> Self {
-        (
-            self.0.with_max_context(max_context),
-            self.1.with_max_context(max_context),
-        )
+        (self.0, self.1.with_max_context(max_context))
     }
 }
 
@@ -258,12 +229,12 @@ where
             .collect()
     }
 
-    /// Runs take the _already_ tokenized input and run the model until the
+    /// Runs take the _already_ tokenized input turned into row elements and run the model until the
     /// maximum sequence length is reached OR until a eos token is generated.
     /// The returned trace contains the _whole_ sequence.
-    fn run_internal<E>(
+    pub fn run_elements<E>(
         &self,
-        input: Vec<Token>,
+        input_tensor: Vec<N>,
         store: &mut GenStore,
         tracker: &mut InferenceTracker,
     ) -> anyhow::Result<Trace<E, N>>
@@ -271,24 +242,20 @@ where
         E: ExtensionField,
     {
         let eos_token: N = self.config.eos_token.as_tensor_type_param();
-        let user_len = input.len();
+        let user_len = input_tensor.len();
         // -1 because we at least want to generate ONE token
         ensure!(
             user_len < self.config.context_length - 1,
             "Input sequence length must be less than the context length"
         );
-        let input_tokens = input
-            .into_iter()
-            .map(|t| t.as_tensor_type_param::<N>())
-            .collect::<Vec<_>>();
 
-        let mut tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
+        let mut tensor = Tensor::new(vec![input_tensor.len()].into(), input_tensor.clone())?;
         let max_window = self.max_context.unwrap_or(self.config.context_length);
         ensure!(
-            input_tokens.len() < max_window,
+            input_tensor.len() < max_window,
             "max window {} is smaller than prompt token count {}",
             max_window,
-            input_tokens.len()
+            input_tensor.len()
         );
 
         ensure!(
@@ -349,7 +316,7 @@ where
         // the correct padding
         full_tokens.pop();
         // and we take only the part that corresponds to the _generated_ tokens
-        full_tokens.splice(..user_len, input_tokens);
+        full_tokens.splice(..user_len, input_tensor);
         let input_len = full_tokens.len();
         tensor = Tensor::new(Shape::new(vec![input_len]), full_tokens.clone())?;
         // 2. padding: we pad the input to the expected shape of the model
@@ -388,8 +355,12 @@ impl Driver<Element> {
     where
         E: ExtensionField,
     {
+        let input_tokens = input
+            .into_iter()
+            .map(|t| t.as_tensor_type_param::<Element>())
+            .collect::<Vec<_>>();
         let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
-        self.run_internal::<E>(input, store, &mut tracker)
+        self.run_elements::<E>(input_tokens, store, &mut tracker)
     }
 
     pub fn run_with_tracker<E>(
@@ -401,7 +372,11 @@ impl Driver<Element> {
     where
         E: ExtensionField,
     {
-        self.run_internal::<E>(input, store, tracker)
+        let input_tokens = input
+            .into_iter()
+            .map(|t| t.as_tensor_type_param::<Element>())
+            .collect::<Vec<_>>();
+        self.run_elements::<E>(input_tokens, store, tracker)
     }
 
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
@@ -410,7 +385,7 @@ impl Driver<Element> {
     /// entry `HashMap` returned by this method identified by the key `self.get_max_poly_size_for_input(input_len)`
     pub fn compute_all_contexts<E, PCS>(
         &self,
-    ) -> anyhow::Result<(LLMProverContext<E, PCS>, LLMVerifierContext<E, PCS>)>
+    ) -> anyhow::Result<(ProverContext<E, PCS>, LLMVerifierContext<E, PCS>)>
     where
         E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
@@ -432,11 +407,7 @@ impl Driver<Element> {
             .model
             .generate_contexts_for_input_shapes(max_input_shapes)?;
         Ok((
-            LLMProverContext {
-                prover_ctx,
-                config: self.config.clone(),
-                max_context: self.max_context,
-            },
+            prover_ctx,
             LLMVerifierContext {
                 verifier_ctx,
                 config: self.config.clone(),
@@ -448,7 +419,7 @@ impl Driver<Element> {
     /// Create the prover & verifier for a given model
     pub fn context<E, PCS>(
         &self,
-    ) -> anyhow::Result<(LLMProverContext<E, PCS>, LLMVerifierContext<E, PCS>)>
+    ) -> anyhow::Result<(ProverContext<E, PCS>, LLMVerifierContext<E, PCS>)>
     where
         E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
@@ -460,11 +431,7 @@ impl Driver<Element> {
         );
         let (prover_ctx, verifier_ctx) = self.model.generate_contexts()?;
         Ok((
-            LLMProverContext {
-                prover_ctx,
-                config: self.config.clone(),
-                max_context: self.max_context,
-            },
+            prover_ctx,
             LLMVerifierContext {
                 verifier_ctx,
                 config: self.config.clone(),
@@ -476,12 +443,12 @@ impl Driver<Element> {
 
     fn chunked_prove_local<'a, 'b, S, E, PCS, Ex>(
         &'a self,
-        ctx: &'b LLMProverContext<E, PCS>,
+        ctx: &'b ProverContext<E, PCS>,
         trace: Trace<E, Element>,
         num_chunks: Option<usize>,
         chunking_strategy: S,
         executor_config: Ex::Config,
-    ) -> anyhow::Result<LLMProof<E, PCS>>
+    ) -> anyhow::Result<Proof<E, PCS>>
     where
         S: ChunkingStrategy,
         E: ExtensionField,
@@ -490,10 +457,9 @@ impl Driver<Element> {
         PCS::ProverParam: Send + Sync,
         Ex: Executor<ProverGraphNode<'b, 'a, E, BasicTranscript<E>, PCS>, usize>,
     {
-        let io = trace.to_verifier_io()?;
         info!("Proving the trace");
         let proof = Prover::<E, BasicTranscript<E>, PCS>::chunked_prove_local::<_, Ex>(
-            &ctx.prover_ctx,
+            ctx,
             trace,
             num_chunks,
             chunking_strategy,
@@ -502,18 +468,18 @@ impl Driver<Element> {
         )
         .expect("unable to generate proof");
         info!("Proof generated");
-        Ok(LLMProof { proof, io })
+        Ok(proof)
     }
 
     /// Utility method to run `chunked_prove_local` with a predefined executor
     #[cfg(test)]
     pub(crate) fn chunked_prove_default_executor<S, E, PCS>(
         &self,
-        ctx: &LLMProverContext<E, PCS>,
+        ctx: &ProverContext<E, PCS>,
         trace: Trace<E, Element>,
         num_chunks: Option<usize>,
         chunking_strategy: S,
-    ) -> anyhow::Result<LLMProof<E, PCS>>
+    ) -> anyhow::Result<Proof<E, PCS>>
     where
         S: ChunkingStrategy,
         E: ExtensionField,
@@ -534,9 +500,9 @@ impl Driver<Element> {
 
     pub fn prove<E, PCS>(
         &self,
-        ctx: &LLMProverContext<E, PCS>,
+        ctx: &ProverContext<E, PCS>,
         trace: Trace<E, Element>,
-    ) -> anyhow::Result<LLMProof<E, PCS>>
+    ) -> anyhow::Result<Proof<E, PCS>>
     where
         E: ExtensionField,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
@@ -559,12 +525,22 @@ where
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
-    pub fn verify(&self, proof: LLMProof<E, PCS>, user_input: Vec<Token>) -> anyhow::Result<()>
+    pub fn verify(
+        &self,
+        proof: Proof<E, PCS>,
+        user_input: Vec<Token>,
+        inference_output: IO<E>,
+    ) -> anyhow::Result<()>
     where
         PCS::Commitment: PartialEq + Eq,
     {
+        ensure!(
+            inference_output.output.len() == 1,
+            "Expected 1 output tensor, found {}",
+            inference_output.output.len()
+        );
         // 0. check the size of the output
-        let output = proof.io.output[0].clone();
+        let output = inference_output.output[0].clone();
         let padded_max_len = output.shape().numel();
         let max_window = self.max_context.unwrap_or(self.config.context_length);
 
@@ -588,9 +564,9 @@ where
         };
 
         // 1. verify the proof it self
-        let prover_input = proof.io.input[0].clone();
-        let prover_output = proof.io.output[0].clone();
-        verify::<_, BasicTranscript<E>, _>(&self.verifier_ctx, proof.proof, proof.io)?;
+        let prover_input = inference_output.input[0].clone();
+        let prover_output = inference_output.output[0].clone();
+        verify::<_, BasicTranscript<E>, _>(&self.verifier_ctx, proof, inference_output)?;
         // 2. verify the sequentiality of the output: from the first newly generated token to the last
         // but without including the padding.
         // output is [seq_len] where []
@@ -622,8 +598,8 @@ where
 mod test {
     use crate::{
         Number, init_test_logging,
-        iop::chunking::LLMChunkingStrategy,
-        model::llm::{Driver, LLMProverContext, LLMVerifierContext, WithMaxContext},
+        iop::{ProverContext, chunking::LLMChunkingStrategy},
+        model::llm::{Driver, LLMVerifierContext, WithMaxContext},
         parser::{
             file_cache,
             gguf::{RawGGUF, TensorLoader},
@@ -666,7 +642,7 @@ mod test {
         #[allow(clippy::type_complexity)]
         let (driver, prover_ctx, verifier_ctx): (
             _,
-            LLMProverContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
+            ProverContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
             LLMVerifierContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
         ) = file_cache::deserialize_or_create_with(&cache_filename, || {
             let driver = Driver::load_from_model(
@@ -696,11 +672,12 @@ mod test {
         } else {
             Some(1) // equivalent to sequential proving
         };
+        let io = trace.to_verifier_io()?;
         let proof = driver.chunked_prove_default_executor(
             &prover_ctx,
             trace,
             num_provers,
-            LLMChunkingStrategy::default(),
+            LLMChunkingStrategy,
         )?;
 
         // Serialize the proof
@@ -712,7 +689,7 @@ mod test {
         );
 
         // Verify the proof
-        verifier_ctx.verify(proof, user_tokens)?;
+        verifier_ctx.verify(proof, user_tokens, io)?;
         Ok(())
     }
 
@@ -729,9 +706,10 @@ mod test {
 
     #[test]
     fn test_llm_driver_inference() -> anyhow::Result<()> {
-        init_test_logging("debug");
+        init_test_logging("info");
         const PRUNED_GPT2: &str = "gpt2.Q2_K.gguf";
         let model_path = file_cache::from_cache(PRUNED_GPT2)?;
+        println!("model path: {:?}", model_path);
 
         // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
         let driver = Driver::load_from_model(GPT2, &RawGGUF::new(model_path.clone()), Some(10))?
@@ -837,7 +815,7 @@ mod test {
         #[allow(clippy::type_complexity)]
         let (driver, prover_ctx, verifier_ctx): (
             _,
-            LLMProverContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
+            ProverContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
             LLMVerifierContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
         ) = file_cache::deserialize_or_create_with(&cache_filename, || {
             let gguf = RawGGUF::new(model_path.clone());
@@ -863,11 +841,12 @@ mod test {
 
         // Prove the trace
         let num_provers = Some(rng_from_env_or_random().gen_range(1..6));
+        let io = trace.to_verifier_io()?;
         let proof = driver.chunked_prove_default_executor(
             &prover_ctx,
             trace,
             num_provers,
-            LLMChunkingStrategy::default(),
+            LLMChunkingStrategy,
         )?;
 
         // Serialize the proof
@@ -879,7 +858,7 @@ mod test {
         );
 
         // Verify the proof
-        verifier_ctx.verify(proof, user_tokens)?;
+        verifier_ctx.verify(proof, user_tokens, io)?;
         Ok(())
     }
 

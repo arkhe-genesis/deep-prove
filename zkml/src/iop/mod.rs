@@ -22,7 +22,6 @@ pub mod chunking;
 pub mod claim;
 pub mod context;
 pub use context::ProverContext;
-pub mod distributed_graph;
 pub mod prover;
 pub mod prover_graph;
 pub mod verifier;

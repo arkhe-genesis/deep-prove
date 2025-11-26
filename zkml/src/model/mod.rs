@@ -23,6 +23,7 @@ use tenstore::{GenStore, GenericStore, StorageKey};
 use tracing::{info, warn};
 
 mod context;
+pub mod exec_graph;
 pub mod llm;
 pub(crate) mod trace;
 pub mod transform;

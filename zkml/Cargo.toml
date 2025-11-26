@@ -132,8 +132,12 @@ harness = false
 name = "tensor"
 
 [[example]]
-name = "chunk-prover"
-path = "examples/chunk_prover.rs"
+name = "chunk-cifar"
+path = "examples/chunk_cifar.rs"
+
+[[example]]
+name = "chunk-llm"
+path = "examples/chunk_llm.rs"
 
 [lints.clippy]
 dbg_macro = "deny"

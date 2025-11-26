@@ -895,7 +895,7 @@ impl ChunkingStrategy for DefaultChunkingStrategy {
 /// enough attention layers to have an high enough number of
 /// chunks
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct LLMChunkingStrategy(());
+pub struct LLMChunkingStrategy;
 
 impl LLMChunkingStrategy {
     fn add_nodes<'a, E: ExtensionField>(
@@ -1127,12 +1127,10 @@ mod test {
             Ok(ctx)
         })?;
 
-        let strategy = LLMChunkingStrategy(());
+        let strategy = LLMChunkingStrategy;
 
         for num_chunks in 1..50 {
-            let chunks = strategy
-                .split(&prover_ctx.prover_ctx.model_ctx, num_chunks)
-                .unwrap();
+            let chunks = strategy.split(&prover_ctx.model_ctx, num_chunks).unwrap();
 
             assert_eq!(chunks.len(), num_chunks);
         }
