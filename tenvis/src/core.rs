@@ -155,7 +155,7 @@ impl GlobalContext {
             let mut min_max_tracker_elt = InferenceTracker::new(InferenceTrackingMode::MinMax);
             let mut store_elt = GenStore::default();
             info!("preparing Element driver...");
-            let driver_elt = driver_f32.into_provable_llm(None)?;
+            let (driver_elt, _metadata) = driver_f32.into_provable_llm(None)?;
             info!("running Element model...");
             let trace_elt = driver_elt.run_with_tracker::<F>(
                 user_tokens,

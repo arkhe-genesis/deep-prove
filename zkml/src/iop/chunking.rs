@@ -1113,7 +1113,7 @@ mod test {
 
         // Generate or load the prover & verifier contexts
         let (prover_ctx, _) = file_cache::deserialize_or_create_with(&cache_filename, || {
-            let driver = Driver::load_from_model(
+            let (driver, _metadata) = Driver::load_from_model(
                 GPT2,
                 &RawGGUF::new(model_path.clone()),
                 Some(MAX_CONTEXT),

@@ -103,7 +103,9 @@ jobs:
             --skip parser::llm::models::gemma3::tests::test_gguf_gemma3_logits \
             --skip parser::llm::models::gemma3::tests::test_safe_gemma3_intermediates \
             --skip layers::einsum::evaluate::tests::test_cached_qkv \
-            --skip model::transform::impls::gpt2rmsnorm::tests::test_mean_subtracted_tensor
+            --skip model::transform::impls::gpt2rmsnorm::tests::test_mean_subtracted_tensor \
+            --skip model::llm::test::test_llm_driver_int_inference_gemma3 \
+            --skip parser::llm::models::gpt2::tests::test_safe_gpt2_load_model
         env:
           IN_CI: "true"
 
@@ -115,6 +117,8 @@ jobs:
           LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda" \
           cargo nextest run --features cuda --test-threads 1 -- \
             parser::llm::models::gemma3::safe_tests::test_safe_gemma3_load_model \
-            parser::llm::models::gemma3::tests::test_gguf_gemma3_load_model
+            parser::llm::models::gemma3::tests::test_gguf_gemma3_load_model \
+            model::llm::test::test_llm_driver_int_inference_gemma3 \
+            parser::llm::models::gpt2::tests::test_safe_gpt2_load_model
         env:
           IN_CI: "true"

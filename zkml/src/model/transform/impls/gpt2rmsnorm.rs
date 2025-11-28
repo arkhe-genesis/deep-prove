@@ -672,8 +672,9 @@ mod tests {
         // Rewrite the model by applying our transformation rule
         let conf = default_pipeline_config().with_float_rules(vec![Box::new(GPT2RMSNorm)]);
 
-        let driver = driver.into_provable_llm(Some(conf))?;
+        let (driver, _metadata) = driver.into_provable_llm(Some(conf))?;
         let trace = driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut GenStore::default())?;
+
         let (prover_ctx, verifier_ctx) = driver
             .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
             .with_max_context(max_context);

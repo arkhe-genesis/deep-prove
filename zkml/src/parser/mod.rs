@@ -5,8 +5,10 @@ pub mod onnx;
 pub mod safe;
 
 use crate::{
-    Element, ScalingStrategy, Shape, model::Model, padding::pad_model,
-    quantization::InferenceObserver,
+    Element, ScalingStrategy, Shape,
+    model::Model,
+    padding::pad_model,
+    quantization::{InferenceObserver, ModelMetadata},
 };
 
 use crate::model::transform::ModelTransform;
@@ -83,7 +85,7 @@ pub trait Load<Loader> {
 pub fn to_quantized<S: ScalingStrategy>(
     mut model: Model<f32>,
     mut pipeline_config: PipelineConfig<S>,
-) -> anyhow::Result<Model<Element>> {
+) -> anyhow::Result<(Model<Element>, ModelMetadata)> {
     // 1. set the input shapes
     if let Some(input_shapes) = pipeline_config.input_shapes.take() {
         model.input_shapes = input_shapes.clone();
@@ -103,8 +105,7 @@ pub fn to_quantized<S: ScalingStrategy>(
         model = rule.apply(model)?;
     }
     // 3. quantize the model into Elements
-    // NOTE: we could return but is it useful ?
-    let (mut quantized_model, _md) = if let Some(strategy) = pipeline_config.quant_strategy {
+    let (mut quantized_model, metadata) = if let Some(strategy) = pipeline_config.quant_strategy {
         strategy.quantize(model, store)?
     } else {
         default_strategy.quantize(model, store)?
@@ -115,7 +116,7 @@ pub fn to_quantized<S: ScalingStrategy>(
     }
     // 5. pad the model
     let padded_model = pad_model(quantized_model)?;
-    Ok(padded_model)
+    Ok((padded_model, metadata))
 }
 
 // Module for caching downloaded files

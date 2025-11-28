@@ -58,7 +58,7 @@ impl GraphRuner for GPT2Runner {
     fn setup(
         &mut self,
     ) -> anyhow::Result<(ProverContext<F, Pcs>, InferenceEngine, Vec<Tensor<Element>>)> {
-        let driver =
+        let (driver, _metadata) =
             Driver::load_from_model(GPT2, &RawGGUF::new(self.gguf_path.clone()), Some(10))?
                 .into_provable_llm(None)?;
         let input_tensor = Tensor::new(

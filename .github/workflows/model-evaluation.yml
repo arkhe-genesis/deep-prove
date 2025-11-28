@@ -1,0 +1,113 @@
+name: Model Evaluation
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'zkml/**'
+      - '.github/workflows/model-evaluation.yml'
+
+jobs:
+  evaluate-models:
+    name: Evaluate ZKML Models
+    runs-on: ['nix']
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Sanity check
+        if: always()
+        run: |
+          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          clean: "false"
+          lfs: "true"
+
+      - name: Force-check LFS
+        run: git lfs pull
+
+      - name: Clean devenv state
+        run: |
+          rm -rf .devenv/state/venv
+          echo "Cleaned Python virtual environment"
+
+      - name: Evaluate Gemma-3 (Single Token Generation)
+        id: eval-gemma3-with-gen
+        shell: devenv shell bash -- -e {0}
+        run: |
+          python3 zkml/assets/scripts/accuracy_evaluation/evaluate_models.py \
+            --model google/gemma-3-270m-it \
+            --dataset-sample wikitext \
+            --max-tokens 512 \
+            --generate-tokens 1 \
+            --markdown \
+            --output-file /tmp/gemma3-with-gen-results.md
+
+      - name: Evaluate GPT-2 (Single Token Generation)
+        id: eval-gpt2-with-gen
+        shell: devenv shell bash -- -e {0}
+        run: |
+          python3 zkml/assets/scripts/accuracy_evaluation/evaluate_models.py \
+            --model openai-community/gpt2 \
+            --dataset-sample wikitext \
+            --max-tokens 512 \
+            --generate-tokens 1 \
+            --markdown \
+            --output-file /tmp/gpt2-with-gen-results.md
+
+      - name: Prepare comment body
+        id: prepare-comment
+        run: |
+          echo "<!-- zkml-model-evaluation -->" > /tmp/comment.md
+          echo "## 🤖 ZKML Model Evaluation Results" >> /tmp/comment.md
+          echo "" >> /tmp/comment.md
+
+          echo "### Gemma-3 (270M) - Autoregressive Generation (512 WikiText Tokens + 1 Generated)" >> /tmp/comment.md
+          echo "" >> /tmp/comment.md
+          cat /tmp/gemma3-with-gen-results.md >> /tmp/comment.md
+          echo "" >> /tmp/comment.md
+
+          echo "### GPT-2 (124M) - Autoregressive Generation (512 WikiText Tokens + 1 Generated)" >> /tmp/comment.md
+          echo "" >> /tmp/comment.md
+          cat /tmp/gpt2-with-gen-results.md >> /tmp/comment.md
+          echo "" >> /tmp/comment.md
+
+          echo "---" >> /tmp/comment.md
+          echo "*Automated evaluation run on commit ${{ github.event.pull_request.head.sha }}*" >> /tmp/comment.md
+
+          # Read the comment into an environment variable
+          COMMENT_BODY=$(cat /tmp/comment.md)
+          echo "comment_body<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMENT_BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Find existing comment
+        uses: peter-evans/find-comment@v3
+        id: find-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- zkml-model-evaluation -->'
+
+      - name: Delete old comment
+        if: steps.find-comment.outputs.comment-id != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.deleteComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ steps.find-comment.outputs.comment-id }}
+            })
+
+      - name: Post new PR comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: ${{ steps.prepare-comment.outputs.comment_body }}

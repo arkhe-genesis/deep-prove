@@ -1,0 +1,895 @@
+#!/usr/bin/env python3
+"""
+Model Evaluation Script for Quantization Validation
+
+This script compares a Rust ZKML model against a baseline PyTorch
+HuggingFace model using three key metrics:
+1. Logit Cosine Similarity
+2. Perplexity on WikiText-103 (or custom text)
+3. Next-Token Agreement
+
+Currently supports: google/gemma-3-270m-it (safetensors format)
+
+Usage:
+    python evaluate_models.py --model google/gemma-3-270m-it --text "Hello world"
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import os
+from dataclasses import dataclass
+from itertools import islice
+from pathlib import Path
+from typing import Generator, List, NamedTuple, Tuple
+
+# Disable tokenizers parallelism to avoid fork warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from huggingface_hub import hf_hub_download
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from torchmetrics.text import Perplexity
+
+# Path configuration - script is in zkml/assets/scripts/accuracy_evaluation/
+SCRIPT_DIR = Path(__file__).parent
+ZKML_ROOT = SCRIPT_DIR.parent.parent.parent
+MODEL_CACHE_DIR = ZKML_ROOT / "model_cache"
+
+# Constants
+MIN_SAMPLE_LENGTH = 100  # Minimum text length for WikiText samples
+TYPICAL_LOGIT_RANGE = (-500, 100)  # Typical range for logits
+SMOKE_TEST_THRESHOLD_PCT = 10  # Max acceptable percentage difference for smoke tests
+SECTION_SEPARATOR = "=" * 60  # Standard section separator
+
+
+def print_section_header(title: str) -> None:
+    """Print a formatted section header."""
+    print(f"\n{SECTION_SEPARATOR}")
+    print(title)
+    print(SECTION_SEPARATOR)
+
+
+@dataclass
+class EvaluationMetrics:
+    """Container for evaluation metrics."""
+    cosine_similarity: float
+    perplexity_baseline: float
+    perplexity_test: float
+    agreement: float
+
+    @property
+    def perplexity_delta_pct(self) -> float:
+        """Compute percentage change in perplexity."""
+        return ((self.perplexity_test - self.perplexity_baseline)
+                / self.perplexity_baseline) * 100
+
+
+class ModelOutput(NamedTuple):
+    """Output from model inference."""
+    logits: np.ndarray
+    input_ids: torch.Tensor
+
+
+def compute_average_metrics(metrics_list: List[EvaluationMetrics]) -> EvaluationMetrics:
+    """
+    Compute average metrics from a list of EvaluationMetrics.
+
+    Args:
+        metrics_list: List of EvaluationMetrics objects
+
+    Returns:
+        EvaluationMetrics with averaged values
+    """
+    return EvaluationMetrics(
+        cosine_similarity=np.mean([m.cosine_similarity for m in metrics_list]),
+        perplexity_baseline=np.mean([m.perplexity_baseline for m in metrics_list]),
+        perplexity_test=np.mean([m.perplexity_test for m in metrics_list]),
+        agreement=np.mean([m.agreement for m in metrics_list]),
+    )
+
+
+def run_smoke_tests_with_warning(
+    baseline_logits: np.ndarray,
+    test_logits: np.ndarray,
+    mode_name: str
+) -> bool:
+    """
+    Run smoke tests and print warning if they fail.
+
+    Args:
+        baseline_logits: Baseline model logits
+        test_logits: Test model logits
+        mode_name: Name of the mode being tested (e.g., "Float", "Integer")
+
+    Returns:
+        True if tests pass, False otherwise
+    """
+    print(f"\n--- {mode_name} Mode Smoke Tests ---")
+    smoke_tests_passed = run_smoke_tests(baseline_logits, test_logits)
+    if not smoke_tests_passed:
+        print(f"\n⚠ Warning: {mode_name} mode smoke tests failed, but continuing with metric calculations...\n")
+    return smoke_tests_passed
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate ZKML model correctness using safetensors format"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="HuggingFace model name (e.g., 'google/gemma-2-2b-it')",
+    )
+    parser.add_argument(
+        "--text",
+        type=str,
+        default=None,
+        help="Input text for evaluation. If not provided, uses WikiText-103 sample",
+    )
+    parser.add_argument(
+        "--dataset-sample",
+        type=str,
+        default="wikitext",
+        choices=["wikitext", "custom"],
+        help="Dataset to use: 'wikitext' for WikiText-103, 'custom' for --text",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Maximum number of tokens to process for single sample (default: 512)",
+    )
+    parser.add_argument(
+        "--full-test-set",
+        action="store_true",
+        help="Evaluate on full WikiText-103 test set with sliding window (slower but proper benchmark)",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=512,
+        help="Sliding window stride for full test set evaluation (default: 512)",
+    )
+    parser.add_argument(
+        "--num-windows",
+        type=int,
+        default=100,
+        help="Number of windows to evaluate in full test set mode (default: 100, use 0 for all windows)",
+    )
+    parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="Output results in markdown format suitable for GitHub comments",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default=None,
+        help="File to write markdown output to (only used with --markdown)",
+    )
+    parser.add_argument(
+        "--generate-tokens",
+        type=int,
+        default=0,
+        help="Number of tokens to generate autoregressively (0 = no generation, just compare logits)",
+    )
+    return parser.parse_args()
+
+
+def get_wikitext_sample(tokenizer: AutoTokenizer, max_tokens: int = 512) -> Tuple[str, List[int]]:
+    """Load a sample from WikiText-103 test set."""
+    print("Loading WikiText-103 dataset...")
+    dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
+
+    # Find a substantial text sample (skip empty lines)
+    for sample in dataset:
+        text = sample["text"].strip()
+        if len(text) > MIN_SAMPLE_LENGTH:
+            # Tokenize and truncate
+            tokens = tokenizer.encode(text)
+            if len(tokens) > max_tokens:
+                tokens = tokens[:max_tokens]
+            text = tokenizer.decode(tokens)
+            print(f"✓ Loaded WikiText-103 sample ({len(tokens)} tokens)")
+            return text, tokens
+
+    raise ValueError("No suitable WikiText-103 sample found")
+
+
+def get_wikitext_full_test(
+    tokenizer: AutoTokenizer,
+    stride: int = 512,
+    max_length: int = 1024,
+    num_windows: int = 100
+) -> Generator[Tuple[str, List[int]], None, None]:
+    """
+    Load full WikiText-103 test set for sliding window evaluation.
+
+    Uses sliding window approach as described in HuggingFace documentation:
+    https://huggingface.co/transformers/v4.2.2/perplexity.html
+
+    Smaller stride = more context per prediction = better (but slower) perplexity.
+    Standard practice: stride=512 for balance of accuracy and speed.
+
+    Args:
+        tokenizer: HuggingFace tokenizer
+        stride: Stride for sliding window (default: 512)
+        max_length: Maximum context length (default: 1024)
+        num_windows: Number of windows to yield (default: 100, use 0 for all windows)
+
+    Yields:
+        (text, tokens) tuples for each window
+    """
+    print("Loading full WikiText-103 test set...")
+    dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
+
+    # Concatenate all test samples (generator expression for memory efficiency)
+    full_text = " ".join(sample["text"] for sample in dataset if sample["text"].strip())
+    print(f"✓ Loaded full test set")
+
+    # Tokenize entire test set
+    all_tokens = tokenizer.encode(full_text)
+    total_possible_windows = (len(all_tokens) - max_length) // stride + 1
+    print(f"  Total tokens: {len(all_tokens)}")
+    print(f"  Total possible windows: {total_possible_windows}")
+
+    windows_to_generate = total_possible_windows if num_windows == 0 else min(num_windows, total_possible_windows)
+    print(f"  Evaluating {windows_to_generate} windows" +
+          ("" if num_windows == 0 else f" (of {total_possible_windows} total)"))
+
+    # Generate sliding windows using itertools.islice for cleaner iteration
+    def window_generator():
+        for i in range(0, len(all_tokens) - max_length, stride):
+            window_tokens = all_tokens[i:i + max_length]
+            window_text = tokenizer.decode(window_tokens)
+            yield window_text, window_tokens
+
+    yield from islice(window_generator(), windows_to_generate)
+
+
+def run_baseline_model(model_name: str, text: str, tokenizer: AutoTokenizer, num_generate: int = 0) -> ModelOutput:
+    """
+    Run HuggingFace baseline model and return all logits.
+
+    Args:
+        model_name: HuggingFace model identifier
+        text: Input text
+        tokenizer: HuggingFace tokenizer
+        num_generate: Number of tokens to generate autoregressively (0 = no generation)
+
+    Returns:
+        ModelOutput with logits and input_ids
+    """
+    print_section_header("Running Baseline HuggingFace Model")
+
+    print(f"Loading model: {model_name}")
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model.eval()
+
+    input_ids = tokenizer.encode(text, return_tensors="pt")
+    print(f"Input tokens: {input_ids.shape[1]}")
+
+    if num_generate > 0:
+        print(f"Generating {num_generate} tokens autoregressively...")
+        all_logits = []
+        current_ids = input_ids.clone()
+
+        with torch.no_grad():
+            for i in range(num_generate + 1):
+                outputs = model(current_ids)
+                logits = outputs.logits  # Shape: [batch, seq_len, vocab_size]
+
+                if i == 0:
+                    # First iteration: keep all logits
+                    all_logits.append(logits.squeeze(0).cpu().numpy())
+                else:
+                    # Subsequent iterations: only append last token's logits
+                    last_logits = logits[0, -1:, :].cpu().numpy()
+                    all_logits.append(last_logits)
+
+                if i < num_generate:
+                    # Get next token (argmax of last position)
+                    next_token_id = logits[0, -1, :].argmax().item()
+                    next_token = tokenizer.decode([next_token_id])
+                    print(f"Generated token {i+1}: {next_token!r} (id={next_token_id})")
+
+                    # Append to sequence
+                    current_ids = torch.cat([current_ids, torch.tensor([[next_token_id]])], dim=1)
+
+        # Concatenate all logits
+        logits_np = np.vstack(all_logits)  # Shape: [seq_len + num_generate, vocab_size]
+        final_ids = current_ids.squeeze(0)
+
+        generated_text = tokenizer.decode(final_ids)
+        print(f"Final output: {generated_text}")
+    else:
+        # Original behavior: single forward pass
+        with torch.no_grad():
+            outputs = model(input_ids)
+            logits = outputs.logits  # Shape: [batch, seq_len, vocab_size]
+
+        # Remove batch dimension and convert to numpy
+        logits_np = logits.squeeze(0).cpu().numpy()  # Shape: [seq_len, vocab_size]
+        final_ids = input_ids.squeeze(0)
+
+    print(f"Logits shape: {logits_np.shape}")
+    print(f"Logits stats: mean={logits_np.mean():.4f}, std={logits_np.std():.4f}, "
+          f"min={logits_np.min():.4f}, max={logits_np.max():.4f}")
+
+    print(f"✓ Baseline inference complete")
+    return ModelOutput(logits=logits_np, input_ids=final_ids)
+
+
+def run_rust_model(model_path: Path, text: str, num_generate: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Run Rust ZKML model and load both float and int logits from stdout.
+
+    Args:
+        model_path: Path to model directory
+        text: Input text
+        num_generate: Number of tokens to generate autoregressively (0 = no generation)
+
+    Returns:
+        Tuple of (logits_float, logits_int) as numpy arrays
+    """
+    print_section_header("Running Rust ZKML Model")
+
+    cmd = [
+        "cargo", "run", "--release", "--bin", "extract-logits",
+        "--",
+        "--model", str(model_path),
+        f"--text={text}",
+    ]
+
+    if num_generate > 0:
+        cmd.append(f"--num-tokens={num_generate}")
+
+    print(f"Executing: {' '.join(cmd)}")
+    print(f"Working directory: {ZKML_ROOT}")
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=ZKML_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # Print stderr (contains tracing logs)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Cargo run failed with exit code {e.returncode}", file=sys.stderr)
+        print(f"stdout: {e.stdout}", file=sys.stderr)
+        print(f"stderr: {e.stderr}", file=sys.stderr)
+        raise
+
+    # Parse JSON from stdout
+    print("Parsing logits from JSON output...")
+    try:
+        output_data = json.loads(result.stdout)
+        logits_float_flat = np.array(output_data['logits_float'], dtype=np.float32)
+        logits_int_flat = np.array(output_data['logits_int'], dtype=np.float32)
+        seq_len = output_data['seq_len']
+        vocab_size = output_data['vocab_size']
+        seq_len_int = output_data['seq_len_int']
+
+        # Reshape to their respective dimensions
+        logits_float = logits_float_flat.reshape(seq_len, vocab_size)
+        logits_int_padded = logits_int_flat.reshape(seq_len_int, vocab_size)
+
+        # Unpad int logits to match float/baseline shape
+        # Int mode may have padded seq_len (e.g., 7 -> 8 for power-of-2)
+        if seq_len_int != seq_len:
+            print(f"  Unpadding int mode seq_len from {seq_len_int} to {seq_len}")
+            logits_int = logits_int_padded[:seq_len, :vocab_size]
+        else:
+            logits_int = logits_int_padded
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"✗ Failed to parse JSON output: {e}", file=sys.stderr)
+        print(f"stdout: {result.stdout[:500]}", file=sys.stderr)
+        raise
+
+    print(f"\nFloat mode (true float32 inference):")
+    print(f"  Logits shape: {logits_float.shape}")
+    print(f"  Logits stats: mean={logits_float.mean():.4f}, std={logits_float.std():.4f}, "
+          f"min={logits_float.min():.4f}, max={logits_float.max():.4f}")
+
+    print(f"\nInt mode (dequantized from quantized inference):")
+    print(f"  Logits shape: {logits_int.shape}")
+    print(f"  Logits stats: mean={logits_int.mean():.4f}, std={logits_int.std():.4f}, "
+          f"min={logits_int.min():.4f}, max={logits_int.max():.4f}")
+
+    print(f"✓ Rust inference complete")
+
+    return logits_float, logits_int
+
+
+def has_invalid_values(arr: np.ndarray) -> bool:
+    """Check if array contains NaN or Inf values."""
+    return bool(np.any(np.isnan(arr)) or np.any(np.isinf(arr)))
+
+
+def compute_cosine_similarity(
+    logits_base: np.ndarray, logits_test: np.ndarray, skip_first: bool = True
+) -> float:
+    """
+    Compute average cosine similarity between logit vectors using PyTorch.
+
+    Args:
+        logits_base: Baseline logits [seq_len, vocab_size]
+        logits_test: Test logits [seq_len, vocab_size]
+        skip_first: Skip first token (no context)
+
+    Returns:
+        Average cosine similarity
+    """
+    start_idx = 1 if skip_first else 0
+
+    # Convert to torch tensors
+    base_torch = torch.from_numpy(logits_base[start_idx:])
+    test_torch = torch.from_numpy(logits_test[start_idx:])
+
+    # Compute cosine similarity for all positions at once
+    # F.cosine_similarity computes along dim=1 (vocab dimension)
+    similarities = F.cosine_similarity(base_torch, test_torch, dim=1)
+
+    return similarities.mean().item()
+
+
+def compute_perplexity(logits: np.ndarray, target_ids: torch.Tensor) -> float:
+    """
+    Compute perplexity given logits and target token IDs using torchmetrics.
+
+    Args:
+        logits: Logits array [seq_len, vocab_size]
+        target_ids: Target token IDs [seq_len]
+
+    Returns:
+        Perplexity value
+    """
+    # Convert to torch and add batch dimension
+    logits_torch = torch.from_numpy(logits).unsqueeze(0)  # [1, seq_len, vocab_size]
+    target_ids_batch = target_ids.unsqueeze(0)  # [1, seq_len]
+
+    # Initialize perplexity metric (no ignore_index needed - we have no padding)
+    metric = Perplexity()
+
+    # Compute perplexity
+    # We use logits[:-1] to predict targets[1:] (standard language modeling)
+    # This skips the first position (no context) and the last logit (no target)
+    perplexity = metric(logits_torch[:, :-1, :], target_ids_batch[:, 1:])
+
+    return perplexity.item()
+
+
+def compute_next_token_agreement(
+    logits_base: np.ndarray, logits_test: np.ndarray, skip_first: bool = True
+) -> float:
+    """
+    Compute next-token prediction agreement rate.
+
+    Args:
+        logits_base: Baseline logits [seq_len, vocab_size]
+        logits_test: Test logits [seq_len, vocab_size]
+        skip_first: Skip first token (no context)
+
+    Returns:
+        Agreement rate (0.0 to 1.0)
+    """
+    start_idx = 1 if skip_first else 0
+
+    # Get predicted token IDs
+    pred_base = np.argmax(logits_base[start_idx:], axis=-1)
+    pred_test = np.argmax(logits_test[start_idx:], axis=-1)
+
+    # Compute agreement directly - fraction of matching predictions
+    # Note: Using numpy instead of sklearn to avoid warnings about
+    # large vocabulary size (262k classes) vs small sample size (~512 tokens)
+    agreement = float(np.mean(pred_base == pred_test))
+
+    return agreement
+
+
+def compute_all_metrics(
+    baseline_logits: np.ndarray,
+    rust_logits: np.ndarray,
+    input_ids: torch.Tensor,
+    skip_first: bool = True
+) -> EvaluationMetrics:
+    """
+    Compute all three evaluation metrics.
+
+    Args:
+        baseline_logits: Baseline model logits [seq_len, vocab_size]
+        rust_logits: Test model logits [seq_len, vocab_size]
+        input_ids: Input token IDs [seq_len]
+        skip_first: Skip first token when computing similarity/agreement
+
+    Returns:
+        EvaluationMetrics object containing all computed metrics
+    """
+    return EvaluationMetrics(
+        cosine_similarity=compute_cosine_similarity(baseline_logits, rust_logits, skip_first),
+        perplexity_baseline=compute_perplexity(baseline_logits, input_ids),
+        perplexity_test=compute_perplexity(rust_logits, input_ids),
+        agreement=compute_next_token_agreement(baseline_logits, rust_logits, skip_first),
+    )
+
+
+def run_smoke_tests(baseline_logits: np.ndarray, rust_logits: np.ndarray) -> bool:
+    """
+    Run smoke tests to verify data integrity and reasonable similarity.
+
+    Args:
+        baseline_logits: Baseline model logits [seq_len, vocab_size]
+        rust_logits: Rust model logits [seq_len, vocab_size]
+
+    Returns:
+        True if all tests pass, False otherwise
+    """
+    print_section_header("Running Smoke Tests")
+
+    # Test 1: Check for NaN/Inf values
+    if has_invalid_values(baseline_logits):
+        print("✗ Baseline logits contain NaN or Inf values", file=sys.stderr)
+        return False
+    print("✓ Baseline logits: No NaN/Inf values")
+
+    if has_invalid_values(rust_logits):
+        print("✗ Rust logits contain NaN or Inf values", file=sys.stderr)
+        return False
+    print("✓ Rust logits: No NaN/Inf values")
+
+    # Test 2: Check value ranges
+    baseline_min, baseline_max = baseline_logits.min(), baseline_logits.max()
+    rust_min, rust_max = rust_logits.min(), rust_logits.max()
+    min_range, max_range = TYPICAL_LOGIT_RANGE
+
+    if baseline_min < min_range or baseline_max > max_range:
+        print(f"⚠ Warning: Baseline logits outside typical range: [{baseline_min:.2f}, {baseline_max:.2f}]")
+    else:
+        print(f"✓ Baseline logits in reasonable range: [{baseline_min:.2f}, {baseline_max:.2f}]")
+
+    if rust_min < min_range or rust_max > max_range:
+        print(f"⚠ Warning: Rust logits outside typical range: [{rust_min:.2f}, {rust_max:.2f}]")
+    else:
+        print(f"✓ Rust logits in reasonable range: [{rust_min:.2f}, {rust_max:.2f}]")
+
+    # Test 3: Check statistical similarity
+    baseline_mean, baseline_std = baseline_logits.mean(), baseline_logits.std()
+    rust_mean, rust_std = rust_logits.mean(), rust_logits.std()
+
+    mean_diff_pct = abs(baseline_mean - rust_mean) / abs(baseline_mean) * 100
+    std_diff_pct = abs(baseline_std - rust_std) / baseline_std * 100
+
+    print(f"  Baseline: mean={baseline_mean:.4f}, std={baseline_std:.4f}")
+    print(f"  Rust:     mean={rust_mean:.4f}, std={rust_std:.4f}")
+
+    if mean_diff_pct > SMOKE_TEST_THRESHOLD_PCT:
+        print(f"✗ Mean difference too large: {mean_diff_pct:.2f}%", file=sys.stderr)
+        return False
+    print(f"✓ Mean difference acceptable: {mean_diff_pct:.2f}%")
+
+    if std_diff_pct > SMOKE_TEST_THRESHOLD_PCT:
+        print(f"✗ Std deviation difference too large: {std_diff_pct:.2f}%", file=sys.stderr)
+        return False
+    print(f"✓ Std deviation difference acceptable: {std_diff_pct:.2f}%")
+
+    print("✓ All smoke tests passed")
+    return True
+
+
+def ensure_model_downloaded(model_name: str, model_path: Path) -> None:
+    """
+    Download exact model files from HuggingFace Hub using hf_hub_download.
+    Downloads only the three required files: config.json, tokenizer.json, model.safetensors
+    Skips downloading files that already exist.
+
+    Args:
+        model_name: HuggingFace model identifier
+        model_path: Local path where model should be stored
+
+    Raises:
+        SystemExit: If download fails
+    """
+    # Files we need for ZKML
+    required_files = [
+        "config.json",
+        "tokenizer.json",
+        "model.safetensors"
+    ]
+
+    # Check which files already exist
+    existing_files = []
+    missing_files = []
+    for filename in required_files:
+        file_path = model_path / filename
+        if file_path.exists():
+            existing_files.append(filename)
+        else:
+            missing_files.append(filename)
+
+    # Skip download if all files exist
+    if not missing_files:
+        print(f"✓ Model files already exist at: {model_path}")
+        return
+
+    print(f"Downloading missing model files from HuggingFace: '{model_name}'...")
+    if existing_files:
+        print(f"  Already present: {', '.join(existing_files)}")
+
+    try:
+        model_path.mkdir(parents=True, exist_ok=True)
+
+        # Download only missing files
+        for filename in missing_files:
+            print(f"  Downloading {filename}...")
+            downloaded_file = hf_hub_download(
+                repo_id=model_name,
+                filename=filename,
+                local_dir=model_path,
+                local_dir_use_symlinks=False,  # Copy actual files, not symlinks
+            )
+            print(f"    ✓ {filename} saved to: {downloaded_file}")
+
+        print(f"  ✓ All files ready at: {model_path}")
+
+    except (OSError, ValueError, RuntimeError) as e:
+        print(f"✗ Failed to download model: {e}", file=sys.stderr)
+        print(f"\nYou may need to authenticate with HuggingFace for gated models:", file=sys.stderr)
+        print(f"  huggingface-cli login", file=sys.stderr)
+        sys.exit(1)
+
+
+def print_evaluation_results(metrics: EvaluationMetrics, num_windows: int = 1) -> None:
+    """
+    Print formatted evaluation results.
+
+    Args:
+        metrics: Computed evaluation metrics
+        num_windows: Number of windows evaluated (for full test set mode)
+    """
+    if num_windows > 1:
+        print_section_header("EVALUATION RESULTS (Full Test Set)")
+        print(f"Total windows evaluated: {num_windows}")
+    else:
+        print_section_header("EVALUATION RESULTS")
+
+    print(f"Cosine similarity: {metrics.cosine_similarity:.6f}")
+    print(f"Perplexity (baseline): {metrics.perplexity_baseline:.4f}")
+    print(f"Perplexity (test): {metrics.perplexity_test:.4f}")
+    print(f"Perplexity Δ: {metrics.perplexity_delta_pct:+.4f}%")
+    print(f"Next-token match: {metrics.agreement * 100:.2f}%")
+    print(f"{'='*60}")
+
+
+def format_metrics_as_markdown(
+    model_name: str,
+    metrics_float: EvaluationMetrics,
+    metrics_int: EvaluationMetrics,
+    smoke_tests_float: bool,
+    smoke_tests_int: bool,
+    num_windows: int = 1
+) -> str:
+    """
+    Format evaluation results as markdown for GitHub comments.
+
+    Args:
+        model_name: Name of the model being evaluated
+        metrics_float: Metrics for float mode
+        metrics_int: Metrics for int mode
+        smoke_tests_float: Whether float mode passed smoke tests
+        smoke_tests_int: Whether int mode passed smoke tests
+        num_windows: Number of windows evaluated
+
+    Returns:
+        Markdown-formatted string
+    """
+    # Determine status emojis
+    float_status = "✅" if smoke_tests_float and metrics_float.agreement >= 0.99 else "⚠️"
+    int_status = "✅" if smoke_tests_int and metrics_int.agreement >= 0.50 else "⚠️"
+
+    md = f"""## Model Evaluation Results: `{model_name}`
+
+| Metric | Float Mode (Dequantized) {float_status} | Integer Mode (Quantized) {int_status} |
+|--------|----------------------------------------|---------------------------------------|
+| Cosine Similarity | `{metrics_float.cosine_similarity:.6f}` | `{metrics_int.cosine_similarity:.6f}` |
+| Perplexity (Baseline) | `{metrics_float.perplexity_baseline:.4f}` | `{metrics_int.perplexity_baseline:.4f}` |
+| Perplexity (ZKML) | `{metrics_float.perplexity_test:.4f}` | `{metrics_int.perplexity_test:.4f}` |
+| Perplexity Δ | `{metrics_float.perplexity_delta_pct:+.4f}%` | `{metrics_int.perplexity_delta_pct:+.4f}%` |
+| Next-Token Match | **`{metrics_float.agreement * 100:.2f}%`** | **`{metrics_int.agreement * 100:.2f}%`** |
+| Smoke Tests | `{"PASS" if smoke_tests_float else "FAIL"}` | `{"PASS" if smoke_tests_int else "FAIL"}` |
+
+"""
+    if num_windows > 1:
+        md += f"\n*Evaluated on {num_windows} sliding windows*\n"
+
+    return md
+
+
+def run_full_test_set_evaluation(
+    model_path: Path,
+    tokenizer: AutoTokenizer,
+    args: argparse.Namespace
+) -> None:
+    """Run evaluation on full WikiText-103 test set with sliding window."""
+    if args.text:
+        print("⚠ Warning: --text ignored when using --full-test-set", file=sys.stderr)
+
+    print_section_header("FULL TEST SET EVALUATION (Sliding Window)")
+    print(f"Stride: {args.stride}")
+    print(f"Max length: {args.max_tokens}")
+    print(f"Windows: {'ALL (evaluate entire test set)' if args.num_windows == 0 else f'{args.num_windows} (sample)'}")
+
+    # Accumulate metrics across all windows
+    all_metrics_float = []
+    all_metrics_int = []
+
+    for num_window, (text, tokens) in enumerate(
+        get_wikitext_full_test(tokenizer, stride=args.stride, max_length=args.max_tokens, num_windows=args.num_windows),
+        start=1
+    ):
+        # Run both models on this window
+        model_output = run_baseline_model(str(model_path), text, tokenizer, args.generate_tokens)
+        logits_float, logits_int = run_rust_model(model_path, text, args.generate_tokens)
+
+        # Verify shapes match
+        if model_output.logits.shape != logits_float.shape:
+            print(f"\n✗ Float mode shape mismatch in window {num_window}!", file=sys.stderr)
+            continue
+
+        if model_output.logits.shape != logits_int.shape:
+            print(f"\n✗ Int mode shape mismatch in window {num_window}!", file=sys.stderr)
+            continue
+
+        # Compute metrics for this window
+        metrics_float = compute_all_metrics(model_output.logits, logits_float, model_output.input_ids, skip_first=True)
+        metrics_int = compute_all_metrics(model_output.logits, logits_int, model_output.input_ids, skip_first=True)
+        all_metrics_float.append(metrics_float)
+        all_metrics_int.append(metrics_int)
+
+        if num_window % 10 == 0:
+            print(f"  Processed {num_window} windows...")
+
+    # Compute average metrics
+    avg_metrics_float = compute_average_metrics(all_metrics_float)
+    avg_metrics_int = compute_average_metrics(all_metrics_int)
+
+    # Print results
+    print_section_header("FLOAT MODE (Full Test Set)")
+    print_evaluation_results(avg_metrics_float, num_windows=len(all_metrics_float))
+
+    print_section_header("INTEGER MODE (Full Test Set)")
+    print_evaluation_results(avg_metrics_int, num_windows=len(all_metrics_int))
+
+
+def run_single_sample_evaluation(
+    model_path: Path,
+    tokenizer: AutoTokenizer,
+    args: argparse.Namespace
+) -> Tuple[EvaluationMetrics, EvaluationMetrics, bool, bool]:
+    """
+    Run evaluation on a single text sample (fast, for debugging).
+
+    Returns:
+        Tuple of (metrics_float, metrics_int, smoke_tests_float, smoke_tests_int)
+    """
+    # Get evaluation text
+    if args.text:
+        text = args.text
+        tokens = tokenizer.encode(text)
+        if len(tokens) > args.max_tokens:
+            tokens = tokens[:args.max_tokens]
+            text = tokenizer.decode(tokens)
+        print(f"Using custom text ({len(tokens)} tokens)")
+    elif args.dataset_sample == "wikitext":
+        text, tokens = get_wikitext_sample(tokenizer, max_tokens=args.max_tokens)
+    else:
+        print("✗ Must provide --text or use --dataset-sample wikitext", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\nEvaluation text preview: {text[:100]}...")
+    print(f"Total tokens: {len(tokens)}")
+
+    # Run baseline model
+    model_output = run_baseline_model(str(model_path), text, tokenizer, args.generate_tokens)
+
+    # Run Rust model - get both float and int logits
+    logits_float, logits_int = run_rust_model(model_path, text, args.generate_tokens)
+
+    # Verify shapes match
+    if model_output.logits.shape != logits_float.shape:
+        print(f"\n✗ Float mode shape mismatch!", file=sys.stderr)
+        print(f"  Baseline: {model_output.logits.shape}", file=sys.stderr)
+        print(f"  Float: {logits_float.shape}", file=sys.stderr)
+        sys.exit(1)
+
+    if model_output.logits.shape != logits_int.shape:
+        print(f"\n✗ Int mode shape mismatch!", file=sys.stderr)
+        print(f"  Baseline: {model_output.logits.shape}", file=sys.stderr)
+        print(f"  Int: {logits_int.shape}", file=sys.stderr)
+        sys.exit(1)
+
+    # Run smoke tests
+    smoke_tests_passed_float = run_smoke_tests_with_warning(model_output.logits, logits_float, "Float")
+    smoke_tests_passed_int = run_smoke_tests_with_warning(model_output.logits, logits_int, "Integer")
+
+    # Compute metrics
+    print_section_header("Computing Evaluation Metrics")
+
+    # Float mode metrics
+    metrics_float = compute_all_metrics(model_output.logits, logits_float, model_output.input_ids, skip_first=True)
+
+    # Int mode metrics
+    metrics_int = compute_all_metrics(model_output.logits, logits_int, model_output.input_ids, skip_first=True)
+
+    # Print results for float mode
+    print_section_header("FLOAT MODE (Dequantized from Quantized Inference)")
+    print_evaluation_results(metrics_float)
+
+    # Print results for int mode
+    print_section_header("INTEGER MODE (Quantized)")
+    print_evaluation_results(metrics_int)
+
+    return metrics_float, metrics_int, smoke_tests_passed_float, smoke_tests_passed_int
+
+
+def main():
+    args = parse_args()
+
+    print_section_header("Model Evaluation - Quantization Validation")
+    print(f"Evaluating model: '{args.model}'")
+
+    # Determine model path in cache
+    model_path = MODEL_CACHE_DIR / args.model
+
+    # Download model if not present
+    ensure_model_downloaded(args.model, model_path)
+
+    print(f"✓ Found model directory: {model_path}")
+    print(f"✓ Found safetensors file: {model_path / 'model.safetensors'}")
+
+    # Convert to absolute path
+    model_path = model_path.absolute()
+
+    # Load tokenizer from local model path (already downloaded with exact files)
+    print(f"\nLoading tokenizer from local cache: {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    # Run evaluation
+    if args.full_test_set:
+        run_full_test_set_evaluation(model_path, tokenizer, args)
+        # TODO: Add return values for full_test_set mode if needed for markdown
+    else:
+        metrics_float, metrics_int, smoke_float, smoke_int = run_single_sample_evaluation(model_path, tokenizer, args)
+
+        # Output markdown if requested
+        if args.markdown:
+            markdown_output = format_metrics_as_markdown(
+                args.model,
+                metrics_float,
+                metrics_int,
+                smoke_float,
+                smoke_int
+            )
+
+            if args.output_file:
+                output_path = Path(args.output_file)
+                output_path.write_text(markdown_output)
+                print(f"\n✓ Markdown output written to: {args.output_file}")
+            else:
+                print_section_header("MARKDOWN OUTPUT")
+                print(markdown_output)
+
+    print(f"\n✓ Evaluation complete!")
+
+
+if __name__ == "__main__":
+    main()

@@ -10,7 +10,7 @@ use crate::{
         gguf::FileTensorLoader as GGUFLoader,
         json::{FileTensorLoader as JSONLoader, unfuse_crate_tensors},
         llm::{
-            LLMConfig,
+            ConfigJSON, LLMConfig, SafeLoader,
             config::LLMStructure,
             transformer::attention_layer::{AttentionCacheConfig, AttentionMechanism},
         },
@@ -64,7 +64,6 @@ impl AttentionMechanism for GPT2Attention {
     fn uses_out_bias(&self) -> bool {
         true
     }
-
     fn qkv_tensors(&self) -> (Vec<KeyedTensor<f32>>, Vec<Option<KeyedTensor<f32>>>) {
         let weights = vec![self.wq.clone(), self.wk.clone(), self.wv.clone()];
         let biases = vec![
@@ -101,6 +100,195 @@ impl AttentionMechanism for GPT2Attention {
 
         model.add_edge(qkv_einsum_id, query_key_id, vec![(0, 0), (1, 1)])?;
         Ok(())
+    }
+}
+
+impl Load<SafeLoader> for GPT2Attention {
+    type Config = (LLMStructure, ConfigJSON);
+
+    /// Load GPT-2 attention weights from HuggingFace SafeTensors format.
+    ///
+    /// # Reference Implementation
+    /// This loader matches the weight layout from HuggingFace Transformers:
+    /// https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+    ///
+    /// # Weight Format
+    /// HuggingFace uses `Conv1D` layers which store weights as (in_features, out_features).
+    /// Conv1D is essentially a Linear layer with transposed weight storage - it computes
+    /// `output = input @ weight` directly (no transpose in forward pass).
+    ///
+    /// The `c_attn` layer fuses Q, K, V projections:
+    /// ```python
+    /// self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+    /// ```
+    /// Weight shape: (embed_dim, 3*embed_dim) where columns are [Q | K | V]
+    ///
+    /// After forward pass, the output is split along the last dimension:
+    /// ```python
+    /// query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+    /// ```
+    fn from_loader(loader: &SafeLoader, (structure, _config): &Self::Config) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        let embedding_size = structure.generic.embedding_size;
+        let hidden_size = structure.generic.hidden_size;
+        ensure!(
+            embedding_size == hidden_size,
+            "embedding_size must be equal to hidden_size"
+        );
+
+        // Load fused QKV weight: shape [hidden_size, 3*hidden_size]
+        // Matches HuggingFace Conv1D(3*embed_dim, embed_dim)
+        let fused_qkv_weight = loader.get_tensor("attn.c_attn.weight")?;
+        ensure!(
+            fused_qkv_weight.shape().as_ref() == &[hidden_size, 3 * hidden_size],
+            "attn.c_attn.weight must have shape [hidden_size, 3*hidden_size], got {:?}",
+            fused_qkv_weight.shape()
+        );
+
+        // Split fused weight into Q, K, V matrices
+        // The Conv1D output columns are organized as [Q_cols | K_cols | V_cols]
+        // where each section has `hidden_size` columns.
+        //
+        // For row-major storage, we iterate through rows and extract the column ranges:
+        // - Q columns: [0, hidden_size)
+        // - K columns: [hidden_size, 2*hidden_size)
+        // - V columns: [2*hidden_size, 3*hidden_size)
+        let fused_tensor = fused_qkv_weight.tensor();
+        let fused_data = fused_tensor.get_data();
+        let mut q_data = Vec::with_capacity(hidden_size * hidden_size);
+        let mut k_data = Vec::with_capacity(hidden_size * hidden_size);
+        let mut v_data = Vec::with_capacity(hidden_size * hidden_size);
+
+        for row in 0..hidden_size {
+            let row_start = row * (3 * hidden_size);
+            // Extract Q columns
+            q_data.extend_from_slice(&fused_data[row_start..row_start + hidden_size]);
+            // Extract K columns
+            k_data.extend_from_slice(
+                &fused_data[row_start + hidden_size..row_start + 2 * hidden_size],
+            );
+            // Extract V columns
+            v_data.extend_from_slice(
+                &fused_data[row_start + 2 * hidden_size..row_start + 3 * hidden_size],
+            );
+        }
+
+        let wq = KeyedTensor::new(
+            format!("{:?}.q", fused_qkv_weight.commitment_id()),
+            Tensor::new(vec![embedding_size, hidden_size].into(), q_data)?.reshaped(
+                vec![
+                    embedding_size,
+                    structure.generic.num_heads,
+                    structure.generic.head_size,
+                ]
+                .into(),
+            )?,
+        );
+        let wk = KeyedTensor::new(
+            format!("{:?}.k", fused_qkv_weight.commitment_id()),
+            Tensor::new(vec![embedding_size, hidden_size].into(), k_data)?.reshaped(
+                vec![
+                    embedding_size,
+                    structure.generic.num_heads,
+                    structure.generic.head_size,
+                ]
+                .into(),
+            )?,
+        );
+        let wv = KeyedTensor::new(
+            format!("{:?}.v", fused_qkv_weight.commitment_id()),
+            Tensor::new(vec![embedding_size, hidden_size].into(), v_data)?.reshaped(
+                vec![
+                    embedding_size,
+                    structure.generic.num_heads,
+                    structure.generic.head_size,
+                ]
+                .into(),
+            )?,
+        );
+
+        // Load fused QKV bias: shape [3*hidden_size]
+        // Organized sequentially as [Q_bias | K_bias | V_bias]
+        let fused_qkv_bias = loader.get_tensor("attn.c_attn.bias")?;
+        ensure!(
+            fused_qkv_bias.shape().as_ref() == &[3 * hidden_size],
+            "attn.c_attn.bias must have shape [3*hidden_size], got {:?}",
+            fused_qkv_bias.shape()
+        );
+
+        let bias_tensor = fused_qkv_bias.tensor();
+        let bias_data = bias_tensor.get_data();
+        // Split bias into Q, K, V components
+        let q_bias = KeyedTensor::new(
+            format!("{:?}.q", fused_qkv_bias.commitment_id()),
+            Tensor::new(
+                vec![structure.generic.num_heads, structure.generic.head_size].into(),
+                bias_data[0..hidden_size].to_vec(),
+            )?,
+        );
+        let k_bias = KeyedTensor::new(
+            format!("{:?}.k", fused_qkv_bias.commitment_id()),
+            Tensor::new(
+                vec![structure.generic.num_heads, structure.generic.head_size].into(),
+                bias_data[hidden_size..2 * hidden_size].to_vec(),
+            )?,
+        );
+        let v_bias = KeyedTensor::new(
+            format!("{:?}.v", fused_qkv_bias.commitment_id()),
+            Tensor::new(
+                vec![structure.generic.num_heads, structure.generic.head_size].into(),
+                bias_data[2 * hidden_size..3 * hidden_size].to_vec(),
+            )?,
+        );
+
+        // Load output projection: c_proj is Conv1D(embed_dim, embed_dim)
+        // Weight shape: [hidden_size, hidden_size]
+        // See: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py#L279
+        let wo = loader
+            .get_tensor("attn.c_proj.weight")?
+            .try_map_tensor(|t| {
+                t.reshaped(
+                    vec![
+                        structure.generic.num_heads,
+                        structure.generic.head_size,
+                        embedding_size,
+                    ]
+                    .into(),
+                )
+            })?;
+        let o_bias = loader.get_tensor("attn.c_proj.bias")?;
+
+        ensure!(
+            wo.shape().as_ref()
+                == &[
+                    structure.generic.num_heads,
+                    structure.generic.head_size,
+                    embedding_size
+                ],
+            "attn.c_proj.weight must have shape [num_heads, head_size, embedding_size], got {:?}",
+            wo.shape()
+        );
+        ensure!(
+            o_bias.shape().as_ref() == &[embedding_size],
+            "attn.c_proj.bias must have shape [embedding_size], got {:?}",
+            o_bias.shape()
+        );
+
+        Ok(Self {
+            max_context_length: structure.generic.context_length,
+            num_heads: structure.generic.num_heads,
+            head_dim: structure.generic.head_size,
+            wq,
+            q_bias,
+            wk,
+            k_bias,
+            wv,
+            v_bias,
+            wo,
+            o_bias,
+        })
     }
 }
 

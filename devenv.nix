@@ -13,11 +13,16 @@
 
     # For tensor visualization
     pkgs.gnuplot_qt pkgs.d2
+
+    # Python dependencies
+    pkgs.zlib
+    pkgs.openblas
   ];
 
   env = {
     OPENSSL_DEV = pkgs.openssl.dev;
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+    LD_LIBRARY_PATH = "${pkgs.zlib}/lib:${pkgs.openblas}/lib:${pkgs.stdenv.cc.cc.lib}/lib";
   };
 
   # https://devenv.sh/tasks/
@@ -36,12 +41,15 @@
     enable = true;
     channel = "nightly";
     version = "2025-08-08";
+    mold.enable = true;
   };
   languages.python = {
     enable = true;
     venv.enable = true;
     venv.requirements = ''
+    datasets
     gguf[gui]
+    huggingface_hub
     matplotlib
     numpy
     onnx
@@ -50,6 +58,7 @@
     scikit-learn
     tabulate
     torch
+    torchmetrics
     torchvision
     tqdm
     transformers

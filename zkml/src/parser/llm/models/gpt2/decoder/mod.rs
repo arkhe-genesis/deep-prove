@@ -14,7 +14,8 @@ use crate::{
         gguf::FileTensorLoader as GGUFLoader,
         json::FileTensorLoader as JSONLoader,
         llm::{
-            LLMConfig, config::LLMStructure, models::gpt2::decoder::attention::GPT2Attention,
+            ConfigJSON, LLMConfig, SafeLoader, config::LLMStructure,
+            models::gpt2::decoder::attention::GPT2Attention,
             transformer::feed_forward::FeedForwardNetwork,
         },
     },
@@ -69,6 +70,105 @@ impl LayerInsertion for GPT2Decoder {
         model.add_edge(post_ffn_id, final_add_id, (0, 1))?;
 
         Ok(final_add_id)
+    }
+}
+
+impl Load<SafeLoader> for GPT2Decoder {
+    type Config = (LLMStructure, ConfigJSON);
+
+    fn from_loader(loader: &SafeLoader, config: &Self::Config) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        let (structure, config_json) = config;
+
+        // Load pre-attention LayerNorm (ln_1)
+        let ln1_weight = loader.get_tensor("ln_1.weight")?;
+        let ln1_bias = loader.get_tensor("ln_1.bias")?;
+        ensure!(
+            ln1_weight.shape().as_ref() == &[structure.generic.embedding_size],
+            "ln_1.weight must have shape [{}] vs given {:?}",
+            structure.generic.embedding_size,
+            ln1_weight.shape()
+        );
+        ensure!(
+            ln1_bias.shape().as_ref() == &[structure.generic.embedding_size],
+            "ln_1.bias must have shape [{}] vs given {:?}",
+            structure.generic.embedding_size,
+            ln1_bias.shape()
+        );
+        let eps = config_json
+            .get::<f32, _>("layer_norm_epsilon")
+            .context("layer_norm_epsilon not found")?;
+        let pre_attention_layernorm = LayerNorm::new(ln1_weight, ln1_bias, eps)?;
+
+        // Load attention mechanism
+        // Don't add "attn." prefix because GPT2Attention::from_loader adds it internally
+        let attention_mechanism = GPT2Attention::from_loader(loader, config)?;
+
+        // Load pre-FFN LayerNorm (ln_2)
+        let ln2_weight = loader.get_tensor("ln_2.weight")?;
+        let ln2_bias = loader.get_tensor("ln_2.bias")?;
+        ensure!(
+            ln2_weight.shape().as_ref() == &[structure.generic.embedding_size],
+            "ln_2.weight must have shape [{}] vs given {:?}",
+            structure.generic.embedding_size,
+            ln2_weight.shape()
+        );
+        ensure!(
+            ln2_bias.shape().as_ref() == &[structure.generic.embedding_size],
+            "ln_2.bias must have shape [{}] vs given {:?}",
+            structure.generic.embedding_size,
+            ln2_bias.shape()
+        );
+        let pre_ffn_layernorm = LayerNorm::new(ln2_weight, ln2_bias, eps)?;
+
+        // Load feed forward network (MLP)
+        // Reference: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py#L301
+        //
+        // HuggingFace GPT-2 MLP uses Conv1D layers:
+        // ```python
+        // self.c_fc = Conv1D(intermediate_size, embed_dim)  # Up projection
+        // self.c_proj = Conv1D(embed_dim, intermediate_size)  # Down projection
+        // ```
+        //
+        // Conv1D stores weights as (in_features, out_features), so:
+        // - c_fc.weight: [hidden_size, intermediate_size] (typically [768, 3072] for GPT-2 base)
+        // - c_proj.weight: [intermediate_size, hidden_size]
+        let feed_forward = {
+            let up = loader.get_tensor("mlp.c_fc.weight")?;
+            let up_bias = Some(loader.get_tensor("mlp.c_fc.bias")?);
+            let down = loader.get_tensor("mlp.c_proj.weight")?;
+            let down_bias = Some(loader.get_tensor("mlp.c_proj.bias")?);
+
+            // Validate shapes match expected Conv1D layout
+            ensure!(
+                up.shape()[0] == structure.generic.hidden_size,
+                "mlp.c_fc.weight should have shape [hidden_size, intermediate_size], got {:?}",
+                up.shape()
+            );
+            ensure!(
+                down.shape()[1] == structure.generic.embedding_size,
+                "mlp.c_proj.weight should have shape [intermediate_size, hidden_size], got {:?}",
+                down.shape()
+            );
+
+            FeedForwardNetwork {
+                gate: None,
+                up,
+                up_bias,
+                down,
+                down_bias,
+                activation: ActivationLayer::Gelu(GELU::new()),
+            }
+        };
+
+        Ok(Self {
+            pre_attention_layernorm,
+            attention_mechanism,
+            pre_ffn_layernorm,
+            feed_forward,
+        })
     }
 }
 

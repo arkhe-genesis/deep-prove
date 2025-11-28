@@ -17,6 +17,10 @@ path = "src/bin/bench/cnn.rs"
 name = "bench-llm"
 path = "src/bin/bench/llm.rs"
 
+[[bin]]
+name = "extract-logits"
+path = "src/bin/extract_logits.rs"
+
 [features]
 default = ["cpu"]
 # Capture layers' quatization outputs for regression tests

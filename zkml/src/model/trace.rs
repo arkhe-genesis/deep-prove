@@ -67,7 +67,7 @@ where
     D: TensorTypeParam + Clone + Serialize + for<'b> Deserialize<'b>,
 {
     /// Get the trace data for node `node_id`, if any
-    pub(crate) fn get_step(&self, node_id: &NodeId) -> Option<&Step<E, D>> {
+    pub fn get_step(&self, node_id: &NodeId) -> Option<&Step<E, D>> {
         self.steps.get(node_id)
     }
 
@@ -184,6 +184,11 @@ where
             .outputs
             .iter_mut()
             .for_each(|handle| handle.attach_store(store.clone()));
+    }
+
+    /// Returns the input tensor handles of the node
+    pub fn inputs(&self) -> &[TensorHandle<D>] {
+        &self.node_inputs
     }
 
     /// Hydrate all the input tensors of the node corresponding to this step.

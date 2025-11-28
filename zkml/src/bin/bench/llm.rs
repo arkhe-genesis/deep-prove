@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         HEADER_ACCURACY,
         HEADER_MODEL_QUANT,
     ]);
-    let driver = bencher.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
+    let (driver, _metadata) = bencher.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
     let (prover_ctx, verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
         bencher.r(HEADER_CONTEXT_TIME, || driver.context())?;
 

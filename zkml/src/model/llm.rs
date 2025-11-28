@@ -18,7 +18,9 @@ use crate::{
         llm::{LLMConfig, Token, models::LLMModelLoader},
         to_quantized,
     },
-    quantization::{InferenceObserver, InferenceTracker, InferenceTrackingMode, IntoElement},
+    quantization::{
+        InferenceObserver, InferenceTracker, InferenceTrackingMode, IntoElement, ModelMetadata,
+    },
     tensor::TensorTypeParam,
     verify,
 };
@@ -102,6 +104,14 @@ pub struct Driver<N> {
     max_context: Option<usize>,
     padding_mode: PaddingMode,
 }
+
+impl<N> Driver<N> {
+    /// Returns the vocabulary size of the model
+    pub fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+}
+
 impl Driver<f32> {
     /// Loads a model from a gguf, safetensors, or json external file. It returns the raw model in float precision.
     /// NOTE: the max_context is only there to hack around the creation of Rope to avoid loading the full matrix if we don't need it. That should
@@ -128,7 +138,7 @@ impl Driver<f32> {
     pub fn into_provable_llm<'a>(
         self,
         mut pipeline_config: Option<PipelineConfig<'a, InferenceObserver>>,
-    ) -> anyhow::Result<Driver<Element>> {
+    ) -> anyhow::Result<(Driver<Element>, ModelMetadata)> {
         let numel = self.max_context.unwrap_or(self.config.context_length);
         let n_inputs = 1;
         let representative_inputs = (0..n_inputs)
@@ -152,15 +162,18 @@ impl Driver<f32> {
         if conf.quant_strategy.is_none() {
             conf = conf.with_strategy(quantization_strategy);
         }
-        let mut quantized_model = to_quantized(self.model, conf)?;
+        let (mut quantized_model, metadata) = to_quantized(self.model, conf)?;
         // just set to one because we run one token after another to derive the full trace.
         quantized_model.input_shapes = vec![Shape::from(vec![1])];
-        Ok(Driver {
-            model: quantized_model,
-            config: self.config,
-            max_context: self.max_context,
-            padding_mode: PaddingMode::Padding,
-        })
+        Ok((
+            Driver {
+                model: quantized_model,
+                config: self.config,
+                max_context: self.max_context,
+                padding_mode: PaddingMode::Padding,
+            },
+            metadata,
+        ))
     }
 
     pub fn run<E>(&self, input: &[Token], store: &mut GenStore) -> anyhow::Result<Trace<E, f32>>
@@ -611,6 +624,7 @@ mod test {
                 },
                 tokenizer::TokenizerLoader,
             },
+            safe::RawSafeTensors,
         },
         rng_from_env_or_random,
         testing::Pcs,
@@ -645,7 +659,7 @@ mod test {
             ProverContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
             LLMVerifierContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
         ) = file_cache::deserialize_or_create_with(&cache_filename, || {
-            let driver = Driver::load_from_model(
+            let (driver, _metadata) = Driver::load_from_model(
                 GPT2,
                 &RawGGUF::new(model_path.clone()),
                 Some(MAX_CONTEXT),
@@ -705,19 +719,38 @@ mod test {
     }
 
     #[test]
-    fn test_llm_driver_inference() -> anyhow::Result<()> {
-        init_test_logging("info");
+    fn test_llm_driver_inference_gpt2_gguf() -> anyhow::Result<()> {
+        init_test_logging("debug");
         const PRUNED_GPT2: &str = "gpt2.Q2_K.gguf";
         let model_path = file_cache::from_cache(PRUNED_GPT2)?;
         println!("model path: {:?}", model_path);
 
         // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
-        let driver = Driver::load_from_model(GPT2, &RawGGUF::new(model_path.clone()), Some(10))?
-            .into_provable_llm(None)?;
+        let raw = RawGGUF::new(model_path.clone());
+        let (driver, _metadata) =
+            Driver::load_from_model(GPT2, &raw, Some(10))?.into_provable_llm(None)?;
+        test_llm_driver_inference_inner(raw, driver)
+    }
+
+    #[test]
+    fn test_llm_driver_inference_gpt2_safe() -> anyhow::Result<()> {
+        const GPT2_SAFE_MODEL: &str = "openai-community/gpt2";
+        init_test_logging("debug");
+        let raw = RawSafeTensors::from_hugging_face_cached(GPT2_SAFE_MODEL)?;
+
+        let (driver, _metadata) =
+            Driver::load_from_model(GPT2, &raw, Some(10))?.into_provable_llm(None)?;
+        test_llm_driver_inference_inner(raw, driver)
+    }
+
+    fn test_llm_driver_inference_inner<R>(raw: R, driver: Driver<i64>) -> anyhow::Result<()>
+    where
+        GPT2: TokenizerLoader<R>,
+    {
         let sentence = "The sky is";
 
         // Best to load the tokenizer from the gguf file if it's available.
-        let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path.clone()))?;
+        let tokenizer = GPT2.load_tokenizer(&raw)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let detokenized = tokenizer.detokenize(&user_tokens);
         let mut store = GenStore::default();
@@ -774,8 +807,9 @@ mod test {
         init_test_logging("debug");
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
         let gguf = RawGGUF::new(model_path.clone());
-        let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(CONTEXT_SIZE))?
-            .into_provable_llm(None)?;
+        let (driver, _metadata) =
+            Driver::load_from_model(Gemma3::new(), &gguf, Some(CONTEXT_SIZE))?
+                .into_provable_llm(None)?;
 
         println!("LLM DRIVER: config: {:?}", driver.config);
 
@@ -819,8 +853,9 @@ mod test {
             LLMVerifierContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
         ) = file_cache::deserialize_or_create_with(&cache_filename, || {
             let gguf = RawGGUF::new(model_path.clone());
-            let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(MAX_CONTEXT))?
-                .into_provable_llm(None)?;
+            let (driver, _metadata) =
+                Driver::load_from_model(Gemma3::new(), &gguf, Some(MAX_CONTEXT))?
+                    .into_provable_llm(None)?;
 
             let (prover_ctx, verifier_ctx) = driver
                 .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?

@@ -627,7 +627,8 @@ impl Positional<f32> {
             PositionalConfig::FixedPositional => {
                 let position_embd = loader
                     .get_tensor("position_embd.weight")
-                    .or_else(|_| loader.get_tensor("transformer.wpe.weight"))?;
+                    .or_else(|_| loader.get_tensor("transformer.wpe.weight"))
+                    .or_else(|_| loader.get_tensor("wpe.weight"))?;
                 let shape = position_embd.shape();
                 ensure!(
                     shape[0] == structure.generic.context_length,

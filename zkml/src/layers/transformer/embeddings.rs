@@ -655,7 +655,8 @@ impl Embeddings<f32> {
         let emb_tensor = loader
             .get_tensor("model.embed_tokens.weight")
             .or_else(|_| loader.get_tensor("token_embd.weight"))
-            .or_else(|_| loader.get_tensor("tok_embeddings.weight"))?;
+            .or_else(|_| loader.get_tensor("tok_embeddings.weight"))
+            .or_else(|_| loader.get_tensor("wte.weight"))?;
         Embeddings::new(emb_tensor)
     }
 }
