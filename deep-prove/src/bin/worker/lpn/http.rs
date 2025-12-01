@@ -49,6 +49,12 @@ where
     unreachable!()
 }
 
+/// A minimal struct to extract just the job_id from a potentially malformed job.
+#[derive(serde::Deserialize)]
+struct PartialJob {
+    job_id: i64,
+}
+
 /// A wrapper for the connection settings, as well as helper functions to
 /// interact with a gateway.
 struct ConnContext {
@@ -66,11 +72,11 @@ impl ConnContext {
         }
     }
 
-    /// Request a new job from the gateway.
+    /// Request a new job from the gateway, returning the raw response body.
     ///
     ///  - Will fail if the connection settings are not valid.
     ///  - Will fail after retries if the connection can not be established.
-    fn request_job(&self) -> anyhow::Result<v2::GwToWorker> {
+    fn request_job(&self) -> anyhow::Result<String> {
         ureq::get(
             self.gw_url
                 .join(&format!("api/v1/jobs/{}", self.worker_name))
@@ -79,11 +85,10 @@ impl ConnContext {
         )
         .header("authorization", &self.address)
         .call()
-        .context("connecting to gateway")
-        .and_then(|mut r| {
-            serde_json::from_reader::<_, v2::GwToWorker>(r.body_mut().as_reader())
-                .context("deserializing job from gateway")
-        })
+        .context("connecting to gateway")?
+        .body_mut()
+        .read_to_string()
+        .context("reading response body")
     }
 
     /// Confirm to the GW that we successfully received the job.
@@ -228,18 +233,46 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     let conn = ConnContext::new(gw_url, worker_name, address);
 
     loop {
-        // 1. Request job to the GW
+        // 1. Request job from the GW
         debug!("waiting for task from gateway");
-        let job = conn.request_job().context("fetching job from gateway")?;
+        let body = match conn.request_job() {
+            Ok(body) => body,
+            Err(e) => {
+                error!("failed to fetch job from gateway: {e:?}");
+                continue;
+            }
+        };
+
+        // 2. Parse the job, handling deserialization errors gracefully
+        let job = match serde_json::from_str::<v2::GwToWorker>(&body) {
+            Ok(job) => job,
+            Err(e) => {
+                error!("failed to deserialize job from gateway: {e}");
+                // Try to extract just the job_id to report the error back
+                if let Ok(partial) = serde_json::from_str::<PartialJob>(&body) {
+                    let err_msg = format!("worker failed to deserialize job: {e}");
+                    if let Err(submit_err) = conn.submit_error(partial.job_id, &err_msg) {
+                        error!("failed to submit error to gateway: {submit_err:?}");
+                    } else {
+                        info!("submitted deserialization error for job #{}", partial.job_id);
+                    }
+                } else {
+                    error!("could not extract job_id from malformed response to report error");
+                }
+                continue;
+            }
+        };
+
         let job_id = job.job_id;
         info!("received job #{job_id} to execute");
 
-        // 2. ACK job
+        // 3. ACK job
         match conn.ack_job(job_id) {
             Ok(_) => debug!("ACK-ed job #{job_id}"),
             Err(err) => error!("failed to ACK job: {err:?}"),
         }
-        // 3. Process job & submit proof
+
+        // 4. Process job & submit proof
         match process_job(job, &mut store, &model_fetcher).await {
             Ok(proof) => {
                 conn.submit_proof(job_id, &proof)

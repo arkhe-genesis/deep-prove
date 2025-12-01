@@ -12,6 +12,7 @@ report.txt
 table_cache_dev_*
 target
 venv
+worker_cache/
 zkml/assets/scripts/covid/data*
 zkml/bench
 zkml/bench.csv
@@ -19,7 +20,6 @@ zkml/cifar_net.pth
 zkml/cnn_model.pth
 zkml/data
 zkml/deepprove.csv
-
 
 # Devenv
 .devenv*
