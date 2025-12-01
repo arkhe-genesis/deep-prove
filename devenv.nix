@@ -41,7 +41,7 @@
     enable = true;
     channel = "nightly";
     version = "2025-08-08";
-    mold.enable = true;
+    mold.enable = pkgs.stdenv.isLinux;
   };
   languages.python = {
     enable = true;
