@@ -62,11 +62,13 @@ impl LayerInsertion for Gemma3Decoder {
             "Gemma3Decoder block should never be the first layer of the model"
         ))?;
 
-        let add_id = model.graph.add_inner(Layer::Add(Add::new()))?;
+        let add_id = model.graph_mut().add_inner(Layer::Add(Add::new()))?;
         model.add_edge(residul_id, add_id, (0, 0))?;
         model.add_edge(post_attention_norm_id, add_id, (0, 1))?;
 
-        let pre_ffn_norm_id = model.graph.add_inner(Layer::RMSNorm(pre_ffn_rmsnorm))?;
+        let pre_ffn_norm_id = model
+            .graph_mut()
+            .add_inner(Layer::RMSNorm(pre_ffn_rmsnorm))?;
         model.add_edge(add_id, pre_ffn_norm_id, (0, 0))?;
 
         let post_ffn_id = feed_forward.add_to_model(model, Some(pre_ffn_norm_id))?;
@@ -74,7 +76,7 @@ impl LayerInsertion for Gemma3Decoder {
         let post_ffn_norm_id =
             model.add_consecutive_layer(Layer::RMSNorm(post_ffn_rmsnorm), Some(post_ffn_id))?;
 
-        let final_add_id = model.graph.add_inner(Layer::Add(Add::new()))?;
+        let final_add_id = model.graph_mut().add_inner(Layer::Add(Add::new()))?;
         model.add_edge(add_id, final_add_id, (0, 0))?;
         model.add_edge(post_ffn_norm_id, final_add_id, (0, 1))?;
         Ok(final_add_id)

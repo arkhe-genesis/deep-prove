@@ -4,13 +4,11 @@ use crate::{
     graph::{Node, NodeId, NodeOutput, PortId},
     layers::provable::{OpInfo, QuantizeOp, TrackedDataId},
     model::{
-        BaseRunner, HandleLifetimeRunner, Model, ToStorageKey, TrackerRunner, tensor_to_handles,
+        BaseRunner, HandleLifetimeRunner, Model, ToStorageKey, TrackerRunner,
         transform::apply_transformations,
     },
-    number::Number,
     padding::PaddingMode,
     quantization::{self, ModelMetadata, metadata::MetadataBuilder},
-    rng_from_env_or_random,
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, anyhow, ensure};
@@ -104,59 +102,57 @@ impl ScalingStrategy for InferenceObserver {
         model: Model<f32>,
         store: &mut GenStore,
     ) -> Result<(Model<Element>, ModelMetadata)> {
-        let tracking_mode = InferenceTrackingMode::MinMax;
         // Alternatively:
         // let tracking_mode = InferenceTrackingMode::Quantiles(0.05, 0.95);
         // let tracking_mode = InferenceTrackingMode::NSigmas(3);
+        let tracking_mode = InferenceTrackingMode::MinMax;
         let mut tracker = InferenceTracker::new(tracking_mode);
 
-        let input_shapes = model.input_shapes();
         let unpadded_input_shapes = model.unpadded_input_shapes();
-        let input_samples = if self.input_samples.is_empty() {
-            let mut rng = rng_from_env_or_random();
+        let input_samples: Vec<Vec<Tensor<f32>>> = if self.input_samples.is_empty() {
             warn!("No representative inputs provided, generating random ones");
-            let inputs = input_shapes
-                .iter()
-                .map(|shape| {
-                    (0..shape.product())
-                        .map(|_| <f32 as Number>::random(&mut rng))
-                        .collect()
-                })
-                .collect();
+            let inputs = unpadded_input_shapes.iter().map(Tensor::random).collect();
             vec![inputs]
         } else {
             info!(
                 "Using the {} provided representative inputs to quantize model",
                 self.input_samples.len()
             );
-            self.input_samples.clone()
-        };
-        // 1. Run the inference multiple times with different inputs
-        // TODO: integrate that within model.rs in a more elegant way with inference step - currently problematic
-        // because of the generics and FFT requirement to take a field
-        let mut nsamples = 0;
-        for inputs in input_samples.into_iter() {
-            let input_tensors = inputs
+            self.input_samples
+                .clone()
                 .into_iter()
-                .zip(model.unpadded_input_shapes())
+                .map(|inputs| {
+                    inputs
+                        .into_iter()
+                        .zip(&unpadded_input_shapes)
+                        .map(|(input, unpadded_shape)| Tensor::new(unpadded_shape.clone(), input))
+                        .collect::<Result<_, _>>()
+                })
+                .collect::<Result<_, _>>()?
+        };
+
+        // Run model over sample inputs
+        for (sample, inputs) in input_samples.into_iter().enumerate() {
+            debug!("Running float inference with the {}-th input", sample + 1);
+
+            let input_handles = inputs
+                .into_iter()
+                .zip(&unpadded_input_shapes)
                 .enumerate()
-                .map(|(i, (input, shape))| {
-                    let input_node_id = model.graph.input_node_id(i)?;
-                    let input_tensor = Tensor::new(shape.clone(), input)?;
+                .map(|(i, (input_tensor, unpadded_shape))| {
+                    let input_node_id = model.graph().input_node_id(i)?;
                     let wrapped_tensor = WrappedTensor::try_from(&input_tensor)?;
                     let handle = TensorHandle::WrappedTensor {
                         storage_key: input_node_id.output_at(0).to_storage_key(),
                         store: store.clone(),
                         wrapped_tensor: Arc::new(RwLock::new(Some(wrapped_tensor))),
-                        unpadded_shape: shape.clone(),
-                        shape,
+                        unpadded_shape: unpadded_shape.clone(),
+                        shape: unpadded_shape.clone(),
                     };
-                    tracker.track(input_node_id.output_at(0), &handle)?;
-                    Ok(input_tensor)
+                    Ok(handle)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            debug!("Running float inference with the {}-th input", nsamples + 1);
-            let input_handles = tensor_to_handles(&input_tensors, &model.graph, store)?;
+
             let runner = BaseRunner {
                 store: store.clone(),
             };
@@ -166,21 +162,16 @@ impl ScalingStrategy for InferenceObserver {
             };
             #[cfg(test)]
             let runner = SanityCheckRunner { inner: runner };
-            let mut runner = HandleLifetimeRunner::count_from_graph(
-                runner,
-                &model.graph,
-                input_handles.clone(),
-            )?;
-            model.run_with_runner::<GoldilocksExt2, _>(input_handles, &mut runner)?;
-            nsamples += 1;
+            let mut runner =
+                HandleLifetimeRunner::count_from_graph(runner, model.graph(), input_handles)?;
+            model.run_with_runner::<GoldilocksExt2, _>(&mut runner)?;
         }
 
-        info!("InferenceObserver: {} total samples observed", nsamples);
-        // 2. get the scaling factor of the input
+        // Get the scaling factor of the input
         let num_model_inputs = unpadded_input_shapes.len();
         let input_scaling = (0..num_model_inputs)
             .map(|i| {
-                let input_node_id = model.graph.input_node_id(i)?;
+                let input_node_id = model.graph().input_node_id(i)?;
                 let (input_min, input_max) =
                     tracker.scaling_range(input_node_id.output_at(0)).unwrap();
                 Ok(ScalingFactor::from_absolute_max(
@@ -442,7 +433,7 @@ fn quantize_model<S: ScalingStrategy>(
     // required for `quantize_op`.
     let mut shape_map = HashMap::<NodeOutput, Shape>::new();
     let quantized_graph = model
-        .graph
+        .into_graph()
         // we create the quantized graph going in the inference order sometimes
         // some layer may need to know some parts of the previously visited
         // nodes
@@ -544,7 +535,10 @@ fn quantize_model<S: ScalingStrategy>(
 
     // Apply any model transformations
     model = apply_transformations(model, transforms)?;
-    let md = md.build(model.graph.input_node_ids(), model.graph.output_node_ids())?;
-    info!("Quantized model with {} layers", model.graph.node_count());
+    let md = md.build(
+        model.graph().input_node_ids(),
+        model.graph().output_node_ids(),
+    )?;
+    info!("Quantized model with {} layers", model.graph().node_count());
     Ok((model, md))
 }

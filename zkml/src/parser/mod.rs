@@ -88,11 +88,11 @@ pub fn to_quantized<S: ScalingStrategy>(
 ) -> anyhow::Result<(Model<Element>, ModelMetadata)> {
     // 1. set the input shapes
     if let Some(input_shapes) = pipeline_config.input_shapes.take() {
-        model.input_shapes = input_shapes.clone();
         // NOTE: currently no difference between padded and unpadded input shapes as it's
         // mostly used for LLM and this notion of padded/unpadded should disappear soon
-        model.unpadded_input_shapes = input_shapes.clone();
+        model.set_shapes(input_shapes.clone(), input_shapes);
     }
+
     let mut default_store = GenStore::default();
     let default_strategy = InferenceObserver::new();
     let store = if let Some(store) = pipeline_config.store {

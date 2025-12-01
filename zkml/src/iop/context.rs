@@ -106,13 +106,13 @@ impl Model<Element> {
         // The shape register is filled along the traversal of the graph.
         let mut shapes: HashMap<NodeOutput, Shape> = HashMap::new();
         debug!("Context : layer info generation ...");
-        let graph_ctx = self.graph.try_map_forward(|id, node| {
+        let graph_ctx = self.graph().try_map_forward(|id, node| {
             Ok(match node {
                 Node::Inner(layer) => {
                     let inner_metrics = Metrics::new();
                     // Collect the shapes of the tensor fed to this layer
                     ctx_aux.last_output_shape =
-                        order_by_in_port(self.graph.incoming_feeds(id).into_iter().map(|feed| {
+                        order_by_in_port(self.graph().incoming_feeds(id).into_iter().map(|feed| {
                             (
                                 NodeInput::new(id, feed.target.port),
                                 shapes[&feed.source].clone(),
@@ -149,7 +149,7 @@ impl Model<Element> {
                 Node::Input(i) => {
                     // Seed the shape register
                     shapes.insert(
-                        NodeOutput::new(self.graph.input_node_id(*i)?, 0),
+                        NodeOutput::new(self.graph().input_node_id(*i)?, 0),
                         input_shapes[*i].clone(),
                     );
                     Node::Input(*i)

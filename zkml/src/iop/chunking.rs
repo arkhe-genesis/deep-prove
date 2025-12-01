@@ -515,7 +515,7 @@ impl ModelChunk {
 
     pub(crate) fn chunk_layers<'a>(&self, model: &'a Model<Element>) -> ModelLayersRef<'a> {
         model
-            .graph
+            .graph()
             .inner_nodes()
             .filter_map(|(node_id, layer)| {
                 // retain the node if it is in the current chunk

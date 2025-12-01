@@ -11,7 +11,7 @@
 //! This is to ensure that the einsum operation can be proven via Sumcheck.
 
 use crate::{
-    Claim, Element, Number, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Number, Shape, Tensor,
     graph::NodeId,
     iop::{context::ContextAux, prover::Prover, verifier::Verifier},
     layers::{

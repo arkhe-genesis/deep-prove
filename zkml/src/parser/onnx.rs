@@ -185,7 +185,7 @@ fn from_inference_model(model: InferenceModel) -> Result<Model<f32>> {
         input_mapping.insert(
             input.0,
             pmodel
-                .graph
+                .graph()
                 .input_nodes()
                 .find(|(_, i)| **i == input.0)
                 .unwrap_or_else(|| panic!("{:?} not found", input))
@@ -202,7 +202,7 @@ fn from_inference_model(model: InferenceModel) -> Result<Model<f32>> {
     }
 
     for (i, outlet) in onnx_model.output_outlets()?.iter().enumerate() {
-        let output_node_id = pmodel.graph.add_output(i)?;
+        let output_node_id = pmodel.graph_mut().add_output(i)?;
         pmodel.add_raw_edge(
             parser.node_mapping[&outlet.node],
             output_node_id,
@@ -278,7 +278,7 @@ impl<'a, I: Iterator<Item = &'a usize> + Sized> ParserFactory<'a, I> {
                 debug!(
                     "parsed node id: {:?} -> {zkml_node_id} : {}",
                     curr_node_id,
-                    model.graph.node(zkml_node_id).unwrap().describe(),
+                    model.graph().node(zkml_node_id).unwrap().describe(),
                 );
                 Some(Ok(zkml_node_id))
             }
@@ -331,7 +331,7 @@ fn load_reshape<'a, I: Iterator<Item = &'a usize> + Sized>(
         node.name
     );
     let zkml_node_id = model
-        .graph
+        .graph_mut()
         .add_inner(Layer::Flatten(crate::layers::flatten::Flatten(false)))?;
     model.add_edge(
         node_mapping[&node.inputs[0].node],
@@ -356,7 +356,7 @@ fn load_flatten<'a, I: Iterator<Item = &'a usize> + Sized>(
         node.name
     );
     let zkml_node_id = model
-        .graph
+        .graph_mut()
         .add_inner(Layer::Flatten(crate::layers::flatten::Flatten(false)))?;
     model.add_edge(
         node_mapping[&node.inputs[0].node],
@@ -423,7 +423,7 @@ fn load_maxpool<'a, I: Iterator<Item = &'a usize> + Sized>(
         ensure_onnx!(dil.iter().all(|&x| x == 1), "Dilations must be 1");
     }
     let zkml_maxpool = Layer::Pooling(Pooling::Maxpool2D(Maxpool2D::default()));
-    let zkml_node_id = model.graph.add_inner(zkml_maxpool)?;
+    let zkml_node_id = model.graph_mut().add_inner(zkml_maxpool)?;
     model.add_edge(
         node_mapping[&node.inputs[0].node],
         zkml_node_id,
@@ -461,7 +461,7 @@ fn load_relu<'a, I: Iterator<Item = &'a usize> + Sized>(
         }
     };
     let zkml_node_id = model
-        .graph
+        .graph_mut()
         .add_inner(Layer::Activation(Activation::new_relu()))?;
     model.add_edge(
         node_mapping[&real_input_id.node],
@@ -686,7 +686,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     let dense = crate::layers::einsum::EinSum::new_dense(weight, bias_tensor)?;
 
     // we put the bias id if present so next layers refer to it and not the gemm node
-    let zkml_node_id = model.graph.add_inner(Layer::EinSum(dense))?;
+    let zkml_node_id = model.graph_mut().add_inner(Layer::EinSum(dense))?;
     model.add_edge(
         node_mapping[&input_link.node],
         zkml_node_id,
@@ -729,7 +729,7 @@ fn load_conv<'a, I: Iterator<Item = &'a usize> + Sized>(
     } else {
         Convolution::new(filter_const, bias_const)?
     };
-    let zkml_node_id = model.graph.add_inner(Layer::Convolution(conv))?;
+    let zkml_node_id = model.graph_mut().add_inner(Layer::Convolution(conv))?;
     model.add_edge(
         node_mapping[&input_link.node],
         zkml_node_id,

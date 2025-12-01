@@ -99,7 +99,7 @@ impl AttentionMechanism for Gemma3Attention {
             caching_dim,
         } = self.caching_dim();
 
-        let qkv_einsum = model.graph.node_mut(qkv_einsum_id).ok_or(anyhow!("Could not insert Gemma3Attention, QKV EinSum with ID({qkv_einsum_id}) has not been inserted"))?;
+        let qkv_einsum = model.graph_mut().node_mut(qkv_einsum_id).ok_or(anyhow!("Could not insert Gemma3Attention, QKV EinSum with ID({qkv_einsum_id}) has not been inserted"))?;
 
         if let Some(Layer::EinSum(einsum)) = qkv_einsum.as_inner_mut() {
             einsum.with_caches(vec![None, None, Some(caching_dim)])?;
@@ -110,8 +110,8 @@ impl AttentionMechanism for Gemma3Attention {
         // If we have a QK norm we add it here
         let (q_rope_id, k_rope_id) =
             if let (Some(q_norm), Some(k_norm)) = (self.q_norm, self.k_norm) {
-                let q_norm_id = model.graph.add_inner(Layer::RMSNorm(q_norm))?;
-                let k_norm_id = model.graph.add_inner(Layer::RMSNorm(k_norm))?;
+                let q_norm_id = model.graph_mut().add_inner(Layer::RMSNorm(q_norm))?;
+                let k_norm_id = model.graph_mut().add_inner(Layer::RMSNorm(k_norm))?;
                 model.add_edge(qkv_einsum_id, q_norm_id, vec![(0, 0)])?;
                 model.add_edge(qkv_einsum_id, k_norm_id, vec![(1, 0)])?;
 
@@ -130,10 +130,10 @@ impl AttentionMechanism for Gemma3Attention {
                 (q_rope_id, k_rope_id)
             } else {
                 let q_rope_id = model
-                    .graph
+                    .graph_mut()
                     .add_inner(Layer::Positional(self.rope.clone()))?;
                 // We have to call `with_cache()` here to ensure that the positional cache for K is not shared with Q
-                let k_rope_id = model.graph.add_inner(Layer::Positional(
+                let k_rope_id = model.graph_mut().add_inner(Layer::Positional(
                     self.rope
                         .with_cache()
                         .with_rope_cache(kv_rank, caching_dim)?,

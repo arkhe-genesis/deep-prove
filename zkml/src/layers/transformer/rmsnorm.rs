@@ -1,6 +1,6 @@
 //! Implementation of the RMSNorm layer
 use crate::{
-    Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Tensor,
+    Claim, Element, NextPowerOfTwo, ProverContext, ScalingFactor, ScalingStrategy, Tensor,
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
     iop::{

@@ -1,34 +1,5 @@
-use crate::{
-    ScalingFactor, ScalingStrategy,
-    backend::Backend,
-    commit::{compute_betas_eval, identity_eval},
-    layers::{
-        LayerProof,
-        provable::{QuantizeOp, QuantizeOutput},
-    },
-    padding::ShapeData,
-    parser::{gguf, json},
-    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
-    to_bit_sequence_le,
-    util::from_mle_list_dimensions,
-};
 use std::iter::once;
 
-use crate::{
-    Claim, Element, Prover, Shape, Tensor,
-    graph::NodeId,
-    iop::{
-        context::{ContextAux, ShapeStep},
-        verifier::Verifier,
-    },
-    layers::{
-        LayerCtx,
-        provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
-    },
-    model::Step,
-    number::Number,
-    padding::{PaddingMode, ShapeInfo},
-};
 use anyhow::{Result, ensure};
 use burn::tensor::{
     Shape as BShape, TensorPrimitive,
@@ -45,6 +16,31 @@ use sumcheck::{
     util::optimal_sumcheck_threads,
 };
 use transcript::Transcript;
+
+use crate::{
+    Claim, Element, NextPowerOfTwo, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    backend::Backend,
+    commit::{compute_betas_eval, identity_eval},
+    graph::NodeId,
+    iop::{
+        context::{ContextAux, ShapeStep},
+        verifier::Verifier,
+    },
+    layers::{
+        LayerCtx, LayerProof,
+        provable::{
+            Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
+            VerifiableCtx,
+        },
+    },
+    model::Step,
+    number::Number,
+    padding::{PaddingMode, ShapeData, ShapeInfo},
+    parser::{gguf, json},
+    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
+    to_bit_sequence_le,
+    util::from_mle_list_dimensions,
+};
 
 /// The short name used to identify the embeddings layer
 pub const EMBEDDINGS_LAYER: &str = "EMBD";

@@ -5,7 +5,7 @@ use super::{
     },
 };
 use crate::{
-    Claim, Element, Prover, ScalingStrategy, Shape, VectorTranscript,
+    Claim, Element, NextPowerOfTwo, Prover, ScalingStrategy, Shape, VectorTranscript,
     backend::Conv2dConfig,
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,

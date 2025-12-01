@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::{
-    Element, Shape, Tensor,
+    Element, NextPowerOfTwo, Shape, Tensor,
     graph::{Node, NodeInput, NodeOutput, order_by_in_port},
     layers::{
         einsum::EinSum,
@@ -111,9 +111,8 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
         shapes: model
             .unpadded_input_shapes()
             .into_iter()
-            .zip(model.padded_input_shapes())
-            .map(|(unpadded_shape, padded_shape)| ShapeData {
-                input_shape_padded: padded_shape,
+            .map(|unpadded_shape| ShapeData {
+                input_shape_padded: unpadded_shape.next_power_of_two(),
                 ignore_garbage_pad: None,
                 input_shape_og: unpadded_shape,
             })
@@ -128,43 +127,44 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
     // compute all shape infos to be able to pad the model afterwards.
     let mut shape_infos: HashMap<NodeOutput, ShapeData> = Default::default();
 
-    let padded_graph = model
-        .graph
-        .try_into_map_forward(|node_id, node, incoming_feeds| {
-            Ok(match node {
-                Node::Inner(layer) => {
-                    let mut si = ShapeInfo {
-                        shapes: order_by_in_port(incoming_feeds.into_iter().map(|feed| {
-                            let in_shape = shape_infos[&feed.source].clone();
-                            (NodeInput::new(node_id, feed.target.port), in_shape)
-                        }))
-                        .collect(),
-                    };
+    let padded_graph =
+        model
+            .into_graph()
+            .try_into_map_forward(|node_id, node, incoming_feeds| {
+                Ok(match node {
+                    Node::Inner(layer) => {
+                        let mut si = ShapeInfo {
+                            shapes: order_by_in_port(incoming_feeds.into_iter().map(|feed| {
+                                let in_shape = shape_infos[&feed.source].clone();
+                                (NodeInput::new(node_id, feed.target.port), in_shape)
+                            }))
+                            .collect(),
+                        };
 
-                    let desc = layer.describe();
-                    let padded_layer = layer
-                        .pad_node(&mut si)
-                        .with_context(|| format!("padding layer {:?}: {}", node_id, desc))?;
+                        let desc = layer.describe();
+                        let padded_layer = layer
+                            .pad_node(&mut si)
+                            .with_context(|| format!("padding layer {:?}: {}", node_id, desc))?;
 
-                    shape_infos.extend(
-                        si.shapes
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, shape_data)| (NodeOutput::new(node_id, i), shape_data)),
-                    );
+                        shape_infos.extend(
+                            si.shapes
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, shape_data)| (NodeOutput::new(node_id, i), shape_data)),
+                        );
 
-                    Node::Inner(padded_layer)
-                }
-                Node::Input(i) => {
-                    shape_infos.insert(node_id.as_model_input(), input_si.shapes[i].clone());
-                    Node::Input(i)
-                }
-                Node::Output(o) => Node::Output(o),
-            })
-        })?;
+                        Node::Inner(padded_layer)
+                    }
+                    Node::Input(i) => {
+                        shape_infos.insert(node_id.as_model_input(), input_si.shapes[i].clone());
+                        Node::Input(i)
+                    }
+                    Node::Output(o) => Node::Output(o),
+                })
+            })?;
 
     model = Model::<Element>::new(unpadded_input_shapes, PaddingMode::Padding, padded_graph);
-    debug!("Padded model with {} layers", model.graph.node_count());
+    debug!("Padded model with {} layers", model.graph().node_count());
     Ok(model)
 }
 

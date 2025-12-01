@@ -1,27 +1,22 @@
-use anyhow::{ensure};
-use zkml::ProverContext;
+use crate::Tensor;
+use anyhow::ensure;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use std::collections::HashMap;
 use tenstore::GenStore;
 use transcript::BasicTranscript;
-use zkml::iop::chunking::ChunkingStrategy;
-use crate::Tensor;
-use zkml::Proof;
-use zkml::IO;
 use zkml::{
-    Element,
+    Element, IO, Proof, ProverContext,
     graph::{
         executor::ThreadPoolExecutor,
         partition::{Partition, PartitionScheduler},
         scheduler::ExecGraph,
     },
-    model::{
-        exec_graph::{
-            ExecGraphNode, InferenceEngine, SerializableGraphCtx, build_execution_graph,
-            extract_graph_outputs, graph_inputs,
-        },
+    iop::chunking::ChunkingStrategy,
+    model::exec_graph::{
+        ExecGraphNode, InferenceEngine, SerializableGraphCtx, build_execution_graph,
+        extract_graph_outputs, graph_inputs,
     },
 };
 
@@ -49,9 +44,11 @@ pub type SerializableCtx = SerializableGraphCtx<F, Pcs>;
 pub trait GraphRuner {
     type ChunkingStrategy: ChunkingStrategy;
     #[allow(clippy::type_complexity)]
-    fn setup(&mut self) -> anyhow::Result<(ProverContext<F, Pcs>,InferenceEngine, Vec<Tensor<Element>>)>;
+    fn setup(
+        &mut self,
+    ) -> anyhow::Result<(ProverContext<F, Pcs>, InferenceEngine, Vec<Tensor<Element>>)>;
     fn chunk_strategy(&self) -> Self::ChunkingStrategy;
-    fn verify_proof(&self, proof: Proof<F,Pcs>, io: IO<F>) -> anyhow::Result<()>;
+    fn verify_proof(&self, proof: Proof<F, Pcs>, io: IO<F>) -> anyhow::Result<()>;
 }
 
 #[allow(clippy::type_complexity)]
@@ -117,8 +114,7 @@ pub fn run_node(
     Ok(())
 }
 
-pub fn main_loop<R: GraphRuner>(num_workers: usize,mut runner: R) -> anyhow::Result<()> 
-{
+pub fn main_loop<R: GraphRuner>(num_workers: usize, mut runner: R) -> anyhow::Result<()> {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -126,7 +122,10 @@ pub fn main_loop<R: GraphRuner>(num_workers: usize,mut runner: R) -> anyhow::Res
     //          COORDINATOR
     // ------------------------------
     let (pk, engine, inputs) = runner.setup()?;
-    println!("model: # nodes: {}", engine.model().graph.inner_nodes_count());
+    println!(
+        "model: # nodes: {}",
+        engine.model().graph().inner_nodes_count()
+    );
 
     let store = GenStore::default();
 
@@ -137,8 +136,7 @@ pub fn main_loop<R: GraphRuner>(num_workers: usize,mut runner: R) -> anyhow::Res
     // the full context is not deserializable since it contains the store, so we need to build it
     // from the deserialized context by attaching the store
     let ctx = deserialized_ctx.to_full_ctx(store.clone());
-    let graph: Graph =
-        build_execution_graph(&ctx, Some(num_workers), runner.chunk_strategy())?;
+    let graph: Graph = build_execution_graph(&ctx, Some(num_workers), runner.chunk_strategy())?;
 
     let inputs = graph_inputs(inputs, store.clone(), &graph)?;
 

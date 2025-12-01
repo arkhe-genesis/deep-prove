@@ -1,6 +1,6 @@
 //! This layer applies the softmax function to the last dimension of the input tensor
 use crate::{
-    Claim, Element, Number, ScalingStrategy, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Number, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     eval_zeroifier_mle,
     graph::NodeId,

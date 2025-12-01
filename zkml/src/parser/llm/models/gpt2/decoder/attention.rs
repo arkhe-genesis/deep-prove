@@ -91,7 +91,7 @@ impl AttentionMechanism for GPT2Attention {
         // First we add the caching to the QKV einsum
         let AttentionCacheConfig { caching_dim, .. } = self.caching_dim();
 
-        let qkv_einsum = model.graph.node_mut(qkv_einsum_id).ok_or(anyhow::anyhow!("Could not insert GPT2Attention, QKV EinSum with ID({qkv_einsum_id}) has not been inserted"))?;
+        let qkv_einsum = model.graph_mut().node_mut(qkv_einsum_id).ok_or(anyhow::anyhow!("Could not insert GPT2Attention, QKV EinSum with ID({qkv_einsum_id}) has not been inserted"))?;
         if let Some(Layer::EinSum(einsum)) = qkv_einsum.as_inner_mut() {
             einsum.with_caches(vec![None, Some(caching_dim), Some(caching_dim)])?;
         } else {

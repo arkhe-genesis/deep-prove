@@ -1,5 +1,5 @@
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -836,7 +836,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
 #[cfg(test)]
 mod tests {
     use crate::{
-        Element, Tensor,
+        Element, NextPowerOfTwo, Tensor,
         layers::{
             provable::PadOp,
             transformer::positional::{Positional, PositionalVariant},

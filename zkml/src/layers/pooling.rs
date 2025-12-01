@@ -3,7 +3,7 @@ use super::{
     provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
 };
 use crate::{
-    Claim, Element, Prover, ProverContext, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Prover, ProverContext, Shape, Tensor,
     backend::Maxpool2dConfig,
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,

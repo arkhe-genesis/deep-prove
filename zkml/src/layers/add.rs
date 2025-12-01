@@ -1,5 +1,5 @@
 use crate::{
-    Claim, Element, Number, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Number, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},

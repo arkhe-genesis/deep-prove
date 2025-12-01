@@ -70,7 +70,7 @@ impl GlobalContext {
                 .map(|x| x.shape().to_owned())
                 .collect::<Vec<_>>();
             let input_f32_handles =
-                tensor_to_handles(&inputs_f32, &model_f32.graph, &mut store_f32)?;
+                tensor_to_handles(&inputs_f32, model_f32.graph(), &mut store_f32)?;
 
             let mut min_max_tracker_f32 = InferenceTracker::new(InferenceTrackingMode::MinMax);
             let runner = BaseRunner {
@@ -84,12 +84,12 @@ impl GlobalContext {
             let runner = SanityCheckRunner { inner: runner };
             let mut runner = HandleLifetimeRunner::count_from_graph(
                 runner,
-                &model_f32.graph,
+                model_f32.graph(),
                 input_f32_handles.clone(),
             )?;
 
             model_f32
-                .run_with_runner::<GoldilocksExt2, _>(input_f32_handles, &mut runner)
+                .run_with_runner::<GoldilocksExt2, _>(&mut runner)
                 .context("running the model in float mode")?;
 
             Rc::new(Snapshot {
@@ -113,7 +113,7 @@ impl GlobalContext {
                 .map(|x| x.shape().to_owned())
                 .collect::<Vec<_>>();
             let input_elt_handles =
-                tensor_to_handles(&inputs_elt, &model_elt.graph, &mut store_elt)?;
+                tensor_to_handles(&inputs_elt, model_elt.graph(), &mut store_elt)?;
 
             let mut min_max_tracker_elt = InferenceTracker::new(InferenceTrackingMode::MinMax);
             let runner = BaseRunner {
@@ -127,12 +127,12 @@ impl GlobalContext {
             let runner = SanityCheckRunner { inner: runner };
             let mut runner = HandleLifetimeRunner::count_from_graph(
                 runner,
-                &model_elt.graph,
+                model_elt.graph(),
                 input_elt_handles.clone(),
             )?;
 
             model_elt
-                .run_with_runner::<F, _>(input_elt_handles, &mut runner)
+                .run_with_runner::<F, _>(&mut runner)
                 .context("running the model in elt mode")?;
             Rc::new(Snapshot {
                 shapes: shape_steps(model_elt.graph(), &input_shapes)?,

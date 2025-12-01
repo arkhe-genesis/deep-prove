@@ -1,5 +1,5 @@
 use crate::{
-    Claim, Element, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     eval_zeroifier_mle,
     graph::NodeId,

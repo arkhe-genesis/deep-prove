@@ -11,7 +11,7 @@ use multilinear_extensions::mle::PointAndEval;
 use quantization::Fieldizer;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Borrow, env, str::FromStr};
+use std::{borrow::Borrow, env, ops::Deref, str::FromStr};
 use transcript::{BasicTranscript, Transcript};
 mod backend;
 mod commit;
@@ -244,6 +244,16 @@ pub trait NextPowerOfTwo {
 impl NextPowerOfTwo for Vec<usize> {
     fn next_power_of_two(&self) -> Self {
         self.iter().map(|&i| i.next_power_of_two()).collect()
+    }
+}
+impl NextPowerOfTwo for Shape {
+    fn next_power_of_two(&self) -> Self {
+        Shape::new(self.deref().next_power_of_two())
+    }
+}
+impl NextPowerOfTwo for Vec<Shape> {
+    fn next_power_of_two(&self) -> Self {
+        self.iter().map(|el| el.next_power_of_two()).collect()
     }
 }
 

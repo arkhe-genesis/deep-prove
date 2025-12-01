@@ -1211,7 +1211,7 @@ mod tests {
     use ark_std::rand::Rng;
     use ff_ext::{FromUniformBytes, GoldilocksExt2 as F};
 
-    use crate::{Element, quantization::TensorFielder, rng_from_env_or_random};
+    use crate::{Element, NextPowerOfTwo, quantization::TensorFielder, rng_from_env_or_random};
 
     use super::*;
 

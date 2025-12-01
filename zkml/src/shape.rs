@@ -1,4 +1,4 @@
-use crate::{NextPowerOfTwo, quantization};
+use crate::quantization;
 use anyhow::{Result, ensure};
 use ff_ext::ExtensionField;
 use multilinear_extensions::util::ceil_log2;
@@ -47,6 +47,7 @@ pub(crate) fn filter_size(shape: &Shape) -> usize {
 )]
 #[display("{_0:?}")]
 pub struct Shape(Vec<usize>);
+
 impl std::fmt::Debug for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[")?;
@@ -329,9 +330,6 @@ impl Shape {
 
     pub fn permute(&self, permutation: &[usize]) -> Self {
         Self(permutation.iter().map(|i| self.0[*i]).collect())
-    }
-    pub fn next_power_of_two(&self) -> Self {
-        Self(self.0.next_power_of_two())
     }
     pub fn extend(&self, other: &Self) -> Self {
         let mut new_shape = self.0.clone();

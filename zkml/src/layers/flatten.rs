@@ -1,6 +1,6 @@
 use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProveInfo};
 use crate::{
-    Shape,
+    NextPowerOfTwo, Shape,
     graph::NodeId,
     iop::context::ContextAux,
     layers::LayerCtx,

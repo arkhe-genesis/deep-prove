@@ -57,7 +57,7 @@ impl LayerInsertion for GPT2Decoder {
         let residual_id = previous_node_id.unwrap();
         let post_attention_id = attention_mechanism.add_to_model(model, Some(initial_norm_id))?;
 
-        let add_id = model.graph.add_inner(Layer::Add(Add::<f32>::new()))?;
+        let add_id = model.graph_mut().add_inner(Layer::Add(Add::<f32>::new()))?;
         model.add_edge(residual_id, add_id, (0, 0))?;
         model.add_edge(post_attention_id, add_id, (0, 1))?;
 
@@ -65,7 +65,7 @@ impl LayerInsertion for GPT2Decoder {
             model.add_consecutive_layer(Layer::LayerNorm(pre_ffn_layernorm), Some(add_id))?;
 
         let post_ffn_id = feed_forward.add_to_model(model, Some(pre_ffn_norm_id))?;
-        let final_add_id = model.graph.add_inner(Layer::Add(Add::<f32>::new()))?;
+        let final_add_id = model.graph_mut().add_inner(Layer::Add(Add::<f32>::new()))?;
         model.add_edge(add_id, final_add_id, (0, 0))?;
         model.add_edge(post_ffn_id, final_add_id, (0, 1))?;
 

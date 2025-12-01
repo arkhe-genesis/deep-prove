@@ -7,7 +7,8 @@ pub use burn_wrapper::{
 };
 
 use crate::{
-    ScalingFactor, backend::Backend, layers::convolution, number::Number, shape::Shape, to_field,
+    NextPowerOfTwo, ScalingFactor, backend::Backend, layers::convolution, number::Number,
+    shape::Shape, to_field,
 };
 use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::{Int, Tensor as BTensor, TensorData};

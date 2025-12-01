@@ -226,8 +226,7 @@ impl Driver<f32> {
             input_handles.clone(),
         )?;
 
-        self.model
-            .run_with_runner::<E, _>(input_handles, &mut runner)?;
+        self.model.run_with_runner::<E, _>(&mut runner)?;
 
         let mut trace = runner.into_inner().into_trace();
         trace.output = trace.graph_outputs(&self.model.graph)?;
@@ -344,7 +343,7 @@ where
             )?;
 
             self.model
-                .run_with_runner::<E, _>(input_handles, &mut runner)
+                .run_with_runner::<E, _>(&mut runner)
                 .with_context(|| {
                     format!("running the {} iteration loop", unpadded_seq_len - user_len)
                 })?;

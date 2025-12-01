@@ -468,7 +468,7 @@ mod tests {
     use tenstore::{GenStore, StorageKey};
 
     use crate::{
-        Element, Tensor,
+        Element, NextPowerOfTwo, Tensor,
         layers::{
             Layer,
             provable::{Evaluate, PadOp},

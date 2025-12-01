@@ -169,7 +169,9 @@ pub trait AttentionMechanism {
         // We insert the query key EinSum into the model (but don't wire it up yet)
         let qkv_einsum_id =
             model.add_consecutive_layer(Layer::EinSum(qkv_einsum), previous_node_id)?;
-        let query_key_id = model.graph.add_inner(Layer::EinSum(query_key_einsum))?;
+        let query_key_id = model
+            .graph_mut()
+            .add_inner(Layer::EinSum(query_key_einsum))?;
         // We insert any custom logic specific to the attention mechanism
         self.insert_custom_logic(model, qkv_einsum_id, query_key_id)?;
         // We insert the attention mask layer and the softmax layer
@@ -214,7 +216,7 @@ pub trait AttentionMechanism {
 
         // Finally we insert the attention value EinSum and output EinSum layers
         let attention_value_id = model
-            .graph
+            .graph_mut()
             .add_inner(Layer::EinSum(attention_value_einsum))?;
 
         model.add_edge(softmax_id, attention_value_id, (0, 0))?;

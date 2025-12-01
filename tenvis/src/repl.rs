@@ -12,7 +12,8 @@ use log::error;
 use serde::{Deserialize, Serialize};
 use tenstore::{GenericStore, StorageKey};
 use zkml::{
-    Element, Number, Tensor, graph::NodeOutput, model::ToStorageKey, tensor::TensorTypeParam,
+    Element, NextPowerOfTwo, Number, Tensor, graph::NodeOutput, model::ToStorageKey,
+    tensor::TensorTypeParam,
 };
 
 enum RunMode {

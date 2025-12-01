@@ -1,6 +1,6 @@
 use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx};
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
+    Claim, Element, NextPowerOfTwo, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
     iop::{

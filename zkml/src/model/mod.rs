@@ -1,7 +1,7 @@
 use std::mem;
 
 use crate::{
-    Element, Shape, Tensor,
+    Element, NextPowerOfTwo, Shape, Tensor,
     graph::{Direction, Edge, Graph, Node, NodeId, NodeInput, NodeOutput, PortLink, Ports},
     iop::prover::{ModelLayers, ModelLayersRef},
     layers::{
@@ -86,6 +86,12 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
+    /// Called once per model inference run.
+    ///
+    /// NOTE: For LLMs this will be called once per token.
+    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &I) -> anyhow::Result<()>;
+
+    /// Called once per model's layer.
     fn run_layer(
         &mut self,
         node_id: NodeId,
@@ -110,6 +116,13 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
+    fn model_inputs(&mut self, _graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
+        for handle in &inputs.input_handles {
+            handle.save_to_store()?;
+        }
+        Ok(())
+    }
+
     fn run_layer(
         &mut self,
         node_id: NodeId,
@@ -179,6 +192,16 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
+    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
+        for (i, handle) in inputs.input_handles.iter().enumerate() {
+            let input_node_id = graph.input_node_id(i)?;
+            let port = 0;
+            self.tracker.track(input_node_id.output_at(port), handle)?;
+        }
+        self.inner.model_inputs(graph, inputs)?;
+        Ok(())
+    }
+
     fn run_layer(
         &mut self,
         node_id: NodeId,
@@ -216,6 +239,16 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
+    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
+        assert_eq!(
+            inputs.input_handles.len(),
+            graph.input_nodes().count(),
+            "The number of input tensors must match the expected number of inputs of the model's graph"
+        );
+        self.inner.model_inputs(graph, inputs)?;
+        Ok(())
+    }
+
     fn run_layer(
         &mut self,
         node_id: NodeId,
@@ -290,6 +323,11 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
+    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
+        self.inner.model_inputs(graph, inputs)?;
+        Ok(())
+    }
+
     fn run_layer(
         &mut self,
         node_id: NodeId,
@@ -411,6 +449,24 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
+    fn model_inputs(&mut self, graph: &ModelGraph<N>, _inputs: &()) -> anyhow::Result<()> {
+        let input_nodes = graph.input_nodes().count();
+
+        let input_storage_keys: Vec<StorageKey<Vec<N>>> = (0..input_nodes)
+            .map(|i| Ok(graph.input_node_id(i)?.output_at(0).to_storage_key()))
+            .collect::<Result<Vec<_>>>()?;
+
+        let input_handles = input_storage_keys
+            .iter()
+            .map(|storage_key| self.get_by_storage_key(storage_key))
+            .collect::<Result<Vec<_>>>()?;
+
+        let inputs = RunInput { input_handles };
+        self.inner.model_inputs(graph, &inputs)?;
+
+        Ok(())
+    }
+
     fn run_layer(
         &mut self,
         node_id: NodeId,
@@ -501,9 +557,9 @@ pub struct Model<N> {
     ///
     ///   - model global outputs are represented by their own
     ///     `Node::Output(output_id)`, and sample their value on input port 0;
-    pub graph: ModelGraph<N>,
-    pub(crate) input_shapes: Vec<Shape>,
-    pub(crate) unpadded_input_shapes: Vec<Shape>,
+    graph: ModelGraph<N>,
+    input_shapes: Vec<Shape>,
+    unpadded_input_shapes: Vec<Shape>,
 }
 
 impl<N> Model<N> {
@@ -512,19 +568,26 @@ impl<N> Model<N> {
         &self.graph
     }
 
+    /// Return an immutable reference to the underlying graph.
+    pub fn graph_mut(&mut self) -> &mut ModelGraph<N> {
+        &mut self.graph
+    }
+
+    /// Consumes the [Model] and returns its [ModelGraph].
+    pub fn into_graph(self) -> ModelGraph<N> {
+        self.graph
+    }
+
+    pub fn set_shapes(&mut self, input_shapes: Vec<Shape>, unpadded_input_shapes: Vec<Shape>) {
+        self.input_shapes = input_shapes;
+        self.unpadded_input_shapes = unpadded_input_shapes;
+    }
+
     /// Returns an iterator over the nodes in the model, in arbitrary order.
     /// It is more efficient then `ForwardIterator` and `BackwardIterator`, so it
     /// can be used to iterate over the nodes when the order does not matter
     pub fn to_unstable_iterator(&self) -> impl Iterator<Item = (&NodeId, &Node<Layer<N>>)> {
         self.graph.nodes()
-    }
-
-    /// Utility method to pad the inputs shapes to the next power of two.
-    fn compute_padded_input_shapes(unpadded_input_shapes: &[Shape]) -> Vec<Shape> {
-        unpadded_input_shapes
-            .iter()
-            .map(|shape| shape.next_power_of_two())
-            .collect()
     }
 
     /// Instantiate a model with the given input shape: the `padding` input specifies whether
@@ -539,7 +602,7 @@ impl<N> Model<N> {
 
         let input_shapes = match padding {
             PaddingMode::NoPadding => unpadded_input_shapes.clone(),
-            PaddingMode::Padding => Self::compute_padded_input_shapes(&unpadded_input_shapes),
+            PaddingMode::Padding => unpadded_input_shapes.next_power_of_two(),
         };
 
         Self {
@@ -591,11 +654,6 @@ impl<N> Model<N> {
     /// Return the number of inputs this model expects.
     pub fn num_inputs(&self) -> usize {
         self.input_shapes.len()
-    }
-
-    /// Compute the input shapes padded to the next power of two
-    pub(crate) fn padded_input_shapes(&self) -> Vec<Shape> {
-        Self::compute_padded_input_shapes(&self.unpadded_input_shapes)
     }
 
     /// Connect the provided input to the given node port.
@@ -662,7 +720,11 @@ where
     pub fn describe(&self) {
         info!("Model description:");
         info!("Unpadded input shapes: {:?}", self.unpadded_input_shapes);
-        info!("Padded input shapes: {:?}", self.padded_input_shapes());
+        info!(
+            "Padded input shapes: {:?}",
+            self.unpadded_input_shapes.next_power_of_two(),
+        );
+
         for (id, layer) in self.graph.forward_inners() {
             let edges = self
                 .graph
@@ -930,19 +992,13 @@ impl Model<f32> {
 }
 
 impl<N: TensorTypeParam> Model<N> {
-    pub fn run_with_runner<E, R>(
-        &self,
-        inputs: Vec<TensorHandle<N>>,
-        runner: &mut R,
-    ) -> anyhow::Result<()>
+    pub fn run_with_runner<E, R>(&self, runner: &mut R) -> anyhow::Result<()>
     where
         E: ExtensionField,
         Layer<N>: Evaluate<N>,
         R: LayerRunner<N, (), E>,
     {
-        for handle in &inputs {
-            handle.save_to_store()?;
-        }
+        runner.model_inputs(&self.graph, &())?;
 
         for (node_id, layer) in self.graph.forward_inners() {
             runner
@@ -984,7 +1040,7 @@ impl<N: TensorTypeParam> Model<N> {
         let mut runner =
             HandleLifetimeRunner::count_from_graph(runner, &self.graph, input_handles.clone())?;
 
-        self.run_with_runner::<E, _>(input_handles, &mut runner)?;
+        self.run_with_runner::<E, _>(&mut runner)?;
 
         let mut trace = runner.into_inner().into_trace();
         trace.output = trace.graph_outputs(&self.graph)?;
@@ -1444,7 +1500,7 @@ pub(crate) mod test {
         representative_inputs: Option<Vec<Tensor<f32>>>,
         store: &mut GenStore,
     ) -> anyhow::Result<(Model<Element>, Vec<Tensor<Element>>)> {
-        let (quantized_model, md) = if let Some(repr_inputs) = representative_inputs {
+        let observer = if let Some(repr_inputs) = representative_inputs {
             InferenceObserver::new_with_representative_input(vec![
                 repr_inputs
                     .iter()
@@ -1453,10 +1509,9 @@ pub(crate) mod test {
             ])
         } else {
             InferenceObserver::new()
-        }
-        .quantize(model, store)?;
+        };
 
-        // quantize input tensor
+        let (quantized_model, md) = observer.quantize(model, store)?;
         let input_tensors = float_inputs
             .into_iter()
             .enumerate()

@@ -1,5 +1,5 @@
 use crate::{
-    Shape,
+    NextPowerOfTwo, Shape,
     padding::PaddingMode,
     tensor::{TensorTypeParam, WrappedTensor},
 };

@@ -4,7 +4,7 @@ use super::{
     provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
 };
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Prover, ProverContext, ScalingFactor, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
     iop::{
@@ -1095,6 +1095,7 @@ mod tests {
     use tenstore::GenStore;
 
     use crate::{
+        init_test_logging_default,
         layers::{Layer, einsum::EinSum},
         model::{Model, test::prove_model},
         tensor::KeyedTensor,
@@ -1104,6 +1105,8 @@ mod tests {
 
     #[test]
     fn test_requant_proving() {
+        init_test_logging_default();
+
         // To test requant proving we make a simple model with a matmul
         let [a, b, d] = [10, 20, 256];
         let first_input_shape = vec![a, b];

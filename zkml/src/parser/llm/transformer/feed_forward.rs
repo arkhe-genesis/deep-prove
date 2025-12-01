@@ -87,7 +87,7 @@ impl LayerInsertion for FeedForwardNetwork {
         let activation_id = match use_gate {
             true => {
                 let activation = Activation::new_for_glu(activation);
-                let glu_id = model.graph.add_inner(Layer::Activation(activation))?;
+                let glu_id = model.graph_mut().add_inner(Layer::Activation(activation))?;
                 // One edge connecting the output of the up projection to the GLU activation
                 model.add_edge(
                     up_einsum_id,
