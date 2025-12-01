@@ -526,15 +526,10 @@ where
         step_data: &Step<E, Element>,
         prover: &mut crate::Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
-        let (claims, proof) = self.prove_internal(
-            node_id,
-            last_claims,
-            ctx,
-            &step_data.unpadded_input_shapes[0],
-            prover,
-        )?;
-
-        // Add the proof to the proof list
+        let input = step_data.input_tensor_at(0)?;
+        let unpadded_shape = input.unpadded_shape();
+        let (claims, proof) =
+            self.prove_internal(node_id, last_claims, ctx, unpadded_shape, prover)?;
         prover.push_proof(node_id, LayerProof::<E, PCS>::Softmax(proof));
 
         Ok(claims)

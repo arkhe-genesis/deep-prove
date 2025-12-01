@@ -368,19 +368,12 @@ where
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = step_data.input_tensors()?;
-        let unpadded_input_shapes = &step_data.unpadded_input_shapes;
 
         let EinSumProofInfo {
             claims,
             proof,
             commitment_map,
-        } = self.prove_internal(
-            ctx,
-            last_claims,
-            &inputs,
-            unpadded_input_shapes,
-            prover.transcript,
-        )?;
+        } = self.prove_internal(ctx, last_claims, &inputs, prover.transcript)?;
 
         // Add the proof to the proof list
         prover.push_proof(node_id, LayerProof::<E, PCS>::EinSum(proof));

@@ -487,28 +487,21 @@ where
     }
 
     /// Ensures this is a [Tensor] variant.
-    pub(crate) fn into_tensor(self) -> anyhow::Result<Self> {
+    pub(crate) fn into_dry_tensor(self) -> anyhow::Result<Self> {
         match self {
             TensorHandle::WrappedTensor {
                 storage_key,
                 store,
-                wrapped_tensor,
                 shape,
                 unpadded_shape,
-            } => {
-                let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
-                let tensor = match guard.deref() {
-                    Some(tensor) => Some(tensor.try_into()?),
-                    None => None,
-                };
-                Ok(TensorHandle::Tensor {
-                    storage_key,
-                    store,
-                    tensor: Arc::new(RwLock::new(tensor)),
-                    shape,
-                    unpadded_shape,
-                })
-            }
+                ..
+            } => Ok(TensorHandle::Tensor {
+                storage_key,
+                store,
+                tensor: Arc::new(RwLock::new(None)),
+                shape,
+                unpadded_shape,
+            }),
             result @ TensorHandle::Tensor { .. } => Ok(result),
         }
     }

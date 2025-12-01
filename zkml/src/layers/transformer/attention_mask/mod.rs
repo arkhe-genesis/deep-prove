@@ -336,12 +336,9 @@ where
         prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = step_data.input_tensors()?;
-        let unpadded_seq_len =
-            *step_data.unpadded_input_shapes[0]
-                .last()
-                .ok_or(anyhow::anyhow!(
-                    "Input shape must have at least one dimension"
-                ))?;
+        let unpadded_seq_len = *inputs[0].unpadded_shape().last().ok_or(anyhow::anyhow!(
+            "Input shape must have at least one dimension"
+        ))?;
 
         ensure!(
             inputs.len() == 1,

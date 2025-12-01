@@ -67,7 +67,11 @@ pub enum ProvingData<E: ExtensionField> {
 pub struct TrackedDataId(String);
 
 #[derive(Clone, Debug)]
-pub struct LayerOut<T: TensorTypeParam, E: ExtensionField> {
+pub struct LayerOut<T, E>
+where
+    T: TensorTypeParam,
+    E: ExtensionField,
+{
     pub(crate) outputs: Vec<WrappedTensor<T>>,
     pub(crate) proving_data: ProvingData<E>,
     pub(crate) tracked_layer_data: HashMap<TrackedDataId, WrappedTensor<T>>,
@@ -88,17 +92,6 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
             proving_data: data,
             tracked_layer_data: self.tracked_layer_data,
         }
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<WrappedTensor<T>>,
-        ProvingData<E>,
-        HashMap<TrackedDataId, WrappedTensor<T>>,
-    ) {
-        (self.outputs, self.proving_data, self.tracked_layer_data)
     }
 
     /// Add a set of intermediate data tensors to be tracked for quantization purposes;

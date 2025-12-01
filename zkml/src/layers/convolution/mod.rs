@@ -765,7 +765,6 @@ impl Convolution<Element> {
         // Struct containing all necessary information
         // to generate a convolution proof
         output: &Tensor<Element>,
-        unpadded_output_shape: &Shape,
         proving_data: &ConvData<E>,
         id: NodeId,
     ) -> anyhow::Result<Claim<E>>
@@ -783,6 +782,7 @@ impl Convolution<Element> {
         // 0s) The non-cleared tensor claim gets passed to the main regular
         // logic of convolution The clearing tensor one gets stored in the proof
         // and will be checked manually by the verifier (CURRENTLY)
+        let unpadded_output_shape = output.unpadded_shape();
         let clearing_tensor = new_clearing_tensor(unpadded_output_shape, output.shape())?;
         // Take the elements BEFORE bias addition - this is what the rest of the
         // convolution proving step expects.
@@ -1466,7 +1466,6 @@ where
             prover,
             last_claims[0],
             &output_tensor,
-            &step_data.unpadded_output_shapes[0],
             &conv_data,
             id,
         )?])

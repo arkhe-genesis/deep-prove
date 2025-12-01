@@ -12,6 +12,7 @@ use crate::{
         context::VerifierContext,
         prover_graph::ProverGraphNode,
     },
+    model::{BaseRunner, HandleLifetimeRunner, SanityCheckRunner, TraceRunner, TrackerRunner},
     padding::PaddingMode,
     parser::{
         PipelineConfig, default_pipeline_config,
@@ -37,7 +38,7 @@ use transcript::BasicTranscript;
 use crate::{
     Element, Shape, Tensor,
     layers::{Layer, provable::Evaluate},
-    model::{Model, Trace},
+    model::{Model, Trace, tensor_to_handles},
     number::Number,
 };
 
@@ -205,10 +206,31 @@ impl Driver<f32> {
             .collect::<Vec<_>>();
 
         let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
-        let trace = self
-            .model
-            .run_with_tracker::<E>(vec![tensor], tracker, store)?;
+        let input_handles = tensor_to_handles(&[tensor], &self.model.graph, store)?;
 
+        let runner = BaseRunner {
+            store: store.clone(),
+        };
+        let runner = TrackerRunner {
+            inner: runner,
+            tracker,
+        };
+        let runner = SanityCheckRunner { inner: runner };
+        let runner = TraceRunner {
+            inner: runner,
+            trace: Trace::<E, f32>::new(input_handles.clone()),
+        };
+        let mut runner = HandleLifetimeRunner::count_from_graph(
+            runner,
+            &self.model.graph,
+            input_handles.clone(),
+        )?;
+
+        self.model
+            .run_with_runner::<E, _>(input_handles, &mut runner)?;
+
+        let mut trace = runner.into_inner().into_trace();
+        trace.output = trace.graph_outputs(&self.model.graph)?;
         Ok(trace)
     }
 }
@@ -271,15 +293,18 @@ where
             input_tensor.len()
         );
 
+        let is_valid_vocab = tensor
+            .get_data()
+            .iter()
+            .all(|t| Number::to_usize(t) < self.config.vocab_size);
         ensure!(
-            tensor
-                .get_data()
-                .iter()
-                .all(|t| Number::to_usize(t) < self.config.vocab_size),
-            "Input tokens must be less than the vocabulary size"
+            is_valid_vocab,
+            "Input tokens must be less than the vocabulary size",
         );
+
         let mut full_tokens = tensor.get_data().to_vec();
         let mut unpadded_seq_len = user_len;
+
         // convert the input to the correct number type and add a dimension to
         // make it 2d, because the embeddings layer expects a 2d tensor This
         // means we're padding the input to the right size (e.g. next power of
@@ -288,28 +313,54 @@ where
             info!(
                 "Running iteration {} with input tensor {:?}",
                 unpadded_seq_len,
-                tensor.shape()
+                tensor.shape(),
             );
-            let trace = if let PaddingMode::NoPadding = self.padding_mode {
-                self.model
-                    // TODO: make it re-usable at least for the static weights
-                    .run_with_tracker::<E>(vec![tensor.clone()], tracker, store)
+
+            let input_handles = if let PaddingMode::NoPadding = self.padding_mode {
+                tensor_to_handles(&[tensor], &self.model.graph, store)?
             } else {
                 let unpadded_shape = tensor.shape().clone();
                 let padded = tensor.pad_next_power_of_two();
                 info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
-                self.model
-                    .run_with_tracker::<E>(vec![padded], tracker, store)
-            }
-            .with_context(|| format!("runng the {} iteration loop", unpadded_seq_len - user_len))?;
+                tensor_to_handles(&[padded], &self.model.graph, store)?
+            };
+            let runner = BaseRunner {
+                store: store.clone(),
+            };
+            let runner = TrackerRunner {
+                inner: runner,
+                tracker,
+            };
+            #[cfg(test)]
+            let runner = SanityCheckRunner { inner: runner };
+            let runner = TraceRunner {
+                inner: runner,
+                trace: Trace::<E, N>::new(input_handles.clone()),
+            };
+            let mut runner = HandleLifetimeRunner::count_from_graph(
+                runner,
+                &self.model.graph,
+                input_handles.clone(),
+            )?;
+
+            self.model
+                .run_with_runner::<E, _>(input_handles, &mut runner)
+                .with_context(|| {
+                    format!("running the {} iteration loop", unpadded_seq_len - user_len)
+                })?;
+
+            let mut trace = runner.into_inner().into_trace();
+            trace.output = trace.graph_outputs(&self.model.graph)?;
+
             ensure!(
                 trace.output.len() == 1,
                 "expected 1 output, got {}",
-                trace.output.len()
+                trace.output.len(),
             );
-            let output_handles = trace.outputs();
-            let output_handle = output_handles.last().unwrap();
-            let output = output_handle.tensor().unwrap();
+            let output = &trace.output[0]
+                .tensor()
+                .expect("Output handler should have associated tensor data");
+
             // We take the last token before the padding
             let output_tokens_len = output.get_data().len();
             let last_token = if output_tokens_len == 1 {
@@ -317,6 +368,7 @@ where
             } else {
                 output.get_data()[unpadded_seq_len - 1]
             };
+
             tensor = Tensor::new(Shape::new(vec![1]), vec![last_token])?;
             full_tokens.push(last_token);
             if last_token == eos_token {
@@ -324,6 +376,7 @@ where
             }
             unpadded_seq_len += 1;
         }
+
         // 1. input construction: we remove the last token since it's either the
         // eos token or the max token we need to regenerate a full trace with
         // the correct padding

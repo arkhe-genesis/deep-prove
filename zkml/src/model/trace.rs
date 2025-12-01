@@ -1,13 +1,20 @@
 use crate::{
-    Element, IO, Shape, Tensor,
+    Element, IO, Tensor,
     graph::NodeId,
     layers::NodeOut,
+    model::ModelGraph,
     quantization::{Fieldizer, ModelMetadata},
     tensor::{TensorHandle, TensorTypeParam},
 };
+
+use anyhow::{anyhow, ensure};
 use ff_ext::ExtensionField;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, fmt::Debug, sync::MappedRwLockReadGuard};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
+    sync::MappedRwLockReadGuard,
+};
 use tenstore::{GenStore, StoreError};
 
 /// The trace produce by running the model during inference
@@ -23,7 +30,11 @@ where
     pub(crate) output: Vec<TensorHandle<D>>,
 }
 
-impl<E: ExtensionField, D: TensorTypeParam> Debug for Trace<E, D> {
+impl<E, D> Debug for Trace<E, D>
+where
+    E: ExtensionField,
+    D: TensorTypeParam,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -35,7 +46,7 @@ impl<E: ExtensionField, D: TensorTypeParam> Debug for Trace<E, D> {
     }
 }
 
-impl<E: ExtensionField, D> Trace<E, D>
+impl<E, D> Trace<E, D>
 where
     E: ExtensionField,
     D: TensorTypeParam,
@@ -59,13 +70,49 @@ where
             .values_mut()
             .for_each(|step| step.attach_store(store.clone()));
     }
-}
 
-impl<E: ExtensionField, D> Trace<E, D>
-where
-    E: ExtensionField,
-    D: TensorTypeParam + Clone + Serialize + for<'b> Deserialize<'b>,
-{
+    /// Find the output tensor handlers.
+    pub(crate) fn graph_outputs(
+        &self,
+        graph: &ModelGraph<D>,
+    ) -> anyhow::Result<Vec<TensorHandle<D>>> {
+        // compute the output tensor from the outputs of the output nodes
+        let output_nodes = graph.output_nodes().map(|(node_id, _)| node_id);
+        let mut outputs = BTreeMap::<usize, TensorHandle<D>>::new();
+        for (output_node_id, in_feed) in output_nodes.into_iter().flat_map(|node_id| {
+            graph
+                .incoming_feeds(node_id)
+                .into_iter()
+                .map(move |in_feed| (node_id, in_feed))
+        }) {
+            let output_idx = graph[output_node_id].as_output().unwrap();
+            let node_outputs = self
+                .get_step(&in_feed.source.node_id)
+                .ok_or(anyhow!("{in_feed:?} not found in trace"))?
+                .outputs();
+            ensure!(
+                node_outputs.len() > *in_feed.source.port,
+                "Number of outputs found in trace ({}) for node {} is smaller than expected number of outputs ({})",
+                node_outputs.len(),
+                in_feed.source.node_id,
+                in_feed.source.port
+            );
+            // if this output wire is an output of the model, insert in the
+            // collection of the model outputs, paired with the index among the
+            // outputs of the model
+            let old_output =
+                outputs.insert(*output_idx, node_outputs[*in_feed.source.port].clone());
+            ensure!(
+                old_output.is_none(),
+                "Trying to insert twice an output value for the same index {output_idx}",
+            );
+        }
+        ensure!(*outputs.first_key_value().unwrap().0 == 0);
+        ensure!(*outputs.last_key_value().unwrap().0 == outputs.len() - 1);
+
+        Ok(outputs.into_values().collect())
+    }
+
     /// Get the trace data for node `node_id`, if any
     pub fn get_step(&self, node_id: &NodeId) -> Option<&Step<E, D>> {
         self.steps.get(node_id)
@@ -75,6 +122,16 @@ where
     pub(crate) fn new_step(&mut self, node_id: NodeId, step: Step<E, D>) {
         assert!(!self.steps.contains_key(&node_id));
         self.steps.insert(node_id, step);
+    }
+
+    /// Get the output tensors of the inference represented by this trace
+    pub fn outputs(&self) -> &[TensorHandle<D>] {
+        &self.output
+    }
+
+    /// Get the inputs tensors of the inference represented by this trace
+    pub fn inputs(&self) -> &[TensorHandle<D>] {
+        &self.input
     }
 
     /// Compute the inputs and outputs tensors from the trace, which are necessary
@@ -96,19 +153,12 @@ where
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(IO::new(inputs, outputs))
     }
-
-    /// Get the output tensors of the inference represented by this trace
-    pub fn outputs(&self) -> &[TensorHandle<D>] {
-        &self.output
-    }
-
-    /// Get the inputs tensors of the inference represented by this trace
-    pub fn inputs(&self) -> &[TensorHandle<D>] {
-        &self.input
-    }
 }
 
-impl<E: ExtensionField> Trace<E, Element> {
+impl<E> Trace<E, Element>
+where
+    E: ExtensionField,
+{
     /// Given as input a trace over quantized values, compute the equivalent
     /// trace with dequantized values
     pub fn dequantized(&self, model_metadata: &ModelMetadata) -> Result<Trace<E, f32>, StoreError> {
@@ -160,16 +210,12 @@ pub struct Step<E: ExtensionField, D: TensorTypeParam> {
     pub(crate) node_inputs: Vec<TensorHandle<D>>,
     /// Ordered by output port (e.g. source_port of the incoming edges)
     pub(crate) node_outputs: NodeOut<D, E>,
-    /// Ordered by output port (e.g. source_port of the outgoing edges)
-    pub(crate) unpadded_output_shapes: Vec<Shape>,
-    /// Ordered by input port (e.g. target_port of the incoming edges)
-    pub(crate) unpadded_input_shapes: Vec<Shape>,
 }
 
-impl<E: ExtensionField, D> Step<E, D>
+impl<E, D> Step<E, D>
 where
     E: ExtensionField,
-    D: TensorTypeParam + Clone + Serialize + for<'b> Deserialize<'b>,
+    D: TensorTypeParam,
 {
     /// Returns the output tensors of the node
     pub fn outputs(&self) -> &[TensorHandle<D>] {
@@ -225,7 +271,10 @@ where
     }
 }
 
-impl<E: ExtensionField> Step<E, Element> {
+impl<E> Step<E, Element>
+where
+    E: ExtensionField,
+{
     pub fn to_dequantize(
         &self,
         model_metadata: &ModelMetadata,
@@ -241,8 +290,6 @@ impl<E: ExtensionField> Step<E, Element> {
         Ok(Step {
             node_inputs,
             node_outputs: self.node_outputs.to_dequantize(model_metadata, node_id)?,
-            unpadded_output_shapes: self.unpadded_output_shapes.clone(),
-            unpadded_input_shapes: self.unpadded_input_shapes.clone(),
         })
     }
 }

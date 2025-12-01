@@ -51,7 +51,6 @@ impl EinSum<Element> {
         ctx: &EinSumContext<E>,
         last_claims: Vec<&Claim<E>>,
         inputs: &[Tensor<Element>],
-        unpadded_input_shapes: &[Shape],
         transcript: &mut T,
     ) -> Result<EinSumProofInfo<E>>
     where
@@ -98,6 +97,10 @@ impl EinSum<Element> {
             full_inputs.len(),
         );
 
+        let unpadded_input_shapes: Vec<_> = inputs
+            .iter()
+            .map(|tensor| tensor.unpadded_shape().clone())
+            .collect();
         let mut unpadded_inputs_iter = unpadded_input_shapes.iter();
         let lhs_unpadded_shape = unpadded_inputs_iter
             .next()

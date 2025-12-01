@@ -354,8 +354,9 @@ where
         let input = step_data.input_tensor_at(0)?;
         let outputs = step_data.output_tensors()?;
         // We need the final dim size to build the less than polynomial
-        let unpadded_dim_size =
-            step_data.unpadded_input_shapes[0].dim(step_data.unpadded_input_shapes[0].rank() - 1);
+        let unpadded_dim_size = *input.unpadded_shape().last().ok_or(anyhow::anyhow!(
+            "Input shape must have at least one dimension"
+        ))?;
         ensure!(
             outputs.len() == 1,
             "Expected 1 output tensor for Logits layer, found {}",
@@ -537,8 +538,9 @@ where
             input.shape(),
         );
 
-        let unpadded_dim_size =
-            step_data.unpadded_input_shapes[0].dim(step_data.unpadded_input_shapes[0].rank() - 1);
+        let unpadded_dim_size = *input.unpadded_shape().last().ok_or(anyhow::anyhow!(
+            "Input shape must have at least one dimension"
+        ))?;
 
         let merged_diff = input
             .slice_last_dim()

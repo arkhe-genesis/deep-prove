@@ -464,12 +464,7 @@ pub struct Graph<N, I, O, W> {
     pub(crate) edges: BTreeMap<EdgeId, Edge<W>>,
 }
 
-impl<N, I, O, W> Graph<N, I, O, W>
-where
-    I: PartialEq + std::fmt::Debug,
-    O: PartialEq + std::fmt::Debug,
-    W: Clone,
-{
+impl<N, I, O, W> Graph<N, I, O, W> {
     /// Create a new, empty graph.
     pub fn new() -> Self {
         Self::default()
@@ -841,22 +836,6 @@ where
             .filter_map(|(n_id, n)| n.as_inner().map(|n| (*n_id, n)))
     }
 
-    /// Return, if it exists, the ID of the input node corresponding to the provided
-    /// input ID.
-    pub fn input_node_id(&self, input_id: I) -> anyhow::Result<NodeId> {
-        self.find_node(|_, n| n.as_input().map(|i| *i == input_id).unwrap_or(false))
-            .map(|(node_id, _)| *node_id)
-            .ok_or_else(|| anyhow::anyhow!("fetching node ID for input {input_id:?}"))
-    }
-
-    /// Return, if it exists, the ID of the output node corresponding to the provided
-    /// output ID.
-    pub fn output_node_id(&self, output_id: O) -> anyhow::Result<NodeId> {
-        self.find_node(|_, n| n.as_output().map(|o| *o == output_id).unwrap_or(false))
-            .map(|(node_id, _)| *node_id)
-            .ok_or_else(|| anyhow::anyhow!("fetching node ID for output {output_id:?}"))
-    }
-
     /// Returns an iterator over all edges in the graph.
     ///
     /// # Examples
@@ -1105,21 +1084,6 @@ where
             .map(|node_id| (node_id, &self.nodes[&node_id]))
     }
 
-    pub fn try_map_forward<N2, I2, O2>(
-        &self,
-        mut f: impl FnMut(NodeId, &Node<N, I, O>) -> anyhow::Result<Node<N2, I2, O2>>,
-    ) -> anyhow::Result<Graph<N2, I2, O2, W>> {
-        let new_nodes = self
-            .dag_order::<true>()
-            .map(|node_id| f(node_id, &self.nodes[&node_id]).map(|new_node| (node_id, new_node)))
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-
-        Ok(Graph {
-            nodes: new_nodes,
-            edges: self.edges.clone(),
-        })
-    }
-
     pub fn try_into_map_forward<N2, I2, O2>(
         mut self,
         mut f: impl FnMut(NodeId, Node<N, I, O>, Vec<Feed>) -> anyhow::Result<Node<N2, I2, O2>>,
@@ -1186,6 +1150,53 @@ where
         })
     }
 }
+
+impl<N, I, O, W> Graph<N, I, O, W>
+where
+    I: PartialEq + std::fmt::Debug,
+{
+    /// Return, if it exists, the ID of the input node corresponding to the provided
+    /// input ID.
+    pub fn input_node_id(&self, input_id: I) -> anyhow::Result<NodeId> {
+        self.find_node(|_, n| n.as_input().map(|i| *i == input_id).unwrap_or(false))
+            .map(|(node_id, _)| *node_id)
+            .ok_or_else(|| anyhow::anyhow!("fetching node ID for input {input_id:?}"))
+    }
+}
+
+impl<N, I, O, W> Graph<N, I, O, W>
+where
+    O: PartialEq + std::fmt::Debug,
+{
+    /// Return, if it exists, the ID of the output node corresponding to the provided
+    /// output ID.
+    pub fn output_node_id(&self, output_id: O) -> anyhow::Result<NodeId> {
+        self.find_node(|_, n| n.as_output().map(|o| *o == output_id).unwrap_or(false))
+            .map(|(node_id, _)| *node_id)
+            .ok_or_else(|| anyhow::anyhow!("fetching node ID for output {output_id:?}"))
+    }
+}
+
+impl<N, I, O, W> Graph<N, I, O, W>
+where
+    W: Clone,
+{
+    pub fn try_map_forward<N2, I2, O2>(
+        &self,
+        mut f: impl FnMut(NodeId, &Node<N, I, O>) -> anyhow::Result<Node<N2, I2, O2>>,
+    ) -> anyhow::Result<Graph<N2, I2, O2, W>> {
+        let new_nodes = self
+            .dag_order::<true>()
+            .map(|node_id| f(node_id, &self.nodes[&node_id]).map(|new_node| (node_id, new_node)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+
+        Ok(Graph {
+            nodes: new_nodes,
+            edges: self.edges.clone(),
+        })
+    }
+}
+
 impl<N, O, W> Graph<N, usize, O, W>
 where
     O: PartialEq + std::fmt::Debug,

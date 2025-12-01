@@ -8,7 +8,9 @@ use zkml::{
     Element, Number, Shape,
     graph::NodeId,
     inputs::Input,
-    model::{Model, llm::Driver},
+    model::{
+        BaseRunner, HandleLifetimeRunner, Model, TrackerRunner, llm::Driver, tensor_to_handles,
+    },
     parser::{
         gguf::{RawGGUF, TensorLoader},
         llm::{HFTokenizer, LLMTokenizer, Token, models::gpt2::GPT2},
@@ -16,6 +18,9 @@ use zkml::{
     },
     quantization::{AbsoluteMax, InferenceTracker, InferenceTrackingMode},
 };
+
+#[cfg(test)]
+use zkml::model::SanityCheckRunner;
 
 type F = ff_ext::GoldilocksExt2;
 pub struct Snapshot<T> {
@@ -54,9 +59,9 @@ impl GlobalContext {
 
         // Run float model
         let snap_f32 = {
-            let mut min_max_tracker_f32 = InferenceTracker::new(InferenceTrackingMode::MinMax);
-            let mut store_f32 = GenStore::default();
             info!("running model in f32 mode");
+
+            let mut store_f32 = GenStore::default();
             let inputs_f32 = model_f32
                 .load_input_flat(inputs.as_floats().to_vec())
                 .context("preparing inputs for float run")?;
@@ -64,13 +69,29 @@ impl GlobalContext {
                 .iter()
                 .map(|x| x.shape().to_owned())
                 .collect::<Vec<_>>();
-            let _trace_f32 = model_f32
-                .run_with_tracker::<GoldilocksExt2>(
-                    inputs_f32,
-                    &mut min_max_tracker_f32,
-                    &mut store_f32,
-                )
+            let input_f32_handles =
+                tensor_to_handles(&inputs_f32, &model_f32.graph, &mut store_f32)?;
+
+            let mut min_max_tracker_f32 = InferenceTracker::new(InferenceTrackingMode::MinMax);
+            let runner = BaseRunner {
+                store: store_f32.clone(),
+            };
+            let runner = TrackerRunner {
+                inner: runner,
+                tracker: &mut min_max_tracker_f32,
+            };
+            #[cfg(test)]
+            let runner = SanityCheckRunner { inner: runner };
+            let mut runner = HandleLifetimeRunner::count_from_graph(
+                runner,
+                &model_f32.graph,
+                input_f32_handles.clone(),
+            )?;
+
+            model_f32
+                .run_with_runner::<GoldilocksExt2, _>(input_f32_handles, &mut runner)
                 .context("running the model in float mode")?;
+
             Rc::new(Snapshot {
                 shapes: shape_steps(model_f32.graph(), &input_shapes)?,
                 model: model_f32,
@@ -81,9 +102,9 @@ impl GlobalContext {
 
         // Run quantized model
         let snap_elt = {
-            let mut min_max_tracker_elt = InferenceTracker::new(InferenceTrackingMode::MinMax);
-            let mut store_elt = GenStore::default();
             info!("running model in element mode");
+
+            let mut store_elt = GenStore::default();
             let inputs_elt = model_elt
                 .load_input_flat(inputs.clone().to_elements(&md))
                 .context("preparing inputs for elt run")?;
@@ -91,8 +112,27 @@ impl GlobalContext {
                 .iter()
                 .map(|x| x.shape().to_owned())
                 .collect::<Vec<_>>();
-            let _trace_elt = model_elt
-                .run_with_tracker::<F>(inputs_elt, &mut min_max_tracker_elt, &mut store_elt)
+            let input_elt_handles =
+                tensor_to_handles(&inputs_elt, &model_elt.graph, &mut store_elt)?;
+
+            let mut min_max_tracker_elt = InferenceTracker::new(InferenceTrackingMode::MinMax);
+            let runner = BaseRunner {
+                store: store_elt.clone(),
+            };
+            let runner = TrackerRunner {
+                inner: runner,
+                tracker: &mut min_max_tracker_elt,
+            };
+            #[cfg(test)]
+            let runner = SanityCheckRunner { inner: runner };
+            let mut runner = HandleLifetimeRunner::count_from_graph(
+                runner,
+                &model_elt.graph,
+                input_elt_handles.clone(),
+            )?;
+
+            model_elt
+                .run_with_runner::<F, _>(input_elt_handles, &mut runner)
                 .context("running the model in elt mode")?;
             Rc::new(Snapshot {
                 shapes: shape_steps(model_elt.graph(), &input_shapes)?,
@@ -117,10 +157,10 @@ impl GlobalContext {
             Driver::load_from_model(GPT2, &RawGGUF::new(gguf_file), Some(context_size))?;
 
         let snap_f32 = {
-            let mut min_max_tracker_f32 = InferenceTracker::new(InferenceTrackingMode::MinMax);
-            info!("preparing f32 driver...");
-            let mut store_f32 = GenStore::default();
             info!("running f32 model");
+
+            let mut min_max_tracker_f32 = InferenceTracker::new(InferenceTrackingMode::MinMax);
+            let mut store_f32 = GenStore::default();
             let trace_f32 = driver_f32.run_with_tracker::<F>(
                 &user_tokens,
                 &mut store_f32,
@@ -152,11 +192,11 @@ impl GlobalContext {
         // NOTE: very important, QKV cache is not reset on clone()
         driver_f32.model.reset();
         let snap_elt = {
+            info!("running Element model...");
+
             let mut min_max_tracker_elt = InferenceTracker::new(InferenceTrackingMode::MinMax);
             let mut store_elt = GenStore::default();
-            info!("preparing Element driver...");
             let (driver_elt, _metadata) = driver_f32.into_provable_llm(None)?;
-            info!("running Element model...");
             let trace_elt = driver_elt.run_with_tracker::<F>(
                 user_tokens,
                 &mut store_elt,

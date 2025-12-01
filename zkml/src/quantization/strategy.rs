@@ -3,21 +3,31 @@ use crate::{
     Element, Shape, Tensor,
     graph::{Node, NodeId, NodeOutput, PortId},
     layers::provable::{OpInfo, QuantizeOp, TrackedDataId},
-    model::{Model, transform::apply_transformations},
+    model::{
+        BaseRunner, HandleLifetimeRunner, Model, ToStorageKey, TrackerRunner, tensor_to_handles,
+        transform::apply_transformations,
+    },
     number::Number,
     padding::PaddingMode,
     quantization::{self, ModelMetadata, metadata::MetadataBuilder},
     rng_from_env_or_random,
-    tensor::{TensorTypeParam, WrappedTensor},
+    tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, anyhow, ensure};
 use average::{Estimate, Max, Min, Quantile, Variance};
 use ff_ext::GoldilocksExt2;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
+    sync::{Arc, RwLock},
+};
 use tenstore::GenStore;
 use tracing::{debug, info, warn};
+
+#[cfg(test)]
+use crate::model::SanityCheckRunner;
 
 /// Trait for quantizing a float-based model into a quantized model. The current implementation
 /// simply looks at the absolute maximum value of the model and uses that as the scaling factor
@@ -99,6 +109,7 @@ impl ScalingStrategy for InferenceObserver {
         // let tracking_mode = InferenceTrackingMode::Quantiles(0.05, 0.95);
         // let tracking_mode = InferenceTrackingMode::NSigmas(3);
         let mut tracker = InferenceTracker::new(tracking_mode);
+
         let input_shapes = model.input_shapes();
         let unpadded_input_shapes = model.unpadded_input_shapes();
         let input_samples = if self.input_samples.is_empty() {
@@ -131,16 +142,39 @@ impl ScalingStrategy for InferenceObserver {
                 .enumerate()
                 .map(|(i, (input, shape))| {
                     let input_node_id = model.graph.input_node_id(i)?;
-                    let input_tensor = Tensor::new(shape, input)?;
+                    let input_tensor = Tensor::new(shape.clone(), input)?;
                     let wrapped_tensor = WrappedTensor::try_from(&input_tensor)?;
-                    tracker.track(input_node_id.output_at(0), &wrapped_tensor);
+                    let handle = TensorHandle::WrappedTensor {
+                        storage_key: input_node_id.output_at(0).to_storage_key(),
+                        store: store.clone(),
+                        wrapped_tensor: Arc::new(RwLock::new(Some(wrapped_tensor))),
+                        unpadded_shape: shape.clone(),
+                        shape,
+                    };
+                    tracker.track(input_node_id.output_at(0), &handle)?;
                     Ok(input_tensor)
                 })
                 .collect::<Result<Vec<_>>>()?;
             debug!("Running float inference with the {}-th input", nsamples + 1);
-            model.run_with_tracker::<GoldilocksExt2>(input_tensors, &mut tracker, store)?;
+            let input_handles = tensor_to_handles(&input_tensors, &model.graph, store)?;
+            let runner = BaseRunner {
+                store: store.clone(),
+            };
+            let runner = TrackerRunner {
+                inner: runner,
+                tracker: &mut tracker,
+            };
+            #[cfg(test)]
+            let runner = SanityCheckRunner { inner: runner };
+            let mut runner = HandleLifetimeRunner::count_from_graph(
+                runner,
+                &model.graph,
+                input_handles.clone(),
+            )?;
+            model.run_with_runner::<GoldilocksExt2, _>(input_handles, &mut runner)?;
             nsamples += 1;
         }
+
         info!("InferenceObserver: {} total samples observed", nsamples);
         // 2. get the scaling factor of the input
         let num_model_inputs = unpadded_input_shapes.len();
@@ -265,7 +299,11 @@ impl InferenceTracker {
             intermediate_data_trackers: HashMap::new(),
         }
     }
-    pub(crate) fn track<N>(&mut self, output: NodeOutput, tensor: &WrappedTensor<N>)
+    pub(crate) fn track<N>(
+        &mut self,
+        output: NodeOutput,
+        handle: &TensorHandle<N>,
+    ) -> anyhow::Result<()>
     where
         N: TensorTypeParam,
     {
@@ -273,23 +311,28 @@ impl InferenceTracker {
             .accumulators
             .entry(output)
             .or_insert_with(|| self.mode.new_accumulator());
+        let guard = handle.wrapped_tensor().unwrap();
+        let tensor = guard.deref();
         for el in N::tensor_to_float(tensor.clone()).get_data() {
             accumulator.add(el as f64);
         }
+        Ok(())
     }
 
-    pub(crate) fn track_intermediate_data(
+    pub(crate) fn track_intermediate_data<N>(
         &mut self,
         node_id: NodeId,
         data_id: TrackedDataId,
-        data: Tensor<f32>,
-    ) {
+        wrapped_tensor: WrappedTensor<N>,
+    ) where
+        N: TensorTypeParam,
+    {
         let accumulator = self
             .intermediate_data_trackers
             .entry((node_id, data_id))
             .or_insert_with(|| self.mode.new_accumulator());
-        for x in data.get_data() {
-            accumulator.add(*x as f64);
+        for el in N::tensor_to_float(wrapped_tensor.clone()).get_data() {
+            accumulator.add(el as f64);
         }
     }
 
