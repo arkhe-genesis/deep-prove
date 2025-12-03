@@ -29,7 +29,7 @@ cpu = ["burn/ndarray", "dep:burn-ndarray"]
 # If `cuda` is also enabled it takes precedence over `wgpu`
 wgpu = ["burn/wgpu", "gpu"]
 # Linux only
-cuda = ["burn/cuda", "gpu"]
+cuda = ["burn/cuda", "gpu", "dep:cubecl-cuda", "dep:cudarc"]
 mem-track = ["utils/mem-track"]
 
 # Internal. Use `wgpu` or `cuda` which will enable `gpu`
@@ -58,7 +58,13 @@ ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 crossbeam-channel = "0.5.15"
 csv.workspace = true
-cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "04b1024999fad223b83650b824993ef8edb4ef20", optional = true }
+# NOTE: The `cubecl` feature spells and `cubecl-cuda` and `cudarc` deps may be
+# removed on newer version of burn. In this version they are needed as `cubecl`
+# enables "cuda-12050" by default, so we need to get rid of it to enable
+# "cuda-13000" only.
+cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "04b1024999fad223b83650b824993ef8edb4ef20", optional = true, default-features = false, features = ["std", "stdlib", "matmul", "convolution"] }
+cubecl-cuda = { git = "https://github.com/tracel-ai/cubecl", rev = "04b1024999fad223b83650b824993ef8edb4ef20", optional = true, default-features = false, features = ["std"] }
+cudarc = { version = "=0.17.3", optional = true, default-features = false, features = ["cuda-13000"] }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }

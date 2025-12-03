@@ -11413,6 +11413,8 @@ dependencies = [
  "crossbeam-channel",
  "csv",
  "cubecl",
+ "cubecl-cuda",
+ "cudarc",
  "derive_more 2.0.1",
  "divan",
  "either",

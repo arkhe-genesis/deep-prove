@@ -93,9 +93,10 @@ jobs:
         # /usr/lib messes up devenv
         run: |
           mkdir -p $HOME/cuda
-          cp /usr/lib/x86_64-linux-gnu/{libcuda.so,libnvrtc.so.12,libnvrtc-builtins.so.12.0,libnvidia-ptxjitcompiler.so,libnvidia-ptxjitcompiler.so.1,libnvidia-ptxjitcompiler.so.580.95.05} $HOME/cuda
+          cp /usr/lib/x86_64-linux-gnu/libcuda.so $HOME/cuda
           cd zkml
-          LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda" \
+          LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64" \
+          CUDARC_CUDA_VERSION="13000" \
           cargo nextest run --features cuda --retries 2 -- \
             --skip model::transform::impls::gpt2rmsnorm::tests::test_gpt2_replace \
             --skip parser::llm::models::gemma3::safe_tests::test_safe_gemma3_load_model \
@@ -114,7 +115,8 @@ jobs:
         # Tests that take more VRAM run sequentially to avoid `BufferTooBig` errors
         run: |
           cd zkml
-          LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda" \
+          LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64" \
+          CUDARC_CUDA_VERSION="13000" \
           cargo nextest run --features cuda --test-threads 1 -- \
             parser::llm::models::gemma3::safe_tests::test_safe_gemma3_load_model \
             parser::llm::models::gemma3::tests::test_gguf_gemma3_load_model \

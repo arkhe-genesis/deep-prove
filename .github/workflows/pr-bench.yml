@@ -136,9 +136,10 @@ jobs:
         # /usr/lib messes up devenv
         run: |
           mkdir -p $HOME/cuda
-          cp /usr/lib/x86_64-linux-gnu/{libcuda.so,libnvrtc.so.12,libnvrtc-builtins.so.12.0,libnvidia-ptxjitcompiler.so,libnvidia-ptxjitcompiler.so.1,libnvidia-ptxjitcompiler.so.580.95.05} $HOME/cuda
+          cp /usr/lib/x86_64-linux-gnu/libcuda.so $HOME/cuda
           cd zkml
-          LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda" \
+          LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/cuda:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64" \
+          CUDARC_CUDA_VERSION="13000" \
           bencher run \
           --host https://api.bencher.dev \
           --project deep-prove-private-70c58ed-ejzl400nndqc0 \
