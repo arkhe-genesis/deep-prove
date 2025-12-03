@@ -34,12 +34,14 @@ impl Input {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(self.input_data.len() > 0);
-        ensure!(
-            self.input_data
-                .iter()
-                .all(|v| v.iter().all(|&x| QUANTIZATION_RANGE.contains(&x))),
-            "can only support real model so far (input at least)"
-        );
+        for (i, input) in self.input_data.iter().enumerate() {
+            for x in input.iter() {
+                ensure!(
+                    QUANTIZATION_RANGE.contains(x),
+                    "input #{i}: value `{x:?}` is out of quantization range {QUANTIZATION_RANGE:?}"
+                );
+            }
+        }
         Ok(())
     }
 
