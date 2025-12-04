@@ -256,10 +256,11 @@ impl<'a, I: Iterator<Item = &'a usize> + Sized> ParserFactory<'a, I> {
             curr_node_id, curr_node.name, curr_node.name, curr_node.inputs
         );
         let op_name = &curr_node.name;
+        let op_name_lower = op_name.to_lowercase();
         let Some(layer_name) = self
             .parsers
             .keys()
-            .find(|&&layer_name| op_name.contains(layer_name))
+            .find(|&&layer_name| op_name_lower.contains(&layer_name.to_lowercase()))
         else {
             return Some(err(format!("Unknown node type: {op_name}: {curr_node:?}")));
         };
