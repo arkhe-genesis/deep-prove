@@ -61,14 +61,16 @@ struct ConnContext {
     gw_url: Url,
     worker_name: String,
     address: String,
+    max_job_size: u64,
 }
 impl ConnContext {
-    fn new(gw_url: Url, worker_name: String, address: String) -> Self {
+    fn new(gw_url: Url, worker_name: String, address: String, max_job_size: u64) -> Self {
         let address = address.trim_start_matches("0x").to_string();
         Self {
             gw_url,
             worker_name,
             address,
+            max_job_size,
         }
     }
 
@@ -86,7 +88,9 @@ impl ConnContext {
         .header("authorization", &self.address)
         .call()
         .context("connecting to gateway")?
-        .body_mut()
+        .into_body()
+        .into_with_config()
+        .limit(self.max_job_size)
         .read_to_string()
         .context("reading response body")
     }
@@ -206,6 +210,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
         json,
         worker_name,
         model_cache_dir,
+        max_job_size,
         s3_args,
     } = args
     else {
@@ -224,13 +229,14 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     info!("gateway URL: {gw_url}");
     info!("operator address: {address}");
     info!("worker unique name: {worker_name}");
+    info!("max job size: {}", humansize::format_size(max_job_size, humansize::BINARY));
 
     let WorkerResources {
         mut store,
         model_fetcher,
     } = instantiate_store(&s3_args, model_cache_dir.clone())
         .context("initializing worker resources")?;
-    let conn = ConnContext::new(gw_url, worker_name, address);
+    let conn = ConnContext::new(gw_url, worker_name, address, max_job_size);
 
     loop {
         // 1. Request job from the GW

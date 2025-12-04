@@ -265,6 +265,10 @@ enum RunMode {
         #[arg(long, env)]
         json: bool,
 
+        /// The maximum size of a job response from the gateway.
+        #[arg(long, env, default_value_t = 100 * 1024 * 1024)] // 100MB
+        max_job_size: u64,
+
         /// If set, use S3 to store & fetch PPs, otherwise use memory.
         #[command(flatten)]
         s3_args: S3Args,
