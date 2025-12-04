@@ -1,14 +1,32 @@
-//! Einstein summation layer for tensor operations. This layer is built via a [`String`] equation which in full genrality looks like:
-//!     `A(ijk)@B(ikl):C(himk):D(ik)->E(ijl)+BIAS(ij):F(hijm):G(ij)+BIAS(j)`
-//! We use upper case identifiers for tensors and lower case for axes, "BIAS" is reserved for bias tensors, which are optional.
-//! The right hand side of "->" specifies the output tensors.
-//! On the input side we only ever have one tensor on the LHS (to the left of "@"), this tensor cannot be a constant tensor.
-//! In this case that tensor is "A", the other tensors "B", "C" and "D" are either constant or witness tensors and it acts on each separately.
-//! The ":" separates each einsum operation, so in this case we have three einsum operations: "A@B + BIAS(ij)", "A@C" and "A@D + BIAS(j)".
+//! Einstein summation layer for tensor operations.
 //!
-//! It is important to note that the LHS tensor "A" cannot be a constant tensor. In addition the contraction axes in the LHS and RHS tensors must appear in the same order
-//! (i.e. if the contraction axes in the LHS are "ik" then the contraction axes in the RHS must also be "ik", not "ki").
-//! This is to ensure that the einsum operation can be proven via Sumcheck.
+//! This layer is built via an equation which in full generality looks like:
+//!
+//! > A(ijk)@B(ikl):C(himk):D(ik)->E(ijl)+BIAS(ij):F(hijm):G(ij)+BIAS(j)
+//!
+//! The equation is split in two by the arrow `->`, the left hand side of the
+//! arrow corresponds to the einsum inputs, and right hand side the result of
+//! the operation.
+//!
+//! In the equantion upper case identifiers represent tensors and lower case
+//! their axes, the axes appear after a tensor name inside the parenthesis. The
+//! optional keyword `BIAS` is reserved for bias tensors.
+//!
+//! The left hand side must a single `@` identifier the first input, this input
+//! cannot be a constant tensor, the input tensor is followed by an arbitrary
+//! number of inputs separated by `:` which are either constant or witness
+//! tensors.
+//!
+//! The right hand size is composed of expressions with an optional `BIAS`
+//! expression, the `BIAS` dimensions must be a subset of its addition pair. E.g
+//! `Q(sh)` or with bias `Q(sh)+BIAS(h)`.
+//!
+//! It is important to note that the LHS tensor "A" cannot be a constant tensor.
+//! In addition the contraction axes in the LHS and RHS tensors must appear
+//! in the same order (i.e. if the contraction axes in the LHS are "ik" then
+//! the contraction axes in the RHS must also be "ik", not "ki"), therefore
+//! permutations are not supported. This is to ensure that the einsum operation
+//! can be proven via Sumcheck.
 
 use crate::{
     Claim, Element, NextPowerOfTwo, Number, Shape, Tensor,
@@ -95,7 +113,7 @@ impl<T> EinSum<T> {
         constant_tensors: Vec<Option<KeyedTensor<T>>>,
         biases: Vec<Option<KeyedTensor<T>>>,
     ) -> Result<Self> {
-        let mapping: AxesMapping = AxesMapping::from_string(equation.clone())?;
+        let mapping: AxesMapping = AxesMapping::from_string(&equation)?;
         let evaluation_info = EvaluationInformation3D::new(&mapping)?;
         // Ensure the number of constant tensors and biases matches the number of inputs in the equation
         let input_count = mapping.input_count();
@@ -114,9 +132,8 @@ impl<T> EinSum<T> {
         let actual_biases = biases.iter().filter(|b| b.is_some()).count();
         ensure!(
             actual_biases == mapping.bias_count(),
-            "Number of biases ({}) does not match number of outputs in equation {equation} that expect a bias (expected: {} biases)",
-            actual_biases,
-            mapping.bias_count()
+            "Number of biases ({actual_biases}) does not match number of expected biases in equation {equation} (expected: {} biases)",
+            mapping.bias_count(),
         );
         ensure!(
             output_count == input_count - 1,

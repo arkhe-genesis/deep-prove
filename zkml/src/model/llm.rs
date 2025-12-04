@@ -407,6 +407,7 @@ where
                 trace.outputs()[0].tensor().unwrap(),
             );
         }
+        self.model.reset();
         Ok(trace)
     }
 }

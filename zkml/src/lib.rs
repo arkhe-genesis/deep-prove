@@ -1,4 +1,5 @@
 //! Deepprove library
+#![recursion_limit = "1024"]
 #![feature(iter_next_chunk)]
 #![feature(min_specialization)]
 #![feature(exact_size_is_empty)]

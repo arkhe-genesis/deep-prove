@@ -106,7 +106,7 @@ impl LayerInsertion for FeedForwardNetwork {
         };
         // Finally, create the down projection EinSum
         // Once again we use `s` for sequence length, `p` for projection/intermediate dimension and `e` for embedding dimension
-        let down_input_terms = "X(sp):WD(pe)";
+        let down_input_terms = "X(sp)@WD(pe)";
         let down_output_terms = if down_bias.is_some() {
             "Y(se)+BIAS(e)"
         } else {

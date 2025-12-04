@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-const DATA_SIZE_POWS: Range<i32> = 7..14;
+const DATA_SIZE_POWS: Range<i32> = 7..13;
 
 #[derive(Debug, Copy, Clone)]
 struct Args {
@@ -902,14 +902,10 @@ mod einsum_layer {
         let size = 1 << args.pow2;
         let left = WrappedTensor::<Element>::random(&vec![size, size].into());
         let right = WrappedTensor::<Element>::random(&vec![size, size].into());
-        let bias = KeyedTensor::new("matmul_bias", Tensor::<Element>::random(&vec![size].into()));
 
-        let einsum_layer = EinSum::<Element>::new(
-            "A(ij)@B(kj)->C(ik)".to_string(),
-            vec![None],
-            vec![Some(bias.clone())],
-        )
-        .unwrap();
+        let einsum_layer =
+            EinSum::<Element>::new("A(ij)@B(kj)->C(ik)".to_string(), vec![None], vec![None])
+                .unwrap();
 
         bencher.bench(|| {
             einsum_layer
@@ -923,14 +919,9 @@ mod einsum_layer {
         let size = 1 << args.pow2;
         let left = WrappedTensor::<f32>::random(&vec![size, size].into());
         let right = WrappedTensor::<f32>::random(&vec![size, size].into());
-        let bias = KeyedTensor::new("matmul_bias", Tensor::<f32>::random(&vec![size].into()));
 
-        let einsum_layer = EinSum::<f32>::new(
-            "A(ij)@B(kj)->C(ik)".to_string(),
-            vec![None],
-            vec![Some(bias.clone())],
-        )
-        .unwrap();
+        let einsum_layer =
+            EinSum::<f32>::new("A(ij)@B(kj)->C(ik)".to_string(), vec![None], vec![None]).unwrap();
 
         bencher.bench(|| {
             einsum_layer

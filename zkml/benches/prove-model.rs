@@ -13,7 +13,7 @@ use zkml::{
         llm::models::gpt2::{GPT2, GPT2_Q8_0},
         onnx::FloatOnnxLoader,
     },
-    quantization::{AbsoluteMax, ModelMetadata},
+    quantization::{AbsoluteMax, InferenceTracker, InferenceTrackingMode, ModelMetadata},
     verify,
 };
 
@@ -129,7 +129,7 @@ fn inference(c: &mut Criterion) {
 
     group
         .sample_size(20)
-        .measurement_time(std::time::Duration::from_secs(80));
+        .measurement_time(std::time::Duration::from_secs(200));
 
     let inputs = zstd::Decoder::new(MLP_IRIS_INPUT).expect("failed to parse zstd");
     let (model, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
@@ -177,6 +177,36 @@ fn inference(c: &mut Criterion) {
         bencher.iter_with_large_drop(|| {
             driver.run::<GoldilocksExt2>(&user_tokens, &mut GenStore::default())
         });
+    });
+
+    // Setting the max context to `10` so that only a single run is performed.
+    let max_context = 10;
+
+    let model_path = file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
+    let format = RawGGUF::new(model_path);
+    let (driver, _metadata) = Driver::load_from_model(GPT2, &format, Some(max_context))
+        .expect("failed to instantiate GPT2 driver")
+        .into_provable_llm(None)
+        .expect("Driver should be provable");
+    let user_tokens = driver.random_sequence(1);
+    let input_tokens = user_tokens
+        .into_iter()
+        .map(|t| t.as_tensor_type_param::<Element>())
+        .collect::<Vec<_>>();
+    let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
+
+    group.bench_function("gpt2_small_run", |bencher| {
+        bencher.iter_batched(
+            || input_tokens.clone(),
+            |input_tokens| {
+                driver.run_elements::<GoldilocksExt2>(
+                    input_tokens,
+                    &mut GenStore::default(),
+                    &mut tracker,
+                )
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();

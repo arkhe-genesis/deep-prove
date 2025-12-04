@@ -6,7 +6,7 @@ use crate::{
     Claim, Shape, Tensor, commit::compute_betas_eval, eval_zeroifier_mle, to_bit_sequence_le,
 };
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
 use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
@@ -107,6 +107,13 @@ pub struct AxesMapping {
 /// Intermediate struct used during parsing of an equation to hold the dimension information for a tensor.
 struct TensorDimInfo {
     input_id: usize,
+    /// Name of each dimension.
+    ///
+    /// NOTE:
+    /// - For inputs these may not be empty. An empty dimension would either
+    ///   mean the input is empty, or a mistake was made, the later is more
+    ///   likely (since empty inputs are not useful), and thefore assumed
+    /// - Outputs may be empty. This will perform an summation on all the inputs
     dims: Vec<char>,
 }
 
@@ -121,31 +128,42 @@ impl AxesMapping {
     /// Capital letters are used to identify tensors, lower-case letters identify axes.
     /// The '@' symbol indicates tensors on the left are acting on tensors on the right, ':' separates multiple tensors being acted on by the same tensor
     /// and the '->' indicates the start of the output tensors. Additionally after the '+' symbol we can have bias tensors that are added to the outputs.
-    pub fn from_string(mut equation: String) -> Result<AxesMapping> {
-        // Strip whitespace from the equation
-        equation.retain(|c| !c.is_whitespace());
-        let mut equation = equation.split("->");
-        let inputs_side = equation
-            .next()
-            .ok_or(anyhow!("Invalid equation, no inputs"))?;
-        let outputs_side = equation
-            .next()
-            .ok_or(anyhow!("Invalid equation, no outputs"))?;
+    pub fn from_string(equation: &str) -> Result<AxesMapping> {
+        let split_equation: Vec<_> = equation.split("->").collect();
 
-        // Split the inputs part into its LHS and RHS components
+        let (inputs_side, outputs_side) = match split_equation[..] {
+            [] => bail!("Invalid equation, no inputs. equation: {equation}"),
+            [_] => bail!("Invalid equation, no outputs. equation: {equation}"),
+            [left, right] => (left, right),
+            _ => bail!("Invalid equantion, more than one ->. equation: {equation}"),
+        };
+
+        let first_input = inputs_side
+            .find('@')
+            .ok_or_else(|| anyhow!("Invalid equation, missing @. equation: {equation}"))?;
+        ensure!(
+            !inputs_side[first_input + 1..].chars().any(|c| c == '@'),
+            "Invalid equation, more than one @. equation: {equation}",
+        );
+        ensure!(
+            !inputs_side[..first_input].chars().any(|c| c == ':'),
+            "Invalid equation, @ must be the first input term. equation: {equation}",
+        );
+
         let input_parts = inputs_side
             .split(&['@', ':'])
             .enumerate()
-            .map(parse_input_term)
-            .collect::<Result<Vec<TensorDimInfo>>>()?;
+            .map(parse_input_expr)
+            .collect::<Result<Vec<TensorDimInfo>>>()
+            .with_context(|| format!("Equation: {equation}"))?;
         ensure!(
             input_parts.len() >= 2,
-            "Invalid inputs, need at least one LHS and one RHS tensor"
+            "Invalid equantion, it must specify at least two inputs. equation: {equation}",
         );
 
-        // Collect the output identifiers and their dimensions, along with any biases
-        let (output_dims, bias_dims) = parse_output_terms(outputs_side)?;
-        // We need the unique characters to build the AxesMapping
+        let (output_dims, bias_dims) =
+            parse_output_exprs(outputs_side).with_context(|| format!("Equation: {equation}"))?;
+
         let unique_chars = input_parts
             .iter()
             .chain(output_dims.iter())
@@ -818,68 +836,126 @@ impl AxesMapping {
     }
 }
 
-/// Parses an input term from the equation, returning the dimensions as a string slice.
-fn parse_input_term((index, term): (usize, &str)) -> Result<TensorDimInfo> {
-    let (term_identifier, term_dims) = term
+/// Parses a term of the form `A(xy)`.
+///
+/// # Returns
+///
+/// The term name and the list of dimensions.
+///
+/// # Errors
+///
+/// If the term name is not upper case ascii
+/// If the dimensions are not an lower case ascii
+/// If there are zero or duplicate dimensions
+fn parse_term(index: usize, term: &str) -> Result<(&str, Vec<char>)> {
+    let left = term
         .find('(')
-        .map(|pos| term.split_at(pos))
-        .ok_or(anyhow!("Invalid tensor spec in LHS, no '('"))?;
+        .ok_or_else(|| anyhow!("Missing left (. index: {index} term: '{term}'"))?;
+    let right = term
+        .rfind(')')
+        .ok_or_else(|| anyhow!("Missing right ). index: {index} term: '{term}'"))?;
+
+    let term_identifier = term[..left].trim();
     ensure!(
         term_identifier.chars().all(|c| c.is_ascii_uppercase()),
-        "Invalid tensor identifier in LHS: {term_identifier}",
+        "Invalid identifier. index: {index} term: '{term}'",
     );
 
-    // Trim the parentheses from the dimensions
-    let term_dims = term_dims.trim_matches(&['(', ')'][..]);
-    // Check there are no repeated dimensions
+    let dimensions: Vec<_> = term[left + 1..right]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
     ensure!(
-        term_dims.chars().all(|c| term_dims.matches(c).count() == 1),
-        "Repeated dimensions in input tensor: {term_identifier}({term_dims})",
+        !dimensions.is_empty(),
+        "No dimensions. index: {index} term: '{term}'",
     );
-    Ok(TensorDimInfo::new(index, term_dims.chars().collect()))
+    ensure!(
+        dimensions.iter().all(|c| c.is_ascii_lowercase()),
+        "Invalid characters. index: {index} term: '{term}'",
+    );
+
+    let mut dims_check = dimensions.clone();
+    dims_check.sort();
+    ensure!(
+        // TODO: change to `array_windows` once stabilized
+        dims_check.windows(2).all(|chars| {
+            match chars {
+                [l, r] => l != r,
+                _ => false,
+            }
+        }),
+        "Repeated dimensions. index: {index} term: '{term}'",
+    );
+    Ok((term_identifier, dimensions))
 }
 
-fn parse_output_terms(output_side: &str) -> Result<(Vec<TensorDimInfo>, Vec<TensorDimInfo>)> {
+/// Parses an equation input term and returns a [TensorDimInfo] on success.
+///
+/// Notes:
+/// - Tensor identifiers must be all upper case ascii, with variable length,
+///   e.g. `BIAS` and `WQ`.
+/// - Dimension identifiers are necessarily single characters.
+fn parse_input_expr((index, term): (usize, &str)) -> Result<TensorDimInfo> {
+    let (term_identifier, dimensions) = parse_term(index, term).context("Input term")?;
+    ensure!(
+        term_identifier != "BIAS",
+        "Input term must not be named BIAS. index: {index} term: '{term}'"
+    );
+
+    Ok(TensorDimInfo::new(index, dimensions))
+}
+
+/// Parses the output expresions of an equation.
+///
+/// The output may be a single term, e.g. `O(i)`, or an expression `O(i)+BIAS(i)`.
+///
+/// # Returns
+///
+/// - A list with the outputs
+/// - A list with the biases
+///
+/// # Errors
+///
+/// - If the bias dimensions are not a subset of the output tensor.
+/// - If either the bias or output tensor term don't respect the term rules, see [parse_term]
+fn parse_output_exprs(output_side: &str) -> Result<(Vec<TensorDimInfo>, Vec<TensorDimInfo>)> {
     let mut bias_count = 0usize;
-    output_side.split(':').filter(|s| !s.is_empty()).enumerate().try_fold((vec![], vec![]), |(mut outputs, mut biases), (term_index, term)| {
-        let mut output_chars = HashSet::<char>::new();
-        term.split('+').enumerate().try_for_each(|(i, part)| {
-            let (identifier, dims) = part
-                .find('(')
-                .map(|pos| part.split_at(pos))
-                .ok_or(anyhow!("Invalid tensor spec in output, no '('"))?;
-            // Trim the parentheses from the dimensions
-                let dims = dims.trim_matches(&['(', ')'][..]);
-                // Check there are no repeated dimensions
-                ensure!(
-                    dims.chars().all(|c| dims.matches(c).count() == 1),
-                    "Repeated dimensions in tensor: {identifier}({dims})"
-                );
-            if i == 0 {
-                ensure!(
-            identifier.chars().all(|c| c.is_ascii_uppercase()),
-            "Invalid tensor identifier in output: {identifier}",
+    let mut outputs = Vec::new();
+    let mut biases = Vec::new();
+
+    for (expr_index, expr) in output_side.split(':').enumerate() {
+        ensure!(!expr.is_empty(), "Output term is empty. index {expr_index}");
+
+        let bias_start_pos = expr.find('+');
+        let term = &expr[..bias_start_pos.unwrap_or(expr.len())];
+        let (term_identifier, dimensions) = parse_term(expr_index, term).context("Output term")?;
+        ensure!(
+            term_identifier != "BIAS",
+            "Input term must not be named BIAS. index: {expr_index} term: '{term}'"
         );
-                output_chars = dims.chars().collect();
-                outputs.push(TensorDimInfo::new(term_index, dims.chars().collect()));
-                Ok(())
-            } else {
-                ensure!(
-                identifier == "BIAS",
-                "Invalid bias tensor identifier in output: {identifier}",
-            );
-            let bias_chars = dims.chars().collect::<HashSet<char>>();
+
+        if let Some(bias_start_pos) = bias_start_pos {
+            let (bias_identifier, bias_dimensions) =
+                parse_term(expr_index, &expr[bias_start_pos + 1..]).context("Output BIAS term")?;
             ensure!(
-                bias_chars.is_subset(&output_chars),
-                "Bias tensor dimensions must be a subset of the output tensor dimensions: {identifier}({dims})"
+                bias_identifier == "BIAS",
+                "Output term after main identifier must be BIAS: \
+                got: {bias_identifier} index: {expr_index} term: '{term}'",
             );
-                biases.push(TensorDimInfo::new(bias_count, dims.chars().collect()));
-                bias_count += 1;
-                Ok(())
-            }
-        })?;
-        Ok((outputs, biases))
-    })
+            ensure!(
+                bias_dimensions.iter().all(|c| dimensions.contains(c)),
+                "Output term BIAS dimensions must be a subset of the output tensor. \
+                term_dims: {dimensions:?} bias_dims: {bias_dimensions:?} term: '{term}'",
+            );
+            biases.push(TensorDimInfo::new(bias_count, bias_dimensions));
+            bias_count += 1;
+        }
+
+        outputs.push(TensorDimInfo::new(expr_index, dimensions));
+    }
+
+    Ok((outputs, biases))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1216,6 +1292,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_invalid_axes_mapping() {
+        // empty
+        assert!(AxesMapping::from_string("").is_err());
+        // no output
+        assert!(AxesMapping::from_string("A(i)").is_err());
+        // to many arrows
+        assert!(AxesMapping::from_string("i->i->i").is_err());
+        assert!(AxesMapping::from_string("A(i)->B(i)->C(i)").is_err());
+        assert!(AxesMapping::from_string("A(a)->B(b)->C(c)").is_err());
+        // missing @
+        assert!(AxesMapping::from_string("A(a):B(b)->A(a)").is_err());
+        // @ is not the first input
+        assert!(AxesMapping::from_string("A(a):B(b)@C(c)->A(a)").is_err());
+        assert!(AxesMapping::from_string("A(a):B(b)@C(c)->A(ab)").is_err());
+        assert!(AxesMapping::from_string("A(a):B(b)@C(c)->A(c)").is_err());
+        // Multiple @
+        assert!(AxesMapping::from_string("A(a)@B(b)@C(c)->A(a)").is_err());
+        assert!(AxesMapping::from_string("A(a)@B(b)@C(c)->A(ab)").is_err());
+        assert!(AxesMapping::from_string("A(a)@B(b)@C(c)->A(c)").is_err());
+    }
+
+    #[test]
+    fn test_invalid_parse_input_term() {
+        // empty
+        assert!(parse_input_expr((0, "")).is_err());
+        // no dimensions
+        assert!(parse_input_expr((0, "A")).is_err());
+        assert!(parse_input_expr((0, "A()")).is_err());
+        // no closing parens
+        assert!(parse_input_expr((0, "A(x")).is_err());
+        // duplicated parens
+        assert!(parse_input_expr((0, "A((x)")).is_err());
+        assert!(parse_input_expr((0, "A(x))")).is_err());
+        assert!(parse_input_expr((0, "A((x))")).is_err());
+        // spaces tensor name
+        assert!(parse_input_expr((0, "W Q(x)")).is_err());
+        // duplicate dimensions
+        assert!(parse_input_expr((0, "A(xx)")).is_err());
+        // invalid chars
+        assert!(parse_input_expr((0, ":(x)")).is_err());
+        assert!(parse_input_expr((0, "#(x)")).is_err());
+        assert!(parse_input_expr((0, "_(x)")).is_err());
+        assert!(parse_input_expr((0, "!(x)")).is_err());
+        assert!(parse_input_expr((0, "A(:)")).is_err());
+        assert!(parse_input_expr((0, "A(#)")).is_err());
+        assert!(parse_input_expr((0, "A(_)")).is_err());
+        assert!(parse_input_expr((0, "A(!)")).is_err());
+        // invalid case
+        assert!(parse_input_expr((0, "a(a)")).is_err());
+        assert!(parse_input_expr((0, "A(A)")).is_err());
+        // BIAS is reserved for outputs
+        assert!(parse_input_expr((0, "BIAS(a)")).is_err());
+    }
+
+    #[test]
+    fn test_invalid_parse_output_terms() {
+        // empty
+        assert!(parse_output_exprs("").is_err());
+        // no dimensions
+        assert!(parse_output_exprs("A").is_err());
+        assert!(parse_output_exprs("A()").is_err());
+        // no closing parens
+        assert!(parse_output_exprs("A(x").is_err());
+        // duplicated parens
+        assert!(parse_output_exprs("A((x)").is_err());
+        assert!(parse_output_exprs("A(x))").is_err());
+        assert!(parse_output_exprs("A((x))").is_err());
+        // spaces tensor name
+        assert!(parse_output_exprs("W Q(x)").is_err());
+        // duplicate dimensions
+        assert!(parse_output_exprs("A(xx)").is_err());
+        // invalid chars
+        assert!(parse_output_exprs(":(x)").is_err());
+        assert!(parse_output_exprs("#(x)").is_err());
+        assert!(parse_output_exprs("_(x)").is_err());
+        assert!(parse_output_exprs("!(x)").is_err());
+        assert!(parse_output_exprs("A(:)").is_err());
+        assert!(parse_output_exprs("A(#)").is_err());
+        assert!(parse_output_exprs("A(_)").is_err());
+        assert!(parse_output_exprs("A(!)").is_err());
+        // invalid case
+        assert!(parse_output_exprs("a(a)").is_err());
+        assert!(parse_output_exprs("A(A)").is_err());
+        // empty output
+        assert!(parse_output_exprs(":A(a)").is_err());
+        assert!(parse_output_exprs("A(a):").is_err());
+        // BIAS is reserved for the additive term
+        assert!(parse_output_exprs("BIAS(a)").is_err());
+        assert!(parse_output_exprs("BIAS(a)+A(a)").is_err());
+        // additive term is not BIAS
+        assert!(parse_output_exprs("A(a)+B(a)").is_err());
+        // BIAS dimensions are not a subset of the input
+        assert!(parse_output_exprs("A(a)+BIAS(b)").is_err());
+    }
+
+    #[test]
     fn test_axes_mapping_parsing() -> Result<()> {
         let mat_mul_test_case = AxesMappingParsingTestCase {
             equation: "A(ij)@B(jk)->C(ik)".to_string(),
@@ -1264,14 +1436,12 @@ mod tests {
         }
 
         // We also test a few invalid cases to ensure they error as expected
-        let invalid_equation = "A(iij)@B(jk)->C(iik)".to_string();
-        let result = AxesMapping::from_string(invalid_equation);
+        let result = AxesMapping::from_string("A(iij)@B(jk)->C(iik)");
         assert!(
             result.is_err(),
             "Expected error for invalid equation with repeated dimensions"
         );
-        let invalid_equation = "A(ij)@B(jk)->C(ikr)".to_string();
-        let result = AxesMapping::from_string(invalid_equation);
+        let result = AxesMapping::from_string("A(ij)@B(jk)->C(ikr)");
         assert!(
             result.is_err(),
             "Expected error for invalid equation with extra dimensions in output"
@@ -1295,7 +1465,7 @@ mod tests {
             expected_axis_count,
             expected_dim_order,
         } = test_case;
-        let mut axes_mapping = AxesMapping::from_string(equation.clone())
+        let mut axes_mapping = AxesMapping::from_string(&equation)
             .with_context(|| format!("Failed to parse axes mapping from equation {equation}"))?;
         assert_eq!(
             axes_mapping.input_count, expected_input_count,
@@ -1331,8 +1501,8 @@ mod tests {
 
     #[test]
     fn test_output_shapes() -> Result<()> {
-        let equation = "A(ij)@B(jk)->C(ik)".to_string();
-        let axes_mapping = AxesMapping::from_string(equation.clone())?;
+        let equation = "A(ij)@B(jk)->C(ik)";
+        let axes_mapping = AxesMapping::from_string(equation)?;
         let mut rng = rng_from_env_or_random();
         for _ in 0..10 {
             let i = rng.gen_range(1..10);
@@ -1358,8 +1528,7 @@ mod tests {
 
     #[test]
     fn test_broadcasted_bias_eval() {
-        let equation = "A(ijk)@B(ikl)->C(ijl)+BIAS(il)".to_string();
-        let axes_mapping = AxesMapping::from_string(equation).unwrap();
+        let axes_mapping = AxesMapping::from_string("A(ijk)@B(ikl)->C(ijl)+BIAS(il)").unwrap();
         let mut rng = rng_from_env_or_random();
         for _ in 0..10 {
             let i = rng.gen_range(1..10);
