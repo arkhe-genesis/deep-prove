@@ -119,7 +119,7 @@ impl<N: TensorTypeParam> Positional<N> {
         }
     }
 
-    pub(crate) fn reset_cache(&self) {
+    pub fn reset_cache(&self) {
         if let Some(cache) = &self.cache {
             cache.lock().unwrap().reset();
         }

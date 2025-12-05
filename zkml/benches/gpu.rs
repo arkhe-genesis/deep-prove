@@ -1,5 +1,8 @@
 use std::ops::Range;
 
+use ff_ext::ExtensionField;
+use zkml::{layers::provable::LayerOut, tensor::TensorTypeParam};
+
 const DATA_SIZE_POWS: Range<i32> = 7..13;
 
 #[derive(Debug, Copy, Clone)]
@@ -15,6 +18,23 @@ fn sizes(range: Range<i32>) -> impl Iterator<Item = Args> {
     range.map(|pow2| Args { pow2 })
 }
 
+/// Gathers the results from the layer.
+///
+/// For the GPU work this is needed to wait for the computation to finish,
+/// otherwise the benchmark is for the time it takes to schedule the work, not
+/// to finish it. This has the unfortunate downside of including the time to
+/// transfer the data to the GPU.
+fn get_results<T, E>(out: LayerOut<T, E>) -> Vec<Vec<T>>
+where
+    T: TensorTypeParam,
+    E: ExtensionField,
+{
+    out.outputs()
+        .iter()
+        .map(|wrapped_tensor| wrapped_tensor.get_data())
+        .collect()
+}
+
 #[divan::bench_group]
 mod add_layer {
     use ff_ext::GoldilocksExt2;
@@ -24,9 +44,9 @@ mod add_layer {
         tensor::{KeyedTensor, WrappedTensor},
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size]);
@@ -49,14 +69,21 @@ mod add_layer {
             .unwrap()
             .quantized_op;
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Add should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Add should succeed")
+                .expect("Add should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size]);
@@ -69,10 +96,17 @@ mod add_layer {
             shape.clone(),
         );
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Add should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Add should succeed")
+                .expect("Add should succeed");
+            get_results(out)
         });
     }
 }
@@ -88,7 +122,7 @@ mod convolution_layer {
         tensor::{KeyedTensor, WrappedTensor},
     };
 
-    use crate::{Args, default_sizes, sizes};
+    use crate::{Args, default_sizes, get_results, sizes};
 
     // Can not execute convolution layer with size 1<<12 [1]
     //
@@ -109,7 +143,7 @@ mod convolution_layer {
     const BATCHES: usize = 1;
     const CHANNELS: usize = 3;
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let kernels = Tensor::<Element>::random(&Shape::new(vec![BATCHES, CHANNELS, 3, 3]));
@@ -126,14 +160,21 @@ mod convolution_layer {
         .prepared_for_fft(&Shape::from(input.shape()))
         .unwrap();
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Convolution should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Convolution should succeed")
+                .expect("Convolution should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = sizes(F32_SIZES))]
+    #[divan::bench(args = sizes(F32_SIZES), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let kernels = Tensor::<f32>::random(&Shape::new(vec![BATCHES, CHANNELS, 3, 3]));
@@ -147,10 +188,17 @@ mod convolution_layer {
         )
         .unwrap();
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Convolution should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Convolution should succeed")
+                .expect("Convolution should succeed");
+            get_results(out)
         });
     }
 }
@@ -165,9 +213,9 @@ mod embeddings_layer {
         tensor::{KeyedTensor, WrappedTensor},
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let vocab_size = 100;
         let size = 1 << args.pow2;
@@ -183,14 +231,22 @@ mod embeddings_layer {
 
         let layer =
             Embeddings::<Element>::new(KeyedTensor::new("embedding_matrix", emb.clone())).unwrap();
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Embeddings should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Embeddings should succeed")
+                .expect("Embeddings should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let emb = Tensor::<f32>::random(&Shape::new(vec![size, size]));
@@ -199,10 +255,18 @@ mod embeddings_layer {
 
         let layer =
             Embeddings::<f32>::new(KeyedTensor::new("embeddings_matrix", emb.clone())).unwrap();
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Embeddings should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Embeddings should succeed")
+                .expect("Embeddings should succeed");
+            get_results(out)
         });
     }
 }
@@ -217,6 +281,8 @@ mod flatten_layer {
         layers::{flatten::Flatten, provable::Evaluate},
         tensor::WrappedTensor,
     };
+
+    use crate::get_results;
 
     #[derive(Debug, Copy, Clone)]
     struct Args {
@@ -233,27 +299,43 @@ mod flatten_layer {
             .map(|(pow2, rank)| Args { pow2, rank })
     }
 
-    #[divan::bench(args = args())]
+    #[divan::bench(args = args(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<Element>::random(&Shape::new([size].repeat(args.rank)));
         let layer = Flatten::default();
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Flatten should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Flatten should succeed")
+                .expect("Flatten should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = args())]
+    #[divan::bench(args = args(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<f32>::random(&Shape::new([size].repeat(args.rank)));
         let layer = Flatten::default();
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Flatten should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Flatten should succeed")
+                .expect("Flatten should succeed");
+            get_results(out)
         });
     }
 }
@@ -267,17 +349,25 @@ mod gelu_layer {
         tensor::WrappedTensor,
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
         let layer = GELU::<f32>::new();
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("GeLU should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("GeLU should succeed")
+                .expect("GeLU should succeed");
+            get_results(out)
         });
     }
 }
@@ -291,9 +381,9 @@ mod logits_layer {
         tensor::WrappedTensor,
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let rows = 1 << args.pow2;
         let cols = 16384;
@@ -303,14 +393,21 @@ mod logits_layer {
 
         let layer = Logits::Argmax;
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Logits should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Logits should succeed")
+                .expect("Logits should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let rows = 1 << args.pow2;
         let cols = 16384;
@@ -319,10 +416,18 @@ mod logits_layer {
         let input = WrappedTensor::<f32>::random(&shape);
 
         let layer = Logits::Argmax;
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Logits should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Logits should succeed")
+                .expect("Logits should succeed");
+            get_results(out)
         });
     }
 
@@ -339,7 +444,7 @@ mod logits_layer {
             .map(|(d0, d1, d2)| ArgsHighRank { d0, d1, d2 })
     }
 
-    #[divan::bench(args = highrank())]
+    #[divan::bench(args = highrank(), threads = false)]
     fn element_highrank(bencher: divan::Bencher, args: ArgsHighRank) {
         let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
 
@@ -347,24 +452,39 @@ mod logits_layer {
 
         let layer = Logits::Argmax;
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Logits high rank should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Logits high rank should succeed")
+                .expect("Logits high rank should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = highrank())]
+    #[divan::bench(args = highrank(), threads = false)]
     fn f32_highrank(bencher: divan::Bencher, args: ArgsHighRank) {
         let shape = Shape::new(vec![args.d0, args.d1, args.d2]);
 
         let input = WrappedTensor::<f32>::random(&shape);
 
         let layer = Logits::Argmax;
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Logits high rank should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Logits high rank should succeed")
+                .expect("Logits high rank should succeed");
+            get_results(out)
         });
     }
 }
@@ -380,7 +500,7 @@ mod norm_layer {
         tensor::{KeyedTensor, WrappedTensor},
     };
 
-    use crate::DATA_SIZE_POWS;
+    use crate::{DATA_SIZE_POWS, get_results};
 
     #[derive(Debug, Copy, Clone)]
     struct Args {
@@ -398,17 +518,17 @@ mod norm_layer {
         })
     }
 
-    #[divan::bench(args = args())]
+    #[divan::bench(args = args(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let dim0 = 1 << args.dim0_pow2;
         let dim1 = 1 << args.dim1_pow2;
 
         let gamma = KeyedTensor::new(
-            "layernom_gamma",
+            "norm_gamma",
             Tensor::<Element>::random(&Shape::new(vec![dim1])),
         );
         let beta = KeyedTensor::new(
-            "layernom_beta",
+            "norm_beta",
             Tensor::<Element>::random(&Shape::new(vec![dim1])),
         );
         let layer = LayerNorm::<Element>::new(gamma, beta, EPS).unwrap();
@@ -419,34 +539,42 @@ mod norm_layer {
         let input = WrappedTensor::try_from(&input).unwrap();
         let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Norm should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Norm should succeed")
+                .expect("Norm should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = args())]
+    #[divan::bench(args = args(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let dim0 = 1 << args.dim0_pow2;
         let dim1 = 1 << args.dim1_pow2;
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
 
-        let gamma = KeyedTensor::new(
-            "layernorm_gamma",
-            Tensor::<f32>::random(&Shape::new(vec![dim1])),
-        );
-        let beta = KeyedTensor::new(
-            "layernorm_beta",
-            Tensor::<f32>::random(&Shape::new(vec![dim1])),
-        );
+        let gamma = KeyedTensor::new("norm_gamma", Tensor::<f32>::random(&Shape::new(vec![dim1])));
+        let beta = KeyedTensor::new("norm_beta", Tensor::<f32>::random(&Shape::new(vec![dim1])));
         let layer = LayerNorm::<f32>::new(gamma, beta, EPS).unwrap();
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Norm should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Norm should succeed")
+                .expect("Norm should succeed");
+            get_results(out)
         });
     }
 }
@@ -465,15 +593,15 @@ mod positional_absolute_layer {
         tensor::{KeyedTensor, WrappedTensor},
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2; // emb = size
         let context = size * 2;
 
         let pos = KeyedTensor::new(
-            "absolute_positional_mat",
+            "positional_absolute_mat",
             Tensor::<f32>::random(&Shape::new(vec![context, size])),
         );
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
@@ -489,46 +617,68 @@ mod positional_absolute_layer {
         let output_scalings =
             AbsoluteMax::scaling_factors_for_node(&(), node_id, unpadded_output_shapes.len());
 
+        let layer = base_layer.clone();
+        let input_scalings = vec![input_scaling];
+
+        let layer = QuantizeOp::quantize_op::<AbsoluteMax>(
+            layer,
+            &(),
+            node_id,
+            &input_scalings,
+            &input_shapes,
+            &output_scalings,
+            &unpadded_output_shapes,
+        )
+        .expect("quantize positional absolute should succeed")
+        .quantized_op;
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Positional absolute should succeed");
+        let _ = get_results(out);
+
         bencher
             .with_inputs(|| {
-                let layer = base_layer.clone();
-                let input_scalings = vec![input_scaling];
-
-                QuantizeOp::quantize_op::<AbsoluteMax>(
-                    layer,
-                    &(),
-                    node_id,
-                    &input_scalings,
-                    &input_shapes,
-                    &output_scalings,
-                    &unpadded_output_shapes,
-                )
-                .expect("quantize positional absolute should succeed")
-                .quantized_op
+                layer.reset_cache();
+                &layer
             })
             .bench_refs(|layer| {
-                layer
+                let out = layer
                     .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional absolute should succeed");
+                get_results(out)
             });
     }
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2; // emb = size
         let context = size * 2;
 
         let pos = KeyedTensor::new(
-            "absolute_positional_mat",
+            "positional_absolute_mat",
             Tensor::<f32>::random(&Shape::new(vec![context, size])),
         );
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
+        let layer = Positional::<f32>::new_absolute(pos.clone());
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Positional absolute should succeed");
+        let _ = get_results(out);
+
         bencher
-            .with_inputs(|| Positional::<f32>::new_absolute(pos.clone()))
+            .with_inputs(|| {
+                layer.reset_cache();
+                &layer
+            })
             .bench_refs(|layer| {
-                layer
+                let out = layer
                     .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional absolute should succeed");
+                get_results(out)
             });
     }
 }
@@ -548,7 +698,7 @@ mod positional_rope_layer {
         tensor::WrappedTensor,
     };
 
-    use crate::DATA_SIZE_POWS;
+    use crate::{DATA_SIZE_POWS, get_results};
 
     #[derive(Debug, Copy, Clone)]
     struct RopeArgs {
@@ -571,7 +721,7 @@ mod positional_rope_layer {
         })
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: RopeArgs) {
         let size: usize = 1 << args.pow2;
         let context = size * 2;
@@ -603,30 +753,38 @@ mod positional_rope_layer {
         let output_scalings =
             AbsoluteMax::scaling_factors_for_node(&(), node_id, unpadded_output_shapes.len());
 
+        let input_scalings = vec![input_scaling];
+        let layer = QuantizeOp::quantize_op::<AbsoluteMax>(
+            base_layer,
+            &(),
+            node_id,
+            &input_scalings,
+            &input_shapes,
+            &output_scalings,
+            &unpadded_output_shapes,
+        )
+        .expect("quantize positional rope should succeed")
+        .quantized_op;
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Positional rope should succeed");
+        let _ = get_results(out);
+
         bencher
             .with_inputs(|| {
-                let layer = base_layer.clone();
-                let input_scalings = vec![input_scaling];
-
-                QuantizeOp::quantize_op::<AbsoluteMax>(
-                    layer,
-                    &(),
-                    node_id,
-                    &input_scalings,
-                    &input_shapes,
-                    &output_scalings,
-                    &unpadded_output_shapes,
-                )
-                .expect("quantize positional rope should succeed")
-                .quantized_op
+                layer.reset_cache();
+                &layer
             })
             .bench_refs(|layer| {
-                layer
+                let out = layer
                     .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional rope should succeed");
+                get_results(out)
             });
     }
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: RopeArgs) {
         let size: usize = 1 << args.pow2;
         let context = size * 2;
@@ -640,20 +798,31 @@ mod positional_rope_layer {
             .collect();
 
         let input = WrappedTensor::random(&Shape::new(vec![size, size]));
+
+        let layer = Positional::<f32>::new_rope(
+            angles.clone(),
+            "rope_angles".to_string().into(),
+            context,
+            args.layout,
+        )
+        .expect("new_rope");
+
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Positional rope should succeed");
+        let _ = get_results(out);
+
         bencher
             .with_inputs(|| {
-                Positional::<f32>::new_rope(
-                    angles.clone(),
-                    "rope_angles".to_string().into(),
-                    context,
-                    args.layout,
-                )
-                .expect("new_rope")
+                layer.reset_cache();
+                &layer
             })
             .bench_refs(|layer| {
-                layer
+                let out = layer
                     .evaluate::<GoldilocksExt2>(&[&input])
                     .expect("Positional rope should succeed");
+                get_results(out)
             });
     }
 }
@@ -668,9 +837,9 @@ mod softmax_layer {
         tensor::WrappedTensor,
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -682,14 +851,21 @@ mod softmax_layer {
             .quantise(input_scaling, *quantization::BIT_LEN)
             .expect("Softmax quantise should succeed");
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Softmax should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed")
+                .expect("Softmax should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -697,10 +873,17 @@ mod softmax_layer {
 
         let layer = Softmax::new(size);
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Softmax should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed")
+                .expect("Softmax should succeed");
+            get_results(out)
         });
     }
 }
@@ -714,19 +897,26 @@ mod requant_layer {
         tensor::WrappedTensor,
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<Element>::random(&Shape::new(vec![size]));
 
         let layer = Requant::from_multiplier(2.0, 8);
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Requant should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Requant should succeed")
+                .expect("Requant should succeed");
+            get_results(out)
         });
     }
 }
@@ -743,9 +933,9 @@ mod pooling_layer {
         tensor::WrappedTensor,
     };
 
-    use crate::{Args, default_sizes};
+    use crate::{Args, default_sizes, get_results};
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -756,14 +946,21 @@ mod pooling_layer {
             stride: MAXPOOL2D_KERNEL_SIZE,
         });
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Softmax should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed")
+                .expect("Softmax should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -774,10 +971,17 @@ mod pooling_layer {
             stride: MAXPOOL2D_KERNEL_SIZE,
         });
 
+        // warm up
+        let out = layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("Softmax should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            layer
+            let out = layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed")
+                .expect("Softmax should succeed");
+            get_results(out)
         });
     }
 }
@@ -792,7 +996,7 @@ mod einsum_layer {
         tensor::{KeyedTensor, WrappedTensor},
     };
 
-    use crate::{Args, default_sizes, sizes};
+    use crate::{Args, default_sizes, get_results, sizes};
 
     // XXX: beyond this point benchmarks for elements are too slow, see matmul
     // benches for measurements.
@@ -802,7 +1006,7 @@ mod einsum_layer {
     const ELEMENT_SIZES: Range<i32> = 7..10;
     const CONCATS: usize = 8;
 
-    #[divan::bench(args = sizes(ELEMENT_SIZES))]
+    #[divan::bench(args = sizes(ELEMENT_SIZES), threads = false)]
     fn einsum_qkv_element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -822,14 +1026,21 @@ mod einsum_layer {
         )
         .unwrap();
 
+        // warm up
+        let out = einsum_layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("EinSum should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            einsum_layer
+            let out = einsum_layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("EinSum should succeed")
+                .expect("EinSum should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn einsum_qkv_f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -852,14 +1063,21 @@ mod einsum_layer {
         )
         .unwrap();
 
+        // warm up
+        let out = einsum_layer
+            .evaluate::<GoldilocksExt2>(&[&input])
+            .expect("EinSum should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            einsum_layer
+            let out = einsum_layer
                 .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("EinSum should succeed")
+                .expect("EinSum should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = sizes(ELEMENT_SIZES))]
+    #[divan::bench(args = sizes(ELEMENT_SIZES), threads = false)]
     fn einsum_concat_matmul_element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -871,14 +1089,21 @@ mod einsum_layer {
             EinSum::<Element>::new("A(kij)@B(jil)->C(ikl)".to_string(), vec![None], vec![None])
                 .unwrap();
 
+        // warm up
+        let out = einsum_layer
+            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .expect("EinSum should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            einsum_layer
+            let out = einsum_layer
                 .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("EinSum should succeed")
+                .expect("EinSum should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn einsum_concat_matmul_f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
 
@@ -890,14 +1115,21 @@ mod einsum_layer {
             EinSum::<f32>::new("A(kij)@B(jil)->C(ikl)".to_string(), vec![None], vec![None])
                 .unwrap();
 
+        // warm up
+        let out = einsum_layer
+            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .expect("EinSum should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            einsum_layer
+            let out = einsum_layer
                 .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("EinSum should succeed")
+                .expect("EinSum should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = sizes(ELEMENT_SIZES))]
+    #[divan::bench(args = sizes(ELEMENT_SIZES), threads = false)]
     fn einsum_matmul_element(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let left = WrappedTensor::<Element>::random(&vec![size, size].into());
@@ -907,14 +1139,21 @@ mod einsum_layer {
             EinSum::<Element>::new("A(ij)@B(kj)->C(ik)".to_string(), vec![None], vec![None])
                 .unwrap();
 
+        // warm up
+        let out = einsum_layer
+            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .expect("EinSum should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            einsum_layer
+            let out = einsum_layer
                 .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("EinSum should succeed")
+                .expect("EinSum should succeed");
+            get_results(out)
         });
     }
 
-    #[divan::bench(args = default_sizes())]
+    #[divan::bench(args = default_sizes(), threads = false)]
     fn einsum_matmul_f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let left = WrappedTensor::<f32>::random(&vec![size, size].into());
@@ -923,10 +1162,17 @@ mod einsum_layer {
         let einsum_layer =
             EinSum::<f32>::new("A(ij)@B(kj)->C(ik)".to_string(), vec![None], vec![None]).unwrap();
 
+        // warm up
+        let out = einsum_layer
+            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .expect("EinSum should succeed");
+        let _ = get_results(out);
+
         bencher.bench(|| {
-            einsum_layer
+            let out = einsum_layer
                 .evaluate::<GoldilocksExt2>(&[&left, &right])
-                .expect("EinSum should succeed")
+                .expect("EinSum should succeed");
+            get_results(out)
         });
     }
 }
