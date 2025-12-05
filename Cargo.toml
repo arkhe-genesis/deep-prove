@@ -79,3 +79,12 @@ lto = "fat"
 [workspace.metadata.release]
 pre-release-hook = ["sh", "../.github/changelog.sh"]
 publish = false
+
+[patch."https://github.com/tracel-ai/cubecl.git"]
+cubecl = { git = "https://github.com/Lagrange-Labs/cubecl.git", branch = "fix-argmax-out-dtype" }
+cubecl-common = { git = "https://github.com/Lagrange-Labs/cubecl.git", branch = "fix-argmax-out-dtype" }
+cubecl-core = { git = "https://github.com/Lagrange-Labs/cubecl.git", branch = "fix-argmax-out-dtype" }
+cubecl-ir = { git = "https://github.com/Lagrange-Labs/cubecl.git", branch = "fix-argmax-out-dtype" }
+cubecl-matmul = { git = "https://github.com/Lagrange-Labs/cubecl.git", branch = "fix-argmax-out-dtype" }
+cubecl-quant = { git = "https://github.com/Lagrange-Labs/cubecl.git", branch = "fix-argmax-out-dtype" }
+cubecl-wgpu = { git = "https://github.com/Lagrange-Labs/cubecl.git", branch = "fix-argmax-out-dtype" }

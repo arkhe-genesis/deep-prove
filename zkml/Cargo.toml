@@ -29,7 +29,7 @@ cpu = ["burn/ndarray", "dep:burn-ndarray"]
 # If `cuda` is also enabled it takes precedence over `wgpu`
 wgpu = ["burn/wgpu", "gpu"]
 # Linux only
-cuda = ["burn/cuda", "gpu", "dep:cubecl-cuda", "dep:cudarc"]
+cuda = ["burn/cuda", "gpu"]
 mem-track = ["utils/mem-track"]
 
 # Internal. Use `wgpu` or `cuda` which will enable `gpu`
@@ -46,10 +46,10 @@ ahash = "0.8.12"
 anyhow.workspace = true
 ark-std.workspace = true
 average = { version = "0.16.0", features = ["std"] }
-burn = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false }
-burn-cubecl = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, optional = true }
-burn-fusion = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, optional = true }
-burn-ndarray = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", optional = true, default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false }
+burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, optional = true }
+burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, optional = true }
+burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", optional = true, default-features = false, features = [
   "std",
   "multi-threads",
 ] }
@@ -58,13 +58,7 @@ ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 crossbeam-channel = "0.5.15"
 csv.workspace = true
-# NOTE: The `cubecl` feature spells and `cubecl-cuda` and `cudarc` deps may be
-# removed on newer version of burn. In this version they are needed as `cubecl`
-# enables "cuda-12050" by default, so we need to get rid of it to enable
-# "cuda-13000" only.
-cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "04b1024999fad223b83650b824993ef8edb4ef20", optional = true, default-features = false, features = ["std", "stdlib", "matmul", "convolution"] }
-cubecl-cuda = { git = "https://github.com/tracel-ai/cubecl", rev = "04b1024999fad223b83650b824993ef8edb4ef20", optional = true, default-features = false, features = ["std"] }
-cudarc = { version = "=0.17.3", optional = true, default-features = false, features = ["cuda-13000"] }
+cubecl = { git = "https://github.com/tracel-ai/cubecl.git", rev = "f917032aff039603aebec234333fe3dab44649ed", optional = true }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }
@@ -109,11 +103,11 @@ utils = { path = "../utils" }
 witness = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, features = [
   "metal",
 ] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-burn = { git = "https://github.com/Lagrange-Labs/burn.git", rev = "3429013c4b8984fdaa3d0fb79e6e38ea204afcb4", default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, features = [
   "vulkan",
 ] }
 

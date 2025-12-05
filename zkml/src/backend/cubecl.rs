@@ -3,7 +3,7 @@ use std::{cmp::min, marker::PhantomData};
 use anyhow::{Result, ensure};
 use burn::{
     backend::{
-        ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr},
+        ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr},
         wgpu::{BoolElement, CubeBackend, FloatElement, IntElement},
     },
     tensor::{Shape as BShape, TensorMetadata, ops::IntTensor},
@@ -204,15 +204,16 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
             &input.client,
             cube_count,
             cube_dim,
-            input.as_tensor_arg::<I>(1),
+            input.as_tensor_arg(1),
             input_strides,
-            kernels.as_tensor_arg::<I>(1),
+            kernels.as_tensor_arg(1),
             kernel_strides,
-            bias.as_tensor_arg::<I>(1),
-            output.as_tensor_arg::<I>(1),
+            bias.as_tensor_arg(1),
+            output.as_tensor_arg(1),
             output_shape,
             config.stride as u32,
-        );
+        )
+        .expect("Kernel to never fail");
 
         Ok(output)
     }
@@ -269,13 +270,14 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
             &input.client,
             cube_count,
             cube_dim,
-            input.as_tensor_arg::<I>(1),
+            input.as_tensor_arg(1),
             input_strides,
-            output.as_tensor_arg::<I>(1),
+            output.as_tensor_arg(1),
             output_shape,
             config.kernel_size as u32,
             config.stride as u32,
-        );
+        )
+        .expect("Kernel to never fail");
 
         Ok(output)
     }
@@ -328,32 +330,31 @@ impl<B: FusionBackend + ZKMLBackend> ZKMLBackend for Fusion<B> {
         streams.tensor(&bias);
 
         let shape = conv2d_i_out_shape(input.shape().dims(), kernels.shape().dims(), &config)?;
-        let out = input
-            .client
-            .tensor_uninitialized(shape.dims.clone().into(), input.dtype());
+        let client = input.client.clone();
+        let out = TensorIr::uninit(client.create_empty_handle(), shape, input.dtype());
 
         let description = Conv2dIIR {
             input: input.clone().into_ir(),
             kernels: kernels.clone().into_ir(),
             bias: bias.clone().into_ir(),
             config,
-            out: out.to_ir_out(),
+            out: out.clone(),
         };
 
-        out.client.clone().register(
-            streams,
-            OperationIr::Custom(CustomOpIr {
-                id: "conv2di".to_string(),
-                inputs: vec![input.into_ir(), kernels.into_ir(), bias.into_ir()],
-                outputs: vec![out.to_ir_out()],
-            }),
-            Conv2dIOps::<B> {
-                description,
-                _phantom: PhantomData,
-            },
-        );
-
-        Ok(out)
+        Ok(client
+            .register(
+                streams,
+                OperationIr::Custom(CustomOpIr {
+                    id: "conv2di".to_string(),
+                    inputs: vec![input.into_ir(), kernels.into_ir(), bias.into_ir()],
+                    outputs: vec![out],
+                }),
+                Conv2dIOps::<B> {
+                    description,
+                    _phantom: PhantomData,
+                },
+            )
+            .output())
     }
 }
 

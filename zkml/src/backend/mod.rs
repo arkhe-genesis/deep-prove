@@ -1,4 +1,4 @@
-use burn::tensor::{Int, Tensor as BTensor, TensorData, ops::IntTensor, try_read_sync};
+use burn::tensor::{Int, Tensor as BTensor, TensorData, ops::IntTensor, read_sync};
 
 use crate::{Element, Shape, Tensor};
 
@@ -32,7 +32,7 @@ pub struct Maxpool2dConfig {
 }
 
 fn to_tensor<B: ZKMLBackend>(data: IntTensor<B>) -> anyhow::Result<Tensor<Element>> {
-    let data = try_read_sync(B::int_into_data(data)).expect("Failed to read input data");
+    let data = read_sync(B::int_into_data(data)).expect("Failed to read input data");
     Tensor::new(
         Shape::new(data.shape.clone()),
         data.into_vec().expect("Couldnt convert input data"),
