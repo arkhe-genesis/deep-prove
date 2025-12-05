@@ -673,7 +673,9 @@ mod tests {
         let conf = default_pipeline_config().with_float_rules(vec![Box::new(GPT2RMSNorm)]);
 
         let (driver, _metadata) = driver.into_provable_llm(Some(conf))?;
-        let trace = driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut GenStore::default())?;
+        let input_tensors = driver.tokens_to_tensor(&user_tokens)?;
+        let trace =
+            driver.run_elements::<GoldilocksExt2>(input_tensors, &mut GenStore::default())?;
 
         let (prover_ctx, verifier_ctx) = driver
             .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?

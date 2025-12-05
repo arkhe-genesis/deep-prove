@@ -10,7 +10,7 @@ use crate::{
     NextPowerOfTwo, ScalingFactor, backend::Backend, layers::convolution, number::Number,
     shape::Shape, to_field,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use burn::tensor::{Int, Tensor as BTensor, TensorData};
 use ceno_p3::{
     field::{Field, FieldAlgebra, TwoAdicField},
@@ -507,36 +507,6 @@ where
         }
     }
 
-    /// Store the [Tensor] into the store.
-    pub(crate) fn save_to_store(&self) -> Result<()> {
-        match self {
-            TensorHandle::WrappedTensor {
-                storage_key,
-                store,
-                wrapped_tensor,
-                ..
-            } => {
-                let guard = wrapped_tensor.read().expect("Lock should not be poisoned");
-                let tensor = guard.as_ref().context("No data available")?;
-                let data = tensor.get_data();
-                store.store(storage_key, &data)?;
-            }
-            TensorHandle::Tensor {
-                storage_key,
-                store,
-                tensor,
-                ..
-            } => {
-                let guard = tensor.read().expect("Lock should not be poisoned");
-                let tensor = guard.as_ref().context("No data available")?;
-                // XXX: Remove the copy below.
-                let data = tensor.get_data().to_vec();
-                store.store(storage_key, &data)?;
-            }
-        };
-        Ok(())
-    }
-
     /// Returns the [StorageKey] used to identify the data in the store.
     pub(crate) fn storage_key(&self) -> &StorageKey<Vec<T>> {
         match self {
@@ -779,18 +749,35 @@ impl<T> TensorHandle<T>
 where
     T: Serialize + for<'a> Deserialize<'a> + TensorTypeParam,
 {
+    pub(crate) fn from_wrapped_tensor(
+        storage_key: StorageKey<Vec<T>>,
+        store: GenStore,
+        wrapped_tensor: WrappedTensor<T>,
+    ) -> Self {
+        let shape = Shape::from(wrapped_tensor.shape());
+        let unpadded_shape = Shape::from(wrapped_tensor.unpadded_shape());
+        Self::WrappedTensor {
+            storage_key,
+            store,
+            wrapped_tensor: Arc::new(RwLock::new(Some(wrapped_tensor))),
+            shape,
+            unpadded_shape,
+        }
+    }
+
     pub(crate) fn from_wrapped_tensor_with_unpadded_shape(
         storage_key: StorageKey<Vec<T>>,
         store: GenStore,
         mut wrapped_tensor: WrappedTensor<T>,
         unpadded_shape: Shape,
     ) -> Self {
+        let shape = Shape::from(wrapped_tensor.shape());
         wrapped_tensor.set_unpadded_shape(unpadded_shape.clone().into());
         Self::WrappedTensor {
             storage_key,
             store,
-            shape: Shape::from(wrapped_tensor.shape()),
             wrapped_tensor: Arc::new(RwLock::new(Some(wrapped_tensor))),
+            shape,
             unpadded_shape,
         }
     }

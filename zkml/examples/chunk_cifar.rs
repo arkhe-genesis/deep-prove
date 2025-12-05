@@ -1,3 +1,4 @@
+#![recursion_limit = "1024"]
 #![allow(clippy::print_stdout)]
 use zkml::{
     self, Element, IO, Proof, ProverContext, Tensor,

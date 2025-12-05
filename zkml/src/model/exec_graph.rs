@@ -19,7 +19,6 @@ use crate::{
         prover_graph::{LocalProverCtx, ProverGraphIO, ProverGraphNode},
     },
     model::{Model, Trace, llm::Driver},
-    quantization::{InferenceTracker, InferenceTrackingMode},
 };
 
 /// Context for the execution graph used for distributed proving
@@ -62,10 +61,8 @@ impl InferenceEngine {
                     input.len() == 1,
                     "LLM inference only supports one sequnce of tokens - batch inference is not supported"
                 );
-                let input = input.pop().unwrap().into_data();
-                // just because we always run with a tracker
-                let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
-                driver.run_elements(input, store, &mut tracker)
+                let input = input.pop().expect("size validated above");
+                driver.run_elements(input, store)
             }
         }
     }

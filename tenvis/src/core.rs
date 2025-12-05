@@ -9,7 +9,8 @@ use zkml::{
     graph::NodeId,
     inputs::Input,
     model::{
-        BaseRunner, HandleLifetimeRunner, Model, TrackerRunner, llm::Driver, tensor_to_handles,
+        BaseRunner, HandleLifetimeRunner, Model, StoreRunner, TrackerRunner, llm::Driver,
+        tensor_to_handles,
     },
     parser::{
         gguf::{RawGGUF, TensorLoader},
@@ -82,15 +83,14 @@ impl GlobalContext {
             };
             #[cfg(test)]
             let runner = SanityCheckRunner { inner: runner };
-            let mut runner = HandleLifetimeRunner::count_from_graph(
-                runner,
-                model_f32.graph(),
-                input_f32_handles.clone(),
-            )?;
+            let runner = StoreRunner::new(runner, store_f32.clone());
+            let mut runner = HandleLifetimeRunner::new(runner, model_f32.graph());
 
             model_f32
-                .run_with_runner::<GoldilocksExt2, _>(&mut runner)
+                .run_with_runner::<GoldilocksExt2, _>(&mut runner, input_f32_handles)
                 .context("running the model in float mode")?;
+
+            drop(runner); // ends the TrackerRunner lifetime, so it free the &mut borrow to the tracker.
 
             Rc::new(Snapshot {
                 shapes: shape_steps(model_f32.graph(), &input_shapes)?,
@@ -125,15 +125,15 @@ impl GlobalContext {
             };
             #[cfg(test)]
             let runner = SanityCheckRunner { inner: runner };
-            let mut runner = HandleLifetimeRunner::count_from_graph(
-                runner,
-                model_elt.graph(),
-                input_elt_handles.clone(),
-            )?;
+            let runner = StoreRunner::new(runner, store_elt.clone());
+            let mut runner = HandleLifetimeRunner::new(runner, model_elt.graph());
 
             model_elt
-                .run_with_runner::<F, _>(&mut runner)
+                .run_with_runner::<F, _>(&mut runner, input_elt_handles)
                 .context("running the model in elt mode")?;
+
+            drop(runner); // ends the TrackerRunner lifetime, so it free the &mut borrow to the tracker.
+
             Rc::new(Snapshot {
                 shapes: shape_steps(model_elt.graph(), &input_shapes)?,
                 model: model_elt,
@@ -147,7 +147,6 @@ impl GlobalContext {
 
     pub fn from_gguf(gguf_file: &Path, prompt: &str, context_size: usize) -> anyhow::Result<Self> {
         info!("loading model");
-        // let prompt = "The sky is";
         let loader = TensorLoader::from_path(gguf_file)?;
         let tokenizer = HFTokenizer::sentencepiece_from_gguf(&loader)?;
         let user_tokens = tokenizer.tokenize(prompt);
@@ -161,14 +160,28 @@ impl GlobalContext {
 
             let mut min_max_tracker_f32 = InferenceTracker::new(InferenceTrackingMode::MinMax);
             let mut store_f32 = GenStore::default();
-            let trace_f32 = driver_f32.run_with_tracker::<F>(
-                &user_tokens,
-                &mut store_f32,
-                &mut min_max_tracker_f32,
-            )?;
+
+            let input_tensor = driver_f32.tokens_to_tensor(&user_tokens)?;
+            let input_handles =
+                tensor_to_handles(&[input_tensor], driver_f32.model.graph(), &mut store_f32)?;
+
+            let runner = BaseRunner {
+                store: store_f32.clone(),
+            };
+            let runner = TrackerRunner {
+                inner: runner,
+                tracker: &mut min_max_tracker_f32,
+            };
+            #[cfg(test)]
+            let runner = SanityCheckRunner { inner: runner };
+            let runner = StoreRunner::new(runner, store_f32.clone());
+            let mut runner = HandleLifetimeRunner::new(runner, driver_f32.model.graph());
+
+            driver_f32.run_with_runner::<F, _>(&mut runner, input_handles)?;
+
+            let outputs = runner.model_outputs(driver_f32.model.graph())?;
             let answer = tokenizer.detokenize(
-                trace_f32
-                    .outputs()
+                outputs
                     .last()
                     .unwrap()
                     .tensor()
@@ -179,6 +192,9 @@ impl GlobalContext {
                     .collect::<Vec<_>>()
                     .as_slice(),
             );
+
+            drop(runner); // ends the TrackerRunner lifetime, so it free the &mut borrow to the tracker.
+
             info!("f32 result: “{prompt}” -> “{answer}”");
             Rc::new(Snapshot {
                 model: driver_f32.model.clone(),
@@ -197,8 +213,9 @@ impl GlobalContext {
             let mut min_max_tracker_elt = InferenceTracker::new(InferenceTrackingMode::MinMax);
             let mut store_elt = GenStore::default();
             let (driver_elt, _metadata) = driver_f32.into_provable_llm(None)?;
-            let trace_elt = driver_elt.run_with_tracker::<F>(
-                user_tokens,
+            let input_tensor = driver_elt.tokens_to_tensor(&user_tokens)?;
+            let trace_elt = driver_elt.run_elements_with_tracker::<F>(
+                input_tensor,
                 &mut store_elt,
                 &mut min_max_tracker_elt,
             )?;

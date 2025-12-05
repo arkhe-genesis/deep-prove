@@ -162,9 +162,8 @@ impl ScalingStrategy for InferenceObserver {
             };
             #[cfg(test)]
             let runner = SanityCheckRunner { inner: runner };
-            let mut runner =
-                HandleLifetimeRunner::count_from_graph(runner, model.graph(), input_handles)?;
-            model.run_with_runner::<GoldilocksExt2, _>(&mut runner)?;
+            let mut runner = HandleLifetimeRunner::new(runner, model.graph());
+            model.run_with_runner::<GoldilocksExt2, _>(&mut runner, input_handles)?;
         }
 
         // Get the scaling factor of the input

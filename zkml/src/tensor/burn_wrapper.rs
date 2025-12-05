@@ -12,8 +12,8 @@ use burn::{
     module::Param,
     nn::{LayerNormConfig, RmsNormConfig},
     tensor::{
-        BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, SliceArg, Tensor as BTensor,
-        TensorData, activation,
+        AsIndex, BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, SliceArg,
+        Tensor as BTensor, TensorData, activation,
         ops::{ConvOptions, IntTensorOps},
     },
 };
@@ -356,6 +356,29 @@ where
         Ok(out)
     }
 
+    /// Select tensor elements along the given dimension corresponding to the given indices.
+    pub fn select(self, dim: impl AsIndex, indices: impl Into<TensorData>) -> Self {
+        let mut unpadded_shape = self.unpadded_shape().clone();
+        let indices = BTensor::from_ints(indices, &Default::default());
+        // XXX: how should indices outside of the unpadded shape be handled?
+        unpadded_shape.dims[dim.index() as usize] = indices.shape().num_elements();
+
+        match self {
+            WrappedTensor::Rank1(tensor, _unpaddded_shape) => {
+                WrappedTensor::Rank1(tensor.select(dim, indices), unpadded_shape)
+            }
+            WrappedTensor::Rank2(tensor, _unpaddded_shape) => {
+                WrappedTensor::Rank2(tensor.select(dim, indices), unpadded_shape)
+            }
+            WrappedTensor::Rank3(tensor, _unpaddded_shape) => {
+                WrappedTensor::Rank3(tensor.select(dim, indices), unpadded_shape)
+            }
+            WrappedTensor::Rank4(tensor, _unpaddded_shape) => {
+                WrappedTensor::Rank4(tensor.select(dim, indices), unpadded_shape)
+            }
+        }
+    }
+
     /// Applies element wise multiplication operation with a scalar.
     pub fn mul_scalar(self, other: T) -> Self {
         delegate!(self, mul_scalar, other)
@@ -389,6 +412,13 @@ where
     /// Returns a new tensor with the same shape and device as the current tensor filled with the provided value.
     pub fn full_like(self, fill_value: T) -> Self {
         delegate!(self, full_like, fill_value)
+    }
+
+    /// Flatten the tensor into 1D shape.
+    pub fn flatten_1d(self) -> Self {
+        let end_dim = self.rank() - 1;
+        let unpadded_shape = self.unpadded_shape().clone().flatten();
+        WrappedTensor::Rank1(delegate_plain!(self, flatten, 0, end_dim), unpadded_shape)
     }
 
     /// Flatten the tensor along a given range of dimensions into 2 dimensions.
@@ -625,13 +655,6 @@ where
                     .copied()
             }
         }
-    }
-
-    /// Flatten the tensor into 1D shape.
-    pub fn flatten_1d(self) -> Self {
-        let end_dim = self.rank() - 1;
-        let unpadded_shape = self.unpadded_shape().clone();
-        WrappedTensor::Rank1(delegate_plain!(self, flatten, 0, end_dim), unpadded_shape)
     }
 
     /// Converts the tensor into a primitive tensor.

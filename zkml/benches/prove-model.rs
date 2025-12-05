@@ -13,7 +13,7 @@ use zkml::{
         llm::models::gpt2::{GPT2, GPT2_Q8_0},
         onnx::FloatOnnxLoader,
     },
-    quantization::{AbsoluteMax, InferenceTracker, InferenceTrackingMode, ModelMetadata},
+    quantization::{AbsoluteMax, ModelMetadata},
     verify,
 };
 
@@ -172,14 +172,18 @@ fn inference(c: &mut Criterion) {
     let driver = Driver::load_from_model(GPT2, &format, Some(max_context))
         .expect("failed to instantiate GPT2 driver");
     let user_tokens = driver.random_sequence(1);
+    let inputs = vec![driver.tokens_to_tensor(&user_tokens).unwrap()];
 
     group.bench_function("gpt2", |bencher| {
-        bencher.iter_with_large_drop(|| {
-            driver.run::<GoldilocksExt2>(&user_tokens, &mut GenStore::default())
-        });
+        bencher.iter_batched(
+            || inputs.clone(),
+            |inputs| driver.run::<GoldilocksExt2>(inputs, &mut GenStore::default()),
+            criterion::BatchSize::SmallInput,
+        );
     });
 
-    // Setting the max context to `10` so that only a single run is performed.
+    // Test with a handful of tokens, this is useful for optimizations for the
+    // LLM token loop as opposed to the Model's layer loop.
     let max_context = 10;
 
     let model_path = file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
@@ -189,22 +193,12 @@ fn inference(c: &mut Criterion) {
         .into_provable_llm(None)
         .expect("Driver should be provable");
     let user_tokens = driver.random_sequence(1);
-    let input_tokens = user_tokens
-        .into_iter()
-        .map(|t| t.as_tensor_type_param::<Element>())
-        .collect::<Vec<_>>();
-    let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
+    let input = driver.tokens_to_tensor(&user_tokens).unwrap();
 
     group.bench_function("gpt2_small_run", |bencher| {
         bencher.iter_batched(
-            || input_tokens.clone(),
-            |input_tokens| {
-                driver.run_elements::<GoldilocksExt2>(
-                    input_tokens,
-                    &mut GenStore::default(),
-                    &mut tracker,
-                )
-            },
+            || input.clone(),
+            |input| driver.run_elements::<GoldilocksExt2>(input, &mut GenStore::default()),
             criterion::BatchSize::SmallInput,
         );
     });

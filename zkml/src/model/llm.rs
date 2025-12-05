@@ -4,28 +4,41 @@
 //! The main usage of a driver for now is to run the LLM forward loop until a specific token or
 //! the maximum context length is reached. It will also be used to prepend a system model correctly.
 
+use std::{
+    ops::Deref,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+};
+
 use crate::{
-    IO, Proof, Prover, ProverContext,
+    Element, IO, Proof, Prover, ProverContext, Shape, Tensor,
     graph::executor::{Executor, SequentialExecutor},
     iop::{
         chunking::{ChunkingStrategy, DefaultChunkingStrategy},
         context::VerifierContext,
         prover_graph::ProverGraphNode,
     },
-    model::{BaseRunner, HandleLifetimeRunner, SanityCheckRunner, TraceRunner, TrackerRunner},
+    layers::{Layer, provable::Evaluate},
+    model::{
+        BaseRunner, HandleLifetimeRunner, LayerRunner, Model, RunInput, Trace, TrackerRunner,
+        tensor_to_handles, wrapped_tensor_to_handles,
+    },
+    number::Number,
     padding::PaddingMode,
     parser::{
         PipelineConfig, default_pipeline_config,
         llm::{LLMConfig, Token, models::LLMModelLoader},
         to_quantized,
     },
-    quantization::{
-        InferenceObserver, InferenceTracker, InferenceTrackingMode, IntoElement, ModelMetadata,
-    },
-    tensor::TensorTypeParam,
+    quantization::{InferenceObserver, InferenceTracker, IntoElement, ModelMetadata},
+    tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
     verify,
 };
-use anyhow::{Context as CC, ensure};
+use anyhow::{Context, anyhow, ensure};
 use ark_std::rand::Rng;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -35,12 +48,8 @@ use tenstore::GenStore;
 use tracing::{debug, info};
 use transcript::BasicTranscript;
 
-use crate::{
-    Element, Shape, Tensor,
-    layers::{Layer, provable::Evaluate},
-    model::{Model, Trace, tensor_to_handles},
-    number::Number,
-};
+#[cfg(test)]
+use crate::model::SanityCheckRunner;
 
 pub trait WithMaxContext {
     fn with_max_context(self, max_context: usize) -> Self;
@@ -66,6 +75,7 @@ where
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
+    /// Sets the `max_context` window for this context.
     fn with_max_context(mut self, max_context: usize) -> Self {
         self.max_context = Some(max_context);
         self
@@ -78,6 +88,7 @@ where
     PCS: PolynomialCommitmentScheme<E>,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
+    /// Sets the `max_context` window for this context.
     fn with_max_context(self, max_context: usize) -> Self {
         (self.0, self.1.with_max_context(max_context))
     }
@@ -90,7 +101,9 @@ where
     E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
 {
+    /// The inference proof.
     pub proof: Proof<E, PCS>,
+
     /// Note the IO contains the _full_ input, e.g. the user input + the generated tokens
     pub io: IO<E>,
 }
@@ -107,6 +120,21 @@ pub struct Driver<N> {
 }
 
 impl<N> Driver<N> {
+    /// Creates a new [Driver]
+    pub fn new(
+        model: Model<N>,
+        config: LLMConfig,
+        max_context: Option<usize>,
+        padding_mode: PaddingMode,
+    ) -> Self {
+        Self {
+            model,
+            config,
+            max_context,
+            padding_mode,
+        }
+    }
+
     /// Returns the vocabulary size of the model
     pub fn vocab_size(&self) -> usize {
         self.config.vocab_size
@@ -114,9 +142,13 @@ impl<N> Driver<N> {
 }
 
 impl Driver<f32> {
-    /// Loads a model from a gguf, safetensors, or json external file. It returns the raw model in float precision.
-    /// NOTE: the max_context is only there to hack around the creation of Rope to avoid loading the full matrix if we don't need it. That should
-    /// be removed if when we remove this hack.
+    /// Load and returns the raw model in float precision.
+    ///
+    /// Loads a model from a gguf, safetensors, or json external file.
+    ///
+    /// NOTE: the max_context is only there to hack around the creation of Rope
+    /// to avoid loading the full matrix if we don't need it. That should be
+    /// removed if when we remove this hack.
     pub fn load_from_model<DataFormat, M: LLMModelLoader<DataFormat>>(
         mut model_type: M,
         data_format: &DataFormat,
@@ -134,8 +166,10 @@ impl Driver<f32> {
         })
     }
 
-    /// Transform the model into a provable llm model with quantization and padding done.
-    /// The result can be serialized and deserialized at will to serve inference+proving for this model.
+    /// Quantizes and pads this model.
+    ///
+    /// The result can be serialized and deserialized at will to serve
+    /// inference+proving for this model.
     pub fn into_provable_llm<'a>(
         self,
         mut pipeline_config: Option<PipelineConfig<'a, InferenceObserver>>,
@@ -176,86 +210,20 @@ impl Driver<f32> {
             metadata,
         ))
     }
-
-    pub fn run<E>(&self, input: &[Token], store: &mut GenStore) -> anyhow::Result<Trace<E, f32>>
-    where
-        E: ExtensionField,
-    {
-        let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
-        self.run_with_tracker(input, store, &mut tracker)
-    }
-
-    pub fn run_with_tracker<E>(
-        &self,
-        input: &[Token],
-        store: &mut GenStore,
-        tracker: &mut InferenceTracker,
-    ) -> anyhow::Result<Trace<E, f32>>
-    where
-        E: ExtensionField,
-    {
-        let user_len = input.len();
-
-        ensure!(
-            user_len < self.config.context_length - 1,
-            "Input sequence length must be less than the context length"
-        );
-        let input_tokens = input
-            .iter()
-            .map(|t| t.as_number::<f32>())
-            .collect::<Vec<_>>();
-
-        let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
-        let input_handles = tensor_to_handles(&[tensor], &self.model.graph, store)?;
-
-        let runner = BaseRunner {
-            store: store.clone(),
-        };
-        let runner = TrackerRunner {
-            inner: runner,
-            tracker,
-        };
-        let runner = SanityCheckRunner { inner: runner };
-        let runner = TraceRunner {
-            inner: runner,
-            trace: Trace::<E, f32>::new(input_handles.clone()),
-        };
-        let mut runner = HandleLifetimeRunner::count_from_graph(
-            runner,
-            &self.model.graph,
-            input_handles.clone(),
-        )?;
-
-        self.model.run_with_runner::<E, _>(&mut runner)?;
-
-        let mut trace = runner.into_inner().into_trace();
-        trace.output = trace.graph_outputs(&self.model.graph)?;
-        Ok(trace)
-    }
 }
 
-impl<N: TensorTypeParam + Serialize + for<'a> Deserialize<'a>> Driver<N>
+impl<N> Driver<N>
 where
+    N: TensorTypeParam,
     Layer<N>: Evaluate<N>,
 {
-    pub fn new(
-        model: Model<N>,
-        config: LLMConfig,
-        max_context: Option<usize>,
-        padding_mode: PaddingMode,
-    ) -> Self {
-        Self {
-            model,
-            config,
-            max_context,
-            padding_mode,
-        }
-    }
+    /// Sets the `max_context` window for this drivef.
     pub fn with_max_context(mut self, max_context: usize) -> Self {
         self.max_context = Some(max_context);
         self
     }
 
+    /// Returns a sequence of `len` random tokens.
     pub fn random_sequence(&self, len: usize) -> Vec<Token> {
         let mut rng = crate::rng_from_env_or_random();
         (0..len)
@@ -263,37 +231,141 @@ where
             .collect()
     }
 
-    /// Runs take the _already_ tokenized input turned into row elements and run the model until the
-    /// maximum sequence length is reached OR until a eos token is generated.
-    /// The returned trace contains the _whole_ sequence.
+    /// Converts a slice of [Token]s into a [Tensor] to be used with this driver.
+    ///
+    /// # Errors
+    ///
+    /// If the number of tokens exceeds the current configured `context_length`.
+    pub fn tokens_to_tensor(&self, input: &[Token]) -> anyhow::Result<Tensor<N>> {
+        ensure!(
+            input.len() < self.config.context_length - 1,
+            "Input sequence length must be less than the context length",
+        );
+        let input_tokens = input
+            .iter()
+            .map(|t| t.as_tensor_type_param::<N>())
+            .collect::<Vec<_>>();
+        Tensor::new(Shape::from([input_tokens.len()]), input_tokens)
+    }
+
+    /// Performs a single run of the model, returning the produced trace.
+    pub fn run<E>(
+        &self,
+        inputs: Vec<Tensor<N>>,
+        store: &mut GenStore,
+    ) -> anyhow::Result<Trace<E, N>>
+    where
+        E: ExtensionField,
+    {
+        let result = self.model.run::<E>(inputs, store);
+        self.model.reset();
+        result
+    }
+
+    /// Run a single iteration of the model using the provided `runner`.
+    pub fn run_with_runner<E, R>(
+        &self,
+        runner: &mut R,
+        inputs: Vec<TensorHandle<N>>,
+    ) -> anyhow::Result<()>
+    where
+        E: ExtensionField,
+        R: LayerRunner<N, (), E>,
+    {
+        let result = self.model.run_with_runner::<E, _>(runner, inputs);
+        self.model.reset();
+        result
+    }
+
+    /// Generate a setence.
+    ///
+    /// Notes:
+    /// - The setence is limited by the EOS token or the context length.
+    /// - The returned trace contains the whole sequence.
+    /// - The layer runner will be used for each token infernece, but not for
+    ///   the trace generation.
     pub fn run_elements<E>(
         &self,
-        input_tensor: Vec<N>,
+        input_tensor: Tensor<N>,
+        store: &mut GenStore,
+    ) -> anyhow::Result<Trace<E, N>>
+    where
+        E: ExtensionField,
+    {
+        let runner = BaseRunner {
+            store: store.clone(),
+        };
+        #[cfg(test)]
+        let runner = SanityCheckRunner { inner: runner };
+        let runner = HandleLifetimeRunner::new(runner, &self.model.graph);
+
+        self.run_elements_with_runner(input_tensor, store, runner)
+    }
+
+    /// Generate a sentence.
+    ///
+    /// Notes:
+    /// - The setence is limited by the EOS token or the context length.
+    /// - The returned trace contains the whole sequence.
+    pub fn run_elements_with_tracker<E>(
+        &self,
+        input_tensor: Tensor<N>,
         store: &mut GenStore,
         tracker: &mut InferenceTracker,
     ) -> anyhow::Result<Trace<E, N>>
     where
         E: ExtensionField,
     {
-        let eos_token: N = self.config.eos_token.as_tensor_type_param();
-        let user_len = input_tensor.len();
+        let runner = BaseRunner {
+            store: store.clone(),
+        };
+        let runner = TrackerRunner {
+            inner: runner,
+            tracker,
+        };
+        #[cfg(test)]
+        let runner = SanityCheckRunner { inner: runner };
+        let runner = HandleLifetimeRunner::new(runner, &self.model.graph);
+
+        self.run_elements_with_runner(input_tensor, store, runner)
+    }
+
+    /// Generate a sentence.
+    ///
+    /// Notes:
+    /// - The setence is limited by the EOS token or the context length.
+    /// - The returned trace contains the whole sequence.
+    /// - The layer runner will be used for each token inferenece, but not for
+    ///   the trace generation.
+    fn run_elements_with_runner<E, I>(
+        &self,
+        input_tensor: Tensor<N>,
+        store: &mut GenStore,
+        mut runner: HandleLifetimeRunner<I, N>,
+    ) -> anyhow::Result<Trace<E, N>>
+    where
+        E: ExtensionField,
+        HandleLifetimeRunner<I, N>: LayerRunner<N, (), E>,
+        I: LayerRunner<N, RunInput<N>, E>,
+    {
+        let input_data = input_tensor.get_data().to_vec();
+        let num_input_tokens = input_data.len();
+
         // -1 because we at least want to generate ONE token
         ensure!(
-            user_len < self.config.context_length - 1,
-            "Input sequence length must be less than the context length"
+            num_input_tokens < self.config.context_length - 1,
+            "Input sequence length must be at least one fewer than the context length",
         );
 
-        let mut tensor = Tensor::new(vec![input_tensor.len()].into(), input_tensor.clone())?;
         let max_window = self.max_context.unwrap_or(self.config.context_length);
         ensure!(
-            input_tensor.len() < max_window,
+            num_input_tokens < max_window,
             "max window {} is smaller than prompt token count {}",
             max_window,
-            input_tensor.len()
+            num_input_tokens,
         );
 
-        let is_valid_vocab = tensor
-            .get_data()
+        let is_valid_vocab = input_data
             .iter()
             .all(|t| Number::to_usize(t) < self.config.vocab_size);
         ensure!(
@@ -301,104 +373,129 @@ where
             "Input tokens must be less than the vocabulary size",
         );
 
-        let mut full_tokens = tensor.get_data().to_vec();
-        let mut unpadded_seq_len = user_len;
+        // Initialise the full tokens with the input data, generated tokens will be appended.
+        let mut full_sentence = input_data;
 
-        // convert the input to the correct number type and add a dimension to
-        // make it 2d, because the embeddings layer expects a 2d tensor This
-        // means we're padding the input to the right size (e.g. next power of
-        // two)
-        while unpadded_seq_len <= max_window {
+        let mut input_handles = if let PaddingMode::NoPadding = self.padding_mode {
+            info!(
+                "LLM: running model with initial unpadded shape: {:?}",
+                input_tensor.shape(),
+            );
+            tensor_to_handles(&[input_tensor], &self.model.graph, store)?
+        } else {
+            let unpadded_shape = input_tensor.shape().clone();
+            let padded = input_tensor.pad_next_power_of_two();
+            info!("LLM: running model with initial padded shape: {unpadded_shape:?}");
+            tensor_to_handles(&[padded], &self.model.graph, store)?
+        };
+
+        // This thread waits for the results
+        let (tx, rx) = mpsc::sync_channel::<WrappedTensor<N>>(10);
+        let stop = Arc::new(AtomicBool::new(false));
+        let eos_token: N = self.config.eos_token.as_tensor_type_param();
+        let handle = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || -> anyhow::Result<Vec<N>> {
+                let mut generated_tokens = Vec::with_capacity(max_window);
+                while let Ok(tensor) = rx.recv() {
+                    let token = tensor.get_data()[0];
+                    if token == eos_token {
+                        stop.store(true, Ordering::Relaxed);
+                        return Ok(generated_tokens);
+                    }
+                    generated_tokens.push(token);
+                }
+
+                // Remove the last token so the final inference will regenerate
+                // a full trace with the correct padding
+                generated_tokens.pop();
+
+                Ok(generated_tokens)
+            })
+        };
+
+        // This loop schedules work to be run, when using a GPU backend this allows for multiple
+        // kernel calls to be scheduled to increase the hardware occupancy.
+        for unpadded_seq_len in num_input_tokens..=max_window {
+            if stop.load(Ordering::Relaxed) {
+                info!(
+                    "Stopping on iteration {}, an EOS was genarted on some of the previous iteraitons",
+                    unpadded_seq_len,
+                );
+                break;
+            }
+
             info!(
                 "Running iteration {} with input tensor {:?}",
                 unpadded_seq_len,
-                tensor.shape(),
+                input_handles[0].shape(),
             );
-
-            let input_handles = if let PaddingMode::NoPadding = self.padding_mode {
-                tensor_to_handles(&[tensor], &self.model.graph, store)?
-            } else {
-                let unpadded_shape = tensor.shape().clone();
-                let padded = tensor.pad_next_power_of_two();
-                info!("LLM: running model with unpadded shape: {unpadded_shape:?}");
-                tensor_to_handles(&[padded], &self.model.graph, store)?
-            };
-            let runner = BaseRunner {
-                store: store.clone(),
-            };
-            let runner = TrackerRunner {
-                inner: runner,
-                tracker,
-            };
-            #[cfg(test)]
-            let runner = SanityCheckRunner { inner: runner };
-            let runner = TraceRunner {
-                inner: runner,
-                trace: Trace::<E, N>::new(input_handles.clone()),
-            };
-            let mut runner = HandleLifetimeRunner::count_from_graph(
-                runner,
-                &self.model.graph,
-                input_handles.clone(),
-            )?;
 
             self.model
-                .run_with_runner::<E, _>(&mut runner)
+                .run_with_runner::<E, _>(&mut runner, input_handles)
                 .with_context(|| {
-                    format!("running the {} iteration loop", unpadded_seq_len - user_len)
+                    format!(
+                        "running the {} iteration loop",
+                        unpadded_seq_len - num_input_tokens
+                    )
                 })?;
 
-            let mut trace = runner.into_inner().into_trace();
-            trace.output = trace.graph_outputs(&self.model.graph)?;
-
+            let model_outputs = runner.model_outputs(&self.model.graph)?;
             ensure!(
-                trace.output.len() == 1,
+                model_outputs.len() == 1,
                 "expected 1 output, got {}",
-                trace.output.len(),
+                model_outputs.len(),
             );
-            let output = &trace.output[0]
-                .tensor()
-                .expect("Output handler should have associated tensor data");
 
-            // We take the last token before the padding
-            let output_tokens_len = output.get_data().len();
-            let last_token = if output_tokens_len == 1 {
-                *output.get_data().last().expect("last token must exist")
+            let output = &model_outputs[0]
+                .wrapped_tensor()
+                .context("Output handler should have associated tensor data")?;
+
+            // Take the last token before the padding
+            let index = if output.shape().num_elements() == 1 {
+                0
             } else {
-                output.get_data()[unpadded_seq_len - 1]
+                unpadded_seq_len - 1
             };
 
-            tensor = Tensor::new(Shape::new(vec![1]), vec![last_token])?;
-            full_tokens.push(last_token);
-            if last_token == eos_token {
-                break;
-            }
-            unpadded_seq_len += 1;
+            let last_token_tensor = output.deref().clone().flatten_1d().select(0, [index]);
+
+            tx.send(last_token_tensor.clone())
+                .context("Results thread is gone")?;
+
+            input_handles =
+                wrapped_tensor_to_handles(&[last_token_tensor], &self.model.graph, store)?;
         }
 
-        // 1. input construction: we remove the last token since it's either the
-        // eos token or the max token we need to regenerate a full trace with
-        // the correct padding
-        full_tokens.pop();
-        // and we take only the part that corresponds to the _generated_ tokens
-        full_tokens.splice(..user_len, input_tensor);
-        let input_len = full_tokens.len();
-        tensor = Tensor::new(Shape::new(vec![input_len]), full_tokens.clone())?;
-        // 2. padding: we pad the input to the expected shape of the model
+        // Drop the sender channel, signaling to the results thread that no more
+        // work will be scheduled
+        drop(tx);
+
+        let generated_tokens = handle
+            .join()
+            .map_err(|err| anyhow!("Results thread paniced. err: {err:?}"))?
+            .context("Fetch tensor results failed")?;
+        full_sentence.extend(generated_tokens);
+        let mut tensor = Tensor::new(Shape::new(vec![full_sentence.len()]), full_sentence.clone())?;
+
+        // Pad the input to the expected shape of the model
         let target_padded_shape = vec![max_window.next_power_of_two()].into();
         if let PaddingMode::Padding = self.padding_mode {
             tensor.pad_to_shape(target_padded_shape)?
         };
-        // 3. model resetting: we need to _reset_ the cache of every QKV layer
-        // in the model - that's because we only expect 1 token to be generated
-        // at a time after the first inference.
+
+        // Reset the model and its caches, otherwise a single token is
+        // generated.
         self.model.reset();
-        // 4. rerun to have a "clean" trace
-        info!("Running last iteration (heavy) with {input_len} tokens");
+
+        info!(
+            "Running last iteration (heavy) with {} tokens",
+            full_sentence.len(),
+        );
 
         let mut store = GenStore::default();
         let trace = self.model.run::<E>(vec![tensor], &mut store)?;
-        for i in user_len..input_len {
+        for i in num_input_tokens..full_sentence.len() {
             assert_eq!(
                 trace.outputs()[0].tensor().unwrap().get_data()[i - 1],
                 trace.inputs()[0].tensor().unwrap().get_data()[i],
@@ -407,44 +504,15 @@ where
                 trace.outputs()[0].tensor().unwrap(),
             );
         }
+
+        // Reset the model, so it can be reused.
         self.model.reset();
+
         Ok(trace)
     }
 }
 
 impl Driver<Element> {
-    pub fn run<E>(
-        &self,
-        input: Vec<Token>,
-        store: &mut GenStore,
-    ) -> anyhow::Result<Trace<E, Element>>
-    where
-        E: ExtensionField,
-    {
-        let input_tokens = input
-            .into_iter()
-            .map(|t| t.as_tensor_type_param::<Element>())
-            .collect::<Vec<_>>();
-        let mut tracker = InferenceTracker::new(InferenceTrackingMode::MinMax);
-        self.run_elements::<E>(input_tokens, store, &mut tracker)
-    }
-
-    pub fn run_with_tracker<E>(
-        &self,
-        input: Vec<Token>,
-        store: &mut GenStore,
-        tracker: &mut InferenceTracker,
-    ) -> anyhow::Result<Trace<E, Element>>
-    where
-        E: ExtensionField,
-    {
-        let input_tokens = input
-            .into_iter()
-            .map(|t| t.as_tensor_type_param::<Element>())
-            .collect::<Vec<_>>();
-        self.run_elements::<E>(input_tokens, store, tracker)
-    }
-
     /// Compute the set of contexts necessary for all the possible input shapes of the LLM.
     /// It returns a `HashMap` which associates a given context to the maximum polynomial size supported
     /// by that context. The proper context to be used for a given input size `input_len` is found in the
@@ -731,7 +799,8 @@ mod test {
         let sentence = "The sky is";
         let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path))?;
         let user_tokens = tokenizer.tokenize(sentence);
-        let trace = driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut store)?;
+        let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
+        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
 
         // Prove the trace
         let num_provers = if DISTRIBUTE_PROVE {
@@ -809,7 +878,8 @@ mod test {
         let mut store = GenStore::default();
         assert_eq!(detokenized, sentence);
         println!("user input in tokens: {user_tokens:?}");
-        let trace = driver.run::<GoldilocksExt2>(user_tokens, &mut store)?;
+        let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
+        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -839,7 +909,8 @@ mod test {
         let sentence = "The sky is";
         let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
-        let trace = driver.run::<GoldilocksExt2>(&user_tokens, &mut store)?;
+        let tensor_inputs = vec![driver.tokens_to_tensor(&user_tokens)?];
+        let trace = driver.run::<GoldilocksExt2>(tensor_inputs, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -870,7 +941,8 @@ mod test {
         let sentence = "The sky is";
         let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
-        let trace = driver.run::<GoldilocksExt2>(user_tokens, &mut store)?;
+        let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
+        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -924,8 +996,8 @@ mod test {
         let loader = TensorLoader::from_path(model_path)?;
         let tokenizer = HFTokenizer::sentencepiece_from_gguf(&loader)?;
         let user_tokens = tokenizer.tokenize(sentence);
-
-        let trace = driver.run::<GoldilocksExt2>(user_tokens.clone(), &mut store)?;
+        let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
+        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
 
         // Prove the trace
         let num_provers = Some(rng_from_env_or_random().gen_range(1..6));

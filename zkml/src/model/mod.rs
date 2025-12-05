@@ -1,4 +1,4 @@
-use std::mem;
+use std::{mem, sync::mpsc, thread};
 
 use crate::{
     Element, NextPowerOfTwo, Shape, Tensor,
@@ -21,7 +21,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::Deref,
 };
-use tenstore::{GenStore, StorageKey};
+use tenstore::{GenStore, GenericStore, StorageKey};
 use tracing::{info, warn};
 
 mod context;
@@ -44,10 +44,11 @@ where
     tracked_data: HashMap<TrackedDataId, WrappedTensor<N>>,
 }
 
-/// Utility to convert model's inputs to handles.
+/// Utility to convert model's input tensors to handles.
 ///
 /// This function will match the input tensors in definition order against the
 /// model's inputs.
+/// The returned values are of the `TensorHandle::Tensor` variant.
 pub fn tensor_to_handles<N>(
     inputs: &[Tensor<N>],
     graph: &ModelGraph<N>,
@@ -62,6 +63,30 @@ where
         let storage_key = input_node_id.output_at(0).to_storage_key();
 
         let handle = TensorHandle::from_tensor(storage_key, store.clone(), tensor.clone());
+        input_handles.push(handle.clone());
+    }
+    Ok(input_handles)
+}
+
+/// Utility to convert model's inputs as wrapped tensors to handles.
+///
+/// This function will match the input tensors in definition order against the
+/// model's inputs.
+/// The returned values are of the `TensorHandle::WrappedTensor` variant.
+pub fn wrapped_tensor_to_handles<N>(
+    inputs: &[WrappedTensor<N>],
+    graph: &ModelGraph<N>,
+    store: &mut GenStore,
+) -> anyhow::Result<Vec<TensorHandle<N>>>
+where
+    N: TensorTypeParam,
+{
+    let mut input_handles = Vec::with_capacity(inputs.len());
+    for (i, tensor) in inputs.iter().enumerate() {
+        let input_node_id = graph.input_node_id(i)?;
+        let storage_key = input_node_id.output_at(0).to_storage_key();
+
+        let handle = TensorHandle::from_wrapped_tensor(storage_key, store.clone(), tensor.clone());
         input_handles.push(handle.clone());
     }
     Ok(input_handles)
@@ -89,7 +114,11 @@ where
     /// Called once per model inference run.
     ///
     /// NOTE: For LLMs this will be called once per token.
-    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &I) -> anyhow::Result<()>;
+    fn model_inputs(
+        &mut self,
+        graph: &ModelGraph<N>,
+        inputs: &[TensorHandle<N>],
+    ) -> anyhow::Result<()>;
 
     /// Called once per model's layer.
     fn run_layer(
@@ -116,10 +145,11 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
-    fn model_inputs(&mut self, _graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
-        for handle in &inputs.input_handles {
-            handle.save_to_store()?;
-        }
+    fn model_inputs(
+        &mut self,
+        _graph: &ModelGraph<N>,
+        _inputs: &[TensorHandle<N>],
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -168,7 +198,6 @@ where
                 tensor,
                 out_shape.clone(),
             );
-            handle.save_to_store()?;
             outputs.push(handle);
         }
 
@@ -177,6 +206,126 @@ where
             proving_data: layer_out.proving_data,
             tracked_data: layer_out.tracked_layer_data,
         })
+    }
+}
+
+type StoreRunnerMsg<N> = (StorageKey<Vec<N>>, WrappedTensor<N>);
+
+/// A runner used to save tensor data to the store in the background.
+///
+/// This runner will spawn a background thread which waits on the results,
+/// and once available saves the data to the store. This allows the inference
+/// to continue running without blocking on pending computation and the data
+/// transfer.
+pub struct StoreRunner<I, N>
+where
+    N: TensorTypeParam,
+{
+    inner: I,
+    tx: Option<mpsc::Sender<StoreRunnerMsg<N>>>,
+    thread_handle: Option<thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+impl<I, N> StoreRunner<I, N>
+where
+    N: TensorTypeParam,
+{
+    pub fn new(inner: I, store: GenStore) -> Self {
+        let (tx, rx) = mpsc::channel::<StoreRunnerMsg<N>>();
+        let thread_handle = thread::spawn(move || {
+            // The transmitter is closed when the the `StoreRunner` is dropped
+            // and all pending messages have been received, at this point there
+            // is no longer more work to be done.
+            //
+            // The code below works even in the presence of drying, this is
+            // because drying a [TensorHandle::WrappedTensor] variant only
+            // deletes the shared [WrappedTensor] copy, which in turn has
+            // its own internal reference count. As long as this copy is not
+            // deleted, the data should be available to be used. This does mean
+            // it takes longer to free up the accelerator (CPU/GPU) memory.
+            while let Ok((storage_key, wrapped_tensor)) = rx.recv() {
+                let data = wrapped_tensor.get_data();
+                store.store(&storage_key, &data)?;
+            }
+
+            Ok(())
+        });
+
+        Self {
+            inner,
+            thread_handle: Some(thread_handle),
+            tx: Some(tx),
+        }
+    }
+
+    fn send(&self, data: StoreRunnerMsg<N>) -> anyhow::Result<()> {
+        self.tx
+            .as_ref()
+            .expect("Sender channel is only be consumed in the Drop")
+            .send(data)?;
+        Ok(())
+    }
+}
+
+impl<I, N> Drop for StoreRunner<I, N>
+where
+    N: TensorTypeParam,
+{
+    fn drop(&mut self) {
+        // Drop the sender channel, signaling to the thread it should stop
+        let tx = self.tx.take();
+        drop(tx);
+
+        // Wait for the thread to finish processing the buffered work
+        let handle = self.thread_handle.take();
+        if let Some(handle) = handle {
+            handle
+                .join()
+                .expect("Store thread should not panic")
+                .expect("Storing store results should not fail");
+        }
+    }
+}
+
+impl<I, N, E> LayerRunner<N, RunInput<N>, E> for StoreRunner<I, N>
+where
+    I: LayerRunner<N, RunInput<N>, E>,
+    N: TensorTypeParam,
+    E: ExtensionField,
+{
+    fn model_inputs(
+        &mut self,
+        graph: &ModelGraph<N>,
+        inputs: &[TensorHandle<N>],
+    ) -> anyhow::Result<()> {
+        for handle in inputs {
+            let tensor = handle.wrapped_tensor()?.clone();
+            let storage_key = handle.storage_key().clone();
+            self.send((storage_key, tensor))?;
+        }
+        self.inner.model_inputs(graph, inputs)?;
+        Ok(())
+    }
+
+    fn run_layer(
+        &mut self,
+        node_id: NodeId,
+        graph: &ModelGraph<N>,
+        layer: &Layer<N>,
+        inputs: &RunInput<N>,
+    ) -> RunResult<N, E>
+    where
+        Layer<N>: Evaluate<N>,
+    {
+        let layer_out = self.inner.run_layer(node_id, graph, layer, inputs)?;
+
+        for handle in &layer_out.outputs {
+            let tensor = handle.wrapped_tensor()?.clone();
+            let storage_key = handle.storage_key().clone();
+            self.send((storage_key, tensor))?;
+        }
+
+        Ok(layer_out)
     }
 }
 
@@ -192,8 +341,12 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
-    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
-        for (i, handle) in inputs.input_handles.iter().enumerate() {
+    fn model_inputs(
+        &mut self,
+        graph: &ModelGraph<N>,
+        inputs: &[TensorHandle<N>],
+    ) -> anyhow::Result<()> {
+        for (i, handle) in inputs.iter().enumerate() {
             let input_node_id = graph.input_node_id(i)?;
             let port = 0;
             self.tracker.track(input_node_id.output_at(port), handle)?;
@@ -239,9 +392,13 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
-    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
+    fn model_inputs(
+        &mut self,
+        graph: &ModelGraph<N>,
+        inputs: &[TensorHandle<N>],
+    ) -> anyhow::Result<()> {
         assert_eq!(
-            inputs.input_handles.len(),
+            inputs.len(),
             graph.input_nodes().count(),
             "The number of input tensors must match the expected number of inputs of the model's graph"
         );
@@ -297,6 +454,11 @@ where
 }
 
 /// A runner used to collect the [Trace].
+///
+/// # Panics
+///
+/// This runner may be used only for a single model run, duplicate layer results
+/// will cause the runner to panic.
 struct TraceRunner<I, N, E>
 where
     N: TensorTypeParam,
@@ -311,9 +473,9 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
-    /// Consumes this runner and returns its [Trace]
-    fn into_trace(self) -> Trace<E, N> {
-        self.trace
+    /// Consumes this runner and returns its parts.
+    fn into_parts(self) -> (I, Trace<E, N>) {
+        (self.inner, self.trace)
     }
 }
 
@@ -323,7 +485,11 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
-    fn model_inputs(&mut self, graph: &ModelGraph<N>, inputs: &RunInput<N>) -> anyhow::Result<()> {
+    fn model_inputs(
+        &mut self,
+        graph: &ModelGraph<N>,
+        inputs: &[TensorHandle<N>],
+    ) -> anyhow::Result<()> {
         self.inner.model_inputs(graph, inputs)?;
         Ok(())
     }
@@ -367,30 +533,41 @@ pub struct HandleLifetimeRunner<I, N>
 where
     N: TensorTypeParam,
 {
-    pub inner: I,
-    pub storagekey_to_handle: HashMap<StorageKey<Vec<N>>, TensorHandle<N>>,
-    pub handle_usage_count: HashMap<StorageKey<Vec<N>>, usize>,
+    inner: I,
+    storagekey_to_handle: HashMap<StorageKey<Vec<N>>, TensorHandle<N>>,
+    handle_usage_count: HashMap<StorageKey<Vec<N>>, usize>,
 }
 
-impl<'graph, I, N> HandleLifetimeRunner<I, N>
+impl<I, N> HandleLifetimeRunner<I, N>
 where
     N: TensorTypeParam,
 {
     /// Counts tensor usages from `graph` and initialise a [Handles<T>] from that.
-    pub fn count_from_graph(
-        inner: I,
-        graph: &'graph ModelGraph<N>,
-        inputs: Vec<TensorHandle<N>>,
-    ) -> anyhow::Result<Self> {
-        // Counts how often a given tensor is used as an input to a layer.
-        //
-        // After each layer evaluation that uses the given tensor, the counter
-        // is decrement. The tensor's cached data is freed once the data is no
-        // longer needed.
-        let mut handle_usage_count = HashMap::<StorageKey<Vec<N>>, _>::new();
-        for (_edge_id, edge) in graph.edges() {
-            let source = edge.source();
+    ///
+    /// NOTE: A unique instance of `HandleLifetimeRunner` is required for each
+    /// model run.
+    pub fn new(inner: I, graph: &ModelGraph<N>) -> Self {
+        let mut handle_usage_count = HashMap::new();
 
+        // Ensure the model's outputs are available after the inference run. This
+        // is achieved by incrementing the usage counter of the output tensors
+        // by one, ensuring it never reaches zero.
+        //
+        // NOTE: This is done only once in the constructor, LLM models work
+        // because the inner counters are refreshed for every new token by the
+        // calls on `model_inputs`, _and_ because the handles are overwritten
+        // after each layer run.
+        for (_edge_id, edge) in graph.edges() {
+            let target = edge.target();
+            let is_output = graph
+                .node(target)
+                .map(|node| node.is_output())
+                .unwrap_or(false);
+            if !is_output {
+                continue;
+            }
+
+            let source = edge.source();
             for link in edge.ports().iter() {
                 let storage_key = source.output_at(link.source_port).to_storage_key();
                 handle_usage_count
@@ -400,35 +577,37 @@ where
             }
         }
 
-        let mut storagekey_to_handle = HashMap::new();
-        for handle in inputs {
-            let uses = handle_usage_count
-                .get(handle.storage_key())
-                .copied()
-                .unwrap_or_default();
+        Self {
+            inner,
+            storagekey_to_handle: HashMap::new(),
+            handle_usage_count,
+        }
+    }
 
-            // edge case: the input is not used by any layers
-            if uses == 0 {
-                warn!("Unused input tensor");
-                handle.dry();
+    /// Returns the model's outputs handles.
+    pub fn model_outputs(&self, graph: &ModelGraph<N>) -> anyhow::Result<Vec<TensorHandle<N>>> {
+        let mut outputs = Vec::new();
+        for (_edge_id, edge) in graph.edges() {
+            let target = edge.target();
+            let is_output = graph
+                .node(target)
+                .map(|node| node.is_output())
+                .unwrap_or(false);
+            if !is_output {
+                continue;
             }
 
-            storagekey_to_handle
-                .insert(handle.storage_key().clone(), handle.into_wrapped_tensor()?);
+            let source = edge.source();
+            for link in edge.ports().iter() {
+                let storage_key = source.output_at(link.source_port).to_storage_key();
+                let handle = self.get_by_storage_key(&storage_key)?;
+                outputs.push(handle);
+            }
         }
 
-        Ok(Self {
-            inner,
-            storagekey_to_handle,
-            handle_usage_count,
-        })
+        Ok(outputs)
     }
-}
 
-impl<I, N> HandleLifetimeRunner<I, N>
-where
-    N: TensorTypeParam,
-{
     /// Returns a copy of the [TensorHandle<N>] corresponding to `storage_key`.
     fn get_by_storage_key(&self, storage_key: &StorageKey<Vec<N>>) -> Result<TensorHandle<N>> {
         self.storagekey_to_handle
@@ -438,7 +617,7 @@ where
     }
 
     /// Consumes this runner and returns the [I].
-    fn into_inner(self) -> I {
+    pub fn into_inner(self) -> I {
         self.inner
     }
 }
@@ -449,20 +628,48 @@ where
     N: TensorTypeParam,
     E: ExtensionField,
 {
-    fn model_inputs(&mut self, graph: &ModelGraph<N>, _inputs: &()) -> anyhow::Result<()> {
-        let input_nodes = graph.input_nodes().count();
+    fn model_inputs(
+        &mut self,
+        graph: &ModelGraph<N>,
+        inputs: &[TensorHandle<N>],
+    ) -> anyhow::Result<()> {
+        // Counts how often a given tensor is used as an input to a layer.
+        //
+        // After each layer evaluation that uses the given tensor, the counter
+        // is decrement. The tensor's cached data is freed once the data is no
+        // longer needed.
+        for (_edge_id, edge) in graph.edges() {
+            let source = edge.source();
 
-        let input_storage_keys: Vec<StorageKey<Vec<N>>> = (0..input_nodes)
-            .map(|i| Ok(graph.input_node_id(i)?.output_at(0).to_storage_key()))
-            .collect::<Result<Vec<_>>>()?;
+            for link in edge.ports().iter() {
+                let storage_key = source.output_at(link.source_port).to_storage_key();
+                self.handle_usage_count
+                    .entry(storage_key)
+                    .and_modify(|curr| *curr += 1)
+                    .or_insert(1);
+            }
+        }
 
-        let input_handles = input_storage_keys
-            .iter()
-            .map(|storage_key| self.get_by_storage_key(storage_key))
-            .collect::<Result<Vec<_>>>()?;
+        for handle in inputs {
+            let uses = self
+                .handle_usage_count
+                .get(handle.storage_key())
+                .copied()
+                .unwrap_or_default();
 
-        let inputs = RunInput { input_handles };
-        self.inner.model_inputs(graph, &inputs)?;
+            // edge case: the input is not used by any layers
+            if uses == 0 {
+                warn!("Unused input tensor");
+                handle.dry();
+            }
+
+            self.storagekey_to_handle.insert(
+                handle.storage_key().clone(),
+                handle.clone().into_wrapped_tensor()?,
+            );
+        }
+
+        self.inner.model_inputs(graph, inputs)?;
 
         Ok(())
     }
@@ -515,10 +722,12 @@ where
                 handle.dry();
             }
 
-            let older = self
-                .storagekey_to_handle
+            // NOTE: the mapping may already have a tensor handle for the given
+            // storage key, this is okay for LLM models which perform multiple
+            // runs of the model and each run reuses the existing tensor storage
+            // keys.
+            self.storagekey_to_handle
                 .insert(handle.storage_key().clone(), handle.clone());
-            assert!(older.is_none(), "Duplicate handle");
         }
 
         Ok(layer_out)
@@ -983,22 +1192,40 @@ where
 impl Model<f32> {
     pub fn run_float(
         &self,
-        input: Vec<Tensor<f32>>,
+        inputs: Vec<Tensor<f32>>,
         store: &mut GenStore,
     ) -> Result<Vec<TensorHandle<f32>>> {
-        self.run::<GoldilocksExt2>(input, store)
-            .map(|handle| handle.outputs().to_vec())
+        let input_handles = tensor_to_handles(&inputs, &self.graph, store)?;
+
+        let runner = BaseRunner {
+            store: store.clone(),
+        };
+        #[cfg(test)]
+        let runner = SanityCheckRunner { inner: runner };
+        let mut runner = HandleLifetimeRunner::new(runner, &self.graph);
+        self.run_with_runner::<GoldilocksExt2, _>(&mut runner, input_handles)?;
+
+        runner.model_outputs(&self.graph)
     }
 }
 
 impl<N: TensorTypeParam> Model<N> {
-    pub fn run_with_runner<E, R>(&self, runner: &mut R) -> anyhow::Result<()>
+    /// Run a single iteration of the model using the provided `runner`.
+    pub fn run_with_runner<E, R>(
+        &self,
+        runner: &mut R,
+        inputs: Vec<TensorHandle<N>>,
+    ) -> anyhow::Result<()>
     where
         E: ExtensionField,
         Layer<N>: Evaluate<N>,
         R: LayerRunner<N, (), E>,
     {
-        runner.model_inputs(&self.graph, &())?;
+        let inputs = inputs
+            .into_iter()
+            .map(|handle| handle.into_wrapped_tensor())
+            .collect::<Result<Vec<_>, _>>()?;
+        runner.model_inputs(&self.graph, &inputs)?;
 
         for (node_id, layer) in self.graph.forward_inners() {
             runner
@@ -1014,9 +1241,7 @@ impl<N: TensorTypeParam> Model<N> {
         Ok(())
     }
 
-    /// Run the inference of the model, producing the `InferenceTrace` necessary to
-    /// later prove the model. The outputs of the model can be fetched from the returned
-    /// trace
+    /// Performs a single run of the model, returning the produced trace.
     pub fn run<E>(
         &self,
         inputs: Vec<Tensor<N>>,
@@ -1033,16 +1258,18 @@ impl<N: TensorTypeParam> Model<N> {
         };
         #[cfg(test)]
         let runner = SanityCheckRunner { inner: runner };
+        let runner = StoreRunner::new(runner, store.clone());
         let runner = TraceRunner {
             inner: runner,
             trace: Trace::new(input_handles.clone()),
         };
-        let mut runner =
-            HandleLifetimeRunner::count_from_graph(runner, &self.graph, input_handles.clone())?;
+        let mut runner = HandleLifetimeRunner::new(runner, &self.graph);
 
-        self.run_with_runner::<E, _>(&mut runner)?;
+        self.run_with_runner::<E, _>(&mut runner, input_handles)?;
 
-        let mut trace = runner.into_inner().into_trace();
+        let trace_runner = runner.into_inner();
+        let (_store_runner, mut trace) = trace_runner.into_parts();
+
         trace.output = trace.graph_outputs(&self.graph)?;
         Ok(trace)
     }

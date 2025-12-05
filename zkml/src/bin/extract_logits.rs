@@ -170,10 +170,7 @@ where
         let data = to_float(logit_tensor.get_data(), *node_id)?;
         let (seq_len, _vocab_size) = extract_dimensions(shape);
 
-        return Ok(LogitsData {
-            data,
-            seq_len,
-        });
+        return Ok(LogitsData { data, seq_len });
     }
 
     bail!(
@@ -228,8 +225,7 @@ where
             final_seq_len = actual_seq_len;
         } else {
             // Subsequent iterations: only append the last token's logits
-            let last_token_logits =
-                &logits_step.data[logits_step.data.len() - actual_vocab_size..];
+            let last_token_logits = &logits_step.data[logits_step.data.len() - actual_vocab_size..];
             all_logits.extend_from_slice(last_token_logits);
             // Update seq_len to account for the new token (using consistent vocab size)
             final_seq_len += 1;
@@ -249,10 +245,7 @@ where
         }
     }
 
-    eprintln!(
-        "{} logits extracted: seq_len {}",
-        mode_name, final_seq_len
-    );
+    eprintln!("{} logits extracted: seq_len {}", mode_name, final_seq_len);
 
     let output = tokenizer.detokenize(&generated_tokens);
     eprintln!("{} output: {}", mode_name.to_lowercase(), output);
@@ -319,7 +312,10 @@ fn main() -> Result<()> {
         user_tokens.clone(),
         args.num_tokens,
         "Float",
-        |tokens, store| driver.run::<GoldilocksExt2>(tokens, store),
+        |tokens, store| {
+            let tensor_inputs = vec![driver.tokens_to_tensor(tokens)?];
+            driver.run::<GoldilocksExt2>(tensor_inputs, store)
+        },
         |data, _node_id| Ok(data.to_vec()),
     )?;
     // Reset cache and convert to provable mode
@@ -339,8 +335,8 @@ fn main() -> Result<()> {
         args.num_tokens,
         "Integer",
         |tokens, store| {
-            let tokens_vec = tokens.to_vec();
-            driver_int.run::<GoldilocksExt2>(tokens_vec, store)
+            let input_tensor = driver_int.tokens_to_tensor(tokens)?;
+            driver_int.run_elements::<GoldilocksExt2>(input_tensor, store)
         },
         |data, node_id| {
             let scaling_factors = metadata.layer_input_scaling_factor(node_id);
