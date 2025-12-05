@@ -32,31 +32,48 @@ const CNN_CIFAR_INPUT: &[u8] = include_bytes!("../assets/scripts/CNN/input.json.
 
 type P<'a, 'b> = Prover<'a, 'b, F, Transcript, Pcs<F>>;
 
-fn parse_model(model_data: &[u8]) -> anyhow::Result<(Model<Element>, ModelMetadata)> {
-    FloatOnnxLoader::from_bytes_with_scaling_strategy(model_data, AbsoluteMax::new())
-        .with_keep_float(true)
-        .build()
-}
-
 fn parse_model_and_inputs<T: std::io::Read>(
     model_data: &[u8],
     inputs: T,
-) -> (Model<Element>, Vec<Vec<Tensor<Element>>>) {
+) -> (Model<Element>, ModelMetadata, Input) {
     let run_inputs = Input::from_reader(inputs).expect("failed to load inputs");
-    let (model, md) = parse_model(model_data).expect("failed to parse model");
-    let inputs = run_inputs
-        .to_elements(&md)
+    let (model, metadata) =
+        FloatOnnxLoader::from_bytes_with_scaling_strategy(model_data, AbsoluteMax::new())
+            .with_keep_float(true)
+            .build()
+            .expect("failed to parse model");
+    (model, metadata, run_inputs)
+}
+
+fn inputs_to_tensor(model: &Model<f32>, run_inputs: &Input) -> Vec<Vec<Tensor<f32>>> {
+    run_inputs
+        .as_floats()
+        .iter()
+        .map(|input| {
+            model
+                .load_input_flat(vec![input.to_vec()])
+                .expect("failed to call load_input_flat on the model")
+        })
+        .collect()
+}
+
+fn inputs_to_elements(
+    model: &Model<Element>,
+    metadata: &ModelMetadata,
+    run_inputs: Input,
+) -> Vec<Vec<Tensor<Element>>> {
+    run_inputs
+        .to_elements(metadata)
         .into_iter()
         .map(|input| {
             model
                 .load_input_flat(vec![input])
                 .expect("failed to call load_input_flat on the model")
         })
-        .collect();
-    (model, inputs)
+        .collect()
 }
 
-fn random_input(inputs: &[Vec<Tensor<Element>>]) -> Vec<Tensor<Element>> {
+fn random_input<T: Clone>(inputs: &[T]) -> T {
     let el = rand::random_range(0..inputs.len());
     inputs[el].clone()
 }
@@ -83,11 +100,12 @@ fn prove(c: &mut Criterion) {
         .measurement_time(std::time::Duration::from_secs(80));
 
     let inputs = zstd::Decoder::new(MLP_IRIS_INPUT).expect("failed to parse zstd");
-    let (model, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
+    let (model, metadata, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
     let (prover_ctx, verifier_ctx) = model
         .generate_contexts::<F, Pcs<F>>()
         .expect("unable to generate context");
 
+    let inputs = inputs_to_elements(&model, &metadata, inputs);
     group.bench_with_input("mlp", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
             || random_input(inputs),
@@ -97,11 +115,12 @@ fn prove(c: &mut Criterion) {
     });
 
     let inputs = zstd::Decoder::new(CNN_CIFAR_INPUT).expect("failed to parse zstd");
-    let (model, inputs) = parse_model_and_inputs(CNN_CIFAR, inputs);
+    let (model, _metadata, inputs) = parse_model_and_inputs(CNN_CIFAR, inputs);
     let (prover_ctx, verifier_ctx) = model
         .generate_contexts::<F, Pcs<F>>()
         .expect("unable to generate context");
 
+    let inputs = inputs_to_elements(&model, &metadata, inputs);
     group.bench_with_input("cnn", &(model, inputs), |bencher, (model, inputs)| {
         bencher.iter_batched(
             || random_input(inputs),
@@ -132,26 +151,88 @@ fn inference(c: &mut Criterion) {
         .measurement_time(std::time::Duration::from_secs(200));
 
     let inputs = zstd::Decoder::new(MLP_IRIS_INPUT).expect("failed to parse zstd");
-    let (model, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
+    let (model, metadata, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
 
-    group.bench_with_input("mlp", &(model, inputs), |bencher, (model, inputs)| {
-        bencher.iter_batched(
-            || random_input(inputs),
-            |inputs| model.run::<F>(inputs, &mut GenStore::default()).unwrap(),
-            criterion::BatchSize::SmallInput,
-        )
-    });
+    let model_f32: &Model<f32> = metadata
+        .float_model
+        .as_ref()
+        .expect("Expected the f32 model to be available");
+    let inputs_f32 = inputs_to_tensor(model_f32, &inputs);
+    group.bench_with_input(
+        "mlp/f32",
+        &(model_f32, inputs_f32),
+        |bencher, (model_f32, inputs_f32)| {
+            bencher.iter_batched(
+                || random_input(inputs_f32),
+                |inputs| {
+                    model_f32
+                        .run::<F>(inputs, &mut GenStore::default())
+                        .unwrap()
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        },
+    );
+
+    let model_elt: Model<Element> = model;
+    let inputs_elt = inputs_to_elements(&model_elt, &metadata, inputs);
+    group.bench_with_input(
+        "mlp/element",
+        &(model_elt, inputs_elt),
+        |bencher, (model_elt, inputs_elt)| {
+            bencher.iter_batched(
+                || random_input(inputs_elt),
+                |inputs| {
+                    model_elt
+                        .run::<F>(inputs, &mut GenStore::default())
+                        .unwrap()
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        },
+    );
 
     let inputs = zstd::Decoder::new(CNN_CIFAR_INPUT).expect("failed to parse zstd");
-    let (model, inputs) = parse_model_and_inputs(CNN_CIFAR, inputs);
+    let (model, metadata, inputs) = parse_model_and_inputs(CNN_CIFAR, inputs);
 
-    group.bench_with_input("cnn", &(model, inputs), |bencher, (model, inputs)| {
-        bencher.iter_batched(
-            || random_input(inputs),
-            |inputs| model.run::<F>(inputs, &mut GenStore::default()).unwrap(),
-            criterion::BatchSize::SmallInput,
-        )
-    });
+    let model_f32: &Model<f32> = metadata
+        .float_model
+        .as_ref()
+        .expect("Expected f32 model to be available");
+    let inputs_f32 = inputs_to_tensor(model_f32, &inputs);
+    group.bench_with_input(
+        "cnn/f32",
+        &(model_f32, inputs_f32),
+        |bencher, (model_f32, inputs_f32)| {
+            bencher.iter_batched(
+                || random_input(inputs_f32),
+                |inputs| {
+                    model_f32
+                        .run::<F>(inputs, &mut GenStore::default())
+                        .unwrap()
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        },
+    );
+
+    let model_elt: Model<Element> = model;
+    let inputs_elt = inputs_to_elements(&model_elt, &metadata, inputs);
+    group.bench_with_input(
+        "cnn/Element",
+        &(model_elt, inputs_elt),
+        |bencher, (model_elt, inputs_elt)| {
+            bencher.iter_batched(
+                || random_input(inputs_elt),
+                |inputs| {
+                    model_elt
+                        .run::<F>(inputs, &mut GenStore::default())
+                        .unwrap()
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        },
+    );
 
     // NOTE: model parsing fails
     // let inputs = zstd::Decoder::new(CNN_COVID_INPUT).expect("failed to parse zstd");
@@ -164,44 +245,37 @@ fn inference(c: &mut Criterion) {
     //     )
     // });
 
-    // Setting the max context to `2` so that only a single run is performed.
-    let max_context = 2;
+    for (name, max_context) in [("gpt2", 2), ("gpt2_small_run", 10)] {
+        let model_path =
+            file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
+        let format = RawGGUF::new(model_path);
+        let driver = Driver::load_from_model(GPT2, &format, Some(max_context))
+            .expect("failed to instantiate GPT2 driver");
+        let user_tokens = driver.random_sequence(1);
 
-    let model_path = file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
-    let format = RawGGUF::new(model_path);
-    let driver = Driver::load_from_model(GPT2, &format, Some(max_context))
-        .expect("failed to instantiate GPT2 driver");
-    let user_tokens = driver.random_sequence(1);
-    let inputs = vec![driver.tokens_to_tensor(&user_tokens).unwrap()];
+        let driver_f32: &Driver<f32> = &driver;
+        let inputs_f32 = vec![driver_f32.tokens_to_tensor(&user_tokens).unwrap()];
+        group.bench_function(format!("{name}/f32"), |bencher| {
+            bencher.iter_batched(
+                || inputs_f32.clone(),
+                |inputs| driver_f32.run::<GoldilocksExt2>(inputs, &mut GenStore::default()),
+                criterion::BatchSize::SmallInput,
+            );
+        });
 
-    group.bench_function("gpt2", |bencher| {
-        bencher.iter_batched(
-            || inputs.clone(),
-            |inputs| driver.run::<GoldilocksExt2>(inputs, &mut GenStore::default()),
-            criterion::BatchSize::SmallInput,
-        );
-    });
-
-    // Test with a handful of tokens, this is useful for optimizations for the
-    // LLM token loop as opposed to the Model's layer loop.
-    let max_context = 10;
-
-    let model_path = file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
-    let format = RawGGUF::new(model_path);
-    let (driver, _metadata) = Driver::load_from_model(GPT2, &format, Some(max_context))
-        .expect("failed to instantiate GPT2 driver")
-        .into_provable_llm(None)
-        .expect("Driver should be provable");
-    let user_tokens = driver.random_sequence(1);
-    let input = driver.tokens_to_tensor(&user_tokens).unwrap();
-
-    group.bench_function("gpt2_small_run", |bencher| {
-        bencher.iter_batched(
-            || input.clone(),
-            |input| driver.run_elements::<GoldilocksExt2>(input, &mut GenStore::default()),
-            criterion::BatchSize::SmallInput,
-        );
-    });
+        let (driver_elt, _metadata) = driver
+            .into_provable_llm(None)
+            .expect("Driver should be provable");
+        let driver_elt: Driver<Element> = driver_elt;
+        let inputs_elt = vec![driver_elt.tokens_to_tensor(&user_tokens).unwrap()];
+        group.bench_function(format!("{name}/Element"), |bencher| {
+            bencher.iter_batched(
+                || inputs_elt.clone(),
+                |inputs| driver_elt.run::<GoldilocksExt2>(inputs, &mut GenStore::default()),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
 
     group.finish();
 }
