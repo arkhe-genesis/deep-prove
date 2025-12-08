@@ -30,7 +30,7 @@ use crate::{
     model::{Step, transform::impls::softmax_mask::SoftmaxMaskTransform},
     padding::PaddingMode,
     quantization::{self, Fieldizer, ScalingFactor},
-    tensor::{TensorTypeParam, WrappedTensor},
+    tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
     to_base, to_bit_sequence_le,
 };
 use anyhow::{Result, anyhow, bail, ensure};
@@ -55,6 +55,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::StorageKey;
 use transcript::Transcript;
 use witness::RowMajorMatrix;
 
@@ -241,11 +242,32 @@ struct SoftmaxErrorData {
     table_bit_size: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
 /// Stores the shift tensor computed during inference.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SoftmaxData {
     /// This is the tensor of normalisation shifts to apply in quantised evaluation.
-    shift_tensor: Tensor<Element>,
+    shift_tensor: WrappedTensor<Element>,
+}
+
+/// Stores the shift tensor computed during inference.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SoftmaxHandle {
+    /// This is the tensor of normalisation shifts to apply in quantised evaluation.
+    pub(crate) shift_handle: TensorHandle<Element>,
+}
+
+impl SoftmaxHandle {
+    pub(crate) fn new(
+        storage_key: StorageKey<Vec<Element>>,
+        softmax_data: SoftmaxData,
+        store: tenstore::GenStore,
+    ) -> Self {
+        let handle =
+            TensorHandle::from_wrapped_tensor(storage_key, store, softmax_data.shift_tensor);
+        Self {
+            shift_handle: handle,
+        }
+    }
 }
 
 impl<N: TensorTypeParam> Softmax<N> {
@@ -546,11 +568,17 @@ where
             output_tensors.len() == 1,
             "Found more than 1 output in inference step of Softmax layer"
         );
-        let softmax_data = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
+        let softmax_handle = step_data.node_outputs.try_softmax_data().ok_or(anyhow!(
             "Softmax data not found in inference step for Softmax layer"
         ))?;
 
-        self.lookup_witness(id, ctx, &input_tensors[0], &output_tensors[0], softmax_data)
+        self.lookup_witness(
+            id,
+            ctx,
+            &input_tensors[0],
+            &output_tensors[0],
+            softmax_handle,
+        )
     }
 }
 

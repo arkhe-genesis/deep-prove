@@ -12,7 +12,13 @@ use crate::{
         verifier::Verifier,
     },
     layers::{
-        activation::ActivationData, convolution::ConvFFTData, transformer::logits::ArgmaxData,
+        activation::{ActivationData, ActivationHandle},
+        convolution::{ConvFFTData, ConvFFTHandle},
+        transformer::{
+            layernorm::LayerNormHandle,
+            logits::{ArgmaxData, ArgmaxHandle},
+            softmax::SoftmaxHandle,
+        },
     },
     lookup::context::LookupWitnessGen,
     model::{trace::Step, transform::ModelTransform},
@@ -26,25 +32,66 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::mle::IntoMLE;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, fmt::Debug};
+use tenstore::{GenStore, StorageKey};
 use transcript::Transcript;
 
-/// Enum if the output of evaluating a layer returns extra data needed during proving.
+/// Extra data returned by layers needed for proving.
+///
 /// This should only be implemented for quantised layers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)]
 pub enum ProvingData {
-    /// Variant for extra data used in proving that we compute during evalaution of quantised convolution.
+    /// Data from evaluation of convolution.
     Convolution(ConvFFTData),
-    /// Variant for extra data used to prove [Softmax][`crate::layers::transformer::softmax::Softmax`] that we compute anyway during quantised evaluation.
+    /// Data from evaluation of softmax.
     Softmax(SoftmaxData),
-    /// Variant used for extra data used to prove [LayerNorm][`crate::layers::transformer::layernorm::LayerNorm`]
+    /// Data from evaluation of layernorm.
     LayerNorm(LayerNormData),
-    /// Variant used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
+    /// Data from evaluation of logits.
     ArgMax(ArgmaxData),
-    /// Variant used for extra data used to prove activation layer
+    /// Data from evaluation of activation.
     Activation(ActivationData),
-    /// Variant used when no extra data is returned.
+    /// No extra data
     None,
+}
+
+/// Extra data returned by layers needed for proving.
+///
+/// This should only be implemented for quantised layers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ProvingHandle {
+    Convolution(ConvFFTHandle),
+    Softmax(SoftmaxHandle),
+    LayerNorm(LayerNormHandle),
+    ArgMax(ArgmaxHandle),
+    Activation(ActivationHandle),
+    None,
+}
+
+impl ProvingHandle {
+    pub(crate) fn new(
+        storage_key: StorageKey<Vec<Element>>,
+        proving_data: ProvingData,
+        store: GenStore,
+    ) -> Self {
+        match proving_data {
+            ProvingData::Convolution(conv_fftdata) => {
+                ProvingHandle::Convolution(ConvFFTHandle::new(storage_key, conv_fftdata, store))
+            }
+            ProvingData::Softmax(softmax_data) => {
+                ProvingHandle::Softmax(SoftmaxHandle::new(storage_key, softmax_data, store))
+            }
+            ProvingData::LayerNorm(layer_norm_data) => {
+                ProvingHandle::LayerNorm(LayerNormHandle::new(storage_key, layer_norm_data, store))
+            }
+            ProvingData::ArgMax(argmax_data) => {
+                ProvingHandle::ArgMax(ArgmaxHandle::new(storage_key, argmax_data, store))
+            }
+            ProvingData::Activation(activation_data) => ProvingHandle::Activation(
+                ActivationHandle::new(storage_key, activation_data, store),
+            ),
+            ProvingData::None => ProvingHandle::None,
+        }
+    }
 }
 
 /// Identifier for an intermediate tensor of a layer, i.e., a tensor which is neither an

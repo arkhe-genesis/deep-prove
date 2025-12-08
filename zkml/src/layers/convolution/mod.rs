@@ -16,7 +16,9 @@ use crate::{
     padding::{PaddingMode, ShapeInfo},
     quantization::{self, BIT_LEN, Fieldizer, IntoElement, ScalingFactor, TensorFielder},
     shape::filter_size,
-    tensor::{CommitmentId, KeyedTensor, Tensor, TensorTypeParam, WrappedTensor, fft},
+    tensor::{
+        CommitmentId, KeyedTensor, Tensor, TensorHandle, TensorTypeParam, WrappedTensor, fft,
+    },
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
@@ -33,7 +35,7 @@ use rayon::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, mem};
+use std::{collections::HashMap, mem, ops::Deref};
 use sumcheck::{
     structs::{IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -129,7 +131,24 @@ where
 /// Caries the data needed to perform the FFT convolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvFFTData {
-    pub input: Tensor<Element>,
+    pub input: WrappedTensor<Element>,
+}
+
+/// Caries the data needed to perform the FFT convolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvFFTHandle {
+    pub(crate) handle: TensorHandle<Element>,
+}
+
+impl ConvFFTHandle {
+    pub(crate) fn new(
+        storage_key: StorageKey<Vec<Element>>,
+        conv_fftdata: ConvFFTData,
+        store: tenstore::GenStore,
+    ) -> Self {
+        let handle = TensorHandle::from_wrapped_tensor(storage_key, store, conv_fftdata.input);
+        Self { handle }
+    }
 }
 
 /// The filter weights, a 4D tensor of the shape `(feature_maps, channels_out,
@@ -1262,13 +1281,11 @@ impl Evaluate<Element> for Convolution<Element> {
             WrappedTensor::try_from(&native)?
         };
 
-        Ok(
-            LayerOut::from_vec(vec![padded]).with_proving_data(ProvingData::Convolution(
-                ConvFFTData {
-                    input: Tensor::try_from(inputs[0].clone())?,
-                },
-            )),
-        )
+        let proving_data = ProvingData::Convolution(ConvFFTData {
+            input: inputs[0].clone(),
+        });
+        let layer_out = LayerOut::from_vec(vec![padded]).with_proving_data(proving_data);
+        Ok(layer_out)
     }
 }
 
@@ -1454,15 +1471,13 @@ where
         let output_tensor = step_data.output_tensor_at(0)?;
 
         let fft_data = step_data.node_outputs.try_convdata().unwrap();
-        let (_, conv_data) = self.fft(&fft_data.input)?;
+        let fft_data = fft_data.handle.tensor()?;
+        let (_, conv_data) = self.fft(fft_data.deref())?;
 
-        Ok(vec![self.prove_convolution_step(
-            prover,
-            last_claims[0],
-            &output_tensor,
-            &conv_data,
-            id,
-        )?])
+        let claim =
+            self.prove_convolution_step(prover, last_claims[0], &output_tensor, &conv_data, id)?;
+
+        Ok(vec![claim])
     }
 }
 

@@ -113,13 +113,6 @@ impl Softmax<Element> {
         let output_tensor =
             WrappedTensor::<Element>::from_data(TensorData::new(output_data, shape))?;
 
-        let shift_shape = shift_tensor.shape();
-        let shift_data = shift_tensor.to_data().to_vec().map_err(|e| {
-            anyhow!("Failed to convert shift_tensor to Vec<Element> in Softmax: {e:?}")
-        })?;
-
-        let shift_tensor = Tensor::<Element>::new(shift_shape.into(), shift_data)?;
-
         if padded {
             Ok(LayerOut {
                 outputs: vec![output_tensor.pad_next_power_of_two()],

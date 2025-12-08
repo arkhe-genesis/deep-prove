@@ -141,14 +141,14 @@ impl Softmax<Element> {
         ctx: &ProverContext<E, PCS>,
         input: &Tensor<Element>,
         output: &Tensor<Element>,
-        softmax_data: &SoftmaxData,
+        softmax_handle: &SoftmaxHandle,
     ) -> Result<LookupWitnessGen<E, PCS>>
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
         // Get the data generated during quantised evaluation
-        let SoftmaxData { shift_tensor } = softmax_data;
+        let SoftmaxHandle { shift_handle } = softmax_handle;
 
         // We need to work out how many chunks to split the normalisation into to be range checked.
         let quant_info = self.quant_info().ok_or(anyhow!(
@@ -177,10 +177,11 @@ impl Softmax<Element> {
 
         let final_dim_size = unpadded_input_shape.dim(-1);
 
+        let shift_data_guard = shift_handle.tensor()?;
         let shifted_data = unpadded_input
             .get_data()
             .chunks(final_dim_size)
-            .zip(shift_tensor.iter())
+            .zip(shift_data_guard.get_data())
             .flat_map(|(input_chunk, shift_elem)| {
                 input_chunk
                     .iter()
@@ -347,11 +348,11 @@ impl Softmax<Element> {
         );
         // The final rmm is the shift values, its width is just shift_shape[0]
 
-        let shift_chunk_size = shift_tensor.shape()[input.rank() - 2..]
+        let shift_chunk_size = shift_handle.shape()[input.rank() - 2..]
             .iter()
             .product::<usize>();
         let shift_chunk_diff = shift_chunk_size.next_power_of_two() - shift_chunk_size;
-        let shift_evals = shift_tensor
+        let shift_evals = shift_data_guard
             .get_data()
             .chunks(shift_chunk_size)
             .map(|chunk| {

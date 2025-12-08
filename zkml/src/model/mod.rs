@@ -6,8 +6,9 @@ use crate::{
     iop::prover::{ModelLayers, ModelLayersRef},
     layers::{
         Layer, NodeOut,
-        provable::{Evaluate, OpInfo, ProvingData, TrackedDataId},
+        provable::{Evaluate, OpInfo, ProvingHandle, TrackedDataId},
         requant::Requant,
+        transformer::logits::ArgmaxHandle,
     },
     padding::PaddingMode,
     quantization::InferenceTracker,
@@ -38,7 +39,7 @@ where
     N: TensorTypeParam,
 {
     outputs: Vec<TensorHandle<N>>,
-    proving_data: ProvingData,
+    proving_data: ProvingHandle,
     tracked_data: HashMap<TrackedDataId, WrappedTensor<N>>,
 }
 
@@ -197,9 +198,13 @@ where
             outputs.push(handle);
         }
 
+        let storage_key = node_id.to_storage_key();
+        let proving_data =
+            ProvingHandle::new(storage_key, layer_out.proving_data, self.store.clone());
+
         Ok(RunOutput {
             outputs,
-            proving_data: layer_out.proving_data,
+            proving_data,
             tracked_data: layer_out.tracked_layer_data,
         })
     }
@@ -446,6 +451,8 @@ where
     }
 }
 
+type TraceRunnerMsg = (StorageKey<Vec<Element>>, WrappedTensor<Element>);
+
 /// A runner used to collect the [Trace].
 ///
 /// # Panics
@@ -457,6 +464,8 @@ where
     N: TensorTypeParam,
 {
     inner: I,
+    tx: Option<mpsc::Sender<TraceRunnerMsg>>,
+    thread_handle: Option<thread::JoinHandle<anyhow::Result<()>>>,
     trace: Trace<N>,
 }
 
@@ -464,8 +473,61 @@ impl<I, N> TraceRunner<I, N>
 where
     N: TensorTypeParam,
 {
+    pub fn new(inner: I, store: GenStore, input_handles: Vec<TensorHandle<N>>) -> Self {
+        let (tx, rx) = mpsc::channel::<TraceRunnerMsg>();
+        let thread_handle = thread::spawn(move || {
+            // The transmitter is closed when the the `StoreRunner` is dropped
+            // and all pending messages have been received, at this point there
+            // is no longer more work to be done.
+            //
+            // The code below works even in the presence of drying, this is
+            // because drying a [TensorHandle::WrappedTensor] variant only
+            // deletes the shared [WrappedTensor] copy, which in turn has
+            // its own internal reference count. As long as this copy is not
+            // deleted, the data should be available to be used. This does mean
+            // it takes longer to free up the accelerator (CPU/GPU) memory.
+            while let Ok((storage_key, wrapped_tensor)) = rx.recv() {
+                let data = wrapped_tensor.get_data();
+                store.store(&storage_key, &data)?;
+            }
+
+            Ok(())
+        });
+
+        Self {
+            inner,
+            thread_handle: Some(thread_handle),
+            tx: Some(tx),
+            trace: Trace::new(input_handles.clone()),
+        }
+    }
+
+    fn send(&self, handle: &TensorHandle<Element>) -> anyhow::Result<()> {
+        let tensor = handle.wrapped_tensor()?.clone();
+        let storage_key = handle.storage_key().clone();
+
+        self.tx
+            .as_ref()
+            .expect("Sender channel is only be consumed in the Drop")
+            .send((storage_key, tensor))?;
+        Ok(())
+    }
+
     /// Consumes this runner and returns its parts.
-    fn into_parts(self) -> (I, Trace<N>) {
+    fn into_parts(mut self) -> (I, Trace<N>) {
+        // Drop the sender channel, signaling to the thread it should stop
+        let tx = self.tx.take();
+        drop(tx);
+
+        // Wait for the thread to finish processing the buffered work
+        let handle = self.thread_handle.take();
+        if let Some(handle) = handle {
+            handle
+                .join()
+                .expect("Store thread should not panic")
+                .expect("Storing store results should not fail");
+        }
+
         (self.inner, self.trace)
     }
 }
@@ -507,7 +569,46 @@ where
             .map(|handle| handle.clone().into_dry_tensor())
             .collect::<Result<_, _>>()?;
 
-        let proving_data = mem::replace(&mut layer_out.proving_data, ProvingData::None);
+        // Save the proving data in the background, and convert the handle to a tensor version.
+        let proving_data = mem::replace(&mut layer_out.proving_data, ProvingHandle::None);
+        let proving_data = match proving_data {
+            ProvingHandle::Convolution(mut conv_ffthandle) => {
+                self.send(&conv_ffthandle.handle)?;
+                conv_ffthandle.handle = conv_ffthandle.handle.into_dry_tensor()?;
+                ProvingHandle::Convolution(conv_ffthandle)
+            }
+            ProvingHandle::Softmax(mut softmax_handle) => {
+                self.send(&softmax_handle.shift_handle)?;
+                softmax_handle.shift_handle = softmax_handle.shift_handle.into_dry_tensor()?;
+                ProvingHandle::Softmax(softmax_handle)
+            }
+            ProvingHandle::LayerNorm(mut layer_norm_handle) => {
+                self.send(&layer_norm_handle.lookup_output)?;
+                self.send(&layer_norm_handle.full_value)?;
+                layer_norm_handle.lookup_output =
+                    layer_norm_handle.lookup_output.into_dry_tensor()?;
+                layer_norm_handle.full_value = layer_norm_handle.full_value.into_dry_tensor()?;
+                ProvingHandle::LayerNorm(layer_norm_handle)
+            }
+            ProvingHandle::ArgMax(argmax_handle) => {
+                let mut new_handles = Vec::with_capacity(argmax_handle.max_values.len());
+                for handle in argmax_handle.max_values {
+                    self.send(&handle)?;
+                    new_handles.push(handle.into_dry_tensor()?);
+                }
+                ProvingHandle::ArgMax(ArgmaxHandle {
+                    max_values: new_handles,
+                })
+            }
+            ProvingHandle::Activation(mut activation_handle) => {
+                self.send(&activation_handle.activation_output)?;
+                activation_handle.activation_output =
+                    activation_handle.activation_output.into_dry_tensor()?;
+                ProvingHandle::Activation(activation_handle)
+            }
+            ProvingHandle::None => ProvingHandle::None,
+        };
+
         let new_step = Step {
             node_inputs: converted_input_handles,
             node_outputs: NodeOut::new(converted_output_handles, proving_data),
@@ -724,6 +825,12 @@ where
 }
 
 impl<N> ToStorageKey<Vec<N>> for NodeOutput {
+    fn to_storage_key(&self) -> StorageKey<Vec<N>> {
+        StorageKey::new(format!("{self}"))
+    }
+}
+
+impl<N> ToStorageKey<Vec<N>> for NodeId {
     fn to_storage_key(&self) -> StorageKey<Vec<N>> {
         StorageKey::new(format!("{self}"))
     }
@@ -1242,10 +1349,7 @@ impl<N: TensorTypeParam> Model<N> {
         #[cfg(test)]
         let runner = SanityCheckRunner { inner: runner };
         let runner = StoreRunner::new(runner, store.clone());
-        let runner = TraceRunner {
-            inner: runner,
-            trace: Trace::new(input_handles.clone()),
-        };
+        let runner = TraceRunner::new(runner, store.clone(), input_handles.clone());
         let mut runner = HandleLifetimeRunner::new(runner, &self.graph);
 
         self.run_with_runner(&mut runner, input_handles)?;

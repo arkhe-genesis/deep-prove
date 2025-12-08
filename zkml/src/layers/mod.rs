@@ -3,12 +3,13 @@ use crate::{
     graph::NodeId,
     iop::context::{ContextAux, ShapeStep},
     layers::{
-        activation::{ACTIVATION_LAYER, Activation, ActivationData, ActivationProof},
+        activation::{ACTIVATION_LAYER, Activation, ActivationHandle, ActivationProof},
         add::{ADD_LAYER, Add, AddCtx, AddProof},
-        convolution::{CONVOLUTION_LAYER, ConvFFTData, Convolution},
+        convolution::{CONVOLUTION_LAYER, ConvFFTHandle, Convolution},
         einsum::{EINSUM_LAYER, EinSum, EinSumContext, EinSumProof},
         flatten::FLATTEN_LAYER,
         pooling::{POOLING_LAYER, Pooling},
+        provable::ProvingHandle,
         requant::{REQUANT_LAYER, Requant, RequantProof},
         reshape::{RESHAPE_LAYER, Reshape, ReshapeCtx},
         transformer::{
@@ -16,11 +17,13 @@ use crate::{
                 ATTENTION_MASK_LAYER, AttentionMask, AttentionMaskCtx, AttentionMaskProof,
             },
             embeddings::{EMBEDDINGS_LAYER, Embeddings, EmbeddingsCtx, EmbeddingsProof},
-            layernorm::{LAYERNORM_LAYER, LayerNorm, LayerNormCtx, LayerNormProof},
-            logits::{LOGITS_LAYER, Logits, LogitsCtx, LogitsProof},
+            layernorm::{
+                LAYERNORM_LAYER, LayerNorm, LayerNormCtx, LayerNormHandle, LayerNormProof,
+            },
+            logits::{ArgmaxHandle, LOGITS_LAYER, Logits, LogitsCtx, LogitsProof},
             positional::{POSITIONAL_LAYER, Positional, PositionalCtx, PositionalProof},
             rmsnorm::{RMSNORM_LAYER, RMSNorm, RMSNormCtx, RMSNormProof},
-            softmax::{SOFTMAX_LAYER, Softmax, SoftmaxCtx, SoftmaxProof},
+            softmax::{SOFTMAX_LAYER, Softmax, SoftmaxCtx, SoftmaxHandle, SoftmaxProof},
         },
     },
     lookup::context::{LayerLookupContext, LookupWitnessGen},
@@ -37,15 +40,13 @@ use flatten::Flatten;
 use mpcs::PolynomialCommitmentScheme;
 use pooling::{PoolingCtx, PoolingProof};
 use provable::{
-    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
-    QuantizeOutput,
+    Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
 };
 use requant::RequantCtx;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 use tenstore::StoreError;
 use transcript::Transcript;
-use transformer::{layernorm::LayerNormData, logits::ArgmaxData, softmax::SoftmaxData};
 
 pub mod activation;
 pub mod add;
@@ -267,51 +268,51 @@ where
     T: TensorTypeParam,
 {
     pub(crate) outputs: Vec<TensorHandle<T>>,
-    pub(crate) proving_data: ProvingData,
+    pub(crate) proving_data: ProvingHandle,
 }
 
 impl<T> NodeOut<T>
 where
     T: TensorTypeParam,
 {
-    pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingData) -> Self {
+    pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingHandle) -> Self {
         Self {
             outputs,
             proving_data,
         }
     }
 
-    pub fn try_convdata(&self) -> Option<&ConvFFTData> {
+    pub fn try_convdata(&self) -> Option<&ConvFFTHandle> {
         match self.proving_data {
-            ProvingData::Convolution(ref conv_data) => Some(conv_data),
+            ProvingHandle::Convolution(ref conv_data) => Some(conv_data),
             _ => None,
         }
     }
 
-    pub fn try_softmax_data(&self) -> Option<&SoftmaxData> {
+    pub fn try_softmax_data(&self) -> Option<&SoftmaxHandle> {
         match self.proving_data {
-            ProvingData::Softmax(ref softmax_data) => Some(softmax_data),
+            ProvingHandle::Softmax(ref softmax_data) => Some(softmax_data),
             _ => None,
         }
     }
 
-    pub fn try_argmax_data(&self) -> Option<&ArgmaxData> {
+    pub fn try_argmax_data(&self) -> Option<&ArgmaxHandle> {
         match self.proving_data {
-            ProvingData::ArgMax(ref argmax_data) => Some(argmax_data),
+            ProvingHandle::ArgMax(ref argmax_data) => Some(argmax_data),
             _ => None,
         }
     }
 
-    pub fn try_layernorm_data(&self) -> Option<&LayerNormData> {
+    pub fn try_layernorm_data(&self) -> Option<&LayerNormHandle> {
         match self.proving_data {
-            ProvingData::LayerNorm(ref layernorm_data) => Some(layernorm_data),
+            ProvingHandle::LayerNorm(ref layernorm_data) => Some(layernorm_data),
             _ => None,
         }
     }
 
-    pub fn try_activation_data(&self) -> Option<&ActivationData> {
+    pub fn try_activation_data(&self) -> Option<&ActivationHandle> {
         match self.proving_data {
-            ProvingData::Activation(ref data) => Some(data),
+            ProvingHandle::Activation(ref data) => Some(data),
             _ => None,
         }
     }

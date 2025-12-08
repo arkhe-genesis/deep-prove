@@ -33,7 +33,7 @@ use crate::{
         safe,
     },
     quantization::{self, Fieldizer},
-    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, KeyedTensor, TensorHandle, TensorTypeParam, WrappedTensor},
     to_base, to_bit_sequence_le,
 };
 use anyhow::{Context, Result, anyhow, ensure};
@@ -56,6 +56,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::StorageKey;
 use tracing::trace;
 use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
@@ -108,17 +109,43 @@ pub struct QuantisedLayerNormData {
     top_chunk_scalar_log: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Data obtained during quantised evaluation of [`LayerNorm`] that is used during proving
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerNormData {
     /// The output of the inverse square root lookup
-    lookup_output: Vec<Element>,
+    lookup_output: WrappedTensor<Element>,
 
     /// The full value of the input.
     ///
     /// Both the part of the input that need to be range checked and the input
     /// of the inverse square root lookup can be derived from this value.
-    full_value: Vec<Element>,
+    full_value: WrappedTensor<Element>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerNormHandle {
+    pub(crate) lookup_output: TensorHandle<Element>,
+    pub(crate) full_value: TensorHandle<Element>,
+}
+
+impl LayerNormHandle {
+    pub(crate) fn new(
+        storage_key: StorageKey<Vec<Element>>,
+        layer_norm_data: LayerNormData,
+        store: tenstore::GenStore,
+    ) -> Self {
+        let key = StorageKey::new(format!("{}-lookup-output", storage_key.id()));
+        let lookup_output =
+            TensorHandle::from_wrapped_tensor(key, store.clone(), layer_norm_data.lookup_output);
+
+        let key = StorageKey::new(format!("{}-full-value", storage_key.id()));
+        let full_value = TensorHandle::from_wrapped_tensor(key, store, layer_norm_data.full_value);
+
+        Self {
+            lookup_output,
+            full_value,
+        }
+    }
 }
 
 impl<N: Number> LayerNorm<N> {
@@ -561,17 +588,8 @@ impl Evaluate<Element> for LayerNorm<Element> {
             .mul(denominator)?
             .add(beta)?;
 
-        let lookup_output = inv_sqrt
-            .to_data()
-            .into_vec()
-            .expect("Failed to compute LayerNorm");
-        let full_value = full_value
-            .to_data()
-            .into_vec()
-            .expect("Failed to compute LayerNorm");
-
         let layernorm_data = LayerNormData {
-            lookup_output,
+            lookup_output: inv_sqrt,
             full_value,
         };
 
@@ -946,10 +964,11 @@ where
             output_tensors.len() == 1,
             "Found more than 1 output in inference step of LayerNorm layer"
         );
-        let layernorm_data = step_data.node_outputs.try_layernorm_data().ok_or(anyhow!(
-            "LayerNorm data not found in inference step for LayerNorm layer"
-        ))?;
-        self.lookup_witness(id, ctx, layernorm_data)
+        let layernorm_handle = step_data
+            .node_outputs
+            .try_layernorm_data()
+            .context("LayerNorm data not found in inference step for LayerNorm layer")?;
+        self.lookup_witness(id, ctx, layernorm_handle)
     }
 }
 
@@ -1129,7 +1148,7 @@ impl LayerNorm<Element> {
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        layernorm_data: &LayerNormData,
+        layernorm_handle: &LayerNormHandle,
     ) -> Result<LookupWitnessGen<E, PCS>>
     where
         E: ExtensionField,
@@ -1139,10 +1158,10 @@ impl LayerNorm<Element> {
     {
         let mut wit_gen = LookupWitnessGen::<E, PCS>::default();
         // Get the data generated during quantised evaluation
-        let LayerNormData {
+        let LayerNormHandle {
             full_value,
             lookup_output,
-        } = layernorm_data;
+        } = layernorm_handle;
 
         // We need to work out how many chunks to split the shifted away part into to be range checked
         let QuantisedLayerNormData {
@@ -1154,12 +1173,18 @@ impl LayerNorm<Element> {
         ))?;
         let number_range_checks = (lut.range_check_bits() - 1) / *quantization::BIT_LEN + 1;
 
+        let full_value_guard = full_value.tensor()?;
+        let full_value_data = full_value_guard.get_data();
+
         let range_check_mask: Element = bit_to_mask(lut.range_check_bits());
-        let lookup_input: Vec<Element> = full_value
+        let lookup_input: Vec<Element> = full_value_data
             .iter()
             .map(|v| v >> lut.range_check_bits())
             .collect();
-        let range_check: Vec<Element> = full_value.iter().map(|v| v & range_check_mask).collect();
+        let range_check: Vec<Element> = full_value_data
+            .iter()
+            .map(|v| v & range_check_mask)
+            .collect();
 
         // Split `range_check` into its constituent parts
         let range_mask: Element = (1 << *quantization::BIT_LEN) - 1;
@@ -1197,9 +1222,12 @@ impl LayerNorm<Element> {
                     acc
                 });
 
-        let inv_sqrt_element_count = lookup_input.iter().zip(lookup_output.iter()).fold(
+        let lookup_output_guard = lookup_output.tensor()?;
+        let lookup_output_data = lookup_output_guard.get_data();
+
+        let inv_sqrt_element_count = lookup_input.iter().zip(lookup_output_data.iter()).fold(
             HashMap::<Element, u64>::new(),
-            |mut acc, (&input, &output)| {
+            |mut acc, (input, output)| {
                 *acc.entry(input + output * COLUMN_SEPARATOR).or_default() += 1;
                 acc
             },
@@ -1215,7 +1243,7 @@ impl LayerNorm<Element> {
             InstancePaddingStrategy::Default,
         );
         let rmm2 = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
-            ceno_p3::matrix::dense::DenseMatrix::new(to_base::<E, _>(lookup_output), 1),
+            ceno_p3::matrix::dense::DenseMatrix::new(to_base::<E, _>(lookup_output_data), 1),
             InstancePaddingStrategy::Default,
         );
         let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm1, rmm2])?;
@@ -1652,12 +1680,14 @@ mod tests {
 
         let expected_proof_data = result.try_layernorm_data().unwrap();
         assert_eq!(
-            &expected_proof_data.full_value, &expected.1,
-            "Full value mismatch"
+            &expected_proof_data.full_value.get_data(),
+            &expected.1,
+            "Full value mismatch",
         );
         assert_eq!(
-            &expected_proof_data.lookup_output, &expected.0,
-            "Lookup output mismatch"
+            &expected_proof_data.lookup_output.get_data(),
+            &expected.0,
+            "Lookup output mismatch",
         );
     }
 
@@ -1722,12 +1752,14 @@ mod tests {
 
         let expected_proof_data = result.try_layernorm_data().unwrap();
         assert_eq!(
-            &expected_proof_data.full_value, &expected.1,
-            "Full value mismatch"
+            &expected_proof_data.full_value.get_data(),
+            &expected.1,
+            "Full value mismatch",
         );
         assert_eq!(
-            &expected_proof_data.lookup_output, &expected.0,
-            "Lookup output mismatch"
+            &expected_proof_data.lookup_output.get_data(),
+            &expected.0,
+            "Lookup output mismatch",
         );
     }
 
@@ -1748,8 +1780,18 @@ mod tests {
             prop_assert_eq!(&result.outputs()[0].get_data(), &expected.2, "Output mismatch. input {:?}", data);
 
             let expected_proof_data = result.try_layernorm_data().unwrap();
-            prop_assert_eq!(&expected_proof_data.full_value, &expected.1, "Full value mismatch. input {:?}", data);
-            prop_assert_eq!(&expected_proof_data.lookup_output, &expected.0, "Lookup output mismatch. input {:?}", data);
+            prop_assert_eq!(
+                &expected_proof_data.full_value.get_data(),
+                &expected.1,
+                "Full value mismatch. input {:?}",
+                data,
+            );
+            prop_assert_eq!(
+                &expected_proof_data.lookup_output.get_data(),
+                &expected.0,
+                "Lookup output mismatch. input {:?}",
+                data,
+            );
         }
 
     }

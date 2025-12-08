@@ -222,6 +222,7 @@ impl Direction {
 #[display("N{_0}")]
 #[debug("Node({_0})")]
 pub struct NodeId(pub usize);
+
 impl NodeId {
     /// Generate the [`NodeInput`] corresponding to the given port for this node.
     pub fn input_at<P: Into<PortId>>(&self, port: P) -> NodeInput {

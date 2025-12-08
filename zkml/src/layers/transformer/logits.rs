@@ -26,7 +26,7 @@ use crate::{
     model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     quantization::{Fieldizer, TensorFielder},
-    tensor::{TensorTypeParam, WrappedTensor},
+    tensor::{TensorHandle, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
@@ -45,6 +45,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::StorageKey;
 use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
@@ -53,12 +54,31 @@ pub const LOGITS_LAYER: &str = "LGIT";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArgmaxData {
-    max_values: Vec<Tensor<Element>>,
+    max_values: Vec<WrappedTensor<Element>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct ArgmaxDataNew<E: TensorTypeParam> {
-    max_values: Vec<WrappedTensor<E>>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArgmaxHandle {
+    pub(crate) max_values: Vec<TensorHandle<Element>>,
+}
+impl ArgmaxHandle {
+    pub(crate) fn new(
+        storage_key: StorageKey<Vec<Element>>,
+        argmax_data: ArgmaxData,
+        store: tenstore::GenStore,
+    ) -> Self {
+        let max_values = argmax_data
+            .max_values
+            .into_iter()
+            .enumerate()
+            .map(|(i, tensor)| {
+                let key = StorageKey::new(format!("{}-argmax-{}", storage_key.id(), i));
+                TensorHandle::from_wrapped_tensor(key, store.clone(), tensor)
+            })
+            .collect();
+
+        Self { max_values }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,7 +120,7 @@ impl Logits {
     fn evaluate_with_argmax_data_f32(
         &self,
         inputs: &[&WrappedTensor<f32>],
-    ) -> anyhow::Result<(LayerOut<f32>, ArgmaxDataNew<f32>)> {
+    ) -> anyhow::Result<(LayerOut<f32>, Vec<WrappedTensor<f32>>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
             "Argmax is for tensors of rank >= 2",
@@ -115,12 +135,7 @@ impl Logits {
                         (indices_bt.float(), max_bt)
                     })
                     .unzip();
-                Ok((
-                    LayerOut::from_vec(indices),
-                    ArgmaxDataNew {
-                        max_values: maximums,
-                    },
-                ))
+                Ok((LayerOut::from_vec(indices), maximums))
             }
         }
     }
@@ -128,7 +143,7 @@ impl Logits {
     fn evaluate_with_argmax_data_element(
         &self,
         inputs: &[&WrappedTensor<Element>],
-    ) -> anyhow::Result<(LayerOut<Element>, ArgmaxDataNew<Element>)> {
+    ) -> anyhow::Result<(LayerOut<Element>, Vec<WrappedTensor<Element>>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
             "Argmax is for tensors of rank >= 2",
@@ -155,12 +170,7 @@ impl Logits {
                     }),
                     |iter| iter.unzip(),
                 )?;
-                Ok((
-                    LayerOut::from_vec(indices),
-                    ArgmaxDataNew {
-                        max_values: maximums,
-                    },
-                ))
+                Ok((LayerOut::from_vec(indices), maximums))
             }
         }
     }
@@ -214,11 +224,7 @@ impl Evaluate<Element> for Logits {
 
         // convert argmax_data to field elements
         let argmax_data = ArgmaxData {
-            max_values: argmax_data
-                .max_values
-                .into_iter()
-                .map(Tensor::try_from)
-                .collect::<anyhow::Result<_>>()?,
+            max_values: argmax_data,
         };
 
         Ok(output.with_proving_data(ProvingData::ArgMax(argmax_data)))
@@ -522,9 +528,9 @@ where
             .map(|d| input_shape.dim(d))
             .product();
         ensure!(
-            max_values.shape().dim(0) == expected_rows,
+            max_values.shape()[0] == expected_rows,
             "Incompatible shapes between max values tensor (rows={}) and flattened input rows (expected_rows={}) for input shape {:?}",
-            max_values.shape().dim(0),
+            max_values.shape()[0],
             expected_rows,
             input.shape(),
         );
@@ -533,9 +539,10 @@ where
             "Input shape must have at least one dimension"
         ))?;
 
+        let max_values_guard = max_values.tensor()?;
         let merged_diff = input
             .slice_last_dim()
-            .zip(max_values.get_data().iter())
+            .zip(max_values_guard.get_data())
             .flat_map(|(row, row_max)| {
                 let current_max = row_max;
                 row.iter()
@@ -556,7 +563,7 @@ where
         });
 
         // commit to max values
-        let commit_data = max_values
+        let commit_data = max_values_guard
             .get_data()
             .iter()
             .map(|v| Fieldizer::<E>::to_field(v).as_bases()[0])

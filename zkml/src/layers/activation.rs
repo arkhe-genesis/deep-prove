@@ -43,6 +43,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::StorageKey;
 use transcript::Transcript;
 use witness::RowMajorMatrix;
 
@@ -69,10 +70,32 @@ pub enum ActivationLayer<N> {
     Relu(Relu),
     Gelu(GELU<N>),
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActivationData {
-    activation_output: Tensor<Element>,
+    activation_output: WrappedTensor<Element>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActivationHandle {
+    pub(crate) activation_output: TensorHandle<Element>,
+}
+
+impl ActivationHandle {
+    pub(crate) fn new(
+        storage_key: StorageKey<Vec<Element>>,
+        activation_data: ActivationData,
+        store: tenstore::GenStore,
+    ) -> Self {
+        let handle = TensorHandle::from_wrapped_tensor(
+            storage_key,
+            store,
+            activation_data.activation_output,
+        );
+        Self {
+            activation_output: handle,
+        }
+    }
 }
 
 /// Currently holds the poly info for the output polynomial of the RELU
@@ -434,12 +457,10 @@ impl Evaluate<Element> for Activation<Element> {
                 // double-check that there is only one output
                 assert_eq!(activation_outputs.len(), 1);
                 let activation_output = activation_outputs.pop().unwrap();
-                Ok(
-                    LayerOut::from_vec(vec![activation_output.clone().mul(inputs[1].clone())?])
-                        .with_proving_data(ProvingData::Activation(ActivationData {
-                            activation_output: Tensor::try_from(activation_output)?,
-                        })),
-                )
+                let layer_out =
+                    LayerOut::from_vec(vec![activation_output.clone().mul(inputs[1].clone())?]);
+                let proving_data = ProvingData::Activation(ActivationData { activation_output });
+                Ok(layer_out.with_proving_data(proving_data))
             }
         }
     }
@@ -567,11 +588,12 @@ where
                 let data = step_data.node_outputs.try_activation_data().ok_or(anyhow!(
                     "Proving data not found in inference trace for activation layer"
                 ))?;
+                let activation_output = data.activation_output.tensor()?;
                 activation_layer.lookup_witness(
                     id,
                     ctx,
                     step_data.input_tensor_at(0)?.deref(),
-                    &data.activation_output,
+                    activation_output.deref(),
                 )
             }
         }
