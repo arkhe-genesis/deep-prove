@@ -92,11 +92,11 @@ impl<N: TensorTypeParam> Absolute<N> {
 }
 
 impl<N> Absolute<N> {
-    pub(super) fn evaluate<E: ExtensionField>(
+    pub(super) fn evaluate(
         &self,
         input: &WrappedTensor<N>,
         positional_cache: &Arc<Mutex<PositionalCache>>,
-    ) -> anyhow::Result<LayerOut<N, E>>
+    ) -> anyhow::Result<LayerOut<N>>
     where
         N: TensorTypeParam,
         Add<N>: Evaluate<N>,
@@ -121,7 +121,7 @@ impl<N> Absolute<N> {
             .lock()
             .unwrap()
             .set_seq_len(past_length + input.unpadded_shape().dims[0])?;
-        let mut outputs = self.add_layer.evaluate::<E>(&[input, &sub_bt])?.outputs;
+        let mut outputs = self.add_layer.evaluate(&[input, &sub_bt])?.outputs;
         ensure!(
             outputs.len() == 1,
             "Expected 1 output from add in positional encoding layer, got {}",
@@ -233,7 +233,7 @@ impl Absolute<Element> {
         &self,
         node_id: NodeId,
         output_claim: &Claim<E>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
@@ -479,7 +479,6 @@ mod tests {
         quantization::{AbsoluteMax, ScalingFactor},
         tensor::{KeyedTensor, TensorSlice, TensorTypeParam, is_close_with_tolerance},
     };
-    use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
 
     #[rstest]
@@ -562,7 +561,7 @@ mod tests {
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer
-                .evaluate::<GoldilocksExt2>(&input.as_wrapped(), &cache)
+                .evaluate(&input.as_wrapped(), &cache)
                 .expect("absolute evaluate should succeed")
                 .outputs
                 .pop()
@@ -607,7 +606,7 @@ mod tests {
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer_q
 
-                .evaluate::<GoldilocksExt2>(&input_q.as_wrapped(),&cache)
+                .evaluate(&input_q.as_wrapped(),&cache)
                 .expect("quantized absolute evaluate should succeed")
                 .outputs
                 .pop()
@@ -615,7 +614,7 @@ mod tests {
 
             let expected = add_q
 
-                .evaluate::<GoldilocksExt2>(&[&input_q.as_wrapped(), &sub_pos_q.as_wrapped()], )
+                .evaluate(&[&input_q.as_wrapped(), &sub_pos_q.as_wrapped()], )
                 .expect("quantized add evaluate should succeed")
                 .outputs
                 .pop()

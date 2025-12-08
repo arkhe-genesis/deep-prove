@@ -249,30 +249,22 @@ where
     }
 
     /// Performs a single run of the model, returning the produced trace.
-    pub fn run<E>(
-        &self,
-        inputs: Vec<Tensor<N>>,
-        store: &mut GenStore,
-    ) -> anyhow::Result<Trace<E, N>>
-    where
-        E: ExtensionField,
-    {
-        let result = self.model.run::<E>(inputs, store);
+    pub fn run(&self, inputs: Vec<Tensor<N>>, store: &mut GenStore) -> anyhow::Result<Trace<N>> {
+        let result = self.model.run(inputs, store);
         self.model.reset();
         result
     }
 
     /// Run a single iteration of the model using the provided `runner`.
-    pub fn run_with_runner<E, R>(
+    pub fn run_with_runner<R>(
         &self,
         runner: &mut R,
         inputs: Vec<TensorHandle<N>>,
     ) -> anyhow::Result<()>
     where
-        E: ExtensionField,
-        R: LayerRunner<N, (), E>,
+        R: LayerRunner<N, ()>,
     {
-        let result = self.model.run_with_runner::<E, _>(runner, inputs);
+        let result = self.model.run_with_runner(runner, inputs);
         self.model.reset();
         result
     }
@@ -284,14 +276,11 @@ where
     /// - The returned trace contains the whole sequence.
     /// - The layer runner will be used for each token infernece, but not for
     ///   the trace generation.
-    pub fn run_elements<E>(
+    pub fn run_elements(
         &self,
         input_tensor: Tensor<N>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Trace<E, N>>
-    where
-        E: ExtensionField,
-    {
+    ) -> anyhow::Result<Trace<N>> {
         let runner = BaseRunner {
             store: store.clone(),
         };
@@ -312,7 +301,7 @@ where
         input_tensor: Tensor<N>,
         store: &mut GenStore,
         tracker: &mut InferenceTracker,
-    ) -> anyhow::Result<Trace<E, N>>
+    ) -> anyhow::Result<Trace<N>>
     where
         E: ExtensionField,
     {
@@ -337,16 +326,15 @@ where
     /// - The returned trace contains the whole sequence.
     /// - The layer runner will be used for each token inferenece, but not for
     ///   the trace generation.
-    fn run_elements_with_runner<E, I>(
+    fn run_elements_with_runner<I>(
         &self,
         input_tensor: Tensor<N>,
         store: &mut GenStore,
         mut runner: HandleLifetimeRunner<I, N>,
-    ) -> anyhow::Result<Trace<E, N>>
+    ) -> anyhow::Result<Trace<N>>
     where
-        E: ExtensionField,
-        HandleLifetimeRunner<I, N>: LayerRunner<N, (), E>,
-        I: LayerRunner<N, RunInput<N>, E>,
+        HandleLifetimeRunner<I, N>: LayerRunner<N, ()>,
+        I: LayerRunner<N, RunInput<N>>,
     {
         let input_data = input_tensor.get_data().to_vec();
         let num_input_tokens = input_data.len();
@@ -432,7 +420,7 @@ where
             );
 
             self.model
-                .run_with_runner::<E, _>(&mut runner, input_handles)
+                .run_with_runner(&mut runner, input_handles)
                 .with_context(|| {
                     format!(
                         "running the {} iteration loop",
@@ -473,7 +461,7 @@ where
 
         let generated_tokens = handle
             .join()
-            .map_err(|err| anyhow!("Results thread paniced. err: {err:?}"))?
+            .map_err(|err| anyhow!("Results thread panicked. err: {err:?}"))?
             .context("Fetch tensor results failed")?;
         full_sentence.extend(generated_tokens);
         let mut tensor = Tensor::new(Shape::new(vec![full_sentence.len()]), full_sentence.clone())?;
@@ -494,7 +482,7 @@ where
         );
 
         let mut store = GenStore::default();
-        let trace = self.model.run::<E>(vec![tensor], &mut store)?;
+        let trace = self.model.run(vec![tensor], &mut store)?;
         for i in num_input_tokens..full_sentence.len() {
             assert_eq!(
                 trace.outputs()[0].tensor().unwrap().get_data()[i - 1],
@@ -578,7 +566,7 @@ impl Driver<Element> {
     fn chunked_prove_local<'a, 'b, S, E, PCS, Ex>(
         &'a self,
         ctx: &'b ProverContext<E, PCS>,
-        trace: Trace<E, Element>,
+        trace: Trace<Element>,
         num_chunks: Option<usize>,
         chunking_strategy: S,
         executor_config: Ex::Config,
@@ -610,7 +598,7 @@ impl Driver<Element> {
     pub(crate) fn chunked_prove_default_executor<S, E, PCS>(
         &self,
         ctx: &ProverContext<E, PCS>,
-        trace: Trace<E, Element>,
+        trace: Trace<Element>,
         num_chunks: Option<usize>,
         chunking_strategy: S,
     ) -> anyhow::Result<Proof<E, PCS>>
@@ -635,7 +623,7 @@ impl Driver<Element> {
     pub fn prove<E, PCS>(
         &self,
         ctx: &ProverContext<E, PCS>,
-        trace: Trace<E, Element>,
+        trace: Trace<Element>,
     ) -> anyhow::Result<Proof<E, PCS>>
     where
         E: ExtensionField,
@@ -800,7 +788,7 @@ mod test {
         let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path))?;
         let user_tokens = tokenizer.tokenize(sentence);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
-        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
+        let trace = driver.run_elements(input_tensor, &mut store)?;
 
         // Prove the trace
         let num_provers = if DISTRIBUTE_PROVE {
@@ -879,7 +867,7 @@ mod test {
         assert_eq!(detokenized, sentence);
         println!("user input in tokens: {user_tokens:?}");
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
-        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
+        let trace = driver.run_elements(input_tensor, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -910,7 +898,7 @@ mod test {
         let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let tensor_inputs = vec![driver.tokens_to_tensor(&user_tokens)?];
-        let trace = driver.run::<GoldilocksExt2>(tensor_inputs, &mut store)?;
+        let trace = driver.run(tensor_inputs, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -942,7 +930,7 @@ mod test {
         let tokenizer = Gemma3::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
-        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
+        let trace = driver.run_elements(input_tensor, &mut store)?;
         let output = trace
             .outputs()
             .last()
@@ -997,7 +985,7 @@ mod test {
         let tokenizer = HFTokenizer::sentencepiece_from_gguf(&loader)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
-        let trace = driver.run_elements::<GoldilocksExt2>(input_tensor, &mut store)?;
+        let trace = driver.run_elements(input_tensor, &mut store)?;
 
         // Prove the trace
         let num_provers = Some(rng_from_env_or_random().gen_range(1..6));

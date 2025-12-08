@@ -955,7 +955,7 @@ where
     PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
 {
-    trace: &'a Trace<E, Element>,
+    trace: &'a Trace<Element>,
     ctx: &'b ProverContext<E, PCS>,
     layers: &'c ModelLayersRef<'c>,
 }
@@ -1029,7 +1029,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWi
 pub(crate) fn generate_lookup_witness_for_chunk<'a, 'b, 'c, E, T, PCS, N, Ex>(
     chunk_graph: &Graph<N, usize, usize, ()>,
     chunk_lookup_ctx: &LookupContext,
-    chunk_trace: &'a Trace<E, Element>,
+    chunk_trace: &'a Trace<Element>,
     ctx: &'b ProverContext<E, PCS>,
     transcript: &mut T,
     layers: &'c ModelLayersRef<'c>,
@@ -1224,7 +1224,7 @@ where
 }
 
 pub fn generate_lookup_witnesses<'a, E, T: Transcript<E>, PCS>(
-    trace: &Trace<E, Element>,
+    trace: &Trace<Element>,
     ctx: &ProverContext<E, PCS>,
     transcript: &mut T,
     layers: &ModelLayersRef<'a>,

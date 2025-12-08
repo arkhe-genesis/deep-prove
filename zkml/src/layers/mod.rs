@@ -261,25 +261,20 @@ impl<E: ExtensionField> LayerCtx<E> {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "E: Serialize, T: Serialize",
-    deserialize = "E: DeserializeOwned, T: DeserializeOwned"
-))]
-pub(crate) struct NodeOut<T, E>
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub(crate) struct NodeOut<T>
 where
-    E: ExtensionField,
     T: TensorTypeParam,
 {
     pub(crate) outputs: Vec<TensorHandle<T>>,
-    pub(crate) proving_data: ProvingData<E>,
+    pub(crate) proving_data: ProvingData,
 }
 
-impl<T, E> NodeOut<T, E>
+impl<T> NodeOut<T>
 where
-    E: ExtensionField,
     T: TensorTypeParam,
 {
-    pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingData<E>) -> Self {
+    pub(crate) fn new(outputs: Vec<TensorHandle<T>>, proving_data: ProvingData) -> Self {
         Self {
             outputs,
             proving_data,
@@ -300,7 +295,7 @@ where
         }
     }
 
-    pub fn try_argmax_data(&self) -> Option<&ArgmaxData<E>> {
+    pub fn try_argmax_data(&self) -> Option<&ArgmaxData> {
         match self.proving_data {
             ProvingData::ArgMax(ref argmax_data) => Some(argmax_data),
             _ => None,
@@ -322,12 +317,12 @@ where
     }
 }
 
-impl<E: ExtensionField> NodeOut<Element, E> {
+impl NodeOut<Element> {
     pub(crate) fn to_dequantize(
         &self,
         model_metadata: &ModelMetadata,
         node_id: NodeId,
-    ) -> Result<NodeOut<f32, E>, StoreError> {
+    ) -> Result<NodeOut<f32>, StoreError> {
         let outputs = self
             .outputs
             .iter()
@@ -433,10 +428,7 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
 }
 
 impl Evaluate<f32> for Layer<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> Result<LayerOut<f32>> {
         match self {
             Layer::Convolution(convolution) => convolution.evaluate(inputs),
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
@@ -458,10 +450,7 @@ impl Evaluate<f32> for Layer<f32> {
 }
 
 impl Evaluate<Element> for Layer<Element> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
         let output = match self {
             Layer::Convolution(convolution) => convolution.evaluate(inputs),
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
@@ -560,7 +549,7 @@ where
         node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&crate::Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<crate::Claim<E>>> {
         match (self, ctx) {
@@ -620,7 +609,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         match self {
             Layer::Convolution(convolution) => convolution.gen_lookup_witness(id, ctx, step_data),

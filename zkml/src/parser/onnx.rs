@@ -882,7 +882,7 @@ mod tests {
         let input = crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0])
             .to_quantized(md.input_scaling(0));
         let inputs = model.prepare_inputs(vec![input]).unwrap();
-        let trace = model.run::<F>(inputs, &mut GenStore::default()).unwrap();
+        let trace = model.run(inputs, &mut GenStore::default()).unwrap();
         println!("Result: {:?}", trace.outputs());
     }
 
@@ -923,7 +923,7 @@ mod tests {
         let inputs = model.prepare_inputs(inputs).unwrap();
 
         info!("RUNNING MODEL...");
-        let trace = model.run::<F>(inputs, &mut GenStore::default()).unwrap();
+        let trace = model.run(inputs, &mut GenStore::default()).unwrap();
 
         info!("RUNNING MODEL DONE...");
         println!("Result: {:?}", trace.outputs());
@@ -963,7 +963,7 @@ mod tests {
             })
             .collect();
         let inputs = model.prepare_inputs(native_input).unwrap();
-        let trace = model.run::<F>(inputs, &mut GenStore::default()).unwrap();
+        let trace = model.run(inputs, &mut GenStore::default()).unwrap();
 
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
@@ -1044,7 +1044,7 @@ mod tests {
 
         let input_tensor = crate::tensor::Tensor::random(&input_shape);
         let trace = model
-            .run::<GoldilocksExt2>(vec![input_tensor], &mut GenStore::default())
+            .run(vec![input_tensor], &mut GenStore::default())
             .unwrap();
         assert!(!trace.steps.is_empty());
     }

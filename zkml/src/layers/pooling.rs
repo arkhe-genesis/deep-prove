@@ -123,10 +123,7 @@ impl OpInfo for Pooling {
 }
 
 impl Evaluate<Element> for Pooling {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating pooling layer"
@@ -158,10 +155,7 @@ impl Evaluate<Element> for Pooling {
 }
 
 impl Evaluate<f32> for Pooling {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> Result<LayerOut<f32>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating pooling layer"
@@ -254,7 +248,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -272,7 +266,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let input_tensors = step_data.input_tensors()?;
         let output_tensors = step_data.output_tensors()?;
@@ -1103,7 +1097,7 @@ mod tests {
             .unwrap();
         let winput = input.as_wrapped();
         let result = Pooling::Maxpool2D(Maxpool2D::default())
-            .evaluate::<GoldilocksExt2>(&[&winput])
+            .evaluate(&[&winput])
             .unwrap();
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(&expected, &result.outputs[0].to_native());
@@ -1119,7 +1113,7 @@ mod tests {
             let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE).unwrap();
 
             let winput = input.as_wrapped();
-            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput]).unwrap();
+            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate(&[&winput]).unwrap();
             prop_assert_eq!(result.outputs.len(), 1);
             prop_assert_eq!(&expected, &result.outputs[0].to_native());
         }
@@ -1129,7 +1123,7 @@ mod tests {
             let expected = input.maxpool2d(MAXPOOL2D_KERNEL_SIZE, MAXPOOL2D_KERNEL_SIZE).unwrap();
 
             let winput = input.as_wrapped();
-            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate::<GoldilocksExt2>(&[&winput]).unwrap();
+            let result = Pooling::Maxpool2D(Maxpool2D::default()).evaluate(&[&winput]).unwrap();
             prop_assert_eq!(result.outputs.len(), 1);
             prop_assert_eq!(&expected, &result.outputs[0].to_native());
         }

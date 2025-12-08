@@ -1163,10 +1163,7 @@ impl Convolution<Element> {
 }
 
 impl Evaluate<f32> for Convolution<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> Result<LayerOut<f32>> {
         let tensor = self.filter.as_pre_fft_tensor();
         ensure!(
             inputs.len() == 1,
@@ -1206,10 +1203,7 @@ impl Evaluate<f32> for Convolution<f32> {
 }
 
 impl Evaluate<Element> for Convolution<Element> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
         let unpadded_input_shape = inputs[0].unpadded_shape();
         ensure!(
             inputs.len() == 1,
@@ -1454,7 +1448,7 @@ where
         id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let output_tensor = step_data.output_tensor_at(0)?;

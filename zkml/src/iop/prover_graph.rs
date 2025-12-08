@@ -65,7 +65,7 @@ impl<'a, 'b, E: ExtensionField, T, PCS> std::fmt::Debug for ProverGraphNode<'a, 
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct ChunkProverInput<E: ExtensionField> {
     chunk: ModelChunk,
-    trace: Trace<E, Element>,
+    trace: Trace<Element>,
     challenge: E,
 }
 
@@ -75,7 +75,7 @@ pub struct ChunkProverInput<E: ExtensionField> {
 #[allow(clippy::large_enum_variant)]
 pub enum ProverGraphIO<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     // Input for the prover split task
-    ProverSplitInput(Trace<E, Element>),
+    ProverSplitInput(Trace<Element>),
     // Input for the task of proving a single chunk
     ChunkProveInput(ChunkProverInput<E>),
     // Output data produced for a given chunk,

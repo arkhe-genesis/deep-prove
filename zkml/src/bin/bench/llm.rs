@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
         let user_tokens = driver.random_sequence(args.min_user_len);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
         let trace = bencher.r(HEADER_INFERENCE_TIME, || {
-            driver.run_elements::<GoldilocksExt2>(input_tensor, &mut GenStore::default())
+            driver.run_elements(input_tensor, &mut GenStore::default())
         })?;
         let io = trace.to_verifier_io()?;
         let proof = bencher.r(HEADER_PROOF_TIME, || driver.prove(&prover_ctx, trace))?;

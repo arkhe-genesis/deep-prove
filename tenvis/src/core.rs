@@ -1,6 +1,5 @@
 use crate::model::{ShapeStep, shape_steps};
 use anyhow::Context;
-use ff_ext::GoldilocksExt2;
 use log::{info, warn};
 use std::{collections::HashMap, path::Path, rc::Rc};
 use tenstore::GenStore;
@@ -87,7 +86,7 @@ impl GlobalContext {
             let mut runner = HandleLifetimeRunner::new(runner, model_f32.graph());
 
             model_f32
-                .run_with_runner::<GoldilocksExt2, _>(&mut runner, input_f32_handles)
+                .run_with_runner(&mut runner, input_f32_handles)
                 .context("running the model in float mode")?;
 
             drop(runner); // ends the TrackerRunner lifetime, so it free the &mut borrow to the tracker.
@@ -129,7 +128,7 @@ impl GlobalContext {
             let mut runner = HandleLifetimeRunner::new(runner, model_elt.graph());
 
             model_elt
-                .run_with_runner::<F, _>(&mut runner, input_elt_handles)
+                .run_with_runner(&mut runner, input_elt_handles)
                 .context("running the model in elt mode")?;
 
             drop(runner); // ends the TrackerRunner lifetime, so it free the &mut borrow to the tracker.
@@ -177,7 +176,7 @@ impl GlobalContext {
             let runner = StoreRunner::new(runner, store_f32.clone());
             let mut runner = HandleLifetimeRunner::new(runner, driver_f32.model.graph());
 
-            driver_f32.run_with_runner::<F, _>(&mut runner, input_handles)?;
+            driver_f32.run_with_runner(&mut runner, input_handles)?;
 
             let outputs = runner.model_outputs(driver_f32.model.graph())?;
             let answer = tokenizer.detokenize(

@@ -164,11 +164,7 @@ fn inference(c: &mut Criterion) {
         |bencher, (model_f32, inputs_f32)| {
             bencher.iter_batched(
                 || random_input(inputs_f32),
-                |inputs| {
-                    model_f32
-                        .run::<F>(inputs, &mut GenStore::default())
-                        .unwrap()
-                },
+                |inputs| model_f32.run(inputs, &mut GenStore::default()).unwrap(),
                 criterion::BatchSize::SmallInput,
             )
         },
@@ -182,11 +178,7 @@ fn inference(c: &mut Criterion) {
         |bencher, (model_elt, inputs_elt)| {
             bencher.iter_batched(
                 || random_input(inputs_elt),
-                |inputs| {
-                    model_elt
-                        .run::<F>(inputs, &mut GenStore::default())
-                        .unwrap()
-                },
+                |inputs| model_elt.run(inputs, &mut GenStore::default()).unwrap(),
                 criterion::BatchSize::SmallInput,
             )
         },
@@ -206,11 +198,7 @@ fn inference(c: &mut Criterion) {
         |bencher, (model_f32, inputs_f32)| {
             bencher.iter_batched(
                 || random_input(inputs_f32),
-                |inputs| {
-                    model_f32
-                        .run::<F>(inputs, &mut GenStore::default())
-                        .unwrap()
-                },
+                |inputs| model_f32.run(inputs, &mut GenStore::default()).unwrap(),
                 criterion::BatchSize::SmallInput,
             )
         },
@@ -224,11 +212,7 @@ fn inference(c: &mut Criterion) {
         |bencher, (model_elt, inputs_elt)| {
             bencher.iter_batched(
                 || random_input(inputs_elt),
-                |inputs| {
-                    model_elt
-                        .run::<F>(inputs, &mut GenStore::default())
-                        .unwrap()
-                },
+                |inputs| model_elt.run(inputs, &mut GenStore::default()).unwrap(),
                 criterion::BatchSize::SmallInput,
             )
         },
@@ -258,7 +242,7 @@ fn inference(c: &mut Criterion) {
         group.bench_function(format!("{name}/f32"), |bencher| {
             bencher.iter_batched(
                 || inputs_f32.clone(),
-                |inputs| driver_f32.run::<GoldilocksExt2>(inputs, &mut GenStore::default()),
+                |inputs| driver_f32.run(inputs, &mut GenStore::default()),
                 criterion::BatchSize::SmallInput,
             );
         });
@@ -271,7 +255,7 @@ fn inference(c: &mut Criterion) {
         group.bench_function(format!("{name}/Element"), |bencher| {
             bencher.iter_batched(
                 || inputs_elt.clone(),
-                |inputs| driver_elt.run::<GoldilocksExt2>(inputs, &mut GenStore::default()),
+                |inputs| driver_elt.run(inputs, &mut GenStore::default()),
                 criterion::BatchSize::SmallInput,
             );
         });

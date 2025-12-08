@@ -229,7 +229,10 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     info!("gateway URL: {gw_url}");
     info!("operator address: {address}");
     info!("worker unique name: {worker_name}");
-    info!("max job size: {}", humansize::format_size(max_job_size, humansize::BINARY));
+    info!(
+        "max job size: {}",
+        humansize::format_size(max_job_size, humansize::BINARY)
+    );
 
     let WorkerResources {
         mut store,
@@ -260,7 +263,10 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
                     if let Err(submit_err) = conn.submit_error(partial.job_id, &err_msg) {
                         error!("failed to submit error to gateway: {submit_err:?}");
                     } else {
-                        info!("submitted deserialization error for job #{}", partial.job_id);
+                        info!(
+                            "submitted deserialization error for job #{}",
+                            partial.job_id
+                        );
                     }
                 } else {
                     error!("could not extract job_id from malformed response to report error");

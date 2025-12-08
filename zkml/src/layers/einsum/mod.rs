@@ -242,7 +242,7 @@ impl<N> Evaluate<N> for EinSum<N>
 where
     N: TensorTypeParam,
 {
-    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<N>]) -> Result<LayerOut<N, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<N>]) -> Result<LayerOut<N>> {
         let outputs = self.evaluate_internal(inputs)?;
         Ok(LayerOut::from_vec(outputs))
     }
@@ -381,7 +381,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = step_data.input_tensors()?;

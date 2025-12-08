@@ -345,10 +345,7 @@ impl<N: TensorTypeParam> OpInfo for RMSNorm<N> {
 }
 
 impl Evaluate<f32> for RMSNorm<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> anyhow::Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> anyhow::Result<LayerOut<f32>> {
         ensure!(inputs.len() == 1);
         let input = inputs[0];
         // Check that the final dimension of the input matches the expected dim_size
@@ -377,10 +374,7 @@ impl Evaluate<f32> for RMSNorm<f32> {
 }
 
 impl Evaluate<Element> for RMSNorm<Element> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
         // First we check to see if there is any quant_info, if not error
         ensure!(
             self.quant_info.is_some(),
@@ -724,7 +718,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let input_tensors = step_data.input_tensors()?;
@@ -747,7 +741,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let output_tensors = step_data.output_tensors()?;
         ensure!(
@@ -1172,7 +1166,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ff_ext::GoldilocksExt2;
     use tenstore::GenStore;
 
     use crate::{
@@ -1201,13 +1194,11 @@ mod tests {
         }
     }
 
-    type E = GoldilocksExt2;
-
     #[test]
     fn test_rmsnorm() {
         let rmsnorm = RMSNorm::random(1024, None);
         let input = Tensor::<f32>::new(vec![1, 1024].into(), vec![0.0; 1024]).unwrap();
-        let output = rmsnorm.evaluate::<E>(&[&input.as_wrapped()]).unwrap();
+        let output = rmsnorm.evaluate(&[&input.as_wrapped()]).unwrap();
         assert_eq!(
             output.outputs[0].shape().clone(),
             vec![1_usize, 1024].into()
@@ -1230,13 +1221,13 @@ mod tests {
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = rmsnorm
-            .evaluate::<E>(&[&dequant_input.as_wrapped()])
+            .evaluate(&[&dequant_input.as_wrapped()])
             .unwrap()
             .outputs[0]
             .clone();
 
         let quant_output = quant_rmsnorm
-            .evaluate::<E>(&[&quant_tensor.as_wrapped()])
+            .evaluate(&[&quant_tensor.as_wrapped()])
             .unwrap()
             .outputs[0]
             .clone();

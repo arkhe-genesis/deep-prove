@@ -126,7 +126,7 @@ impl<N: TensorTypeParam> AttentionMask<N> {
 }
 
 impl<T: TensorTypeParam> Evaluate<T> for AttentionMask<T> {
-    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T>> {
         inputs
             .iter()
             .map(|input| self.evaluate_internal(input))
@@ -332,7 +332,7 @@ where
         node_id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = step_data.input_tensors()?;

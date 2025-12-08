@@ -49,17 +49,17 @@ pub enum InferenceEngine {
 }
 
 impl InferenceEngine {
-    pub fn run<E: ExtensionField>(
+    pub fn run(
         &self,
         mut input: Vec<Tensor<Element>>,
         store: &mut GenStore,
-    ) -> anyhow::Result<Trace<E, Element>> {
+    ) -> anyhow::Result<Trace<Element>> {
         match self {
             InferenceEngine::Generic(model) => model.run(input, store),
             InferenceEngine::LLM(driver) => {
                 ensure!(
                     input.len() == 1,
-                    "LLM inference only supports one sequnce of tokens - batch inference is not supported"
+                    "LLM inference only supports one sequence of tokens - batch inference is not supported"
                 );
                 let input = input.pop().expect("size validated above");
                 driver.run_elements(input, store)

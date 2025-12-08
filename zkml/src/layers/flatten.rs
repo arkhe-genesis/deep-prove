@@ -66,7 +66,7 @@ impl<T> Evaluate<T> for Flatten
 where
     T: TensorTypeParam,
 {
-    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating reshape layer"
@@ -101,7 +101,6 @@ impl PadOp for Flatten {
 
 #[cfg(test)]
 mod tests {
-    use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::ops::Range;
 
@@ -115,7 +114,7 @@ mod tests {
             let expected = input.to_flatten();
 
             let layer = Flatten(false);
-                let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).expect("flatten evaluation must be successful");
+                let computed = layer.evaluate(&[&input.as_wrapped()]).expect("flatten evaluation must be successful");
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
@@ -125,7 +124,7 @@ mod tests {
             let expected = input.to_flatten();
 
             let layer = Flatten(false);
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).expect("flatten evaluation must be successful");
+            let computed = layer.evaluate(&[&input.as_wrapped()]).expect("flatten evaluation must be successful");
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }

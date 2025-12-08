@@ -321,7 +321,7 @@ impl ModelChunk {
         &self,
         mut edges: impl Iterator<Item = &'b EdgeId>,
         commitment_ctx: &CommitmentProverCtx<E, PCS>,
-        chunk_trace: &'d Trace<E, Element>,
+        chunk_trace: &'d Trace<Element>,
         group_type: GroupType,
     ) -> anyhow::Result<PCS::CommitmentWithWitness>
     where
@@ -366,7 +366,7 @@ impl ModelChunk {
     pub(crate) fn commitments<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
         &self,
         commitment_ctx: &CommitmentProverCtx<E, PCS>,
-        full_trace: &Trace<E, Element>,
+        full_trace: &Trace<Element>,
         group_type: GroupType,
     ) -> anyhow::Result<BTreeMap<ChunkID, PCS::CommitmentWithWitness>>
     where
@@ -488,10 +488,10 @@ impl ModelChunk {
     }
 
     // derive the trace for chunk `self` from `full_trace`
-    pub(crate) fn chunk_trace<E: ExtensionField>(
+    pub(crate) fn chunk_trace(
         &self,
-        full_trace: &Trace<E, Element>,
-    ) -> anyhow::Result<Trace<E, Element>> {
+        full_trace: &Trace<Element>,
+    ) -> anyhow::Result<Trace<Element>> {
         let steps = self
             .subgraph
             .inner_nodes()

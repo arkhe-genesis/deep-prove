@@ -507,8 +507,6 @@ mod tests {
     use super::*;
     use ff_ext::GoldilocksExt2;
 
-    type F = GoldilocksExt2;
-
     #[test]
     fn test_mean_subtraction_matrix() {
         let mut rng = rng_from_env_or_random();
@@ -615,7 +613,7 @@ mod tests {
         let tensor = Tensor::new(vec![input_tokens.len()].into(), input_tokens.clone())?;
         let mut store = GenStore::default();
 
-        let trace = model.run::<F>(vec![tensor.clone()], &mut store)?;
+        let trace = model.run(vec![tensor.clone()], &mut store)?;
         // Get the final node of the Model, we will compare the inputs to this node before and after the transformation (we compare the inputs because the outputs of this layer are tokens
         // and it may be the case that we would get the same tokens out but the actual logits are different)
         let last_model_node_id = model
@@ -634,7 +632,7 @@ mod tests {
         // Now we generate the post-transformation trace and extract the logits step data
         let mut store = GenStore::default();
 
-        let new_trace = model.run::<F>(vec![tensor.clone()], &mut store)?;
+        let new_trace = model.run(vec![tensor.clone()], &mut store)?;
 
         let post_transform_final_step = new_trace.get_step(&last_model_node_id).unwrap();
         let post_transform_inputs = post_transform_final_step.input_tensors().unwrap();
@@ -674,8 +672,7 @@ mod tests {
 
         let (driver, _metadata) = driver.into_provable_llm(Some(conf))?;
         let input_tensors = driver.tokens_to_tensor(&user_tokens)?;
-        let trace =
-            driver.run_elements::<GoldilocksExt2>(input_tensors, &mut GenStore::default())?;
+        let trace = driver.run_elements(input_tensors, &mut GenStore::default())?;
 
         let (prover_ctx, verifier_ctx) = driver
             .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?

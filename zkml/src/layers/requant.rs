@@ -146,10 +146,7 @@ impl OpInfo for Requant {
 }
 
 impl Evaluate<Element> for Requant {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
         let max_abs_val: Element = 1 << self.intermediate_bit_size;
         let rounding: Element = 1 << (self.shift() - 1);
         let shift = self.shift().try_into().context("Shift too large")?;
@@ -444,7 +441,7 @@ where
         id: NodeId,
         ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        _step_data: &Step<E, Element>,
+        _step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let claim = self.prove_step(prover, last_claims[0], ctx, id)?;
@@ -456,7 +453,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors()?;
         ensure!(
@@ -1090,7 +1087,6 @@ impl<E: ExtensionField> RequantCtx<E> {
 
 #[cfg(test)]
 mod tests {
-    use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use tenstore::GenStore;
 
@@ -1176,7 +1172,7 @@ mod tests {
         ) {
             let layer = Requant::from_multiplier(2.0, 8);
             let wtensor = tensor.as_wrapped();
-            let computed = layer.evaluate::<GoldilocksExt2>(&[&wtensor]).unwrap().outputs;
+            let computed = layer.evaluate(&[&wtensor]).unwrap().outputs;
             let expected = requant_reference(&layer, &[&tensor]).unwrap();
 
             prop_assert_eq!(&expected, &computed.into_iter().map(|t| t.to_native()).collect::<Vec<_>>());

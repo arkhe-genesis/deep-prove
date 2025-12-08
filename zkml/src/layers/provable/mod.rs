@@ -31,9 +31,8 @@ use transcript::Transcript;
 /// Enum if the output of evaluating a layer returns extra data needed during proving.
 /// This should only be implemented for quantised layers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 #[allow(clippy::large_enum_variant)]
-pub enum ProvingData<E: ExtensionField> {
+pub enum ProvingData {
     /// Variant for extra data used in proving that we compute during evalaution of quantised convolution.
     Convolution(ConvFFTData),
     /// Variant for extra data used to prove [Softmax][`crate::layers::transformer::softmax::Softmax`] that we compute anyway during quantised evaluation.
@@ -41,7 +40,7 @@ pub enum ProvingData<E: ExtensionField> {
     /// Variant used for extra data used to prove [LayerNorm][`crate::layers::transformer::layernorm::LayerNorm`]
     LayerNorm(LayerNormData),
     /// Variant used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
-    ArgMax(ArgmaxData<E>),
+    ArgMax(ArgmaxData),
     /// Variant used for extra data used to prove activation layer
     Activation(ActivationData),
     /// Variant used when no extra data is returned.
@@ -67,17 +66,16 @@ pub enum ProvingData<E: ExtensionField> {
 pub struct TrackedDataId(String);
 
 #[derive(Clone, Debug)]
-pub struct LayerOut<T, E>
+pub struct LayerOut<T>
 where
     T: TensorTypeParam,
-    E: ExtensionField,
 {
     pub(crate) outputs: Vec<WrappedTensor<T>>,
-    pub(crate) proving_data: ProvingData<E>,
+    pub(crate) proving_data: ProvingData,
     pub(crate) tracked_layer_data: HashMap<TrackedDataId, WrappedTensor<T>>,
 }
 
-impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
+impl<T: TensorTypeParam> LayerOut<T> {
     pub(crate) fn from_vec(out: Vec<WrappedTensor<T>>) -> Self {
         Self {
             outputs: out,
@@ -86,7 +84,7 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
         }
     }
 
-    pub(crate) fn with_proving_data(self, data: ProvingData<E>) -> Self {
+    pub(crate) fn with_proving_data(self, data: ProvingData) -> Self {
         Self {
             outputs: self.outputs,
             proving_data: data,
@@ -129,7 +127,7 @@ impl<T: TensorTypeParam, E: ExtensionField> LayerOut<T, E> {
         }
     }
 
-    pub fn try_argmax_data(&self) -> Option<&ArgmaxData<E>> {
+    pub fn try_argmax_data(&self) -> Option<&ArgmaxData> {
         match self.proving_data {
             ProvingData::ArgMax(ref argmax_data) => Some(argmax_data),
             _ => None,
@@ -165,7 +163,7 @@ pub trait OpInfo {
 
 pub trait Evaluate<T: TensorTypeParam> {
     /// Evaluates the operation given any inputs tensors and constant inputs.
-    fn evaluate<E: ExtensionField>(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T, E>>;
+    fn evaluate(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T>>;
 }
 
 /// Helper method employed to call `Evaluate::evaluate` when there are no `unpadded_input_shapes`
@@ -173,7 +171,7 @@ pub trait Evaluate<T: TensorTypeParam> {
 pub fn evaluate_layer<E: ExtensionField, T: TensorTypeParam, O: Evaluate<T>>(
     layer: &O,
     inputs: &[&WrappedTensor<T>],
-) -> Result<LayerOut<T, E>> {
+) -> Result<LayerOut<T>> {
     layer.evaluate(inputs)
 }
 
@@ -297,7 +295,7 @@ where
         _node_id: NodeId,
         _ctx: &'b Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        _step_data: &Step<E, Element>,
+        _step_data: &Step<Element>,
         _prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
@@ -313,7 +311,7 @@ where
         &self,
         _id: NodeId,
         _ctx: &ProverContext<E, PCS>,
-        _step_data: &Step<E, Element>,
+        _step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         Ok(Default::default())
     }

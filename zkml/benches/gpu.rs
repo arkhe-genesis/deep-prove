@@ -1,6 +1,5 @@
 use std::ops::Range;
 
-use ff_ext::ExtensionField;
 use zkml::{layers::provable::LayerOut, tensor::TensorTypeParam};
 
 const DATA_SIZE_POWS: Range<i32> = 7..13;
@@ -24,10 +23,9 @@ fn sizes(range: Range<i32>) -> impl Iterator<Item = Args> {
 /// otherwise the benchmark is for the time it takes to schedule the work, not
 /// to finish it. This has the unfortunate downside of including the time to
 /// transfer the data to the GPU.
-fn get_results<T, E>(out: LayerOut<T, E>) -> Vec<Vec<T>>
+fn get_results<T>(out: LayerOut<T>) -> Vec<Vec<T>>
 where
     T: TensorTypeParam,
-    E: ExtensionField,
 {
     out.outputs()
         .iter()
@@ -37,7 +35,6 @@ where
 
 #[divan::bench_group]
 mod add_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         ScalingFactor, Shape, Tensor,
         layers::{add::Add, provable::Evaluate},
@@ -70,15 +67,11 @@ mod add_layer {
             .quantized_op;
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Add should succeed");
+        let out = layer.evaluate(&[&input]).expect("Add should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Add should succeed");
+            let out = layer.evaluate(&[&input]).expect("Add should succeed");
             get_results(out)
         });
     }
@@ -97,15 +90,11 @@ mod add_layer {
         );
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Add should succeed");
+        let out = layer.evaluate(&[&input]).expect("Add should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Add should succeed");
+            let out = layer.evaluate(&[&input]).expect("Add should succeed");
             get_results(out)
         });
     }
@@ -115,7 +104,6 @@ mod add_layer {
 mod convolution_layer {
     use std::ops::Range;
 
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape, Tensor,
         layers::{convolution::Convolution, provable::Evaluate},
@@ -162,13 +150,13 @@ mod convolution_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Convolution should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("Convolution should succeed");
             get_results(out)
         });
@@ -190,13 +178,13 @@ mod convolution_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Convolution should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("Convolution should succeed");
             get_results(out)
         });
@@ -205,7 +193,6 @@ mod convolution_layer {
 
 #[divan::bench_group]
 mod embeddings_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::embeddings::Embeddings},
@@ -234,13 +221,13 @@ mod embeddings_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Embeddings should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("Embeddings should succeed");
             get_results(out)
         });
@@ -258,13 +245,13 @@ mod embeddings_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Embeddings should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("Embeddings should succeed");
             get_results(out)
         });
@@ -275,7 +262,6 @@ mod embeddings_layer {
 mod flatten_layer {
     use std::ops::{Range, RangeInclusive};
 
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape,
         layers::{flatten::Flatten, provable::Evaluate},
@@ -306,15 +292,11 @@ mod flatten_layer {
         let layer = Flatten::default();
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Flatten should succeed");
+        let out = layer.evaluate(&[&input]).expect("Flatten should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Flatten should succeed");
+            let out = layer.evaluate(&[&input]).expect("Flatten should succeed");
             get_results(out)
         });
     }
@@ -326,15 +308,11 @@ mod flatten_layer {
         let layer = Flatten::default();
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Flatten should succeed");
+        let out = layer.evaluate(&[&input]).expect("Flatten should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Flatten should succeed");
+            let out = layer.evaluate(&[&input]).expect("Flatten should succeed");
             get_results(out)
         });
     }
@@ -342,7 +320,6 @@ mod flatten_layer {
 
 #[divan::bench_group]
 mod gelu_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Shape,
         layers::{activation::GELU, provable::Evaluate},
@@ -358,15 +335,11 @@ mod gelu_layer {
         let layer = GELU::<f32>::new();
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("GeLU should succeed");
+        let out = layer.evaluate(&[&input]).expect("GeLU should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("GeLU should succeed");
+            let out = layer.evaluate(&[&input]).expect("GeLU should succeed");
             get_results(out)
         });
     }
@@ -374,7 +347,6 @@ mod gelu_layer {
 
 #[divan::bench_group]
 mod logits_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape,
         layers::{provable::Evaluate, transformer::logits::Logits},
@@ -394,15 +366,11 @@ mod logits_layer {
         let layer = Logits::Argmax;
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Logits should succeed");
+        let out = layer.evaluate(&[&input]).expect("Logits should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Logits should succeed");
+            let out = layer.evaluate(&[&input]).expect("Logits should succeed");
             get_results(out)
         });
     }
@@ -418,15 +386,11 @@ mod logits_layer {
         let layer = Logits::Argmax;
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Logits should succeed");
+        let out = layer.evaluate(&[&input]).expect("Logits should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Logits should succeed");
+            let out = layer.evaluate(&[&input]).expect("Logits should succeed");
             get_results(out)
         });
     }
@@ -454,13 +418,13 @@ mod logits_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Logits high rank should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("Logits high rank should succeed");
             get_results(out)
         });
@@ -476,13 +440,13 @@ mod logits_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Logits high rank should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("Logits high rank should succeed");
             get_results(out)
         });
@@ -493,7 +457,6 @@ mod logits_layer {
 mod norm_layer {
     use std::ops::Range;
 
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::layernorm::LayerNorm},
@@ -540,15 +503,11 @@ mod norm_layer {
         let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Norm should succeed");
+        let out = layer.evaluate(&[&input]).expect("Norm should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Norm should succeed");
+            let out = layer.evaluate(&[&input]).expect("Norm should succeed");
             get_results(out)
         });
     }
@@ -565,15 +524,11 @@ mod norm_layer {
         let layer = LayerNorm::<f32>::new(gamma, beta, EPS).unwrap();
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Norm should succeed");
+        let out = layer.evaluate(&[&input]).expect("Norm should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Norm should succeed");
+            let out = layer.evaluate(&[&input]).expect("Norm should succeed");
             get_results(out)
         });
     }
@@ -581,7 +536,6 @@ mod norm_layer {
 
 #[divan::bench_group]
 mod positional_absolute_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         ScalingFactor, ScalingStrategy, Shape, Tensor,
         layers::{
@@ -634,7 +588,7 @@ mod positional_absolute_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Positional absolute should succeed");
         let _ = get_results(out);
 
@@ -645,7 +599,7 @@ mod positional_absolute_layer {
             })
             .bench_refs(|layer| {
                 let out = layer
-                    .evaluate::<GoldilocksExt2>(&[&input])
+                    .evaluate(&[&input])
                     .expect("Positional absolute should succeed");
                 get_results(out)
             });
@@ -665,7 +619,7 @@ mod positional_absolute_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Positional absolute should succeed");
         let _ = get_results(out);
 
@@ -676,7 +630,7 @@ mod positional_absolute_layer {
             })
             .bench_refs(|layer| {
                 let out = layer
-                    .evaluate::<GoldilocksExt2>(&[&input])
+                    .evaluate(&[&input])
                     .expect("Positional absolute should succeed");
                 get_results(out)
             });
@@ -685,7 +639,6 @@ mod positional_absolute_layer {
 
 #[divan::bench_group]
 mod positional_rope_layer {
-    use ff_ext::GoldilocksExt2;
     use std::f32::consts::PI;
     use zkml::{
         ScalingFactor, ScalingStrategy, Shape, Tensor,
@@ -768,7 +721,7 @@ mod positional_rope_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Positional rope should succeed");
         let _ = get_results(out);
 
@@ -779,7 +732,7 @@ mod positional_rope_layer {
             })
             .bench_refs(|layer| {
                 let out = layer
-                    .evaluate::<GoldilocksExt2>(&[&input])
+                    .evaluate(&[&input])
                     .expect("Positional rope should succeed");
                 get_results(out)
             });
@@ -809,7 +762,7 @@ mod positional_rope_layer {
 
         // warm up
         let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("Positional rope should succeed");
         let _ = get_results(out);
 
@@ -820,7 +773,7 @@ mod positional_rope_layer {
             })
             .bench_refs(|layer| {
                 let out = layer
-                    .evaluate::<GoldilocksExt2>(&[&input])
+                    .evaluate(&[&input])
                     .expect("Positional rope should succeed");
                 get_results(out)
             });
@@ -829,7 +782,6 @@ mod positional_rope_layer {
 
 #[divan::bench_group]
 mod softmax_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::softmax::Softmax},
@@ -852,15 +804,11 @@ mod softmax_layer {
             .expect("Softmax quantise should succeed");
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Softmax should succeed");
+        let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed");
+            let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
             get_results(out)
         });
     }
@@ -874,15 +822,11 @@ mod softmax_layer {
         let layer = Softmax::new(size);
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Softmax should succeed");
+        let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed");
+            let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
             get_results(out)
         });
     }
@@ -890,7 +834,6 @@ mod softmax_layer {
 
 #[divan::bench_group]
 mod requant_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape,
         layers::{provable::Evaluate, requant::Requant},
@@ -907,15 +850,11 @@ mod requant_layer {
         let layer = Requant::from_multiplier(2.0, 8);
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Requant should succeed");
+        let out = layer.evaluate(&[&input]).expect("Requant should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Requant should succeed");
+            let out = layer.evaluate(&[&input]).expect("Requant should succeed");
             get_results(out)
         });
     }
@@ -923,7 +862,6 @@ mod requant_layer {
 
 #[divan::bench_group]
 mod pooling_layer {
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape,
         layers::{
@@ -947,15 +885,11 @@ mod pooling_layer {
         });
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Softmax should succeed");
+        let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed");
+            let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
             get_results(out)
         });
     }
@@ -972,15 +906,11 @@ mod pooling_layer {
         });
 
         // warm up
-        let out = layer
-            .evaluate::<GoldilocksExt2>(&[&input])
-            .expect("Softmax should succeed");
+        let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer
-                .evaluate::<GoldilocksExt2>(&[&input])
-                .expect("Softmax should succeed");
+            let out = layer.evaluate(&[&input]).expect("Softmax should succeed");
             get_results(out)
         });
     }
@@ -989,7 +919,6 @@ mod pooling_layer {
 mod einsum_layer {
     use std::ops::Range;
 
-    use ff_ext::GoldilocksExt2;
     use zkml::{
         Element, Shape, Tensor,
         layers::{einsum::EinSum, provable::Evaluate},
@@ -1028,13 +957,13 @@ mod einsum_layer {
 
         // warm up
         let out = einsum_layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("EinSum should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("EinSum should succeed");
             get_results(out)
         });
@@ -1065,13 +994,13 @@ mod einsum_layer {
 
         // warm up
         let out = einsum_layer
-            .evaluate::<GoldilocksExt2>(&[&input])
+            .evaluate(&[&input])
             .expect("EinSum should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&input])
+                .evaluate(&[&input])
                 .expect("EinSum should succeed");
             get_results(out)
         });
@@ -1091,13 +1020,13 @@ mod einsum_layer {
 
         // warm up
         let out = einsum_layer
-            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .evaluate(&[&left, &right])
             .expect("EinSum should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
+                .evaluate(&[&left, &right])
                 .expect("EinSum should succeed");
             get_results(out)
         });
@@ -1117,13 +1046,13 @@ mod einsum_layer {
 
         // warm up
         let out = einsum_layer
-            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .evaluate(&[&left, &right])
             .expect("EinSum should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
+                .evaluate(&[&left, &right])
                 .expect("EinSum should succeed");
             get_results(out)
         });
@@ -1141,13 +1070,13 @@ mod einsum_layer {
 
         // warm up
         let out = einsum_layer
-            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .evaluate(&[&left, &right])
             .expect("EinSum should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
+                .evaluate(&[&left, &right])
                 .expect("EinSum should succeed");
             get_results(out)
         });
@@ -1164,13 +1093,13 @@ mod einsum_layer {
 
         // warm up
         let out = einsum_layer
-            .evaluate::<GoldilocksExt2>(&[&left, &right])
+            .evaluate(&[&left, &right])
             .expect("EinSum should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
             let out = einsum_layer
-                .evaluate::<GoldilocksExt2>(&[&left, &right])
+                .evaluate(&[&left, &right])
                 .expect("EinSum should succeed");
             get_results(out)
         });

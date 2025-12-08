@@ -14,7 +14,6 @@ use crate::{
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Context, Result, ensure};
-use ff_ext::{ExtensionField, GoldilocksExt2};
 use itertools::izip;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -32,15 +31,14 @@ pub mod transform;
 pub use context::{ContextGraph, ModelCtx};
 pub use trace::{Step, Trace};
 
-type RunResult<N, E> = anyhow::Result<RunOutput<N, E>>;
+type RunResult<N> = anyhow::Result<RunOutput<N>>;
 
-pub struct RunOutput<N, E>
+pub struct RunOutput<N>
 where
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     outputs: Vec<TensorHandle<N>>,
-    proving_data: ProvingData<E>,
+    proving_data: ProvingData,
     tracked_data: HashMap<TrackedDataId, WrappedTensor<N>>,
 }
 
@@ -106,10 +104,9 @@ where
     input_handles: Vec<TensorHandle<N>>,
 }
 
-pub trait LayerRunner<N, I, E>
+pub trait LayerRunner<N, I>
 where
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     /// Called once per model inference run.
     ///
@@ -127,7 +124,7 @@ where
         graph: &ModelGraph<N>,
         layer: &Layer<N>,
         inputs: &I,
-    ) -> RunResult<N, E>
+    ) -> RunResult<N>
     where
         Layer<N>: Evaluate<N>;
 }
@@ -140,10 +137,9 @@ pub struct BaseRunner {
     pub store: GenStore,
 }
 
-impl<N, E> LayerRunner<N, RunInput<N>, E> for BaseRunner
+impl<N> LayerRunner<N, RunInput<N>> for BaseRunner
 where
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     fn model_inputs(
         &mut self,
@@ -159,7 +155,7 @@ where
         graph: &ModelGraph<N>,
         layer: &Layer<N>,
         inputs: &RunInput<N>,
-    ) -> RunResult<N, E>
+    ) -> RunResult<N>
     where
         Layer<N>: Evaluate<N>,
     {
@@ -287,11 +283,10 @@ where
     }
 }
 
-impl<I, N, E> LayerRunner<N, RunInput<N>, E> for StoreRunner<I, N>
+impl<I, N> LayerRunner<N, RunInput<N>> for StoreRunner<I, N>
 where
-    I: LayerRunner<N, RunInput<N>, E>,
+    I: LayerRunner<N, RunInput<N>>,
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     fn model_inputs(
         &mut self,
@@ -313,7 +308,7 @@ where
         graph: &ModelGraph<N>,
         layer: &Layer<N>,
         inputs: &RunInput<N>,
-    ) -> RunResult<N, E>
+    ) -> RunResult<N>
     where
         Layer<N>: Evaluate<N>,
     {
@@ -335,11 +330,10 @@ pub struct TrackerRunner<'a, I> {
     pub tracker: &'a mut InferenceTracker,
 }
 
-impl<'a, I, N, E> LayerRunner<N, RunInput<N>, E> for TrackerRunner<'a, I>
+impl<'a, I, N> LayerRunner<N, RunInput<N>> for TrackerRunner<'a, I>
 where
-    I: LayerRunner<N, RunInput<N>, E>,
+    I: LayerRunner<N, RunInput<N>>,
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     fn model_inputs(
         &mut self,
@@ -361,7 +355,7 @@ where
         graph: &ModelGraph<N>,
         layer: &Layer<N>,
         inputs: &RunInput<N>,
-    ) -> RunResult<N, E>
+    ) -> RunResult<N>
     where
         Layer<N>: Evaluate<N>,
     {
@@ -386,11 +380,10 @@ pub struct SanityCheckRunner<I> {
     pub inner: I,
 }
 
-impl<I, N, E> LayerRunner<N, RunInput<N>, E> for SanityCheckRunner<I>
+impl<I, N> LayerRunner<N, RunInput<N>> for SanityCheckRunner<I>
 where
-    I: LayerRunner<N, RunInput<N>, E>,
+    I: LayerRunner<N, RunInput<N>>,
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     fn model_inputs(
         &mut self,
@@ -412,7 +405,7 @@ where
         graph: &ModelGraph<N>,
         layer: &Layer<N>,
         inputs: &RunInput<N>,
-    ) -> RunResult<N, E>
+    ) -> RunResult<N>
     where
         Layer<N>: Evaluate<N>,
     {
@@ -459,31 +452,28 @@ where
 ///
 /// This runner may be used only for a single model run, duplicate layer results
 /// will cause the runner to panic.
-struct TraceRunner<I, N, E>
+struct TraceRunner<I, N>
 where
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     inner: I,
-    trace: Trace<E, N>,
+    trace: Trace<N>,
 }
 
-impl<I, N, E> TraceRunner<I, N, E>
+impl<I, N> TraceRunner<I, N>
 where
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     /// Consumes this runner and returns its parts.
-    fn into_parts(self) -> (I, Trace<E, N>) {
+    fn into_parts(self) -> (I, Trace<N>) {
         (self.inner, self.trace)
     }
 }
 
-impl<I, N, E> LayerRunner<N, RunInput<N>, E> for TraceRunner<I, N, E>
+impl<I, N> LayerRunner<N, RunInput<N>> for TraceRunner<I, N>
 where
-    I: LayerRunner<N, RunInput<N>, E>,
+    I: LayerRunner<N, RunInput<N>>,
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     fn model_inputs(
         &mut self,
@@ -500,7 +490,7 @@ where
         graph: &ModelGraph<N>,
         layer: &Layer<N>,
         inputs: &RunInput<N>,
-    ) -> RunResult<N, E>
+    ) -> RunResult<N>
     where
         Layer<N>: Evaluate<N>,
     {
@@ -622,11 +612,10 @@ where
     }
 }
 
-impl<I, N, E> LayerRunner<N, (), E> for HandleLifetimeRunner<I, N>
+impl<I, N> LayerRunner<N, ()> for HandleLifetimeRunner<I, N>
 where
-    I: LayerRunner<N, RunInput<N>, E>,
+    I: LayerRunner<N, RunInput<N>>,
     N: TensorTypeParam,
-    E: ExtensionField,
 {
     fn model_inputs(
         &mut self,
@@ -680,7 +669,7 @@ where
         graph: &ModelGraph<N>,
         layer: &Layer<N>,
         _inputs: &(),
-    ) -> RunResult<N, E>
+    ) -> RunResult<N>
     where
         Layer<N>: Evaluate<N>,
     {
@@ -1203,7 +1192,7 @@ impl Model<f32> {
         #[cfg(test)]
         let runner = SanityCheckRunner { inner: runner };
         let mut runner = HandleLifetimeRunner::new(runner, &self.graph);
-        self.run_with_runner::<GoldilocksExt2, _>(&mut runner, input_handles)?;
+        self.run_with_runner(&mut runner, input_handles)?;
 
         runner.model_outputs(&self.graph)
     }
@@ -1211,15 +1200,14 @@ impl Model<f32> {
 
 impl<N: TensorTypeParam> Model<N> {
     /// Run a single iteration of the model using the provided `runner`.
-    pub fn run_with_runner<E, R>(
+    pub fn run_with_runner<R>(
         &self,
         runner: &mut R,
         inputs: Vec<TensorHandle<N>>,
     ) -> anyhow::Result<()>
     where
-        E: ExtensionField,
         Layer<N>: Evaluate<N>,
-        R: LayerRunner<N, (), E>,
+        R: LayerRunner<N, ()>,
     {
         let inputs = inputs
             .into_iter()
@@ -1242,13 +1230,8 @@ impl<N: TensorTypeParam> Model<N> {
     }
 
     /// Performs a single run of the model, returning the produced trace.
-    pub fn run<E>(
-        &self,
-        inputs: Vec<Tensor<N>>,
-        store: &mut GenStore,
-    ) -> anyhow::Result<Trace<E, N>>
+    pub fn run(&self, inputs: Vec<Tensor<N>>, store: &mut GenStore) -> anyhow::Result<Trace<N>>
     where
-        E: ExtensionField,
         Layer<N>: Evaluate<N>,
     {
         let input_handles = tensor_to_handles(&inputs, &self.graph, store)?;
@@ -1265,7 +1248,7 @@ impl<N: TensorTypeParam> Model<N> {
         };
         let mut runner = HandleLifetimeRunner::new(runner, &self.graph);
 
-        self.run_with_runner::<E, _>(&mut runner, input_handles)?;
+        self.run_with_runner(&mut runner, input_handles)?;
 
         let trace_runner = runner.into_inner();
         let (_store_runner, mut trace) = trace_runner.into_parts();
@@ -1482,7 +1465,7 @@ pub(crate) mod test {
     #[test]
     fn test_model_long() {
         let (model, inputs) = Model::random(3).unwrap();
-        model.run::<F>(inputs, &mut Default::default()).unwrap();
+        model.run(inputs, &mut Default::default()).unwrap();
     }
 
     #[test]
@@ -1519,9 +1502,7 @@ pub(crate) mod test {
         let input = Tensor::random(&input_shape);
         let inputs_padded = model.prepare_inputs(vec![input]).unwrap();
 
-        let _ = model
-            .run::<F>(inputs_padded, &mut Default::default())
-            .unwrap();
+        let _ = model.run(inputs_padded, &mut Default::default()).unwrap();
     }
 
     #[test]
@@ -1557,7 +1538,7 @@ pub(crate) mod test {
 
         let mut store = GenStore::default();
         let input = input.into_native();
-        let trace = model.run::<F>(vec![input], &mut store).unwrap();
+        let trace = model.run(vec![input], &mut store).unwrap();
         assert_eq!(trace.steps.len(), 2);
         // Verify first step
 
@@ -1631,7 +1612,7 @@ pub(crate) mod test {
         model.automatic_output_labelling().unwrap();
         model.describe();
         let mut store = GenStore::default();
-        let trace = model.run::<F>(vec![input], &mut store).unwrap();
+        let trace = model.run(vec![input], &mut store).unwrap();
         let (prover_ctx, verifier_ctx) = model
             .generate_contexts::<F, Pcs<F>>()
             .expect("Unable to generate contexts");
@@ -1643,7 +1624,6 @@ pub(crate) mod test {
         verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
 
-    type E = GoldilocksExt2;
     type T = BasicTranscript<GoldilocksExt2>;
     type N = Element;
 
@@ -1700,7 +1680,7 @@ pub(crate) mod test {
         let input = random_vector(input_shape.iter().product());
         let input_tensor = Tensor::new(input_shape, input).unwrap();
         let trace = model
-            .run::<E>(vec![input_tensor], &mut Default::default())
+            .run(vec![input_tensor], &mut Default::default())
             .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
@@ -1713,7 +1693,7 @@ pub(crate) mod test {
 
         let input_tensor = Tensor::random(&input_shape);
         let trace = model
-            .run::<E>(vec![input_tensor], &mut Default::default())
+            .run(vec![input_tensor], &mut Default::default())
             .unwrap();
         assert_eq!(trace.steps.len(), 3);
     }
@@ -1858,9 +1838,7 @@ pub(crate) mod test {
         model.add_edge(relu2, output_node_ids[0], (0, 0)).unwrap();
         model.add_edge(relu2, output_node_ids[1], (1, 0)).unwrap();
         model.add_edge(relu3, output_node_ids[2], (0, 0)).unwrap();
-        model
-            .run::<GoldilocksExt2>(input_tensors, &mut Default::default())
-            .unwrap();
+        model.run(input_tensors, &mut Default::default()).unwrap();
     }
 
     #[test]

@@ -175,9 +175,7 @@ fn convolution_test_simple_element() {
         .unwrap()
         .prepared_for_fft(input.shape())
         .unwrap();
-    let result = conv
-        .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
-        .unwrap();
+    let result = conv.evaluate(&[&input.as_wrapped()]).unwrap();
     let fft_result = result.outputs()[0];
 
     check_tensor_consistency(&conv2d_result, &fft_result.to_native());
@@ -210,9 +208,7 @@ fn convolution_test_random_element() {
         .unwrap()
         .prepared_for_fft(input.shape())
         .unwrap();
-    let result = conv
-        .evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])
-        .unwrap();
+    let result = conv.evaluate(&[&input.as_wrapped()]).unwrap();
     let fft_result = result.outputs()[0];
 
     check_tensor_consistency(&conv2d_result, &fft_result.to_native());
@@ -301,7 +297,7 @@ proptest! {
         let expected = input.input.conv2d(&input.kernels, &input.bias, stride).unwrap();
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap();
-        let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
+        let result = conv.evaluate(&[&input.input.as_wrapped()]).unwrap();
 
         #[cfg(not(feature = "gpu"))]
         const THRESHOLD: f32 = 1e-3;
@@ -323,7 +319,7 @@ proptest! {
         let expected = input.input.conv2d(&input.kernels, &input.bias, stride).unwrap();
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap();
-        let result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
+        let result = conv.evaluate(&[&input.input.as_wrapped()]).unwrap();
 
         #[cfg(not(feature = "gpu"))]
         const THRESHOLD: f32 = 1e-3;
@@ -346,7 +342,7 @@ proptest! {
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap()
         .prepared_for_fft(input.input.shape()).unwrap();
-        let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
+        let fft_result = conv.evaluate(&[&input.input.as_wrapped()]).unwrap();
 
         // Remove the leading dimension, the fft only supports 3d tensors.
         let conv2d_result = conv2d_result.squeeze(0).unwrap();
@@ -359,7 +355,7 @@ proptest! {
 
         let conv = Convolution::new(input.kernels.clone(), input.bias.clone()).unwrap()
         .prepared_for_fft(input.input.shape()).unwrap();
-        let fft_result = conv.evaluate::<GoldilocksExt2>(&[&input.input.as_wrapped()]).unwrap();
+        let fft_result = conv.evaluate(&[&input.input.as_wrapped()]).unwrap();
 
         // Remove the leading dimension, the fft only supports 3d tensors.
         let conv2d_result = conv2d_result.squeeze(0).unwrap();

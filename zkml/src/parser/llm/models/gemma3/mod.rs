@@ -241,7 +241,6 @@ pub mod tests {
     use std::{collections::HashMap, fs::File, io::BufReader};
 
     use anyhow::{Context, ensure};
-    use ff_ext::GoldilocksExt2;
     use serde::{Deserialize, Serialize};
     use tenstore::GenStore;
 
@@ -489,7 +488,7 @@ pub mod tests {
                 logit.input_token.iter().map(|x| *x as f32).collect(),
             )?;
             let mut store = GenStore::default();
-            let trace = model.run::<GoldilocksExt2>(vec![input], &mut store)?;
+            let trace = model.run(vec![input], &mut store)?;
             let deep_prove_logits = trace
                 .get_step(&argmax_layer_id)
                 .ok_or(anyhow::anyhow!(
@@ -629,7 +628,7 @@ pub mod tests {
         )?;
 
         let mut store = GenStore::default();
-        let trace = model.run::<GoldilocksExt2>(vec![input], &mut store)?;
+        let trace = model.run(vec![input], &mut store)?;
 
         // Compare embedding outputs
         let python_embeddings = intermediates

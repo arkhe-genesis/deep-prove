@@ -354,10 +354,7 @@ where
     N: TensorTypeParam,
     Add<N>: Evaluate<N>,
 {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<N>],
-    ) -> anyhow::Result<LayerOut<N, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<N>]) -> anyhow::Result<LayerOut<N>> {
         ensure!(
             inputs.len() == 1,
             "Positional layer expects 1 input, got {}",
@@ -661,7 +658,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(

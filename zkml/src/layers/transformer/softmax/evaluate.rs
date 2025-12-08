@@ -52,10 +52,10 @@ impl Softmax<Element> {
             .sub(dim_maxes)
     }
 
-    pub(crate) fn evaluate_internal<E: ExtensionField>(
+    pub(crate) fn evaluate_internal(
         &self,
         inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element, E>> {
+    ) -> Result<LayerOut<Element>> {
         // First we check that we have some quantisation info.
         ensure!(
             self.quant_info.is_some(),

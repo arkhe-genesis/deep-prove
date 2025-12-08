@@ -144,10 +144,7 @@ impl Add<Element> {
 }
 
 impl Evaluate<f32> for Add<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> anyhow::Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> anyhow::Result<LayerOut<f32>> {
         let left = inputs[0];
         let shape = left.shape();
         let right = if inputs.len() == 2 {
@@ -182,10 +179,7 @@ impl Evaluate<f32> for Add<f32> {
 }
 
 impl Evaluate<Element> for Add<Element> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> anyhow::Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> anyhow::Result<LayerOut<Element>> {
         let quant_info = self
             .quant_info
             .as_ref()
@@ -527,7 +521,7 @@ where
         node_id: NodeId,
         _ctx: &Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
@@ -603,18 +597,16 @@ where
 mod test {
     use std::{fmt::Debug, ops::Range};
 
-    use ff_ext::GoldilocksExt2;
+    use proptest::prelude::*;
     use tenstore::{GenStore, StorageKey};
 
+    use super::*;
     use crate::{
         Element,
         layers::Layer,
         model::{Model, test::prove_model},
         tensor::is_close_with_tolerance,
     };
-    use proptest::prelude::*;
-
-    use super::*;
 
     #[test]
     fn test_add_quantization() {
@@ -632,7 +624,7 @@ mod test {
 
         let qadd = add.quantize(&[s1, s2], s3).unwrap().quantized_op;
         let qadd_result = qadd
-            .evaluate::<GoldilocksExt2>(&[&qt1.as_wrapped(), &qt2.as_wrapped()])
+            .evaluate(&[&qt1.as_wrapped(), &qt2.as_wrapped()])
             .unwrap();
 
         let quant_info = qadd.quant_info.as_ref().unwrap();
@@ -735,10 +727,10 @@ mod test {
                 // In case of two layers the operand is used as the 2nd input
                 let add = Add::<f32>::new();
 
-                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap()
+                add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap()
             } else {
                 let add = Add::<f32>::new_with(operand, unpadded_shape);
-                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).unwrap()
+                add.evaluate(&[&input.as_wrapped()]).unwrap()
             };
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
@@ -766,11 +758,11 @@ mod test {
                 let mut add = Add::<Element>::new();
                 add.quant_info = Some(quant_info);
 
-                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap()
+                add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap()
             } else {
                 let mut add = Add::<Element>::new_with(operand, unpadded_shape);
                 add.quant_info = Some(quant_info);
-                add.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).unwrap()
+                add.evaluate(&[&input.as_wrapped()]).unwrap()
             };
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());

@@ -13,7 +13,6 @@ use crate::{
 };
 use anyhow::{Result, anyhow, ensure};
 use average::{Estimate, Max, Min, Quantile, Variance};
-use ff_ext::GoldilocksExt2;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -163,7 +162,7 @@ impl ScalingStrategy for InferenceObserver {
             #[cfg(test)]
             let runner = SanityCheckRunner { inner: runner };
             let mut runner = HandleLifetimeRunner::new(runner, model.graph());
-            model.run_with_runner::<GoldilocksExt2, _>(&mut runner, input_handles)?;
+            model.run_with_runner(&mut runner, input_handles)?;
         }
 
         // Get the scaling factor of the input

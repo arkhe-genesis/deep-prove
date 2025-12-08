@@ -420,7 +420,7 @@ impl<N: TensorTypeParam> Rope<N> {
         &self,
         node_id: NodeId,
         output_claim: &Claim<E>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>>
     where
@@ -590,11 +590,11 @@ impl<N: TensorTypeParam> Rope<N> {
 }
 
 impl<N> Rope<N> {
-    pub(super) fn evaluate<E: ExtensionField>(
+    pub(super) fn evaluate(
         &self,
         input: &WrappedTensor<N>,
         positional_cache: &Arc<Mutex<PositionalCache>>,
-    ) -> Result<LayerOut<N, E>>
+    ) -> Result<LayerOut<N>>
     where
         N: TensorTypeParam,
         Add<N>: Evaluate<N>,
@@ -1152,8 +1152,8 @@ mod tests {
             .collect_vec();
 
         // run quantized model and get the output
-        let trace = quantized_model.run::<GoldilocksExt2>(inputs.clone(), &mut store)?;
-        let io = trace.to_verifier_io()?;
+        let trace = quantized_model.run(inputs.clone(), &mut store)?;
+        let io = trace.to_verifier_io::<GoldilocksExt2>()?;
 
         // pad the model
         let padded_model = pad_model(quantized_model)?;
@@ -1161,10 +1161,9 @@ mod tests {
         let padded_inputs = padded_model.prepare_inputs(inputs)?;
 
         // run the padded model
-        let padded_trace =
-            padded_model.run::<GoldilocksExt2>(padded_inputs, &mut Default::default())?;
+        let padded_trace = padded_model.run(padded_inputs, &mut Default::default())?;
 
-        let padded_io = padded_trace.to_verifier_io()?;
+        let padded_io = padded_trace.to_verifier_io::<GoldilocksExt2>()?;
 
         let output = &io.output[0];
         let padded_output = &padded_io.output[0];
@@ -1248,7 +1247,7 @@ mod tests {
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
 
             let out = layer
-                .evaluate::<GoldilocksExt2>(&input.as_wrapped(), &cache)
+                .evaluate(&input.as_wrapped(), &cache)
                 .expect("rope evaluate").outputs.into_iter().next().unwrap();
 
 
@@ -1289,7 +1288,7 @@ mod tests {
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
 
             let out_q = layer_q
-                .evaluate::<GoldilocksExt2>(&input_q.as_wrapped(), &cache)
+                .evaluate(&input_q.as_wrapped(), &cache)
                 .expect("rope evaluate quant").outputs.into_iter().next().unwrap();
 
             prop_assert_eq!(out_q.shape(), vec![seq_len, embedding_size].into());

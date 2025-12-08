@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use ff_ext::{ExtensionField, GoldilocksExt2};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tenstore::GenStore;
@@ -23,6 +22,7 @@ use zkml::{
         },
         safe::RawSafeTensors,
     },
+    tensor::TensorTypeParam,
 };
 
 /// Section separator for debug output
@@ -134,13 +134,12 @@ fn get_next_token(logits: &[f32], vocab_size: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn extract_logits_from_trace<E, N, F>(
+fn extract_logits_from_trace<N, F>(
     driver: &Driver<N>,
-    trace: &Trace<E, N>,
+    trace: &Trace<N>,
     to_float: F,
 ) -> Result<LogitsData>
 where
-    E: ExtensionField,
     N: zkml::tensor::TensorTypeParam,
     F: Fn(&[N], zkml::graph::NodeId) -> Result<Vec<f32>>,
 {
@@ -180,7 +179,7 @@ where
 }
 
 /// Run autoregressive generation for the given driver
-fn run_autoregressive_generation<E, N, RunFn, ExtractFn>(
+fn run_autoregressive_generation<N, RunFn, ExtractFn>(
     driver: &Driver<N>,
     tokenizer: &HFTokenizer,
     initial_tokens: Vec<Token>,
@@ -190,9 +189,8 @@ fn run_autoregressive_generation<E, N, RunFn, ExtractFn>(
     extract_fn: ExtractFn,
 ) -> Result<LogitsData>
 where
-    E: ExtensionField,
-    N: zkml::tensor::TensorTypeParam,
-    RunFn: Fn(&[Token], &mut GenStore) -> Result<Trace<E, N>>,
+    N: TensorTypeParam,
+    RunFn: Fn(&[Token], &mut GenStore) -> Result<Trace<N>>,
     ExtractFn: Fn(&[N], zkml::graph::NodeId) -> Result<Vec<f32>>,
 {
     let mut generated_tokens = initial_tokens;
@@ -314,7 +312,7 @@ fn main() -> Result<()> {
         "Float",
         |tokens, store| {
             let tensor_inputs = vec![driver.tokens_to_tensor(tokens)?];
-            driver.run::<GoldilocksExt2>(tensor_inputs, store)
+            driver.run(tensor_inputs, store)
         },
         |data, _node_id| Ok(data.to_vec()),
     )?;
@@ -336,7 +334,7 @@ fn main() -> Result<()> {
         "Integer",
         |tokens, store| {
             let input_tensor = driver_int.tokens_to_tensor(tokens)?;
-            driver_int.run_elements::<GoldilocksExt2>(input_tensor, store)
+            driver_int.run_elements(input_tensor, store)
         },
         |data, node_id| {
             let scaling_factors = metadata.layer_input_scaling_factor(node_id);

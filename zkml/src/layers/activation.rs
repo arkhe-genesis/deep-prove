@@ -160,10 +160,7 @@ impl<N> GeGlu<N> {
 }
 
 impl ActivationLayer<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> Result<Vec<WrappedTensor<f32>>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> Result<Vec<WrappedTensor<f32>>> {
         match self {
             ActivationLayer::Relu(_relu) => Ok(inputs
                 .iter()
@@ -172,7 +169,7 @@ impl ActivationLayer<f32> {
             ActivationLayer::Gelu(gelu) => inputs
                 .iter()
                 .map(|input| {
-                    let mut outputs = gelu.evaluate::<E>(&[input])?.outputs;
+                    let mut outputs = gelu.evaluate(&[input])?.outputs;
                     ensure!(outputs.len() == 1);
                     Ok(outputs.pop().unwrap())
                 })
@@ -395,21 +392,16 @@ impl QuantizeOp for Activation<f32> {
 }
 
 impl Evaluate<f32> for Activation<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> Result<LayerOut<f32>> {
         match self {
-            Activation::Plain(layer) => layer
-                .evaluate::<E>(inputs)
-                .map(|outputs| LayerOut::from_vec(outputs)),
+            Activation::Plain(layer) => layer.evaluate(inputs).map(LayerOut::from_vec),
             Activation::GLU(layer) => {
                 ensure!(
                     inputs.len() == 2,
                     "Expected 2 inputs for activation layer used in GLU, found {} inputs instead",
                     inputs.len(),
                 );
-                let mut activation_outputs = layer.evaluate::<E>(&[inputs[0]])?;
+                let mut activation_outputs = layer.evaluate(&[inputs[0]])?;
                 // double-check that there is only one output
                 assert_eq!(activation_outputs.len(), 1);
                 let activation_out = activation_outputs.pop().unwrap();
@@ -427,14 +419,11 @@ impl Evaluate<f32> for Activation<f32> {
 }
 
 impl Evaluate<Element> for Activation<Element> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
         match self {
-            Activation::Plain(activation_layer) => activation_layer
-                .evaluate(inputs)
-                .map(|outputs| LayerOut::from_vec(outputs)),
+            Activation::Plain(activation_layer) => {
+                activation_layer.evaluate(inputs).map(LayerOut::from_vec)
+            }
             Activation::GLU(activation_layer) => {
                 ensure!(
                     inputs.len() == 2,
@@ -534,7 +523,7 @@ where
         id: NodeId,
         ctx: &'b Self::Ctx,
         last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
         let inputs = &step_data.node_inputs;
@@ -549,7 +538,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
         let outputs = step_data.output_tensors()?;
         ensure!(
@@ -951,10 +940,7 @@ impl<N> GELU<N> {
 }
 
 impl Evaluate<f32> for GELU<f32> {
-    fn evaluate<E: ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> anyhow::Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> anyhow::Result<LayerOut<f32>> {
         let output_tensors: Vec<WrappedTensor<f32>> = inputs
             .par_iter()
             .map(|tensor| WrappedTensor::gelu((*tensor).clone()))
@@ -1025,7 +1011,6 @@ impl GELU<f32> {
 #[cfg(test)]
 mod test {
     use burn::tensor::activation::gelu;
-    use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
 
     use crate::{
@@ -1099,7 +1084,7 @@ mod test {
 
         let expected_output_data = input_data.iter().map(gelu_float).collect::<Vec<_>>();
 
-        let layer_out = gelu.evaluate::<GoldilocksExt2>(&[&input_tensor])?;
+        let layer_out = gelu.evaluate(&[&input_tensor])?;
         assert_eq!(layer_out.outputs().len(), 1);
         let output_tensor = &layer_out.outputs()[0];
 

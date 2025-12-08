@@ -25,7 +25,7 @@ use crate::{
     },
     model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
-    quantization::{IntoElement, TensorFielder},
+    quantization::{Fieldizer, TensorFielder},
     tensor::{TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -52,8 +52,8 @@ use witness::{InstancePaddingStrategy, RowMajorMatrix};
 pub const LOGITS_LAYER: &str = "LGIT";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArgmaxData<E> {
-    max_values: Vec<Tensor<E>>,
+pub struct ArgmaxData {
+    max_values: Vec<Tensor<Element>>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,10 +97,10 @@ pub enum Logits {
 }
 
 impl Logits {
-    fn evaluate_with_argmax_data_f32<E: ff_ext::ExtensionField>(
+    fn evaluate_with_argmax_data_f32(
         &self,
         inputs: &[&WrappedTensor<f32>],
-    ) -> anyhow::Result<(LayerOut<f32, E>, ArgmaxDataNew<f32>)> {
+    ) -> anyhow::Result<(LayerOut<f32>, ArgmaxDataNew<f32>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
             "Argmax is for tensors of rank >= 2",
@@ -125,10 +125,10 @@ impl Logits {
         }
     }
 
-    fn evaluate_with_argmax_data_element<E: ff_ext::ExtensionField>(
+    fn evaluate_with_argmax_data_element(
         &self,
         inputs: &[&WrappedTensor<Element>],
-    ) -> anyhow::Result<(LayerOut<Element, E>, ArgmaxDataNew<Element>)> {
+    ) -> anyhow::Result<(LayerOut<Element>, ArgmaxDataNew<Element>)> {
         ensure!(
             inputs.iter().all(|i| i.rank() >= 2),
             "Argmax is for tensors of rank >= 2",
@@ -201,10 +201,7 @@ impl Logits {
 }
 
 impl Evaluate<f32> for Logits {
-    fn evaluate<E: ff_ext::ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<f32>],
-    ) -> anyhow::Result<LayerOut<f32, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> anyhow::Result<LayerOut<f32>> {
         let (output, _) = self.evaluate_with_argmax_data_f32(inputs)?;
 
         Ok(output)
@@ -212,10 +209,7 @@ impl Evaluate<f32> for Logits {
 }
 
 impl Evaluate<Element> for Logits {
-    fn evaluate<E: ff_ext::ExtensionField>(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> anyhow::Result<LayerOut<Element, E>> {
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> anyhow::Result<LayerOut<Element>> {
         let (output, argmax_data) = self.evaluate_with_argmax_data_element(inputs)?;
 
         // convert argmax_data to field elements
@@ -223,10 +217,7 @@ impl Evaluate<Element> for Logits {
             max_values: argmax_data
                 .max_values
                 .into_iter()
-                .map(|m| {
-                    let t: Tensor<E> = Tensor::try_from(m)?.to_fields();
-                    anyhow::Ok(t)
-                })
+                .map(Tensor::try_from)
                 .collect::<anyhow::Result<_>>()?,
         };
 
@@ -343,7 +334,7 @@ where
         node_id: NodeId,
         ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<Vec<Claim<E>>> {
         ensure!(
@@ -497,7 +488,7 @@ where
         &self,
         id: NodeId,
         ctx: &ProverContext<E, PCS>,
-        step_data: &Step<E, Element>,
+        step_data: &Step<Element>,
     ) -> anyhow::Result<LookupWitnessGen<E, PCS>> {
         ensure!(
             step_data.node_inputs.len() == 1,
@@ -546,7 +537,7 @@ where
             .slice_last_dim()
             .zip(max_values.get_data().iter())
             .flat_map(|(row, row_max)| {
-                let current_max = row_max.to_element();
+                let current_max = row_max;
                 row.iter()
                     .enumerate()
                     .map(|(j, r)| {
@@ -568,7 +559,7 @@ where
         let commit_data = max_values
             .get_data()
             .iter()
-            .map(|v| v.as_bases()[0])
+            .map(|v| Fieldizer::<E>::to_field(v).as_bases()[0])
             .collect::<Vec<E::BaseField>>();
 
         let rmm = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
@@ -848,7 +839,6 @@ impl LogitsCtx {
 
 #[cfg(test)]
 mod test {
-    use ff_ext::GoldilocksExt2;
     use tenstore::GenStore;
 
     use super::*;
@@ -894,7 +884,7 @@ mod test {
         let input = Tensor::new(vec![3, 2].into(), vec![0.0, 1.0, 3.0, 2.0, 4.0, 5.0]).unwrap();
         let logits = Logits::Argmax;
 
-        let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
+        let out = logits.evaluate(&[&input.as_wrapped()])?;
         // first slice is [0,1] so argmax here is 1
         // second slice is [3,2] so argmax here is 0
         // the last dimension is [4,5] so argmax here is 1
@@ -949,7 +939,7 @@ mod test {
         }
         let input = Tensor::new(vec![2, 3, 4].into(), data).unwrap();
         let logits = Logits::Argmax;
-        let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()])?;
+        let out = logits.evaluate(&[&input.as_wrapped()])?;
         let indices = out.outputs()[0].get_data();
         assert_eq!(indices.len(), 6);
         for (r, &idx) in indices.iter().enumerate() {
@@ -965,7 +955,7 @@ mod test {
             //  Each row has a unique argmax and the output tensor shape is [rows,1].
             let input = Tensor::new(shape.clone().into(), data).unwrap();
             let logits = Logits::Argmax;
-            let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).unwrap();
+            let out = logits.evaluate(&[&input.as_wrapped()]).unwrap();
             let indices = out.outputs()[0].get_data();
             prop_assert_eq!(indices.len(), expected.len());
             for (i, idx) in indices.iter().enumerate() { prop_assert!((*idx - expected[i]).abs() < 1e-6); }
@@ -977,7 +967,7 @@ mod test {
             let input = Tensor::new(shape.clone().into(), data_elem).unwrap();
             let logits = Logits::Argmax;
 
-            let out = logits.evaluate::<GoldilocksExt2>(&[&input.as_wrapped()]).unwrap();
+            let out = logits.evaluate(&[&input.as_wrapped()]).unwrap();
             let indices = out.outputs()[0].get_data();
             prop_assert_eq!(indices.len(), expected.len());
             for (i, idx) in indices.iter().enumerate() { prop_assert_eq!(*idx as usize, expected[i] as usize); }

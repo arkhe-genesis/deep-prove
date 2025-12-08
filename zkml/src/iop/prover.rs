@@ -520,7 +520,7 @@ where
     fn generate_chunk_commitments(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &Trace<E, Element>,
+        chunk_trace: &Trace<Element>,
         group_type: GroupType,
     ) -> anyhow::Result<BTreeMap<ChunkID, PCS::Commitment>> {
         let commitments = chunk.commitments(&self.ctx.commitment_ctx, chunk_trace, group_type)?;
@@ -547,7 +547,7 @@ where
     fn generate_chunk_io_commitments(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &Trace<E, Element>,
+        chunk_trace: &Trace<Element>,
     ) -> anyhow::Result<ChunkIOCommitments<PCS::Commitment>> {
         let input_commitments =
             self.generate_chunk_commitments(chunk, chunk_trace, GroupType::Incoming)?;
@@ -573,7 +573,7 @@ where
     pub(crate) fn prove_chunk<'d>(
         mut self,
         chunk: ModelChunk,
-        chunk_trace: &Trace<E, Element>,
+        chunk_trace: &Trace<Element>,
         chunk_layers: &ModelLayersRef<'d>,
     ) -> anyhow::Result<ChunkProof<E, PCS>> {
         let chunk_id = chunk.chunk_id;
@@ -900,7 +900,7 @@ where
 
     /// Return the inputs to be provided to the execution graph `graph`
     pub(crate) fn graph_inputs(
-        full_trace: Trace<E, Element>,
+        full_trace: Trace<Element>,
         graph: &ProverGraph<E, T, PCS>,
     ) -> anyhow::Result<HashMap<NodeInput, ProverGraphIO<E, PCS>>>
     where
@@ -959,7 +959,7 @@ where
         Ex: Executor<ProverGraphNode<'a, 'd, E, T, PCS>, usize>,
     >(
         ctx: &'a ProverContext<E, PCS>,
-        full_trace: Trace<E, Element>,
+        full_trace: Trace<Element>,
         num_chunks: Option<usize>,
         chunking_strategy: S,
         model: &'d Model<Element>,
@@ -992,7 +992,7 @@ where
 
     pub fn prove<'d>(
         ctx: &'a ProverContext<E, PCS>,
-        full_trace: Trace<E, Element>,
+        full_trace: Trace<Element>,
         model: &'d Model<Element>,
     ) -> anyhow::Result<Proof<E, PCS>>
     where
@@ -1068,7 +1068,7 @@ where
     >(
         &mut self,
         chunk: &ModelChunk,
-        chunk_trace: &'c Trace<E, Element>,
+        chunk_trace: &'c Trace<Element>,
         lookup_ctx: &LookupContext,
         chunk_layers: &'d ModelLayersRef<'d>,
         executor_config: &Ex::Config,
