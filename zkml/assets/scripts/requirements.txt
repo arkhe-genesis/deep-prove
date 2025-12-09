@@ -6,7 +6,9 @@ pandas
 scikit-learn
 numpy
 torch
+torchmetrics
 tqdm
 psutil
 transformers
 datasets
+nltk

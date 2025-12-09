@@ -8,6 +8,10 @@ on:
       - 'zkml/**'
       - '.github/workflows/model-evaluation.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   evaluate-models:
     name: Evaluate ZKML Models
@@ -37,7 +41,7 @@ jobs:
           rm -rf .devenv/state/venv
           echo "Cleaned Python virtual environment"
 
-      - name: Evaluate Gemma-3 (Single Token Generation)
+      - name: Evaluate Gemma-3
         id: eval-gemma3-with-gen
         shell: devenv shell bash -- -e {0}
         run: |
@@ -45,11 +49,11 @@ jobs:
             --model google/gemma-3-270m-it \
             --dataset-sample wikitext \
             --max-tokens 512 \
-            --generate-tokens 1 \
+            --generate-tokens 5 \
             --markdown \
             --output-file /tmp/gemma3-with-gen-results.md
 
-      - name: Evaluate GPT-2 (Single Token Generation)
+      - name: Evaluate GPT-2
         id: eval-gpt2-with-gen
         shell: devenv shell bash -- -e {0}
         run: |
@@ -57,7 +61,7 @@ jobs:
             --model openai-community/gpt2 \
             --dataset-sample wikitext \
             --max-tokens 512 \
-            --generate-tokens 1 \
+            --generate-tokens 5 \
             --markdown \
             --output-file /tmp/gpt2-with-gen-results.md
 
@@ -68,12 +72,12 @@ jobs:
           echo "## 🤖 ZKML Model Evaluation Results" >> /tmp/comment.md
           echo "" >> /tmp/comment.md
 
-          echo "### Gemma-3 (270M) - Autoregressive Generation (512 WikiText Tokens + 1 Generated)" >> /tmp/comment.md
+          echo "### Gemma-3 (270M) - Autoregressive Generation (512 WikiText Tokens)" >> /tmp/comment.md
           echo "" >> /tmp/comment.md
           cat /tmp/gemma3-with-gen-results.md >> /tmp/comment.md
           echo "" >> /tmp/comment.md
 
-          echo "### GPT-2 (124M) - Autoregressive Generation (512 WikiText Tokens + 1 Generated)" >> /tmp/comment.md
+          echo "### GPT-2 (124M) - Autoregressive Generation (512 WikiText Tokens)" >> /tmp/comment.md
           echo "" >> /tmp/comment.md
           cat /tmp/gpt2-with-gen-results.md >> /tmp/comment.md
           echo "" >> /tmp/comment.md

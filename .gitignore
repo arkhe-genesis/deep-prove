@@ -27,3 +27,4 @@ devenv.local.nix
 
 # direnv
 .direnv
+.nltk_data

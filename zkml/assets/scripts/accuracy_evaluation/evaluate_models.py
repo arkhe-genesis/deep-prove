@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from torchmetrics.text import Perplexity
+from torchmetrics.text import Perplexity, ROUGEScore
 
 # Path configuration - script is in zkml/assets/scripts/accuracy_evaluation/
 SCRIPT_DIR = Path(__file__).parent
@@ -57,46 +57,69 @@ def print_section_header(title: str) -> None:
 @dataclass
 class EvaluationMetrics:
     """Container for evaluation metrics."""
+
     cosine_similarity: float
     perplexity_baseline: float
     perplexity_test: float
     agreement: float
+    rouge1_f1: float = 0.0  # ROUGE-1 F1 score (unigram overlap)
+    rouge2_f1: float = 0.0  # ROUGE-2 F1 score (bigram overlap)
+    rougeL_f1: float = 0.0  # ROUGE-L F1 score (longest common subsequence)
 
     @property
     def perplexity_delta_pct(self) -> float:
         """Compute percentage change in perplexity."""
-        return ((self.perplexity_test - self.perplexity_baseline)
-                / self.perplexity_baseline) * 100
+        return (
+            (self.perplexity_test - self.perplexity_baseline) / self.perplexity_baseline
+        ) * 100
 
 
 class ModelOutput(NamedTuple):
     """Output from model inference."""
+
     logits: np.ndarray
     input_ids: torch.Tensor
+    generated_text: str = ""
+    generated_only_text: str = ""  # Only generated tokens, no input
 
 
-def compute_average_metrics(metrics_list: List[EvaluationMetrics]) -> EvaluationMetrics:
+def compute_average_metrics(
+    metrics_list: List[EvaluationMetrics],
+) -> Tuple[EvaluationMetrics, EvaluationMetrics]:
     """
-    Compute average metrics from a list of EvaluationMetrics.
+    Compute average and max metrics from a list of EvaluationMetrics.
 
     Args:
         metrics_list: List of EvaluationMetrics objects
 
     Returns:
-        EvaluationMetrics with averaged values
+        Tuple of (mean_metrics, max_metrics)
     """
-    return EvaluationMetrics(
+    mean_metrics = EvaluationMetrics(
         cosine_similarity=np.mean([m.cosine_similarity for m in metrics_list]),
         perplexity_baseline=np.mean([m.perplexity_baseline for m in metrics_list]),
         perplexity_test=np.mean([m.perplexity_test for m in metrics_list]),
         agreement=np.mean([m.agreement for m in metrics_list]),
+        rouge1_f1=np.mean([m.rouge1_f1 for m in metrics_list]),
+        rouge2_f1=np.mean([m.rouge2_f1 for m in metrics_list]),
+        rougeL_f1=np.mean([m.rougeL_f1 for m in metrics_list]),
     )
+
+    max_metrics = EvaluationMetrics(
+        cosine_similarity=np.max([m.cosine_similarity for m in metrics_list]),
+        perplexity_baseline=np.max([m.perplexity_baseline for m in metrics_list]),
+        perplexity_test=np.max([m.perplexity_test for m in metrics_list]),
+        agreement=np.max([m.agreement for m in metrics_list]),
+        rouge1_f1=np.max([m.rouge1_f1 for m in metrics_list]),
+        rouge2_f1=np.max([m.rouge2_f1 for m in metrics_list]),
+        rougeL_f1=np.max([m.rougeL_f1 for m in metrics_list]),
+    )
+
+    return mean_metrics, max_metrics
 
 
 def run_smoke_tests_with_warning(
-    baseline_logits: np.ndarray,
-    test_logits: np.ndarray,
-    mode_name: str
+    baseline_logits: np.ndarray, test_logits: np.ndarray, mode_name: str
 ) -> bool:
     """
     Run smoke tests and print warning if they fail.
@@ -112,7 +135,9 @@ def run_smoke_tests_with_warning(
     print(f"\n--- {mode_name} Mode Smoke Tests ---")
     smoke_tests_passed = run_smoke_tests(baseline_logits, test_logits)
     if not smoke_tests_passed:
-        print(f"\n⚠ Warning: {mode_name} mode smoke tests failed, but continuing with metric calculations...\n")
+        print(
+            f"\n⚠ Warning: {mode_name} mode smoke tests failed, but continuing with metric calculations...\n"
+        )
     return smoke_tests_passed
 
 
@@ -183,7 +208,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_wikitext_sample(tokenizer: AutoTokenizer, max_tokens: int = 512) -> Tuple[str, List[int]]:
+def get_wikitext_sample(
+    tokenizer: AutoTokenizer, max_tokens: int = 512
+) -> Tuple[str, List[int]]:
     """Load a sample from WikiText-103 test set."""
     print("Loading WikiText-103 dataset...")
     dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
@@ -207,7 +234,7 @@ def get_wikitext_full_test(
     tokenizer: AutoTokenizer,
     stride: int = 512,
     max_length: int = 1024,
-    num_windows: int = 100
+    num_windows: int = 100,
 ) -> Generator[Tuple[str, List[int]], None, None]:
     """
     Load full WikiText-103 test set for sliding window evaluation.
@@ -240,21 +267,29 @@ def get_wikitext_full_test(
     print(f"  Total tokens: {len(all_tokens)}")
     print(f"  Total possible windows: {total_possible_windows}")
 
-    windows_to_generate = total_possible_windows if num_windows == 0 else min(num_windows, total_possible_windows)
-    print(f"  Evaluating {windows_to_generate} windows" +
-          ("" if num_windows == 0 else f" (of {total_possible_windows} total)"))
+    windows_to_generate = (
+        total_possible_windows
+        if num_windows == 0
+        else min(num_windows, total_possible_windows)
+    )
+    print(
+        f"  Evaluating {windows_to_generate} windows"
+        + ("" if num_windows == 0 else f" (of {total_possible_windows} total)")
+    )
 
     # Generate sliding windows using itertools.islice for cleaner iteration
     def window_generator():
         for i in range(0, len(all_tokens) - max_length, stride):
-            window_tokens = all_tokens[i:i + max_length]
+            window_tokens = all_tokens[i : i + max_length]
             window_text = tokenizer.decode(window_tokens)
             yield window_text, window_tokens
 
     yield from islice(window_generator(), windows_to_generate)
 
 
-def run_baseline_model(model_name: str, text: str, tokenizer: AutoTokenizer, num_generate: int = 0) -> ModelOutput:
+def run_baseline_model(
+    model_name: str, text: str, tokenizer: AutoTokenizer, num_generate: int = 0
+) -> ModelOutput:
     """
     Run HuggingFace baseline model and return all logits.
 
@@ -301,14 +336,21 @@ def run_baseline_model(model_name: str, text: str, tokenizer: AutoTokenizer, num
                     print(f"Generated token {i+1}: {next_token!r} (id={next_token_id})")
 
                     # Append to sequence
-                    current_ids = torch.cat([current_ids, torch.tensor([[next_token_id]])], dim=1)
+                    current_ids = torch.cat(
+                        [current_ids, torch.tensor([[next_token_id]])], dim=1
+                    )
 
         # Concatenate all logits
         logits_np = np.vstack(all_logits)  # Shape: [seq_len + num_generate, vocab_size]
         final_ids = current_ids.squeeze(0)
 
         generated_text = tokenizer.decode(final_ids)
+        # Decode only the generated tokens (after input)
+        input_token_count = input_ids.shape[1]
+        generated_only_ids = final_ids[input_token_count:]
+        generated_only_text = tokenizer.decode(generated_only_ids)
         print(f"Final output: {generated_text}")
+        print(f"Generated only: {generated_only_text}")
     else:
         # Original behavior: single forward pass
         with torch.no_grad():
@@ -318,16 +360,28 @@ def run_baseline_model(model_name: str, text: str, tokenizer: AutoTokenizer, num
         # Remove batch dimension and convert to numpy
         logits_np = logits.squeeze(0).cpu().numpy()  # Shape: [seq_len, vocab_size]
         final_ids = input_ids.squeeze(0)
+        generated_text = tokenizer.decode(final_ids)
 
     print(f"Logits shape: {logits_np.shape}")
-    print(f"Logits stats: mean={logits_np.mean():.4f}, std={logits_np.std():.4f}, "
-          f"min={logits_np.min():.4f}, max={logits_np.max():.4f}")
+    print(
+        f"Logits stats: mean={logits_np.mean():.4f}, std={logits_np.std():.4f}, "
+        f"min={logits_np.min():.4f}, max={logits_np.max():.4f}"
+    )
 
     print(f"✓ Baseline inference complete")
-    return ModelOutput(logits=logits_np, input_ids=final_ids)
+    # For generation mode, we have generated_only_text; for non-generation, it's empty
+    gen_only = generated_only_text if num_generate > 0 else ""
+    return ModelOutput(
+        logits=logits_np,
+        input_ids=final_ids,
+        generated_text=generated_text,
+        generated_only_text=gen_only,
+    )
 
 
-def run_rust_model(model_path: Path, text: str, num_generate: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+def run_rust_model(
+    model_path: Path, text: str, num_generate: int = 0
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run Rust ZKML model and load both float and int logits from stdout.
 
@@ -337,14 +391,19 @@ def run_rust_model(model_path: Path, text: str, num_generate: int = 0) -> Tuple[
         num_generate: Number of tokens to generate autoregressively (0 = no generation)
 
     Returns:
-        Tuple of (logits_float, logits_int) as numpy arrays
+        Tuple of (logits_float, logits_int)
     """
     print_section_header("Running Rust ZKML Model")
 
     cmd = [
-        "cargo", "run", "--release", "--bin", "extract-logits",
+        "cargo",
+        "run",
+        "--release",
+        "--bin",
+        "extract-logits",
         "--",
-        "--model", str(model_path),
+        "--model",
+        str(model_path),
         f"--text={text}",
     ]
 
@@ -374,20 +433,26 @@ def run_rust_model(model_path: Path, text: str, num_generate: int = 0) -> Tuple[
     print("Parsing logits from JSON output...")
     try:
         output_data = json.loads(result.stdout)
-        logits_float_flat = np.array(output_data['logits_float'], dtype=np.float32)
-        logits_int_flat = np.array(output_data['logits_int'], dtype=np.float32)
-        seq_len = output_data['seq_len']
-        vocab_size = output_data['vocab_size']
-        seq_len_int = output_data['seq_len_int']
+        logits_float_flat = np.array(output_data["logits_float"], dtype=np.float32)
+        logits_int_flat = np.array(output_data["logits_int"], dtype=np.float32)
+        seq_len = output_data["seq_len"]
+        vocab_size = output_data["vocab_size"]
+        seq_len_int = output_data["seq_len_int"]
 
         # Reshape to their respective dimensions
         logits_float = logits_float_flat.reshape(seq_len, vocab_size)
-        logits_int_padded = logits_int_flat.reshape(seq_len_int, vocab_size)
+
+        # Integer mode may have padded BOTH seq_len and vocab_size
+        # Calculate the actual padded vocab size from the array
+        padded_vocab_size = len(logits_int_flat) // seq_len_int
+        logits_int_padded = logits_int_flat.reshape(seq_len_int, padded_vocab_size)
 
         # Unpad int logits to match float/baseline shape
-        # Int mode may have padded seq_len (e.g., 7 -> 8 for power-of-2)
-        if seq_len_int != seq_len:
-            print(f"  Unpadding int mode seq_len from {seq_len_int} to {seq_len}")
+        # Int mode may have padded seq_len (e.g., 7 -> 8) and vocab_size (e.g., 50257 -> 65536)
+        if seq_len_int != seq_len or padded_vocab_size != vocab_size:
+            print(
+                f"  Unpadding int mode from ({seq_len_int}, {padded_vocab_size}) to ({seq_len}, {vocab_size})"
+            )
             logits_int = logits_int_padded[:seq_len, :vocab_size]
         else:
             logits_int = logits_int_padded
@@ -398,17 +463,61 @@ def run_rust_model(model_path: Path, text: str, num_generate: int = 0) -> Tuple[
 
     print(f"\nFloat mode (true float32 inference):")
     print(f"  Logits shape: {logits_float.shape}")
-    print(f"  Logits stats: mean={logits_float.mean():.4f}, std={logits_float.std():.4f}, "
-          f"min={logits_float.min():.4f}, max={logits_float.max():.4f}")
+    print(
+        f"  Logits stats: mean={logits_float.mean():.4f}, std={logits_float.std():.4f}, "
+        f"min={logits_float.min():.4f}, max={logits_float.max():.4f}"
+    )
 
     print(f"\nInt mode (dequantized from quantized inference):")
     print(f"  Logits shape: {logits_int.shape}")
-    print(f"  Logits stats: mean={logits_int.mean():.4f}, std={logits_int.std():.4f}, "
-          f"min={logits_int.min():.4f}, max={logits_int.max():.4f}")
+    print(
+        f"  Logits stats: mean={logits_int.mean():.4f}, std={logits_int.std():.4f}, "
+        f"min={logits_int.min():.4f}, max={logits_int.max():.4f}"
+    )
 
     print(f"✓ Rust inference complete")
 
     return logits_float, logits_int
+
+
+def compute_generated_text_from_logits(
+    logits: np.ndarray,
+    tokenizer: AutoTokenizer,
+    num_input_tokens: int,
+    num_generated_tokens: int,
+) -> str:
+    """
+    Compute generated text from logits using argmax.
+
+    Args:
+        logits: Logits array [seq_len, vocab_size] where logits[i] predicts token at position i+1
+        tokenizer: HuggingFace tokenizer
+        num_input_tokens: Number of input tokens (including BOS if present)
+        num_generated_tokens: Number of tokens that were generated
+
+    Returns:
+        Generated text (decoded from argmax of logits)
+    """
+    if logits.shape[0] < num_input_tokens:
+        return ""
+
+    # Logits[i] predicts the token at position i+1
+    # For num_input_tokens input tokens [0...num_input_tokens-1], the generated tokens are at positions:
+    # [num_input_tokens, num_input_tokens+1, ..., num_input_tokens+num_generated_tokens-1]
+    # These are predicted by logits at positions:
+    # [num_input_tokens-1, num_input_tokens, ..., num_input_tokens+num_generated_tokens-2]
+    start_idx = num_input_tokens - 1
+    end_idx = start_idx + num_generated_tokens
+
+    generated_logits = logits[start_idx:end_idx]
+
+    # Get token IDs using argmax
+    generated_token_ids = np.argmax(generated_logits, axis=1).tolist()
+
+    # Decode to text
+    generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=False)
+
+    return generated_text
 
 
 def has_invalid_values(arr: np.ndarray) -> bool:
@@ -497,29 +606,68 @@ def compute_next_token_agreement(
     return agreement
 
 
+def compute_rouge_scores(
+    text_baseline: str, text_test: str
+) -> Tuple[float, float, float]:
+    """
+    Compute ROUGE scores between baseline and test generated text using torchmetrics.
+
+    Args:
+        text_baseline: Baseline generated text
+        text_test: Test model generated text
+
+    Returns:
+        Tuple of (rouge1_f1, rouge2_f1, rougeL_f1)
+    """
+    rouge = ROUGEScore()
+    scores = rouge(preds=[text_test], target=[text_baseline])
+
+    return (
+        scores["rouge1_fmeasure"].item(),
+        scores["rouge2_fmeasure"].item(),
+        scores["rougeL_fmeasure"].item(),
+    )
+
+
 def compute_all_metrics(
     baseline_logits: np.ndarray,
     rust_logits: np.ndarray,
     input_ids: torch.Tensor,
-    skip_first: bool = True
+    skip_first: bool = True,
+    baseline_text: str = "",
+    rust_text: str = "",
 ) -> EvaluationMetrics:
     """
-    Compute all three evaluation metrics.
+    Compute all evaluation metrics.
 
     Args:
         baseline_logits: Baseline model logits [seq_len, vocab_size]
         rust_logits: Test model logits [seq_len, vocab_size]
         input_ids: Input token IDs [seq_len]
         skip_first: Skip first token when computing similarity/agreement
+        baseline_text: Baseline generated text (optional, for ROUGE)
+        rust_text: Test model generated text (optional, for ROUGE)
 
     Returns:
         EvaluationMetrics object containing all computed metrics
     """
+    # Compute ROUGE scores if both texts are provided
+    rouge1_f1, rouge2_f1, rougeL_f1 = 0.0, 0.0, 0.0
+    if baseline_text and rust_text:
+        rouge1_f1, rouge2_f1, rougeL_f1 = compute_rouge_scores(baseline_text, rust_text)
+
     return EvaluationMetrics(
-        cosine_similarity=compute_cosine_similarity(baseline_logits, rust_logits, skip_first),
+        cosine_similarity=compute_cosine_similarity(
+            baseline_logits, rust_logits, skip_first
+        ),
         perplexity_baseline=compute_perplexity(baseline_logits, input_ids),
         perplexity_test=compute_perplexity(rust_logits, input_ids),
-        agreement=compute_next_token_agreement(baseline_logits, rust_logits, skip_first),
+        agreement=compute_next_token_agreement(
+            baseline_logits, rust_logits, skip_first
+        ),
+        rouge1_f1=rouge1_f1,
+        rouge2_f1=rouge2_f1,
+        rougeL_f1=rougeL_f1,
     )
 
 
@@ -553,12 +701,18 @@ def run_smoke_tests(baseline_logits: np.ndarray, rust_logits: np.ndarray) -> boo
     min_range, max_range = TYPICAL_LOGIT_RANGE
 
     if baseline_min < min_range or baseline_max > max_range:
-        print(f"⚠ Warning: Baseline logits outside typical range: [{baseline_min:.2f}, {baseline_max:.2f}]")
+        print(
+            f"⚠ Warning: Baseline logits outside typical range: [{baseline_min:.2f}, {baseline_max:.2f}]"
+        )
     else:
-        print(f"✓ Baseline logits in reasonable range: [{baseline_min:.2f}, {baseline_max:.2f}]")
+        print(
+            f"✓ Baseline logits in reasonable range: [{baseline_min:.2f}, {baseline_max:.2f}]"
+        )
 
     if rust_min < min_range or rust_max > max_range:
-        print(f"⚠ Warning: Rust logits outside typical range: [{rust_min:.2f}, {rust_max:.2f}]")
+        print(
+            f"⚠ Warning: Rust logits outside typical range: [{rust_min:.2f}, {rust_max:.2f}]"
+        )
     else:
         print(f"✓ Rust logits in reasonable range: [{rust_min:.2f}, {rust_max:.2f}]")
 
@@ -578,7 +732,10 @@ def run_smoke_tests(baseline_logits: np.ndarray, rust_logits: np.ndarray) -> boo
     print(f"✓ Mean difference acceptable: {mean_diff_pct:.2f}%")
 
     if std_diff_pct > SMOKE_TEST_THRESHOLD_PCT:
-        print(f"✗ Std deviation difference too large: {std_diff_pct:.2f}%", file=sys.stderr)
+        print(
+            f"✗ Std deviation difference too large: {std_diff_pct:.2f}%",
+            file=sys.stderr,
+        )
         return False
     print(f"✓ Std deviation difference acceptable: {std_diff_pct:.2f}%")
 
@@ -600,11 +757,7 @@ def ensure_model_downloaded(model_name: str, model_path: Path) -> None:
         SystemExit: If download fails
     """
     # Files we need for ZKML
-    required_files = [
-        "config.json",
-        "tokenizer.json",
-        "model.safetensors"
-    ]
+    required_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
     # Check which files already exist
     existing_files = []
@@ -643,17 +796,25 @@ def ensure_model_downloaded(model_name: str, model_path: Path) -> None:
 
     except (OSError, ValueError, RuntimeError) as e:
         print(f"✗ Failed to download model: {e}", file=sys.stderr)
-        print(f"\nYou may need to authenticate with HuggingFace for gated models:", file=sys.stderr)
+        print(
+            f"\nYou may need to authenticate with HuggingFace for gated models:",
+            file=sys.stderr,
+        )
         print(f"  huggingface-cli login", file=sys.stderr)
         sys.exit(1)
 
 
-def print_evaluation_results(metrics: EvaluationMetrics, num_windows: int = 1) -> None:
+def print_evaluation_results(
+    metrics: EvaluationMetrics,
+    max_metrics: EvaluationMetrics = None,
+    num_windows: int = 1,
+) -> None:
     """
     Print formatted evaluation results.
 
     Args:
-        metrics: Computed evaluation metrics
+        metrics: Computed evaluation metrics (mean values)
+        max_metrics: Max evaluation metrics (optional)
         num_windows: Number of windows evaluated (for full test set mode)
     """
     if num_windows > 1:
@@ -662,11 +823,41 @@ def print_evaluation_results(metrics: EvaluationMetrics, num_windows: int = 1) -
     else:
         print_section_header("EVALUATION RESULTS")
 
-    print(f"Cosine similarity: {metrics.cosine_similarity:.6f}")
-    print(f"Perplexity (baseline): {metrics.perplexity_baseline:.4f}")
-    print(f"Perplexity (test): {metrics.perplexity_test:.4f}")
-    print(f"Perplexity Δ: {metrics.perplexity_delta_pct:+.4f}%")
-    print(f"Next-token match: {metrics.agreement * 100:.2f}%")
+    if max_metrics:
+        print(
+            f"Cosine similarity: {metrics.cosine_similarity:.6f} (mean) / {max_metrics.cosine_similarity:.6f} (max)"
+        )
+        print(
+            f"Perplexity (baseline): {metrics.perplexity_baseline:.4f} (mean) / {max_metrics.perplexity_baseline:.4f} (max)"
+        )
+        print(
+            f"Perplexity (test): {metrics.perplexity_test:.4f} (mean) / {max_metrics.perplexity_test:.4f} (max)"
+        )
+        print(
+            f"Perplexity Δ: {metrics.perplexity_delta_pct:+.4f}% (mean) / {max_metrics.perplexity_delta_pct:+.4f}% (max)"
+        )
+        print(
+            f"Next-token match: {metrics.agreement * 100:.2f}% (mean) / {max_metrics.agreement * 100:.2f}% (max)"
+        )
+        print(
+            f"ROUGE-1 F1: {metrics.rouge1_f1:.4f} (mean) / {max_metrics.rouge1_f1:.4f} (max)"
+        )
+        print(
+            f"ROUGE-2 F1: {metrics.rouge2_f1:.4f} (mean) / {max_metrics.rouge2_f1:.4f} (max)"
+        )
+        print(
+            f"ROUGE-L F1: {metrics.rougeL_f1:.4f} (mean) / {max_metrics.rougeL_f1:.4f} (max)"
+        )
+    else:
+        print(f"Cosine similarity: {metrics.cosine_similarity:.6f}")
+        print(f"Perplexity (baseline): {metrics.perplexity_baseline:.4f}")
+        print(f"Perplexity (test): {metrics.perplexity_test:.4f}")
+        print(f"Perplexity Δ: {metrics.perplexity_delta_pct:+.4f}%")
+        print(f"Next-token match: {metrics.agreement * 100:.2f}%")
+        print(f"ROUGE-1 F1: {metrics.rouge1_f1:.4f}")
+        print(f"ROUGE-2 F1: {metrics.rouge2_f1:.4f}")
+        print(f"ROUGE-L F1: {metrics.rougeL_f1:.4f}")
+
     print(f"{'='*60}")
 
 
@@ -676,38 +867,172 @@ def format_metrics_as_markdown(
     metrics_int: EvaluationMetrics,
     smoke_tests_float: bool,
     smoke_tests_int: bool,
-    num_windows: int = 1
+    num_windows: int = 1,
+    generated_text_baseline: str = "",
+    generated_text_float: str = "",
+    generated_text_int: str = "",
+    input_text: str = "",
+    max_metrics_float: EvaluationMetrics = None,
+    max_metrics_int: EvaluationMetrics = None,
 ) -> str:
     """
     Format evaluation results as markdown for GitHub comments.
 
     Args:
         model_name: Name of the model being evaluated
-        metrics_float: Metrics for float mode
-        metrics_int: Metrics for int mode
+        metrics_float: Metrics for float mode (mean values)
+        metrics_int: Metrics for int mode (mean values)
         smoke_tests_float: Whether float mode passed smoke tests
         smoke_tests_int: Whether int mode passed smoke tests
         num_windows: Number of windows evaluated
+        generated_text_baseline: Baseline generated text (optional, includes input)
+        generated_text_float: Float mode generated text (optional, includes input)
+        generated_text_int: Integer mode generated text (optional, includes input)
+        input_text: Input text to strip from generated text (optional)
+        max_metrics_float: Max metrics for float mode (optional)
+        max_metrics_int: Max metrics for int mode (optional)
 
     Returns:
         Markdown-formatted string
     """
     # Determine status emojis
-    float_status = "✅" if smoke_tests_float and metrics_float.agreement >= 0.99 else "⚠️"
+    float_status = (
+        "✅" if smoke_tests_float and metrics_float.agreement >= 0.99 else "⚠️"
+    )
     int_status = "✅" if smoke_tests_int and metrics_int.agreement >= 0.50 else "⚠️"
 
     md = f"""## Model Evaluation Results: `{model_name}`
 
 | Metric | Float Mode (Dequantized) {float_status} | Integer Mode (Quantized) {int_status} |
 |--------|----------------------------------------|---------------------------------------|
-| Cosine Similarity | `{metrics_float.cosine_similarity:.6f}` | `{metrics_int.cosine_similarity:.6f}` |
-| Perplexity (Baseline) | `{metrics_float.perplexity_baseline:.4f}` | `{metrics_int.perplexity_baseline:.4f}` |
-| Perplexity (ZKML) | `{metrics_float.perplexity_test:.4f}` | `{metrics_int.perplexity_test:.4f}` |
-| Perplexity Δ | `{metrics_float.perplexity_delta_pct:+.4f}%` | `{metrics_int.perplexity_delta_pct:+.4f}%` |
-| Next-Token Match | **`{metrics_float.agreement * 100:.2f}%`** | **`{metrics_int.agreement * 100:.2f}%`** |
+"""
+
+    # Format float mode column
+    def format_float_col(val, max_val=None, fmt=".6f", is_pct=False, bold=False):
+        suffix = "%" if is_pct else ""
+        if max_val is not None:
+            formatted = f"`{val:{fmt}}{suffix} (mean) / {max_val:{fmt}}{suffix} (max)`"
+        else:
+            formatted = f"`{val:{fmt}}{suffix}`"
+        return f"**{formatted}**" if bold else formatted
+
+    # Format each metric row
+    cosine_float = format_float_col(
+        metrics_float.cosine_similarity,
+        max_metrics_float.cosine_similarity if max_metrics_float else None,
+    )
+    cosine_int = format_float_col(
+        metrics_int.cosine_similarity,
+        max_metrics_int.cosine_similarity if max_metrics_int else None,
+    )
+
+    perp_base_float = format_float_col(
+        metrics_float.perplexity_baseline,
+        max_metrics_float.perplexity_baseline if max_metrics_float else None,
+        ".4f",
+    )
+    perp_base_int = format_float_col(
+        metrics_int.perplexity_baseline,
+        max_metrics_int.perplexity_baseline if max_metrics_int else None,
+        ".4f",
+    )
+
+    perp_test_float = format_float_col(
+        metrics_float.perplexity_test,
+        max_metrics_float.perplexity_test if max_metrics_float else None,
+        ".4f",
+    )
+    perp_test_int = format_float_col(
+        metrics_int.perplexity_test,
+        max_metrics_int.perplexity_test if max_metrics_int else None,
+        ".4f",
+    )
+
+    perp_delta_float = format_float_col(
+        metrics_float.perplexity_delta_pct,
+        max_metrics_float.perplexity_delta_pct if max_metrics_float else None,
+        "+.4f",
+        is_pct=True,
+    )
+    perp_delta_int = format_float_col(
+        metrics_int.perplexity_delta_pct,
+        max_metrics_int.perplexity_delta_pct if max_metrics_int else None,
+        "+.4f",
+        is_pct=True,
+    )
+
+    agreement_float = format_float_col(
+        metrics_float.agreement * 100,
+        max_metrics_float.agreement * 100 if max_metrics_float else None,
+        ".2f",
+        is_pct=True,
+        bold=True,
+    )
+    agreement_int = format_float_col(
+        metrics_int.agreement * 100,
+        max_metrics_int.agreement * 100 if max_metrics_int else None,
+        ".2f",
+        is_pct=True,
+        bold=True,
+    )
+
+    rouge1_float = format_float_col(
+        metrics_float.rouge1_f1,
+        max_metrics_float.rouge1_f1 if max_metrics_float else None,
+        ".4f",
+    )
+    rouge1_int = format_float_col(
+        metrics_int.rouge1_f1,
+        max_metrics_int.rouge1_f1 if max_metrics_int else None,
+        ".4f",
+    )
+
+    rouge2_float = format_float_col(
+        metrics_float.rouge2_f1,
+        max_metrics_float.rouge2_f1 if max_metrics_float else None,
+        ".4f",
+    )
+    rouge2_int = format_float_col(
+        metrics_int.rouge2_f1,
+        max_metrics_int.rouge2_f1 if max_metrics_int else None,
+        ".4f",
+    )
+
+    rougeL_float = format_float_col(
+        metrics_float.rougeL_f1,
+        max_metrics_float.rougeL_f1 if max_metrics_float else None,
+        ".4f",
+    )
+    rougeL_int = format_float_col(
+        metrics_int.rougeL_f1,
+        max_metrics_int.rougeL_f1 if max_metrics_int else None,
+        ".4f",
+    )
+
+    md += f"""| Cosine Similarity | {cosine_float} | {cosine_int} |
+| Perplexity (Baseline) | {perp_base_float} | {perp_base_int} |
+| Perplexity (ZKML) | {perp_test_float} | {perp_test_int} |
+| Perplexity Δ | {perp_delta_float} | {perp_delta_int} |
+| Next-Token Match | {agreement_float} | {agreement_int} |
 | Smoke Tests | `{"PASS" if smoke_tests_float else "FAIL"}` | `{"PASS" if smoke_tests_int else "FAIL"}` |
+| ROUGE-1 F1 | {rouge1_float} | {rouge1_int} |
+| ROUGE-2 F1 | {rouge2_float} | {rouge2_int} |
+| ROUGE-L F1 | {rougeL_float} | {rougeL_int} |
 
 """
+
+    # Add generated text if available
+    if generated_text_baseline or generated_text_float or generated_text_int:
+        md += "### Generated Text\n\n"
+
+        # All generated text strings now contain only generated portion (no input)
+        if generated_text_baseline:
+            md += f"**Baseline (PyTorch):** {generated_text_baseline}\n\n"
+        if generated_text_float:
+            md += f"**Float Mode (Dequantized):** {generated_text_float}\n\n"
+        if generated_text_int:
+            md += f"**Integer Mode (Quantized):** {generated_text_int}\n\n"
+
     if num_windows > 1:
         md += f"\n*Evaluated on {num_windows} sliding windows*\n"
 
@@ -715,78 +1040,164 @@ def format_metrics_as_markdown(
 
 
 def run_full_test_set_evaluation(
-    model_path: Path,
-    tokenizer: AutoTokenizer,
-    args: argparse.Namespace
-) -> None:
-    """Run evaluation on full WikiText-103 test set with sliding window."""
+    model_path: Path, tokenizer: AutoTokenizer, args: argparse.Namespace
+) -> Tuple[
+    EvaluationMetrics,
+    EvaluationMetrics,
+    EvaluationMetrics,
+    EvaluationMetrics,
+    bool,
+    bool,
+]:
+    """
+    Run evaluation on full WikiText-103 test set with sliding window.
+
+    Returns:
+        Tuple of (avg_metrics_float, max_metrics_float, avg_metrics_int,
+                  max_metrics_int, smoke_tests_float, smoke_tests_int)
+    """
     if args.text:
         print("⚠ Warning: --text ignored when using --full-test-set", file=sys.stderr)
 
     print_section_header("FULL TEST SET EVALUATION (Sliding Window)")
     print(f"Stride: {args.stride}")
     print(f"Max length: {args.max_tokens}")
-    print(f"Windows: {'ALL (evaluate entire test set)' if args.num_windows == 0 else f'{args.num_windows} (sample)'}")
+    print(
+        f"Windows: {'ALL (evaluate entire test set)' if args.num_windows == 0 else f'{args.num_windows} (sample)'}"
+    )
 
     # Accumulate metrics across all windows
     all_metrics_float = []
     all_metrics_int = []
+    smoke_tests_float = True
+    smoke_tests_int = True
 
     for num_window, (text, tokens) in enumerate(
-        get_wikitext_full_test(tokenizer, stride=args.stride, max_length=args.max_tokens, num_windows=args.num_windows),
-        start=1
+        get_wikitext_full_test(
+            tokenizer,
+            stride=args.stride,
+            max_length=args.max_tokens,
+            num_windows=args.num_windows,
+        ),
+        start=1,
     ):
         # Run both models on this window
-        model_output = run_baseline_model(str(model_path), text, tokenizer, args.generate_tokens)
-        logits_float, logits_int = run_rust_model(model_path, text, args.generate_tokens)
+        model_output = run_baseline_model(
+            str(model_path), text, tokenizer, args.generate_tokens
+        )
+        logits_float, logits_int = run_rust_model(
+            model_path, text, args.generate_tokens
+        )
+
+        # Always compute generated text from logits using argmax for all modes
+        # This ensures ROUGE metrics compare argmax predictions across all models
+        num_input_tokens = len(model_output.input_ids)
+
+        baseline_generated_from_logits = ""
+        if args.generate_tokens > 0:
+            # Compute baseline generated text from baseline logits using argmax
+            baseline_generated_from_logits = compute_generated_text_from_logits(
+                model_output.logits, tokenizer, num_input_tokens, args.generate_tokens
+            )
+            # Compute ZKML float generated text from float logits using argmax
+            generated_text_float = compute_generated_text_from_logits(
+                logits_float, tokenizer, num_input_tokens, args.generate_tokens
+            )
+            # Compute ZKML int generated text from int logits using argmax
+            generated_text_int = compute_generated_text_from_logits(
+                logits_int, tokenizer, num_input_tokens, args.generate_tokens
+            )
 
         # Verify shapes match
         if model_output.logits.shape != logits_float.shape:
-            print(f"\n✗ Float mode shape mismatch in window {num_window}!", file=sys.stderr)
+            print(
+                f"\n✗ Float mode shape mismatch in window {num_window}!",
+                file=sys.stderr,
+            )
             continue
 
         if model_output.logits.shape != logits_int.shape:
-            print(f"\n✗ Int mode shape mismatch in window {num_window}!", file=sys.stderr)
+            print(
+                f"\n✗ Int mode shape mismatch in window {num_window}!", file=sys.stderr
+            )
             continue
 
         # Compute metrics for this window
-        metrics_float = compute_all_metrics(model_output.logits, logits_float, model_output.input_ids, skip_first=True)
-        metrics_int = compute_all_metrics(model_output.logits, logits_int, model_output.input_ids, skip_first=True)
+        metrics_float = compute_all_metrics(
+            model_output.logits,
+            logits_float,
+            model_output.input_ids,
+            skip_first=True,
+            baseline_text=baseline_generated_from_logits,
+            rust_text=generated_text_float,
+        )
+        metrics_int = compute_all_metrics(
+            model_output.logits,
+            logits_int,
+            model_output.input_ids,
+            skip_first=True,
+            baseline_text=baseline_generated_from_logits,
+            rust_text=generated_text_int,
+        )
         all_metrics_float.append(metrics_float)
         all_metrics_int.append(metrics_int)
 
         if num_window % 10 == 0:
             print(f"  Processed {num_window} windows...")
 
-    # Compute average metrics
-    avg_metrics_float = compute_average_metrics(all_metrics_float)
-    avg_metrics_int = compute_average_metrics(all_metrics_int)
+    # Compute average and max metrics
+    avg_metrics_float, max_metrics_float = compute_average_metrics(all_metrics_float)
+    avg_metrics_int, max_metrics_int = compute_average_metrics(all_metrics_int)
 
     # Print results
     print_section_header("FLOAT MODE (Full Test Set)")
-    print_evaluation_results(avg_metrics_float, num_windows=len(all_metrics_float))
+    print_evaluation_results(
+        avg_metrics_float, max_metrics_float, num_windows=len(all_metrics_float)
+    )
 
     print_section_header("INTEGER MODE (Full Test Set)")
-    print_evaluation_results(avg_metrics_int, num_windows=len(all_metrics_int))
+    print_evaluation_results(
+        avg_metrics_int, max_metrics_int, num_windows=len(all_metrics_int)
+    )
+
+    return (
+        avg_metrics_float,
+        max_metrics_float,
+        avg_metrics_int,
+        max_metrics_int,
+        smoke_tests_float,
+        smoke_tests_int,
+    )
 
 
 def run_single_sample_evaluation(
-    model_path: Path,
-    tokenizer: AutoTokenizer,
-    args: argparse.Namespace
-) -> Tuple[EvaluationMetrics, EvaluationMetrics, bool, bool]:
+    model_path: Path, tokenizer: AutoTokenizer, args: argparse.Namespace
+) -> Tuple[
+    EvaluationMetrics,
+    EvaluationMetrics,
+    EvaluationMetrics,
+    EvaluationMetrics,
+    bool,
+    bool,
+    str,
+    str,
+    str,
+    str,
+]:
     """
     Run evaluation on a single text sample (fast, for debugging).
 
     Returns:
-        Tuple of (metrics_float, metrics_int, smoke_tests_float, smoke_tests_int)
+        Tuple of (metrics_float, max_metrics_float, metrics_int, max_metrics_int,
+                  smoke_tests_float, smoke_tests_int,
+                  generated_text_baseline, generated_text_float, generated_text_int, input_text)
     """
     # Get evaluation text
     if args.text:
         text = args.text
         tokens = tokenizer.encode(text)
         if len(tokens) > args.max_tokens:
-            tokens = tokens[:args.max_tokens]
+            tokens = tokens[: args.max_tokens]
             text = tokenizer.decode(tokens)
         print(f"Using custom text ({len(tokens)} tokens)")
     elif args.dataset_sample == "wikitext":
@@ -799,10 +1210,34 @@ def run_single_sample_evaluation(
     print(f"Total tokens: {len(tokens)}")
 
     # Run baseline model
-    model_output = run_baseline_model(str(model_path), text, tokenizer, args.generate_tokens)
+    model_output = run_baseline_model(
+        str(model_path), text, tokenizer, args.generate_tokens
+    )
 
     # Run Rust model - get both float and int logits
     logits_float, logits_int = run_rust_model(model_path, text, args.generate_tokens)
+
+    # Always compute generated text from logits using argmax for all modes
+    # This ensures ROUGE metrics compare argmax predictions across all models
+    # Note: model_output.input_ids contains the FULL sequence (input + generated), not just input
+    # Calculate the original input token count from the total sequence length
+    total_tokens = len(model_output.input_ids)
+    num_input_tokens = total_tokens - args.generate_tokens
+
+    baseline_generated_from_logits = ""
+    if args.generate_tokens > 0:
+        # Compute baseline generated text from baseline logits using argmax
+        baseline_generated_from_logits = compute_generated_text_from_logits(
+            model_output.logits, tokenizer, num_input_tokens, args.generate_tokens
+        )
+        # Compute ZKML float generated text from float logits using argmax
+        generated_text_float = compute_generated_text_from_logits(
+            logits_float, tokenizer, num_input_tokens, args.generate_tokens
+        )
+        # Compute ZKML int generated text from int logits using argmax
+        generated_text_int = compute_generated_text_from_logits(
+            logits_int, tokenizer, num_input_tokens, args.generate_tokens
+        )
 
     # Verify shapes match
     if model_output.logits.shape != logits_float.shape:
@@ -818,27 +1253,56 @@ def run_single_sample_evaluation(
         sys.exit(1)
 
     # Run smoke tests
-    smoke_tests_passed_float = run_smoke_tests_with_warning(model_output.logits, logits_float, "Float")
-    smoke_tests_passed_int = run_smoke_tests_with_warning(model_output.logits, logits_int, "Integer")
+    smoke_tests_passed_float = run_smoke_tests_with_warning(
+        model_output.logits, logits_float, "Float"
+    )
+    smoke_tests_passed_int = run_smoke_tests_with_warning(
+        model_output.logits, logits_int, "Integer"
+    )
 
     # Compute metrics
     print_section_header("Computing Evaluation Metrics")
 
     # Float mode metrics
-    metrics_float = compute_all_metrics(model_output.logits, logits_float, model_output.input_ids, skip_first=True)
+    metrics_float = compute_all_metrics(
+        model_output.logits,
+        logits_float,
+        model_output.input_ids,
+        skip_first=True,
+        baseline_text=baseline_generated_from_logits,
+        rust_text=generated_text_float,
+    )
 
     # Int mode metrics
-    metrics_int = compute_all_metrics(model_output.logits, logits_int, model_output.input_ids, skip_first=True)
+    metrics_int = compute_all_metrics(
+        model_output.logits,
+        logits_int,
+        model_output.input_ids,
+        skip_first=True,
+        baseline_text=baseline_generated_from_logits,
+        rust_text=generated_text_int,
+    )
 
     # Print results for float mode
     print_section_header("FLOAT MODE (Dequantized from Quantized Inference)")
-    print_evaluation_results(metrics_float)
+    print_evaluation_results(metrics_float, max_metrics=metrics_float)
 
     # Print results for int mode
     print_section_header("INTEGER MODE (Quantized)")
-    print_evaluation_results(metrics_int)
+    print_evaluation_results(metrics_int, max_metrics=metrics_int)
 
-    return metrics_float, metrics_int, smoke_tests_passed_float, smoke_tests_passed_int
+    return (
+        metrics_float,
+        metrics_float,  # max = mean for single sample
+        metrics_int,
+        metrics_int,  # max = mean for single sample
+        smoke_tests_passed_float,
+        smoke_tests_passed_int,
+        model_output.generated_only_text,
+        generated_text_float,
+        generated_text_int,
+        text,
+    )
 
 
 def main():
@@ -865,10 +1329,49 @@ def main():
 
     # Run evaluation
     if args.full_test_set:
-        run_full_test_set_evaluation(model_path, tokenizer, args)
-        # TODO: Add return values for full_test_set mode if needed for markdown
+        (
+            avg_metrics_float,
+            max_metrics_float,
+            avg_metrics_int,
+            max_metrics_int,
+            smoke_float,
+            smoke_int,
+        ) = run_full_test_set_evaluation(model_path, tokenizer, args)
+
+        # Output markdown if requested
+        if args.markdown:
+            num_windows = args.num_windows if args.num_windows > 0 else "all"
+            markdown_output = format_metrics_as_markdown(
+                args.model,
+                avg_metrics_float,
+                avg_metrics_int,
+                smoke_float,
+                smoke_int,
+                num_windows=num_windows if isinstance(num_windows, int) else 0,
+                max_metrics_float=max_metrics_float,
+                max_metrics_int=max_metrics_int,
+            )
+
+            if args.output_file:
+                output_path = Path(args.output_file)
+                output_path.write_text(markdown_output)
+                print(f"\n✓ Markdown output written to: {args.output_file}")
+            else:
+                print_section_header("MARKDOWN OUTPUT")
+                print(markdown_output)
     else:
-        metrics_float, metrics_int, smoke_float, smoke_int = run_single_sample_evaluation(model_path, tokenizer, args)
+        (
+            metrics_float,
+            max_metrics_float,
+            metrics_int,
+            max_metrics_int,
+            smoke_float,
+            smoke_int,
+            gen_text_baseline,
+            gen_text_float,
+            gen_text_int,
+            input_text,
+        ) = run_single_sample_evaluation(model_path, tokenizer, args)
 
         # Output markdown if requested
         if args.markdown:
@@ -877,7 +1380,14 @@ def main():
                 metrics_float,
                 metrics_int,
                 smoke_float,
-                smoke_int
+                smoke_int,
+                num_windows=1,
+                generated_text_baseline=gen_text_baseline,
+                generated_text_float=gen_text_float,
+                generated_text_int=gen_text_int,
+                input_text=input_text,
+                max_metrics_float=max_metrics_float,
+                max_metrics_int=max_metrics_int,
             )
 
             if args.output_file:

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use tenstore::GenStore;
 use zkml::{
     graph::Node,
-    layers::Layer,
+    layers::{Layer, provable::Evaluate},
     model::{Trace, llm::Driver},
     parser::{
         ModelNameProvider,
@@ -22,7 +22,6 @@ use zkml::{
         },
         safe::RawSafeTensors,
     },
-    tensor::TensorTypeParam,
 };
 
 /// Section separator for debug output
@@ -120,20 +119,6 @@ fn validate_model_files(model_dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf)>
     Ok((paths[0].clone(), paths[1].clone(), paths[2].clone()))
 }
 
-/// Get the next token prediction from logits (argmax of last token's logits)
-fn get_next_token(logits: &[f32], vocab_size: usize) -> usize {
-    // Get the logits for the last token in the sequence
-    let last_token_logits = &logits[logits.len() - vocab_size..];
-
-    // Find the token with the highest logit value
-    last_token_logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
-}
-
 fn extract_logits_from_trace<N, F>(
     driver: &Driver<N>,
     trace: &Trace<N>,
@@ -178,79 +163,44 @@ where
     )
 }
 
-/// Run autoregressive generation for the given driver
-fn run_autoregressive_generation<N, RunFn, ExtractFn>(
+/// Run inference using run_elements for the given driver
+fn run_generation<N, ExtractFn>(
     driver: &Driver<N>,
     tokenizer: &HFTokenizer,
-    initial_tokens: Vec<Token>,
-    num_tokens: usize,
+    tokens: &[Token],
     mode_name: &str,
-    run_fn: RunFn,
     extract_fn: ExtractFn,
 ) -> Result<LogitsData>
 where
-    N: TensorTypeParam,
-    RunFn: Fn(&[Token], &mut GenStore) -> Result<Trace<N>>,
+    N: zkml::tensor::TensorTypeParam,
     ExtractFn: Fn(&[N], zkml::graph::NodeId) -> Result<Vec<f32>>,
+    Layer<N>: Evaluate<N>,
 {
-    let mut generated_tokens = initial_tokens;
-    let mut all_logits = Vec::new();
-    let mut final_seq_len = 0;
-    // Get actual vocab size from driver config (not padded)
-    let actual_vocab_size = driver.vocab_size();
+    let mut store = GenStore::default();
+    let tensor_inputs = driver.tokens_to_tensor(tokens)?;
+    let trace: Trace<N> = driver.run_elements(tensor_inputs, &mut store)?;
+    let logits_step = extract_logits_from_trace(driver, &trace, &extract_fn)?;
 
-    // Run num_tokens + 1 iterations: initial + num_tokens generations
-    // Only generate tokens in the first num_tokens iterations
-    for i in 0..=num_tokens {
-        driver.model.reset();
-        let mut store = GenStore::default();
+    let input_text = tokenizer.detokenize(tokens);
+    eprintln!("{} input: {}", mode_name, input_text);
 
-        eprintln!(
-            "{} mode: Running inference on {} tokens",
-            mode_name,
-            generated_tokens.len()
-        );
-
-        let trace = run_fn(&generated_tokens, &mut store)?;
-        let logits_step = extract_logits_from_trace(driver, &trace, &extract_fn)?;
-
-        if i == 0 {
-            // First iteration: store logits for the actual input tokens
-            // Note: Integer mode may pad seq_len to power-of-2, but we only want the actual tokens
-            let actual_seq_len = generated_tokens.len();
-            let logits_to_store = actual_seq_len * actual_vocab_size;
-            all_logits = logits_step.data[..logits_to_store].to_vec();
-            final_seq_len = actual_seq_len;
-        } else {
-            // Subsequent iterations: only append the last token's logits
-            let last_token_logits = &logits_step.data[logits_step.data.len() - actual_vocab_size..];
-            all_logits.extend_from_slice(last_token_logits);
-            // Update seq_len to account for the new token (using consistent vocab size)
-            final_seq_len += 1;
-        }
-
-        if i < num_tokens {
-            // Get next token and append to sequence
-            let next_token_id = get_next_token(&logits_step.data, actual_vocab_size);
-            let next_token: Token = next_token_id.into();
-            generated_tokens.push(next_token);
-            eprintln!(
-                "Generated token {}: {} (id={})",
-                i + 1,
-                tokenizer.detokenize(&[next_token]),
-                next_token_id
-            );
-        }
-    }
-
-    eprintln!("{} logits extracted: seq_len {}", mode_name, final_seq_len);
-
-    let output = tokenizer.detokenize(&generated_tokens);
-    eprintln!("{} output: {}", mode_name.to_lowercase(), output);
+    let output_tokens = trace
+        .outputs()
+        .last()
+        .unwrap()
+        .tensor()
+        .unwrap()
+        .get_data()
+        .iter()
+        .skip(tokens.len())
+        .map(|t| Token::from(zkml::Number::to_usize(t)))
+        .collect::<Vec<_>>();
+    let output = tokenizer.detokenize(&output_tokens);
+    eprintln!("{} output: {}", mode_name, output);
 
     Ok(LogitsData {
-        data: all_logits,
-        seq_len: final_seq_len,
+        data: logits_step.data,
+        seq_len: logits_step.seq_len,
     })
 }
 
@@ -279,17 +229,14 @@ fn main() -> Result<()> {
         let tokenizer = gpt2.load_tokenizer(&format)?;
         let user_tokens = tokenizer.tokenize(&args.text);
         let driver =
-            Driver::load_from_model(gpt2, &format, Some(args.num_tokens + user_tokens.len() + 1))?;
+            Driver::load_from_model(gpt2, &format, Some(args.num_tokens + user_tokens.len()))?;
         (driver, tokenizer, user_tokens)
     } else if is_gemma3 {
         let gemma3 = Gemma3::new();
         let tokenizer = gemma3.load_tokenizer(&format)?;
         let user_tokens = tokenizer.tokenize(&args.text);
-        let driver = Driver::load_from_model(
-            gemma3,
-            &format,
-            Some(args.num_tokens + user_tokens.len() + 1),
-        )?;
+        let driver =
+            Driver::load_from_model(gemma3, &format, Some(args.num_tokens + user_tokens.len()))?;
         (driver, tokenizer, user_tokens)
     } else {
         bail!(
@@ -299,21 +246,16 @@ fn main() -> Result<()> {
         );
     };
 
-    // Run float mode with autoregressive generation
+    // Run float mode
     eprintln!(
         "\n{} Running Float Mode {}",
         SECTION_SEPARATOR, SECTION_SEPARATOR
     );
-    let logits_float = run_autoregressive_generation(
+    let logits_float = run_generation::<_, _>(
         &driver,
         &tokenizer,
-        user_tokens.clone(),
-        args.num_tokens,
+        &user_tokens,
         "Float",
-        |tokens, store| {
-            let tensor_inputs = vec![driver.tokens_to_tensor(tokens)?];
-            driver.run(tensor_inputs, store)
-        },
         |data, _node_id| Ok(data.to_vec()),
     )?;
     // Reset cache and convert to provable mode
@@ -324,18 +266,12 @@ fn main() -> Result<()> {
     driver.model.reset();
     let (driver_int, metadata) = driver.into_provable_llm(None)?;
 
-    // Run provable mode with autoregressive generation
-    // vocab_size is obtained from driver_int.vocab_size() which returns the actual (non-padded) size
-    let logits_int = run_autoregressive_generation(
+    // Run provable mode
+    let logits_int = run_generation::<_, _>(
         &driver_int,
         &tokenizer,
-        user_tokens.clone(),
-        args.num_tokens,
+        &user_tokens,
         "Integer",
-        |tokens, store| {
-            let input_tensor = driver_int.tokens_to_tensor(tokens)?;
-            driver_int.run_elements(input_tensor, store)
-        },
         |data, node_id| {
             let scaling_factors = metadata.layer_input_scaling_factor(node_id);
             let scaling_factor = scaling_factors

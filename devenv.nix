@@ -1,5 +1,15 @@
 { pkgs, lib, config, inputs, ... }:
 
+let
+  # Combine NLTK data packages into a single directory
+  nltk-data = pkgs.symlinkJoin {
+    name = "nltk-data";
+    paths = [
+      pkgs.nltk-data.punkt
+      pkgs.nltk-data.punkt-tab
+    ];
+  };
+in
 {
   cachix.enable = false;
 
@@ -23,6 +33,8 @@
     OPENSSL_DEV = pkgs.openssl.dev;
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     LD_LIBRARY_PATH = "${pkgs.zlib}/lib:${pkgs.openblas}/lib:${pkgs.stdenv.cc.cc.lib}/lib";
+    # Point NLTK to pre-installed data in nix store
+    NLTK_DATA = "${nltk-data}";
   };
 
   # https://devenv.sh/tasks/
@@ -51,6 +63,7 @@
     gguf[gui]
     huggingface_hub
     matplotlib
+    nltk
     numpy
     onnx
     psutil
