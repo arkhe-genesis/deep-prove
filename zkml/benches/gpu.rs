@@ -38,7 +38,7 @@ mod add_layer {
     use zkml::{
         ScalingFactor, Shape, Tensor,
         layers::{add::Add, provable::Evaluate},
-        tensor::{KeyedTensor, WrappedTensor},
+        tensor::WrappedTensor,
     };
 
     use crate::{Args, default_sizes, get_results};
@@ -50,16 +50,14 @@ mod add_layer {
         let operand = Tensor::<f32>::random(&shape);
         let input = Tensor::<f32>::random(&shape);
         let result = operand.add(&input);
-        let layer = Add::<f32>::new_with(
-            KeyedTensor::new("add_operand", operand.clone()),
-            shape.clone(),
-        );
+        let layer = Add::<f32>::new();
 
         let operand_scaling = ScalingFactor::from_tensor(&operand, None);
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let result_scaling = ScalingFactor::from_tensor(&result, None);
 
         let input = WrappedTensor::try_from(&input.to_quantized(&input_scaling)).unwrap();
+        let operand = WrappedTensor::try_from(&operand.to_quantized(&operand_scaling)).unwrap();
 
         let layer = layer
             .quantize(&[operand_scaling, input_scaling], result_scaling)
@@ -67,11 +65,15 @@ mod add_layer {
             .quantized_op;
 
         // warm up
-        let out = layer.evaluate(&[&input]).expect("Add should succeed");
+        let out = layer
+            .evaluate(&[&input, &operand])
+            .expect("Add should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer.evaluate(&[&input]).expect("Add should succeed");
+            let out = layer
+                .evaluate(&[&input, &operand])
+                .expect("Add should succeed");
             get_results(out)
         });
     }
@@ -80,21 +82,21 @@ mod add_layer {
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size]);
-        let operand = Tensor::<f32>::random(&shape);
-
+        let operand = WrappedTensor::<f32>::random(&shape);
         let input = WrappedTensor::<f32>::random(&shape);
 
-        let layer = Add::<f32>::new_with(
-            KeyedTensor::new("add_operand", operand.clone()),
-            shape.clone(),
-        );
+        let layer = Add::<f32>::new();
 
         // warm up
-        let out = layer.evaluate(&[&input]).expect("Add should succeed");
+        let out = layer
+            .evaluate(&[&input, &operand])
+            .expect("Add should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer.evaluate(&[&input]).expect("Add should succeed");
+            let out = layer
+                .evaluate(&[&input, &operand])
+                .expect("Add should succeed");
             get_results(out)
         });
     }

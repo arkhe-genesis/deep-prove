@@ -14,16 +14,16 @@ use crate::{
         requant::{FIXED_POINT_SCALE, Requant},
     },
     model::Step,
-    padding::{PaddingMode, ShapeData, ShapeInfo},
+    padding::{PaddingMode, ShapeInfo},
     quantization::{self, Fieldizer},
-    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Context, Result, bail, ensure};
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::util::ceil_log2;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::HashMap, marker::PhantomData};
 use transcript::Transcript;
 
 /// The short name used to identify the Add layer.
@@ -33,10 +33,8 @@ pub const ADD_LAYER: &str = "_ADD";
 /// If there is two inputs, no static weight, then the output shape is the same as the first input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Add<N> {
-    /// The operand is the right side of the Add operation.
-    /// shape is the unpadded shape of the operand
-    operand: Option<(KeyedTensor<N>, Shape)>,
     quant_info: Option<AddQuantInfo>,
+    phantom: PhantomData<N>,
 }
 
 impl<N: TensorTypeParam> Default for Add<N> {
@@ -63,14 +61,8 @@ pub struct AddProof<E> {
 impl<N: TensorTypeParam> Add<N> {
     pub fn new() -> Self {
         Self {
-            operand: None,
             quant_info: None,
-        }
-    }
-    pub fn new_with(operand: KeyedTensor<N>, unpadded_shape: Shape) -> Self {
-        Self {
-            operand: Some((operand, unpadded_shape)),
-            quant_info: None,
+            phantom: PhantomData {},
         }
     }
 }
@@ -78,10 +70,10 @@ impl<N: TensorTypeParam> Add<N> {
 impl Add<Element> {
     pub(crate) fn prove_step<A, E, T, PCS>(
         &self,
-        node_id: NodeId,
+        _node_id: NodeId,
         last_claims: Vec<&Claim<E>>,
         inputs: &[A],
-        prover: &mut Prover<E, T, PCS>,
+        _prover: &mut Prover<E, T, PCS>,
     ) -> anyhow::Result<(Vec<Claim<E>>, AddProof<E>)>
     where
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
@@ -105,34 +97,12 @@ impl Add<Element> {
         let left_input = inputs[0].as_ref();
         let left_eval = left_input.to_field_mle().evaluate(&last_claim.point);
         let mut output_claims = vec![Claim::new(last_claim.point.clone(), left_eval)];
-        let right_eval = match &self.operand {
-            Some((operand, _)) => {
-                // out = x1 * s1 + x2 * s2
-                // so x1 = (out - x2 * s2) / s1
-                let a: E = self.quant_info.as_ref().unwrap().left_scale().to_field();
-                let left_side: E = left_eval * a;
-                let right_side: E = last_claim.eval - left_side;
-                let right_eval =
-                    right_side / self.quant_info.as_ref().unwrap().right_scale().to_field();
-                let mut claims = HashMap::new();
-                claims.insert(
-                    operand.commitment_id(),
-                    Claim::new(last_claim.point.clone(), right_eval),
-                );
-                // this claim gets verified by the PCS openings since it's a static one
-                prover.add_common_claims(node_id, claims);
-                right_eval
-            }
-            None => {
-                let right_eval = inputs[1]
-                    .as_ref()
-                    .to_field_mle()
-                    .evaluate(&last_claim.point);
-                // this claims gets passed to the previous layer alongside the left one.
-                output_claims.push(Claim::new(last_claim.point.clone(), right_eval));
-                right_eval
-            }
-        };
+        let right_eval = inputs[1]
+            .as_ref()
+            .to_field_mle()
+            .evaluate(&last_claim.point);
+        // this claims gets passed to the previous layer alongside the left one.
+        output_claims.push(Claim::new(last_claim.point.clone(), right_eval));
 
         let proof = AddProof {
             left_eval,
@@ -145,34 +115,22 @@ impl Add<Element> {
 
 impl Evaluate<f32> for Add<f32> {
     fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> anyhow::Result<LayerOut<f32>> {
-        let left = inputs[0];
-        let shape = left.shape();
-        let right = if inputs.len() == 2 {
-            let right = inputs[1];
-            let left_shape = left.shape();
-            let right_shape = left.shape();
+        ensure!(
+            inputs.len() == 2,
+            "Add layer with an operand expects two inputs. got: {}",
+            inputs.len()
+        );
+        let left = inputs[0].clone();
+        let right = inputs[1].clone();
 
-            ensure!(
-                left_shape.num_elements() == right_shape.num_elements(),
-                "Add layer expects inputs to have the same shape: {left_shape:?} vs {right_shape:?}",
-            );
-            right.clone()
-        } else if inputs.len() == 1 {
-            let (operand, _) = self
-                .operand
-                .as_ref()
-                .context("Add operand can't be None if there is only one input")?;
-            let operand_shape = operand.shape();
-            ensure!(
-                shape.num_elements() == operand_shape.product(),
-                "Add layer expects input and operand to have the same shape: {shape:?} vs {operand_shape:?}",
-            );
-            WrappedTensor::try_from(operand)?
-        } else {
-            bail!("Add layer expects 1 or 2 inputs, got {}", inputs.len());
-        };
+        let left_shape = left.shape();
+        let right_shape = right.shape();
 
-        let left = left.clone();
+        ensure!(
+            left_shape.num_elements() == right_shape.num_elements(),
+            "Add layer expects inputs to have the same shape: {left_shape:?} vs {right_shape:?}",
+        );
+
         let result = left.add(right)?;
         Ok(LayerOut::from_tensor(result))
     }
@@ -180,28 +138,21 @@ impl Evaluate<f32> for Add<f32> {
 
 impl Evaluate<Element> for Add<Element> {
     fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> anyhow::Result<LayerOut<Element>> {
+        ensure!(
+            inputs.len() == 2,
+            "Add layer expects 2 inputs if there is no operand"
+        );
+        let left = inputs[0].clone();
+        let right = inputs[1].clone();
+
         let quant_info = self
             .quant_info
             .as_ref()
             .context("Add layer is not quantized")?;
-        ensure!(!inputs.is_empty(), "Add layer expects at least 1 input");
-        let left_tensor = inputs[0];
-        let right_tensor = match self.operand {
-            Some((ref op, _)) => WrappedTensor::try_from(op)?,
-            None => {
-                ensure!(
-                    inputs.len() == 2,
-                    "Add layer expects 2 inputs if there is no operand"
-                );
-                inputs[1].clone()
-            }
-        };
-        let left_scaled = left_tensor.clone().mul_scalar(quant_info.left_scale());
-        let right_scaled = right_tensor.mul_scalar(quant_info.right_scale());
 
-        let left = left_scaled;
-        let right = right_scaled;
-        let result = left.add(right)?;
+        let left_scaled = left.mul_scalar(quant_info.left_scale());
+        let right_scaled = right.mul_scalar(quant_info.right_scale());
+        let result = left_scaled.add(right_scaled)?;
         Ok(LayerOut::from_tensor(result))
     }
 }
@@ -212,29 +163,16 @@ impl<N> OpInfo for Add<N> {
         input_shapes: &[Shape],
         padding_mode: PaddingMode,
     ) -> Result<Vec<Shape>> {
-        if let Some((_, og_shape)) = &self.operand {
-            assert!(
-                input_shapes.len() == 1,
-                "Add layer expects 1 input if there is an operand"
-            );
-            assert!(
-                *og_shape == input_shapes[0],
-                "Add layer operand shape mismatch: {:?} vs {:?}",
-                og_shape,
-                &input_shapes[0]
-            );
-        } else {
-            assert!(
-                input_shapes.len() == 2,
-                "Add layer expects 2 inputs if there is no operand"
-            );
-            assert!(
-                input_shapes[0] == input_shapes[1],
-                "Add layer input shapes mismatch: {:?} vs {:?}",
-                input_shapes[0],
-                input_shapes[1]
-            );
-        }
+        assert!(
+            input_shapes.len() == 2,
+            "Add layer expects 2 inputs if there is no operand"
+        );
+        assert!(
+            input_shapes[0] == input_shapes[1],
+            "Add layer input shapes mismatch: {:?} vs {:?}",
+            input_shapes[0],
+            input_shapes[1],
+        );
         match padding_mode {
             PaddingMode::NoPadding => Ok(vec![input_shapes[0].clone()]),
             PaddingMode::Padding => Ok(vec![input_shapes[0].next_power_of_two()]),
@@ -413,16 +351,13 @@ impl Add<f32> {
         input_scaling: &[ScalingFactor],
         output_scaling: ScalingFactor,
     ) -> anyhow::Result<QuantizeOutput<Add<Element>>> {
-        let left_scaling = input_scaling[0];
-        let right_scaling = match self.operand {
-            Some((ref t, _)) => ScalingFactor::from_tensor(t, None),
-            None => input_scaling[1],
-        };
-        let add_quant_info = AddQuantInfo::new(&left_scaling, &right_scaling, &output_scaling);
+        let left = input_scaling[0];
+        let right = input_scaling[1];
+        let add_quant_info = AddQuantInfo::new(&left, &right, &output_scaling);
 
         let quantized_model = Add::<Element> {
-            operand: self.operand.map(|(t, s)| (t.quantize(&right_scaling), s)),
             quant_info: Some(add_quant_info),
+            phantom: PhantomData {},
         };
 
         let requant = requant_from_add(add_quant_info);
@@ -466,43 +401,26 @@ impl ProveInfo for Add<Element> {
     fn step_info<E: ExtensionField>(
         &self,
         id: NodeId,
-        mut aux: ContextAux,
+        aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
         let Some(ref quant_info) = self.quant_info else {
             bail!("Add layer is not quantized");
         };
-        let mut ctx = AddCtx {
+        let ctx = AddCtx {
             quant_info: *quant_info,
             operand_key: None,
             node_id: id,
-        };
-        if let Some((ref op, _)) = self.operand {
-            let mut model_polys = HashMap::new();
-            model_polys.insert(op.commitment_id(), op.get_data().to_vec());
-            aux.model_polys = Some(model_polys);
-            ctx.operand_key = Some(op.commitment_id());
         };
         Ok((LayerCtx::Add(ctx), aux))
     }
 }
 
 impl PadOp for Add<Element> {
-    fn pad_node(mut self, si: &mut ShapeInfo) -> anyhow::Result<Self>
+    fn pad_node(self, si: &mut ShapeInfo) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
-        if let Some((op, og_shape)) = self.operand {
-            ensure!(si.shapes.len() == 1, "Add layer expects 1 input shape");
-            let op = op.map_tensor(|t| t.pad_next_power_of_two());
-            let padded_shape = op.shape().clone();
-            self.operand = Some((op, og_shape.clone()));
-            ShapeData::new(og_shape.clone());
-            let sd = si.shapes.first_mut().unwrap();
-            sd.input_shape_og = og_shape.clone();
-            sd.input_shape_padded = padded_shape;
-        } else {
-            ensure!(si.shapes.len() == 2, "Add layer expects 2 input shapes");
-        }
+        ensure!(si.shapes.len() == 2, "Add layer expects 2 input shapes");
         Ok(self)
     }
 }
@@ -598,7 +516,7 @@ mod test {
     use std::{fmt::Debug, ops::Range};
 
     use proptest::prelude::*;
-    use tenstore::{GenStore, StorageKey};
+    use tenstore::GenStore;
 
     use super::*;
     use crate::{
@@ -655,8 +573,6 @@ mod test {
             1e-2_f32,
             1e-1_f32,
         );
-        println!("computed_result: {:?}", computed_result.get_data());
-        println!("t3: {:?}", t3.get_data());
 
         assert!(
             close_to_float,
@@ -683,55 +599,14 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_add_proving_with_operand() {
-        let input_shape = Shape::from(vec![3, 7]);
-        for _ in 0..25 {
-            let mut model =
-                Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
-            let operand = KeyedTensor::new(
-                StorageKey::<f32>::new("add_operand"),
-                Tensor::<f32>::random(&input_shape),
-            );
-            let add = Add::new_with(operand, input_shape.clone());
-            let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();
-            model.automatic_output_labelling().unwrap();
-            model.describe();
-            prove_model(model, &mut GenStore::default()).unwrap();
-        }
-    }
-
-    #[test]
-    fn test_add_requant() {
-        let t1 = Tensor::<f32>::random(&vec![4].into());
-        let s1 = ScalingFactor::from_tensor(&t1, None);
-        let qt1 = t1.clone().to_quantized(&s1);
-        let ct1 = qt1.dequantize(&s1);
-        println!("t1: {:?}", t1.get_data());
-        println!("qt1: {:?}", qt1.get_data());
-        println!("ct1: {:?}", ct1.get_data());
-        println!(
-            "is close: {:?}",
-            is_close_with_tolerance(t1.get_data(), ct1.get_data(), 1e-2_f32, 0.1e-2_f32)
-        );
-    }
-
     proptest! {
         #[test]
         fn test_add_with_f32(input in any_input::<f32>(1..256, 1..256)) {
-            let Input { operand, unpadded_shape, input, is_two_layers } = input;
+            let Input { operand, input } = input;
 
             let expected = input.add(&operand);
-
-            let computed = if is_two_layers {
-                // In case of two layers the operand is used as the 2nd input
-                let add = Add::<f32>::new();
-
-                add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap()
-            } else {
-                let add = Add::<f32>::new_with(operand, unpadded_shape);
-                add.evaluate(&[&input.as_wrapped()]).unwrap()
-            };
+            let add = Add::<f32>::new();
+            let computed = add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap();
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
@@ -742,7 +617,7 @@ mod test {
             left_multiplier in 1..=10_i64,
             right_multiplier in 1..=10_i64,
         ) {
-            let Input { operand, unpadded_shape, input, is_two_layers } = input;
+            let Input { operand, input } = input;
 
             let expected = input.scalar_mul(&left_multiplier).add(&operand.scalar_mul(&right_multiplier));
 
@@ -753,27 +628,18 @@ mod test {
                 intermediate_bit_size: 13,
             };
 
-            let computed = if is_two_layers {
-                // In case of two layers the operand is used as the 2nd input
-                let mut add = Add::<Element>::new();
-                add.quant_info = Some(quant_info);
+            let mut add = Add::<Element>::new();
+            add.quant_info = Some(quant_info);
 
-                add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap()
-            } else {
-                let mut add = Add::<Element>::new_with(operand, unpadded_shape);
-                add.quant_info = Some(quant_info);
-                add.evaluate(&[&input.as_wrapped()]).unwrap()
-            };
+            let computed = add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap();
 
             prop_assert_eq!(&expected, &computed.outputs[0].to_native());
         }
     }
 
     struct Input<T> {
-        operand: KeyedTensor<T>,
-        unpadded_shape: Shape,
+        operand: Tensor<T>,
         input: Tensor<T>,
-        is_two_layers: bool,
     }
 
     impl<T> Debug for Input<T> {
@@ -790,15 +656,7 @@ mod test {
             let shape = Shape::new(vec![dim_x, dim_y]);
             let operand = Tensor::<T>::any(shape.clone());
             let input = Tensor::<T>::any(shape.clone());
-            let unpadded_shape = Just(shape);
-            (operand, unpadded_shape, input, any::<bool>()).prop_map(
-                |(operand, unpadded_shape, input, is_two_layers)| Input {
-                    operand: KeyedTensor::new("add_operand", operand),
-                    unpadded_shape,
-                    input,
-                    is_two_layers,
-                },
-            )
+            (operand, input).prop_map(|(operand, input)| Input { operand, input })
         })
     }
 }
