@@ -129,7 +129,7 @@ name = "prove-model"
 
 [[bench]]
 harness = false
-name = "gpu"
+name = "layers"
 
 [[bench]]
 harness = false

@@ -18,7 +18,6 @@ use zkml::{
 };
 
 type F = GoldilocksExt2;
-// the hasher type is chosen depending on the feature flag inside the mpcs crate
 type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
 type Transcript = transcript::basic::BasicTranscript<F>;
@@ -27,8 +26,6 @@ const MLP_IRIS: &[u8] = include_bytes!("../assets/scripts/MLP/mlp-iris-01.onnx")
 const MLP_IRIS_INPUT: &[u8] = include_bytes!("../assets/scripts/MLP/input.json.zst");
 const CNN_CIFAR: &[u8] = include_bytes!("../assets/scripts/CNN/cnn-cifar-01.onnx");
 const CNN_CIFAR_INPUT: &[u8] = include_bytes!("../assets/scripts/CNN/input.json.zst");
-// const CNN_COVID: &[u8] = include_bytes!("../assets/scripts/covid/cnn-covid.onnx");
-// const CNN_COVID_INPUT: &[u8] = include_bytes!("../assets/scripts/covid/input.json.zst");
 
 type P<'a, 'b> = Prover<'a, 'b, F, Transcript, Pcs<F>>;
 
@@ -43,18 +40,6 @@ fn parse_model_and_inputs<T: std::io::Read>(
             .build()
             .expect("failed to parse model");
     (model, metadata, run_inputs)
-}
-
-fn inputs_to_tensor(model: &Model<f32>, run_inputs: &Input) -> Vec<Vec<Tensor<f32>>> {
-    run_inputs
-        .as_floats()
-        .iter()
-        .map(|input| {
-            model
-                .load_input_flat(vec![input.to_vec()])
-                .expect("failed to call load_input_flat on the model")
-        })
-        .collect()
 }
 
 fn inputs_to_elements(
@@ -129,17 +114,6 @@ fn prove(c: &mut Criterion) {
         )
     });
 
-    // NOTE: disabling covid model, as it is /very/ memory-intensive
-    // let inputs = zstd::Decoder::new(CNN_COVID_INPUT).expect("failed to parse zstd");
-    // let (model, inputs) = parse_model_and_inputs(CNN_COVID, inputs);
-    // group.bench_with_input("covid", &(model, inputs), |bencher, (model, inputs)| {
-    //     bencher.iter_batched(
-    //         || inputs.clone(),
-    //         |inputs| infer_model(model, inputs),
-    //         criterion::BatchSize::SmallInput,
-    //     )
-    // });
-
     group.finish();
 }
 
@@ -149,85 +123,6 @@ fn inference(c: &mut Criterion) {
     group
         .sample_size(20)
         .measurement_time(std::time::Duration::from_secs(200));
-
-    let inputs = zstd::Decoder::new(MLP_IRIS_INPUT).expect("failed to parse zstd");
-    let (model, metadata, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
-
-    let model_f32: &Model<f32> = metadata
-        .float_model
-        .as_ref()
-        .expect("Expected the f32 model to be available");
-    let inputs_f32 = inputs_to_tensor(model_f32, &inputs);
-    group.bench_with_input(
-        "mlp/f32",
-        &(model_f32, inputs_f32),
-        |bencher, (model_f32, inputs_f32)| {
-            bencher.iter_batched(
-                || random_input(inputs_f32),
-                |inputs| model_f32.run(inputs, &mut GenStore::default()).unwrap(),
-                criterion::BatchSize::SmallInput,
-            )
-        },
-    );
-
-    let model_elt: Model<Element> = model;
-    let inputs_elt = inputs_to_elements(&model_elt, &metadata, inputs);
-    group.bench_with_input(
-        "mlp/element",
-        &(model_elt, inputs_elt),
-        |bencher, (model_elt, inputs_elt)| {
-            bencher.iter_batched(
-                || random_input(inputs_elt),
-                |inputs| model_elt.run(inputs, &mut GenStore::default()).unwrap(),
-                criterion::BatchSize::SmallInput,
-            )
-        },
-    );
-
-    let inputs = zstd::Decoder::new(CNN_CIFAR_INPUT).expect("failed to parse zstd");
-    let (model, metadata, inputs) = parse_model_and_inputs(CNN_CIFAR, inputs);
-
-    let model_f32: &Model<f32> = metadata
-        .float_model
-        .as_ref()
-        .expect("Expected f32 model to be available");
-    let inputs_f32 = inputs_to_tensor(model_f32, &inputs);
-    group.bench_with_input(
-        "cnn/f32",
-        &(model_f32, inputs_f32),
-        |bencher, (model_f32, inputs_f32)| {
-            bencher.iter_batched(
-                || random_input(inputs_f32),
-                |inputs| model_f32.run(inputs, &mut GenStore::default()).unwrap(),
-                criterion::BatchSize::SmallInput,
-            )
-        },
-    );
-
-    let model_elt: Model<Element> = model;
-    let inputs_elt = inputs_to_elements(&model_elt, &metadata, inputs);
-    group.bench_with_input(
-        "cnn/Element",
-        &(model_elt, inputs_elt),
-        |bencher, (model_elt, inputs_elt)| {
-            bencher.iter_batched(
-                || random_input(inputs_elt),
-                |inputs| model_elt.run(inputs, &mut GenStore::default()).unwrap(),
-                criterion::BatchSize::SmallInput,
-            )
-        },
-    );
-
-    // NOTE: model parsing fails
-    // let inputs = zstd::Decoder::new(CNN_COVID_INPUT).expect("failed to parse zstd");
-    // let (model, inputs) = parse_model_and_inputs(CNN_COVID, inputs);
-    // group.bench_with_input("covid", &(model, inputs), |bencher, (model, inputs)| {
-    //     bencher.iter_batched(
-    //         || inputs.clone(),
-    //         |inputs| infer_model(model, inputs),
-    //         criterion::BatchSize::SmallInput,
-    //     )
-    // });
 
     for (name, max_context) in [("gpt2", 2), ("gpt2_small_run", 10)] {
         let model_path =
