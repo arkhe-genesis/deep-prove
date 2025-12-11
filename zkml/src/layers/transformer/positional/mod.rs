@@ -26,7 +26,7 @@ use crate::{
             config::{LLMStructure, PositionalConfig, RopeConfig},
         },
     },
-    quantization::{Fieldizer, TensorFielder},
+    quantization::ToField,
     tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Ok, Result, bail, ensure};
@@ -281,7 +281,7 @@ impl<N: TensorTypeParam> Positional<N> {
         transcript: &mut T,
     ) -> anyhow::Result<(Vec<E>, Claim<E>)>
     where
-        N: Fieldizer<E>,
+        N: ToField<E>,
     {
         // first, we compute the number of variables that we need to fill to get to the `positional_matrix`
         // polynomial
@@ -330,7 +330,7 @@ impl<N: TensorTypeParam> Positional<N> {
                 Ok((
                     i,
                     sub_matrices[i]
-                        .to_fields()
+                        .to_field()
                         .to_mle_2d()?
                         .evaluate(&evaluation_point[..sub_pos_vars + i]),
                 ))

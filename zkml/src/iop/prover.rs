@@ -30,7 +30,7 @@ use crate::{
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
     model::{Model, Trace},
-    quantization::TensorFielder,
+    quantization::ToField,
     tensor::{CommitmentId, get_root_of_unity},
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -642,7 +642,7 @@ where
                     let output_tensor_guard = trace_step.output_tensor_at(
                         **source_port,
                     )?;
-                    output_tensor_guard.to_fields()
+                    output_tensor_guard.to_field()
                 };
                 ensure!(
                     outputs.insert(output_id, output_tensor).is_none(),
@@ -688,7 +688,7 @@ where
             })?
             .into_iter() // then, we compute the claims for each output
             .map(|(port, tensor)| {
-                let claim = compute_claim(self.transcript, tensor.to_fields());
+                let claim = compute_claim(self.transcript, tensor.to_field());
                 (port, claim)
         }).collect();
         // each layer generates claims about its inputs. Each claim is indexed by
@@ -717,7 +717,7 @@ where
                                 .with_context(|| {
                                     format!("hydrating tensor {}", handle.storage_key())
                                 })
-                                .map(|tensor_guard| tensor_guard.to_fields())
+                                .map(|tensor_guard| tensor_guard.to_field())
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
 

@@ -218,11 +218,11 @@ pub fn bias_scaling_matmul(input: &ScalingFactor, model: &ScalingFactor) -> Scal
 ///
 /// The trait is generic over `F` because there are more than one target field,
 /// e.g. baby bear and goldilocks.
-pub trait Fieldizer<F> {
+pub trait ToField<F> {
     fn to_field(&self) -> F;
 }
 
-impl<F: ExtensionField> Fieldizer<F> for Element {
+impl<F: ExtensionField> ToField<F> for Element {
     fn to_field(&self) -> F {
         if self.is_negative() {
             // Doing wrapped arithmetic : p-128 ... p-1 means negative number
@@ -234,11 +234,15 @@ impl<F: ExtensionField> Fieldizer<F> for Element {
     }
 }
 
-pub(crate) trait IntoElement {
+/// Trait to convert a field element to its base.
+///
+/// The [From] and [Into] traits can not be used because of the orphan rules, it
+/// is not allowed to implement a foreign trait for a foreign type.
+pub(crate) trait ToElement {
     fn to_element(&self) -> Element;
 }
 
-impl<F: ExtensionField> IntoElement for F {
+impl<F: ExtensionField> ToElement for F {
     fn to_element(&self) -> Element {
         let e = self.to_canonical_u64_vec()[0];
         let modulus_half = <F::BaseField as SmallField>::MODULUS_U64 >> 1;
@@ -257,15 +261,20 @@ impl<F: ExtensionField> IntoElement for F {
     }
 }
 
-pub trait TensorFielder<F> {
-    fn to_fields(self) -> Tensor<F>;
+impl<F: ExtensionField, T> ToField<Vec<F>> for [T]
+where
+    T: ToField<F>,
+{
+    fn to_field(&self) -> Vec<F> {
+        to_field::<T, F, _>(self)
+    }
 }
 
-impl<F: ExtensionField, T> TensorFielder<F> for &Tensor<T>
+impl<F: ExtensionField, T> ToField<Tensor<F>> for Tensor<T>
 where
-    T: Fieldizer<F> + Clone,
+    T: ToField<F>,
 {
-    fn to_fields(self) -> Tensor<F> {
+    fn to_field(&self) -> Tensor<F> {
         let shape = self.shape();
         let unpadded_shape = self.unpadded_shape();
         let data = to_field::<T, F, _>(self.get_data());
@@ -274,15 +283,84 @@ where
     }
 }
 
-impl<'a, F: ExtensionField, T> TensorFielder<F> for &TensorSlice<'a, T>
+impl<'a, F: ExtensionField, T> ToField<Tensor<F>> for TensorSlice<'a, T>
 where
-    T: Fieldizer<F>,
+    T: ToField<F>,
 {
-    fn to_fields(self) -> Tensor<F> {
+    fn to_field(&self) -> Tensor<F> {
         Tensor::new(self.get_shape(), to_field::<T, F, _>(self.get_data())).expect(
             "a tensor can always be created from previously\
             successfully created shape and data; qed",
         )
+    }
+}
+
+pub trait Quantize {
+    type Output;
+
+    fn quantize(&self, scaling: &ScalingFactor) -> Self::Output;
+}
+
+impl Quantize for Element {
+    type Output = Element;
+
+    fn quantize(&self, _scaling: &ScalingFactor) -> Self::Output {
+        *self
+    }
+}
+
+impl Quantize for f32 {
+    type Output = Element;
+
+    fn quantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        scaling.quantize(self)
+    }
+}
+
+impl<T> Quantize for [T]
+where
+    T: Quantize,
+{
+    type Output = Vec<<T as Quantize>::Output>;
+
+    fn quantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        self.iter().map(|e| T::quantize(e, scaling)).collect()
+    }
+}
+
+impl<T> Quantize for Vec<T>
+where
+    T: Quantize,
+{
+    type Output = Vec<<T as Quantize>::Output>;
+
+    fn quantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        self.iter().map(|e| T::quantize(e, scaling)).collect()
+    }
+}
+
+pub trait Dequantize {
+    type Output;
+
+    fn dequantize(&self, scaling: &ScalingFactor) -> Self::Output;
+}
+
+impl Dequantize for Element {
+    type Output = f32;
+
+    fn dequantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        scaling.dequantize(self)
+    }
+}
+
+impl<T> Dequantize for [T]
+where
+    T: Dequantize,
+{
+    type Output = Vec<<T as Dequantize>::Output>;
+
+    fn dequantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        self.iter().map(|el| el.dequantize(scaling)).collect()
     }
 }
 
@@ -339,7 +417,7 @@ impl MinMax for Element {
 
 #[cfg(test)]
 mod test {
-    use crate::quantization::{Fieldizer, IntoElement, split_scale_into_multiplier};
+    use crate::quantization::{ToElement, ToField, split_scale_into_multiplier};
 
     use crate::Element;
 

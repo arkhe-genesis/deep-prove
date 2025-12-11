@@ -3,7 +3,7 @@ use crate::{
     graph::NodeId,
     layers::NodeOut,
     model::ModelGraph,
-    quantization::{Fieldizer, ModelMetadata},
+    quantization::{ModelMetadata, ToField},
     tensor::{TensorHandle, TensorTypeParam},
 };
 
@@ -136,7 +136,7 @@ where
     pub fn to_verifier_io<E>(&self) -> anyhow::Result<IO<E>>
     where
         E: ExtensionField,
-        D: Fieldizer<E>,
+        D: ToField<E>,
     {
         let inputs = self
             .input

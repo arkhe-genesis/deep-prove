@@ -16,7 +16,7 @@ use crate::{
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
     model::Step,
-    quantization::TensorFielder,
+    quantization::{Quantize, ToField},
     tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -252,7 +252,7 @@ impl Absolute<Element> {
         let sub_pos: Tensor<E> = matrix_slice
             .slice_over_first_dim(0, input.shape()[0])
             .to_tensor()?
-            .to_fields();
+            .to_field();
 
         let (mut claims, add_proof) = self.add_layer.prove_step(
             node_id,
@@ -476,7 +476,7 @@ mod tests {
         },
         model::{Model, test::prove_model},
         padding::{PaddingMode, ShapeData, ShapeInfo},
-        quantization::{AbsoluteMax, ScalingFactor},
+        quantization::{AbsoluteMax, Quantize, ScalingFactor},
         tensor::{KeyedTensor, TensorSlice, TensorTypeParam, is_close_with_tolerance},
     };
     use proptest::prelude::*;
@@ -596,7 +596,7 @@ mod tests {
                 )
                 .expect("quantize absolute should succeed");
             let layer_q = q.quantized_op;
-            let input_q = input.to_quantized(&input_sf);
+            let input_q = input.quantize(&input_sf);
 
             let (pos_q, add_q) = (layer_q.positional.clone(), &layer_q.add_layer);
             let sub_slice = TensorSlice::from(pos_q.deref()).slice_over_first_dim(0, seq_len);

@@ -3,7 +3,9 @@
 use crate::{
     ScalingFactor,
     layers::{provable::QuantizeOutput, requant::Requant},
-    quantization::{self, bias_scaling_matmul, model_scaling_factor_from_tensor_and_bias},
+    quantization::{
+        self, Quantize, bias_scaling_matmul, model_scaling_factor_from_tensor_and_bias,
+    },
 };
 
 use super::*;
@@ -83,10 +85,10 @@ impl EinSum<f32> {
                     );
                     let quantized_weight = weight_tensor
                         .clone()
-                        .map_tensor(|t| t.to_quantized(&weight_scaling));
+                        .map_tensor(|t| t.quantize(&weight_scaling));
                     let quantized_bias = bias_opt
                         .clone()
-                        .map(|bias| bias.map_tensor(|t| t.to_quantized(&bias_scaling)));
+                        .map(|bias| bias.map_tensor(|t| t.quantize(&bias_scaling)));
                     let requant = Requant::from_scaling_factors(
                         lhs_input_scaling,
                         weight_scaling,
@@ -111,7 +113,7 @@ impl EinSum<f32> {
                     let bias_scaling = bias_scaling_matmul(&lhs_input_scaling, &rhs_input_scaling);
                     let quantized_bias = bias_opt
                         .clone()
-                        .map(|bias| bias.map_tensor(|t| t.to_quantized(&bias_scaling)));
+                        .map(|bias| bias.map_tensor(|t| t.quantize(&bias_scaling)));
                     let requant = Requant::from_scaling_factors(
                         lhs_input_scaling,
                         rhs_input_scaling,

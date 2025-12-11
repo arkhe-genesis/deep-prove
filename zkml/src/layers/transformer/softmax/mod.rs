@@ -29,7 +29,7 @@ use crate::{
     },
     model::{Step, transform::impls::softmax_mask::SoftmaxMaskTransform},
     padding::PaddingMode,
-    quantization::{self, Fieldizer, ScalingFactor},
+    quantization::{self, ScalingFactor, ToField},
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
     to_base, to_bit_sequence_le,
 };
@@ -969,6 +969,7 @@ mod tests {
         layers::{Layer, transformer::attention_mask::AttentionMask},
         model::{Model, test::prove_model},
         padding::PaddingMode,
+        quantization::{Dequantize, Quantize},
         tensor::is_close_with_tolerance,
     };
     // use burn::tensor::{Int as BInt, Tensor as BTensor, TensorData as BTensorData};
@@ -997,8 +998,8 @@ mod tests {
                 Some((-1 << 24, 1 << 24)),
             );
 
-            let test_q_quant = test_q.to_quantized(&q_scaling);
-            let test_k_quant = test_k.to_quantized(&k_scaling);
+            let test_q_quant = test_q.quantize(&q_scaling);
+            let test_k_quant = test_k.quantize(&k_scaling);
 
             let test_qk_quant = test_q_quant.matmul(&test_k_quant).unwrap();
 
@@ -1140,7 +1141,7 @@ mod tests {
             let SoftmaxInput { n, data } = input;
             let float_tensor = Tensor::<f32>::new(vec![1, n, n].into(), data.clone()).unwrap();
             let scaling = ScalingFactor::from_tensor(&float_tensor, None);
-            let quant_input = float_tensor.to_quantized(&scaling);
+            let quant_input = float_tensor.quantize(&scaling);
 
             let layer_f = Softmax::<f32>::new(n);
             let layer_q = layer_f.quantise(scaling, *quantization::BIT_LEN).unwrap();

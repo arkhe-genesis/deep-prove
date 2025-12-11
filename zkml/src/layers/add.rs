@@ -15,7 +15,7 @@ use crate::{
     },
     model::Step,
     padding::{PaddingMode, ShapeInfo},
-    quantization::{self, Fieldizer},
+    quantization::{self, ToField},
     tensor::{CommitmentId, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -523,6 +523,7 @@ mod test {
         Element,
         layers::Layer,
         model::{Model, test::prove_model},
+        quantization::{Dequantize, Quantize},
         tensor::is_close_with_tolerance,
     };
 
@@ -533,8 +534,8 @@ mod test {
         let t2 = Tensor::<f32>::random(&vec![2, 2].into());
         let s1 = ScalingFactor::from_tensor(&t1, None);
         let s2 = ScalingFactor::from_tensor(&t2, None);
-        let qt1 = t1.to_quantized(&s1); // x1_q = round(x1 / s1)
-        let qt2 = t2.to_quantized(&s2);
+        let qt1 = t1.quantize(&s1); // x1_q = round(x1 / s1)
+        let qt2 = t2.quantize(&s2);
         let dequant_t1 = qt1.dequantize(&s1);
         let dequant_t2 = qt2.dequantize(&s2);
         let t3 = dequant_t1.add(&dequant_t2);

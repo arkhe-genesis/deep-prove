@@ -19,7 +19,7 @@ use crate::{
     model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo, pooling},
-    quantization::{Fieldizer, IntoElement},
+    quantization::{ToElement, ToField},
     tensor::WrappedTensor,
     to_base,
 };
@@ -961,7 +961,7 @@ mod tests {
 
             let output_mle = MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
                 output_num_vars,
-                padded_output.to_field::<F>(),
+                padded_output.to_field().into_data(),
             );
 
             let num_threads = optimal_sumcheck_threads(output_num_vars);

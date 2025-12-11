@@ -5,7 +5,7 @@ use timed_core::Output;
 use utils::{Metrics, init_csv_recorder, stream_data, stream_metrics};
 use zkml::{
     model::Model,
-    quantization::{AbsoluteMax, InferenceObserver, ModelMetadata},
+    quantization::{AbsoluteMax, InferenceObserver, ModelMetadata, Quantize},
 };
 
 use anyhow::{Context as CC, Result, bail, ensure};
@@ -146,21 +146,17 @@ impl InputJSON {
         Ok(())
     }
 
-    fn into_elements(self, md: &ModelMetadata) -> (Vec<Vec<Element>>, Vec<Vec<Element>>) {
+    fn into_elements(
+        self,
+        model_metadata: &ModelMetadata,
+    ) -> (Vec<Vec<Element>>, Vec<Vec<Element>>) {
         // NOTE: this rely on the assumption that there is only one input
-        let input_sf = md.input_scaling(0);
-        let inputs = self
-            .input_data
-            .into_iter()
-            .map(|input| input.into_iter().map(|e| input_sf.quantize(&e)).collect())
-            .collect();
+        let input_scaling = model_metadata.input_scaling(0);
+        let inputs = self.input_data.quantize(input_scaling);
+
         // NOTE: this rely on the assumption that there is only one output
-        let output_sf = *md.output_scaling(0);
-        let outputs = self
-            .output_data
-            .into_iter()
-            .map(|output| output.into_iter().map(|e| output_sf.quantize(&e)).collect())
-            .collect();
+        let output_scaling = *model_metadata.output_scaling(0);
+        let outputs = self.output_data.quantize(&output_scaling);
         (inputs, outputs)
     }
 

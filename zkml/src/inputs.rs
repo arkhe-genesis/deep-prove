@@ -4,8 +4,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Element,
-    quantization::{ModelMetadata, QUANTIZATION_RANGE},
+    Element, ScalingFactor,
+    quantization::{ModelMetadata, QUANTIZATION_RANGE, Quantize},
 };
 
 /// Inputs to the model
@@ -76,11 +76,17 @@ impl Input {
     }
 
     pub fn to_elements(self, md: &ModelMetadata) -> Vec<Vec<Element>> {
-        let input_sf = md.input_scaling(0);
+        self.quantize(md.input_scaling(0))
+    }
+}
 
+impl Quantize for Input {
+    type Output = Vec<Vec<Element>>;
+
+    fn quantize(&self, scaling: &ScalingFactor) -> Self::Output {
         self.input_data
-            .into_iter()
-            .map(|input| input.into_iter().map(|e| input_sf.quantize(&e)).collect())
+            .iter()
+            .map(|el| el.quantize(scaling))
             .collect()
     }
 }

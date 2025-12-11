@@ -855,8 +855,10 @@ mod tests {
     use tenstore::GenStore;
 
     use crate::{
-        Prover, ScalingFactor, init_test_logging_default, quantization::InferenceObserver,
-        testing::Pcs, verify,
+        Prover, init_test_logging_default,
+        quantization::{InferenceObserver, Quantize},
+        testing::Pcs,
+        verify,
     };
     use tracing::info;
     use transcript::BasicTranscript;
@@ -880,22 +882,12 @@ mod tests {
         let filepath = "assets/scripts/MLP/mlp-iris-01.onnx";
         let (model, md) = FloatOnnxLoader::new(filepath).build().unwrap();
         let input = crate::tensor::Tensor::<f32>::random(&model.input_shapes()[0])
-            .to_quantized(md.input_scaling(0));
+            .quantize(md.input_scaling(0));
         let inputs = model.prepare_inputs(vec![input]).unwrap();
         let trace = model.run(inputs, &mut GenStore::default()).unwrap();
         println!("Result: {:?}", trace.outputs());
     }
 
-    #[test]
-    fn test_quantize() {
-        let input: [f32; 2] = [0.09039914, -0.07716653];
-        let scaling = ScalingFactor::from_span(1.0, -1.0, None);
-        println!("Result: {} => {:?}", input[0], scaling.quantize(&input[0]));
-        println!("Result: {} => {:?}", input[1], scaling.quantize(&input[0]));
-        println!("Result: {} => {:?}", 0, scaling.quantize(&0.0));
-        println!("Result: {} => {:?}", -1.0, scaling.quantize(&-1.0));
-        println!("Result: {} => {:?}", 1.0, scaling.quantize(&1.0));
-    }
     #[test]
     #[ignore]
     fn test_covid_cnn() {
@@ -917,7 +909,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, shape)| {
-                crate::tensor::Tensor::<f32>::random(&shape).to_quantized(md.input_scaling(i))
+                crate::tensor::Tensor::<f32>::random(&shape).quantize(md.input_scaling(i))
             })
             .collect();
         let inputs = model.prepare_inputs(inputs).unwrap();
@@ -959,7 +951,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, shape)| {
-                crate::tensor::Tensor::<f32>::random(&shape).to_quantized(md.input_scaling(i))
+                crate::tensor::Tensor::<f32>::random(&shape).quantize(md.input_scaling(i))
             })
             .collect();
         let inputs = model.prepare_inputs(native_input).unwrap();

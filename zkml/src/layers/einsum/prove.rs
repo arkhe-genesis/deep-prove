@@ -8,7 +8,7 @@ use crate::{
     Claim, Shape, Tensor,
     commit::compute_betas_eval,
     layers::einsum::axis::{FixedAxis, FixedPolys},
-    quantization::TensorFielder,
+    quantization::ToField,
     tensor::CommitmentId,
 };
 
@@ -69,12 +69,12 @@ impl EinSum<Element> {
         let first_input = inputs_iter
             .next()
             .context("At least one input tensor must be provided")?
-            .to_fields();
+            .to_field();
 
         let field_constants = self
             .constant_tensors
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.tensor().to_fields()))
+            .map(|t| t.as_ref().map(|tensor| tensor.tensor().to_field()))
             .collect::<Vec<Option<Tensor<E>>>>();
 
         let mut full_inputs = Vec::with_capacity(field_constants.len() + 1);
@@ -86,7 +86,7 @@ impl EinSum<Element> {
                     let tensor = inputs_iter
                         .next()
                         .context("Not enough input tensors provided")?;
-                    full_inputs.push(tensor.to_fields());
+                    full_inputs.push(tensor.to_field());
                 }
             }
         }
@@ -195,7 +195,7 @@ impl EinSum<Element> {
             .filter_map(|(output_id, (bias_opt, split_point))| {
                 if let Some(bias) = bias_opt.as_ref() {
                     let key = bias.commitment_id();
-                    let bias_field: Tensor<E> = bias.to_fields();
+                    let bias_field: Tensor<E> = bias.to_field();
                     let bias_poly = bias_field.to_mle();
                     let bias_point = self
                         .mapping

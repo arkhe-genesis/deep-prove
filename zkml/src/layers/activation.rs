@@ -22,7 +22,7 @@ use crate::{
     model::Step,
     number::Number,
     padding::PaddingMode,
-    quantization::{self, BIT_LEN, Fieldizer},
+    quantization::{self, BIT_LEN, ToField},
     tensor::{Tensor, TensorHandle, WrappedModuleFn, WrappedTensor},
 };
 use either::Either;

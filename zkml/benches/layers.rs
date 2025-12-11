@@ -38,6 +38,7 @@ mod add_layer {
     use zkml::{
         ScalingFactor, Shape, Tensor,
         layers::{add::Add, provable::Evaluate},
+        quantization::Quantize,
         tensor::WrappedTensor,
     };
 
@@ -56,8 +57,8 @@ mod add_layer {
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let result_scaling = ScalingFactor::from_tensor(&result, None);
 
-        let input = WrappedTensor::try_from(&input.to_quantized(&input_scaling)).unwrap();
-        let operand = WrappedTensor::try_from(&operand.to_quantized(&operand_scaling)).unwrap();
+        let input = WrappedTensor::try_from(&input.quantize(&input_scaling)).unwrap();
+        let operand = WrappedTensor::try_from(&operand.quantize(&operand_scaling)).unwrap();
 
         let layer = layer
             .quantize(&[operand_scaling, input_scaling], result_scaling)
@@ -199,6 +200,7 @@ mod embeddings_layer {
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::embeddings::Embeddings},
         number::Number,
+        quantization::Quantize,
         tensor::{KeyedTensor, WrappedTensor},
     };
 
@@ -216,7 +218,7 @@ mod embeddings_layer {
             Some((0, vocab_size as Element)),
         );
 
-        let input = WrappedTensor::try_from(&input.to_quantized(&scaling)).unwrap();
+        let input = WrappedTensor::try_from(&input.quantize(&scaling)).unwrap();
 
         let layer =
             Embeddings::<Element>::new(KeyedTensor::new("embedding_matrix", emb.clone())).unwrap();
@@ -545,7 +547,7 @@ mod positional_absolute_layer {
             transformer::positional::Positional,
         },
         padding::PaddingMode,
-        quantization::AbsoluteMax,
+        quantization::{AbsoluteMax, Quantize},
         tensor::{KeyedTensor, WrappedTensor},
     };
 
@@ -562,7 +564,7 @@ mod positional_absolute_layer {
         );
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
-        let input = WrappedTensor::try_from(&input_f32.to_quantized(&input_scaling)).unwrap();
+        let input = WrappedTensor::try_from(&input_f32.quantize(&input_scaling)).unwrap();
 
         let base_layer = Positional::<f32>::new_absolute(pos.clone());
         let input_shapes = vec![Shape::new(vec![size, size])];
@@ -649,7 +651,7 @@ mod positional_rope_layer {
             transformer::positional::{Positional, RopeLayout},
         },
         padding::PaddingMode,
-        quantization::AbsoluteMax,
+        quantization::{AbsoluteMax, Quantize},
         tensor::WrappedTensor,
     };
 
@@ -686,7 +688,7 @@ mod positional_rope_layer {
 
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
-        let input = WrappedTensor::try_from(&input_f32.to_quantized(&input_scaling)).unwrap();
+        let input = WrappedTensor::try_from(&input_f32.quantize(&input_scaling)).unwrap();
 
         let num_angles = size / 2;
         let angles: Vec<f32> = (0..num_angles)

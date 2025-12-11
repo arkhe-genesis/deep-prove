@@ -19,7 +19,7 @@ use crate::{
     },
     lookup::logup_gkr::structs::{LogUpBatchVerifierClaim, LogUpInput},
     model::Trace,
-    quantization::{self, Fieldizer},
+    quantization::{self, ToField},
     to_base,
 };
 use anyhow::{Context as CC, anyhow, bail, ensure};

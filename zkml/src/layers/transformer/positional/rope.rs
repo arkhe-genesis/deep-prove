@@ -19,7 +19,7 @@ use crate::{
     },
     model::Step,
     padding::PaddingMode,
-    quantization::{self, Fieldizer, TensorFielder},
+    quantization::{self, Quantize, ToField},
     tensor::{
         CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor,
         is_close_with_tolerance,
@@ -426,7 +426,7 @@ impl<N: TensorTypeParam> Rope<N> {
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
-        N: Fieldizer<E>,
+        N: ToField<E>,
         E: ExtensionField,
         T: Transcript<E>,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
@@ -439,10 +439,10 @@ impl<N: TensorTypeParam> Rope<N> {
         let sine_matrix_slice = TensorSlice::from(self.sine_matrix.deref());
         let sub_cos_matrix = cosine_matrix_slice
             .slice_over_first_dim(0, input_shape.dim(-2))
-            .to_fields();
+            .to_field();
         let sub_sin_matrix = sine_matrix_slice
             .slice_over_first_dim(0, input_shape.dim(-2))
-            .to_fields();
+            .to_field();
 
         // build sum-check to compute the output as `input*sub_cos_matrix + permuted_input*sub_sin_matrix`
         // The permuted input is the input tensor permuted as follows:
@@ -1021,7 +1021,7 @@ mod tests {
         },
         model::{Model, test::prove_model},
         padding::PaddingMode,
-        quantization::AbsoluteMax,
+        quantization::{AbsoluteMax, Quantize},
         rng_from_env_or_random,
         tensor::{TensorTypeParam, is_close_with_tolerance},
     };
@@ -1284,7 +1284,7 @@ mod tests {
             let input_sf = ScalingFactor::from_tensor(&input, None);
             let q = layer.quantize::<AbsoluteMax>(&(), 0.into(), input_sf).expect("quantize rope");
             let layer_q = q.quantized_op;
-            let input_q = input.to_quantized(&input_sf);
+            let input_q = input.quantize(&input_sf);
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
 
             let out_q = layer_q

@@ -25,7 +25,7 @@ use crate::{
     },
     model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
-    quantization::{Fieldizer, TensorFielder},
+    quantization::ToField,
     tensor::{TensorHandle, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -368,7 +368,7 @@ where
         let max_mle = layer_polys[0].as_ref();
         let logup_input = ctx.build_lookup_input(
             max_mle.get_base_field_vec(),
-            input.to_fields(),
+            input.to_field(),
             &prover.challenge_storage,
             unpadded_dim_size,
         )?;
@@ -414,7 +414,8 @@ where
             .collect::<Vec<E::BaseField>>();
         // `base_lt_evals` is the MLE evals on the boolean hypercube for one row, now we need to repeat this number of rows times
         let lt_mle = vec![base_lt_evals; 1 << num_row_vars].concat().into_mle();
-        let input_mle = input.to_fields().into_mle_2d()?;
+        let input_field: Tensor<E> = input.to_field();
+        let input_mle = input_field.into_mle_2d()?;
 
         let padded_max_evals = max_mle
             .get_base_field_vec()
@@ -566,7 +567,7 @@ where
         let commit_data = max_values_guard
             .get_data()
             .iter()
-            .map(|v| Fieldizer::<E>::to_field(v).as_bases()[0])
+            .map(|v| ToField::<E>::to_field(v).as_bases()[0])
             .collect::<Vec<E::BaseField>>();
 
         let rmm = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(

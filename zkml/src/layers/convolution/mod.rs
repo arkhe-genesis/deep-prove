@@ -14,7 +14,7 @@ use crate::{
     model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo},
-    quantization::{self, BIT_LEN, Fieldizer, IntoElement, ScalingFactor, TensorFielder},
+    quantization::{self, BIT_LEN, Quantize, ScalingFactor, ToElement, ToField},
     shape::filter_size,
     tensor::{
         CommitmentId, KeyedTensor, Tensor, TensorHandle, TensorTypeParam, WrappedTensor, fft,
@@ -387,7 +387,7 @@ impl Filter<Element> {
         );
 
         let n_x = input.shape()[1].next_power_of_two();
-        let real_input = input.to_field::<F>();
+        let real_input = input.data().to_field();
         let new_n = 2 * n_x * n_x;
 
         // Convert the convolution input to the frequency domain.
@@ -601,7 +601,7 @@ impl Convolution<f32> {
     /// otherwise the same scaling factor of the weights (i.e., `s`) is used
     fn quantize(self, s: &ScalingFactor, bias_s: &ScalingFactor) -> Result<Convolution<Element>> {
         let tensor = self.filter.as_pre_fft_tensor();
-        let quantized_filter = tensor.to_quantized(s);
+        let quantized_filter = tensor.quantize(s);
         let bias = self.bias.quantize(bias_s);
         Convolution::<Element>::new(
             KeyedTensor::new(self.filter.storage_key().cast(), quantized_filter),
@@ -824,8 +824,8 @@ impl Convolution<Element> {
             info!("PROVE: unpadded_output_shape: {unpadded_output_shape:?}");
             info!("PROVE: output.shape(): {:?}", output.shape());
             let cleared_out = conv_after_bias.to_flatten().mul(&clearing_tensor);
-            let fielded: Tensor<E> = cleared_out.to_fields();
-            fielded.get_data().to_vec() == output.to_field()
+            let fielded: Tensor<E> = cleared_out.to_field();
+            fielded.data() == output.to_field().data()
         });
         let clearing_proof = hadamard::prove(
             prover.transcript,
@@ -1057,7 +1057,8 @@ impl Convolution<Element> {
                 point[(2 * self.fft_filter_size()).ilog2() as usize..].to_vec(),
             ]
             .concat();
-            let y = tensor.to_field_mle().evaluate(&r);
+            let field_data: Vec<E> = tensor.data().to_field();
+            let y = field_data.into_mle().evaluate(&r);
             ensure!(
                 y == partial_evals.clone().into_mle().evaluate(&weights_rand),
                 "Error in fft_weights eval"

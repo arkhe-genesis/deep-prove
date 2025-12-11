@@ -1287,7 +1287,7 @@ mod tests {
     use ark_std::rand::Rng;
     use ff_ext::{FromUniformBytes, GoldilocksExt2 as F};
 
-    use crate::{Element, NextPowerOfTwo, quantization::TensorFielder, rng_from_env_or_random};
+    use crate::{Element, NextPowerOfTwo, quantization::ToField, rng_from_env_or_random};
 
     use super::*;
 
@@ -1561,9 +1561,9 @@ mod tests {
                 Tensor::<Element>::new(expected_output_shape.clone(), broadcasted_data).unwrap();
 
             // Pad both tensors and convert to fields
-            let bias_field: Tensor<F> = bias_tensor.pad_next_power_of_two().to_fields();
+            let bias_field: Tensor<F> = bias_tensor.pad_next_power_of_two().to_field();
             let broadcasted_bias_field: Tensor<F> =
-                broadcasted_bias.pad_next_power_of_two().to_fields();
+                broadcasted_bias.pad_next_power_of_two().to_field();
 
             let broadcasted_mle = broadcasted_bias_field.to_mle();
             let broadcasted_eval = broadcasted_mle.evaluate(&point);

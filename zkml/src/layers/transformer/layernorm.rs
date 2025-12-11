@@ -32,7 +32,7 @@ use crate::{
         llm::{LLMConfig, transformer::NormType},
         safe,
     },
-    quantization::{self, Fieldizer},
+    quantization::{self, Quantize, ToField},
     tensor::{CommitmentId, KeyedTensor, TensorHandle, TensorTypeParam, WrappedTensor},
     to_base, to_bit_sequence_le,
 };
@@ -180,7 +180,12 @@ impl<N: Number> LayerNorm<N> {
     pub fn quant_info(&self) -> Option<&QuantisedLayerNormData> {
         self.quant_info.as_ref()
     }
+}
 
+impl<N> LayerNorm<N>
+where
+    N: Number + Quantize<Output = Element>,
+{
     /// Quantise the layer. To do this we want to have a common scale factor so that lookup tables can be reused, so we use the
     /// constant [`LAYERNORM_SCALE_FACTOR`] as the input column scale factor. We need to work out how big the table needs to be to cover
     /// all of our possible inputs.
@@ -245,18 +250,9 @@ impl<N: Number> LayerNorm<N> {
             top_chunk_scalar_log,
         };
 
-        let quant_gamma = self.gamma.try_map_tensor(|gamma| {
-            let quant_gamma_data = gamma
-                .get_data()
-                .iter()
-                .map(|v| {
-                    let vf32 = v.to_f32()?;
-                    Ok(model_scaling.quantize(&vf32))
-                })
-                .collect::<Result<Vec<Element>, anyhow::Error>>()?;
-
-            Tensor::<Element>::new(gamma.shape().clone(), quant_gamma_data)
-        })?;
+        let quant_gamma = self
+            .gamma
+            .map_tensor(|gamma| gamma.quantize(&model_scaling));
         // Work out how to quantise the bias, it needs to have the same scale factor as the end product.
         // This will be `input_scaling.scale() * model_scaling.scale() * 1.0f32 / LAYERNORM_OUTPUT_SCALE_FACTOR as f32`
         let bias_scale = input_scale * model_scaling.scale() / LAYERNORM_OUTPUT_SCALE_FACTOR as f32;
@@ -273,18 +269,7 @@ impl<N: Number> LayerNorm<N> {
             (quant_bias_min, quant_bias_max),
         );
 
-        let quant_beta = self.beta.try_map_tensor(|beta| {
-            let quant_bias_data = beta
-                .get_data()
-                .iter()
-                .map(|v| {
-                    let vf32 = v.to_f32()?;
-                    Ok(bias_scaling.quantize(&vf32))
-                })
-                .collect::<Result<Vec<Element>, anyhow::Error>>()?;
-
-            Tensor::<Element>::new(beta.shape().clone(), quant_bias_data)
-        })?;
+        let quant_beta = self.beta.map_tensor(|beta| beta.quantize(&bias_scaling));
 
         ensure!(
             quant_gamma.shape() == quant_beta.shape(),
@@ -926,7 +911,7 @@ where
             "LayerNorm step should only have one input, received {}",
             input_tensors.len()
         );
-        let input_field = input_tensors[0].to_field();
+        let input_field = input_tensors[0].to_field().into_data();
         // We also make the MLE for the sum of each dim we perform layernorm on
         let last_dim = *input_tensors[0]
             .shape()
@@ -1037,8 +1022,9 @@ impl LayerNorm<Element> {
                 .collect::<Vec<E::BaseField>>(),
         );
 
+        let gamma_field: Tensor<E> = self.gamma.to_field();
         let gamma_poly: MultilinearExtension<E> =
-            std::iter::repeat_n(self.gamma.to_field::<E>(), 1 << logup_vars)
+            std::iter::repeat_n(gamma_field.into_data(), 1 << logup_vars)
                 .flatten()
                 .collect::<Vec<_>>()
                 .into_mle();
@@ -1122,7 +1108,8 @@ impl LayerNorm<Element> {
                 self.gamma.commitment_id(),
                 Claim::<E>::new(point, io_evaluations[3]),
             );
-            let beta_eval = self.beta.to_field::<E>().into_mle().evaluate(&bias_point);
+            let beta_field: Tensor<E> = self.beta.to_field();
+            let beta_eval = beta_field.into_mle().evaluate(&bias_point);
             claims.insert(
                 self.beta.commitment_id(),
                 Claim::<E>::new(bias_point, beta_eval),
@@ -1457,6 +1444,7 @@ mod tests {
         init_test_logging_default,
         layers::{Evaluate, Layer},
         model::{Model, test::prove_model},
+        quantization::Dequantize,
         tensor::is_close_with_tolerance,
     };
 
@@ -1512,7 +1500,7 @@ mod tests {
         let input_scaling = ScalingFactor::from_tensor(&input_tensor, None);
         // We quantise the float input to obtain `quant_tensor` and then we dequantise to obtain `dequant_input`
         // this lets us run quantised evaluation and floating point evaluation and compare the outputs.
-        let quant_tensor = input_tensor.to_quantized(&input_scaling);
+        let quant_tensor = input_tensor.quantize(&input_scaling);
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = layernorm

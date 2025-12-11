@@ -7,8 +7,12 @@ pub use burn_wrapper::{
 };
 
 use crate::{
-    NextPowerOfTwo, ScalingFactor, backend::Backend, layers::convolution, number::Number,
-    shape::Shape, to_field,
+    NextPowerOfTwo, ScalingFactor,
+    backend::Backend,
+    layers::convolution,
+    number::Number,
+    quantization::{Dequantize, Quantize},
+    shape::Shape,
 };
 use anyhow::{Result, bail, ensure};
 use burn::tensor::{Int, Tensor as BTensor, TensorData};
@@ -37,7 +41,7 @@ use std::{
 use tenstore::{GenStore, GenericStore, StorageKey, StoreError};
 
 use crate::{
-    Element, layers::pooling::MAXPOOL2D_KERNEL_SIZE, quantization::Fieldizer, to_bit_sequence_le,
+    Element, layers::pooling::MAXPOOL2D_KERNEL_SIZE, quantization::ToField, to_bit_sequence_le,
 };
 
 #[derive(
@@ -167,12 +171,16 @@ impl<T> DerefMut for KeyedTensor<T> {
     }
 }
 
-impl KeyedTensor<f32> {
-    pub fn quantize(self, s: &ScalingFactor) -> KeyedTensor<Element> {
-        let quantized_tensor = self.tensor.to_quantized(s);
+impl<T> Quantize for KeyedTensor<T>
+where
+    T: Quantize,
+{
+    type Output = KeyedTensor<<T as Quantize>::Output>;
+
+    fn quantize(&self, scaling: &ScalingFactor) -> Self::Output {
         KeyedTensor {
-            key: self.key.cast::<Element>(),
-            tensor: quantized_tensor,
+            key: self.key.cast::<<T as Quantize>::Output>(),
+            tensor: self.tensor.quantize(scaling),
         }
     }
 }
@@ -1047,14 +1055,6 @@ impl<T> Tensor<T> {
     pub fn dim(&self, dim: usize) -> usize {
         self.shape[dim]
     }
-
-    /// Returns the tensor data converted to extension field elements.
-    pub fn to_field<F: ExtensionField>(&self) -> Vec<F>
-    where
-        T: Fieldizer<F>,
-    {
-        to_field::<T, F, _>(&self.data)
-    }
 }
 
 impl<T> AsRef<Tensor<T>> for Tensor<T> {
@@ -1076,19 +1076,6 @@ impl Tensor<Element> {
         Ok(self
             .shape
             .matmul_output_bitsize(quantized_self_input_range, quantized_other_input_range))
-    }
-
-    pub fn dequantize(&self, s: &ScalingFactor) -> Tensor<f32> {
-        let data = self
-            .data
-            .iter()
-            .map(|e| s.dequantize(e))
-            .collect::<Vec<_>>();
-        Tensor {
-            shape: self.shape.clone(),
-            data,
-            unpadded_shape: self.unpadded_shape.clone(),
-        }
     }
 
     /// Converts this [Tensor<Element>] into [MultilinearExtension].
@@ -1186,24 +1173,11 @@ impl<F: Field> Tensor<F> {
 
 impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
     fn from(value: &Tensor<Element>) -> Self {
-        Self {
-            data: value.to_field::<F>(),
-            shape: value.shape.clone(),
-            unpadded_shape: value.unpadded_shape.clone(),
-        }
+        value.to_field()
     }
 }
 
 impl Tensor<f32> {
-    pub fn to_quantized(&self, s: &ScalingFactor) -> Tensor<Element> {
-        let data = self.data.iter().map(|x| s.quantize(x)).collect::<Vec<_>>();
-        Tensor {
-            shape: self.shape.clone(),
-            data,
-            unpadded_shape: self.unpadded_shape.clone(),
-        }
-    }
-
     /// Consumes this tensor and creates a [burn::tensor::Tensor].
     pub fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D> {
         IntoBTensor::to_btensor(self)
@@ -2031,6 +2005,37 @@ impl PartialEq for Tensor<f32> {
 impl PartialEq for Tensor<GoldilocksExt2> {
     fn eq(&self, other: &Self) -> bool {
         self.shape == other.shape && self.data == other.data
+    }
+}
+
+impl<T> Quantize for Tensor<T>
+where
+    T: Quantize,
+{
+    type Output = Tensor<<T as Quantize>::Output>;
+
+    fn quantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        Tensor {
+            data: self.data.quantize(scaling),
+            shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
+        }
+    }
+}
+
+impl<T> Dequantize for Tensor<T>
+where
+    T: Dequantize,
+{
+    type Output = Tensor<<T as Dequantize>::Output>;
+
+    fn dequantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        let data = self.data.dequantize(scaling);
+        Tensor {
+            shape: self.shape.clone(),
+            data,
+            unpadded_shape: self.unpadded_shape.clone(),
+        }
     }
 }
 

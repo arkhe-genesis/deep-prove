@@ -18,7 +18,7 @@ use crate::{
     },
     model::Step,
     padding::PaddingMode,
-    quantization::{Fieldizer, TensorFielder},
+    quantization::ToField,
     tensor::{TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
 };
@@ -352,7 +352,7 @@ where
         );
 
         let mask_proving_data =
-            MaskProvingData::from_claims_and_input(last_claims[0], &inputs[0].to_fields())?;
+            MaskProvingData::from_claims_and_input(last_claims[0], &inputs[0].to_field())?;
 
         let (proof, claims) =
             self.prove_internal(ctx, mask_proving_data, unpadded_seq_len, prover)?;

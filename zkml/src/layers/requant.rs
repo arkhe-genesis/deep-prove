@@ -25,7 +25,7 @@ use crate::{
     },
     model::Step,
     padding::PaddingMode,
-    quantization::{self, Fieldizer},
+    quantization::{self, ToField},
     tensor::WrappedTensor,
     to_base,
 };

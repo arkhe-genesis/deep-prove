@@ -5,7 +5,7 @@ use ceno_p3::field::FieldAlgebra;
 use ff_ext::GoldilocksExt2;
 use std::cmp::{Ordering, PartialEq};
 
-use crate::{Element, quantization::Fieldizer};
+use crate::{Element, quantization::ToField};
 
 pub trait Number:
     Copy

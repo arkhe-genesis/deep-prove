@@ -9,7 +9,7 @@ use ark_std::rand::{self, SeedableRng, rngs::StdRng};
 use ff_ext::{ExtensionField, FieldFrom};
 use itertools::Itertools;
 use multilinear_extensions::mle::PointAndEval;
-use quantization::Fieldizer;
+use quantization::ToField;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{borrow::Borrow, env, ops::Deref, str::FromStr};
@@ -122,7 +122,7 @@ pub fn eval_infinitizer_mle<F: ExtensionField + FieldFrom<u64>>(
     row_point: &[F],
     minus_infinity: Element,
 ) -> F {
-    <Element as Fieldizer<F>>::to_field(&minus_infinity)
+    <Element as ToField<F>>::to_field(&minus_infinity)
         * (F::ONE - eval_zeroifier_mle(column_point, row_point))
 }
 #[allow(dead_code)]
@@ -197,7 +197,7 @@ pub(crate) fn to_base<E, I>(iter: I) -> Vec<E::BaseField>
 where
     I: IntoIterator,
     I::Item: Borrow<Element>,
-    Element: Fieldizer<E>,
+    Element: ToField<E>,
     E: ExtensionField,
 {
     iter.into_iter()
@@ -210,7 +210,7 @@ pub(crate) fn to_field<T, E, I>(iter: I) -> Vec<E>
 where
     I: IntoIterator,
     I::Item: Borrow<T>,
-    T: Fieldizer<E>,
+    T: ToField<E>,
     E: ExtensionField,
 {
     iter.into_iter().map(|v| v.borrow().to_field()).collect()

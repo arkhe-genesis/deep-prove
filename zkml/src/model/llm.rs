@@ -34,7 +34,7 @@ use crate::{
         llm::{LLMConfig, Token, models::LLMModelLoader},
         to_quantized,
     },
-    quantization::{InferenceObserver, InferenceTracker, IntoElement, ModelMetadata},
+    quantization::{InferenceObserver, InferenceTracker, ModelMetadata, ToElement},
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
     verify,
 };

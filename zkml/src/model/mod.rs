@@ -1419,7 +1419,7 @@ pub(crate) mod test {
             requant::Requant,
         },
         padding::{PaddingMode, pad_model},
-        quantization::InferenceObserver,
+        quantization::{InferenceObserver, Quantize},
         rng_from_env_or_random,
         tensor::{KeyedTensor, Tensor, TensorHandle, TensorTypeParam},
         testing::{Pcs, random_vector},
@@ -1826,7 +1826,7 @@ pub(crate) mod test {
         let input_tensors = float_inputs
             .into_iter()
             .enumerate()
-            .map(|(i, data)| data.to_quantized(md.input_scaling(i)))
+            .map(|(i, data)| data.quantize(md.input_scaling(i)))
             .collect_vec();
         Ok((quantized_model, input_tensors))
     }

@@ -22,6 +22,7 @@ use zkml::{
         },
         safe::RawSafeTensors,
     },
+    quantization::Dequantize,
 };
 
 /// Section separator for debug output
@@ -277,10 +278,7 @@ fn main() -> Result<()> {
             let scaling_factor = scaling_factors
                 .first()
                 .context("Failed to get scaling factor for logits layer")?;
-            Ok(data
-                .iter()
-                .map(|&v| scaling_factor.dequantize(&v))
-                .collect())
+            Ok(data.dequantize(scaling_factor))
         },
     )?;
 

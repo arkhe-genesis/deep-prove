@@ -37,6 +37,7 @@ use crate::{
     number::Number,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     parser::{gguf, json},
+    quantization::Quantize,
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -372,9 +373,7 @@ impl QuantizeOp for Embeddings<f32> {
         } = self;
 
         let scale_factor = ScalingFactor::from_absolute_max(mat.max_abs_output(), None);
-
-        let quantised_mat = mat.map_tensor(|t| t.to_quantized(&scale_factor));
-
+        let quantised_mat = mat.map_tensor(|t| t.quantize(&scale_factor));
         let qemb = Embeddings {
             mat: quantised_mat,
             emb_size,
@@ -664,7 +663,7 @@ mod tests {
         Element,
         layers::Layer,
         model::{Model, test::prove_model_with},
-        quantization::TensorFielder,
+        quantization::{Quantize, ToField},
         rng_from_env_or_random,
     };
 
@@ -730,7 +729,7 @@ mod tests {
         let seq_len: usize = 5;
         let indices_elem: Vec<Element> = (0..seq_len).map(|i| i as Element).collect::<Vec<_>>();
         let indices: Tensor<GoldilocksExt2> =
-            Tensor::<Element>::new(vec![5].into(), indices_elem.clone())?.to_fields();
+            Tensor::<Element>::new(vec![5].into(), indices_elem.clone())?.to_field();
         let vocab_size = 6;
         let emb_size = 10;
         let one_hot = one_hot_encoding(indices.get_data(), vocab_size);
@@ -778,10 +777,10 @@ mod tests {
         let out = embeddings.evaluate(&[&input.as_wrapped()])?;
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
         assert_eq!(Shape::from(out.outputs()[0].shape()), expected_shape);
-        let onehot_result = one_hot.matmul(&emb.to_fields())?;
+        let onehot_result = one_hot.matmul(&emb.to_field())?;
         assert_eq!(
             onehot_result.get_data(),
-            out.outputs()[0].to_native().to_fields().get_data()
+            out.outputs()[0].to_native().to_field().get_data()
         );
 
         Ok(())
@@ -868,7 +867,7 @@ mod tests {
                 <f32 as Number>::MAX,
                 Some((0, vocab_size as Element)),
             );
-            let input = input.to_quantized(&scaling);
+            let input = input.quantize(&scaling);
 
             let emb_data = emb.get_data();
             let new_emb = input

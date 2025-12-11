@@ -32,7 +32,7 @@ use crate::{
         llm::{LLMConfig, transformer::NormType},
         safe,
     },
-    quantization::{self, Fieldizer},
+    quantization::{self, Quantize, ToField},
     shape::Shape,
     tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
     to_base,
@@ -168,7 +168,13 @@ impl<N: Number> RMSNorm<N> {
     pub fn normalisation_dim_size(&self) -> usize {
         self.dim_size
     }
+}
 
+impl<N> RMSNorm<N>
+where
+    N: Number,
+    N: Quantize<Output = Element>,
+{
     /// Quantise the layer. To do this we want to have a common scale factor so that lookup tables can be reused, so we use the
     /// constant [`RMSNORM_SCALE_FACTOR`] as the input column scale factor. We need to work out how big the table needs to be to cover
     /// all of our possible inputs.
@@ -231,20 +237,7 @@ impl<N: Number> RMSNorm<N> {
         let quant_alpha = self
             .alpha
             .as_ref()
-            .map(|alpha| {
-                alpha.try_new_map_tensor(|alpha| {
-                    let new_data = alpha
-                        .iter()
-                        .map(|v| {
-                            let vf32 = v.to_f32()?;
-                            Ok(model_scaling.quantize(&vf32))
-                        })
-                        .collect::<Result<Vec<Element>, anyhow::Error>>()
-                        .expect("Converting an f32 to f32 and quantising should never fail");
-                    Tensor::<Element>::new(alpha.shape().clone(), new_data)
-                })
-            })
-            .transpose()?;
+            .map(|alpha| alpha.new_map_tensor(|alpha| alpha.quantize(&model_scaling)));
 
         // To calculate the intermediate bit size we have that the output is `self.alpha * input  * lookup_output`
         // So lets work out the left hand bit size
@@ -826,7 +819,7 @@ impl RMSNorm<Element> {
                 alpha
                     .get_data()
                     .iter()
-                    .map(<Element as Fieldizer<E>>::to_field)
+                    .map(<Element as ToField<E>>::to_field)
                     .collect::<Vec<E>>(),
                 1 << logup_vars,
             )
@@ -1172,6 +1165,7 @@ mod tests {
         init_test_logging_default,
         layers::Layer,
         model::{Model, test::prove_model},
+        quantization::Dequantize,
         tensor::is_close_with_tolerance,
     };
 
@@ -1217,7 +1211,7 @@ mod tests {
         let (quant_rmsnorm, _) = rmsnorm.quantise(input_scaling, model_scaling).unwrap();
         // We quantise the float input to obtain `quant_tensor` and then we dequantise to obtain `dequant_input`
         // this lets us run quantised evaluation and floating point evaluation and compare the outputs.
-        let quant_tensor = input_tensor.to_quantized(&input_scaling);
+        let quant_tensor = input_tensor.quantize(&input_scaling);
         let dequant_input = quant_tensor.dequantize(&input_scaling);
 
         let dequant_output = rmsnorm
