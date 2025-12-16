@@ -452,12 +452,13 @@ where
     }
 
     /// Find the maximum absolute value.
-    pub fn max_abs(self) -> Result<T> {
+    pub fn max_abs(self) -> Self {
         let tensor = delegate_plain!(self, max_abs);
-        Ok(tensor
-            .into_data()
-            .as_slice::<T>()
-            .map_err(|e| anyhow::format_err!("{e:?}"))?[0])
+        let unpadded_shape = tensor.shape();
+        WrappedTensor::Rank1 {
+            tensor,
+            unpadded_shape,
+        }
     }
 
     /// Transpose the tensor.

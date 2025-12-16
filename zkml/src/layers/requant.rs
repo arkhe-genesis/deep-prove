@@ -147,17 +147,20 @@ impl OpInfo for Requant {
 
 impl Evaluate<Element> for Requant {
     fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
-        let max_abs_val: Element = 1 << self.intermediate_bit_size;
         let rounding: Element = 1 << (self.shift() - 1);
         let shift = self.shift().try_into().context("Shift too large")?;
 
         let mut result = Vec::with_capacity(inputs.len());
         for input in inputs {
-            let max_el = (*input).clone().max_abs()?;
-            ensure!(
-                max_el < max_abs_val,
-                "Could not apply requantisation, tensor had absolute value too large, given value: {max_el}, max value: {max_abs_val}.",
-            );
+            #[cfg(test)]
+            {
+                let max_abs_val: Element = 1 << self.intermediate_bit_size;
+                let max_el = (*input).clone().max_abs().get_data()[0];
+                ensure!(
+                    max_el < max_abs_val,
+                    "Could not apply requantisation, tensor had absolute value too large, given value: {max_el}, max value: {max_abs_val}.",
+                );
+            };
 
             let unclamped = (*input)
                 .clone()
