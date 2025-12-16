@@ -182,7 +182,7 @@ fn convolution_test_simple_element() {
 
     // Pad the conv2d result to match the fft padded shape with the extra values set to 0.
     conv2d_result
-        .pad_to_shape(fft_result.to_native().shape().clone())
+        .pad_to_shape(Shape::from(fft_result.shape()))
         .unwrap();
 
     assert_eq!(conv2d_result.get_data(), fft_result.get_data());
@@ -215,7 +215,7 @@ fn convolution_test_random_element() {
 
     // Pad the conv2d result to match the fft padded shape with the extra values set to 0.
     conv2d_result
-        .pad_to_shape(fft_result.to_native().shape().clone())
+        .pad_to_shape(Shape::from(fft_result.shape()))
         .unwrap();
 
     assert_eq!(conv2d_result.get_data(), fft_result.get_data());
@@ -370,6 +370,8 @@ proptest! {
         let clearing_tensor = new_clearing_tensor(&og_shape, padded.shape()).unwrap();
         let cleared_tensor1 = padded.to_flatten().mul(&clearing_tensor);
         let cleared_tensor2 = clear_garbage(&padded, &og_shape).unwrap();
+
+        // The shapes are different, to_flatten creates a 1D tensor, compare only the data.
         assert_eq!(cleared_tensor1.get_data(), cleared_tensor2.get_data());
     }
 }

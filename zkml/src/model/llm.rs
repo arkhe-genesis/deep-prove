@@ -441,12 +441,12 @@ where
 
             // Take the last token before the padding
             let index = if output.shape().num_elements() == 1 {
-                0
+                WrappedTensor::try_from(vec![0])?
             } else {
-                unpadded_seq_len - 1
+                WrappedTensor::try_from(vec![(unpadded_seq_len - 1) as Element])?
             };
 
-            let last_token_tensor = output.deref().clone().flatten_1d().select(0, [index]);
+            let last_token_tensor = output.deref().clone().flatten_1d().select(0, index)?;
 
             tx.send(last_token_tensor.clone())
                 .context("Results thread is gone")?;

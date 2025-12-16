@@ -164,11 +164,9 @@ impl Evaluate<Element> for Requant {
                 .mul_scalar(self.fixed_point_multiplier)
                 .add_scalar(rounding)
                 .bitwise_right_shift_scalar(shift);
-            let mut clamped = unclamped
+            let clamped = unclamped
                 .clamp_max(*quantization::MAX)
                 .clamp_min(*quantization::MIN);
-
-            clamped.set_unpadded_shape(input.unpadded_shape().clone());
 
             result.push(clamped);
         }
@@ -1175,7 +1173,10 @@ mod tests {
             let computed = layer.evaluate(&[&wtensor]).unwrap().outputs;
             let expected = requant_reference(&layer, &[&tensor]).unwrap();
 
-            prop_assert_eq!(&expected, &computed.into_iter().map(|t| t.to_native()).collect::<Vec<_>>());
+            prop_assert_eq!(
+                &expected,
+                &computed.into_iter().map(|tensor| tensor.to_native()).collect::<Vec<_>>(),
+            );
         }
     }
 }

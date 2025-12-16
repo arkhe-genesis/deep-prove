@@ -1,10 +1,6 @@
 use std::iter::once;
 
-use anyhow::{Result, ensure};
-use burn::tensor::{
-    Shape as BShape, TensorPrimitive,
-    ops::{FloatTensorOps, IntTensorOps},
-};
+use anyhow::{Context, Result, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -19,7 +15,6 @@ use transcript::Transcript;
 
 use crate::{
     Claim, Element, NextPowerOfTwo, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
-    backend::Backend,
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
     iop::{
@@ -205,19 +200,9 @@ impl Evaluate<f32> for Embeddings<f32> {
         let input = inputs[0];
 
         let weights = WrappedTensor::try_from(self.embedding_matrix())?;
-        let indices = input.clone().int();
+        let res = weights.select(0, input.clone().int())?;
 
-        let res = Backend::float_select(
-            weights.into_primitive().tensor(),
-            0,
-            indices.into_primitive(),
-        );
-
-        let out = WrappedTensor::Rank2(
-            burn::tensor::Tensor::<Backend, 2>::new(TensorPrimitive::Float(res)),
-            input.unpadded_shape().clone(),
-        );
-        Ok(LayerOut::from_tensor(out))
+        Ok(LayerOut::from_tensor(res))
     }
 }
 
@@ -229,36 +214,27 @@ impl Evaluate<Element> for Embeddings<Element> {
             inputs.iter().map(|x| x.shape()).collect::<Vec<_>>()
         );
         ensure!(inputs.len() == 1, "embeddings only support 1 input tensor");
+        let input = inputs[0];
+
         // we still uses this evaluation for inference as it's quicker
         // than doing the matmul with one hot encoding. Proving however will generate
         // the one hot encoding and do the matmul.
 
-        let input = inputs[0];
+        let weights = WrappedTensor::try_from(self.embedding_matrix())
+            .context("Failed to create wrapped tensor for embedding matrix")?;
 
-        let weights = self.embedding_matrix().clone().to_btensor::<2>();
-        let is_padded = input.is_padded();
-        let indices = if is_padded {
+        let indices = if input.is_padded() {
             input.clone().reduce_to_unpadded_shape()?
         } else {
             input.clone()
         };
 
-        // The unpadded shape for the output is [seq_len, emb_size]
-        let emb_size = self.embedding_matrix().unpadded_shape().dim(-1);
+        let res = weights.select(0, indices)?;
 
-        let output_unpadded_shape = BShape::from(vec![input.unpadded_shape()[0], emb_size]);
-        let res = Backend::int_select(weights.into_primitive(), 0, indices.into_primitive());
-        let out = if is_padded {
-            WrappedTensor::Rank2(
-                burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res),
-                output_unpadded_shape,
-            )
-            .pad_next_power_of_two()
+        let out = if input.is_padded() {
+            res.pad_next_power_of_two()
         } else {
-            WrappedTensor::Rank2(
-                burn::tensor::Tensor::<Backend, 2, burn::tensor::Int>::from_primitive(res),
-                output_unpadded_shape,
-            )
+            res
         };
 
         Ok(LayerOut::from_tensor(out))
@@ -778,10 +754,8 @@ mod tests {
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
         assert_eq!(Shape::from(out.outputs()[0].shape()), expected_shape);
         let onehot_result = one_hot.matmul(&emb.to_field())?;
-        assert_eq!(
-            onehot_result.get_data(),
-            out.outputs()[0].to_native().to_field().get_data()
-        );
+
+        assert_eq!(onehot_result, out.outputs()[0].to_native().to_field());
 
         Ok(())
     }
@@ -852,7 +826,7 @@ mod tests {
             ).unwrap();
             let computed = layer.evaluate(&[&input.as_wrapped()]).unwrap();
 
-            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
+            prop_assert_eq!(expected, computed.outputs[0].to_native());
         }
 
         #[test]
@@ -894,7 +868,7 @@ mod tests {
             ).unwrap();
             let computed = layer.evaluate(&[&input.as_wrapped()]).unwrap();
 
-            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
+            prop_assert_eq!(expected, computed.outputs[0].to_native());
         }
     }
 

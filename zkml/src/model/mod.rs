@@ -98,6 +98,7 @@ pub trait ToStorageKey<N> {
 }
 
 /// Input data for a layer runner.
+#[derive(Debug)]
 struct RunInput<N>
 where
     N: TensorTypeParam,
@@ -1641,11 +1642,11 @@ pub(crate) mod test {
         model.automatic_output_labelling().unwrap();
 
         let mut store = GenStore::default();
-        let input = input.into_native();
+        let input = input.to_native();
         let trace = model.run(vec![input], &mut store).unwrap();
         assert_eq!(trace.steps.len(), 2);
-        // Verify first step
 
+        // Verify first step
         assert_eq!(
             trace
                 .get_step(&first_id)
@@ -1653,7 +1654,7 @@ pub(crate) mod test {
                 .output_tensor_at(0)
                 .unwrap()
                 .deref(),
-            &output1.into_native(),
+            &output1.to_native(),
         );
 
         // Verify second step
@@ -1664,7 +1665,7 @@ pub(crate) mod test {
                 .output_tensor_at(0)
                 .unwrap()
                 .deref(),
-            &final_output.clone().into_native(),
+            &final_output.to_native(),
         );
 
         assert_eq!(final_output.get_data().len(), 7usize.next_power_of_two());

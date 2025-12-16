@@ -613,13 +613,12 @@ mod tests {
                 .unwrap();
 
             let expected = add_q
-
                 .evaluate(&[&input_q.as_wrapped(), &sub_pos_q.as_wrapped()], )
                 .expect("quantized add evaluate should succeed")
                 .outputs
                 .pop()
                 .unwrap();
-            prop_assert_eq!(out.to_native(), expected.to_native());
+            prop_assert_eq!(out.get_data(), expected.get_data());
         }
 
         #[test]

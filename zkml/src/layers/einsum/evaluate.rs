@@ -930,8 +930,8 @@ mod tests {
                 .expect("Failed to evaluate EinSum layer");
 
             for (cached, full) in cached_output.iter().zip(full_output.iter()).skip(1) {
-                let cached_data = cached.clone().into_native().into_data();
-                let full_data = full.clone().into_native().into_data();
+                let cached_data = cached.get_data();
+                let full_data = full.get_data();
                 assert_eq!(
                     cached_data, full_data,
                     "Cached output does not match full sequence output"

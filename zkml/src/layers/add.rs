@@ -609,7 +609,7 @@ mod test {
             let add = Add::<f32>::new();
             let computed = add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap();
 
-            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
+            prop_assert_eq!(expected, computed.outputs[0].to_native());
         }
 
         #[test]
@@ -634,7 +634,7 @@ mod test {
 
             let computed = add.evaluate(&[&input.as_wrapped(), &operand.as_wrapped()]).unwrap();
 
-            prop_assert_eq!(&expected, &computed.outputs[0].to_native());
+            prop_assert_eq!(expected, computed.outputs[0].to_native());
         }
     }
 

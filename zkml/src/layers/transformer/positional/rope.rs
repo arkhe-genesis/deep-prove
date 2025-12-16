@@ -105,7 +105,10 @@ impl RopeLayout {
                 );
                 let chunking_dim = reshape_shape.len() - 1;
                 match input {
-                    WrappedTensor::Rank1(input, s) => {
+                    WrappedTensor::Rank1 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut reshaped =
                             input.reshape::<2, _>(reshape_shape).chunk(2, chunking_dim);
                         let x1 = reshaped.remove(0);
@@ -113,9 +116,15 @@ impl RopeLayout {
                         let x2 = x2.neg();
                         let output =
                             BTensor::cat(vec![x2, x1], chunking_dim).reshape::<1, _>(input_shape);
-                        WrappedTensor::Rank1(output, s)
+                        WrappedTensor::Rank1 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
-                    WrappedTensor::Rank2(input, s) => {
+                    WrappedTensor::Rank2 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut reshaped =
                             input.reshape::<3, _>(reshape_shape).chunk(2, chunking_dim);
                         let x1 = reshaped.remove(0);
@@ -123,9 +132,15 @@ impl RopeLayout {
                         let x2 = x2.neg();
                         let output =
                             BTensor::cat(vec![x2, x1], chunking_dim).reshape::<2, _>(input_shape);
-                        WrappedTensor::Rank2(output, s)
+                        WrappedTensor::Rank2 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
-                    WrappedTensor::Rank3(input, s) => {
+                    WrappedTensor::Rank3 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut reshaped =
                             input.reshape::<4, _>(reshape_shape).chunk(2, chunking_dim);
                         let x1 = reshaped.remove(0);
@@ -133,9 +148,15 @@ impl RopeLayout {
                         let x2 = x2.neg();
                         let output =
                             BTensor::cat(vec![x2, x1], chunking_dim).reshape::<3, _>(input_shape);
-                        WrappedTensor::Rank3(output, s)
+                        WrappedTensor::Rank3 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
-                    WrappedTensor::Rank4(input, s) => {
+                    WrappedTensor::Rank4 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut reshaped =
                             input.reshape::<5, _>(reshape_shape).chunk(2, chunking_dim);
                         let x1 = reshaped.remove(0);
@@ -143,40 +164,67 @@ impl RopeLayout {
                         let x2 = x2.neg();
                         let output =
                             BTensor::cat(vec![x2, x1], chunking_dim).reshape::<4, _>(input_shape);
-                        WrappedTensor::Rank4(output, s)
+                        WrappedTensor::Rank4 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
                 }
             }
             RopeLayout::RotateHalf => {
                 let chunking_dim = input_shape.rank() - 1;
                 match input {
-                    WrappedTensor::Rank1(input, s) => {
+                    WrappedTensor::Rank1 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut chunked = input.chunk(2, chunking_dim);
                         let x1 = chunked.remove(0);
                         let x2 = chunked.remove(0).neg();
                         let output = BTensor::cat(vec![x2, x1], chunking_dim);
-                        WrappedTensor::Rank1(output, s)
+                        WrappedTensor::Rank1 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
-                    WrappedTensor::Rank2(input, s) => {
+                    WrappedTensor::Rank2 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut chunked = input.chunk(2, chunking_dim);
                         let x1 = chunked.remove(0);
                         let x2 = chunked.remove(0).neg();
                         let output = BTensor::cat(vec![x2, x1], chunking_dim);
-                        WrappedTensor::Rank2(output, s)
+                        WrappedTensor::Rank2 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
-                    WrappedTensor::Rank3(input, s) => {
+                    WrappedTensor::Rank3 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut chunked = input.chunk(2, chunking_dim);
                         let x1 = chunked.remove(0);
                         let x2 = chunked.remove(0).neg();
                         let output = BTensor::cat(vec![x2, x1], chunking_dim);
-                        WrappedTensor::Rank3(output, s)
+                        WrappedTensor::Rank3 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
-                    WrappedTensor::Rank4(input, s) => {
+                    WrappedTensor::Rank4 {
+                        tensor: input,
+                        unpadded_shape,
+                    } => {
                         let mut chunked = input.chunk(2, chunking_dim);
                         let x1 = chunked.remove(0);
                         let x2 = chunked.remove(0).neg();
                         let output = BTensor::cat(vec![x2, x1], chunking_dim);
-                        WrappedTensor::Rank4(output, s)
+                        WrappedTensor::Rank4 {
+                            tensor: output,
+                            unpadded_shape,
+                        }
                     }
                 }
             }

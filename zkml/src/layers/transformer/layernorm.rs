@@ -585,11 +585,11 @@ impl Evaluate<Element> for LayerNorm<Element> {
             let padded_output = reduced_output.pad_next_power_of_two();
             let repadded_data: Vec<Element> = padded_output.to_data().into_vec().unwrap();
             let og_data: Vec<Element> = output.clone().to_data().into_vec().unwrap();
-            let sum_native = sum.to_native();
             if is_padded {
+                let sum_native = sum.get_data();
                 ensure!(
                     repadded_data == og_data,
-                    "LayerNorm Padded and unpadded output data do not match! Sum: {sum_native}"
+                    "LayerNorm Padded and unpadded output data do not match! Sum: {sum_native:?}"
                 );
             }
         }
