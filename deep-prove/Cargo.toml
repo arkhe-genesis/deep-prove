@@ -30,6 +30,7 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-marketplacemetering = { workspace = true, optional = true }
 axum = { workspace = true, features = ["http1", "json"] }
 base64 = "0.22.1"
+bincode.workspace = true
 clap = { workspace = true, features = ["cargo", "derive", "env"] }
 derive_more = { workspace = true, features = ["from"] }
 exponential-backoff = "2.1.0"

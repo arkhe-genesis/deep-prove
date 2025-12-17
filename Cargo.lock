@@ -3527,6 +3527,7 @@ dependencies = [
  "aws-sdk-marketplacemetering",
  "axum 0.8.7",
  "base64 0.22.1",
+ "bincode 2.0.1",
  "clap",
  "derive_more 2.1.0",
  "exponential-backoff",

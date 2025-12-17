@@ -112,7 +112,7 @@ burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964
 ] }
 
 [dev-dependencies]
-bincode = { version = "2.0.1" }
+bincode.workspace = true
 blake3 = { version = "1", features = ["mmap"] }
 criterion = { "version" = "0.6", features = ["html_reports"] }
 divan = { version = "0.1.21" }

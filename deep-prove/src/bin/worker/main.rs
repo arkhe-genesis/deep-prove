@@ -274,14 +274,60 @@ enum RunMode {
         s3_args: S3Args,
     },
     /// Prove inference on local files
+    #[command()]
     OneShot {
         /// The model to prove inference on.
-        #[arg(short = 'm', long)]
-        onnx: PathBuf,
+        #[arg(short = 'm', long = "model", required = true)]
+        model: PathBuf,
 
-        /// The inputs to prove inference for.
-        #[arg(short = 'i', long)]
-        inputs: PathBuf,
+        /// Format of the supplied model
+        /// currently supported: onnx, gguf, safetensors
+        #[arg(long, value_enum, required = true)]
+        model_format: ModelFormat,
+
+        /// The inputs to prove inference for (only valid for ONNX).
+        #[arg(
+            short = 'i',
+            long,
+            required_if_eq("model_format", "onnx"),
+            conflicts_with_all = ["prompt", "tokenizer", "config", "max_new_tokens"]
+        )]
+        inputs: Option<PathBuf>,
+
+        /// Prompt to prove for LLM models (gguf/safetensors).
+        #[arg(
+            long,
+            required_if_eq_any([("model_format", "gguf"), ("model_format", "safetensors")]),
+            conflicts_with = "inputs"
+        )]
+        prompt: Option<String>,
+
+        /// Path to tokenizer.json (required for safetensors).
+        #[arg(
+            long,
+            required_if_eq("model_format", "safetensors"),
+            requires = "config",
+            conflicts_with = "inputs"
+        )]
+        tokenizer: Option<PathBuf>,
+
+        /// Path to config.json (required for safetensors).
+        #[arg(
+            long,
+            required_if_eq("model_format", "safetensors"),
+            requires = "tokenizer",
+            conflicts_with = "inputs"
+        )]
+        config: Option<PathBuf>,
+
+        /// Maximum number of tokens to generate (LLM only).
+        #[arg(
+            long,
+            default_value_t = 8,
+            conflicts_with = "inputs",
+            requires = "prompt"
+        )]
+        max_new_tokens: usize,
     },
     /// Run a HTTP server and process requests
     LocalApi {
@@ -313,4 +359,11 @@ async fn main() -> anyhow::Result<()> {
 enum StoreKind {
     S3(S3Store),
     Mem(MemStore),
+}
+
+#[derive(Copy, Clone, clap::ValueEnum)]
+pub enum ModelFormat {
+    Onnx,
+    Gguf,
+    Safetensors,
 }

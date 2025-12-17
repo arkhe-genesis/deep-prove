@@ -1,8 +1,12 @@
 use anyhow::Context;
-use clap::{Parser, Subcommand};
-use deep_prove::middleware::v1::{DeepProveRequest as DeepProveRequestV1, Output};
+use bincode::serde::decode_from_slice;
+use clap::{Parser, Subcommand, ValueEnum};
+use deep_prove::middleware::{
+    llm::LlmOneShotOutput,
+    v1::{DeepProveRequest as DeepProveRequestV1, Output},
+};
 use redact::Secret;
-use std::{io::BufReader, path::PathBuf};
+use std::{fs, path::PathBuf};
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -121,13 +125,51 @@ async fn main() -> anyhow::Result<()> {
         local_config @ Executor::LocalApi { .. } => local::connect(local_config).await,
         Executor::Verify { proof } => {
             info!("verifying proof in `{}`", proof.display());
-            let output: Vec<Output> = serde_json::from_reader(BufReader::new(
-                std::fs::File::open(&proof)
-                    .with_context(|| format!("failed to open `{}`", proof.display()))?,
-            ))
-            .context("deserializing proof")?;
+            verify_proof(proof)
+        }
+    }
+}
 
-            output.into_iter().try_fold((), |_, o| o.proof.verify())
+#[derive(Copy, Clone, ValueEnum)]
+pub enum ProofFormat {
+    Json,
+    Bin,
+}
+
+fn verify_proof(proof: PathBuf) -> anyhow::Result<()> {
+    let bytes = fs::read(&proof)
+        .with_context(|| format!("failed to read proof file `{}`", proof.display()))?;
+
+    let format = match proof
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "json" => ProofFormat::Json,
+        _ => ProofFormat::Bin,
+    };
+
+    match format {
+        ProofFormat::Json => {
+            let outputs: Vec<Output> =
+                serde_json::from_slice(&bytes).context("deserializing ONNX proof (JSON)")?;
+            outputs.into_iter().try_fold((), |_, o| o.proof.verify())
+        }
+        ProofFormat::Bin => {
+            let (llm, _) =
+                decode_from_slice::<LlmOneShotOutput, _>(&bytes, bincode::config::standard())
+                    .context("deserializing LLM proof (bincode)")?;
+
+            info!(
+                "verifying LLM proof for model {} with prompt {:?}",
+                llm.model_name, llm.prompt
+            );
+            if let Some(text) = &llm.llm_response {
+                info!("LLM response: {}", text);
+            }
+
+            llm.verifier
+                .verify(llm.proof.proof, llm.tokens, llm.proof.io)
         }
     }
 }
