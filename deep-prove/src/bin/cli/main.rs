@@ -23,8 +23,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Executor {
-    /// Interact with a LPN gateway with the HTTP.
-    LpnHttp {
+    /// Authenticate to a LPN gateway and store the authentication token.
+    Authenticate {
         /// The URL of the LPN gateway.
         #[arg(short, long, env, default_value = "http://localhost:4000")]
         gw_url: Url,
@@ -32,6 +32,20 @@ enum Executor {
         /// The client ETH private key.
         #[clap(short, long, env)]
         private_key: Secret<String>,
+
+        /// Where to store the authentication token.
+        #[clap(short, long, env, default_value = "lpn-token.txt")]
+        token_path: PathBuf,
+    },
+    /// Interact with a LPN gateway with the HTTP.
+    LpnHttp {
+        /// The URL of the LPN gateway.
+        #[arg(short, long, env, default_value = "http://localhost:4000")]
+        gw_url: Url,
+
+        /// How to authenticate to the LPN gateway.
+        #[clap(flatten)]
+        auth: AuthMethod,
 
         #[command(subcommand)]
         command: Command,
@@ -53,6 +67,17 @@ enum Executor {
         #[arg(long, short)]
         proof: PathBuf,
     },
+}
+
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+pub struct AuthMethod {
+    /// Authenticate to the LPN gateway with the provided token.
+    #[clap(short, long, env)]
+    pub token_path: Option<PathBuf>,
+    /// Authenticate to the LPN gateway with this private key.
+    #[clap(short, long, env)]
+    pub private_key: Option<Secret<String>>,
 }
 
 #[derive(Subcommand)]
@@ -121,6 +146,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.executor {
+        Executor::Authenticate {
+            gw_url,
+            private_key,
+            token_path,
+        } => lpn::http::save_token(&gw_url, private_key.expose_secret(), &token_path).await,
         http_config @ Executor::LpnHttp { .. } => lpn::http::connect(http_config).await,
         local_config @ Executor::LocalApi { .. } => local::connect(local_config).await,
         Executor::Verify { proof } => {

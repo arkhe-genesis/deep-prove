@@ -4,7 +4,7 @@ use anyhow::{Context, bail};
 use axum::http::StatusCode;
 use deep_prove::middleware::v2::{ClientToGw, TaskClass};
 use serde_json::json;
-use std::io::Write;
+use std::{io::Write, path::Path};
 use tracing::{error, info};
 use url::Url;
 use zeroize::Zeroize;
@@ -15,6 +15,21 @@ use crate::{Command, Executor};
 /// Maximum proof size (1GiB)
 const MAX_PROOF_SIZE: u64 = 1000 * 1024 * 1024;
 
+/// Attempt to obtain an authentication token from the gateway, then save it to
+/// the provided path.
+pub async fn save_token(gw_url: &Url, private_key: &str, token_path: &Path) -> anyhow::Result<()> {
+    let token = authenticate(gw_url, private_key)
+        .await
+        .context("fetching authentication token")?;
+    std::fs::File::create(token_path)
+        .with_context(|| format!("creating `{}`", token_path.display()))?
+        .write_all(token.as_bytes())
+        .context("writing token to file")?;
+    Ok(())
+}
+
+/// Attempt to fetch from the gateway an authentication token for the user
+/// identified with the provided Ethereum private key.
 pub async fn authenticate(api_url: &Url, private_key: &str) -> anyhow::Result<String> {
     let endpoint = api_url.join("/api/v1/prove/auth")?;
     let signer = PrivateKeySigner::from_slice(
@@ -51,15 +66,29 @@ pub async fn authenticate(api_url: &Url, private_key: &str) -> anyhow::Result<St
 pub async fn connect(executor: Executor) -> anyhow::Result<()> {
     let Executor::LpnHttp {
         gw_url,
-        mut private_key,
+        auth,
         command,
     } = executor
     else {
         unreachable!()
     };
 
-    let token = authenticate(&gw_url, private_key.expose_secret()).await?;
-    private_key.zeroize();
+    let token = match (auth.token_path, auth.private_key) {
+        (Some(ref token_path), None) => std::fs::read_to_string(token_path).with_context(|| {
+            format!(
+                "reading authentication token from `{}`",
+                token_path.display()
+            )
+        })?,
+        (None, Some(ref mut private_key)) => {
+            let token = authenticate(&gw_url, private_key.expose_secret())
+                .await
+                .context("authenticating to the gateway")?;
+            private_key.zeroize();
+            token
+        }
+        _ => unreachable!("per clap arg groups"),
+    };
 
     match command {
         Command::Submit { .. } => bail!("`submit` is not supported"),
