@@ -13,6 +13,7 @@ version.workspace = true
 default = []
 # Enable worker's AWS marketplace billing
 aws-marketplace = ["dep:aws-config", "dep:aws-sdk-marketplacemetering"]
+cuda = ["zkml/cuda"]
 
 [[bin]]
 name = "deep-prove-worker"
