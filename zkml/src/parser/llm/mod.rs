@@ -10,6 +10,7 @@ pub use crate::parser::{
 };
 pub use config::LLMConfig;
 use serde::{Deserialize, Serialize};
+use tenstore::StorageKey;
 pub use tokenizer::{HFTokenizer, LLMTokenizer};
 
 use crate::{
@@ -183,7 +184,11 @@ where
             "O(sv)"
         };
         let equation = format!("{input_terms}->{output_terms}");
-        let proj_weights = embeddings.mat.clone();
+        let mut proj_weights = embeddings.mat.clone();
+        // We need to modify the key to avoid conflicts between the embeddings matrix and the final projection
+        // the embeddings matrix is scaled _after_ parsing the model, but the final projection is *not* scaled
+        // so in effect, these are two different tensors and thus need to be represented by two different keys
+        proj_weights.key = StorageKey::from(format!("{}_final_proj", proj_weights.key));
         let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
 
         Ok(Self::new(
@@ -233,7 +238,11 @@ where
             "O(sv)"
         };
         let equation = format!("{input_terms}->{output_terms}");
-        let proj_weights = embeddings.mat.clone();
+        let mut proj_weights = embeddings.mat.clone();
+        // We need to modify the key to avoid conflicts between the embeddings matrix and the final projection
+        // the embeddings matrix is scaled _after_ parsing the model, but the final projection is *not* scaled
+        // so in effect, these are two different tensors and thus need to be represented by two different keys
+        proj_weights.key = StorageKey::from(format!("{}_final_proj", proj_weights.key));
         let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
 
         Ok(Self::new(

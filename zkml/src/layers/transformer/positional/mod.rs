@@ -552,7 +552,8 @@ impl Positional<f32> {
                     max_seq_length,
                     layout,
                 } = *rope_config;
-                let base_freq_id = format!("{}.rope.freq_base", c.generic.model_name);
+                let base_freq_id =
+                    format!("{}.rope.freq_base.{base_frequency}", c.generic.model_name);
                 let head_size = c.generic.head_size;
                 Self::new_rope_from_frequency(
                     base_frequency,

@@ -1091,7 +1091,10 @@ pub mod safe_tests {
     use tenstore::GenStore;
 
     use super::*;
-    use crate::{Tensor, parser::llm::LLMTokenizer};
+    use crate::{
+        Tensor, init_test_logging, iop::chunking::LLMChunkingStrategy, model::llm::Driver,
+        parser::llm::LLMTokenizer,
+    };
 
     pub const GEMMA3_SAFE_MODEL: &str = "google/gemma-3-270m-it";
 
@@ -1119,6 +1122,35 @@ pub mod safe_tests {
         assert_eq!(config.eos_token, 1usize.into());
         let input = Tensor::new(vec![1].into(), vec![1562_f32])?;
         model.run_float(vec![input], &mut GenStore::default())?;
+        Ok(())
+    }
+
+    use crate::{model::llm::WithMaxContext, testing::Pcs};
+    use ff_ext::GoldilocksExt2;
+
+    #[test]
+    #[ignore = "Large machine to run"]
+    fn test_safe_gemma3_proving() -> anyhow::Result<()> {
+        init_test_logging("debug");
+        let max_context = 12;
+        let raw = RawSafeTensors::from_hugging_face_cached(GEMMA3_SAFE_MODEL)?;
+        let (driver, _metadata) = Driver::load_from_model(Gemma3::new(), &raw, Some(max_context))?
+            .into_provable_llm(None)?;
+
+        let tokenizer = Gemma3::new().load_tokenizer(&raw)?;
+        let user_tokens = tokenizer.tokenize("The sky is");
+        let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
+        let trace = driver.run_elements(input_tensor, &mut GenStore::default())?;
+        let (prover_ctx, _verifier_ctx) = driver
+            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+            .with_max_context(max_context);
+        let num_provers = Some(6);
+        let _ = driver.chunked_prove_default_executor(
+            &prover_ctx,
+            trace,
+            num_provers,
+            LLMChunkingStrategy,
+        )?;
         Ok(())
     }
 }

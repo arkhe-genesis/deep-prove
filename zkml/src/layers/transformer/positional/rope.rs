@@ -516,10 +516,10 @@ impl<N: TensorTypeParam> Rope<N> {
         let input_mle = input.deref().to_field_mle();
         let sub_cos_mle = sub_cos_matrix.into_mle();
         let sub_sin_mle = sub_sin_matrix.into_mle();
-        let num_vars = input_mle.num_vars();
         ensure!(
-            output_claim.point.len() == num_vars,
-            "Number of variables of input tensor ({num_vars}) different from number of variables of output claim point ({})",
+            output_claim.point.len() == input_mle.num_vars(),
+            "Number of variables of input tensor ({}) different from number of variables of output claim point ({})",
+            input_mle.num_vars(),
             output_claim.point.len(),
         );
         // We split the output claim point into its relative dim parts
@@ -559,6 +559,7 @@ impl<N: TensorTypeParam> Rope<N> {
             .collect::<Vec<E>>()
             .into_mle();
 
+        let num_vars = input_mle.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
         let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
         let input_expr = expr_builder.lift(Either::Left(&input_mle));
@@ -595,7 +596,7 @@ impl<N: TensorTypeParam> Rope<N> {
                 output_claim,
                 &cosine_matrix_slice,
                 &self.cosine_matrix,
-                input_shape[0],
+                input_shape.dim(-2),
                 prover.transcript,
             )?;
 
@@ -606,7 +607,7 @@ impl<N: TensorTypeParam> Rope<N> {
             output_claim,
             &sine_matrix_slice,
             &self.sine_matrix,
-            input_shape[0],
+            input_shape.dim(-2),
             prover.transcript,
         )?;
 
@@ -1124,7 +1125,8 @@ mod tests {
         #[case] context_length: usize,
         #[case] layout: RopeLayout,
     ) {
-        let input_shape = vec![seq_len, embedding_size];
+        let extra_dim = 6;
+        let input_shape = vec![extra_dim, seq_len, embedding_size];
 
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
