@@ -8,8 +8,7 @@ use deep_prove::{
     store::{self, MemStore, S3Store, Store},
 };
 use std::path::PathBuf;
-use tracing::{debug, error, info};
-use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt::format::FmtSpan};
+use tracing::{Span, debug, error, info};
 use url::Url;
 use zkml::{
     Element, Prover,
@@ -28,6 +27,7 @@ mod lpn;
 async fn run_model_v1<S: Store>(
     model: DeepProveRequestV1,
     mut store: S,
+    proof_id: String,
 ) -> Result<Vec<v1::Output>> {
     info!("Proving inference");
     let DeepProveRequestV1 {
@@ -38,10 +38,16 @@ async fn run_model_v1<S: Store>(
         scaling_input_hash,
     } = model;
 
+    info!(
+        "Received proof job: inputs={} scaling_strategy={:?}",
+        input.len(),
+        scaling_strategy
+    );
     let model_file_hash = model_file_hash.unwrap_or_else(|| {
         let hash = <sha2::Sha256 as sha2::Digest>::digest(&model);
         format!("{hash:X}")
     });
+    debug!("Computed model hash: {model_file_hash}");
 
     let params_key = store::ParamsKey {
         model_file_hash: model_file_hash.clone(),
@@ -57,19 +63,22 @@ async fn run_model_v1<S: Store>(
         .await
         .context("fetching PPs")?;
     let is_stored_params = params.is_some();
-
     let store::ScaledModel {
         model,
         model_metadata,
     } = store
         .clone()
-        .get_or_init_model_with(&model_key, async move || {
+        .get_or_init_model_with(&model_key, || async move {
+            let parse_model_span = Span::current();
             let model_bytes = model.clone();
-            let (model, model_metadata) =
-                tokio::task::spawn_blocking(move || parse_model(model_bytes.as_ref()))
-                    .await
-                    .context("running parsing model task")?
-                    .context("parsing model")?;
+            debug!("Parsing model bytes and preparing metadata");
+            let (model, model_metadata) = tokio::task::spawn_blocking(move || {
+                let _enter = parse_model_span.enter();
+                parse_model(model_bytes.as_ref())
+            })
+            .await
+            .context("running parsing model task")?
+            .context("parsing model")?;
             Ok(store::ScaledModel {
                 model,
                 model_metadata,
@@ -77,14 +86,25 @@ async fn run_model_v1<S: Store>(
         })
         .await
         .context("initializing model")?;
+    let layer_count = model.graph().inner_nodes().count();
+    let input_count = model.num_inputs();
+    let output_count = model.graph().output_nodes().count();
+    info!(
+        "Model prepared: inputs={} outputs={} layers={}",
+        input_count, output_count, layer_count
+    );
 
     let inputs = input.to_elements(&model_metadata);
 
     let (prover_ctx, verifier_ctx, model) = if let Some(store::Params { prover, verifier }) = params
     {
+        info!("Using stored proving and verifier contexts");
         (prover, verifier, model)
     } else {
+        let ctx_span = Span::current();
+        info!("Generating proving and verifier contexts");
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let _enter = ctx_span.enter();
             let (prover_ctx, verifier_ctx) =
                 model.generate_contexts().context("generating model")?;
             Ok((prover_ctx, verifier_ctx, model))
@@ -106,6 +126,7 @@ async fn run_model_v1<S: Store>(
             )
             .await
             .context("storing PPs")?;
+        info!("Stored generated proving parameters for reuse");
 
         let store::Params { prover, verifier } = store
             .get_params(&params_key)
@@ -118,10 +139,12 @@ async fn run_model_v1<S: Store>(
         (prover_ctx, verifier_ctx)
     };
 
+    let parent_span = Span::current();
     let proofs = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _parent_guard = parent_span.enter();
         let mut proofs = vec![];
         for (i, input) in inputs.into_iter().enumerate() {
-            debug!("Running input #{i}");
+            debug!(input_index = i, proof_id = %proof_id, "Running input");
             let input_tensors = model
                 .load_input_flat(vec![input])
                 .context("loading flat inputs")?;
@@ -172,41 +195,6 @@ fn parse_model(bytes: &[u8]) -> anyhow::Result<(Model<Element>, ModelMetadata)> 
     FloatOnnxLoader::from_bytes_with_scaling_strategy(bytes, strategy)
         .with_keep_float(true)
         .build()
-}
-
-fn setup_logging(json: bool) {
-    if json {
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_level(true)
-            .with_file(true)
-            .with_line_number(true)
-            .with_target(true)
-            .with_env_filter(
-                EnvFilter::builder()
-                    .with_default_directive(LevelFilter::INFO.into())
-                    .from_env_lossy(),
-            )
-            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber).expect("Setting up logging failed");
-    } else {
-        let subscriber = tracing_subscriber::fmt()
-            .pretty()
-            .compact()
-            .with_level(true)
-            .with_file(true)
-            .with_line_number(true)
-            .with_target(true)
-            .with_env_filter(
-                EnvFilter::builder()
-                    .with_default_directive(LevelFilter::INFO.into())
-                    .from_env_lossy(),
-            )
-            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber).expect("Setting up logging failed");
-    };
 }
 
 #[derive(Parser)]

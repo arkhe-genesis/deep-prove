@@ -1,5 +1,5 @@
 [workspace]
-members = ["zkml", "deep-prove", "utils", "tenvis"]
+members = ["zkml", "deep-prove", "utils", "tenvis", "telemetry"]
 resolver = "2"
 
 [workspace.package]

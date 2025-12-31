@@ -20,7 +20,7 @@ use axum::{
 };
 use deep_prove::{middleware::v1::DeepProveRequest as DeepProveRequestV1, store::MemStore};
 use tokio::sync::Mutex;
-use tracing::{error, info, trace};
+use tracing::{error, info, info_span, trace};
 
 #[derive(Default)]
 struct AppState {
@@ -39,7 +39,7 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
     else {
         unreachable!()
     };
-    crate::setup_logging(json);
+    let _telemetry_guard = telemetry::setup_logging("deep-prove-worker", json);
 
     #[cfg(feature = "aws-marketplace")]
     {
@@ -78,9 +78,14 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
             loop {
                 let maybe_work = { app_state.lock().await.work_queue.pop() };
                 if let Some(proof_request) = maybe_work {
+                    let request_span =
+                        info_span!("dp_worker_prove_inference", proof_id = "api-local");
+                    let _entered = request_span.enter();
                     let now = std::time::Instant::now();
                     info!("processing proof...");
-                    let result = crate::run_model_v1(proof_request, store.clone()).await;
+                    let result =
+                        crate::run_model_v1(proof_request, store.clone(), "api-local".to_string())
+                            .await;
                     match result {
                         Ok(output) => {
                             info!("proof generated in {}s", now.elapsed().as_secs());

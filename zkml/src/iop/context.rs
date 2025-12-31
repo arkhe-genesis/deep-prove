@@ -18,7 +18,7 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap};
-use tracing::{debug, trace};
+use tracing::{debug, info_span, trace};
 use transcript::Transcript;
 use utils::Metrics;
 
@@ -193,6 +193,8 @@ impl Model<Element> {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
         let input_shapes = self.input_shapes();
+        let span = info_span!("zkml_generate_contexts", inputs = input_shapes.len());
+        let _guard = span.enter();
         let (step_info, commitment_ctx, lookup) = self.build_global_context_data(&input_shapes)?;
         let (prover_ctx, verifier_ctx) = commitment_ctx.generate_contexts()?;
 
@@ -227,6 +229,11 @@ impl Model<Element> {
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
+        let span = info_span!(
+            "zkml_generate_contexts_for_input_shapes",
+            inputs = input_shapes.len()
+        );
+        let _guard = span.enter();
         debug!("Building global context");
         let (steps_info, commitment_ctx, lookup) = self.build_global_context_data(&input_shapes)?;
         debug!("Built global context");

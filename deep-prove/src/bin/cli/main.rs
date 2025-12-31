@@ -7,8 +7,7 @@ use deep_prove::middleware::{
 };
 use redact::Secret;
 use std::{fs, path::PathBuf};
-use tracing::{info, level_filters::LevelFilter};
-use tracing_subscriber::EnvFilter;
+use tracing::{info, info_span};
 use url::Url;
 
 mod local;
@@ -127,22 +126,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let subscriber = tracing_subscriber::fmt()
-        .pretty()
-        .compact()
-        .with_level(true)
-        .with_file(false)
-        .with_line_number(false)
-        .with_target(false)
-        .without_time()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).context("Setting up logging failed")?;
-
+    let _telemetry_guard = telemetry::setup_logging("deep-prove-cli", false);
     let args = Args::parse();
 
     match args.executor {
@@ -151,9 +135,16 @@ async fn main() -> anyhow::Result<()> {
             private_key,
             token_path,
         } => lpn::http::save_token(&gw_url, private_key.expose_secret(), &token_path).await,
-        http_config @ Executor::LpnHttp { .. } => lpn::http::connect(http_config).await,
-        local_config @ Executor::LocalApi { .. } => local::connect(local_config).await,
+        http_config @ Executor::LpnHttp { .. } => {
+            let _span = info_span!("dp_cli_lpn_http").entered();
+            lpn::http::connect(http_config).await
+        }
+        local_config @ Executor::LocalApi { .. } => {
+            let _span = info_span!("dp_cli_local_api").entered();
+            local::connect(local_config).await
+        }
         Executor::Verify { proof } => {
+            let _span = info_span!("dp_cli_verify", proof_path = %proof.display()).entered();
             info!("verifying proof in `{}`", proof.display());
             verify_proof(proof)
         }

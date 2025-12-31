@@ -22,7 +22,7 @@ use std::{
     ops::Deref,
 };
 use tenstore::{GenStore, GenericStore, StorageKey};
-use tracing::{info, warn};
+use tracing::{info, info_span, warn};
 
 mod context;
 pub mod exec_graph;
@@ -1324,6 +1324,12 @@ impl<N: TensorTypeParam> Model<N> {
         runner.model_inputs(&self.graph, &inputs)?;
 
         for (node_id, layer) in self.graph.forward_inners() {
+            let span = info_span!(
+                "zkml_layer_run",
+                node_id = %node_id,
+                op = layer.as_kind_str()
+            );
+            let _guard = span.enter();
             runner
                 .run_layer(node_id, &self.graph, layer, &())
                 .with_context(|| {
@@ -1342,6 +1348,12 @@ impl<N: TensorTypeParam> Model<N> {
     where
         Layer<N>: Evaluate<N>,
     {
+        let span = info_span!(
+            "zkml_model_run",
+            inputs = inputs.len(),
+            nodes = self.graph.inner_nodes().count()
+        );
+        let _guard = span.enter();
         let input_handles = tensor_to_handles(&inputs, &self.graph, store)?;
 
         let runner = BaseRunner {

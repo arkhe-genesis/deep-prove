@@ -26,6 +26,7 @@ default = ["cpu"]
 # Capture layers' quatization outputs for regression tests
 capture-layers-quant = []
 cpu = ["burn/ndarray", "dep:burn-ndarray"]
+otel = ["dep:telemetry"]
 # If `cuda` is also enabled it takes precedence over `wgpu`
 wgpu = ["burn/wgpu", "gpu"]
 # Linux only
@@ -100,6 +101,7 @@ tract-onnx = { workspace = true }
 transcript = { workspace = true }
 ureq = { workspace = true }
 utils = { path = "../utils" }
+telemetry = { package = "telemetry", path = "../telemetry", optional = true }
 witness = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

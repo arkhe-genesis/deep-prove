@@ -6,7 +6,7 @@ use deep_prove::middleware::{v1, v2};
 use exponential_backoff::Backoff;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
 use url::Url;
 use zkml::quantization::ScalingStrategyKind;
 
@@ -176,6 +176,8 @@ async fn process_job(
     store: &mut StoreKind,
     fetcher: &ModelFetcher,
 ) -> anyhow::Result<Vec<u8>> {
+    let span = info_span!("process_job", proof_id = job.job_id, s3_key = %job.s3_key);
+    let _entered = span.enter();
     let model_mmap = fetcher
         .fetch(&job.s3_key)
         .await
@@ -190,8 +192,16 @@ async fn process_job(
     };
 
     let result = match store {
-        StoreKind::S3(store) => crate::run_model_v1(request, store.clone()).await,
-        StoreKind::Mem(store) => crate::run_model_v1(request, store.clone()).await,
+        StoreKind::S3(store) => {
+            let span = tracing::info_span!("dp_worker_prove_inference", proof_id = %job.job_id);
+            let _entered = span.enter();
+            crate::run_model_v1(request, store.clone(), job.job_id.to_string()).await
+        }
+        StoreKind::Mem(store) => {
+            let span = tracing::info_span!("dp_worker_prove_inference", proof_id = %job.job_id);
+            let _entered = span.enter();
+            crate::run_model_v1(request, store.clone(), job.job_id.to_string()).await
+        }
     };
 
     match result {
@@ -216,7 +226,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     else {
         unreachable!()
     };
-    crate::setup_logging(json);
+    let _telemetry_guard = telemetry::setup_logging("deep-prove-worker", json);
 
     let worker_name = worker_name
         .ok_or(anyhow!("no worker name set"))

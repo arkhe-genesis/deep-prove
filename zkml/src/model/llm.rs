@@ -45,7 +45,7 @@ use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tenstore::GenStore;
-use tracing::{debug, info};
+use tracing::{debug, info, info_span};
 use transcript::BasicTranscript;
 
 #[cfg(test)]
@@ -631,6 +631,11 @@ impl Driver<Element> {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
+        let span = info_span!(
+            "zkml_llm_prove",
+            max_context = self.max_context.unwrap_or_default()
+        );
+        let _entered = span.enter();
         self.chunked_prove_local::<_, _, _, SequentialExecutor>(
             ctx,
             trace,
@@ -656,6 +661,13 @@ where
     where
         PCS::Commitment: PartialEq + Eq,
     {
+        let span = info_span!(
+            "zkml_llm_verify",
+            max_context = self.max_context.unwrap_or(self.config.context_length),
+            input_tokens = inference_output.input.len(),
+            output_tensors = inference_output.output.len()
+        );
+        let _entered = span.enter();
         ensure!(
             inference_output.output.len() == 1,
             "Expected 1 output tensor, found {}",

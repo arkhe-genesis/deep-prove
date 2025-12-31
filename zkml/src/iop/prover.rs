@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap};
 use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use timed::timed_instrument;
-use tracing::{debug, trace};
+use tracing::{debug, info_span, trace};
 use transcript::Transcript;
 use utils::{Metrics, stream_metrics};
 
@@ -969,6 +969,12 @@ where
         T: InitTranscript,
         PCS: 'static,
     {
+        // we can go deeper in the span tree to trace each step of chunked proving
+        let span = info_span!(
+            "zkml_prove_chunked",
+            chunks = num_chunks.unwrap_or_default()
+        );
+        let _guard = span.enter();
         // split in chunks
         let chunks = ctx
             .model_ctx
@@ -999,6 +1005,8 @@ where
         T: InitTranscript,
         PCS: 'static,
     {
+        let span = info_span!("zkml_prove");
+        let _guard = span.enter();
         Self::chunked_prove_local::<_, SequentialExecutor>(
             ctx,
             full_trace,

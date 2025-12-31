@@ -14,6 +14,8 @@ default = []
 # Enable worker's AWS marketplace billing
 aws-marketplace = ["dep:aws-config", "dep:aws-sdk-marketplacemetering"]
 cuda = ["zkml/cuda"]
+# Enable OpenTelemetry tracing
+otel = ["telemetry/otel"]
 
 [[bin]]
 name = "deep-prove-worker"
@@ -73,6 +75,8 @@ tract-onnx = { workspace = true }
 transcript.workspace = true
 ureq = { workspace = true }
 url = "2.5.4"
+utils = { path = "../utils" }
+telemetry = { package = "telemetry", path = "../telemetry" }
 uuid = "1.17.0"
 zeroize = "1.8.1"
 zkml = { path = "../zkml" }

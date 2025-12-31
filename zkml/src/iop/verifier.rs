@@ -26,7 +26,7 @@ use itertools::Itertools;
 use mpcs::{Point, PolynomialCommitmentScheme};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use tracing::{info, trace};
+use tracing::{info, info_span, trace};
 use transcript::Transcript;
 
 /// What the verifier must have besides the proof
@@ -544,6 +544,12 @@ where
     E: ExtensionField,
     PCS::Commitment: PartialEq + Eq,
 {
+    let span = info_span!(
+        "zkml_verify_proof",
+        inputs = io.input.len(),
+        outputs = io.output.len()
+    );
+    let _guard = span.enter();
     Verifier::<E, T, PCS>::verify(ctx, &io, proof)
 }
 

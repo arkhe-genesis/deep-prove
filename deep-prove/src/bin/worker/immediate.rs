@@ -52,7 +52,7 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
         unreachable!()
     };
 
-    crate::setup_logging(false);
+    let _telemetry_guard = telemetry::setup_logging("deep-prove-worker", false);
 
     match model_format {
         ModelFormat::Onnx => run_one_shot_onnx(model, inputs).await,
@@ -75,6 +75,8 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
 }
 
 async fn run_one_shot_onnx(model: PathBuf, inputs: Option<PathBuf>) -> anyhow::Result<()> {
+    let request_span = tracing::info_span!("dp_worker_prove_inference", proof_id = %"one-shot");
+    let _entered = request_span.enter();
     let inputs =
         inputs.context("inputs are required for ONNX one-shot proving (--inputs <file>)")?;
 
@@ -95,7 +97,7 @@ async fn run_one_shot_onnx(model: PathBuf, inputs: Option<PathBuf>) -> anyhow::R
         scaling_input_hash,
     };
     let store = MemStore::default();
-    let proofs = crate::run_model_v1(request, store).await?;
+    let proofs = crate::run_model_v1(request, store, "one-shot-onnx".to_string()).await?;
 
     // create a file to write the proofs to
     let file = tempfile::Builder::new()
@@ -127,6 +129,8 @@ async fn run_one_shot_llm(
     prompt: Option<String>,
     max_new_tokens: usize,
 ) -> anyhow::Result<()> {
+    let request_span = tracing::info_span!("dp_worker_prove_inference", proof_id = %"one-shot-llm");
+    let _entered = request_span.enter();
     let prompt = prompt.expect("clap enforces --prompt for LLM formats");
 
     let prompt_tokens = prompt.clone();
