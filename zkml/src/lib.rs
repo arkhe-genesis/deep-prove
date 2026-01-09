@@ -21,6 +21,7 @@ pub mod inputs;
 pub mod iop;
 pub mod layers;
 pub mod lookup;
+pub mod measure;
 pub mod model;
 pub mod number;
 pub mod padding;

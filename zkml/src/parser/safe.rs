@@ -13,6 +13,7 @@
 //!   conventions are handled by higher-level code.
 
 use std::{
+    fmt::Display,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -39,6 +40,12 @@ pub struct RawSafeTensors {
     config: PathBuf,
 }
 
+impl Display for RawSafeTensors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SafeTensors: {}", self.model.display())
+    }
+}
+
 impl RawSafeTensors {
     pub fn new<I: AsRef<Path>>(model: I, tokenizer: I, config: I) -> Self {
         Self {
@@ -53,7 +60,6 @@ impl RawSafeTensors {
     /// - model.safetensors
     /// - tokenizer.json
     /// - config.json
-    #[cfg(test)]
     pub fn from_hugging_face(
         repo: &str,
         destination_folder: impl AsRef<Path>,
@@ -93,7 +99,6 @@ impl RawSafeTensors {
 
     /// Cached variant that stores files under the test cache directory (model_cache/<repo>/)
     /// and only downloads when missing. Paths are resolved via `parser::file_cache::from_cache`.
-    #[cfg(test)]
     pub fn from_hugging_face_cached(repo: &str) -> anyhow::Result<Self> {
         use crate::parser::file_cache;
         use std::fs;

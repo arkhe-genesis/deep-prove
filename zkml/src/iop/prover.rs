@@ -29,6 +29,7 @@ use crate::{
         },
         logup_gkr::prover::batch_multiple_sizes_prove,
     },
+    measure,
     model::{Model, Trace},
     quantization::ToField,
     tensor::{CommitmentId, get_root_of_unity},
@@ -44,12 +45,15 @@ use multilinear_extensions::{
     virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Instant,
+};
 use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use timed::timed_instrument;
 use tracing::{debug, info_span, trace};
 use transcript::Transcript;
-use utils::{Metrics, stream_metrics};
+use utils::Metrics;
 
 /// Prover generates a series of sumcheck proofs to prove the inference of a model
 pub struct Prover<'a, 'b, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>
@@ -597,10 +601,11 @@ where
 
         // we need to compute commitments of the input/output edges of each chunk and add them
         // to the transcript.
-        let chunk_commitments = self.generate_chunk_io_commitments(&chunk, chunk_trace)?;
+        let chunk_commitments = measure::r("prove_chunk_commitments", || {
+            self.generate_chunk_io_commitments(&chunk, chunk_trace)
+        })?;
 
         let span = metrics.to_span();
-        stream_metrics("Witness context", &span);
         debug!("== Witness context metrics {} ==", span);
 
         debug!("== Challenge storage ==");
@@ -616,6 +621,7 @@ where
         debug!("== Generating claims ==");
         let metrics = Metrics::new();
 
+        let now = Instant::now();
         // compute the claims for the model outputs produced in this chunk, each identified by the
         // model output port ID
         let output_claims_by_port = chunk.model_outputs_in_chunk()?.into_iter()
@@ -786,7 +792,6 @@ where
         }
 
         let span = metrics.to_span();
-        stream_metrics("Claims", &span);
         debug!("== Claims generation metrics {} ==", span);
 
         // Now we need add the claims about the input and output of the chunk
@@ -825,17 +830,20 @@ where
         let metrics = Metrics::new();
         let table_proof = self.prove_tables(chunk_id, &lookup_ctx)?;
         let span = metrics.to_span();
-        stream_metrics("Tables", &span);
         debug!("== Lookup Table claims generation metrics {} ==", span);
+
+        measure::record_timing("prove_claims", now.elapsed());
 
         debug!("== Generate proof ==");
         let metrics = Metrics::new();
 
-        let commit_proof = self.commit_prover.prove(
-            &self.ctx.commitment_ctx,
-            &self.lookup_witness,
-            self.transcript,
-        )?;
+        let commit_proof = measure::r("prove_commitment_opening", || {
+            self.commit_prover.prove(
+                &self.ctx.commitment_ctx,
+                &self.lookup_witness,
+                self.transcript,
+            )
+        })?;
         let chunk_data = ChunkProofData {
             output_evals: chunk_output_claims
                 .into_iter()
@@ -862,7 +870,6 @@ where
         };
 
         let span = metrics.to_span();
-        stream_metrics("Proof", &span);
         debug!("== Generate proof metrics {} ==", span);
 
         Ok(chunk_proof)
@@ -873,7 +880,7 @@ where
     /// is assigned as a coordinator, that starts the process (e.g. executes the first task)
     /// and finishes it (outputs the final proof).
     #[allow(clippy::type_complexity)]
-    pub(crate) fn build_execution_graph<'c>(
+    pub fn build_execution_graph<'c>(
         chunks: Vec<ModelChunk>,
     ) -> anyhow::Result<ProverGraph<'a, 'c, E, T, PCS>>
     where
@@ -899,7 +906,7 @@ where
     }
 
     /// Return the inputs to be provided to the execution graph `graph`
-    pub(crate) fn graph_inputs(
+    pub fn graph_inputs(
         full_trace: Trace<Element>,
         graph: &ProverGraph<E, T, PCS>,
     ) -> anyhow::Result<HashMap<NodeInput, ProverGraphIO<E, PCS>>>
@@ -982,16 +989,15 @@ where
 
         let global_metrics = Metrics::new();
 
-        let output_proof = {
+        let output_proof = measure::r("prove_full", || {
             // build the computational graph to prove chunks
             let graph = Self::build_execution_graph(chunks)?;
             let inputs = Self::graph_inputs(full_trace, &graph)?;
             let context = LocalProverCtx::new(ctx, model);
-            Self::run_execution_graph::<Ex>(graph, inputs, &context, executor_conf)?
-        };
+            Self::run_execution_graph::<Ex>(graph, inputs, &context, executor_conf)
+        })?;
 
         let global_metrics_span = global_metrics.to_span();
-        stream_metrics("Global", &global_metrics_span);
         debug!("== Global metrics {} ==", global_metrics_span);
         Ok(output_proof)
     }

@@ -1,5 +1,6 @@
 use candle_core::quantized::{QTensor, gguf_file::Value};
 use std::{
+    fmt::Display,
     fs::File,
     io::{BufReader, Read, Seek},
     ops::Deref,
@@ -21,6 +22,12 @@ use crate::{
 /// contains all required metadata including the tokenizer, we don't need to track anything else.
 #[derive(Clone, Debug)]
 pub struct RawGGUF(PathBuf);
+
+impl Display for RawGGUF {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GGUF: {}", self.0.display())
+    }
+}
 
 impl RawGGUF {
     pub fn new(path: impl AsRef<Path>) -> Self {

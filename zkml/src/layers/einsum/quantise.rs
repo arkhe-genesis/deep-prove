@@ -63,14 +63,15 @@ impl EinSum<f32> {
         let lhs_bit_size = ceil_log2(lhs_max.abs().max(lhs_min.abs()) as usize);
 
         // Now we can iterate through the rhs (that are either constant tensors or inputs) and calculate the requant info for each
-        let (requants, quant_weights, quant_biases) = izip!(
+        let (requants, quant_weights, quant_biases, output_scalings) = izip!(
             self.constant_tensors.iter(),
             self.biases.iter(),
             output_scaling_factors.iter()
         )
         .fold(
-            (vec![], vec![], vec![]),
-            |(mut requants, mut weight, mut bias), (weight_opt, bias_opt, output_scaling)| {
+            (vec![], vec![], vec![], vec![]),
+            |(mut requants, mut weight, mut bias, mut output_scalings),
+             (weight_opt, bias_opt, output_scaling)| {
                 let intermediate_bit_size = if bias_opt.is_some() {
                     lhs_bit_size + *quantization::BIT_LEN + contraction_bits + 1 // If we have a bias we need an extra bit for the addition
                 } else {
@@ -89,13 +90,31 @@ impl EinSum<f32> {
                     let quantized_bias = bias_opt
                         .clone()
                         .map(|bias| bias.map_tensor(|t| t.quantize(&bias_scaling)));
-                    let requant = Requant::from_scaling_factors(
-                        lhs_input_scaling,
-                        weight_scaling,
-                        *output_scaling,
-                        intermediate_bit_size,
-                    );
-                    requants.push(requant);
+                    // If `self.requantise` is set to `true` we include a requantisation step after evaluation
+                    if self.requantise() {
+                        let requant = Requant::from_scaling_factors(
+                            lhs_input_scaling,
+                            weight_scaling,
+                            *output_scaling,
+                            intermediate_bit_size,
+                        );
+
+                        requants.push(requant);
+                        output_scalings.push(*output_scaling);
+                    } else {
+                        // Otherwise we return no requant step and calculate the output scaling factor accordingly
+                        let output_max = output_scaling.max();
+                        let output_min = output_scaling.min();
+                        let quantised_min: Element = -1 << (intermediate_bit_size - 1);
+                        let quantised_max: Element = (1 << (intermediate_bit_size - 1)) - 1;
+                        let updated_scaling = ScalingFactor::from_parts(
+                            output_max,
+                            output_min,
+                            bias_scaling.scale(),
+                            (quantised_min, quantised_max),
+                        );
+                        output_scalings.push(updated_scaling);
+                    }
                     weight.push(Some(quantized_weight));
                     bias.push(quantized_bias);
                 } else {
@@ -114,19 +133,39 @@ impl EinSum<f32> {
                     let quantized_bias = bias_opt
                         .clone()
                         .map(|bias| bias.map_tensor(|t| t.quantize(&bias_scaling)));
-                    let requant = Requant::from_scaling_factors(
-                        lhs_input_scaling,
-                        rhs_input_scaling,
-                        *output_scaling,
-                        intermediate_bit_size,
-                    );
-                    requants.push(requant);
+                    // If `self.requantise` is set to `true` we include a requantisation step after evaluation
+                    if self.requantise() {
+                        let requant = Requant::from_scaling_factors(
+                            lhs_input_scaling,
+                            rhs_input_scaling,
+                            *output_scaling,
+                            intermediate_bit_size,
+                        );
+
+                        requants.push(requant);
+                        output_scalings.push(*output_scaling);
+                    } else {
+                        // Otherwise we return no requant step and calculate the output scaling factor accordingly
+                        let output_max = output_scaling.max();
+                        let output_min = output_scaling.min();
+                        let quantised_min: Element = -1 << (intermediate_bit_size - 1);
+                        let quantised_max: Element = (1 << (intermediate_bit_size - 1)) - 1;
+                        let updated_scaling = ScalingFactor::from_parts(
+                            output_max,
+                            output_min,
+                            bias_scaling.scale(),
+                            (quantised_min, quantised_max),
+                        );
+                        output_scalings.push(updated_scaling);
+                    }
+
                     weight.push(None);
                     bias.push(quantized_bias);
                 }
-                (requants, weight, bias)
+                (requants, weight, bias, output_scalings)
             },
         );
+
         let quantized_op = EinSum {
             equation: self.equation,
             mapping: self.mapping,
@@ -137,7 +176,13 @@ impl EinSum<f32> {
             bias_unpadded_shapes: self.bias_unpadded_shapes,
             padded: self.padded,
             caches: self.caches,
+            requantise: self.requantise,
         };
-        QuantizeOutput::new(quantized_op, output_scaling_factors.to_vec()).with_requants(requants)
+
+        if !requants.is_empty() {
+            QuantizeOutput::new(quantized_op, output_scalings).with_requants(requants)
+        } else {
+            Ok(QuantizeOutput::new(quantized_op, output_scalings))
+        }
     }
 }

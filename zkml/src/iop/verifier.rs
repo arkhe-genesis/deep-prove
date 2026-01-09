@@ -6,6 +6,7 @@ use crate::{
         compute_claim,
         context::ShapeStep,
     },
+    measure,
 };
 
 use crate::{
@@ -211,7 +212,8 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
         //
         // always make sure the proof corresponds to the expected type of proof
         // in the context.
-        let claims = chunk.subgraph.backward_iter().try_fold(
+        let claims = measure::r("verify_claims", || {
+            chunk.subgraph.backward_iter().try_fold(
             HashMap::<NodeInput, Claim<E>>::new(),
             |mut claims, (node_id, _)| -> anyhow::Result<HashMap<NodeInput, Claim<E>>> {
                 let node = ctx.model.nodes.node(node_id).
@@ -349,7 +351,8 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
                 };
                 Ok(claims)
             },
-        )?;
+        )
+        })?;
 
         // Now we need add the claims about the input and output of the chunk
         chunk.outgoing_edges.keys().try_for_each(|group_id| {
@@ -550,7 +553,9 @@ where
         outputs = io.output.len()
     );
     let _guard = span.enter();
-    Verifier::<E, T, PCS>::verify(ctx, &io, proof)
+    measure::r("verify_full", || {
+        Verifier::<E, T, PCS>::verify(ctx, &io, proof)
+    })
 }
 
 fn verify_table<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(

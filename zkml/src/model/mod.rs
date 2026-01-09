@@ -1431,6 +1431,7 @@ pub(crate) mod test {
             provable::{OpInfo, evaluate_layer},
             requant::Requant,
         },
+        measure::{self, Measure},
         padding::{PaddingMode, pad_model},
         quantization::{InferenceObserver, Quantize},
         rng_from_env_or_random,
@@ -1685,6 +1686,7 @@ pub(crate) mod test {
 
     #[test]
     fn test_single_cnn_prover() {
+        measure::set_global(Measure::new());
         let n_w = 1 << 2;
         let k_w = 1 << 4;
         let n_x = 1 << 5;
@@ -1739,6 +1741,7 @@ pub(crate) mod test {
         let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
 
         verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
+        measure::to_csv("cnn_prover.csv").unwrap();
     }
 
     type T = BasicTranscript<GoldilocksExt2>;

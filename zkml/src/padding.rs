@@ -247,6 +247,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             biases,
             bias_unpadded_shapes,
             caches,
+            requantise,
             ..
         } = einsum;
 
@@ -292,6 +293,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             bias_unpadded_shapes,
             padded: true,
             caches: padded_caches,
+            requantise,
         })
     } else {
         // This is the case when the previous layer was a flatten
@@ -364,6 +366,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             biases: _,
             bias_unpadded_shapes,
             caches,
+            requantise,
             ..
         } = einsum;
 
@@ -378,6 +381,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             bias_unpadded_shapes,
             padded: true,
             caches,
+            requantise,
         })
     }
 }

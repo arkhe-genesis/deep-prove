@@ -90,6 +90,8 @@ pub struct EinSum<T> {
     pub(crate) padded: bool,
     /// used if the outputs of the einsum need to be cached
     pub caches: Vec<Option<Arc<Mutex<ConcatenationCache>>>>,
+    /// Flag to indicate if a requantisation step should be inserted after this layer
+    pub(crate) requantise: bool,
 }
 
 impl<T> EinSum<T> {
@@ -185,6 +187,7 @@ impl<T> EinSum<T> {
             bias_unpadded_shapes,
             padded: false,
             caches: vec![None; output_count],
+            requantise: true,
         })
     }
 
@@ -235,6 +238,16 @@ impl<T> EinSum<T> {
                 c_lock.reset();
             }
         });
+    }
+    /// Getter for the requantisation flag.
+    pub fn requantise(&self) -> bool {
+        self.requantise
+    }
+
+    /// Set the requantisation flag to [`false`]
+    pub fn disable_requantisation(mut self) -> Self {
+        self.requantise = false;
+        self
     }
 }
 

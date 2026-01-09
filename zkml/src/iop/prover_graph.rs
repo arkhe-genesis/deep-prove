@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use crate::{
-    Proof,
+    Proof, measure,
     model::{Model, Trace},
 };
 use anyhow::{bail, ensure};
@@ -155,21 +155,23 @@ where
                 let ProverGraphIO::ProverSplitInput(full_trace) = inputs.pop().unwrap() else {
                     bail!("Expected input for chunk prover executor")
                 };
-                let mut transcript = Prover::<E, T, PCS>::initialise_transcript(ctx.ctx)?;
-                // squeeze the common challenge to initialize the transcript for each cbunk
-                let challenge = transcript.read_challenge();
-                split_node
-                    .chunks
-                    .iter()
-                    .map(|chunk| {
-                        let chunk_trace = chunk.chunk_trace(&full_trace)?;
-                        Ok(ProverGraphIO::ChunkProveInput(ChunkProverInput {
-                            chunk: chunk.clone(),
-                            trace: chunk_trace,
-                            challenge: challenge.elements,
-                        }))
-                    })
-                    .collect()
+                measure::r("chunk_split", || {
+                    let mut transcript = Prover::<E, T, PCS>::initialise_transcript(ctx.ctx)?;
+                    // squeeze the common challenge to initialize the transcript for each cbunk
+                    let challenge = transcript.read_challenge();
+                    split_node
+                        .chunks
+                        .iter()
+                        .map(|chunk| {
+                            let chunk_trace = chunk.chunk_trace(&full_trace)?;
+                            Ok(ProverGraphIO::ChunkProveInput(ChunkProverInput {
+                                chunk: chunk.clone(),
+                                trace: chunk_trace,
+                                challenge: challenge.elements,
+                            }))
+                        })
+                        .collect()
+                })
             }
             ProverGraphNode::ChunkProver(_) => {
                 ensure!(
@@ -180,13 +182,15 @@ where
                 let ProverGraphIO::ChunkProveInput(input) = inputs.pop().unwrap() else {
                     bail!("Expected input for chunk prover executor")
                 };
+                let chunk_proof = measure::r_if_bigger("chunk_prover", || {
+                    let mut transcript: T = initialize_transcript_for_chunk(input.challenge);
+                    let prover = Prover::new(ctx.ctx, &mut transcript);
+                    let chunk_layers = input.chunk.chunk_layers(ctx.model);
+                    prover.prove_chunk(input.chunk.clone(), &input.trace, &chunk_layers)
+                })?;
                 // initialise a prover for the given chunk
-                let mut transcript: T = initialize_transcript_for_chunk(input.challenge);
-                let prover = Prover::new(ctx.ctx, &mut transcript);
-                let chunk_layers = input.chunk.chunk_layers(ctx.model);
-                let chunk_proof =
-                    prover.prove_chunk(input.chunk.clone(), &input.trace, &chunk_layers)?;
-                Ok(vec![ProverGraphIO::ChunkProof(chunk_proof)])
+
+                Ok(vec![ProverGraphIO::ChunkProof(chunk_proof?)])
             }
             ProverGraphNode::Final => {
                 let outputs = inputs

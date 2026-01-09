@@ -5,6 +5,7 @@
 //! the maximum context length is reached. It will also be used to prepend a system model correctly.
 
 use std::{
+    fmt::Display,
     ops::Deref,
     sync::{
         Arc,
@@ -149,11 +150,16 @@ impl Driver<f32> {
     /// NOTE: the max_context is only there to hack around the creation of Rope
     /// to avoid loading the full matrix if we don't need it. That should be
     /// removed if when we remove this hack.
-    pub fn load_from_model<DataFormat, M: LLMModelLoader<DataFormat>>(
+    pub fn load_from_model<DataFormat: Display, M: LLMModelLoader<DataFormat>>(
         mut model_type: M,
         data_format: &DataFormat,
         max_context: Option<usize>,
     ) -> anyhow::Result<Self> {
+        info!(
+            "LLM Driver: Loading model {} from {}",
+            model_type.model_name(),
+            data_format
+        );
         if let Some(max_context) = max_context {
             model_type = model_type.with_max_context_length(max_context);
         }

@@ -18,6 +18,7 @@ use crate::{
         },
     },
     lookup::logup_gkr::structs::{LogUpBatchVerifierClaim, LogUpInput},
+    measure,
     model::Trace,
     quantization::{self, ToField},
     to_base,
@@ -1235,13 +1236,15 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
 {
-    generate_lookup_witness_for_chunk::<_, _, _, _, SequentialExecutor>(
-        &ctx.model_ctx.nodes,
-        &ctx.lookup,
-        trace,
-        ctx,
-        transcript,
-        layers,
-        &(),
-    )
+    measure::r("witness_commitment", || {
+        generate_lookup_witness_for_chunk::<_, _, _, _, SequentialExecutor>(
+            &ctx.model_ctx.nodes,
+            &ctx.lookup,
+            trace,
+            ctx,
+            transcript,
+            layers,
+            &(),
+        )
+    })
 }

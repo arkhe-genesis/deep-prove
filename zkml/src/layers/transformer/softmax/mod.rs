@@ -382,6 +382,10 @@ impl<N: TensorTypeParam> Softmax<N> {
         &self,
         input_scaling: ScalingFactor,
     ) -> SoftmaxErrorData {
+        tracing::info!(
+            "Calculating scale factors for Softmax with max context size {}",
+            self.max_size
+        );
         let max_context_size = self.max_size as f32;
 
         // This works out the maximum possible output bitsize based on the fact that the following layer will have
@@ -407,7 +411,8 @@ impl<N: TensorTypeParam> Softmax<N> {
 
         // Now we work out the pair (last_table_value, input_sf) such that the relative error given by (1.0 / (2.0 * input_sf)).exp() - 1.0 <= 0.01 - max_context_size * table_rounding
         // So we iterate through powers of two calculating temp_sf = table_lower_bound / 2^i until 1.0 / (2.0 * (1.0 + 0.01 - max_context_size * table_rounding).ln()) <= temp_sf
-        let mut initial_power = *quantization::BIT_LEN;
+        // We set the starting power to 16 as this should be large enough for most cases while still giving a very manageable table size.
+        let mut initial_power = 16;
         let mut input_sf = (1 << initial_power) as f32 / table_lower_bound;
 
         let limit = 1.0f32 / (2.0 * (1.01 - max_context_size * table_rounding).ln());
@@ -424,27 +429,12 @@ impl<N: TensorTypeParam> Softmax<N> {
                 break;
             }
         }
+
         // The case that may cause issues seems to always be when all the values on a row are the same, so we quickly check here what the error for that case would be
         let temperature = Number::to_f32(&self.scalar).unwrap_or(1.0);
         let all_same_shift = (-(max_context_size.ln()) / (input_scaling.scale() * temperature))
             .round_ties_even() as Element;
         let rescaling_mult = input_scaling.scale() * temperature * input_sf;
-
-        // Now we need to convert this rescaling multiplier into a fixed point multiplier and a right shift.
-        let log_m = rescaling_mult.log2();
-        // This is the right shift
-        let int_part = log_m.trunc().abs() as usize;
-        // This is used to calculate the fixed point multiplier
-        let float_part = log_m.fract();
-
-        let epsilon = 2.0f32.powf(float_part);
-
-        let fixed_point_multiplier =
-            (epsilon * (1u64 << FIXED_POINT_SCALE) as f32).round_ties_even() as Element;
-
-        let rescaling_error = ((input_scaling.scale() / 2.0f32) * fixed_point_multiplier as f32
-            + 2.0f32.powf((int_part + FIXED_POINT_SCALE - 1) as f32))
-            / (2.0f32.powf((int_part + FIXED_POINT_SCALE) as f32));
 
         let rescaled_shift =
             ((all_same_shift as f32) * rescaling_mult).round_ties_even() as Element;
@@ -457,7 +447,7 @@ impl<N: TensorTypeParam> Softmax<N> {
 
         // Now we can calculate the relative error
         let input_error_factor = input_sf.min(1.0 / input_scaling.scale());
-        let input_error_factor = input_error_factor.min(1.0 / rescaling_error);
+
         let first_part = (1.0 / (2.0 * input_error_factor)).exp() - 1.0;
         let table_max_value: Element = 1 + (-1 << initial_power);
         let val_too_large_error = (table_max_value as f32 / input_sf).exp();
@@ -466,6 +456,7 @@ impl<N: TensorTypeParam> Softmax<N> {
         let other_relative_error = first_part + max_context_size * other_error_part;
 
         let relative_error = relative_sum_error.max(other_relative_error);
+
         SoftmaxErrorData {
             input_sf,
             output_sf: output_sf as f32,
@@ -983,7 +974,7 @@ mod tests {
         let scale = 1.0f32 / 64.0f32.sqrt();
         let softmax = Softmax::<f32>::new_with_scale(scale, 1024);
 
-        for num_tokens in 1024..=1024 {
+        for num_tokens in 1015..=1024 {
             // Make random q and k vectors
             let test_q = Tensor::<f32>::random(&vec![num_tokens, 768].into());
             let test_k = Tensor::<f32>::random(&vec![768, num_tokens].into());
@@ -1027,8 +1018,14 @@ mod tests {
 
             // The relative error comes from quantising the shift factor
             // The absolute error comes from the tables output scale factor
-            let rel_error = (1.0 / (2.0f32 * lut.input_sf())).exp() - 1.0;
-            let out_error = 1.0 / (2.0f32 * lut.output_sf());
+            let input_error_factor = (1.0 / (2.0f32 * lut.input_sf())).exp() - 1.0;
+            let table_max_value: Element = 1 + (-1 << lut.table_bit_size());
+            let val_too_large_error = (table_max_value as f32 / lut.input_sf()).exp();
+            let table_rounding = 1.0 / (2.0 * lut.output_sf());
+            let other_error_part = table_rounding.max(val_too_large_error);
+
+            let rel_error = input_error_factor + other_error_part + f32::EPSILON;
+            let out_error = 1.0 / (2.0f32 * lut.output_sf()) + f32::EPSILON;
 
             for (q_chunk, f_chunk) in quant_output.outputs[0]
                 .get_data()
@@ -1042,7 +1039,7 @@ mod tests {
                     assert!(
                         is_close_with_tolerance(&[float_q], &[*f], out_error, rel_error),
                         "Quant dequant diff was larger than expected got: {quant_dequant_diff}, expected less than {}",
-                        *f * rel_error + out_error
+                        *f * rel_error + out_error,
                     );
                 }
             }

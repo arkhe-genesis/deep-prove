@@ -1,59 +1,110 @@
 use anyhow::bail;
-use clap::Parser;
-use csv::WriterBuilder;
+use clap::{ArgGroup, Parser, ValueEnum, builder::ArgPredicate};
 use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
-use std::{collections::HashMap, fs::OpenOptions, path::Path, time};
 use tenstore::GenStore;
 use timed_core::Output;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 use zkml::{
     ProverContext,
-    model::llm::LLMVerifierContext,
-    parser::{file_cache, gguf::RawGGUF, llm::models::gpt2::GPT2},
+    measure::{self, Measure},
+    model::llm::{Driver, LLMVerifierContext, WithMaxContext},
+    parser::{
+        file_cache,
+        gguf::RawGGUF,
+        llm::models::{gemma3::Gemma3, gpt2::GPT2},
+        safe::RawSafeTensors,
+    },
 };
 
 type F = GoldilocksExt2;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
 type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
+#[derive(Clone, Debug, ValueEnum)]
+enum Model {
+    GPT2,
+    Gemma3,
+}
+
+impl std::fmt::Display for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Model::GPT2 => write!(f, "gpt2"),
+            Model::Gemma3 => write!(f, "gemma3"),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
+#[command(
+    group(ArgGroup::new("weights").args(["gguf", "hf"]).required(true)),
+    group(ArgGroup::new("length").args(["sequence", "max_context"]).required(true)),
+)]
 struct LLMArgs {
     /// gguf file to load. It can be a local path or a URL to download.
     #[arg(short, long)]
-    gguf: String,
+    gguf: Option<String>,
+
+    /// Hugging Face model ID. It MUST be a safetensors model for now. If the model isn't present
+    /// in the cache, it will be downloaded.
+    #[arg(long)]
+    hf: Option<String>,
 
     /// max context length (in tokens)
-    #[arg(long, default_value_t = 1024)]
-    max_context: usize,
+    #[arg(long)]
+    max_context: Option<usize>,
 
-    /// number of samples to process
-    #[arg(short, long, default_value_t = 30)]
-    num_samples: usize,
+    /// When specifying a sequence, the model will try each difference sequence length, just generating 2 tokens each time
+    /// So for seqlen = n, it will start with a prompt of n-2 tokens, and generates two tokens.
+    #[arg(long, value_delimiter = ',')]
+    sequence: Vec<usize>,
 
     /// min user input length (in tokens)
-    #[arg(long, default_value_t = 1)]
+    #[arg(
+        long,
+        requires = "max_context",
+        conflicts_with = "sequence",
+        default_value_t = 1
+    )]
     min_user_len: usize,
 
     /// model to use
-    #[arg(short, long, default_value_t = {"gpt2".to_string()})]
-    model: String,
+    #[arg(short, long, value_enum)]
+    model: Model,
 
-    /// output file name
-    #[arg(short, long, default_value_t = {"bench-llm.csv".to_string()})]
+    /// DEPRECATED: output file name that records individual methods
+    #[arg(short, long, default_value_t = {"bench-llm-deprecated.csv".to_string()})]
     output: String,
+
+    /// Benchmark csv output file name
+    #[arg(
+        long,
+        default_value_if("distributed", ArgPredicate::IsPresent, Some("bench_distributed.csv")),
+        default_value = "bench.csv" // Optional: what to use if NOT distributed
+    )]
+    bench: String,
+
+    /// How many rayon threads to use
+    /// If not provided, will use the number of logical cores
+    /// If 0, will use the number of physical cores
+    #[arg(long)]
+    num_threads: Option<usize>,
+
+    /// Profile distributed execution
+    #[arg(long, default_value_t = false)]
+    distributed: bool,
 }
 
-const HEADER_MODEL: &str = "model";
-const HEADER_MODEL_QUANT: &str = "model_quant";
+const HEADER_MODEL: &str = "model_name";
+const HEADER_MODEL_QUANT: &str = "quantization_time";
+const HEADER_CONTEXT_GENERATION: &str = "context_generation_time";
 const HEADER_MAX_CONTEXT: &str = "max_context";
-const HEADER_NUM_SAMPLES: &str = "num_samples";
+const HEADER_NUM_THREADS: &str = "num_threads";
 const HEADER_MIN_USER_LEN: &str = "min_user_len";
-const HEADER_ACCURACY: &str = "accuracy";
 const HEADER_INFERENCE_TIME: &str = "inference_time";
-const HEADER_PROOF_TIME: &str = "proof_time";
-const HEADER_VERIFY_TIME: &str = "verification";
-const HEADER_CONTEXT_TIME: &str = "context_time";
+const HEADER_PROOF_SIZE: &str = "proof_size";
 
 fn main() -> anyhow::Result<()> {
     let subscriber = tracing_subscriber::fmt::Subscriber::builder()
@@ -62,119 +113,280 @@ fn main() -> anyhow::Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
     timed_core::set_output(Output::CSV("bench-llm.csv".to_string()));
-    let args = LLMArgs::parse();
-    let model_path = file_cache::from_cache(&args.gguf)?;
-    let format = RawGGUF::new(model_path);
 
-    let driver = match args.model.to_lowercase().as_str() {
-        zkml::parser::llm::models::gpt2::GPT2_NAME => {
-            Driver::load_from_model(GPT2, &format, Some(args.max_context))?
+    let args = LLMArgs::parse();
+
+    // either its spceified and if 0 it's the physical cores otherwise what is speciied but no more than the logical cores
+    let num_threads = if let Some(nt) = args.num_threads {
+        if nt == 0 {
+            num_cpus::get_physical()
+        } else {
+            nt.min(num_cpus::get())
         }
-        _ => bail!("Model {:?} not supported", args.model),
+    } else {
+        num_cpus::get()
+    };
+    info!("Using {} threads", num_threads);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .unwrap();
+
+    let (max_context, sequence) = if let Some(max_context) = args.max_context {
+        (max_context, vec![(args.min_user_len, max_context)])
+    } else {
+        let mut sequence = args.sequence.clone();
+        sequence.sort();
+        (
+            *sequence.last().unwrap(),
+            sequence
+                .into_iter()
+                .map(|s| (s.saturating_sub(2), s))
+                .collect(),
+        )
     };
 
-    let mut bencher = CSVBencher::from_headers(vec![
-        HEADER_MODEL,
-        HEADER_MAX_CONTEXT,
-        HEADER_NUM_SAMPLES,
-        HEADER_MIN_USER_LEN,
-        HEADER_ACCURACY,
-        HEADER_MODEL_QUANT,
-    ]);
-    let (driver, _metadata) = bencher.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
+    info!(
+        "Running with max context {} and user_prompt->max_length: {:?}",
+        max_context,
+        sequence
+            .iter()
+            .map(|(s, m)| format!("({}->{})", s, m))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let driver = if let Some(gguf) = args.gguf {
+        let model_path = file_cache::from_cache(&gguf)?;
+        match args.model {
+            Model::GPT2 => {
+                Driver::load_from_model(GPT2, &RawGGUF::new(model_path), Some(max_context))?
+            }
+            _ => bail!("Model {:?} not supported for gguf", args.model),
+        }
+    } else if let Some(hf) = args.hf {
+        let safe = RawSafeTensors::from_hugging_face_cached(&hf)?;
+        match args.model {
+            Model::GPT2 => Driver::load_from_model(GPT2, &safe, Some(max_context))?,
+            Model::Gemma3 => Driver::load_from_model(
+                Gemma3::new().with_max_context(max_context),
+                &safe,
+                Some(max_context),
+            )?,
+        }
+    } else {
+        bail!("Either gguf or hf must be provided");
+    };
+
+    let mut premeasure = Measure::new()
+        .with(HEADER_MODEL, &args.model.to_string())
+        .with(HEADER_NUM_THREADS, &num_threads.to_string());
+    let (mut driver, _metadata) =
+        premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
     let (prover_ctx, verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
-        bencher.r(HEADER_CONTEXT_TIME, || driver.context())?;
+        premeasure.r(HEADER_CONTEXT_GENERATION, || driver.context())?;
 
-    bencher.set(HEADER_MODEL, args.model);
-    bencher.set(HEADER_MAX_CONTEXT, args.max_context);
-    bencher.set(HEADER_NUM_SAMPLES, args.num_samples);
-    bencher.set(HEADER_MIN_USER_LEN, args.min_user_len);
+    let verifier_ctx = verifier_ctx.with_max_context(max_context);
 
-    for _ in 0..args.num_samples {
-        let user_tokens = driver.random_sequence(args.min_user_len);
+    for (user_prompt, max_ctx) in sequence {
+        // make a new measure for each trial, but always keep the initial measurements for each sample
+        measure::set_global(premeasure.clone());
+
+        measure::set(HEADER_MAX_CONTEXT, max_ctx.to_string());
+        measure::set(HEADER_MIN_USER_LEN, user_prompt.to_string());
+
+        driver = driver.with_max_context(max_ctx);
+        let user_tokens = driver.random_sequence(user_prompt);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
-        let trace = bencher.r(HEADER_INFERENCE_TIME, || {
+        let trace = measure::r(HEADER_INFERENCE_TIME, || {
             driver.run_elements(input_tensor, &mut GenStore::default())
         })?;
-        let io = trace.to_verifier_io()?;
-        let proof = bencher.r(HEADER_PROOF_TIME, || driver.prove(&prover_ctx, trace))?;
-        bencher.r(HEADER_VERIFY_TIME, || {
-            verifier_ctx
-                .verify(proof, user_tokens, io)
-                .expect("invalid proof")
-        });
-        bencher.flush(&args.output)?;
+
+        let (proof, io) = if args.distributed {
+            distributed::run_distributed(trace, &driver, &prover_ctx)?
+        } else {
+            let io = trace.to_verifier_io()?;
+            let proof = driver.prove(&prover_ctx, trace)?;
+            (proof, io)
+        };
+
+        let proof_size = rmp_serde::to_vec(&proof)?.len();
+        measure::set(HEADER_PROOF_SIZE, proof_size);
+        verifier_ctx
+            .verify(proof, user_tokens, io)
+            .expect("invalid proof");
+        if !args.distributed {
+            measure::post_process(|metrics| {
+                let Ok(proof_time) = metrics.get("prove_full").unwrap().parse::<usize>() else {
+                    return;
+                };
+                let Ok(ctx_length) = metrics.get(HEADER_MAX_CONTEXT).unwrap().parse::<usize>()
+                else {
+                    return;
+                };
+                let token_per_second = ctx_length as f64 / (proof_time as f64 / 1000.0);
+                metrics.insert("token/sec".to_string(), token_per_second.to_string());
+            })?;
+        }
+        measure::to_csv(&args.bench)?;
     }
 
     Ok(())
 }
 
-use tracing::info;
-use zkml::model::llm::Driver;
+mod distributed {
+    use std::collections::HashMap;
 
-struct CSVBencher {
-    data: HashMap<String, String>,
-    headers: Vec<String>,
-}
+    use super::*;
+    use anyhow::{anyhow, ensure};
+    use tracing::debug;
+    use transcript::BasicTranscript;
 
-impl CSVBencher {
-    pub fn from_headers<S: IntoIterator<Item = T>, T: Into<String>>(headers: S) -> Self {
-        let strings: Vec<String> = headers.into_iter().map(Into::into).collect();
-        Self {
-            data: Default::default(),
-            headers: strings,
+    use zkml::{
+        Element, IO, Proof, Prover,
+        graph::{
+            executor::{Executor, ThreadPoolExecutor},
+            partition::PartitionScheduler,
+            scheduler::ExecGraph,
+        },
+        iop::{
+            chunking::LLMChunkingStrategy,
+            prover_graph::{LocalProverCtx, ProverGraphIO, ProverGraphNode},
+        },
+        model::Trace,
+    };
+
+    pub type T = BasicTranscript<F>;
+
+    // Type of nodes of the graph to execute
+    pub type Node<'a, 'b> = ProverGraphNode<'a, 'b, F, T, Pcs<F>>;
+
+    // Type of execution graph to be partitioned and executed in the workers
+    pub type Graph<'a, 'b> = ExecGraph<Node<'a, 'b>, Color>;
+
+    // Color is used to create the partitions, assign different nodes to different workers.
+    // It can be usize or any other type such as IP address etc.
+    pub type Color = usize;
+
+    /// What a partition scheduler outputs
+    pub type PartitionOutput<'a, 'b> = zkml::graph::partition::PartitionOutput<Node<'a, 'b>, Color>;
+
+    const CHUNK_OUTPUT_SIZE: &str = "chunk_output_size";
+    const CHUNK_INPUT_SIZE: &str = "chunk_input_size";
+
+    fn run_next_partition<'a, 'b, E: Executor<Node<'a, 'b>, Color>>(
+        schedulers: &mut HashMap<Color, PartitionScheduler<Node<'a, 'b>, Color, E>>,
+    ) -> anyhow::Result<Option<PartitionOutput<'a, 'b>>> {
+        let mut to_be_sent_outputs = Vec::new();
+        let mut final_output = None;
+        let mut done_schedulers = Vec::new();
+        for (color, scheduler) in schedulers.iter_mut() {
+            let outputs = scheduler.try_run_partition()?;
+            for out in outputs {
+                if let Some(to_node) = out.to {
+                    let serialized_output = rmp_serde::to_vec(&out)?;
+                    // ToDo: measure serialized_output
+                    if to_node == 0 {
+                        // this is data sent to the coordinator, so we add it to the set of data sent by workers
+                        // to the coordinator
+                        measure::accumulate_key(
+                            CHUNK_OUTPUT_SIZE,
+                            serialized_output.len(),
+                            |a, b| a + b,
+                        )?
+                    } else if *color == 0 {
+                        // this is data sent by the coordinator, so we add it to the set of data sent to the workers
+                        measure::accumulate_key(
+                            CHUNK_INPUT_SIZE,
+                            serialized_output.len(),
+                            |a, b| a + b,
+                        )?
+                    } else {
+                        unreachable!(
+                            "Data is either sent to coordinator or received by coordinator"
+                        )
+                    };
+                    debug!("Node {} sending output to node {}", color, to_node);
+                    to_be_sent_outputs.push((to_node, out));
+                } else {
+                    // we found the final output
+                    final_output = Some(out);
+                }
+                if scheduler.is_done() {
+                    done_schedulers.push(*color);
+                }
+            }
         }
+
+        for (dest_color, out) in to_be_sent_outputs {
+            schedulers
+                .get_mut(&dest_color)
+                .ok_or(anyhow!("Scheduler not found for color {dest_color}"))?
+                .set_child_partition_output(out)?
+        }
+
+        for color in done_schedulers {
+            schedulers.remove(&color);
+        }
+
+        Ok(final_output)
     }
 
-    pub fn r<A, F: FnOnce() -> A>(&mut self, column: &str, f: F) -> A {
-        self.check(column);
-        let now = time::Instant::now();
-        let output = f();
-        let elapsed = now.elapsed().as_millis();
-        info!("STEP: {} took {}ms", column, elapsed);
-        self.data.insert(column.to_string(), elapsed.to_string());
-        output
-    }
+    #[allow(clippy::type_complexity)]
+    pub(super) fn run_distributed(
+        full_trace: Trace<Element>,
+        driver: &Driver<Element>,
+        prover_ctx: &ProverContext<F, Pcs<F>>,
+    ) -> anyhow::Result<(Proof<F, Pcs<F>>, IO<F>)> {
+        let io = full_trace.to_verifier_io()?;
 
-    fn check(&self, column: &str) {
-        if self.data.contains_key(column) {
-            panic!(
-                "CSVBencher only flushes one row at a time for now (key already registered: {column})"
-            );
-        }
-        if !self.headers.contains(&column.to_string()) {
-            panic!("column {column} non existing");
-        }
-    }
+        let chunks = prover_ctx.split_in_chunks(None, LLMChunkingStrategy)?;
+        let graph: Graph = Prover::build_execution_graph(chunks)?;
 
-    pub fn set<I: ToString>(&mut self, column: &str, data: I) {
-        self.check(column);
-        self.data.insert(column.to_string(), data.to_string());
-    }
+        let inputs = Prover::graph_inputs(full_trace, &graph)?;
 
-    fn flush(&self, fname: &str) -> anyhow::Result<()> {
-        let file_exists = Path::new(fname).exists();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(file_exists)
-            .write(true)
-            .open(fname)?;
-        let mut writer = WriterBuilder::new()
-            .has_headers(!file_exists)
-            .from_writer(file);
+        ensure!(
+            inputs.len() == 1,
+            "Expected exactly one input node (coordinator split)"
+        );
 
-        let values: Vec<_> = self
-            .headers
-            .iter()
-            .map(|k| self.data[k].to_string())
-            .collect();
+        let flat_inputs =
+            inputs
+                .into_iter()
+                .fold(Vec::new(), |mut ios, (node_input, chunk_prover_io)| {
+                    ios.push((node_input.node_id, chunk_prover_io));
+                    ios
+                });
+        let partitions = graph.partition_by_color(flat_inputs)?;
 
-        if !file_exists {
-            writer.write_record(&self.headers)?;
+        let mut schedulers = partitions
+            .into_iter()
+            .map(|(color, partitions)| {
+                let ctx = LocalProverCtx::new(prover_ctx, &driver.model);
+                Ok((
+                    color,
+                    PartitionScheduler::<_, _, ThreadPoolExecutor>::new(partitions, ctx, ())?,
+                ))
+            })
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+
+        let mut final_outputs = Vec::new();
+        while !schedulers.is_empty() {
+            if let Some(final_output) = run_next_partition(&mut schedulers)? {
+                final_outputs.push(final_output.output)
+            };
         }
 
-        writer.write_record(&values)?;
-        writer.flush()?;
-        Ok(())
+        // Creates channels pairs to communicate with all other nodes
+        ensure!(
+            final_outputs.len() == 1,
+            "Expected 1 outputs for the graph, {} outputs received",
+            final_outputs.len()
+        );
+        let proof = match final_outputs.pop().unwrap() {
+            ProverGraphIO::FinalProof(proof) => proof,
+            _ => bail!("Invalid output type found after execution of ProverGraph"),
+        };
+        Ok((proof, io))
     }
 }

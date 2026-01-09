@@ -1,7 +1,7 @@
 //! This module implements a prover instance that generates proofs completely
 //! locally, in a one-shot manner. After a successful proof generation, they are
 //! written to a local file.
-use std::{io::BufWriter, path::PathBuf};
+use std::{fmt::Display, io::BufWriter, path::PathBuf};
 
 use anyhow::Context;
 use deep_prove::store::MemStore;
@@ -251,7 +251,7 @@ fn load_llm_artifacts(
     })
 }
 
-fn build_driver_from_names<DataFormat>(
+fn build_driver_from_names<DataFormat: Display>(
     model_names: Vec<String>,
     raw: DataFormat,
     prompt: String,

@@ -159,7 +159,8 @@ pub trait AttentionMechanism {
         // Extract the tensors from the attention mechanism
         let (weights, biases) = self.qkv_tensors();
         let qkv_einsum = Self::build_qkv_einsum(qkv_equation, weights, biases)?;
-        let query_key_einsum = Self::build_query_key_attention_einsum(query_key_equation)?;
+        let query_key_einsum =
+            Self::build_query_key_attention_einsum(query_key_equation)?.disable_requantisation();
         let attention_value_einsum = Self::build_attention_value_einsum(attention_value_equation)?;
         let (out_weight, out_bias) = self.out_tensors();
         let output_einsum =
