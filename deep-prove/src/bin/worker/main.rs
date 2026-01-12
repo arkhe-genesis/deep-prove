@@ -8,7 +8,7 @@ use deep_prove::{
     store::{self, MemStore, S3Store, Store},
 };
 use std::path::PathBuf;
-use tracing::{Span, debug, error, info};
+use tracing::{Span, debug, info};
 use url::Url;
 use zkml::{
     Element, Prover,
@@ -149,36 +149,29 @@ async fn run_model_v1<S: Store>(
                 .load_input_flat(vec![input])
                 .context("loading flat inputs")?;
 
-            let trace_result = model.run(
-                input_tensors,
-                &mut tenstore::GenStore::new_temporary(1000 * 1024 * 1024)?,
-            );
-            // If model.run fails, print the error and continue to the next input
-            match trace_result {
-                Ok(trace) => {
-                    let output_handles = trace.outputs();
-                    let outputs = output_handles
-                        .iter()
-                        .map(|handle| handle.tensor().map(|t| t.clone()))
-                        .collect::<Result<_, _>>()?;
-                    let io = trace.to_verifier_io().context("generating verifier IOs")?;
-                    let proof = Prover::<_, T, _>::prove(&prover_ctx, trace, &model)
-                        .with_context(|| "unable to generate proof for {i}th input")?;
+            let trace = model
+                .run(
+                    input_tensors,
+                    &mut tenstore::GenStore::new_temporary(1000 * 1024 * 1024)?,
+                )
+                .context(format!("Running inference for input {}", i + 1))?;
+            let output_handles = trace.outputs();
+            let outputs = output_handles
+                .iter()
+                .map(|handle| handle.tensor().map(|t| t.clone()))
+                .collect::<Result<_, _>>()?;
+            let io = trace.to_verifier_io().context("generating verifier IOs")?;
+            let proof = Prover::<_, T, _>::prove(&prover_ctx, trace, &model)
+                .with_context(|| "unable to generate proof for {i}th input")?;
 
-                    proofs.push(v1::Output {
-                        outputs,
-                        proof: Provable {
-                            proof,
-                            io,
-                            ctx: verifier_ctx.clone(),
-                        },
-                    });
-                }
-                Err(e) => {
-                    error!("[!] Error running inference for input {}: {}", i + 1, e);
-                    continue; // Skip to the next input without writing to CSV
-                }
-            };
+            proofs.push(v1::Output {
+                outputs,
+                proof: Provable {
+                    proof,
+                    io,
+                    ctx: verifier_ctx.clone(),
+                },
+            });
         }
         Ok(proofs)
     })
