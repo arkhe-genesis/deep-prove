@@ -25,9 +25,9 @@ use crate::{
     },
     model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
-    quantization::ToField,
+    quantization::{self, ToField},
     tensor::{TensorHandle, WrappedTensor},
-    to_bit_sequence_le,
+    to_base, to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
 use anyhow::{Result, anyhow, bail, ensure};
@@ -37,7 +37,12 @@ use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{Expression, mle::IntoMLE, virtual_polys::VirtualPolynomialsBuilder};
+use multilinear_extensions::{
+    Expression,
+    mle::{ArcMultilinearExtension, IntoMLE},
+    util::{ceil_log2, transpose},
+    virtual_polys::VirtualPolynomialsBuilder,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
@@ -110,13 +115,21 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LogitsProof<E, PCS> 
         PCS::write_commitment(&self.max_commitment, transcript).map_err(|e| anyhow!("{e:?}"))
     }
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantizedArgMaxData {
+    input_bit_size: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Logits {
-    Argmax,
+    Argmax(Option<QuantizedArgMaxData>),
 }
 
 impl Logits {
+    pub fn new_argmax() -> Self {
+        Logits::Argmax(None)
+    }
+
     fn evaluate_with_argmax_data_f32(
         &self,
         inputs: &[&WrappedTensor<f32>],
@@ -126,7 +139,7 @@ impl Logits {
             "Argmax is for tensors of rank >= 2",
         );
         match self {
-            Logits::Argmax => {
+            Logits::Argmax(_) => {
                 let (indices, maximums): (Vec<_>, Vec<_>) = inputs
                     .iter()
                     .map(|input| {
@@ -149,7 +162,7 @@ impl Logits {
             "Argmax is for tensors of rank >= 2",
         );
         match self {
-            Logits::Argmax => {
+            Logits::Argmax(_) => {
                 let (indices, maximums): (Vec<_>, Vec<_>) = itertools::process_results(
                     inputs.iter().map(|input| {
                         let shape: Shape = input.unpadded_shape().into();
@@ -207,6 +220,93 @@ impl Logits {
         t.append_field_element_ext(&input_claim.eval);
 
         t.read_challenge().elements
+    }
+
+    fn range_check_chunks(&self) -> usize {
+        match self {
+            Logits::Argmax(Some(data)) => {
+                let bit_size = data.input_bit_size + 1; // +1 since this is the upper bound for max - input values
+                // ensure that `bit_size` is at least `quantization::BIT_LEN`
+                let bit_size = bit_size.max(*quantization::BIT_LEN);
+                bit_size.div_ceil(*quantization::BIT_LEN)
+            }
+            Logits::Argmax(None) => {
+                unimplemented!("Range check chunks not implemented for unquantized logits")
+            }
+        }
+    }
+
+    fn build_lookup_input<E: ExtensionField>(
+        &self,
+        committed_polys: &[ArcMultilinearExtension<E>],
+        challenge_storage: &ChallengeStorage<E>,
+        tt: &TableType,
+        input: Tensor<E>,
+        unpadded_dim_size: usize,
+    ) -> anyhow::Result<LogUpInput<E>> {
+        let column_evals = if committed_polys.len() == 1 {
+            let input_shape = input.shape();
+            let last_dim = input_shape.dim(input_shape.len() - 1);
+            vec![
+                input
+                    .get_data()
+                    .par_chunks(last_dim)
+                    .zip(committed_polys[0].get_base_field_vec().par_iter())
+                    .map(|(chunk, &max)| {
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .map(|(i, val)| {
+                                if i < unpadded_dim_size {
+                                    max - val.as_bases()[0]
+                                } else {
+                                    E::BaseField::ZERO
+                                }
+                            })
+                            .collect::<Vec<E::BaseField>>()
+                    })
+                    .collect::<Vec<Vec<E::BaseField>>>()
+                    .concat(),
+            ]
+        } else {
+            committed_polys[1..]
+                .iter()
+                .map(|mle| mle.get_base_field_vec().to_vec())
+                .collect::<Vec<Vec<E::BaseField>>>()
+        };
+
+        let (constant_challenge, column_separation_challenge) = challenge_storage
+            .get_challenges_by_name(&tt.name())
+            .ok_or(anyhow!(
+                "No challenges found for Table Type: {}, cannot prove Logits ArgMax",
+                tt.name()
+            ))?;
+        LogUpInput::<E>::new_lookup(
+            column_evals,
+            constant_challenge,
+            column_separation_challenge,
+            tt.num_columns(),
+        )
+        .map_err(|e| anyhow!("{e:?}"))
+    }
+
+    fn recombine_range_check_claims<E: ExtensionField>(
+        logup_claims: &[Claim<E>],
+    ) -> anyhow::Result<Claim<E>> {
+        ensure!(!logup_claims.is_empty());
+        let point = logup_claims[0].point.clone();
+        let multiplier = E::from_canonical_u64(1 << *quantization::BIT_LEN);
+        let eval = logup_claims
+            .iter()
+            .try_fold((E::ZERO, E::ONE), |(eval, factor), claim| {
+                ensure!(
+                    claim.point == point,
+                    "All logup claims must be on the same point to recombine"
+                );
+                Ok((eval + factor * claim.eval, factor * multiplier))
+            })?
+            .0;
+        Ok(Claim { point, eval })
     }
 }
 
@@ -267,7 +367,8 @@ impl ProveInfo for Logits {
 
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
 
-        let lookup_ctx = LayerLookupContext::new(vec![TableType::Range], vec![1]);
+        let lookup_ctx =
+            LayerLookupContext::new(vec![TableType::Range], vec![self.range_check_chunks()]);
         Ok((
             LayerCtx::Logits(LogitsCtx {
                 lookup_ctx,
@@ -285,12 +386,25 @@ impl QuantizeOp for Logits {
         self,
         _data: &S::AuxData,
         _node_id: NodeId,
-        _input_scaling: &[ScalingFactor],
+        input_scaling: &[ScalingFactor],
         _unpadded_input_shapes: &[Shape],
         output_scalings: &[ScalingFactor],
         _unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Self::QuantizedOp>> {
-        Ok(QuantizeOutput::new(self, output_scalings.to_vec()))
+        ensure!(
+            input_scaling.len() == 1,
+            "Logits layer expects a single input scaling factor, found {}",
+            input_scaling.len()
+        );
+        // compute bit size of the input
+        let input_bit_size = {
+            let (min, max) = input_scaling[0].domain();
+            ceil_log2(min.abs().max(max.abs()) as usize)
+        };
+        Ok(QuantizeOutput::new(
+            Logits::Argmax(Some(QuantizedArgMaxData { input_bit_size })),
+            output_scalings.to_vec(),
+        ))
     }
 }
 
@@ -366,10 +480,11 @@ where
         let commitment = PCS::get_pure_commitment(layer_commitment);
 
         let max_mle = layer_polys[0].as_ref();
-        let logup_input = ctx.build_lookup_input(
-            max_mle.get_base_field_vec(),
-            input.to_field(),
+        let logup_input = self.build_lookup_input(
+            &layer_polys,
             &prover.challenge_storage,
+            &ctx.lookup_ctx.tables[0],
+            input.to_field(),
             unpadded_dim_size,
         )?;
         let logup_batch_proof = batch_multiple_sizes_prove(&[logup_input], prover.transcript)?;
@@ -377,11 +492,15 @@ where
         // get the claim about the difference between max_values and input data
         let output_claims = logup_batch_proof.output_claims();
         ensure!(
-            output_claims.len() == 1,
-            "Expected 1 claim from logup proof in Logits layer, found {}",
+            output_claims.len() == self.range_check_chunks(),
+            "Expected {} claims from logup proof in Logits layer, found {}",
+            self.range_check_chunks(),
             output_claims.len(),
         );
-        let diff_claim = &output_claims[0];
+
+        // we need to compute a claim about the polynomial given the difference between max_mle and input values:
+        // the `output_claims` are about the range-checked chunks of such a difference, so we just need to re-combine them
+        let diff_claim = Self::recombine_range_check_claims(output_claims)?;
 
         // evaluate max_values MLE on the same point of `diff_claim`
         // we need to extract the row-related coordinates from `diff_claim.point`
@@ -472,10 +591,23 @@ where
         let input_eval = sumcheck_evals[0];
         let max_eval = sumcheck_evals[1];
 
-        prover.commit_prover.add_witness_claim(
-            node_id,
-            vec![(point[num_col_vars..].to_vec(), vec![max_eval])],
-        );
+        if self.range_check_chunks() == 1 {
+            prover.commit_prover.add_witness_claim(
+                node_id,
+                vec![(point[num_col_vars..].to_vec(), vec![max_eval])],
+            );
+        } else {
+            prover.commit_prover.add_witness_claim(
+                node_id,
+                vec![
+                    (point[num_col_vars..].to_vec(), vec![max_eval]),
+                    (
+                        diff_claim.point().to_vec(),
+                        output_claims.iter().map(|c| c.eval).collect(),
+                    ),
+                ],
+            );
+        }
 
         let final_input_claim = Claim::new(state.collect_raw_challenges(), input_eval);
 
@@ -507,7 +639,7 @@ where
         let input = &inputs[0];
 
         ensure!(
-            matches!(self, Logits::Argmax),
+            matches!(self, Logits::Argmax(Some(_))),
             "Only Argmax is currently supported in Logits layer"
         );
 
@@ -558,10 +690,22 @@ where
                     .collect::<Vec<Element>>()
             })
             .collect::<Vec<Element>>();
-        let element_count = merged_diff.iter().fold(HashMap::new(), |mut acc, diff| {
-            *acc.entry(*diff).or_default() += 1;
-            acc
-        });
+        // split merged diff in chunks
+        let mut element_count = HashMap::new();
+        let chunks = (0..self.range_check_chunks())
+            .map(|i| {
+                merged_diff
+                    .iter()
+                    .map(|v| {
+                        let shifted = v >> (i * (*quantization::BIT_LEN));
+                        let mask = (1i64 << (*quantization::BIT_LEN)) - 1;
+                        let value = shifted & mask;
+                        *element_count.entry(value).or_default() += 1;
+                        value
+                    })
+                    .collect::<Vec<Element>>()
+            })
+            .collect::<Vec<Vec<Element>>>();
 
         // commit to max values
         let commit_data = max_values_guard
@@ -574,7 +718,20 @@ where
             ceno_p3::matrix::dense::DenseMatrix::new(commit_data, 1),
             InstancePaddingStrategy::Default,
         );
-        let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm])?;
+        let width = self.range_check_chunks();
+        let layer_commitment = if width == 1 {
+            // no need to commit to a single chunk
+            ctx.commitment_ctx.batch_commit(vec![rmm])?
+        } else {
+            let chunk_rmm = RowMajorMatrix::new_by_inner_matrix(
+                ceno_p3::matrix::dense::DenseMatrix::new(
+                    to_base::<E, _>(transpose(chunks).into_iter().flatten()),
+                    width,
+                ),
+                InstancePaddingStrategy::Default,
+            );
+            ctx.commitment_ctx.batch_commit(vec![rmm, chunk_rmm])?
+        };
 
         let mut gen = LookupWitnessGen::<E, PCS>::default();
         gen.insert_logup_witness(id, layer_commitment);
@@ -622,12 +779,19 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         self.lookup_ctx
             .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
 
-        let poly_evals = batch_claim.poly_evals();
+        let poly_claims = batch_claim
+            .poly_evals()
+            .iter()
+            .map(|eval| Claim::new(batch_claim.point().to_vec(), *eval))
+            .collect::<Vec<Claim<E>>>();
+
+        let num_range_checks = self.lookup_ctx.instances_per_table[0];
 
         ensure!(
-            poly_evals.len() == 1,
-            "Expected 1 claim for logup when verifying Logis layer, found {}",
-            poly_evals.len(),
+            poly_claims.len() == num_range_checks,
+            "Expected {} claims for logup when verifying Logis layer, found {}",
+            num_range_checks,
+            poly_claims.len(),
         );
 
         ensure!(
@@ -644,7 +808,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         let num_col_vars = input_shape.dim(input_shape.rank() - 1).ilog2() as usize;
         let (_, row_point) = Logits::split_claim_point(batch_claim.point(), num_row_vars)?;
 
-        let input_claim = Claim::new(batch_claim.point().to_vec(), poly_evals[0]);
+        let input_claim = Logits::recombine_range_check_claims(&poly_claims)?;
 
         let two_inv = E::TWO.inverse();
         let num_cols = E::from_canonical_usize(1 << num_col_vars);
@@ -655,7 +819,6 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             .collect_vec();
 
         let challenge = Logits::squeeze_challenge(verifier.transcript, &input_claim);
-
         // verify hadamard product sum-check
         let input_num_vars = shape_step.padded_input_shape[0].num_vars().iter().sum();
         let hadamard_poly_aux =
@@ -725,11 +888,26 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         )?;
 
         // Add the max_values claim to the commitment verifier
-        verifier.commit_verifier.add_witness_claim(
-            self.node_id,
-            proof.max_commitment.clone(),
-            vec![(sumcheck_point[num_col_vars..].to_vec(), vec![max_eval])],
-        );
+        if num_range_checks == 1 {
+            verifier.commit_verifier.add_witness_claim(
+                self.node_id,
+                proof.max_commitment.clone(),
+                vec![(sumcheck_point[num_col_vars..].to_vec(), vec![max_eval])],
+            );
+        } else {
+            verifier.commit_verifier.add_witness_claim(
+                self.node_id,
+                proof.max_commitment.clone(),
+                vec![
+                    (sumcheck_point[num_col_vars..].to_vec(), vec![max_eval]),
+                    (
+                        input_claim.point().to_vec(),
+                        poly_claims.iter().map(|c| c.eval).collect(),
+                    ),
+                ],
+            );
+        }
+
         let final_input_claim = Claim::new(sumcheck_point, input_eval);
 
         Ok(vec![final_input_claim])
@@ -799,50 +977,6 @@ impl LogitsCtx {
         );
         Ok(())
     }
-
-    fn build_lookup_input<E: ExtensionField>(
-        &self,
-        max_evals: &[E::BaseField],
-        input: Tensor<E>,
-        challenge_storage: &ChallengeStorage<E>,
-        unpadded_dim_size: usize,
-    ) -> anyhow::Result<LogUpInput<E>> {
-        let input_shape = input.shape();
-        let last_dim = input_shape.dim(input_shape.len() - 1);
-
-        let column_evals = input
-            .get_data()
-            .par_chunks(last_dim)
-            .zip(max_evals.par_iter())
-            .map(|(chunk, &max)| {
-                chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(i, val)| {
-                        if i < unpadded_dim_size {
-                            max - val.as_bases()[0]
-                        } else {
-                            E::BaseField::ZERO
-                        }
-                    })
-                    .collect::<Vec<E::BaseField>>()
-            })
-            .collect::<Vec<Vec<E::BaseField>>>();
-
-        let (constant_challenge, column_separation_challenge) = challenge_storage
-            .get_challenges_by_name(&self.lookup_ctx.tables[0].name())
-            .ok_or(anyhow!(
-                "No challenges found for Table Type: {}, cannot prove Logits ArgMax",
-                self.lookup_ctx.tables[0].name()
-            ))?;
-        LogUpInput::<E>::new_lookup(
-            vec![column_evals.concat()],
-            constant_challenge,
-            column_separation_challenge,
-            1,
-        )
-        .map_err(|e| anyhow!("{e:?}"))
-    }
 }
 
 #[cfg(test)]
@@ -851,12 +985,12 @@ mod test {
 
     use super::*;
     use crate::{
-        layers::{Layer, provable::Evaluate},
+        layers::{Layer, einsum::EinSum, provable::Evaluate},
         model::{
             Model,
             test::{prove_model, prove_model_with},
         },
-        tensor::Tensor,
+        tensor::{KeyedTensor, Tensor},
     };
     use proptest::prelude::*;
     use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -890,7 +1024,7 @@ mod test {
     #[test]
     fn test_logits_argmax() -> anyhow::Result<()> {
         let input = Tensor::new(vec![3, 2].into(), vec![0.0, 1.0, 3.0, 2.0, 4.0, 5.0]).unwrap();
-        let logits = Logits::Argmax;
+        let logits = Logits::Argmax(None);
 
         let out = logits.evaluate(&[&input.as_wrapped()])?;
         // first slice is [0,1] so argmax here is 1
@@ -908,7 +1042,7 @@ mod test {
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
 
         let _ = model
-            .add_consecutive_layer(Layer::Logits(Logits::Argmax), None)
+            .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), None)
             .unwrap();
 
         model.automatic_output_labelling().unwrap();
@@ -925,13 +1059,45 @@ mod test {
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
 
         let _ = model
-            .add_consecutive_layer(Layer::Logits(Logits::Argmax), None)
+            .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), None)
             .unwrap();
 
         model.automatic_output_labelling().unwrap();
         let inputs = Tensor::zeros(input_shape);
 
         prove_model_with(model, vec![inputs], &mut GenStore::default()).unwrap();
+    }
+
+    #[test]
+    fn test_proven_argmax_after_einsum() {
+        let seq_len = 13;
+        let vocab_size = 17;
+        let hidden_size = 23;
+
+        let input_shape = Shape::new(vec![seq_len, hidden_size]);
+
+        let einsum = Layer::EinSum(
+            EinSum::new_matmul(
+                None,
+                Some(KeyedTensor::new(
+                    "embedding_matrix",
+                    Tensor::random(&vec![hidden_size, vocab_size].into()),
+                )),
+                false,
+                None,
+            )
+            .unwrap()
+            .disable_requantisation(),
+        );
+        let mut model =
+            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
+        let einsum_id = model.add_consecutive_layer(einsum, None).unwrap();
+        let _ = model
+            .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), Some(einsum_id))
+            .unwrap();
+
+        model.automatic_output_labelling().unwrap();
+        prove_model(model, &mut GenStore::default()).unwrap();
     }
 
     #[test]
@@ -946,7 +1112,7 @@ mod test {
             }
         }
         let input = Tensor::new(vec![2, 3, 4].into(), data).unwrap();
-        let logits = Logits::Argmax;
+        let logits = Logits::Argmax(None);
         let out = logits.evaluate(&[&input.as_wrapped()])?;
         let indices = out.outputs()[0].get_data();
         assert_eq!(indices.len(), 6);
@@ -962,7 +1128,7 @@ mod test {
             //  rows = product of all leading dims (shape[..rank-1]).
             //  Each row has a unique argmax and the output tensor shape is [rows,1].
             let input = Tensor::new(shape.clone().into(), data).unwrap();
-            let logits = Logits::Argmax;
+            let logits = Logits::Argmax(None);
             let out = logits.evaluate(&[&input.as_wrapped()]).unwrap();
             let indices = out.outputs()[0].get_data();
             prop_assert_eq!(indices.len(), expected.len());
@@ -973,7 +1139,7 @@ mod test {
         fn prop_logits_argmax_element((shape, data, expected) in logits_input_strategy()) {
             let data_elem: Vec<Element> = data.into_iter().map(|v| v.round_ties_even() as Element).collect();
             let input = Tensor::new(shape.clone().into(), data_elem).unwrap();
-            let logits = Logits::Argmax;
+            let logits = Logits::Argmax(None);
 
             let out = logits.evaluate(&[&input.as_wrapped()]).unwrap();
             let indices = out.outputs()[0].get_data();

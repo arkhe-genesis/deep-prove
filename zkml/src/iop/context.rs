@@ -85,9 +85,7 @@ impl Model<Element> {
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
-        let mut max_poly_len = input_shapes
-            .iter()
-            .fold(0usize, |acc, shapes| acc.max(shapes.product()));
+        let mut max_poly_len = 1;
 
         // An accumulator used to carry information over while converting the graph
         let mut ctx_aux = ContextAux {

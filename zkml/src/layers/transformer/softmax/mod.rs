@@ -790,19 +790,18 @@ impl ProveInfo for Softmax<Element> {
             let instances_per_table = vec![number_of_range_checks, 1, number_zero_chunks, 1];
             let lookup_ctx = LayerLookupContext::new(tables, instances_per_table);
 
-            // There are no common commitments for this layer
-            aux.model_polys = None;
-            aux.max_poly_len = aux
-                .last_output_shape
-                .iter()
-                .fold(aux.max_poly_len, |acc, shapes| {
-                    acc.max(shapes.next_power_of_two().product())
-                });
             let shape = &aux.last_output_shape[0];
             ensure!(
                 shape.rank() == 2 || shape.rank() == 3,
                 "Softmax only supports 2D or 3D tensors"
             );
+
+            // There are no common commitments for this layer
+            aux.model_polys = None;
+            aux.max_poly_len = {
+                let shape_2d: Shape = shape[shape.len() - 2..].to_vec().into();
+                shape_2d.numel().next_power_of_two()
+            };
 
             // The output shape is the same as the input shape so we don't need to update it
             // return the LayerCtx and the updated ContextAux

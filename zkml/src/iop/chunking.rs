@@ -919,9 +919,9 @@ impl LLMChunkingStrategy {
 impl ChunkingStrategy for LLMChunkingStrategy {
     fn ideal_num_chunks<E: ExtensionField>(&self, model: &ModelCtx<E>) -> usize {
         // the ideal number of chunks is given by splitting the model at each `Add` node
-        // hence, the ideal number of chunks is `num_add_nodes + 1`
+        // hence, the ideal number of chunks is `num_add_nodes + 2`
         let num_add_nodes = self.add_nodes(model).count();
-        num_add_nodes + 1
+        num_add_nodes + 2
     }
 
     fn split<E: ExtensionField>(
@@ -929,22 +929,52 @@ impl ChunkingStrategy for LLMChunkingStrategy {
         model: &ModelCtx<E>,
         num_chunks: usize,
     ) -> anyhow::Result<Vec<ChunkedGraph>> {
-        // first, find add layers there are in the model
-        let add_nodes = self.add_nodes(model).collect::<HashSet<_>>();
-        let num_add_nodes = add_nodes.len();
-        // we check if there are enough `Add` nodes to create `num_chunks` chunks. Note that
-        // the number of chunks we can create at most is `num_add_nodes + 1`, because the `Add`
-        // nodes are the split points of the graph: thus, if there are `num_add_nodes` split
-        // points, we get `num_add_nodes + 1` chunks of the graph
-        if num_add_nodes + 1 >= num_chunks {
+        let num_ideal_chunks = self.ideal_num_chunks(model);
+        if num_ideal_chunks >= num_chunks {
+            // whether we create an extra chunk at the end of the LLM for Argmax and final projection,
+            // which are computationally intensive and so it is beneficial to have a standalone chunk for
+            // them
+            let num_extra_chunks = if num_chunks >= 2 { 1 } else { 0 };
+            let mut subgraphs = vec![ChunkedGraph::new(); num_chunks];
+            let mut nodes_map = HashMap::new();
+            let mut nodes_iter = model
+                .nodes
+                .backward_iter()
+                .filter(|(_, node)| node.is_inner());
+            let first_add_chunk = if num_extra_chunks > 0 {
+                // the first chunk is given by Logits and previous EinSum node
+                let mut next_node = |node_type: String| {
+                    let (node_id, node) = nodes_iter.next().expect("No node found in LLM model?");
+                    ensure!(
+                        node.as_inner().expect("It's an inner node").variant_name() == node_type,
+                        "Last node of LLM is not {node_type}"
+                    );
+                    subgraphs[0].add_node_with_id(node_id, Node::Inner(()))?;
+                    Ok(node_id)
+                };
+                nodes_map.insert(next_node("Logits".to_string())?, 0);
+                nodes_map.insert(next_node("EinSum".to_string())?, 0);
+                1
+            } else {
+                0
+            };
+
+            // first, find add layers there are in the model
+            let add_nodes = self.add_nodes(model).collect::<HashSet<_>>();
+            let num_add_nodes = add_nodes.len();
+            let num_add_chunks = num_chunks - num_extra_chunks;
+            // we check if there are enough `Add` nodes to create `num_add_chunks` chunks. Note that
+            // the number of chunks we can create at most is `num_add_nodes + 1`, because the `Add`
+            // nodes are the split points of the graph: thus, if there are `num_add_nodes` split
+            // points, we get `num_add_nodes + 1` chunks of the graph
+            ensure!(num_add_nodes + 1 >= num_add_chunks);
             // there are enough add nodes to create chunks, so we split the graph at each add node,
             // up until num_chunks are created
             debug!("Chunking an LLM with {num_add_nodes} Add nodes in {num_chunks} chunks");
-            // `num_chunks` might be smaller than `num_add_nodes`. To get at most `num_chunks`, we
+            // `num_add_chunks` might be smaller than `num_add_nodes`. To get at most `num_add_chunks`, we
             // split the graph after every `add_nodes_per_chunk` `Add` nodes found, where
-            // `add_nodes_per_chunk = ceil((num_add_nodes +1)/num_chunks)`
-            let add_nodes_per_chunk = (num_add_nodes + num_chunks) / num_chunks;
-            let mut subgraphs = vec![ChunkedGraph::new(); num_chunks];
+            // `add_nodes_per_chunk = (num_add_nodes +1)/num_add_chunks`
+            let add_nodes_per_chunk = (num_add_nodes + 1) / num_add_chunks;
 
             // we sweep over nodes to split the into subgraphs; the node where there is a partition between chunks
             // is the add node, because this should guarantee that the source
@@ -954,21 +984,17 @@ impl ChunkingStrategy for LLMChunkingStrategy {
             // source node of the next `Add` node will alwayes end up in the same chunk.
             // While partitioning the nodes in chunks, we also compute a map that determines the chunk where a
             // given node is placed in
-            let nodes_map = model
-                .nodes
-                .backward_iter()
-                .filter(|(_, node)| node.is_inner())
-                .scan(0, |add_nodes_found, (node_id, _)| {
-                    let chunk = *add_nodes_found / add_nodes_per_chunk;
-                    let res = subgraphs[chunk]
-                        .add_node_with_id(node_id, Node::Inner(()))
-                        .map(|_| (node_id, chunk));
-                    if add_nodes.contains(&node_id) {
-                        *add_nodes_found += 1;
-                    }
-                    Some(res)
-                })
-                .collect::<anyhow::Result<HashMap<_, _>>>()?;
+            nodes_iter.try_fold(0, |mut add_nodes_found, (node_id, _)| {
+                let chunk = add_nodes_found / add_nodes_per_chunk + first_add_chunk;
+                // ensure that chunk is at most num_chunks - 1
+                let chunk = chunk.min(num_chunks - 1);
+                subgraphs[chunk].add_node_with_id(node_id, Node::Inner(()))?;
+                nodes_map.insert(node_id, chunk);
+                if add_nodes.contains(&node_id) {
+                    add_nodes_found += 1;
+                }
+                anyhow::Ok(add_nodes_found)
+            })?;
 
             // we check that the source nodes of each `Add` node end up in the same chunk
             add_nodes.iter().try_for_each(|add_node_id| {

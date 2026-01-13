@@ -9,6 +9,7 @@
 /// - Nodes can be indexed by a custom type. This allows backwards compatibility with other graph implementations
 ///   like `petgraph` or `onnx`.
 use anyhow::{Context, anyhow, ensure};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -673,6 +674,23 @@ impl<N, I, O, W> Graph<N, I, O, W> {
         self.edges
             .remove(edge_id)
             .ok_or(anyhow!("Edge with id {edge_id:?} not found"))?;
+        Ok(())
+    }
+
+    pub fn remove_node(&mut self, node_id: NodeId) -> anyhow::Result<()> {
+        // remove edges
+        let to_be_removed_edges = self
+            .incomings(node_id)
+            .chain(self.outgoings(node_id))
+            .map(|(&edge_id, _)| edge_id)
+            .collect_vec();
+
+        for edge in to_be_removed_edges {
+            self.remove_edge(&edge)?
+        }
+
+        self.nodes.remove(&node_id);
+
         Ok(())
     }
 

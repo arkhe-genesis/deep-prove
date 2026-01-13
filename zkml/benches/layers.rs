@@ -367,7 +367,7 @@ mod logits_layer {
 
         let input = WrappedTensor::<Element>::random(&shape);
 
-        let layer = Logits::Argmax;
+        let layer = Logits::new_argmax();
 
         // warm up
         let out = layer.evaluate(&[&input]).expect("Logits should succeed");
@@ -387,7 +387,7 @@ mod logits_layer {
 
         let input = WrappedTensor::<f32>::random(&shape);
 
-        let layer = Logits::Argmax;
+        let layer = Logits::new_argmax();
 
         // warm up
         let out = layer.evaluate(&[&input]).expect("Logits should succeed");
@@ -418,7 +418,7 @@ mod logits_layer {
 
         let input = WrappedTensor::<Element>::random(&shape);
 
-        let layer = Logits::Argmax;
+        let layer = Logits::new_argmax();
 
         // warm up
         let out = layer
@@ -440,7 +440,7 @@ mod logits_layer {
 
         let input = WrappedTensor::<f32>::random(&shape);
 
-        let layer = Logits::Argmax;
+        let layer = Logits::new_argmax();
 
         // warm up
         let out = layer

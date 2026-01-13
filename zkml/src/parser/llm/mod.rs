@@ -140,9 +140,12 @@ impl<T: LayerInsertion> LLMModel<T> {
         last_node_id = Some(model.add_consecutive_layer(self.final_norm.to_layer(), last_node_id)?);
 
         last_node_id =
-            Some(model.add_consecutive_layer(Layer::EinSum(self.final_proj), last_node_id)?);
+            Some(model.add_consecutive_layer(
+                Layer::EinSum(
+                    self.final_proj.disable_requantisation() // we can skip requantisation here since we can handle bigger values in Argmax
+                ), last_node_id)?);
 
-        model.add_consecutive_layer(Layer::Logits(Logits::Argmax), last_node_id)?;
+        model.add_consecutive_layer(Layer::Logits(Logits::new_argmax()), last_node_id)?;
         model.automatic_output_labelling()?;
         Ok(model)
     }
