@@ -1454,7 +1454,7 @@ pub(crate) mod test {
     const SELECTOR_POOLING: usize = 2;
     const MOD_SELECTOR: usize = 2;
 
-    type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs<F>>;
+    pub type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs<F>>;
 
     impl Model<Element> {
         pub fn random(num_dense_layers: usize) -> Result<(Self, Vec<Tensor<Element>>)> {

@@ -559,13 +559,73 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
 #[cfg(test)]
 mod tests {
     use tenstore::GenStore;
+    use transcript::BasicTranscript;
 
     use crate::{
         layers::Layer,
-        model::{Model, test::prove_model},
+        model::{
+            Model,
+            test::{F, P, prove_model, quantize_model},
+        },
+        padding::pad_model,
+        testing::Pcs,
     };
 
+    type T = BasicTranscript<F>;
     use super::*;
+    use crate::verify;
+
+    #[test]
+    fn test_einsum_larger_context() -> anyhow::Result<()> {
+        let [a, b, c] = [3, 16, 32];
+        let max_stack = 8;
+        let runtime_stack = 4;
+        let mut model = Model::new_from_input_shapes(
+            vec![vec![max_stack, a, b].into()],
+            PaddingMode::NoPadding,
+        );
+        let weight = KeyedTensor::new("weight", Tensor::random(&vec![b, c].into()));
+        let einsum = EinSum::new(
+            "A(ijk)@B(kl)->C(ijl)".to_string(),
+            vec![Some(weight)],
+            vec![None],
+        )
+        .unwrap();
+        let _ = model
+            .add_consecutive_layer(Layer::EinSum(einsum), None)
+            .unwrap();
+        model.automatic_output_labelling().unwrap();
+        model.describe();
+        // that _should_ work since it is a smaller stack than the model
+        let float_inputs = vec![Tensor::random(&vec![runtime_stack, a, b].into())];
+
+        let mut store = GenStore::default();
+        let (quantized_model, quantized_inputs) =
+            quantize_model(model, float_inputs, None, &mut store)?;
+        let mut padded_model = pad_model(quantized_model)?;
+
+        padded_model.set_shapes(
+            quantized_inputs
+                .iter()
+                .map(|t| t.shape().next_power_of_two())
+                .collect(),
+            quantized_inputs.iter().map(|t| t.shape().clone()).collect(),
+        );
+        let input_tensors = padded_model
+            .prepare_inputs(quantized_inputs.clone())
+            .unwrap();
+        let trace = padded_model.run(input_tensors, &mut store)?;
+        let io = trace.to_verifier_io().unwrap();
+        let (prover_ctx, verifier_ctx) = padded_model
+            .generate_contexts::<F, Pcs<F>>()
+            .expect("Unable to generate contexts");
+
+        let proof = P::prove(&prover_ctx, trace, &padded_model).expect("unable to generate proof");
+
+        verify::<_, T, _>(&verifier_ctx, proof, io)?;
+        // prove_model(model, &mut GenStore::default()).unwrap();
+        Ok(())
+    }
 
     #[test]
     fn test_einsum_proving_with_bias_and_transpose() {

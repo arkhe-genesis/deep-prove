@@ -36,8 +36,6 @@ where
     pub commitment_ctx: CommitmentProverCtx<E, PCS>,
     /// Context holding all the different table types we use in lookups
     pub lookup: LookupContext,
-    /// unpadded shape of the first initial input
-    pub unpadded_input_shapes: Vec<Shape>,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProverContext<E, PCS>
@@ -69,8 +67,6 @@ pub struct VerifierContext<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>
     pub commitment_ctx: CommitmentVerifierCtx<E, PCS>,
     /// Context holding all the different table types we use in lookups
     pub lookup: LookupContext,
-    /// unpadded shape of the first initial input
-    pub unpadded_input_shapes: Vec<Shape>,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifierContext<E, PCS> {
@@ -202,14 +198,12 @@ impl Model<Element> {
             model_ctx: step_info.clone(),
             commitment_ctx: prover_ctx,
             lookup: lookup.clone(),
-            unpadded_input_shapes: self.unpadded_input_shapes(),
         };
 
         let verifier_ctx = VerifierContext {
             model: step_info,
             commitment_ctx: verifier_ctx,
             lookup,
-            unpadded_input_shapes: self.unpadded_input_shapes(),
         };
 
         Ok((prover_ctx, verifier_ctx))
@@ -243,14 +237,12 @@ impl Model<Element> {
             model_ctx: steps_info.clone(),
             commitment_ctx: commit_prover_ctx,
             lookup: lookup.clone(),
-            unpadded_input_shapes: self.unpadded_input_shapes(),
         };
 
         let verifier_context = VerifierContext {
             model: steps_info,
             commitment_ctx: commit_verifier_ctx,
             lookup,
-            unpadded_input_shapes: self.unpadded_input_shapes(),
         };
         Ok((prover_context, verifier_context))
     }

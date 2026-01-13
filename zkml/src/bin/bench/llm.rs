@@ -1,6 +1,7 @@
 use anyhow::bail;
 use clap::{ArgGroup, Parser, ValueEnum, builder::ArgPredicate};
 use ff_ext::GoldilocksExt2;
+use libc::{RUSAGE_SELF, getrusage, rusage};
 use mpcs::{Basefold, BasefoldRSParams};
 use tenstore::GenStore;
 use timed_core::Output;
@@ -183,10 +184,8 @@ fn main() -> anyhow::Result<()> {
         .with(HEADER_NUM_THREADS, &num_threads.to_string());
     let (mut driver, _metadata) =
         premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
-    let (prover_ctx, verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
+    let (prover_ctx, mut verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
         premeasure.r(HEADER_CONTEXT_GENERATION, || driver.context())?;
-
-    let verifier_ctx = verifier_ctx.with_max_context(max_context);
 
     for (user_prompt, max_ctx) in sequence {
         // make a new measure for each trial, but always keep the initial measurements for each sample
@@ -206,12 +205,19 @@ fn main() -> anyhow::Result<()> {
             distributed::run_distributed(trace, &driver, &prover_ctx)?
         } else {
             let io = trace.to_verifier_io()?;
+            let peak_rss = peak_rss_bytes();
             let proof = driver.prove(&prover_ctx, trace)?;
+            let new_peak_rss = peak_rss_bytes();
+            measure::set(
+                "prove_full_memory_peak",
+                ((new_peak_rss - peak_rss) / 1024 / 1024).to_string(),
+            );
             (proof, io)
         };
 
         let proof_size = rmp_serde::to_vec(&proof)?.len();
         measure::set(HEADER_PROOF_SIZE, proof_size);
+        verifier_ctx = verifier_ctx.with_max_context(max_ctx);
         verifier_ctx
             .verify(proof, user_tokens, io)
             .expect("invalid proof");
@@ -232,6 +238,23 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn peak_rss_bytes() -> u64 {
+    unsafe {
+        let mut r: rusage = std::mem::zeroed();
+        getrusage(RUSAGE_SELF, &mut r);
+
+        #[cfg(target_os = "linux")]
+        {
+            (r.ru_maxrss as u64) * 1024
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+        {
+            r.ru_maxrss as u64
+        }
+    }
 }
 
 mod distributed {
@@ -371,11 +394,19 @@ mod distributed {
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
 
         let mut final_outputs = Vec::new();
+        let mut max_peak_rss = 0;
         while !schedulers.is_empty() {
+            let peak_rss = peak_rss_bytes();
             if let Some(final_output) = run_next_partition(&mut schedulers)? {
                 final_outputs.push(final_output.output)
             };
+            let new_peak_rss = peak_rss_bytes();
+            max_peak_rss = max_peak_rss.max(new_peak_rss - peak_rss);
         }
+        measure::set(
+            "prove_full_memory_peak",
+            (max_peak_rss / 1024 / 1024).to_string(),
+        );
 
         // Creates channels pairs to communicate with all other nodes
         ensure!(

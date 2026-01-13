@@ -283,7 +283,7 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
                                         shape_step,
                                     )
                                     .with_context(|| format!(
-                                        "Verification failed for node with ID {node_id}"
+                                        "Verification failed for node with ID {node_id}: {}",layer.describe()
                                     ))?
                             } else {
                                 // we only propagate the claims, without
@@ -445,7 +445,10 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
         let verifier = Verifier::<'_, E, T, PCS>::new(&mut transcript, io);
 
         let shape_steps = ctx.model.shape_steps(
-            &ctx.unpadded_input_shapes,
+            &io.input
+                .iter()
+                .map(|t| t.unpadded_shape().clone())
+                .collect_vec(),
             &verifier
                 .io
                 .input

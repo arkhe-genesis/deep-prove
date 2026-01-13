@@ -256,7 +256,10 @@ impl Measure {
             let mut reader = std::io::BufReader::new(File::open(fname).unwrap()).lines();
             let header_line = reader.next().unwrap()?;
             let header = header_line.split(",").collect::<Vec<&str>>();
-            ensure!(header == self.data.keys().collect::<Vec<&String>>());
+            ensure!(
+                header == self.data.keys().collect::<Vec<&String>>(),
+                "Header mismatch in {fname}"
+            );
         }
         // iterate over all columns in order and write the values
         writer.write_record(self.data.values().map(|v| v.to_string()))?;

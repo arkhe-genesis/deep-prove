@@ -104,6 +104,7 @@ utils = { path = "../utils" }
 telemetry = { package = "telemetry", path = "../telemetry", optional = true }
 witness = { workspace = true }
 num_cpus = "1.17.0"
+libc = "0.2.180"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, features = [
