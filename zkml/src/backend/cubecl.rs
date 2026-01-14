@@ -167,7 +167,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
         // Because of the rounding done by div_ceil, it is possible for the kernel to be
         // called a few extra times. This is okay because the kernel handles out-of-bounds
         // calls.
-        let cube_dim = CubeDim::default();
+        let cube_dim = CubeDim::new(&input.client, output.shape.num_elements());
         let cube_count = fit_to_cube(
             (output.shape.num_elements() as u32).div_ceil(cube_dim.num_elems()),
             R::max_cube_count(),
@@ -241,7 +241,7 @@ impl<R: CubeRuntime, F: FloatElement, I: IntElement, BT: BoolElement> ZKMLBacken
         // Because of the rounding done by div_ceil, it is possible for the kernel to be
         // called a few extra times. This is okay because the kernel handles out-of-bounds
         // calls.
-        let cube_dim = CubeDim::default();
+        let cube_dim = CubeDim::new(&input.client, output.shape.num_elements());
         let cube_count = fit_to_cube(
             (output.shape.num_elements() as u32).div_ceil(cube_dim.num_elems()),
             R::max_cube_count(),

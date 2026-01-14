@@ -850,9 +850,9 @@ where
     }
 
     /// Returns a tensor containing the elements selected from the given ranges.
-    pub fn slice<const D2: usize, R: Clone + SliceArg<D2>>(self, ranges: R) -> Self {
-        fn to_shape<const D2: usize, R: SliceArg<D2>>(shape: &BShape, ranges: R) -> BShape {
-            let slices = ranges.into_slices(shape.clone());
+    pub fn slice<R: Clone + SliceArg>(self, ranges: R) -> Self {
+        fn to_shape<R: SliceArg>(shape: &BShape, ranges: R) -> BShape {
+            let slices = ranges.into_slices(shape);
             let dims: Vec<usize> = slices
                 .iter()
                 .enumerate()
@@ -1327,7 +1327,7 @@ impl WrappedTensor<f32> {
             bail!("Unexpected input rank: {input_rank}, expected 4.")
         };
         let result =
-            burn::tensor::module::max_pool2d(tensor, kernel_size, stride, padding, dilation);
+            burn::tensor::module::max_pool2d(tensor, kernel_size, stride, padding, dilation, false);
         Ok(WrappedTensor::Rank4 {
             tensor: result,
             unpadded_shape,
@@ -1364,7 +1364,7 @@ impl WrappedTensor<f32> {
         let device = Default::default();
         let mut norm = config.init(&device);
         norm.gamma = Param::from_tensor(gamma);
-        norm.beta = Param::from_tensor(beta);
+        norm.beta = Some(Param::from_tensor(beta));
         let output = norm.forward(input);
         Ok(Self::Rank2 {
             tensor: output,

@@ -47,10 +47,10 @@ ahash = "0.8.12"
 anyhow.workspace = true
 ark-std.workspace = true
 average = { version = "0.16.0", features = ["std"] }
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false }
-burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, optional = true }
-burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, optional = true }
-burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", optional = true, default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "c071730459a135b4d06ad0e14c8a0e5771e5ba58", default-features = false }
+burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "c071730459a135b4d06ad0e14c8a0e5771e5ba58", default-features = false, optional = true }
+burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "c071730459a135b4d06ad0e14c8a0e5771e5ba58", default-features = false, optional = true }
+burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "c071730459a135b4d06ad0e14c8a0e5771e5ba58", optional = true, default-features = false, features = [
   "std",
   "multi-threads",
 ] }
@@ -59,7 +59,7 @@ ceno-p3 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 crossbeam-channel = "0.5.15"
 csv.workspace = true
-cubecl = { git = "https://github.com/tracel-ai/cubecl.git", rev = "f917032aff039603aebec234333fe3dab44649ed", optional = true }
+cubecl = { git = "https://github.com/tracel-ai/cubecl.git", rev = "7cd8e9c869d363edcbf989fd905eb4b28df938ab", optional = true }
 derive_more = { workspace = true, features = ["full"] }
 either = { workspace = true }
 ff_ext = { workspace = true }
@@ -107,11 +107,11 @@ num_cpus = "1.17.0"
 libc = "0.2.180"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "c071730459a135b4d06ad0e14c8a0e5771e5ba58", default-features = false, features = [
   "metal",
 ] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-burn = { git = "https://github.com/tracel-ai/burn.git", rev = "e2333e037315b2964ccd4d22d75018e83ce83099", default-features = false, features = [
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "c071730459a135b4d06ad0e14c8a0e5771e5ba58", default-features = false, features = [
   "vulkan",
 ] }
 

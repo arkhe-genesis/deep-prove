@@ -9,7 +9,7 @@ pub fn zkml_max_pool2d_i_kernel<I: Int>(
     input: &Tensor<I>,
     input_strides: Sequence<u32>,
     output: &mut Tensor<I>,
-    output_shape: Sequence<FastDivmod>,
+    output_shape: Sequence<FastDivmod<u32>>,
     #[comptime] kernel_size: u32,
     #[comptime] output_stride: u32,
 ) {
@@ -19,9 +19,9 @@ pub fn zkml_max_pool2d_i_kernel<I: Int>(
     }
 
     // decode the output position
-    let (batch, rem) = output_shape.index(3).div_mod(ABSOLUTE_POS);
-    let (channel, rem) = output_shape.index(2).div_mod(rem);
-    let (oh, ow) = output_shape.index(1).div_mod(rem);
+    let (batch, rem) = output_shape.index(3_usize).div_mod(ABSOLUTE_POS as u32);
+    let (channel, rem) = output_shape.index(2_usize).div_mod(rem);
+    let (oh, ow) = output_shape.index(1_usize).div_mod(rem);
 
     let (oh_stride, ow_stride) = (oh * output_stride, ow * output_stride);
 
@@ -34,12 +34,12 @@ pub fn zkml_max_pool2d_i_kernel<I: Int>(
             let w = ow_stride + kw;
 
             // compute the input position
-            let mut pos = batch * input_strides.index(3);
-            pos += channel * input_strides.index(2);
-            pos += h * input_strides.index(1);
+            let mut pos = batch * input_strides.index(3_usize);
+            pos += channel * input_strides.index(2_usize);
+            pos += h * input_strides.index(1_usize);
             pos += w;
 
-            max = I::max(max, input[pos]);
+            max = I::max(max, input[pos as usize]);
         }
     }
 
