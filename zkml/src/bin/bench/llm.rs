@@ -208,10 +208,17 @@ fn main() -> anyhow::Result<()> {
             let peak_rss = peak_rss_bytes();
             let proof = driver.prove(&prover_ctx, trace)?;
             let new_peak_rss = peak_rss_bytes();
-            measure::set(
-                "prove_full_memory_peak",
-                ((new_peak_rss - peak_rss) / 1024 / 1024).to_string(),
-            );
+            if new_peak_rss > peak_rss {
+                // new_peak_rss is the peak memory consumption during proving
+                measure::set(
+                    "prove_full_memory_peak",
+                    (new_peak_rss / 1024 / 1024).to_string(),
+                );
+            } else {
+                // cannot reliably measure peak memory consumption
+                measure::set("prove_full_memory_peak", "NaN".to_string());
+            }
+
             (proof, io)
         };
 
