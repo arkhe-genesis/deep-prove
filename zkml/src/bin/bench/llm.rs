@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
 
     let args = LLMArgs::parse();
 
-    // either its spceified and if 0 it's the physical cores otherwise what is speciied but no more than the logical cores
+    // either its spceified and if 0 it's the physical cores otherwise what is specified but no more than the logical cores
     let num_threads = if let Some(nt) = args.num_threads {
         if nt == 0 {
             num_cpus::get_physical()

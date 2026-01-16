@@ -58,7 +58,7 @@
 
 - Convert `DryTensor` to use `KeyTensor` ([62d0675](https://github.com/Lagrange-Labs/deep-prove-private/commit/62d0675a1e93c82d4b2003a8b246f45387280c3f))
 
-- Homogeneize graph traversal ([30db79a](https://github.com/Lagrange-Labs/deep-prove-private/commit/30db79af34b4cbc813965d17168df830a393ccdb))
+- Homogenize graph traversal ([30db79a](https://github.com/Lagrange-Labs/deep-prove-private/commit/30db79af34b4cbc813965d17168df830a393ccdb))
 
 - Store padded unpadded shapes in tensor ([3f0eff7](https://github.com/Lagrange-Labs/deep-prove-private/commit/3f0eff71c6e81c38d818f4d9fbc1f2910d3b6620))
 
@@ -249,7 +249,7 @@
 
 - Add temp file cache for S3 data ([8ae76db](https://github.com/Lagrange-Labs/deep-prove-private/commit/8ae76db8c4bde29584e36b02b750058f8bc4b849))
 
-- Util to conver iterator to base field elements ([84f5463](https://github.com/Lagrange-Labs/deep-prove-private/commit/84f5463ea6b059b03c9aca008ee3fa33b2d7fa67))
+- Util to convert iterator to base field elements ([84f5463](https://github.com/Lagrange-Labs/deep-prove-private/commit/84f5463ea6b059b03c9aca008ee3fa33b2d7fa67))
 
 - Integrate the DP GW-specific HTTP API cli ([0669ba8](https://github.com/Lagrange-Labs/deep-prove-private/commit/0669ba80482c0fcc4a01ad29445ba8c698e0b4f2))
 

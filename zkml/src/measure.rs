@@ -8,7 +8,7 @@
 //! be the same as the ones in the first row.
 //! If you need to make _multiple_ times the same measurement (e.g. have multiple lines per row), don't forget
 //! to use a new `[Measure]` object.
-//! To use it accross a global codebase without passing the metrics object around, you can use the `set_global_metrics` function.
+//! To use it across a global codebase without passing the metrics object around, you can use the `set_global_metrics` function.
 //! ```rust
 //! use zkml::measure::Measure;
 //!

@@ -112,7 +112,7 @@ struct TensorDimInfo {
     /// NOTE:
     /// - For inputs these may not be empty. An empty dimension would either
     ///   mean the input is empty, or a mistake was made, the later is more
-    ///   likely (since empty inputs are not useful), and thefore assumed
+    ///   likely (since empty inputs are not useful), and therefore assumed
     /// - Outputs may be empty. This will perform an summation on all the inputs
     dims: Vec<char>,
 }
@@ -906,7 +906,7 @@ fn parse_input_expr((index, term): (usize, &str)) -> Result<TensorDimInfo> {
     Ok(TensorDimInfo::new(index, dimensions))
 }
 
-/// Parses the output expresions of an equation.
+/// Parses the output expressions of an equation.
 ///
 /// The output may be a single term, e.g. `O(i)`, or an expression `O(i)+BIAS(i)`.
 ///

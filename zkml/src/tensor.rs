@@ -610,7 +610,7 @@ where
     pub fn tensor(&self) -> Result<MappedRwLockReadGuard<'_, Tensor<T>>> {
         match self {
             TensorHandle::WrappedTensor { .. } => {
-                bail!("Tensor is unavaiable for a wrapped tensor handler")
+                bail!("Tensor is unavailable for a wrapped tensor handler")
             }
             TensorHandle::Tensor { tensor, .. } => loop {
                 {
@@ -657,7 +657,7 @@ where
                 }
             },
             TensorHandle::Tensor { .. } => {
-                bail!("Wrapped tensor is unavaiable for a tensor handler")
+                bail!("Wrapped tensor is unavailable for a tensor handler")
             }
         }
     }

@@ -49,7 +49,7 @@ repos:
     name: cargo clippy
     description: "Run cargo clippy lint tool"
     stages: ["pre-commit", "pre-push"]
-    entry: "CUDARC_CUDA_VERSION=13000 cargo clippy --workspace --all-targets --all-features -- -D warnings"
+    entry: "env CUDARC_CUDA_VERSION=13000 cargo clippy --workspace --all-targets --all-features -- -D warnings"
     language: system
     'types': [file, rust]
     require_serial: true
