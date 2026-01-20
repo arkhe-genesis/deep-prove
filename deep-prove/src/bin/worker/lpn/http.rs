@@ -63,6 +63,13 @@ struct ConnContext {
     address: String,
     max_job_size: u64,
 }
+
+/// Job response data from the gateway.
+struct JobResponse {
+    body: String,
+    traceparent: Option<String>,
+}
+
 impl ConnContext {
     fn new(gw_url: Url, worker_name: String, address: String, max_job_size: u64) -> Self {
         let address = address.trim_start_matches("0x").to_string();
@@ -74,12 +81,13 @@ impl ConnContext {
         }
     }
 
-    /// Request a new job from the gateway, returning the raw response body.
+    /// Request a new job from the gateway, returning the raw response body
+    /// and any trace headers attached by the gateway.
     ///
     ///  - Will fail if the connection settings are not valid.
     ///  - Will fail after retries if the connection can not be established.
-    fn request_job(&self) -> anyhow::Result<String> {
-        ureq::get(
+    fn request_job(&self) -> anyhow::Result<JobResponse> {
+        let response = ureq::get(
             self.gw_url
                 .join(&format!("api/v1/jobs/{}", self.worker_name))
                 .unwrap()
@@ -87,12 +95,22 @@ impl ConnContext {
         )
         .header("authorization", &self.address)
         .call()
-        .context("connecting to gateway")?
-        .into_body()
-        .into_with_config()
-        .limit(self.max_job_size)
-        .read_to_string()
-        .context("reading response body")
+        .context("connecting to gateway")?;
+
+        let traceparent = response
+            .headers()
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        let body = response
+            .into_body()
+            .into_with_config()
+            .limit(self.max_job_size)
+            .read_to_string()
+            .context("reading response body")?;
+
+        Ok(JobResponse { body, traceparent })
     }
 
     /// Confirm to the GW that we successfully received the job.
@@ -102,12 +120,12 @@ impl ConnContext {
     fn ack_job(&self, job_id: i64) -> anyhow::Result<()> {
         retry_operation(
             || {
-                ureq::get(
+                telemetry::inject_trace_headers(ureq::get(
                     self.gw_url
                         .join(&format!("/api/v1/jobs/{}/{job_id}/ack", self.worker_name))
                         .unwrap()
                         .as_str(),
-                )
+                ))
                 .header("authorization", &self.address)
                 .call()
             },
@@ -129,12 +147,12 @@ impl ConnContext {
         );
         retry_operation(
             || {
-                ureq::put(
+                telemetry::inject_trace_headers(ureq::put(
                     self.gw_url
                         .join(&format!("/api/v1/jobs/{}/{job_id}/proof", self.worker_name))
                         .unwrap()
                         .as_str(),
-                )
+                ))
                 .header("authorization", &self.address)
                 .send_json(json!({
                     "proof": BASE64_STANDARD.encode(proof),
@@ -153,12 +171,12 @@ impl ConnContext {
     fn submit_error(&self, job_id: i64, err_msg: &str) -> anyhow::Result<()> {
         retry_operation(
             || {
-                ureq::put(
+                telemetry::inject_trace_headers(ureq::put(
                     self.gw_url
                         .join(&format!("/api/v1/jobs/{}/{job_id}/error", self.worker_name))
                         .unwrap()
                         .as_str(),
-                )
+                ))
                 .header("authorization", &self.address)
                 .send_json(json!({
                     "error": err_msg,
@@ -254,13 +272,14 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     loop {
         // 1. Request job from the GW
         debug!("waiting for task from gateway");
-        let body = match conn.request_job() {
+        let response = match conn.request_job() {
             Ok(body) => body,
             Err(e) => {
                 error!("failed to fetch job from gateway: {e:?}");
                 continue;
             }
         };
+        let JobResponse { body, traceparent } = response;
 
         // 2. Parse the job, handling deserialization errors gracefully
         let job = match serde_json::from_str::<v2::GwToWorker>(&body) {
@@ -286,6 +305,13 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
         };
 
         let job_id = job.job_id;
+        let job_span = info_span!("gw_job", proof_id = job_id);
+        let trace_headers: Vec<_> = traceparent
+            .iter()
+            .map(|v| ("traceparent".to_string(), v.clone()))
+            .collect();
+        telemetry::set_parent_from_headers(&job_span, &trace_headers);
+        let _entered = job_span.enter();
         info!("received job #{job_id} to execute");
 
         // 3. ACK job

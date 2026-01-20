@@ -4,15 +4,12 @@ pub use disabled::*;
 #[cfg(not(feature = "otel"))]
 mod disabled {
     use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, layer::SubscriberExt, registry};
+    use ureq::RequestBuilder;
 
-    pub type OtelLayer = ();
     #[derive(Clone, Copy)]
     pub struct OtelGuard;
-    pub fn init_otel_layer(_service_name: &str) -> Option<(OtelLayer, OtelGuard)> {
-        None
-    }
-    pub fn setup_logging(service_name: &str, json: bool) -> Option<OtelGuard> {
-        let _ = service_name;
+
+    pub fn setup_logging(_service_name: &str, json: bool) -> Option<OtelGuard> {
         let filter = EnvFilter::builder()
             .with_default_directive(LevelFilter::INFO.into())
             .from_env_lossy();
@@ -46,8 +43,12 @@ mod disabled {
 
         None
     }
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct OtelLogFormatter;
+
+    pub fn inject_trace_headers<T>(req: RequestBuilder<T>) -> RequestBuilder<T> {
+        req
+    }
+
+    pub fn set_parent_from_headers(_span: &tracing::Span, _headers: &[(String, String)]) {}
 }
 
 #[cfg(feature = "otel")]
@@ -58,13 +59,15 @@ mod enabled {
     use std::{env, time::Duration};
 
     use opentelemetry::{
-        KeyValue,
-        global::set_tracer_provider,
+        Context, KeyValue,
+        global::{get_text_map_propagator, set_text_map_propagator, set_tracer_provider},
+        propagation::{Extractor, Injector},
         trace::{TraceContextExt, TracerProvider as _},
     };
     use opentelemetry_otlp::{self, Protocol, SpanExporter, WithExportConfig, WithHttpConfig};
     use opentelemetry_sdk::{
         Resource, runtime,
+        propagation::TraceContextPropagator,
         trace::{
             SdkTracer, SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor,
         },
@@ -76,9 +79,12 @@ mod enabled {
     use tracing_subscriber::{
         EnvFilter, Layer, Registry, filter::LevelFilter, fmt, layer::SubscriberExt, registry,
     };
+    use ureq::RequestBuilder;
 
-    pub type OtelLayer = OpenTelemetryLayer<Registry, SdkTracer>;
-    pub struct OtelGuard(pub SdkTracerProvider);
+    type OtelLayer = OpenTelemetryLayer<Registry, SdkTracer>;
+
+    /// Guard that keeps the tracer provider alive and shuts it down on drop.
+    pub struct OtelGuard(SdkTracerProvider);
 
     impl Drop for OtelGuard {
         fn drop(&mut self) {
@@ -87,9 +93,12 @@ mod enabled {
     }
 
     /// Initialize OTEL layer if `OTEL_EXPORTER_OTLP_ENDPOINT` is set otherwise returns `None`.
-    pub fn init_otel_layer(service_name: &str) -> Option<(OtelLayer, OtelGuard)> {
+    fn init_otel_layer(service_name: &str) -> Option<(OtelLayer, OtelGuard)> {
         let endpoint = match env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-            Ok(s) if !s.is_empty() => s,
+            Ok(s) if !s.is_empty() => reqwest::Url::parse(&s)
+                .and_then(|url| url.join("/v1/traces"))
+                .ok()?
+                .to_string(),
             _ => {
                 eprintln!("OTEL tracing disabled (no OTEL_EXPORTER_OTLP_ENDPOINT set)");
                 return None;
@@ -132,6 +141,7 @@ mod enabled {
             .build();
 
         set_tracer_provider(provider.clone());
+        set_text_map_propagator(TraceContextPropagator::new());
         let tracer = provider.tracer("telemetry");
         let otel_layer = layer().with_tracer(tracer);
         let guard = OtelGuard(provider);
@@ -187,9 +197,74 @@ mod enabled {
         None
     }
 
+    /// Inject current context into a carrier (HTTP headers, etc).
+    fn inject_context(ctx: &Context, carrier: &mut impl Injector) {
+        get_text_map_propagator(|prop| prop.inject_context(ctx, carrier));
+    }
+
+    /// Extract context from a carrier (HTTP headers, etc).
+    fn extract_context(carrier: &impl Extractor) -> Option<Context> {
+        let ctx = get_text_map_propagator(|prop| prop.extract(carrier));
+        if ctx.span().span_context().is_valid() {
+            Some(ctx)
+        } else {
+            None
+        }
+    }
+
+    /// Returns headers carrying the current tracing context (traceparent/baggage).
+    /// Empty when no valid span is present.
+    fn current_trace_headers() -> Vec<(String, String)> {
+        struct Collector<'a>(&'a mut Vec<(String, String)>);
+        impl<'a> Injector for Collector<'a> {
+            fn set(&mut self, key: &str, value: String) {
+                if key.eq_ignore_ascii_case("traceparent") {
+                    self.0.push((key.to_string(), value));
+                }
+            }
+        }
+
+        let ctx = tracing::Span::current().context();
+        let mut headers = Vec::new();
+        inject_context(&ctx, &mut Collector(&mut headers));
+        headers
+    }
+
+    /// Inject the current trace headers into a ureq request builder.
+    pub fn inject_trace_headers<T>(req: RequestBuilder<T>) -> RequestBuilder<T> {
+        let mut req = req;
+        for (k, v) in current_trace_headers() {
+            req = req.header(&k, &v);
+        }
+        req
+    }
+
+    /// Sets the OpenTelemetry parent for a span from incoming headers.
+    pub fn set_parent_from_headers(span: &tracing::Span, headers: &[(String, String)]) {
+        struct HeaderExtractor<'a> {
+            headers: &'a [(String, String)],
+        }
+        impl<'a> Extractor for HeaderExtractor<'a> {
+            fn get(&self, key: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v.as_str())
+            }
+
+            fn keys(&self) -> Vec<&str> {
+                self.headers.iter().map(|(k, _)| k.as_str()).collect()
+            }
+        }
+
+        if let Some(ctx) = extract_context(&HeaderExtractor { headers }) {
+            let _ = span.set_parent(ctx);
+        }
+    }
+
     /// Formatter that prefixes log events with trace/span IDs when available.
     #[derive(Debug, Default, Clone, Copy)]
-    pub struct OtelLogFormatter;
+    struct OtelLogFormatter;
     impl<S, N> fmt::FormatEvent<S, N> for OtelLogFormatter
     where
         S: tracing::Subscriber + for<'a> registry::LookupSpan<'a>,
