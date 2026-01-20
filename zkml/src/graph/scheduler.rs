@@ -1,5 +1,5 @@
 use crate::graph::{NodeId, NodeInput, NodeOutput, PortId, graph::Graph};
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -367,35 +367,45 @@ where
         input_data: HashMap<NodeInput, N::IO>,
     ) -> anyhow::Result<Vec<ReadyNode<N, C>>> {
         ensure!(self.running_nodes.is_empty(), "Running nodes must be empty");
-        let input_data = input_data.into_iter().fold(
-            HashMap::<NodeId, BTreeMap<PortId, N::IO>>::new(),
-            |mut acc, (node_input, io)| {
-                if self.graph.is_source(node_input.node_id) {
-                    // If this is an input node, prepare its ordered inputs.
-                    acc.entry(node_input.node_id)
-                        .or_default()
-                        .insert(node_input.port, io);
-                } else {
-                    // Otherwise, just store the IO data to be used later.
-                    self.waiting_input_data.insert(node_input, io);
-                }
-
-                acc
-            },
+        ensure!(self.done_nodes.is_empty(), "Done nodes must be empty");
+        ensure!(
+            self.waiting_input_data.is_empty(),
+            "Waiting input data must be empty",
         );
 
-        Ok(input_data
-            .into_iter()
-            .map(|(node_id, payload)| {
-                let node = &self.graph[node_id];
-                self.running_nodes.insert(node_id);
-                ReadyNode {
-                    node: node.as_inner().unwrap().clone(),
-                    inputs: payload.into_values().collect(),
-                    node_id,
-                }
-            })
-            .collect::<Vec<_>>())
+        let mut inputs: HashMap<NodeId, BTreeMap<PortId, N::IO>> =
+            HashMap::with_capacity(input_data.len());
+        for (node_input, io) in input_data {
+            if self.graph.is_source(node_input.node_id) {
+                inputs
+                    .entry(node_input.node_id)
+                    .or_default()
+                    .insert(node_input.port, io)
+                    .map_or(Ok(()), |_value| {
+                        Err(anyhow!("Duplicated input for input node: {}", node_input))
+                    })?;
+            } else {
+                self.waiting_input_data
+                    .insert(node_input, io)
+                    .map_or(Ok(()), |_value| {
+                        Err(anyhow!("Duplicated data for node: {}", node_input))
+                    })?;
+            }
+        }
+
+        let mut ready = Vec::with_capacity(inputs.len());
+        for (node_id, payload) in inputs {
+            let node = &self.graph[node_id];
+            self.running_nodes.insert(node_id);
+            let ready_node = ReadyNode {
+                node: node.as_inner().unwrap().clone(),
+                inputs: payload.into_values().collect(),
+                node_id,
+            };
+            ready.push(ready_node);
+        }
+
+        Ok(ready)
     }
 
     /// Marks a node as completed and propagates its output to successor nodes.

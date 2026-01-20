@@ -358,6 +358,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use crossbeam_channel::unbounded;
     use ff_ext::GoldilocksExt2;
     use rayon::scope;
@@ -368,7 +369,7 @@ mod tests {
 
     use crate::{
         graph::{
-            NodeId, NodeInput, NodeOutput,
+            NodeInput, NodeOutput,
             executor::Executor,
             scheduler::{ExecNode, GraphScheduler, ReadyNode, ReleasePolicy},
         },
@@ -416,103 +417,90 @@ mod tests {
         }
     }
 
-    /// A ThreadPoolExecutor which serializes the nodes of the execution graph and the IO of each node
-    pub(crate) struct SerializedThreadPoolExecutor<S>(S);
+    struct SerializedThreadPoolExecutor;
 
-    impl<N, C, S> Executor<N, C> for SerializedThreadPoolExecutor<S>
+    impl<N, C> Executor<N, C> for SerializedThreadPoolExecutor
     where
         N::IO: Clone + Send + Sync + Serialize + DeserializeOwned,
         C: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned,
         N::Context: Sync, // Context is shared (not owned) across threads
         N: ExecNode + Clone + Send + Sync + Serialize + DeserializeOwned,
-        S: TryToBytes<ReadyNode<N, C>>
-            + TryFromBytes<ReadyNode<N, C>>
-            + TryToBytes<Vec<N::IO>>
-            + TryFromBytes<Vec<N::IO>>
-            + Send
-            + Sync,
     {
-        type Config = S;
+        type Config = ();
 
         fn run(
-            config: &Self::Config,
+            _config: &Self::Config,
             scheduler: GraphScheduler<N, C>,
             input_data: HashMap<NodeInput, N::IO>,
             context: &N::Context,
         ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
-            // we want to release all ready nodes all the time so that the threadpool is always busy
+            // Release all to keep the threadpool busy
             let mut scheduler = scheduler.with_release_policy(ReleasePolicy::All);
-            // final vector to collect outputs on the main thread
-            let mut outputs = HashMap::new();
-            //  channel to send results from task thread to the scoped logic
-            let (result_sender, result_receiver) = unbounded();
-            // channel to send results from scoped logic to main thread
-            // we need to indirections because we are spawning tasks dynamically
-            // depending on the output of previous tasks so everything must happen in the scope
-            // and we also need to collect the final outputs outside the scope to return them
-            // NOTE: all the channels are used in only one direction and are sequential (a -> b -> c) so there is no risk of deadlock
-            let (outputs_sender, outputs_receiver) = unbounded();
             let mut ready_nodes = scheduler.init_nodes(input_data)?;
-            scope(move |s| -> anyhow::Result<()> {
+
+            scope(move |s| -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
+                let mut outputs = HashMap::new();
+                let (tx, rx) = unbounded();
+
                 while !scheduler.is_done() {
-                    // execute all ready tasks
-                    for node in ready_nodes.drain(..) {
-                        let result_sender_local = result_sender.clone();
-                        let node_id = node.node_id;
-                        let serialized_node = config.try_to_bytes(&node)?;
-                        // we put the task in the rayon threadpool and it'll be executed as soon as possible
+                    for node in ready_nodes {
+                        let tx = tx.clone();
+
+                        // TEST: ensure the node can be encoded
+                        let node_encoded = BincodeSerializer
+                            .try_to_bytes(&node)
+                            .context("Failed to serialize graph node")?;
+
                         s.spawn(move |_| {
-                            let mut node: ReadyNode<N, C> =
-                                match config.try_from_bytes(&serialized_node) {
-                                    Ok(node) => node,
-                                    Err(e) => {
-                                        result_sender_local.send((node_id, Err(e))).unwrap();
-                                        return;
-                                    }
-                                };
-                            match node.run(context) {
-                                Ok(output) => {
-                                    let serialized_output = config.try_to_bytes(&output);
-                                    result_sender_local
-                                        .send((node_id, serialized_output))
-                                        .unwrap()
+                            // TEST: ensure the node can be decoded
+                            let decoded: anyhow::Result<ReadyNode<N, C>> = BincodeSerializer
+                                .try_from_bytes(&node_encoded)
+                                .context("Failed to deserialize graph node");
+
+                            let mut node = match decoded {
+                                Ok(decoded) => decoded,
+                                Err(err) => {
+                                    tx.send((node.node_id, Err(err))).expect(
+                                        "Sender channel closed unexpectedly, can not send error",
+                                    );
+                                    return;
                                 }
-                                // transmit error back to the main thread
-                                Err(e) => result_sender_local.send((node_id, Err(e))).unwrap(),
+                            };
+
+                            match node.run(context) {
+                                Ok(output) => tx.send((node.node_id, Ok(output))).expect(
+                                    "Sender channel closed unexpectedly, can not send node result",
+                                ),
+                                err @ Err(_) => tx.send((node.node_id, err)).expect(
+                                    "Sender channel closed unexpectedly, can not send error",
+                                ),
                             };
                         });
                     }
-                    // wait for a result - there is always one result
-                    // since we know the graph is not done yet and each time
-                    // we have an output we check if the graph is done
-                    let (node_idx, output): (NodeId, Result<Vec<u8>, anyhow::Error>) =
-                        result_receiver.recv().unwrap();
+
+                    let (node_id, output) = rx
+                        .recv()
+                        .expect("Receiver channel closed unexpectedly, can not read results");
+
                     match output {
-                        Ok(serialized_output) => {
-                            let output: Vec<N::IO> = config.try_from_bytes(&serialized_output)?;
-                            let graph_outputs = scheduler.mark_done(node_idx, &output).unwrap();
-                            if !graph_outputs.is_empty() {
-                                outputs_sender.clone().send(Ok(graph_outputs)).unwrap()
-                            }
+                        Ok(output) => {
+                            let graph_outputs = scheduler
+                                .mark_done(node_id, &output)
+                                .context("Failed to mark node with scheduler")?;
+                            outputs.extend(graph_outputs);
                             ready_nodes = scheduler.next_ready_nodes()?;
                         }
-                        Err(e) => {
-                            // transmit the error back to the main thread
-                            let err = anyhow::anyhow!("Error running node {node_idx:?}: {e}");
-                            outputs_sender.send(Err(err)).unwrap();
-                            return Ok(());
+                        Err(err) => {
+                            return Err(err.context("Error running node {node_idx:?}"));
                         }
                     }
                 }
-                Ok(())
-            })?;
-            for output in outputs_receiver.iter() {
-                outputs.extend(output?)
-            }
-            Ok(outputs)
+                Ok(outputs)
+            })
         }
     }
 
+    /// Test the data can be serialized / deserialized as this is necessary for distributed proving.
     #[test]
     fn test_exec_graph_data_serialization() -> anyhow::Result<()> {
         let (model, input) = Model::random(6)?;
@@ -535,17 +523,14 @@ mod tests {
         )?;
         let inputs = graph_inputs(input, store.clone(), &graph)?;
 
-        // serialize and deserialize prover context
         let serialized_ctx = BincodeSerializer.try_to_bytes(ctx.as_ref())?;
         let deserialized_ctx: SerializableGraphCtx<F, Pcs<F>> =
             BincodeSerializer.try_from_bytes(&serialized_ctx)?;
 
         let ctx = deserialized_ctx.to_full_ctx(store.clone());
 
-        // run the execution graph
         let scheduler = GraphScheduler::new(graph);
-        let outputs =
-            SerializedThreadPoolExecutor::run(&BincodeSerializer, scheduler, inputs, &ctx)?;
+        let outputs = SerializedThreadPoolExecutor::run(&(), scheduler, inputs, &ctx)?;
         let (proof, io) = extract_graph_outputs(outputs.into_values())?;
 
         verify::<_, T, _>(&verifier_ctx, proof, io)

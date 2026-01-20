@@ -3,6 +3,7 @@ use super::{
     scheduler::{ExecNode, GraphScheduler, ReleasePolicy},
 };
 use crate::graph::{NodeInput, NodeOutput};
+use anyhow::Context;
 use crossbeam_channel::unbounded;
 use rayon::scope;
 use std::collections::HashMap;
@@ -176,61 +177,47 @@ where
         input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
     ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
-        // we want to release all ready nodes all the time so that the threadpool is always busy
+        // Release all to keep the threadpool busy
         let mut scheduler = scheduler.with_release_policy(ReleasePolicy::All);
-        // final vector to collect outputs on the main thread
-        let mut outputs = HashMap::new();
-        //  channel to send results from task thread to the scoped logic
-        let (result_sender, result_receiver) = unbounded();
-        // channel to send results from scoped logic to main thread
-        // we need to indirections because we are spawning tasks dynamically
-        // depending on the output of previous tasks so everything must happen in the scope
-        // and we also need to collect the final outputs outside the scope to return them
-        // NOTE: all the channels are used in only one direction and are sequential (a -> b -> c) so there is no risk of deadlock
-        let (outputs_sender, outputs_receiver) = unbounded();
         let mut ready_nodes = scheduler.init_nodes(input_data)?;
-        scope(move |s| -> anyhow::Result<()> {
+
+        scope(move |s| -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
+            let mut outputs = HashMap::new();
+            let (tx, rx) = unbounded();
+
             while !scheduler.is_done() {
-                // execute all ready tasks
-                for mut node in ready_nodes.drain(..) {
-                    let result_sender_local = result_sender.clone();
-                    let node_id = node.node_id;
-                    // we put the task in the rayon threadpool and it'll be executed as soon as possible
+                for mut node in ready_nodes {
+                    let tx = tx.clone();
                     s.spawn(move |_| {
                         match node.run(context) {
-                            Ok(output) => result_sender_local.send((node_id, Ok(output))).unwrap(),
-                            // transmit error back to the main thread
-                            Err(e) => result_sender_local.send((node_id, Err(e))).unwrap(),
+                            Ok(output) => tx.send((node.node_id, Ok(output))).expect(
+                                "Sender channel closed unexpectedly, can not send node result",
+                            ),
+                            Err(e) => tx
+                                .send((node.node_id, Err(e)))
+                                .expect("Sender channel closed unexpectedly, can not send error"),
                         };
                     });
                 }
-                // wait for a result - there is always one result
-                // since we know the graph is not done yet and each time
-                // we have an output we check if the graph is done
-                let (node_idx, output): (NodeId, Result<Vec<N::IO>, anyhow::Error>) =
-                    result_receiver.recv().unwrap();
+
+                let (node_idx, output): (NodeId, Result<Vec<N::IO>, anyhow::Error>) = rx
+                    .recv()
+                    .expect("Receiver channel closed unexpectedly, can not read results");
                 match output {
                     Ok(output) => {
-                        let graph_outputs = scheduler.mark_done(node_idx, &output).unwrap();
-                        if !graph_outputs.is_empty() {
-                            outputs_sender.clone().send(Ok(graph_outputs)).unwrap()
-                        }
+                        let graph_outputs = scheduler
+                            .mark_done(node_idx, &output)
+                            .context("Failed to mark node with scheduler")?;
+                        outputs.extend(graph_outputs);
                         ready_nodes = scheduler.next_ready_nodes()?;
                     }
-                    Err(e) => {
-                        // transmit the error back to the main thread
-                        let err = anyhow::anyhow!("Error running node {node_idx:?}: {e}");
-                        outputs_sender.send(Err(err)).unwrap();
-                        return Ok(());
+                    Err(err) => {
+                        return Err(err.context("Error running node {node_idx:?}"));
                     }
                 }
             }
-            Ok(())
-        })?;
-        for output in outputs_receiver.iter() {
-            outputs.extend(output?)
-        }
-        Ok(outputs)
+            Ok(outputs)
+        })
     }
 }
 
