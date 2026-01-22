@@ -139,6 +139,10 @@ name = "layers"
 harness = false
 name = "tensor"
 
+[[bench]]
+harness = false
+name = "graph"
+
 [[example]]
 name = "chunk-cifar"
 path = "examples/chunk_cifar.rs"

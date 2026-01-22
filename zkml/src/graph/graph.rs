@@ -1131,18 +1131,23 @@ impl<N, I, O, W> Graph<N, I, O, W> {
             .map(|(node_id, _)| *node_id)
             .collect::<BTreeSet<_>>();
         (0..self.nodes.len()).scan(all_nodes, |unvisited_nodes, _| {
-            let next_node = unvisited_nodes.iter().find_map(|&node_id| {
-                let is_node_next = if FORWARD {
+            let next_node = if FORWARD {
+                unvisited_nodes.iter().find_map(|&node_id| {
                     // if the node only has "input" edges, then this is true
                     // otherwise, we check that each predecessor has already been visited
-                    self.neighbors(node_id, Direction::Incoming)
-                        .all(|(_, edge)| !unvisited_nodes.contains(&edge.source()))
-                } else {
-                    self.neighbors(node_id, Direction::Outgoing)
-                        .all(|(_, edge)| !unvisited_nodes.contains(&edge.target()))
-                };
-                if is_node_next { Some(node_id) } else { None }
-            });
+                    let is_node_next = self
+                        .neighbors(node_id, Direction::Incoming)
+                        .all(|(_, edge)| !unvisited_nodes.contains(&edge.source()));
+                    if is_node_next { Some(node_id) } else { None }
+                })
+            } else {
+                unvisited_nodes.iter().rev().find_map(|&node_id| {
+                    let is_node_next = self
+                        .neighbors(node_id, Direction::Outgoing)
+                        .all(|(_, edge)| !unvisited_nodes.contains(&edge.target()));
+                    if is_node_next { Some(node_id) } else { None }
+                })
+            };
             if let Some(ref next_node) = next_node {
                 unvisited_nodes.remove(next_node);
             }
