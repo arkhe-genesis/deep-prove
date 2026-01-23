@@ -180,8 +180,7 @@ pub trait AttentionMechanism {
             AttentionSpan::Full => {
                 let mask_id = model.add_consecutive_layer(
                     Layer::AttentionMask(
-                        AttentionMask::<f32>::new(max_context_length, f32::NEG_INFINITY)
-                            .with_span(attention_span)?,
+                        AttentionMask::<f32>::new(f32::NEG_INFINITY).with_span(attention_span)?,
                     ),
                     Some(query_key_id),
                 )?;
@@ -189,7 +188,7 @@ pub trait AttentionMechanism {
 
                 model.add_consecutive_layer(
                     Layer::Softmax(
-                        Softmax::<f32>::new(max_context_length)
+                        Softmax::<f32>::new(max_context_length.next_power_of_two())
                             .with_scale(1.0f32 / (head_dim as f32).sqrt()),
                     ),
                     Some(mask_id),
@@ -199,11 +198,13 @@ pub trait AttentionMechanism {
                 // Insert the attention mask layer with local span
                 let mask_id = model.add_consecutive_layer(
                     Layer::AttentionMask(
-                        AttentionMask::<f32>::new(max_context_length, f32::NEG_INFINITY)
-                            .with_span(attention_span)?,
+                        AttentionMask::<f32>::new(f32::NEG_INFINITY).with_span(attention_span)?,
                     ),
                     Some(query_key_id),
                 )?;
+                let effective_context_length = effective_context_length
+                    .min(max_context_length)
+                    .next_power_of_two();
                 // Now in the Softmax layer we know we only have at most effective_context_length non-zero entries (after applying exp)
                 model.add_consecutive_layer(
                     Layer::Softmax(

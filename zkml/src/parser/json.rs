@@ -187,7 +187,7 @@ pub mod test {
         let path = get_json_file(TINY_GPT2_NAME)?;
         let loader = FileTensorLoader::new_from_path(path)?;
         println!("loader keys: {:?}", loader.content.metadata.keys());
-        let config = LLMConfig::from_json(&loader)?;
+        let config = LLMConfig::from_json(&loader, None)?;
         println!("tiny gpt2 config: {config:?}");
         let model = LLMModel::<GPT2Decoder>::from_loader(&loader, &config)?;
         let init_user_shape = Shape::from(vec![1]);

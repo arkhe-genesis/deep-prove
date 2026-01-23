@@ -564,7 +564,8 @@ impl Positional<f32> {
                 )
             }
             PositionalConfig::FixedPositional => {
-                let position_embd = loader.get_tensor("position_embd.weight")?;
+                let mut position_embd = loader.get_tensor("position_embd.weight")?;
+                position_embd.truncate_on_first_dim(c.generic.context_length)?;
                 let shape = position_embd.shape();
                 ensure!(
                     shape[0] == c.generic.context_length,
@@ -583,7 +584,8 @@ impl Positional<f32> {
         }
     }
     pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
-        let position_embd = l.get_tensor("position_embd.weight")?;
+        let mut position_embd = l.get_tensor("position_embd.weight")?;
+        position_embd.truncate_on_first_dim(c.context_length)?;
         ensure!(position_embd.rank() == 2, "position_embd must be 2d");
         ensure!(
             position_embd.shape()[0] == c.context_length,
@@ -623,10 +625,11 @@ impl Positional<f32> {
                 )
             }
             PositionalConfig::FixedPositional => {
-                let position_embd = loader
+                let mut position_embd = loader
                     .get_tensor("position_embd.weight")
                     .or_else(|_| loader.get_tensor("transformer.wpe.weight"))
                     .or_else(|_| loader.get_tensor("wpe.weight"))?;
+                position_embd.truncate_on_first_dim(structure.generic.context_length)?;
                 let shape = position_embd.shape();
                 ensure!(
                     shape[0] == structure.generic.context_length,

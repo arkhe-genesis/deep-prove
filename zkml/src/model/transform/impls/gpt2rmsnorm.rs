@@ -596,13 +596,13 @@ mod tests {
         // First we load up a GPT-2 model
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let gguf = RawGGUF::new(model_path);
-        let driver = Driver::load_from_model(GPT2, &gguf, Some(10))?;
+        let driver = Driver::load_from_model(GPT2::new(), &gguf, Some(10))?;
         // Extract the model
         let Driver { model, .. } = driver;
         model.describe();
         // Make a tester input for the model so we can compare the pre and post transformation outputs
         let sentence = "The sky is";
-        let tokenizer = GPT2.load_tokenizer(&gguf)?;
+        let tokenizer = GPT2::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
 
         let input_tokens = user_tokens
@@ -661,10 +661,10 @@ mod tests {
         // First we load up a GPT-2 model
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let gguf = RawGGUF::new(model_path);
-        let driver = Driver::load_from_model(GPT2, &gguf, Some(max_context))?;
+        let driver = Driver::load_from_model(GPT2::new(), &gguf, Some(max_context))?;
         // Make a tester input for the model so we can compare the pre and post transformation outputs
         let sentence = "The sky is";
-        let tokenizer = GPT2.load_tokenizer(&gguf)?;
+        let tokenizer = GPT2::new().load_tokenizer(&gguf)?;
         let user_tokens = tokenizer.tokenize(sentence);
 
         // Rewrite the model by applying our transformation rule

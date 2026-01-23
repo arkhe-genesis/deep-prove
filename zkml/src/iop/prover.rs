@@ -591,13 +591,15 @@ where
 
         // NOTE: until https://github.com/Plonky3/Plonky3/pull/999 is fixed, we have
         // to use the sequential executor and not the threadpool executor.
-        self.instantiate_witness_ctx_for_chunk::<SequentialExecutor>(
-            &chunk,
-            chunk_trace,
-            &lookup_ctx,
-            chunk_layers,
-            &(),
-        )?;
+        measure::r("witness_commitment", || {
+            self.instantiate_witness_ctx_for_chunk::<SequentialExecutor>(
+                &chunk,
+                chunk_trace,
+                &lookup_ctx,
+                chunk_layers,
+                &(),
+            )
+        })?;
 
         // we need to compute commitments of the input/output edges of each chunk and add them
         // to the transcript.

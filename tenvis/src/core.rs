@@ -152,7 +152,7 @@ impl GlobalContext {
         let input_shape = Shape::new(vec![user_tokens.len()]);
 
         let driver_f32 =
-            Driver::load_from_model(GPT2, &RawGGUF::new(gguf_file), Some(context_size))?;
+            Driver::load_from_model(GPT2::new(), &RawGGUF::new(gguf_file), Some(context_size))?;
 
         let snap_f32 = {
             info!("running f32 model");

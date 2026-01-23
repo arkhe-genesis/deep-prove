@@ -67,14 +67,13 @@ fn non_caching_case_mask(span: AttentionSpan, seq_len: usize) -> BTensor<Backend
     match span {
         AttentionSpan::Full => plain_mask,
         AttentionSpan::Local(n) => {
-            let offset = (seq_len - 1).saturating_sub(n) as i64 - 1;
-            // If the offset is negative, it means the local span covers the whole matrix so we just return the plain mask
-            if offset < 0 {
+            // If the sliding window is bigger than seq_len-1, it means the local span covers the whole matrix so we just return the plain mask
+            if n >= seq_len - 1 {
                 plain_mask
             } else {
                 let extra_mask = BTensor::<Backend, 2, Bool>::triu_mask(
                     [seq_len, seq_len],
-                    -offset,
+                    -(n as i64),
                     &Default::default(),
                 );
                 plain_mask.bool_or(extra_mask)
@@ -149,8 +148,7 @@ mod tests {
         };
 
         let input = WrappedTensor::<T>::random(&shape);
-        let attention_mask =
-            AttentionMask::<T>::new(seq_len, <T as Number>::MIN).with_span(span)?;
+        let attention_mask = AttentionMask::<T>::new(<T as Number>::MIN).with_span(span)?;
 
         let output = attention_mask.evaluate_internal(&input)?;
 

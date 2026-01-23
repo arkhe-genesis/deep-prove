@@ -63,8 +63,6 @@ pub const ATTENTION_MASK_LAYER: &str = "MASK";
 /// cached inferences for now.
 #[derive(Clone, Debug, Serialize, Deserialize, Copy)]
 pub struct AttentionMask<N> {
-    /// Since a casual mask is always square this is the dim size for both the rows and the columns
-    pub dim_size: usize,
     span: AttentionSpan,
     /// The value for negative infinity
     negative_infinity: N,
@@ -84,7 +82,6 @@ impl<N: TensorTypeParam> Default for AttentionMask<N> {
     fn default() -> Self {
         AttentionMask {
             negative_infinity: <N as Number>::MIN,
-            dim_size: Default::default(),
             span: Default::default(),
         }
     }
@@ -98,30 +95,76 @@ pub struct AttentionMaskProof<E: ExtensionField> {
     sumcheck_proof: IOPProof<E>,
     /// The input evaluations
     evaluations: Vec<E>,
+    /// Proof for the sumcheck employed to prove claims about the local attention mask
+    local_mask_proof: Option<IOPProof<E>>,
 }
 
 impl<N: TensorTypeParam> AttentionMask<N> {
     /// Creates a new mask given the unpadded input shape and the value to use for `-inf`
-    pub fn new(dim_size: usize, negative_inf: N) -> AttentionMask<N> {
+    pub fn new(negative_inf: N) -> AttentionMask<N> {
         AttentionMask {
-            dim_size,
             negative_infinity: negative_inf,
             span: Default::default(),
         }
     }
     pub fn with_span(self, span: AttentionSpan) -> anyhow::Result<AttentionMask<N>> {
-        if let AttentionSpan::Local(n) = span {
-            ensure!(
-                n < self.dim_size,
-                "Span cannot be greater than the dimension size"
-            );
-        }
         Ok(AttentionMask { span, ..self })
     }
 
     /// Sets the negative infinity value
     pub fn set_negative_infinity(&mut self, negative_infinity: N) {
         self.negative_infinity = negative_infinity;
+    }
+
+    pub fn is_local_mask(&self) -> bool {
+        matches!(&self.span, AttentionSpan::Local(_))
+    }
+
+    fn build_sumcheck_expression<E: ExtensionField>(
+        &self,
+        input_shape: &Shape,
+        negative_inf: Element,
+        decomposed_mask: bool,
+    ) -> Vec<Expression<E>> {
+        // If the input shape has rank greater than two we treat it as a batch of 2D images.
+        // Since we handle it in this way we make the eq_poly and less than poly the first two witness indices.
+        let eq_expr = Expression::<E>::WitIn(0);
+        let mask_expr = if decomposed_mask {
+            Expression::<E>::WitIn(1) * Expression::<E>::WitIn(4)
+        } else {
+            Expression::<E>::WitIn(1)
+        };
+        // This expr ensures we only apply the mask to the unpadded portion of each row of the input
+        let row_lt_expr = Expression::<E>::WitIn(2);
+        // This expr ensures we only apply the mask to the unpadded portion of each column of the input
+        let column_lt_expr = Expression::<E>::WitIn(3);
+        let lt_expr = row_lt_expr * column_lt_expr;
+        let one_minus_mask_expr = Expression::Constant(Either::Right(E::ONE)) - mask_expr.clone();
+        // The input offset is 4 since we have eq_poly, mask_poly and two less than polys before the input polys start
+        let input_offset: u16 = if decomposed_mask { 5 } else { 4 };
+        if input_shape.rank() > 2 {
+            let batch_size = input_shape.slice(..input_shape.rank() - 2).numel();
+            (0..batch_size as u16)
+                .map(|j| {
+                    let wit_poly_id = j + input_offset;
+                    // Each term is the same it is just the challenge that changes
+                    eq_expr.clone()
+                        * lt_expr.clone()
+                        * Expression::Challenge(j, 1, E::ONE, E::ZERO)
+                        * (mask_expr.clone() * Expression::WitIn(wit_poly_id)
+                            + Expression::Constant(Either::Right(negative_inf.to_field()))
+                                * one_minus_mask_expr.clone())
+                })
+                .collect()
+        } else {
+            vec![
+                eq_expr
+                    * lt_expr
+                    * (mask_expr * Expression::WitIn(input_offset)
+                        + Expression::Constant(Either::Right(negative_inf.to_field()))
+                            * one_minus_mask_expr),
+            ]
+        }
     }
 }
 
@@ -188,10 +231,10 @@ impl QuantizeOp for AttentionMask<f32> {
             .first()
             .map(|sf| sf.domain().0)
             .expect("We have ensured there is at least one scaling factor");
-        let AttentionMask { dim_size, span, .. } = self;
+        let AttentionMask { span, .. } = self;
 
         let quantised_mask =
-            AttentionMask::<Element>::new(dim_size, quantized_negative_infinity).with_span(span)?;
+            AttentionMask::<Element>::new(quantized_negative_infinity).with_span(span)?;
 
         Ok(QuantizeOutput::new(quantised_mask, input_scaling.to_vec()))
     }
@@ -210,11 +253,7 @@ impl ProveInfo for AttentionMask<Element> {
             shapes.len() == 1,
             "Casual Mask can only be applied to a single input"
         );
-        let input_shape = &shapes[0];
-        let negative_inf = self.negative_infinity;
-        let sumcheck_expression = build_sumcheck_expression::<E>(input_shape, negative_inf);
-        let layer_ctx =
-            LayerCtx::AttentionMask(AttentionMaskCtx::<E>::new(*self, sumcheck_expression, id));
+        let layer_ctx = LayerCtx::AttentionMask(AttentionMaskCtx::new(*self, id));
 
         // We make sure to update the ContextAux so that it knows there are no model commitments for this layer
         aux.model_polys = None;
@@ -223,77 +262,21 @@ impl ProveInfo for AttentionMask<Element> {
     }
 }
 
-fn build_sumcheck_expression<E: ExtensionField>(
-    input_shape: &Shape,
-    negative_inf: Element,
-) -> Vec<Expression<E>> {
-    // If the input shape has rank greater than two we treat it as a batch of 2D images.
-    // Since we handle it in this way we make the eq_poly and less than poly the first two witness indices.
-    let eq_expr = Expression::<E>::WitIn(0);
-    let mask_expr = Expression::<E>::WitIn(1);
-    // This expr ensures we only apply the mask to the unpadded portion of each row of the input
-    let row_lt_expr = Expression::<E>::WitIn(2);
-    // This expr ensures we only apply the mask to the unpadded portion of each column of the input
-    let column_lt_expr = Expression::<E>::WitIn(3);
-    let lt_expr = row_lt_expr * column_lt_expr;
-    let one_minus_mask_expr = Expression::Constant(Either::Right(E::ONE)) - mask_expr.clone();
-    // The input offset is 4 since we have eq_poly, mask_poly and two less than polys before the input polys start
-    const INPUT_OFFSET: u16 = 4;
-    if input_shape.rank() > 2 {
-        let batch_size = input_shape.slice(..input_shape.rank() - 2).numel();
-        (0..batch_size as u16)
-            .map(|j| {
-                let wit_poly_id = j + INPUT_OFFSET;
-                // Each term is the same it is just the challenge that changes
-                eq_expr.clone()
-                    * lt_expr.clone()
-                    * Expression::Challenge(j, 1, E::ONE, E::ZERO)
-                    * (mask_expr.clone() * Expression::WitIn(wit_poly_id)
-                        + Expression::Constant(Either::Right(negative_inf.to_field()))
-                            * one_minus_mask_expr.clone())
-            })
-            .collect()
-    } else {
-        vec![
-            eq_expr
-                * lt_expr
-                * (mask_expr * Expression::WitIn(INPUT_OFFSET)
-                    + Expression::Constant(Either::Right(negative_inf.to_field()))
-                        * one_minus_mask_expr),
-        ]
-    }
-}
-
 /// Context for the attention mask operation, needed by the verifier to check a mask was applied correctly.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct AttentionMaskCtx<E: ExtensionField> {
+pub struct AttentionMaskCtx {
     pub op: AttentionMask<Element>,
-    pub sumcheck_expression: Vec<Expression<E>>,
     pub node_id: NodeId,
 }
 
-impl<E: ExtensionField> AttentionMaskCtx<E> {
+impl AttentionMaskCtx {
     /// Create a new [`AttentionMaskCtx`]
-    pub fn new(
-        op: AttentionMask<Element>,
-        sumcheck_expression: Vec<Expression<E>>,
-        node_id: NodeId,
-    ) -> Self {
-        AttentionMaskCtx {
-            op,
-            sumcheck_expression,
-            node_id,
-        }
-    }
-
-    /// Getter for the dim size for the mask
-    pub fn dim_size(&self) -> usize {
-        self.op.dim_size
+    pub fn new(op: AttentionMask<Element>, node_id: NodeId) -> Self {
+        AttentionMaskCtx { op, node_id }
     }
 }
 
-impl<E: ExtensionField> OpInfo for AttentionMaskCtx<E> {
+impl OpInfo for AttentionMaskCtx {
     fn output_shapes(
         &self,
         input_shapes: &[Shape],
@@ -325,7 +308,7 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     PCS::ProverParam: Send + Sync,
 {
-    type Ctx = AttentionMaskCtx<E>;
+    type Ctx = AttentionMaskCtx;
 
     fn prove<'a, 'b, 'c, 'd, T: transcript::Transcript<E>>(
         &'a self,
@@ -361,7 +344,7 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for AttentionMaskCtx<E>
+impl<E, PCS> VerifiableCtx<E, PCS> for AttentionMaskCtx
 where
     E: ExtensionField,
     PCS: PolynomialCommitmentScheme<E>,
@@ -433,24 +416,38 @@ mod tests {
     fn test_attention_mask_proving() -> Result<()> {
         let mut rng = rng_from_env_or_random();
 
-        let dim_size: usize = rng.gen_range(3..10);
+        let seq_len: usize = rng.gen_range(3..10);
 
         for rank in 3..4 {
-            println!("Testing rank: {rank}: DIM SIZE: {dim_size}");
-            let mask = AttentionMask::new(dim_size, f32::NEG_INFINITY);
-            test_causal_mask_proving_helper(rank, mask)?;
+            println!("Testing rank: {rank}: DIM SIZE: {seq_len}");
+            let mask = AttentionMask::new(f32::NEG_INFINITY);
+            test_causal_mask_proving_helper(rank, mask, seq_len)?;
         }
         Ok(())
     }
 
-    fn test_causal_mask_proving_helper(rank: usize, mask: AttentionMask<f32>) -> Result<()> {
-        let mut rng = rng_from_env_or_random();
+    #[test]
+    fn test_local_attention_mask_proving() -> Result<()> {
+        // test proving of `AttentionMask::Local` variant, using a given sliding window
+        let seq_len: usize = 8;
+        let window_size: usize = 2;
 
-        let dim_size = mask.dim_size;
+        let mask =
+            AttentionMask::new(f32::NEG_INFINITY).with_span(AttentionSpan::Local(window_size))?;
+
+        test_causal_mask_proving_helper(2, mask, seq_len)
+    }
+
+    fn test_causal_mask_proving_helper(
+        rank: usize,
+        mask: AttentionMask<f32>,
+        seq_len: usize,
+    ) -> Result<()> {
+        let mut rng = rng_from_env_or_random();
 
         let shape: Shape = (0..rank - 2)
             .map(|_| rng.gen_range(3..8))
-            .chain([dim_size, dim_size])
+            .chain([seq_len, seq_len])
             .collect::<Vec<usize>>()
             .into();
         println!("Testing mask on shape: {shape:?}");
@@ -477,10 +474,10 @@ mod tests {
         // we test over a model where EinSum is the first layer, so we need 2 input shapes
         let input_shape_left = shape
             .slice(..rank - 2)
-            .extend(&Shape::new(vec![dim_size, 10]));
+            .extend(&Shape::new(vec![seq_len, 10]));
         let input_shape_right = shape
             .slice(..rank - 2)
-            .extend(&Shape::new(vec![10, dim_size]));
+            .extend(&Shape::new(vec![10, seq_len]));
 
         let mut model = Model::new_from_input_shapes(
             vec![input_shape_left, input_shape_right],

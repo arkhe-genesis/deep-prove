@@ -244,7 +244,7 @@ where
     /// If the number of tokens exceeds the current configured `context_length`.
     pub fn tokens_to_tensor(&self, input: &[Token]) -> anyhow::Result<Tensor<N>> {
         ensure!(
-            input.len() < self.config.context_length - 1,
+            input.len() < self.config.context_length,
             "Input sequence length must be less than the context length",
         );
         let input_tokens = input
@@ -787,7 +787,7 @@ mod test {
             LLMVerifierContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
         ) = file_cache::deserialize_or_create_with(&cache_filename, || {
             let (driver, _metadata) = Driver::load_from_model(
-                GPT2,
+                GPT2::new(),
                 &RawGGUF::new(model_path.clone()),
                 Some(MAX_CONTEXT),
             )?
@@ -803,7 +803,7 @@ mod test {
         // Generate the trace
         let mut store = GenStore::default();
         let sentence = "The sky is";
-        let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path))?;
+        let tokenizer = GPT2::new().load_tokenizer(&RawGGUF::new(model_path))?;
         let user_tokens = tokenizer.tokenize(sentence);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
         let trace = driver.run_elements(input_tensor, &mut store)?;
@@ -856,7 +856,7 @@ mod test {
         // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
         let raw = RawGGUF::new(model_path.clone());
         let (driver, _metadata) =
-            Driver::load_from_model(GPT2, &raw, Some(10))?.into_provable_llm(None)?;
+            Driver::load_from_model(GPT2::new(), &raw, Some(10))?.into_provable_llm(None)?;
         test_llm_driver_inference_inner(raw, driver)
     }
 
@@ -867,7 +867,7 @@ mod test {
         let raw = RawSafeTensors::from_hugging_face_cached(GPT2_SAFE_MODEL)?;
 
         let (driver, _metadata) =
-            Driver::load_from_model(GPT2, &raw, Some(10))?.into_provable_llm(None)?;
+            Driver::load_from_model(GPT2::new(), &raw, Some(10))?.into_provable_llm(None)?;
         test_llm_driver_inference_inner(raw, driver)
     }
 
@@ -878,7 +878,7 @@ mod test {
         let sentence = "The sky is";
 
         // Best to load the tokenizer from the gguf file if it's available.
-        let tokenizer = GPT2.load_tokenizer(&raw)?;
+        let tokenizer = GPT2::new().load_tokenizer(&raw)?;
         let user_tokens = tokenizer.tokenize(sentence);
         let detokenized = tokenizer.detokenize(&user_tokens);
         let mut store = GenStore::default();

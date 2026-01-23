@@ -92,7 +92,11 @@ pub enum AttentionHeadType {
 }
 
 impl LLMConfig {
-    pub fn from_gguf(l: &FileTensorLoader, model_name: &str) -> anyhow::Result<Self> {
+    pub fn from_gguf(
+        l: &FileTensorLoader,
+        model_name: &str,
+        max_context_length: Option<usize>,
+    ) -> anyhow::Result<Self> {
         let embedding_size = l
             .metadata::<usize>(&l.embedding_size_key(model_name))
             .context("embedding_size_key not found")?;
@@ -140,7 +144,11 @@ impl LLMConfig {
             embedding_size,
             num_heads,
             head_size,
-            context_length,
+            context_length: if let Some(max_context) = max_context_length {
+                max_context
+            } else {
+                context_length
+            },
             norm_epsilon,
             num_block,
             vocab_size,
@@ -148,7 +156,10 @@ impl LLMConfig {
         })
     }
 
-    pub fn from_json(l: &json::FileTensorLoader) -> anyhow::Result<Self> {
+    pub fn from_json(
+        l: &json::FileTensorLoader,
+        max_context_length: Option<usize>,
+    ) -> anyhow::Result<Self> {
         let hidden_size = l.metadata_to_u32("hidden_dim")? as usize;
         let embedding_size = hidden_size;
         let num_heads = l.metadata_to_u32("num_attention_heads")? as usize;
@@ -165,7 +176,11 @@ impl LLMConfig {
             num_heads,
             head_size: hidden_size / num_heads,
             num_block: num_blocks,
-            context_length,
+            context_length: if let Some(max_context) = max_context_length {
+                max_context
+            } else {
+                context_length
+            },
             norm_epsilon,
             vocab_size,
             // only support for gpt2 for now

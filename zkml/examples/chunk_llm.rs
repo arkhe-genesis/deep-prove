@@ -44,7 +44,7 @@ struct GPT2Runner {
 impl GPT2Runner {
     pub fn new(model_path: &str, user_input: &str) -> anyhow::Result<Self> {
         let model_path = full_model_path(model_path);
-        let tokenizer = GPT2.load_tokenizer(&RawGGUF::new(model_path.clone()))?;
+        let tokenizer = GPT2::new().load_tokenizer(&RawGGUF::new(model_path.clone()))?;
         let user_tokens = tokenizer.tokenize(user_input);
         Ok(Self {
             gguf_path: model_path.to_str().unwrap().to_string(),
@@ -60,7 +60,7 @@ impl GraphRuner for GPT2Runner {
         &mut self,
     ) -> anyhow::Result<(ProverContext<F, Pcs>, InferenceEngine, Vec<Tensor<Element>>)> {
         let (driver, _metadata) =
-            Driver::load_from_model(GPT2, &RawGGUF::new(self.gguf_path.clone()), Some(10))?
+            Driver::load_from_model(GPT2::new(), &RawGGUF::new(self.gguf_path.clone()), Some(10))?
                 .into_provable_llm(None)?;
         let input_tensor = Tensor::new(
             vec![self.user_input.len()].into(),

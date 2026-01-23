@@ -161,19 +161,15 @@ fn main() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(&gguf)?;
         match args.model {
             Model::GPT2 => {
-                Driver::load_from_model(GPT2, &RawGGUF::new(model_path), Some(max_context))?
+                Driver::load_from_model(GPT2::new(), &RawGGUF::new(model_path), Some(max_context))?
             }
             _ => bail!("Model {:?} not supported for gguf", args.model),
         }
     } else if let Some(hf) = args.hf {
         let safe = RawSafeTensors::from_hugging_face_cached(&hf)?;
         match args.model {
-            Model::GPT2 => Driver::load_from_model(GPT2, &safe, Some(max_context))?,
-            Model::Gemma3 => Driver::load_from_model(
-                Gemma3::new().with_max_context(max_context),
-                &safe,
-                Some(max_context),
-            )?,
+            Model::GPT2 => Driver::load_from_model(GPT2::new(), &safe, Some(max_context))?,
+            Model::Gemma3 => Driver::load_from_model(Gemma3::new(), &safe, Some(max_context))?,
         }
     } else {
         bail!("Either gguf or hf must be provided");

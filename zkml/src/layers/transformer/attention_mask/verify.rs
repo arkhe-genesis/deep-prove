@@ -1,5 +1,9 @@
 //! Code for verifying an attention mask layer
 
+use anyhow::anyhow;
+
+use crate::commit::identity_eval;
+
 use super::*;
 
 impl AttentionMask<Element> {
@@ -19,6 +23,7 @@ impl AttentionMask<Element> {
         let AttentionMaskProof {
             sumcheck_proof,
             evaluations,
+            local_mask_proof,
         } = proof;
 
         let MaskVerifyingData {
@@ -28,8 +33,18 @@ impl AttentionMask<Element> {
         } = mask_verifying_data;
 
         let num_vars = eq_point.len();
+        let additional_mask_poly = local_mask_proof.is_some();
+        let max_degree = if additional_mask_poly {
+            ensure!(
+                self.is_local_mask(),
+                "Found sumcheck proof for local mask with a full attention mask"
+            );
+            6
+        } else {
+            5
+        };
         let aux_info = VPAuxInfo {
-            max_degree: 5,
+            max_degree,
             max_num_variables: num_vars,
             ..Default::default()
         };
@@ -50,14 +65,27 @@ impl AttentionMask<Element> {
 
         let (column_point, row_point) = sumcheck_point.split_at(dim_vars);
 
-        let mask_eval = eval_zeroifier_mle(column_point, row_point);
+        let mut mask_eval = eval_zeroifier_mle(column_point, row_point);
+        if additional_mask_poly {
+            mask_eval *= evaluations[0]; // in this case, the first evaluation is for the additional mask polynomial
+            self.verify_additional_mask_poly_eval(
+                row_point,
+                column_point,
+                evaluations[0],
+                local_mask_proof.as_ref().unwrap(),
+                verifier,
+            )?;
+        }
+
+        let input_evals = &evaluations[additional_mask_poly as usize..];
+
         let (row_lt_eval, column_lt_eval) =
             self.evaluate_row_column_lt_polys::<E>(row_point, column_point, unpadded_seq_len)?;
         let lt_eval = row_lt_eval * column_lt_eval;
         let neg_inf_field: E = self.negative_infinity.to_field();
         let calc_eval = eq_eval
             * lt_eval
-            * batching_challenges.iter().zip(evaluations.iter()).fold(
+            * batching_challenges.iter().zip(input_evals.iter()).fold(
                 E::ZERO,
                 |acc, (chal, eval)| {
                     acc + *chal * (mask_eval * *eval + neg_inf_field * (E::ONE - mask_eval))
@@ -74,7 +102,7 @@ impl AttentionMask<Element> {
         // Construct the input claim
         let combined_eval = batching_challenges
             .iter()
-            .zip(evaluations.iter())
+            .zip(input_evals.iter())
             .fold(E::ZERO, |acc, (c, e)| acc + (*c) * (*e));
         let full_point = sumcheck_point
             .iter()
@@ -111,8 +139,99 @@ impl AttentionMask<Element> {
         let column_eval = eval_zeroifier_mle(column_point, &seq_len_bits);
         Ok((row_eval, column_eval))
     }
+
+    fn verify_additional_mask_poly_eval<E, T, PCS>(
+        &self,
+        row_point: &[E],
+        column_point: &[E],
+        eval: E,
+        local_mask_proof: &IOPProof<E>,
+        verifier: &mut Verifier<E, T, PCS>,
+    ) -> anyhow::Result<()>
+    where
+        E: ExtensionField,
+        PCS: PolynomialCommitmentScheme<E>,
+        T: Transcript<E>,
+    {
+        let AttentionSpan::Local(window) = self.span else {
+            Err(anyhow!("Found sumcheck proof for full attention mask"))?
+        };
+        let num_row_vars = row_point.len();
+        let seq_len = 1usize << num_row_vars;
+        ensure!(
+            window < seq_len,
+            "Sliding window not smaller than sequence length"
+        );
+
+        let num_col_vars = column_point.len();
+        // compute the evaluation for the padding polynomial, i.e., the polynomial P[i,j] = 1 iff j >= seq_len - window
+        let pad_col_bits = to_bit_sequence_le(seq_len - window - 1, num_col_vars)
+            .map(|b| E::from_canonical_usize(b))
+            .collect_vec();
+        let padded_eval = E::ONE - eval_zeroifier_mle(column_point, &pad_col_bits);
+
+        let aux_info = VPAuxInfo {
+            max_degree: 2,
+            max_num_variables: num_col_vars,
+            ..Default::default()
+        };
+        let subclaim = IOPVerifierState::<E>::verify(
+            eval - padded_eval,
+            local_mask_proof,
+            &aux_info,
+            verifier.transcript,
+        );
+
+        let sumcheck_point = subclaim
+            .point
+            .iter()
+            .map(|c| c.elements)
+            .collect::<Vec<E>>();
+
+        // evaluation for the upper diagonal MLE produced by the sumcheck. The evaluation is computed
+        // using the formula for the lower trianfular MLE, but swapping the row point with the
+        // column point (i.e., the ones given by sumcheck challenges)
+        let upper_eval = eval_zeroifier_mle(row_point, &sumcheck_point);
+
+        // evaluation for the shift matrix MLE
+        let shift_eval = eval_shift_matrix(&sumcheck_point, column_point, window);
+
+        let calc_eval = upper_eval * shift_eval;
+        ensure!(
+            calc_eval == subclaim.expected_evaluation,
+            "Mask sumcheck verification failed, expected evaluation {:?} got {:?}",
+            subclaim.expected_evaluation,
+            calc_eval
+        );
+
+        Ok(())
+    }
 }
 
+/// Compute the evaluation for the MLE of a square shift matrix S for the given `shift` at the row and column points
+/// provided as input. The shift matrix S is defined as S[i,j] = 1 iff i <= j + shift;
+/// given a generic square matrix `A`, right-multiplying `S` to `A` shifts the columns of `A` `shift` times to the left,
+/// leaving 0 columns in place of the shifted columns. The shift matrix is employed to construct the local attention mask  
+fn eval_shift_matrix<E: ExtensionField>(row_point: &[E], column_point: &[E], shift: usize) -> E {
+    let b1 = compute_betas_eval(row_point);
+    let num_row_vars = row_point.len();
+    let num_col_vars = column_point.len();
+    assert_eq!(b1.len(), 1 << num_row_vars);
+    (0..(1 << num_row_vars))
+        .zip(b1)
+        .fold(E::ZERO, |sum, (row, beta)| {
+            if row < shift {
+                sum
+            } else {
+                let col = row - shift;
+                let col_le_bits = to_bit_sequence_le(col, num_col_vars)
+                    .map(|b| E::from_canonical_usize(b))
+                    .collect_vec();
+                let selector = beta * identity_eval(column_point, &col_le_bits);
+                sum + selector
+            }
+        })
+}
 #[derive(Debug, Clone)]
 /// Struct storing all information to verify a [`AttentionMaskProof`]. We prove and verify the mask applied to each individual 2D sub tensor in a batched fashion.
 /// This struct hold the information needed and is constructed from the shaps and the last claim.

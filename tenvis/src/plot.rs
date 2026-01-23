@@ -12,7 +12,7 @@ use zkml::{
 use crate::Command;
 
 fn parse_llm<P: AsRef<Path>>(filename: P) -> anyhow::Result<Model<f32>> {
-    let driver_f32 = Driver::load_from_model(GPT2, &RawGGUF::new(filename), Some(10))
+    let driver_f32 = Driver::load_from_model(GPT2::new(), &RawGGUF::new(filename), Some(10))
         .context("loading LLM from file")?;
     Ok(driver_f32.model)
 }

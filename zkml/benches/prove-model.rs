@@ -128,7 +128,7 @@ fn inference(c: &mut Criterion) {
         let model_path =
             file_cache::from_cache(GPT2_Q8_0).expect("failed to find GPT2 model in cache");
         let format = RawGGUF::new(model_path);
-        let driver = Driver::load_from_model(GPT2, &format, Some(max_context))
+        let driver = Driver::load_from_model(GPT2::new(), &format, Some(max_context))
             .expect("failed to instantiate GPT2 driver");
         let user_tokens = driver.random_sequence(1);
 

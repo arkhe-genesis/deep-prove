@@ -266,10 +266,10 @@ where
     let loader = detect_llm(&model_names)?;
     match loader {
         DetectedModel::Gpt2 => {
-            let tokenizer = GPT2.load_tokenizer(&raw)?;
+            let tokenizer = GPT2::new().load_tokenizer(&raw)?;
             let user_tokens = tokenizer.tokenize(&prompt);
             let max_context = user_tokens.len() + max_new_tokens;
-            let driver = Driver::load_from_model(GPT2, &raw, Some(max_context))?
+            let driver = Driver::load_from_model(GPT2::new(), &raw, Some(max_context))?
                 .into_provable_llm(None)?
                 .0;
             Ok((driver, tokenizer, user_tokens))

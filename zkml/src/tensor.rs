@@ -1055,6 +1055,21 @@ impl<T> Tensor<T> {
     pub fn dim(&self, dim: usize) -> usize {
         self.shape[dim]
     }
+
+    pub fn truncate_on_first_dim(&mut self, new_size: usize) -> anyhow::Result<()> {
+        let shape = self.shape();
+        let first_dim = shape[0];
+        ensure!(
+            new_size <= first_dim,
+            "Truncating to {new_size} while first dimension is {first_dim}"
+        );
+        let stride = shape.strides()[0];
+        // retain `new_size` strides of the tensor
+        self.data.truncate(new_size * stride);
+        self.shape[0] = new_size;
+        self.unpadded_shape[0] = new_size;
+        Ok(())
+    }
 }
 
 impl<T> AsRef<Tensor<T>> for Tensor<T> {

@@ -1082,7 +1082,7 @@ mod tests {
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
 
-        let mask = AttentionMask::<f32>::new(dim_size, f32::NEG_INFINITY);
+        let mask = AttentionMask::<f32>::new(f32::NEG_INFINITY);
         let softmax = Softmax::<f32>::new_with_scale(1.0f32 / 64.0f32.sqrt(), 1024);
 
         let mask_id = model

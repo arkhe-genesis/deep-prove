@@ -108,7 +108,7 @@ impl ModelLoader<RawGGUF> for Gemma3 {
 
     fn parse(&self, raw: &RawGGUF) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
         let loader = raw.loader()?;
-        let config = LLMConfig::from_gguf(&loader, "gemma3")?;
+        let config = LLMConfig::from_gguf(&loader, "gemma3", self.max_ctx_length)?;
 
         let sliding_window = loader
             .metadata::<usize>(&loader.sliding_window_key("gemma3"))
@@ -189,7 +189,11 @@ impl ModelLoader<RawSafeTensors> for Gemma3 {
             num_heads,
             head_size,
             num_block,
-            context_length,
+            context_length: if let Some(max_context) = self.max_ctx_length {
+                max_context
+            } else {
+                context_length
+            },
             norm_epsilon,
             vocab_size,
             eos_token,
@@ -441,7 +445,7 @@ pub mod tests {
     fn test_gguf_gemma3_load_model() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
         let mygguf = RawGGUF::new(model_path);
-        let (model, config) = Gemma3::new().with_max_context(2048).parse(&mygguf)?;
+        let (model, config) = Gemma3::new().parse(&mygguf)?;
         assert_eq!(config.num_heads, 4);
         assert_eq!(config.num_block, 18);
         assert_eq!(config.embedding_size, 640);
@@ -1116,7 +1120,7 @@ pub mod safe_tests {
         assert_eq!(config.num_block, 18);
         assert_eq!(config.embedding_size, 640);
         assert_eq!(config.hidden_size, 640);
-        assert_eq!(config.context_length, 32768);
+        assert_eq!(config.context_length, 2048);
         assert_eq!(config.norm_epsilon, 1e-6);
         assert_eq!(config.vocab_size, 262144);
         assert_eq!(config.eos_token, 1usize.into());

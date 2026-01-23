@@ -66,8 +66,9 @@ mod enabled {
     };
     use opentelemetry_otlp::{self, Protocol, SpanExporter, WithExportConfig, WithHttpConfig};
     use opentelemetry_sdk::{
-        Resource, runtime,
+        Resource,
         propagation::TraceContextPropagator,
+        runtime,
         trace::{
             SdkTracer, SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor,
         },

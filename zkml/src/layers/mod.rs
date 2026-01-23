@@ -138,7 +138,7 @@ pub enum LayerCtx<E: ExtensionField> {
     Reshape(ReshapeCtx),
     Embeddings(EmbeddingsCtx),
     Positional(PositionalCtx),
-    AttentionMask(AttentionMaskCtx<E>),
+    AttentionMask(AttentionMaskCtx),
     Logits(LogitsCtx),
 }
 

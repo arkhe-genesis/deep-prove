@@ -1,4 +1,7 @@
-use crate::parser::{Load, llm::models::gpt2::decoder::GPT2Decoder};
+use crate::parser::{
+    Load,
+    llm::models::{LLMModelLoader, gpt2::decoder::GPT2Decoder},
+};
 
 use crate::{
     Shape,
@@ -27,11 +30,28 @@ pub mod decoder;
 /// For more information about GPT2, see
 /// https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
 #[derive(Clone, Debug, Default)]
-pub struct GPT2;
+pub struct GPT2 {
+    /// Current hack to avoid committing to huge positional matrix
+    max_ctx_length: Option<usize>,
+}
 
 impl GPT2 {
     pub fn new() -> Self {
-        GPT2
+        Self::default()
+    }
+}
+
+impl<DataFormat> LLMModelLoader<DataFormat> for GPT2
+where
+    GPT2: ModelLoader<DataFormat, ModelConfig = LLMConfig>,
+{
+    fn with_max_context_length(self, max_ctx_length: usize) -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            max_ctx_length: Some(max_ctx_length),
+        }
     }
 }
 
@@ -77,7 +97,7 @@ impl ModelLoader<RawGGUF> for GPT2 {
 
     fn parse(&self, raw: &RawGGUF) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
         let loader = raw.loader()?;
-        let config = LLMConfig::from_gguf(&loader, "gpt2")?;
+        let config = LLMConfig::from_gguf(&loader, "gpt2", self.max_ctx_length)?;
         let structure = gpt2_structure(&config);
         let model = LLMModel::<GPT2Decoder>::from_loader(&loader, &structure)?;
         // even though the llm runtime doesn't care about the model input shape, which is designed for "static" input shapes, we still
@@ -97,7 +117,7 @@ impl ModelLoader<RawJSON> for GPT2 {
 
     fn parse(&self, raw: &RawJSON) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
         let loader = json::FileTensorLoader::new_from_path(&raw.0)?;
-        let config = LLMConfig::from_json(&loader)?;
+        let config = LLMConfig::from_json(&loader, self.max_ctx_length)?;
         let model = LLMModel::<GPT2Decoder>::from_loader(&loader, &config)?;
         let init_user_shape = Shape::from(vec![1]);
         let model = model.into_provable_model(init_user_shape)?;
@@ -152,7 +172,11 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
             num_heads,
             head_size: hidden_size / num_heads,
             num_block,
-            context_length,
+            context_length: if let Some(max_context) = self.max_ctx_length {
+                max_context
+            } else {
+                context_length
+            },
             norm_epsilon,
             vocab_size,
             eos_token: eos_token.into(),
@@ -264,7 +288,7 @@ pub mod tests {
     fn test_gpt2_load_gguf_tokenizer() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let mygguf = RawGGUF::new(model_path);
-        let tokenizer = GPT2.load_tokenizer(&mygguf)?;
+        let tokenizer = GPT2::new().load_tokenizer(&mygguf)?;
         let s = "do or don't. there is no try.";
         let tokens = tokenizer.tokenize(s);
         let s2 = tokenizer.detokenize(&tokens);
@@ -276,7 +300,7 @@ pub mod tests {
     fn test_gpt2_load_gguf_model() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let mygguf = RawGGUF::new(model_path);
-        let (model, config) = GPT2.parse(&mygguf)?;
+        let (model, config) = GPT2::new().parse(&mygguf)?;
         assert_eq!(config.num_heads, 12);
         assert_eq!(config.num_block, 12);
         assert_eq!(config.embedding_size, 768);
