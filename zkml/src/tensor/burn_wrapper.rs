@@ -1120,8 +1120,9 @@ where
         }
     }
 
+    /// Returns a [WrappedTensor] filled with random data of `shape`.
     pub fn random(shape: &Shape) -> Self {
-        Self::try_from(&Tensor::random(shape)).unwrap()
+        Self::try_from(Tensor::random(shape)).unwrap()
     }
 
     pub fn equal_elem<const D: usize>(
@@ -1714,6 +1715,7 @@ pub trait IntoBTensor {
     type Kind: BTensorKind<Backend> + BasicOps<Backend> + Numeric<Backend>;
 
     fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D, Self::Kind>;
+    fn into_btensor<const D: usize>(self) -> BTensor<Backend, D, Self::Kind>;
 }
 
 impl<T> IntoBTensor for Tensor<T>
@@ -1729,6 +1731,11 @@ where
             &Default::default(),
         )
     }
+
+    fn into_btensor<const D: usize>(self) -> BTensor<Backend, D, Self::Kind> {
+        let Tensor { data, shape, .. } = self;
+        BTensor::from_data(TensorData::new(data, shape), &Default::default())
+    }
 }
 
 /// Tensor parameter type ([`f32`] or [`Element`]/[`i64`])
@@ -1739,50 +1746,6 @@ pub trait TensorTypeParam:
     type Kind: BTensorKind<Backend> + BasicOps<Backend> + Numeric<Backend>;
 
     fn tensor_to_float(tensor: WrappedTensor<Self>) -> WrappedTensor<f32>;
-
-    /// Convert tensor into a wrapper burn tensor
-    fn wrap(tensor: &Tensor<Self>) -> Result<WrappedTensor<Self>>
-    where
-        Self: Sized,
-    {
-        let rank = tensor.rank();
-        let unpadded_shape = tensor.unpadded_shape().clone().into();
-
-        let out = match rank {
-            1 => {
-                let input = tensor.to_btensor::<1>();
-                WrappedTensor::Rank1 {
-                    tensor: input,
-                    unpadded_shape,
-                }
-            }
-            2 => {
-                let input = tensor.to_btensor::<2>();
-                WrappedTensor::Rank2 {
-                    tensor: input,
-                    unpadded_shape,
-                }
-            }
-            3 => {
-                let input = tensor.to_btensor::<3>();
-                WrappedTensor::Rank3 {
-                    tensor: input,
-                    unpadded_shape,
-                }
-            }
-            4 => {
-                let input = tensor.to_btensor::<4>();
-                WrappedTensor::Rank4 {
-                    tensor: input,
-                    unpadded_shape,
-                }
-            }
-            _ => {
-                bail!("Unexpected tensor rank: {rank}")
-            }
-        };
-        Ok(out)
-    }
 }
 
 impl TensorTypeParam for f32 {
@@ -1808,7 +1771,40 @@ where
     type Error = anyhow::Error;
 
     fn try_from(value: &Tensor<T>) -> Result<Self> {
-        <T as TensorTypeParam>::wrap(value)
+        value.clone().try_into()
+    }
+}
+
+impl<T> TryFrom<Tensor<T>> for WrappedTensor<T>
+where
+    T: TensorTypeParam,
+{
+    type Error = anyhow::Error;
+
+    fn try_from(tensor: Tensor<T>) -> Result<Self> {
+        let unpadded_shape = tensor.unpadded_shape().clone().into();
+
+        match tensor.rank() {
+            1 => Ok(WrappedTensor::Rank1 {
+                tensor: tensor.into_btensor::<1>(),
+                unpadded_shape,
+            }),
+            2 => Ok(WrappedTensor::Rank2 {
+                tensor: tensor.into_btensor::<2>(),
+                unpadded_shape,
+            }),
+            3 => Ok(WrappedTensor::Rank3 {
+                tensor: tensor.into_btensor::<3>(),
+                unpadded_shape,
+            }),
+            4 => Ok(WrappedTensor::Rank4 {
+                tensor: tensor.into_btensor::<4>(),
+                unpadded_shape,
+            }),
+            _ => {
+                bail!("Unexpected tensor rank: {}", tensor.rank())
+            }
+        }
     }
 }
 
@@ -1819,6 +1815,19 @@ where
     type Error = anyhow::Error;
 
     fn try_from(tensor: &WrappedTensor<T>) -> Result<Self, Self::Error> {
+        let shape = tensor.shape().into();
+        let data = tensor.get_data();
+        Tensor::<T>::new(shape, data)
+    }
+}
+
+impl<T> TryFrom<WrappedTensor<T>> for Tensor<T>
+where
+    T: TensorTypeParam,
+{
+    type Error = anyhow::Error;
+
+    fn try_from(tensor: WrappedTensor<T>) -> Result<Self, Self::Error> {
         let shape = tensor.shape().into();
         let data = tensor.get_data();
         Tensor::<T>::new(shape, data)
@@ -1850,19 +1859,6 @@ where
     }
 }
 
-impl<T> TryFrom<WrappedTensor<T>> for Tensor<T>
-where
-    T: TensorTypeParam,
-{
-    type Error = anyhow::Error;
-
-    fn try_from(tensor: WrappedTensor<T>) -> Result<Self, Self::Error> {
-        let shape = tensor.shape().into();
-        let data = tensor.get_data();
-        Tensor::<T>::new(shape, data)
-    }
-}
-
 impl<T> TryFrom<&KeyedTensor<T>> for WrappedTensor<T>
 where
     T: TensorTypeParam,
@@ -1870,7 +1866,7 @@ where
     type Error = anyhow::Error;
 
     fn try_from(value: &KeyedTensor<T>) -> Result<Self> {
-        <T as TensorTypeParam>::wrap(&value.tensor)
+        value.tensor().try_into()
     }
 }
 
@@ -1989,7 +1985,7 @@ where
         D: serde::Deserializer<'de>,
     {
         let tensor: Tensor<T> = Tensor::deserialize(deserializer)?;
-        WrappedTensor::try_from(&tensor).map_err(serde::de::Error::custom)
+        WrappedTensor::try_from(tensor).map_err(serde::de::Error::custom)
     }
 }
 

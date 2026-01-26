@@ -1279,7 +1279,7 @@ impl Evaluate<Element> for Convolution<Element> {
         let padded = {
             let mut native = Tensor::try_from(conv_output)?;
             native.pad_to_shape(fft_shape)?;
-            WrappedTensor::try_from(&native)?
+            WrappedTensor::try_from(native)?
         };
 
         let proving_data = ProvingData::Convolution(ConvFFTData {

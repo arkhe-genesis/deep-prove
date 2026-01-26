@@ -57,8 +57,8 @@ mod add_layer {
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let result_scaling = ScalingFactor::from_tensor(&result, None);
 
-        let input = WrappedTensor::try_from(&input.quantize(&input_scaling)).unwrap();
-        let operand = WrappedTensor::try_from(&operand.quantize(&operand_scaling)).unwrap();
+        let input = WrappedTensor::try_from(input.quantize(&input_scaling)).unwrap();
+        let operand = WrappedTensor::try_from(operand.quantize(&operand_scaling)).unwrap();
 
         let layer = layer
             .quantize(&[operand_scaling, input_scaling], result_scaling)
@@ -218,7 +218,7 @@ mod embeddings_layer {
             Some((0, vocab_size as Element)),
         );
 
-        let input = WrappedTensor::try_from(&input.quantize(&scaling)).unwrap();
+        let input = WrappedTensor::try_from(input.quantize(&scaling)).unwrap();
 
         let layer =
             Embeddings::<Element>::new(KeyedTensor::new("embedding_matrix", emb.clone())).unwrap();
@@ -503,7 +503,7 @@ mod norm_layer {
         let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
-        let input = WrappedTensor::try_from(&input).unwrap();
+        let input = WrappedTensor::try_from(input).unwrap();
         let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
 
         // warm up
@@ -564,7 +564,7 @@ mod positional_absolute_layer {
         );
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
-        let input = WrappedTensor::try_from(&input_f32.quantize(&input_scaling)).unwrap();
+        let input = WrappedTensor::try_from(input_f32.quantize(&input_scaling)).unwrap();
 
         let base_layer = Positional::<f32>::new_absolute(pos.clone());
         let input_shapes = vec![Shape::new(vec![size, size])];
@@ -688,7 +688,7 @@ mod positional_rope_layer {
 
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
-        let input = WrappedTensor::try_from(&input_f32.quantize(&input_scaling)).unwrap();
+        let input = WrappedTensor::try_from(input_f32.quantize(&input_scaling)).unwrap();
 
         let num_angles = size / 2;
         let angles: Vec<f32> = (0..num_angles)
@@ -802,7 +802,7 @@ mod softmax_layer {
         let input = Tensor::<Element>::random(&Shape::new(vec![size, size]));
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
-        let input = WrappedTensor::try_from(&input).unwrap();
+        let input = WrappedTensor::try_from(input).unwrap();
         let layer = Softmax::<f32>::new(size)
             .quantise(input_scaling, *quantization::BIT_LEN)
             .expect("Softmax quantise should succeed");

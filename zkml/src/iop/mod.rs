@@ -183,7 +183,7 @@ pub(crate) fn compute_claim<E: ExtensionField, T: Transcript<E>>(
     tensor: Tensor<E>,
 ) -> Claim<E> {
     // Derive the first randomness
-    let r_i = transcript.read_challenges(tensor.num_vars());
+    let r_i = transcript.read_challenges(tensor.shape().num_vars().iter().sum());
     let y_i = tensor.into_mle().evaluate(&r_i);
     Claim {
         point: r_i,

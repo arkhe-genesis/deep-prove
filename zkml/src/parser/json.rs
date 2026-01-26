@@ -25,7 +25,7 @@ impl ModelNameProvider for RawJSON {
 /// Generic helper function to unfuse a tensor's data into multiple chunks.
 /// Expects the input tensor `fused_tensor` (crate::Tensor<f32>) to contain flat data.
 pub fn unfuse_crate_tensors(
-    fused_tensor: Tensor<f32>,
+    fused_tensor: &Tensor<f32>,
     expected_chunk_len_elements: usize,
     num_chunks: usize,
 ) -> anyhow::Result<Vec<Vec<f32>>> {

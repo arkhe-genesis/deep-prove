@@ -1039,6 +1039,7 @@ mod test {
         Element,
         layers::Layer,
         model::{Model, test::prove_model},
+        tensor::IntoBTensor,
     };
 
     use super::*;
@@ -1131,7 +1132,7 @@ mod test {
             let shape = Shape::new(vec![size]);
             let tensor = Tensor::<f32>::random(&shape);
 
-            let btensor = tensor.clone().to_btensor::<1>();
+            let btensor = tensor.to_btensor::<1>();
             let data = gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
             let resultb = Tensor::<f32>::new(shape.clone(), data).unwrap();
 

@@ -404,7 +404,7 @@ impl Evaluate<Element> for RMSNorm<Element> {
                 if let Some(alpha) = self.alpha.as_ref() {
                     chunk
                         .iter()
-                        .zip(alpha.iter())
+                        .zip(alpha.data())
                         .map(|(&v, &alpha)| alpha * v * denominator)
                         .collect::<Vec<Element>>()
                 } else {
@@ -417,7 +417,7 @@ impl Evaluate<Element> for RMSNorm<Element> {
             .collect::<Vec<Element>>();
 
         let output_tensor =
-            WrappedTensor::try_from(&Tensor::<Element>::new(input.shape().into(), output_data)?)?;
+            WrappedTensor::try_from(Tensor::new(input.shape().into(), output_data)?)?;
         Ok(LayerOut::from_tensor(output_tensor))
     }
 }

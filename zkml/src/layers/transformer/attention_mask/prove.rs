@@ -37,7 +37,7 @@ fn fix_mle_rec<E: ExtensionField, const FIX_ROW: bool>(
     );
 }
 
-/// Optimized algorithm to fix the row variables of the MLE for the lower traingular matrix L
+/// Optimized algorithm to fix the row variables of the MLE for the lower triangular matrix L
 #[cfg(test)]
 pub(crate) fn fix_lower_mle_rows<E: ExtensionField>(row_point: &[E]) -> Vec<E> {
     let mut evals = vec![E::ZERO; 1 << row_point.len()];
@@ -45,7 +45,7 @@ pub(crate) fn fix_lower_mle_rows<E: ExtensionField>(row_point: &[E]) -> Vec<E> {
     evals
 }
 
-/// Optimized algorithm to fix the column variables of the MLE for the lower traingular matrix L
+/// Optimized algorithm to fix the column variables of the MLE for the lower triangular matrix L
 pub(crate) fn fix_lower_mle_columns<E: ExtensionField>(column_point: &[E]) -> Vec<E> {
     let mut evals = vec![E::ZERO; 1 << column_point.len()];
     fix_mle_rec::<E, false>(&mut evals, column_point, E::ONE, 0, 0);
@@ -325,11 +325,12 @@ impl<E: ExtensionField> MaskProvingData<E> {
         let chunk_size = second_to_last_dim * final_dim;
 
         let input_polys = unpadded_input
-            .get_data_into()
+            .data()
             .chunks(chunk_size)
             .map(|chunk| {
-                Tensor::<E>::new(vec![second_to_last_dim, final_dim].into(), chunk.to_vec())
-                    .map(|t| t.pad_next_power_of_two().get_data_into())
+                let tensor =
+                    Tensor::<E>::new(vec![second_to_last_dim, final_dim].into(), chunk.to_vec())?;
+                Ok(tensor.pad_next_power_of_two().into_data())
             })
             .collect::<Result<Vec<Vec<E>>>>()?;
 

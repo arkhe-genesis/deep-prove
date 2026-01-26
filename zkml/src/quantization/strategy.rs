@@ -140,7 +140,7 @@ impl ScalingStrategy for InferenceObserver {
                 .enumerate()
                 .map(|(i, (input_tensor, unpadded_shape))| {
                     let input_node_id = model.graph().input_node_id(i)?;
-                    let wrapped_tensor = WrappedTensor::try_from(&input_tensor)?;
+                    let wrapped_tensor = WrappedTensor::try_from(input_tensor)?;
                     let handle = TensorHandle::WrappedTensor {
                         storage_key: input_node_id.output_at(0).to_storage_key(),
                         store: store.clone(),

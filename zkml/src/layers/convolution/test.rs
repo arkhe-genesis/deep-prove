@@ -72,22 +72,34 @@ fn test_clear_garbage() {
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![1, 1, 2]);
     let tensor = Tensor::new(padded_shape, vec![1, 2]).unwrap();
-    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0]);
+    assert_eq!(
+        clear_garbage(&tensor, &shape).unwrap().data().as_slice(),
+        [1, 0],
+    );
 
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![1, 2, 1]);
     let tensor = Tensor::new(padded_shape, vec![1, 2]).unwrap();
-    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0]);
+    assert_eq!(
+        clear_garbage(&tensor, &shape).unwrap().data().as_slice(),
+        [1, 0],
+    );
 
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![2, 1, 1]);
     let tensor = Tensor::new(padded_shape, vec![1, 2]).unwrap();
-    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0]);
+    assert_eq!(
+        clear_garbage(&tensor, &shape).unwrap().data().as_slice(),
+        [1, 0],
+    );
 
     let shape = Shape::new(vec![1, 1, 1]);
     let padded_shape = Shape::new(vec![1, 2, 2]);
     let tensor = Tensor::new(padded_shape, vec![1, 2, 3, 4]).unwrap();
-    assert_eq!(clear_garbage(&tensor, &shape).unwrap().data(), [1, 0, 0, 0]);
+    assert_eq!(
+        clear_garbage(&tensor, &shape).unwrap().data().as_slice(),
+        [1, 0, 0, 0],
+    );
 }
 
 #[test]

@@ -237,9 +237,10 @@ fn modify_einsum(einsum: &mut EinSum<f32>) -> Result<()> {
         if let Some(tensor) = opt_tensor {
             *tensor = tensor.try_new_map_tensor(|bias_tensor| {
                 let bias_shape = bias_tensor.shape();
-                let bias_sum = bias_tensor.iter().sum::<f32>();
+                let bias_sum = bias_tensor.data().iter().sum::<f32>();
                 let bias_mean = bias_sum / bias_shape.numel() as f32;
                 let new_bias_data = bias_tensor
+                    .data()
                     .iter()
                     .map(|x| x - bias_mean)
                     .collect::<Vec<f32>>();
@@ -334,7 +335,7 @@ fn mean_subtracted_tensor(tensor: &Tensor<f32>, dim: usize) -> Result<Tensor<f32
 
     let einsum = EinSum::<f32>::new(equation, vec![None], vec![None])?;
     let wrapped = WrappedTensor::try_from(tensor)?;
-    let wrapped_mean = WrappedTensor::try_from(&subtract_mean_tensor)?;
+    let wrapped_mean = WrappedTensor::try_from(subtract_mean_tensor)?;
     let mut output = einsum.evaluate_internal(&[&wrapped, &wrapped_mean])?;
 
     let out = output.remove(0);
@@ -369,7 +370,7 @@ fn rescale_einsum(
 ) -> Result<EinSum<f32>> {
     einsum.reset_caches();
 
-    let wrapped_bias = WrappedTensor::try_from(&bias.tensor())?.unsqueeze_dim(0)?;
+    let wrapped_bias = WrappedTensor::try_from(bias)?.unsqueeze_dim(0)?;
 
     let new_biases = einsum.evaluate_internal(&[&wrapped_bias])?;
     let biases = einsum
@@ -427,7 +428,7 @@ fn rescale_einsum(
                     let wrapped_t = WrappedTensor::try_from(t)?;
                     let to_cat = wrapped_t
                         .iter_dim(dim)
-                        .zip(scales.iter())
+                        .zip(scales.data())
                         .map(|(dim_chunk, &scale)| dim_chunk.mul_scalar(scale))
                         .collect::<Vec<WrappedTensor<f32>>>();
                     let cat_tensor = WrappedTensor::cat(to_cat, dim)?;

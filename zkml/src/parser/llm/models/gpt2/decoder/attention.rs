@@ -470,7 +470,7 @@ impl Load<JSONLoader> for GPT2Attention {
         let bias_chunk_elements = hidden_size;
         let fused_qvk_bias_key = fused_qkv_bias.key.clone();
         let mut unfused_biases_data =
-            unfuse_crate_tensors(fused_qkv_bias.into_tensor(), bias_chunk_elements, 3)
+            unfuse_crate_tensors(fused_qkv_bias.tensor(), bias_chunk_elements, 3)
                 .context("Failed to unfuse QKV biases in from_json")?;
 
         let q_bias = KeyedTensor::new(

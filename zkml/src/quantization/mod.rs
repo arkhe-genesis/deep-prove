@@ -188,10 +188,10 @@ pub fn split_scale_into_multiplier(s: f32) -> (i32, f32) {
 pub fn model_scaling_factor_from_tensor_and_bias(
     input: &ScalingFactor,
     main: &Tensor<f32>,
-    bias: &Option<Tensor<f32>>,
+    bias: Option<&Tensor<f32>>,
 ) -> (ScalingFactor, ScalingFactor) {
     let max_weight = main.max_abs_output();
-    let max_bias = bias.as_ref().map(|bias| bias.max_abs_output());
+    let max_bias = bias.map(|bias| bias.max_abs_output());
     let max_value = if let Some(max_bias) = max_bias {
         max_weight.max(max_bias)
     } else {

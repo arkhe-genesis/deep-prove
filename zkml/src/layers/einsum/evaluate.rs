@@ -558,8 +558,8 @@ mod tests {
                 .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
-            let a_burn = a.to_btensor::<2>();
-            let b_burn = b.to_btensor::<2>();
+            let a_burn = a.into_btensor::<2>();
+            let b_burn = b.into_btensor::<2>();
             let expected_burn = a_burn.matmul(b_burn);
 
             let burn_data: Vec<N> = expected_burn
@@ -569,8 +569,8 @@ mod tests {
             let expected = Tensor::new(c_shape.clone(), burn_data).unwrap();
             let output = Tensor::new(c_shape, output[0].clone().get_data()).unwrap();
             assert_eq!(
-                output.clone().get_data_into(),
-                expected.clone().get_data_into(),
+                output.data(),
+                expected.data(),
                 "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {output}, Expected: {expected}",
             );
         }
@@ -611,11 +611,11 @@ mod tests {
                 .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
-            let a_burn = a.to_btensor::<2>();
-            let b_burn = b.to_btensor::<2>();
+            let a_burn = a.into_btensor::<2>();
+            let b_burn = b.into_btensor::<2>();
             let expected_burn_matmul = a_burn.matmul(b_burn);
 
-            let burn_bias = bias.to_btensor::<1>().unsqueeze::<2>();
+            let burn_bias = bias.into_btensor::<1>().unsqueeze::<2>();
             let expected_burn = expected_burn_matmul.add(burn_bias);
 
             let burn_data: Vec<N> = expected_burn
@@ -625,8 +625,8 @@ mod tests {
             let expected = Tensor::new(c_shape.clone(), burn_data).unwrap();
             let output = Tensor::new(c_shape, output[0].clone().get_data()).unwrap();
             assert_eq!(
-                output.clone().get_data_into(),
-                expected.clone().get_data_into(),
+                output.data(),
+                expected.data(),
                 "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {output}, Expected: {expected}",
             );
         }
@@ -663,8 +663,8 @@ mod tests {
                 .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
-            let a_burn = a.to_btensor::<3>();
-            let b_burn = b.to_btensor::<3>();
+            let a_burn = a.into_btensor::<3>();
+            let b_burn = b.into_btensor::<3>();
             let expected_burn_vec = a_burn
                 .iter_dim(0)
                 .zip(b_burn.iter_dim(0))
@@ -679,8 +679,8 @@ mod tests {
             let expected = Tensor::new(c_shape.clone(), burn_data).unwrap();
             let output = Tensor::new(c_shape, output[0].clone().get_data()).unwrap();
             assert_eq!(
-                output.clone().get_data_into(),
-                expected.clone().get_data_into(),
+                output.data(),
+                expected.data(),
                 "Failed for shapes A: {a_shape:?}, B: {b_shape:?}, Calculated: {output}, Expected: {expected}",
             );
         }
@@ -723,9 +723,9 @@ mod tests {
                 .evaluate_internal(&[&a.as_wrapped(), &b.as_wrapped(), &c.as_wrapped()])
                 .expect("Failed to evaluate EinSum layer");
 
-            let a_burn = a.to_btensor::<3>();
-            let b_burn = b.to_btensor::<3>();
-            let c_burn = c.to_btensor::<3>();
+            let a_burn = a.into_btensor::<3>();
+            let b_burn = b.into_btensor::<3>();
+            let c_burn = c.into_btensor::<3>();
 
             // The first output is D(xac) which is a standard batched matmul of A and B
             let expected_d_burn_vec = a_burn
@@ -759,8 +759,8 @@ mod tests {
                 let expected = Tensor::new(shape.clone(), burn_data).unwrap();
                 let output = Tensor::new(shape, output.clone().get_data()).unwrap();
                 assert_eq!(
-                    output.clone().get_data_into(),
-                    expected.clone().get_data_into(),
+                    output.data(),
+                    expected.data(),
                     "Failed for output {i} shapes A: {a_shape:?}, B: {b_shape:?}, C: {c_shape:?}, Calculated: {output}, Expected: {expected}"
                 );
             }
@@ -821,10 +821,10 @@ mod tests {
                 .expect("Failed to evaluate EinSum layer");
 
             // Manually compute the expected output
-            let x_burn = x.to_btensor::<2>();
-            let wq_burn = wq.to_btensor::<3>();
-            let wk_burn = wk.to_btensor::<2>();
-            let wv_burn = wv.to_btensor::<2>();
+            let x_burn = x.into_btensor::<2>();
+            let wq_burn = wq.into_btensor::<3>();
+            let wk_burn = wk.into_btensor::<2>();
+            let wv_burn = wv.into_btensor::<2>();
 
             // First compute X @ WQ to get Q
             let q_burn_vec = wq_burn
@@ -987,7 +987,7 @@ mod tests {
             let k_burn = k.to_btensor::<3>();
 
             let calc_expected_output = |q: Tensor<N>| -> Vec<N> {
-                let q_burn = q.to_btensor::<4>();
+                let q_burn = q.into_btensor::<4>();
                 let expected_burn_vec = q_burn
                     .iter_dim(0)
                     .map(|q_head| {

@@ -82,7 +82,7 @@ impl EinSum<f32> {
                     let (weight_scaling, bias_scaling) = model_scaling_factor_from_tensor_and_bias(
                         &lhs_input_scaling,
                         weight_tensor,
-                        &bias_opt.clone().map(|t| t.tensor()),
+                        bias_opt.as_ref().map(|t| t.tensor()),
                     );
                     let quantized_weight = weight_tensor
                         .clone()

@@ -114,15 +114,14 @@ impl<T> KeyedTensor<T> {
         (&self.key).into()
     }
 
+    /// Consumes the [KeyedTensor] and returns the internal [Tensor].
     pub fn into_tensor(self) -> Tensor<T> {
         self.tensor
     }
 
-    pub fn tensor(&self) -> Tensor<T>
-    where
-        T: Clone,
-    {
-        self.tensor.clone()
+    /// Returns a reference to the internal [Tensor].
+    pub fn tensor(&self) -> &Tensor<T> {
+        &self.tensor
     }
 
     pub fn map_tensor<U>(self, f: impl FnOnce(Tensor<T>) -> Tensor<U>) -> KeyedTensor<U> {
@@ -837,33 +836,13 @@ impl<T> Tensor<T> {
     }
 
     /// Return an immutable reference to this tensor data.
-    pub fn data(&self) -> &[T] {
-        &self.data
-    }
-
-    /// Return an immutable reference to this tensor data.
-    pub fn data_vec(&self) -> &Vec<T> {
+    pub fn data(&self) -> &Vec<T> {
         &self.data
     }
 
     /// Consume this tensore, returning its backing.
     pub fn into_data(self) -> Vec<T> {
         self.data
-    }
-
-    /// Return the number of elements contained in this tensor, independently of
-    /// its shape.
-    pub fn data_size(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn num_vars(&self) -> usize {
-        self.shape.num_vars().iter().sum()
-    }
-
-    /// Iterates over the data in the tensor
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.data.iter()
     }
 
     /// Mutable Iterator over the data in the tensor
@@ -1042,11 +1021,6 @@ impl<T> Tensor<T> {
         &self.data
     }
 
-    /// Consumes the tensor and return its data.
-    pub fn get_data_into(self) -> Vec<T> {
-        self.data
-    }
-
     /// Returns the size of the given dimension.
     ///
     /// # Panics
@@ -1192,13 +1166,6 @@ impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
     }
 }
 
-impl Tensor<f32> {
-    /// Consumes this tensor and creates a [burn::tensor::Tensor].
-    pub fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D> {
-        IntoBTensor::to_btensor(self)
-    }
-}
-
 impl<T: Clone> Tensor<T> {
     pub fn to_flatten(&self) -> Self {
         let new_data = self.get_data().to_vec();
@@ -1327,7 +1294,7 @@ impl<T: Number> Tensor<T> {
     /// # use zkml::{Tensor, Shape, Element};
     /// let shape = Shape::new(vec![2, 2]);
     /// let tensor = Tensor::<Element>::one(shape);
-    /// assert_eq!(tensor.data(), [1, 1, 1, 1]);
+    /// assert_eq!(tensor.data().as_slice(), [1, 1, 1, 1]);
     /// ```
     pub fn one(shape: Shape) -> Self {
         Tensor {
@@ -2934,7 +2901,7 @@ mod test {
             "Tensor padding to next power of two failed."
         );
         assert_eq!(
-            new_tensor.data(),
+            new_tensor.data().as_slice(),
             [1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 0, 0, 0, 0],
             "Tensor padding to next power of two failed."
         );
@@ -2948,7 +2915,7 @@ mod test {
             "Tensor padding to next power of two failed."
         );
         assert_eq!(
-            new_tensor.data(),
+            new_tensor.data().as_slice(),
             [1, 2, 1, 2, 1, 2, 0, 0],
             "Tensor padding to next power of two failed."
         );
@@ -2968,7 +2935,7 @@ mod test {
             "Tensor padding to next power of two failed."
         );
         assert_eq!(
-            new_tensor.data(),
+            new_tensor.data().as_slice(),
             [
                 1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 0, 0, 0, 0, 0, 11, 11, 11, 0, 12, 12, 12, 0, 13,
                 13, 13, 0, 0, 0, 0, 0,

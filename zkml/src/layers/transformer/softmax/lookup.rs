@@ -196,7 +196,7 @@ impl Softmax<Element> {
                 Tensor::<Element>::new(shape_2d.clone(), chunk.to_vec())
                     .expect("Failed to create chunk tensor in SOftmax witness gen")
                     .pad_next_power_of_two_with_value(negative_infinity)
-                    .get_data_into()
+                    .into_data()
             })
             .collect::<Vec<Vec<Element>>>();
 
@@ -204,7 +204,7 @@ impl Softmax<Element> {
         // These are the sums of the rows after Softmax, we check that these are all within the allowable error of quantised 1.0.
         let unpadded_output = output.reduce_to_shape(unpadded_input_shape)?;
         let normalisation_lookups = unpadded_output
-            .get_data_into()
+            .data()
             .chunks(chunk_size)
             .map(|outer_chunk| {
                 let num_repeats = final_dim_size.next_power_of_two() - final_dim_size;

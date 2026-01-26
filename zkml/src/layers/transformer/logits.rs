@@ -545,7 +545,7 @@ where
         // build one-hot encoded output matrix
         let mut one_hot_output = vec![E::BaseField::ZERO; input_shape.product()];
 
-        for (i, out) in outputs[0].iter().cloned().enumerate() {
+        for (i, out) in outputs[0].data().iter().cloned().enumerate() {
             let out = out as usize;
             let index = i * input_shape.dim(input_shape.rank() - 1) + out;
             one_hot_output[index] = E::BaseField::ONE;

@@ -105,11 +105,10 @@ impl<N> Absolute<N> {
 
         let is_padded = input.is_padded();
 
-        let sub_bt = WrappedTensor::try_from(
-            &self
-                .positional
-                .slice_2d(past_length, past_length + input.unpadded_shape().dims[0])?,
-        )?;
+        let sliced = self
+            .positional
+            .slice_2d(past_length, past_length + input.unpadded_shape().dims[0])?;
+        let sub_bt = WrappedTensor::try_from(sliced)?;
 
         let sub_bt = if is_padded {
             sub_bt.pad_next_power_of_two()
