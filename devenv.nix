@@ -27,6 +27,19 @@ in
     # Python dependencies
     pkgs.zlib
     pkgs.openblas
+    pkgs.python3Packages.datasets
+    pkgs.python3Packages.gguf
+    pkgs.python3Packages.huggingface-hub
+    pkgs.python3Packages.matplotlib
+    pkgs.python3Packages.nltk
+    pkgs.python3Packages.numpy
+    pkgs.python3Packages.onnx
+    pkgs.python3Packages.pandas
+    pkgs.python3Packages.psutil
+    pkgs.python3Packages.scikit-learn
+    pkgs.python3Packages.tabulate
+    pkgs.python3Packages.tqdm
+    pkgs.python3Packages.transformers
   ];
 
   env = {
@@ -54,27 +67,16 @@ in
     channel = "nightly";
     version = "2025-08-08";
     mold.enable = pkgs.stdenv.isLinux;
+    rustflags = "--cfg tokio_unstable"; # Needed for metrics
   };
   languages.python = {
     enable = true;
     venv.enable = true;
+    # More recent torch ends up in SIGFPE when evaluating Gemma3
     venv.requirements = ''
-    datasets
-    gguf[gui]
-    huggingface_hub
-    matplotlib
-    nltk
-    numpy
-    onnx
-    psutil
-    pandas
-    scikit-learn
-    tabulate
-    torch
+    torch == 2.7.1
     torchmetrics
     torchvision
-    tqdm
-    transformers
     '';
   };
 

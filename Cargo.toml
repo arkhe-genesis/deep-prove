@@ -1,5 +1,5 @@
 [workspace]
-members = ["zkml", "deep-prove", "utils", "tenvis", "telemetry"]
+members = ["zkml", "deep-prove", "utils", "tenstore", "tenvis", "telemetry", "io-copy", "remote-store"]
 resolver = "2"
 
 [workspace.package]
@@ -12,6 +12,11 @@ repository = "https://github.com/LagrangeLabs/deep-prove"
 version = "1.0.1"
 
 [workspace.dependencies]
+io-copy = { path = "io-copy" }
+remote-store = { path = "remote-store" }
+tenstore = { path = "tenstore" }
+zkml = { path = "zkml" }
+
 anyhow = { version = "1.0", default-features = false }
 ark-std = "0.5"
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
@@ -37,13 +42,17 @@ semver = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
+test-log = "0.2"
 thiserror = "2.0.12"
 timed = { git = "https://github.com/nikkolasg/timed-rs" }
 timed-core = { git = "https://github.com/nikkolasg/timed-rs" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio-metrics = "0.4.6"
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tract-onnx = "0.21"
 ureq = { version = "3.1.2", features = ["default", "json"] }
+vise = "0.3.2"
 
 ceno-p3 = { package = "p3", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 ff_ext = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
@@ -51,6 +60,7 @@ mpcs = { package = "mpcs", git = "https://github.com/Lagrange-Labs/gkr-backend",
 multilinear_extensions = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 sumcheck = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 transcript = { git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
+uuid = { version = "1.17.0", features = ["v4"] }
 witness = { package = "witness", git = "https://github.com/Lagrange-Labs/gkr-backend", branch = "deep-prove-extra-features" }
 
 # Test must run fast, but still provides stacktraces.

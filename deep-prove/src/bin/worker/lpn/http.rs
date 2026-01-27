@@ -6,6 +6,7 @@ use deep_prove::middleware::{v1, v2};
 use exponential_backoff::Backoff;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tenstore::GenStore;
 use tracing::{debug, error, info, info_span, warn};
 use url::Url;
 use zkml::quantization::ScalingStrategyKind;
@@ -192,6 +193,7 @@ impl ConnContext {
 async fn process_job(
     job: v2::GwToWorker,
     store: &mut StoreKind,
+    tenstore: GenStore,
     fetcher: &ModelFetcher,
 ) -> anyhow::Result<Vec<u8>> {
     let span = info_span!("process_job", proof_id = job.job_id, s3_key = %job.s3_key);
@@ -213,12 +215,12 @@ async fn process_job(
         StoreKind::S3(store) => {
             let span = tracing::info_span!("dp_worker_prove_inference", proof_id = %job.job_id);
             let _entered = span.enter();
-            crate::run_model_v1(request, store.clone(), job.job_id.to_string()).await
+            crate::run_model_v1(request, store.clone(), tenstore, job.job_id.to_string()).await
         }
         StoreKind::Mem(store) => {
             let span = tracing::info_span!("dp_worker_prove_inference", proof_id = %job.job_id);
             let _entered = span.enter();
-            crate::run_model_v1(request, store.clone(), job.job_id.to_string()).await
+            crate::run_model_v1(request, store.clone(), tenstore, job.job_id.to_string()).await
         }
     };
 
@@ -231,7 +233,7 @@ async fn process_job(
     }
 }
 
-pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
+pub async fn run(args: crate::RunMode, tenstore: GenStore) -> anyhow::Result<()> {
     let RunMode::Http {
         gw_url,
         address,
@@ -270,6 +272,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
     let conn = ConnContext::new(gw_url, worker_name, address, max_job_size);
 
     loop {
+        let job_tenstore = tenstore.start_new_run();
         // 1. Request job from the GW
         debug!("waiting for task from gateway");
         let response = match conn.request_job() {
@@ -321,7 +324,7 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
         }
 
         // 4. Process job & submit proof
-        match process_job(job, &mut store, &model_fetcher).await {
+        match process_job(job, &mut store, job_tenstore.clone(), &model_fetcher).await {
             Ok(proof) => {
                 conn.submit_proof(job_id, &proof)
                     .context("submitting proofs to gateway")?;
@@ -332,6 +335,9 @@ pub async fn run(args: crate::RunMode) -> anyhow::Result<()> {
                     .context("submitting error to gateway")?;
                 info!("submitted error for job #{job_id}");
             }
+        }
+        if let Err(err) = job_tenstore.clean_up() {
+            error!("failed to clean-up tensor store: {err:?}");
         }
     }
 }

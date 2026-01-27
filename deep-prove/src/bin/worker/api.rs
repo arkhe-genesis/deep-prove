@@ -19,6 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use deep_prove::{middleware::v1::DeepProveRequest as DeepProveRequestV1, store::MemStore};
+use tenstore::GenStore;
 use tokio::sync::Mutex;
 use tracing::{error, info, info_span, trace};
 
@@ -30,7 +31,7 @@ struct AppState {
 
 /// Expose a long-lived local HTTP API, executing submitted proofs and returning
 /// ready proofs on request.
-pub async fn serve(args: RunMode) -> anyhow::Result<()> {
+pub async fn serve(args: RunMode, tenstore: GenStore) -> anyhow::Result<()> {
     let RunMode::LocalApi {
         port,
         json,
@@ -83,9 +84,14 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
                     let _entered = request_span.enter();
                     let now = std::time::Instant::now();
                     info!("processing proof...");
-                    let result =
-                        crate::run_model_v1(proof_request, store.clone(), "api-local".to_string())
-                            .await;
+                    let job_tenstore = tenstore.start_new_run();
+                    let result = crate::run_model_v1(
+                        proof_request,
+                        store.clone(),
+                        job_tenstore.clone(),
+                        "api-local".to_string(),
+                    )
+                    .await;
                     match result {
                         Ok(output) => {
                             info!("proof generated in {}s", now.elapsed().as_secs());
@@ -96,6 +102,9 @@ pub async fn serve(args: RunMode) -> anyhow::Result<()> {
                             );
                         }
                         Err(err) => error!("failed to generate proof: {err:?}"),
+                    }
+                    if let Err(err) = job_tenstore.clean_up() {
+                        error!("failed to clean-up tensor store: {err:?}");
                     }
                 } else {
                     trace!("no proof request");

@@ -9,6 +9,7 @@ use ff_ext::GoldilocksExt2;
 use memmap2::Mmap;
 use mpcs::{Basefold, BasefoldRSParams};
 use tempfile::Builder;
+use tenstore::GenStore;
 use tracing::info;
 use zkml::{
     Element, Number,
@@ -38,7 +39,7 @@ type Pcs = Basefold<F, BasefoldRSParams>;
 
 /// Run the prover once, directly feeding it the required inputs. The proofs are
 /// written to a file.
-pub async fn run(args: RunMode) -> anyhow::Result<()> {
+pub async fn run(args: RunMode, tenstore: GenStore) -> anyhow::Result<()> {
     let RunMode::OneShot {
         model,
         model_format,
@@ -55,9 +56,15 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
     let _telemetry_guard = telemetry::setup_logging("deep-prove-worker", false);
 
     match model_format {
-        ModelFormat::Onnx => run_one_shot_onnx(model, inputs).await,
+        ModelFormat::Onnx => run_one_shot_onnx(model, inputs, tenstore).await,
         ModelFormat::Gguf => {
-            run_one_shot_llm(LlmModel::Gguf { model_path: model }, prompt, max_new_tokens).await
+            run_one_shot_llm(
+                LlmModel::Gguf { model_path: model },
+                prompt,
+                max_new_tokens,
+                tenstore,
+            )
+            .await
         }
         ModelFormat::Safetensors => {
             run_one_shot_llm(
@@ -68,13 +75,18 @@ pub async fn run(args: RunMode) -> anyhow::Result<()> {
                 },
                 prompt,
                 max_new_tokens,
+                tenstore,
             )
             .await
         }
     }
 }
 
-async fn run_one_shot_onnx(model: PathBuf, inputs: Option<PathBuf>) -> anyhow::Result<()> {
+async fn run_one_shot_onnx(
+    model: PathBuf,
+    inputs: Option<PathBuf>,
+    tenstore: GenStore,
+) -> anyhow::Result<()> {
     let request_span = tracing::info_span!("dp_worker_prove_inference", proof_id = %"one-shot");
     let _entered = request_span.enter();
     let inputs =
@@ -97,7 +109,7 @@ async fn run_one_shot_onnx(model: PathBuf, inputs: Option<PathBuf>) -> anyhow::R
         scaling_input_hash,
     };
     let store = MemStore::default();
-    let proofs = crate::run_model_v1(request, store, "one-shot-onnx".to_string()).await?;
+    let proofs = crate::run_model_v1(request, store, tenstore, "one-shot-onnx".to_string()).await?;
 
     // create a file to write the proofs to
     let file = tempfile::Builder::new()
@@ -128,6 +140,7 @@ async fn run_one_shot_llm(
     model: LlmModel,
     prompt: Option<String>,
     max_new_tokens: usize,
+    mut tenstore: GenStore,
 ) -> anyhow::Result<()> {
     let request_span = tracing::info_span!("dp_worker_prove_inference", proof_id = %"one-shot-llm");
     let _entered = request_span.enter();
@@ -147,9 +160,8 @@ async fn run_one_shot_llm(
         .context("generating contexts for LLM")?
         .with_max_context(max_context);
 
-    let mut store = tenstore::GenStore::default();
     let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
-    let trace = driver.run_elements(input_tensor, &mut store)?;
+    let trace = driver.run_elements(input_tensor, &mut tenstore)?;
     let io = trace.to_verifier_io()?;
     let proof = driver.prove(&prover_ctx, trace.clone())?;
     let llm_proof = LLMProof { proof, io };

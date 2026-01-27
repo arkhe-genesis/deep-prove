@@ -7,7 +7,8 @@ use deep_prove::{
     },
     store::{self, MemStore, S3Store, Store},
 };
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
+use tenstore::GenStore;
 use tracing::{Span, debug, info};
 use url::Url;
 use zkml::{
@@ -26,7 +27,8 @@ mod lpn;
 /// list of inputs.
 async fn run_model_v1<S: Store>(
     model: DeepProveRequestV1,
-    mut store: S,
+    mut model_data_store: S,
+    mut tenstore: GenStore,
     proof_id: String,
 ) -> Result<Vec<v1::Output>> {
     info!("Proving inference");
@@ -58,7 +60,7 @@ async fn run_model_v1<S: Store>(
         scaling_input_hash,
     };
 
-    let params = store
+    let params = model_data_store
         .get_params(&params_key)
         .await
         .context("fetching PPs")?;
@@ -66,7 +68,7 @@ async fn run_model_v1<S: Store>(
     let store::ScaledModel {
         model,
         model_metadata,
-    } = store
+    } = model_data_store
         .clone()
         .get_or_init_model_with(&model_key, || async move {
             let parse_model_span = Span::current();
@@ -116,7 +118,7 @@ async fn run_model_v1<S: Store>(
 
     let (prover_ctx, verifier_ctx) = if !is_stored_params {
         // Since prover_ctx is not `Clone` we store and then retrieve the params
-        store
+        model_data_store
             .insert_params(
                 &params_key,
                 store::Params {
@@ -128,7 +130,7 @@ async fn run_model_v1<S: Store>(
             .context("storing PPs")?;
         info!("Stored generated proving parameters for reuse");
 
-        let store::Params { prover, verifier } = store
+        let store::Params { prover, verifier } = model_data_store
             .get_params(&params_key)
             .await
             .context("fetching PPs after storing")?
@@ -150,10 +152,7 @@ async fn run_model_v1<S: Store>(
                 .context("loading flat inputs")?;
 
             let trace = model
-                .run(
-                    input_tensors,
-                    &mut tenstore::GenStore::new_temporary(1000 * 1024 * 1024)?,
-                )
+                .run(input_tensors, &mut tenstore)
                 .context(format!("Running inference for input {}", i + 1))?;
             let output_handles = trace.outputs();
             let outputs = output_handles
@@ -195,6 +194,22 @@ fn parse_model(bytes: &[u8]) -> anyhow::Result<(Model<Element>, ModelMetadata)> 
 struct Args {
     #[command(subcommand)]
     run_mode: RunMode,
+
+    /// Tensor store kind. One of: temporary, local, remote
+    #[arg(long, value_enum, required = true)]
+    tensor_store: TenStoreKind,
+
+    /// Tensor store in-memory cache size in bytes. Defaults to 1 MiB
+    #[arg(long, default_value = "1048576")]
+    store_cache_size: usize,
+
+    /// Tensor store file-system cache root dir
+    #[arg(long)]
+    store_root_dir: Option<PathBuf>,
+
+    /// Tensor remote store server address.
+    #[arg(long)]
+    store_server_addr: Option<SocketAddr>,
 }
 
 #[derive(clap::Args)]
@@ -328,11 +343,31 @@ enum RunMode {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    match args.run_mode {
-        local_args @ RunMode::OneShot { .. } => immediate::run(local_args).await,
-        api_args @ RunMode::LocalApi { .. } => api::serve(api_args).await,
-        http_args @ RunMode::Http { .. } => lpn::http::run(http_args).await,
+    let Args {
+        run_mode,
+        tensor_store,
+        store_cache_size,
+        store_root_dir,
+        store_server_addr,
+    } = Args::parse();
+
+    let tenstore = match tensor_store {
+        TenStoreKind::Temporary => GenStore::new_temporary(store_cache_size),
+        TenStoreKind::Local => GenStore::new_local(
+            store_root_dir.context("Must specify cache dir for local store")?,
+            store_cache_size,
+        ),
+        TenStoreKind::Remote => GenStore::new_remote(
+            store_root_dir.context("Must specify cache dir for local store")?,
+            store_cache_size,
+            store_server_addr.context("Must server address for remote store")?,
+        ),
+    }?;
+
+    match run_mode {
+        local_args @ RunMode::OneShot { .. } => immediate::run(local_args, tenstore).await,
+        api_args @ RunMode::LocalApi { .. } => api::serve(api_args, tenstore).await,
+        http_args @ RunMode::Http { .. } => lpn::http::run(http_args, tenstore).await,
     }
 }
 
@@ -347,4 +382,12 @@ pub enum ModelFormat {
     Onnx,
     Gguf,
     Safetensors,
+}
+
+/// Tensor store kind
+#[derive(Copy, Clone, clap::ValueEnum)]
+enum TenStoreKind {
+    Temporary,
+    Local,
+    Remote,
 }

@@ -213,7 +213,7 @@ def get_wikitext_sample(
 ) -> Tuple[str, List[int]]:
     """Load a sample from WikiText-103 test set."""
     print("Loading WikiText-103 dataset...")
-    dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split="test")
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
 
     # Find a substantial text sample (skip empty lines)
     for sample in dataset:

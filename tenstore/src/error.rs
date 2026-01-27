@@ -21,4 +21,7 @@ pub enum StoreError {
 
     #[error("empty page")]
     EmptyStore,
+
+    #[error("remote store failed: {0}")]
+    RemoteStoreError(anyhow::Error),
 }

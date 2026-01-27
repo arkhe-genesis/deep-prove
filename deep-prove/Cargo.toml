@@ -26,6 +26,10 @@ name = "deep-prove-cli"
 path = "src/bin/cli/main.rs"
 
 [dependencies]
+remote-store.workspace = true
+zkml.workspace = true
+tenstore.workspace = true
+
 alloy = { version = "1.0.22", default-features = false }
 alloy-signer = "1.0.25"
 anyhow.workspace = true
@@ -56,7 +60,6 @@ serde_json.workspace = true
 sha2 = "0.10.9"
 telemetry = { package = "telemetry", path = "../telemetry" }
 tempfile.workspace = true
-tenstore = { path = "../tenstore" }
 tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs"] }
 tokio-stream = { version = "0.1.17" }
 tonic = { version = "0.12.3", features = [
@@ -77,7 +80,6 @@ transcript.workspace = true
 ureq = { workspace = true }
 url = "2.5.4"
 utils = { path = "../utils" }
-uuid = "1.17.0"
+uuid.workspace = true
 zeroize = "1.8.1"
-zkml = { path = "../zkml" }
 zstd = "0.13.3"
