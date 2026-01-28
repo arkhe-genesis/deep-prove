@@ -4,7 +4,6 @@ extend-exclude = ["*.nix", "zkml/model_cache/**"]
 [default]
 check-filename = true
 extend-identifiers = { "Ein" = "Ein", "EinSum" = "EinSum", "NdArray" = "NdArray" }
-format = "brief"
 
 [default.extend-words]
 Ein = "Ein"

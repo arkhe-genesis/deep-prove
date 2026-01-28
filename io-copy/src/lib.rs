@@ -37,7 +37,11 @@ mod copy_impl {
         sync::atomic::{AtomicBool, Ordering},
     };
 
-    use libc::{EINVAL, ENOSYS, EOVERFLOW, EPERM, sendfile64};
+    #[cfg(target_os = "macos")]
+    use libc::sendfile as sendfile_macos;
+    #[cfg(not(target_os = "macos"))]
+    use libc::sendfile64;
+    use libc::{EINVAL, ENOSYS, EOVERFLOW, EPERM};
 
     pub(crate) fn copy_spec<R: Read + ?Sized, W: Write + ?Sized>(
         read: &mut R,
@@ -290,7 +294,20 @@ mod copy_impl {
             // according to its manpage that's the maximum size sendfile() will copy per invocation
             let chunk_size = min(len - written, 0x7ffff000_u64) as usize;
 
-            let result = cvt(unsafe { sendfile64(writer, reader, ptr::null_mut(), chunk_size) });
+            let result = {
+                #[cfg(target_os = "macos")]
+                {
+                    let mut written: i64 = chunk_size as i64;
+                    let result = cvt(unsafe {
+                        sendfile_macos(writer, reader, 0, &mut written, ptr::null_mut(), 0)
+                    });
+                    result.map(|_| written)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    cvt(unsafe { sendfile64(writer, reader, ptr::null_mut(), chunk_size) })
+                }
+            };
 
             match result {
                 Ok(0) => break, // EOF
