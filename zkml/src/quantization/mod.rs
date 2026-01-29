@@ -132,15 +132,7 @@ impl ScalingFactor {
     /// Take a floating point number and quantize it to an BIT_LEN-bit integer
     /// S = (a - (-a)) / (2^{BIT_LEN-1}- (-2^{BIT_LEN-1})) = 2a / 2^BIT_LEN
     pub fn quantize(&self, value: &f32) -> Element {
-        // assert!(
-        //    *value >= -1.0 && *value <= 1.0,
-        //    "Input value must be between -1.0 and 1.0"
-        //);
-        let zero_point = 0;
-
-        // formula is q = round(r/S) + z
-        // let scaled =((value.clamp(self.min,self.max) - self.min) / self.scale()).round() * self.scale() + self.min;
-        let scaled = (*value / self.scale()).round_ties_even() as Element + zero_point;
+        let scaled = (*value / self.scale()).round_ties_even() as Element;
         if scaled < self.quantized_domain.0 || scaled > self.quantized_domain.1 {
             warn!(
                 "Quantized value {} from {} is out of range [{}, {}]",
@@ -190,9 +182,9 @@ pub fn model_scaling_factor_from_tensor_and_bias(
     main: &Tensor<f32>,
     bias: Option<&Tensor<f32>>,
 ) -> (ScalingFactor, ScalingFactor) {
-    let max_weight = main.max_abs_output();
-    let max_bias = bias.map(|bias| bias.max_abs_output());
-    let max_value = if let Some(max_bias) = max_bias {
+    let max_weight = main.max_abs();
+    let max_value = if let Some(bias) = bias {
+        let max_bias = bias.max_abs();
         max_weight.max(max_bias)
     } else {
         max_weight

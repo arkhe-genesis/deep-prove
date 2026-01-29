@@ -46,9 +46,12 @@ impl EinSum<Element> {
                     .iter()
                     .chain(self.biases.iter())
                     .filter_map(|tensor_opt| {
-                        tensor_opt
-                            .as_ref()
-                            .map(|t| (t.commitment_id(), t.pad_next_power_of_two().into_data()))
+                        tensor_opt.as_ref().map(|t| {
+                            (
+                                t.commitment_id(),
+                                t.tensor().pad_next_power_of_two().into_data(),
+                            )
+                        })
                     })
                     .collect(),
             );

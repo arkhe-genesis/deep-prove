@@ -15,6 +15,7 @@ use crate::{
         llm::{config::LLMStructure, transformer::feed_forward::FeedForwardNetwork},
         safe::{ConfigJSON, FileTensorLoader as SafeLoader},
     },
+    tensor::{KeyedTensor, WrappedTensor},
 };
 
 use anyhow::{Result, anyhow, ensure};
@@ -85,10 +86,13 @@ impl LayerInsertion for Gemma3Decoder {
 
 /// Scale the RMSNorm alpha by adding 1.0 to each element.
 fn scale_norm(rmsnorm: &mut RMSNorm<f32>) {
-    rmsnorm.alpha = rmsnorm
-        .alpha
-        .take()
-        .map(|alpha| alpha.map_tensor(|t| t.map_data(|v| v + 1.0)))
+    if let Some(alpha) = rmsnorm.alpha.take() {
+        let (alpha, key) = alpha.into_parts();
+        let alpha = WrappedTensor::try_from(alpha).unwrap();
+        let scaled = alpha.add_scalar(1.0);
+        let alpha = KeyedTensor::from_wrapped_tensor(scaled, key).unwrap();
+        rmsnorm.alpha = Some(alpha);
+    }
 }
 
 impl Load<GGUFLoader> for Gemma3Decoder {

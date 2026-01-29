@@ -818,8 +818,8 @@ impl PadOp for Rope<Element> {
     where
         Self: Sized,
     {
-        self.cosine_matrix = self.cosine_matrix.map_tensor(|t| t.pad_next_power_of_two());
-        self.sine_matrix = self.sine_matrix.map_tensor(|t| t.pad_next_power_of_two());
+        self.cosine_matrix = self.cosine_matrix.pad_next_power_of_two();
+        self.sine_matrix = self.sine_matrix.pad_next_power_of_two();
         if let Some(cache) = &self.concatenation_cache {
             let mut cache = cache.lock().unwrap();
             cache.set_padding_mode(PaddingMode::Padding);

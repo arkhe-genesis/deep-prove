@@ -142,7 +142,7 @@ impl Absolute<f32> {
         unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Absolute<Element>>> {
         // quantize positional matrix
-        let max = self.positional.max_abs_output();
+        let max = self.positional.max_abs();
         let pos_scaling = ScalingFactor::from_absolute_max(max, None);
 
         ensure!(
@@ -185,7 +185,7 @@ impl PadOp for Absolute<Element> {
     where
         Self: Sized,
     {
-        self.positional = self.positional.map_tensor(|t| t.pad_next_power_of_two());
+        self.positional = self.positional.pad_next_power_of_two();
         Ok(self)
     }
 }
@@ -208,7 +208,7 @@ impl Absolute<Element> {
                 .into_iter()
                 .chain(once((
                     self.positional.commitment_id(),
-                    self.positional.pad_next_power_of_two().into_data(),
+                    self.positional.tensor().pad_next_power_of_two().into_data(),
                 )))
                 .collect(),
         );

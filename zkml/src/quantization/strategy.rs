@@ -390,7 +390,7 @@ impl ScalingStrategy for AbsoluteMax {
                 })?;
             input_tensor
                 .into_iter()
-                .map(|input| ScalingFactor::from_absolute_max(input.max_abs_output(), None))
+                .map(|input| ScalingFactor::from_absolute_max(input.max_abs(), None))
                 .collect_vec()
         } else {
             (0..model.num_inputs())

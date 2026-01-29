@@ -68,12 +68,6 @@ impl<const T: usize> From<[usize; T]> for Shape {
     }
 }
 
-impl From<Shape> for burn::prelude::Shape {
-    fn from(value: Shape) -> Self {
-        burn::prelude::Shape { dims: value.0 }
-    }
-}
-
 impl Shape {
     /// Creates a new shape from the iterator.
     ///
@@ -331,11 +325,25 @@ impl Shape {
     pub fn permute(&self, permutation: &[usize]) -> Self {
         Self(permutation.iter().map(|i| self.0[*i]).collect())
     }
+
+    /// Returns a new [Shape] with the dimensions of `other` added to it.
+    ///
+    /// ```
+    /// # use zkml::Shape;
+    /// let first = Shape::new(vec![1, 2]);
+    /// let second = Shape::new(vec![3, 4]);
+    /// let new_shape = first.extend(&second);
+    /// assert_eq!(new_shape.dim(0), 1);
+    /// assert_eq!(new_shape.dim(1), 2);
+    /// assert_eq!(new_shape.dim(2), 3);
+    /// assert_eq!(new_shape.dim(3), 4);
+    /// ```
     pub fn extend(&self, other: &Self) -> Self {
         let mut new_shape = self.0.clone();
-        new_shape.extend(other.0.clone());
+        new_shape.extend(other.0.iter());
         Self(new_shape)
     }
+
     pub fn concat(&self, other: &Self) -> Self {
         assert!(
             self.rank() == other.rank(),
@@ -501,6 +509,20 @@ impl From<burn::prelude::Shape> for Shape {
 impl From<&burn::prelude::Shape> for Shape {
     fn from(value: &burn::prelude::Shape) -> Self {
         Self(value.dims.to_vec())
+    }
+}
+
+impl From<Shape> for burn::prelude::Shape {
+    fn from(value: Shape) -> Self {
+        burn::prelude::Shape { dims: value.0 }
+    }
+}
+
+impl From<&Shape> for burn::prelude::Shape {
+    fn from(value: &Shape) -> Self {
+        burn::prelude::Shape {
+            dims: value.0.clone(),
+        }
     }
 }
 

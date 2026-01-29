@@ -204,7 +204,10 @@ impl<T: Clone + Copy + Default> FilterTensor<T> {
         let n_w = (padded_input_shape[1] - pre_fft_shape[2] + 1).next_power_of_two();
         let new_shape = Shape::new(vec![pre_fft_shape[0], pre_fft_shape[1], n_w, n_w]);
 
-        let tensor = tensor.new_map_tensor(|t| Tensor::new_unchecked(new_shape, t.data().to_vec()));
+        let tensor = KeyedTensor::new(
+            tensor.storage_key().clone(),
+            Tensor::new_unchecked(new_shape, tensor.tensor().data().to_vec()),
+        );
 
         *self = FilterTensor::FftFilter {
             tensor,
@@ -611,8 +614,8 @@ impl Convolution<f32> {
 
     fn max_abs_weight(&self) -> f32 {
         let tensor = self.filter.as_pre_fft_tensor();
-        let max_weight = tensor.max_abs_output();
-        let max_bias = self.bias.max_abs_output();
+        let max_weight = tensor.max_abs();
+        let max_bias = self.bias.max_abs();
         let distance = (max_weight - max_bias).abs() / max_weight;
         if distance > 0.1 {
             warn!(
@@ -620,7 +623,7 @@ impl Convolution<f32> {
                 distance * 100.0
             );
         }
-        tensor.max_abs_output().max(self.bias.max_abs_output())
+        tensor.max_abs().max(self.bias.max_abs())
     }
 }
 
@@ -1315,7 +1318,7 @@ impl ProveInfo for Convolution<Element> {
 
         let conv_info = LayerCtx::Convolution(self.conv_context(id));
         let filter_poly = tensor.pad_next_power_of_two().into_data();
-        let bias_poly = self.bias.pad_next_power_of_two().into_data();
+        let bias_poly = self.bias.tensor().pad_next_power_of_two().into_data();
         aux.model_polys = {
             let mut model_polys = HashMap::new();
             model_polys.insert(self.filter.commitment_id(), filter_poly);
@@ -1633,7 +1636,7 @@ pub(crate) fn conv2d<T: Number>(
     // NOTE: neither padding nor dilation is supported
     //
     // The shape formula can be found at pythorch [1], the one below is
-    // simplified since padding is no supported (defaults to 0) and neither
+    // simplified since padding is not supported (defaults to 0) and neither
     // dilation is supported (defaults to 1).
     //
     // [1] - https://docs.pytorch.org/docs/stable/generated/torch.nn.Conv2d.html#torch.nn.Conv2d

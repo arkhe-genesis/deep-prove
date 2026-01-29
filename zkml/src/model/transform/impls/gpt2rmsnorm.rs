@@ -225,9 +225,8 @@ fn modify_einsum(einsum: &mut EinSum<f32>) -> Result<()> {
         .zip(dims_to_modify)
         .try_for_each(|(opt_tensor, dim)| {
             if let Some(tensor) = opt_tensor {
-                let new_tensor = mean_subtracted_tensor(&tensor.tensor, dim)?;
-                *tensor = tensor.new_map_tensor(|_| new_tensor);
-                Result::<()>::Ok(())
+                *tensor.tensor_mut() = mean_subtracted_tensor(&tensor.tensor, dim)?;
+                Ok(())
             } else {
                 bail!("Expected constant tensor in Einsum to modify")
             }
@@ -254,7 +253,7 @@ fn modify_einsum(einsum: &mut EinSum<f32>) -> Result<()> {
 /// Modify the embeddings in an [`Embeddings`] layer so that the output has rows with mean 0.
 fn modify_embeddings(embeddings: &mut Embeddings<f32>) -> Result<()> {
     // The embedding is just a wrapper around a MatMul with extra info so we call modify_matmul
-    embeddings.mat = embeddings.mat.new_map_tensor(mean_subtracted_matrix);
+    embeddings.mat = mean_subtracted_matrix(&embeddings.mat)?;
     Ok(())
 }
 
@@ -264,7 +263,7 @@ fn modify_positional(positional_layer: &mut Positional<f32>) -> Result<()> {
     *positional_layer = match &positional_layer.variant {
         PositionalVariant::Absolute(absolute) => {
             let Absolute::<f32> { positional, .. } = absolute;
-            let new_mat = positional.new_map_tensor(mean_subtracted_matrix);
+            let new_mat = mean_subtracted_matrix(positional)?;
             Positional::new_absolute(new_mat)
         }
         PositionalVariant::Rope(_) => {
@@ -278,24 +277,10 @@ fn modify_positional(positional_layer: &mut Positional<f32>) -> Result<()> {
 
 /// This function calculates the mean subtraction matrix so that all the output rows have mean 0.
 /// It takes as input the final dimension size of the layer.
-fn mean_subtracted_matrix(matrix: &Tensor<f32>) -> Tensor<f32> {
-    let matrix_shape = matrix.shape();
-    let row_size = matrix_shape.dim(-1);
-
-    let subtract_mean_matrix = (0..row_size)
-        .flat_map(|i| (0..row_size).map(move |j| if i == j { row_size as f32 - 1.0 } else { -1.0 }))
-        .collect::<Vec<f32>>();
-
-    let subtract_mean_tensor =
-        Tensor::new(Shape::new(vec![row_size, row_size]), subtract_mean_matrix)
-            .expect("Failed to create mean subtraction tensor");
-    let mut modified_matrix = matrix
-        .matmul(&subtract_mean_tensor)
-        .expect("Failed to right-multiply by mean subtraction matrix");
-    modified_matrix
-        .iter_mut()
-        .for_each(|x| *x /= row_size as f32);
-    modified_matrix
+fn mean_subtracted_matrix(matrix: &KeyedTensor<f32>) -> anyhow::Result<KeyedTensor<f32>> {
+    let tensor = WrappedTensor::try_from(matrix.tensor())?;
+    let centered = tensor.mean_center_rows();
+    KeyedTensor::from_wrapped_tensor(centered, matrix.storage_key().clone())
 }
 
 fn mean_subtracted_tensor(tensor: &Tensor<f32>, dim: usize) -> Result<Tensor<f32>> {
@@ -389,7 +374,10 @@ fn rescale_einsum(
                     anyhow!("Couldn't extract data from new einsum bias tensor: {e:?}")
                 })?;
                 let new_tensor = Tensor::new(shape, new_bias_data)?;
-                Ok(Some(old_bias.new_map_tensor(|_| new_tensor)))
+                Ok(Some(KeyedTensor::new(
+                    old_bias.storage_key().clone(),
+                    new_tensor,
+                )))
             } else {
                 // This case only arises when modifying the final projection in GPT2 which has no bias
                 // so we can safely squeeze the leading 1 dimension here
@@ -399,7 +387,10 @@ fn rescale_einsum(
                     anyhow!("Couldn't extract data from new einsum bias tensor: {e:?}")
                 })?;
                 let new_tensor = Tensor::new(shape.into(), new_bias_data)?;
-                Ok(Some(bias.new_map_tensor(|_| new_tensor)))
+                Ok(Some(KeyedTensor::new(
+                    bias.storage_key().clone(),
+                    new_tensor,
+                )))
             }
         })
         .collect::<Result<Vec<Option<KeyedTensor<f32>>>>>()?;
@@ -507,38 +498,6 @@ mod tests {
 
     use super::*;
     use ff_ext::GoldilocksExt2;
-
-    #[test]
-    fn test_mean_subtraction_matrix() {
-        let mut rng = rng_from_env_or_random();
-        // First we create a random matrix for our "constant right hand side"
-        let const_col_size: usize = rng.gen_range(4..20);
-        let const_row_size: usize = rng.gen_range(4..20);
-        let const_shape = Shape::new(vec![const_col_size, const_row_size]);
-        let const_matrix = Tensor::<f32>::random(&const_shape);
-        // Make the mean subtraction matrix
-        let modified_const = mean_subtracted_matrix(&const_matrix);
-
-        for _ in 0..5 {
-            let input_num_cols: usize = rng.gen_range(4..20);
-            let input_shape = Shape::new(vec![input_num_cols, const_col_size]);
-            let input_matrix = Tensor::<f32>::random(&input_shape);
-
-            let mul_result = input_matrix.matmul(&modified_const).unwrap();
-            let result_without_mean = input_matrix.matmul(&const_matrix).unwrap();
-            mul_result
-                .slice_last_dim()
-                .zip(result_without_mean.slice_last_dim())
-                .for_each(|(row, row_without_mean)| {
-                    let sum = row_without_mean.iter().sum::<f32>();
-                    let mean = sum / row.len() as f32;
-                    row.iter().zip(row_without_mean.iter()).for_each(|(a, b)| {
-                        let diff = a - (b - mean);
-                        assert!(diff.abs() < 1e-6, "Difference is too large: {diff}");
-                    });
-                })
-        }
-    }
 
     #[test]
     fn test_mean_subtracted_tensor() -> anyhow::Result<()> {

@@ -34,8 +34,8 @@ impl GarbagePad {
                 let previous_input_shape_og = previous_shape.0.clone();
                 let previous_input_shape_padded = previous_shape.1.clone();
                 *matrix = matrix.pad_matrix_to_ignore_garbage(
-                    previous_input_shape_og.as_ref(),
-                    previous_input_shape_padded.as_ref(),
+                    &previous_input_shape_og,
+                    &previous_input_shape_padded,
                     &padded_matrix_shape,
                 )?;
             }
@@ -253,12 +253,12 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
 
         let padded_constant_tensors = constant_tensors
             .into_iter()
-            .map(|opt| opt.map(|tensor| tensor.map_tensor(|t| t.pad_next_power_of_two())))
+            .map(|opt| opt.map(|tensor| tensor.pad_next_power_of_two()))
             .collect::<Vec<_>>();
 
         let padded_biases = biases
             .into_iter()
-            .map(|opt| opt.map(|tensor| tensor.map_tensor(|t| t.pad_next_power_of_two())))
+            .map(|opt| opt.map(|tensor| tensor.pad_next_power_of_two()))
             .collect::<Vec<_>>();
 
         // Currently we do not support garbage padding for einsum outputs, this is because we are in the process

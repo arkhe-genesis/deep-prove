@@ -84,12 +84,8 @@ impl EinSum<f32> {
                         weight_tensor,
                         bias_opt.as_ref().map(|t| t.tensor()),
                     );
-                    let quantized_weight = weight_tensor
-                        .clone()
-                        .map_tensor(|t| t.quantize(&weight_scaling));
-                    let quantized_bias = bias_opt
-                        .clone()
-                        .map(|bias| bias.map_tensor(|t| t.quantize(&bias_scaling)));
+                    let quantized_weight = weight_tensor.quantize(&weight_scaling);
+                    let quantized_bias = bias_opt.as_ref().map(|bias| bias.quantize(&bias_scaling));
                     // If `self.requantise` is set to `true` we include a requantisation step after evaluation
                     if self.requantise() {
                         let requant = Requant::from_scaling_factors(
@@ -130,9 +126,7 @@ impl EinSum<f32> {
                         lhs_bit_size + rhs_bit_size + contraction_bits
                     };
                     let bias_scaling = bias_scaling_matmul(&lhs_input_scaling, &rhs_input_scaling);
-                    let quantized_bias = bias_opt
-                        .clone()
-                        .map(|bias| bias.map_tensor(|t| t.quantize(&bias_scaling)));
+                    let quantized_bias = bias_opt.as_ref().map(|bias| bias.quantize(&bias_scaling));
                     // If `self.requantise` is set to `true` we include a requantisation step after evaluation
                     if self.requantise() {
                         let requant = Requant::from_scaling_factors(

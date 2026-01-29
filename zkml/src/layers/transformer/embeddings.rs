@@ -267,7 +267,7 @@ impl PadOp for Embeddings<Element> {
             ignore_garbage_pad: None,
         }];
 
-        let padded_emb = self.mat.map_tensor(|t| t.pad_next_power_of_two());
+        let padded_emb = self.mat.pad_next_power_of_two();
 
         Ok(Self {
             mat: padded_emb,
@@ -348,8 +348,8 @@ impl QuantizeOp for Embeddings<f32> {
             vocab_size,
         } = self;
 
-        let scale_factor = ScalingFactor::from_absolute_max(mat.max_abs_output(), None);
-        let quantised_mat = mat.map_tensor(|t| t.quantize(&scale_factor));
+        let scale_factor = ScalingFactor::from_absolute_max(mat.max_abs(), None);
+        let quantised_mat = mat.quantize(&scale_factor);
         let qemb = Embeddings {
             mat: quantised_mat,
             emb_size,

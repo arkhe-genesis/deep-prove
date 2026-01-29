@@ -250,14 +250,12 @@ where
             top_chunk_scalar_log,
         };
 
-        let quant_gamma = self
-            .gamma
-            .map_tensor(|gamma| gamma.quantize(&model_scaling));
+        let quant_gamma = self.gamma.quantize(&model_scaling);
         // Work out how to quantise the bias, it needs to have the same scale factor as the end product.
         // This will be `input_scaling.scale() * model_scaling.scale() * 1.0f32 / LAYERNORM_OUTPUT_SCALE_FACTOR as f32`
         let bias_scale = input_scale * model_scaling.scale() / LAYERNORM_OUTPUT_SCALE_FACTOR as f32;
 
-        let bias_max = self.beta.max_abs_output().to_f32()?;
+        let bias_max = self.beta.max_abs().to_f32()?;
 
         let quant_bias_min = (-bias_max / bias_scale).round_ties_even() as Element;
         let quant_bias_max = (bias_max / bias_scale).round_ties_even() as Element;
@@ -269,7 +267,7 @@ where
             (quant_bias_min, quant_bias_max),
         );
 
-        let quant_beta = self.beta.map_tensor(|beta| beta.quantize(&bias_scaling));
+        let quant_beta = self.beta.quantize(&bias_scaling);
 
         ensure!(
             quant_gamma.shape() == quant_beta.shape(),
@@ -742,8 +740,8 @@ impl ProveInfo for LayerNorm<Element> {
             let lookup_ctx = LayerLookupContext::new(tables, instances_per_table);
 
             // Add the Gamma and Beta commitments
-            let gamma_evals = self.gamma.pad_next_power_of_two().into_data();
-            let beta_evals = self.beta.pad_next_power_of_two().into_data();
+            let gamma_evals = self.gamma.tensor().pad_next_power_of_two().into_data();
+            let beta_evals = self.beta.tensor().pad_next_power_of_two().into_data();
 
             aux.model_polys = {
                 let mut model_polys = HashMap::new();
@@ -875,8 +873,8 @@ impl PadOp for LayerNorm<Element> {
             eps,
             quant_info,
         } = self;
-        let padded_gamma = gamma.map_tensor(|t| t.pad_next_power_of_two());
-        let padded_beta = beta.map_tensor(|t| t.pad_next_power_of_two());
+        let padded_gamma = gamma.pad_next_power_of_two();
+        let padded_beta = beta.pad_next_power_of_two();
 
         Ok(LayerNorm::<Element> {
             gamma: padded_gamma,

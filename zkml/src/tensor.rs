@@ -124,8 +124,14 @@ impl<T> KeyedTensor<T> {
         &self.tensor
     }
 
-    pub fn map_tensor<U>(self, f: impl FnOnce(Tensor<T>) -> Tensor<U>) -> KeyedTensor<U> {
-        self.try_map_tensor(|t| Ok(f(t))).unwrap()
+    /// Sets the value of `tensor`.
+    pub(crate) fn set_tensor(&mut self, tensor: Tensor<T>) {
+        self.tensor = tensor;
+    }
+
+    /// Returns a mutable reference to the internal [Tensor].
+    pub fn tensor_mut(&mut self) -> &mut Tensor<T> {
+        &mut self.tensor
     }
 
     pub fn try_map_tensor<U>(
@@ -138,13 +144,6 @@ impl<T> KeyedTensor<T> {
         })
     }
 
-    pub fn new_map_tensor<U>(&self, f: impl FnOnce(&Tensor<T>) -> Tensor<U>) -> KeyedTensor<U> {
-        KeyedTensor {
-            key: self.key.cast::<U>(),
-            tensor: f(&self.tensor),
-        }
-    }
-
     pub fn try_new_map_tensor<U>(
         &self,
         f: impl FnOnce(&Tensor<T>) -> anyhow::Result<Tensor<U>>,
@@ -153,6 +152,35 @@ impl<T> KeyedTensor<T> {
             key: self.key.cast::<U>(),
             tensor: f(&self.tensor)?,
         })
+    }
+
+    /// Consumes the [KeyedTensor] and returns its parts.
+    pub(crate) fn into_parts(self) -> (Tensor<T>, StorageKey<T>) {
+        (self.tensor, self.key)
+    }
+}
+
+impl<T: Copy + Default> KeyedTensor<T> {
+    /// Pads the tensor to the next power-of-two.
+    pub fn pad_next_power_of_two(&self) -> Self {
+        let tensor = self.tensor.pad_next_power_of_two();
+        Self {
+            key: self.key.clone(),
+            tensor,
+        }
+    }
+}
+
+impl<T> KeyedTensor<T>
+where
+    T: TensorTypeParam,
+{
+    pub(crate) fn from_wrapped_tensor(
+        tensor: WrappedTensor<T>,
+        key: StorageKey<T>,
+    ) -> anyhow::Result<Self> {
+        let tensor = Tensor::try_from(tensor)?;
+        Ok(Self { tensor, key })
     }
 }
 
@@ -1332,9 +1360,9 @@ impl<T: Number> Tensor<T> {
     /// # use zkml::{Tensor, Shape, Element};
     /// let tensor = Tensor::<Element>::new(Shape::new(vec![7]), vec![3, 1, 0, -11, 7, 9,
     /// 2]).unwrap();
-    /// assert_eq!(tensor.max_abs_output(), 11);
+    /// assert_eq!(tensor.max_abs(), 11);
     /// ```
-    pub fn max_abs_output(&self) -> T {
+    pub fn max_abs(&self) -> T {
         self.data
             .par_iter()
             .cloned()
@@ -1394,10 +1422,11 @@ impl<T: Number> Tensor<T> {
 
     /// Scalar multiplication with f32.
     pub fn scalar_mul_f32<N2: Number>(&self, scalar: N2) -> Tensor<T> {
+        let scalar = scalar.to_f32().expect("Failed to convert scalar to f32");
         let scaled = self
             .data
             .par_iter()
-            .map(|x| T::from_f32(x.to_f32()? * scalar.to_f32()?))
+            .map(|x| T::from_f32(x.to_f32()? * scalar))
             .collect::<anyhow::Result<Vec<_>>>()
             .expect("Failed to scale tensor");
         Tensor {
@@ -1444,8 +1473,8 @@ impl<T: Number> Tensor<T> {
 
         Ok(result)
     }
+
     /// Perform matrix-vector multiplication
-    /// TODO: actually getting the result should be done via proper tensor-like libraries
     pub fn matvec(&self, vector: &Tensor<T>) -> Result<Tensor<T>> {
         ensure!(self.shape.is_matrix(), "First argument must be a matrix.");
         ensure!(
@@ -1468,6 +1497,7 @@ impl<T: Number> Tensor<T> {
 
         Ok(result)
     }
+
     /// Transpose the matrix (2D tensor)
     pub fn transpose(&self) -> Result<Tensor<T>> {
         ensure!(self.shape.is_matrix(), "Tensor is not a matrix.");
@@ -1802,6 +1832,35 @@ impl<T: Number> Tensor<T> {
 }
 
 impl<T: TensorTypeParam> Tensor<T> {
+    /// Pads a matrix so it can be used with the output of a FFT-based
+    /// convolution.
+    ///
+    /// The FFT-based convolution has all dimensions of the original convolution
+    /// padded to the next power of 2. This method performs an equivalent
+    /// padding to the a matrix, so it can be multiplied against the FFT based
+    /// convolution. This is used to transform a dense layer that comes after a
+    /// FFT-convolution, and ensure the vec-matrix multiplication is performed
+    /// correctly.
+    ///
+    /// Given a convolution result `X` and a matrix `M`, the FFT-based
+    /// convolution is such that`X' = fft(X)`, here `M` is padded to `M'` such
+    /// that `M * X == M' * X'`, ensuring the result remains consistent despite
+    /// the padding in `X'`.
+    pub fn pad_matrix_to_ignore_garbage(
+        &self,
+        conv_shape_og: &Shape,
+        conv_shape_pad: &Shape,
+        matrix_shape_pad: &Shape,
+    ) -> Result<Self> {
+        let wrapped = WrappedTensor::try_from(self)?;
+        let result = wrapped.pad_matrix_to_ignore_garbage(
+            conv_shape_og,
+            conv_shape_pad,
+            matrix_shape_pad,
+        )?;
+        Tensor::try_from(result)
+    }
+
     #[cfg(test)]
     pub fn into_wrapped(self) -> WrappedTensor<T> {
         WrappedTensor::try_from(&self).unwrap()
@@ -1862,74 +1921,6 @@ where
     pub fn get(&self, accessors: Vec<usize>) -> Result<T> {
         let flat_index = self.get_idx(accessors)?;
         Ok(self.data[flat_index])
-    }
-}
-
-impl<T> Tensor<T>
-where
-    T: Copy + Clone + Send + Sync,
-    T: Copy + Default + std::ops::Mul<Output = T> + std::iter::Sum,
-    T: std::ops::Add<Output = T> + std::ops::Sub<Output = T> + std::ops::Mul<Output = T>,
-{
-    // Pads a matrix `M` to `M'` so that matrix-vector multiplication with a flattened FFT-padded convolution output `X'`
-    /// matches the result of multiplying `M` with the original convolution output `X`.
-    ///
-    /// The real convolution output `X` has dimensions `(C, H, W)`. However, when using FFT-based convolution,
-    /// the output `X'` is padded to dimensions `(C', H', W')`, where `C'`, `H'`, and `W'` are the next power of 2
-    /// greater than or equal to `C`, `H`, and `W`, respectively.
-    /// Given a matrix `M` designed to multiply with the flattened `X`, this function pads `M` into `M'` such that
-    /// `M * X == M' * X'`, ensuring the result remains consistent despite the padding in `X'`.
-    pub fn pad_matrix_to_ignore_garbage(
-        &self,
-        conv_shape_og: &[usize],
-        conv_shape_pad: &[usize],
-        mat_shp_pad: &Shape,
-    ) -> Result<Self> {
-        ensure!(
-            conv_shape_og.len() == 3 && conv_shape_pad.len() == 3,
-            "Expects conv2d shape output to be 3d: conv_shape_og: {:?}, conv_shape_pad: {:?}",
-            conv_shape_og.len(),
-            conv_shape_pad.len()
-        );
-        ensure!(
-            mat_shp_pad.len() == 2 && self.shape.len() == 2,
-            "Expects matrix to be 2d: mat_shp_pad: {:?}, self.shape: {:?}",
-            mat_shp_pad.len(),
-            self.shape.len()
-        );
-        let mat_shp_og = self.shape();
-
-        let new_data: Vec<T> = (0..mat_shp_pad[0] * mat_shp_pad[1])
-            .into_par_iter()
-            .map(|new_loc| {
-                // Decompose new_loc into (row, channel, h_in, w_in) for the padded output space
-                let row = new_loc / mat_shp_pad[1];
-                let channel =
-                    (new_loc / (conv_shape_pad[1] * conv_shape_pad[2])) % conv_shape_pad[0];
-                let h_in = (new_loc / conv_shape_pad[2]) % conv_shape_pad[1];
-                let w_in = new_loc % conv_shape_pad[2];
-
-                // Check if this position corresponds to an original data location
-                if row < mat_shp_og[0]
-                    && channel < conv_shape_og[0]
-                    && h_in < conv_shape_og[1]
-                    && w_in < conv_shape_og[2]
-                {
-                    let old_loc = channel * conv_shape_og[1] * conv_shape_og[2]
-                        + h_in * conv_shape_og[2]
-                        + w_in
-                        + row * mat_shp_og[1];
-                    self.data[old_loc]
-                } else {
-                    T::default() // Default value for non-mapped positions
-                }
-            })
-            .collect();
-        Tensor::new_with_unpadded_shape(
-            mat_shp_pad.to_vec().into(),
-            vec![self.unpadded_shape[0], mat_shp_pad[1]].into(),
-            new_data,
-        )
     }
 }
 
@@ -3323,32 +3314,34 @@ mod test {
 
     #[test]
     fn test_tensor_pad_matrix_to_ignore_garbage() {
-        let old_shape = Shape::new(vec![2usize, 3, 3]);
-        let orows = 10usize;
-        let ocols = old_shape.product();
+        let conv_shape_og = Shape::new(vec![2usize, 3, 3]);
+        let mat_shape_og = Shape::new(vec![10usize, conv_shape_og.product()]);
 
-        let new_shape = Shape::new(vec![3usize, 4, 4]);
-        let nrows = 12usize;
-        let ncols = new_shape.product();
+        let conv_shape_pad = Shape::new(vec![3usize, 4, 4]);
+        let mat_shape_pad = Shape::new(vec![12usize, conv_shape_pad.product()]);
 
-        let og_t = Tensor::<Element>::random(&old_shape);
-        let og_flat_t = og_t.to_flatten(); // This is equivalent to conv2d output (flattened)
+        // The flattened output of a conv2d
+        let conv_out_og = Tensor::<Element>::random(&conv_shape_og);
+        let conv_out_og_flat = conv_out_og.to_flatten();
 
-        let mut pad_t = og_t.clone();
-        pad_t.pad_to_shape(new_shape.clone()).unwrap();
-        let pad_flat_t = pad_t.to_flatten();
+        // The layer after conv2d, in this case a dense layer
+        let dense_og = Tensor::random(&mat_shape_og);
+        let result_og = dense_og.matvec(&conv_out_og_flat).unwrap();
 
-        let og_mat = Tensor::random(&vec![orows, ocols].into()); // This is equivalent to the first dense matrix
-        let og_result = og_mat.matvec(&og_flat_t).unwrap();
+        // The equivalent output for a FFT-conv2d
+        let mut conv_out_pad = conv_out_og.clone();
+        conv_out_pad.pad_to_shape(conv_shape_pad.clone()).unwrap();
+        let conv_out_pad_flat = conv_out_pad.to_flatten();
 
-        let pad_mat = og_mat
-            .pad_matrix_to_ignore_garbage(&old_shape, &new_shape, &vec![nrows, ncols].into())
+        // The layer after FFT-conv2d
+        let dense_pad = dense_og
+            .pad_matrix_to_ignore_garbage(&conv_shape_og, &conv_shape_pad, &mat_shape_pad)
             .unwrap();
-        let pad_result = pad_mat.matvec(&pad_flat_t).unwrap();
+        let result_pad = dense_pad.matvec(&conv_out_pad_flat).unwrap();
 
         assert_eq!(
-            og_result.get_data()[..orows],
-            pad_result.get_data()[..orows],
+            result_og.get_data()[..mat_shape_og.dim(0)],
+            result_pad.get_data()[..mat_shape_og.dim(0)],
             "Unable to get rid of garbage values from conv fft."
         );
     }
@@ -3744,5 +3737,38 @@ mod test {
             }
         }
 
+        #[test]
+        fn proptest_tensor_pad_matrix_to_ignore_garbage(x in 1usize..32, y in 1usize..256, z in 1usize..256, w in 1usize..8) {
+            let conv_shape_og = Shape::new(vec![x, y, z]);
+            let mat_shape_og = Shape::new(vec![w, conv_shape_og.product()]);
+
+            let conv_shape_pad = conv_shape_og.next_power_of_two();
+            let matrix_shape_pad = Shape::new(vec![w, conv_shape_pad.product()]);
+
+            // The flattened output of a conv2d
+            let conv_out_og = Tensor::<Element>::random(&conv_shape_og);
+            let conv_out_og_flat = conv_out_og.to_flatten();
+
+            // The layer after conv2d, in this case a dense layer
+            let dense_og = Tensor::random(&mat_shape_og);
+            let result_og = dense_og.matvec(&conv_out_og_flat).unwrap();
+
+            // The equivalent output for a FFT-conv2d
+            let mut conv_out_pad = conv_out_og.clone();
+            conv_out_pad.pad_to_shape(conv_shape_pad.clone()).unwrap();
+            let conv_out_pad_flat = conv_out_pad.to_flatten();
+
+            // The layer after FFT-conv2d
+            let dense_pad = dense_og
+                .pad_matrix_to_ignore_garbage(&conv_shape_og, &conv_shape_pad, &matrix_shape_pad)
+                .unwrap();
+            let result_pad = dense_pad.matvec(&conv_out_pad_flat).unwrap();
+
+            prop_assert_eq!(
+                &result_og.get_data()[..mat_shape_og.dim(0)],
+                &result_pad.get_data()[..mat_shape_og.dim(0)],
+                "Unable to get rid of garbage values from conv fft.",
+            );
+        }
     }
 }

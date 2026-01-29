@@ -237,7 +237,7 @@ where
         let quant_alpha = self
             .alpha
             .as_ref()
-            .map(|alpha| alpha.new_map_tensor(|alpha| alpha.quantize(&model_scaling)));
+            .map(|alpha| alpha.quantize(&model_scaling));
 
         // To calculate the intermediate bit size we have that the output is `self.alpha * input  * lookup_output`
         // So lets work out the left hand bit size
@@ -480,7 +480,7 @@ impl PadOp for RMSNorm<Element> {
             quant_info,
         } = self;
 
-        let padded_alpha = alpha.map(|a| a.map_tensor(|a| a.pad_next_power_of_two()));
+        let padded_alpha = alpha.map(|tensor| tensor.pad_next_power_of_two());
 
         Ok(RMSNorm::<Element> {
             alpha: padded_alpha,

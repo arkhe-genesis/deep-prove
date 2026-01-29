@@ -46,18 +46,21 @@ impl Gemma3 {
 
     fn scale_embeddings(llm_config: &LLMConfig, llm_model: &mut LLMModel<Gemma3Decoder>) {
         let normalizer_factor = (llm_config.hidden_size as f32).sqrt();
-        llm_model.embeddings.mat = llm_model
+        let scaled = llm_model
             .embeddings
             .mat
-            .new_map_tensor(|t| t.scalar_mul_f32(normalizer_factor));
+            .tensor()
+            .scalar_mul_f32(normalizer_factor);
+        llm_model.embeddings.mat.set_tensor(scaled);
     }
 
     fn scale_norm(rmsnorm: &mut Norm<f32>) {
         if let Norm::RMSNorm(rmsnorm) = rmsnorm {
-            rmsnorm.alpha = rmsnorm
-                .alpha
-                .take()
-                .map(|alpha| alpha.map_tensor(|t| t.map_data(|v| v + 1.0)))
+            if let Some(alpha) = rmsnorm.alpha.as_mut() {
+                for v in alpha.tensor_mut().iter_mut() {
+                    *v += 1.0;
+                }
+            }
         }
     }
 }
