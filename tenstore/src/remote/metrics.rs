@@ -1,6 +1,7 @@
 use std::{borrow::Cow, collections::HashMap, future::Future, io};
 
 use tokio::task;
+use tracing::error;
 use vise::{Counter, Global, LabeledFamily, Metrics};
 
 #[vise::register]
@@ -182,55 +183,6 @@ impl<R: 'static + Send> TaskMonitor<R> {
         Ok(abort_handle)
     }
 
-    /// Spawn `future`, without collecting metrics for the task.
-    pub fn spawn_no_metrics<F>(
-        &mut self,
-        task_name: Cow<'static, str>,
-        future: F,
-    ) -> io::Result<task::AbortHandle>
-    where
-        F: Future<Output = R> + Send + 'static,
-    {
-        let abort_handle = self.join_set.build_task().name(&task_name).spawn(future)?;
-
-        self.id_to_name
-            .entry(abort_handle.id())
-            .or_default()
-            .push(task_name.clone());
-
-        Ok(abort_handle)
-    }
-
-    /// Spawn a blocking task.
-    ///
-    /// This utility will:
-    ///
-    /// - Spawns the task inside a [task::JoinSet]. The lifecyle of the task is managed as follows:
-    ///     - [TaskMonitor::join_next] returns the task [Result], if it finish execution with normal control flow.
-    ///     - Otheriwse, `join_next` returns an [Err] in case the task panics or is aborted.
-    ///     - Once dropped, the [TaskMonitor] aborts all unfished tasks it owns.
-    pub async fn spawn_blocking<F>(
-        &mut self,
-        task_name: Cow<'static, str>,
-        task: F,
-    ) -> io::Result<task::AbortHandle>
-    where
-        F: FnOnce() -> R + Send + 'static,
-    {
-        let abort_handle = self
-            .join_set
-            .build_task()
-            .name(&task_name)
-            .spawn_blocking(task)?;
-
-        self.id_to_name
-            .entry(abort_handle.id())
-            .or_default()
-            .push(task_name.clone());
-
-        Ok(abort_handle)
-    }
-
     /// Waits until one of the tasks in the set completes and returns its output and name.
     ///
     /// Returns `None` if the set is empty.
@@ -257,9 +209,14 @@ impl<R: 'static + Send> TaskMonitor<R> {
         }
     }
 
-    /// Returns whether there are monitored tasks.
-    pub fn is_empty(&self) -> bool {
-        self.join_set.is_empty()
+    /// Ensure that all the tasks in this monitor have completed.
+    pub async fn join_all(&mut self) {
+        while let Some(res) = self.join_set.join_next().await {
+            match res {
+                Ok(_) => {}
+                Err(err) => error!("while joining task monitor: {err:?}"),
+            }
+        }
     }
 }
 

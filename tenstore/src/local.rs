@@ -1,4 +1,4 @@
-use crate::{StorageKey, StoreError};
+use crate::{LocalStore, StorageKey, StoreError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -63,7 +63,7 @@ impl Display for InternalKey {
 
 /// A disk-backed page store featuring a bounded memory cache of the most
 /// accessed pages.
-pub struct LocalStore<P> {
+pub struct DiskStore<P> {
     /// Keep track of the storage details associated to a stored page.
     ///
     /// This is string-indexed instead of [`StoreKey`]-indexed because data
@@ -77,7 +77,7 @@ pub struct LocalStore<P> {
     root: P,
 }
 
-impl<P: AsRef<Path>> LocalStore<P> {
+impl<P: AsRef<Path>> DiskStore<P> {
     pub fn new(root: P, max_cache_size: usize) -> Result<Self, StoreError> {
         const DEFAULT_CACHE_SIZE: NonZero<usize> = NonZero::new(1024 * 1024).expect("1MiB > 0");
 
@@ -94,7 +94,7 @@ impl<P: AsRef<Path>> LocalStore<P> {
     }
 }
 
-impl<P> std::fmt::Debug for LocalStore<P> {
+impl<P> std::fmt::Debug for DiskStore<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "L {:50} {:12} Filename", "ID", "Size")?;
         for (_run, ks) in self.storage.iter() {
@@ -112,7 +112,7 @@ impl<P> std::fmt::Debug for LocalStore<P> {
     }
 }
 
-impl<P: AsRef<Path>> LocalStore<P> {
+impl<P: AsRef<Path>> DiskStore<P> {
     /// Fetch and decode data associated with the given run ID and key
     pub(crate) fn fetch<T>(
         &mut self,
@@ -233,7 +233,7 @@ impl<P: AsRef<Path>> LocalStore<P> {
     }
 }
 
-impl<P: AsRef<Path>> remote_store::client::LocalStore for LocalStore<P> {
+impl<P: AsRef<Path>> LocalStore for DiskStore<P> {
     type Error = StoreError;
     type Key = InternalKey;
 

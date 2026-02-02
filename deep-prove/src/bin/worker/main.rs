@@ -7,7 +7,7 @@ use deep_prove::{
     },
     store::{self, MemStore, S3Store, Store},
 };
-use std::{net::SocketAddr, path::PathBuf};
+use std::path::PathBuf;
 use tenstore::GenStore;
 use tracing::{Span, debug, info};
 use url::Url;
@@ -208,8 +208,8 @@ struct Args {
     store_root_dir: Option<PathBuf>,
 
     /// Tensor remote store server address.
-    #[arg(long)]
-    store_server_addr: Option<SocketAddr>,
+    #[arg(long, default_value = "http://localhost:4000")]
+    store_server_addr: Option<url::Url>,
 }
 
 #[derive(clap::Args)]

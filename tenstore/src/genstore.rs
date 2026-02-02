@@ -1,14 +1,9 @@
-pub mod local;
-pub mod remote;
-
+use crate::{StorageKey, StoreError, local::DiskStore, remote::RemoteStore};
+use serde::{Deserialize, Serialize};
 use std::{
-    net::ToSocketAddrs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-
-use crate::{StorageKey, StoreError};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub trait GenericStore {
@@ -38,15 +33,15 @@ pub struct GenStore {
 #[derive(Clone)]
 pub enum GenStoreKind {
     /// A local-only store, rooted in some directory on disk.
-    Local(Arc<Mutex<local::LocalStore<PathBuf>>>),
+    Local(Arc<Mutex<DiskStore<PathBuf>>>),
 
     /// The temporary folder-based store is a dedicated enum, for it must keep
     /// ownership of the `TempDir`, otherwise it would get dropped and erased
     /// from disk.
-    Tmp(Arc<Mutex<local::LocalStore<tempfile::TempDir>>>),
+    Tmp(Arc<Mutex<DiskStore<tempfile::TempDir>>>),
 
-    /// A remote store combined with a local-store.
-    Remote(Arc<Mutex<remote::Client>>),
+    /// A remote store combined with a local-store for caching.
+    Remote(Arc<Mutex<RemoteStore>>),
 }
 
 impl std::fmt::Debug for GenStoreKind {
@@ -68,7 +63,7 @@ impl GenStore {
     }
 
     pub fn new_temporary(cache_size: usize) -> Result<Self, StoreError> {
-        let kind = GenStoreKind::Tmp(Arc::new(Mutex::new(local::LocalStore::new(
+        let kind = GenStoreKind::Tmp(Arc::new(Mutex::new(DiskStore::new(
             tempfile::tempdir().unwrap(),
             cache_size,
         )?)));
@@ -76,22 +71,20 @@ impl GenStore {
     }
 
     pub fn new_local(root: PathBuf, cache_size: usize) -> Result<Self, StoreError> {
-        let kind = GenStoreKind::Local(Arc::new(Mutex::new(local::LocalStore::new(
-            root, cache_size,
-        )?)));
+        let kind = GenStoreKind::Local(Arc::new(Mutex::new(DiskStore::new(root, cache_size)?)));
         Ok(Self::new_kind(kind))
     }
 
     pub fn new_remote<P>(
         root: P,
         cache_size: usize,
-        server_addr: impl ToSocketAddrs,
+        server_addr: url::Url,
     ) -> Result<Self, StoreError>
     where
         P: 'static + AsRef<Path> + Send,
     {
         let kind = GenStoreKind::Remote(Arc::new(Mutex::new(
-            remote::Client::new(root, cache_size, server_addr)
+            RemoteStore::new(root, cache_size, server_addr)
                 .map_err(StoreError::RemoteStoreError)?,
         )));
         Ok(Self::new_kind(kind))

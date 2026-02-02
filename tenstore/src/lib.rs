@@ -1,15 +1,18 @@
+use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Debug, Display},
     hash::Hash,
     marker::PhantomData,
 };
-
-mod error;
-mod genstore;
+use uuid::Uuid;
 
 pub use error::StoreError;
 pub use genstore::{GenStore, GenericStore};
-use serde::{Deserialize, Serialize};
+
+mod error;
+mod genstore;
+mod local;
+mod remote;
 
 /// Identifier for storage data.
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,4 +104,20 @@ impl<T> From<StorageKey<T>> for String {
     fn from(value: StorageKey<T>) -> Self {
         value.id
     }
+}
+
+pub trait LocalStore {
+    type Error: Display;
+    type Key;
+
+    /// Returns true if the store contains the given key.
+    fn contains(&mut self, storage_key: &Self::Key) -> bool;
+
+    /// Fetch the data associated with the given key.
+    fn fetch(&mut self, storage_key: Self::Key) -> Result<&Vec<u8>, Self::Error>;
+
+    /// Store the data under the given key.
+    fn store(&mut self, storage_key: Self::Key, data: Vec<u8>) -> Result<(), Self::Error>;
+
+    fn clean_up(&mut self, run_id: Uuid) -> Result<(), Self::Error>;
 }
