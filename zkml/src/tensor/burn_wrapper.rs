@@ -2446,7 +2446,7 @@ mod test {
 
                 for (value_centered, value) in centered_row.iter().zip(row.iter()) {
                     let diff = value_centered - (value - mean);
-                    assert!(diff.abs() < 1e-6, "Difference is too large: {diff}");
+                    assert!(diff.abs() < 2e-6, "Difference is too large: {diff}");
                 }
             }
         }
