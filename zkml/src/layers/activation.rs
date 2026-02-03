@@ -23,7 +23,7 @@ use crate::{
     number::Number,
     padding::PaddingMode,
     quantization::{self, BIT_LEN, ToField},
-    tensor::{Tensor, TensorHandle, WrappedModuleFn, WrappedTensor},
+    tensor::{Tensor, TensorHandle, TensorTypeParam, WrappedModuleFn, WrappedTensor},
 };
 use either::Either;
 use ff_ext::ExtensionField;
@@ -169,7 +169,10 @@ impl<N> Activation<N> {
     }
 }
 
-impl<N> From<GeGlu<N>> for Layer<N> {
+impl<N> From<GeGlu<N>> for Layer<N>
+where
+    N: TensorTypeParam,
+{
     fn from(geglu: GeGlu<N>) -> Self {
         Layer::Activation(geglu.0)
     }
@@ -251,8 +254,8 @@ impl ActivationLayer<Element> {
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     {
-        let input_data = activation_input.get_data();
-        let output_data = activation_output.get_data();
+        let input_data = activation_input.data();
+        let output_data = activation_output.data();
         debug_assert_eq!(
             input_data.len(),
             output_data.len(),
@@ -890,7 +893,7 @@ impl Relu {
         Tensor::new(
             input.shape().clone(),
             input
-                .get_data()
+                .data()
                 .par_iter()
                 .map(|e| Self::apply(*e))
                 .collect::<Vec<_>>(),
@@ -1136,11 +1139,11 @@ mod test {
             let data = gelu(btensor).to_data().into_vec().expect("Failed to compute GELU");
             let resultb = Tensor::<f32>::new(shape.clone(), data).unwrap();
 
-            let data = tensor.get_data();
+            let data = tensor.data();
             let data = data.iter().map(gelu_float).collect::<Vec<_>>();
             let result = Tensor::new(shape, data).unwrap();
 
-            resultb.get_data().iter().zip(result.get_data().iter()).try_for_each(|(left, right)| {
+            resultb.data().iter().zip(result.data().iter()).try_for_each(|(left, right)| {
                 prop_assert!(
                     (left - right).abs() < 1e-3,
                     "Actual: {left}, Expected: {right}",

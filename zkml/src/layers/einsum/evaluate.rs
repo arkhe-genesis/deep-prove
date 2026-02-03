@@ -35,40 +35,34 @@ where
             .map(|&input_tens| input_tens.clone().reduce_to_unpadded_shape())
             .collect::<Result<Vec<WrappedTensor<N>>>>()?
             .into_iter();
+
         // The LHS is never a constant tensor, so we take it from the inputs
         let lhs_input = unpadded_inputs_iter
             .next()
-            .ok_or(anyhow!("No input tensors provided"));
+            .ok_or(anyhow!("No input tensors provided"))?;
 
-        let const_tens_map = match self.padded {
-            true => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
-                WrappedTensor::try_from(const_tensor)?.reduce_to_unpadded_shape()
-            },
-            false => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
-                WrappedTensor::try_from(const_tensor)
-            },
-        };
-
-        let unpadded_inputs = std::iter::once(lhs_input)
-            .chain(self.constant_tensors.iter().map(|opt_const| {
-                if let Some(const_tensor) = opt_const {
-                    const_tens_map(const_tensor)
+        let mut unpadded_inputs: Vec<WrappedTensor<N>> = Vec::with_capacity(inputs.len());
+        let mut unpadded_shapes: Vec<Shape> = Vec::with_capacity(inputs.len());
+        unpadded_shapes.push(Shape::from(lhs_input.shape()));
+        unpadded_inputs.push(lhs_input);
+        for constant in self.constant_tensors.iter() {
+            let next = if let Some(const_tensor) = constant {
+                let tensor = WrappedTensor::try_from(const_tensor)?;
+                if self.padded {
+                    tensor.reduce_to_unpadded_shape()?
                 } else {
-                    unpadded_inputs_iter
-                        .next()
-                        .ok_or_else(|| anyhow!("Not enough input tensors provided"))
+                    tensor
                 }
-            }))
-            .collect::<Result<Vec<WrappedTensor<N>>>>()?;
-
-        // If the stack_axes_size is 1 and the lhs has rank 2 then we can make 2D matmuls instead of 3D batched matmuls
-        let unpadded_shapes = unpadded_inputs
-            .iter()
-            .map(|t| {
-                let BShape { dims } = t.shape();
-                Shape::new(dims)
-            })
-            .collect::<Vec<_>>();
+            } else {
+                unpadded_inputs_iter
+                    .next()
+                    .ok_or_else(|| anyhow!("Not enough input tensors provided"))?
+            };
+            // If the stack_axes_size is 1 and the lhs has rank 2 then we can
+            // make 2D matmuls instead of 3D batched matmuls
+            unpadded_shapes.push(Shape::from(next.shape()));
+            unpadded_inputs.push(next);
+        }
 
         self.burn_evaluation(unpadded_inputs, &unpadded_shapes)
     }
@@ -856,7 +850,7 @@ mod tests {
 
                 let expected = Tensor::new(shape.clone(), burn_data).unwrap();
                 let output = Tensor::new(shape, output.clone().get_data()).unwrap();
-                for (output, expected) in output.get_data().iter().zip(expected.get_data().iter()) {
+                for (output, expected) in output.data().iter().zip(expected.data().iter()) {
                     assert!(
                         cmp_result(output, expected),
                         "Failed for output {name} shapes X: {x_shape:?}, WQ: {wq_shape:?}, WK: {wk_shape:?}, WV: {wv_shape:?}, Calculated: {output}, Expected: {expected}"
@@ -1012,11 +1006,7 @@ mod tests {
             let expected_full = Tensor::new(qkt_full_shape.clone(), expected_full_data).unwrap();
             let output_full =
                 Tensor::new(qkt_full_shape, output_full[0].clone().get_data()).unwrap();
-            for (expected, output) in expected_full
-                .get_data()
-                .iter()
-                .zip(output_full.get_data().iter())
-            {
+            for (expected, output) in expected_full.data().iter().zip(output_full.data().iter()) {
                 assert!(
                     cmp_result(expected, output),
                     "Failed for full sequence shapes Q: {q_full_shape:?}, K: {k_shape:?}, Calculated: {output}, Expected: {expected}",
@@ -1037,9 +1027,9 @@ mod tests {
                 Tensor::new(qkt_single_shape, output_single[0].clone().get_data()).unwrap();
 
             for (expected, output) in expected_single
-                .get_data()
+                .data()
                 .iter()
-                .zip(output_single.get_data().iter())
+                .zip(output_single.data().iter())
             {
                 assert!(
                     cmp_result(expected, output),

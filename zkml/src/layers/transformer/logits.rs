@@ -249,7 +249,7 @@ impl Logits {
             let last_dim = input_shape.dim(input_shape.len() - 1);
             vec![
                 input
-                    .get_data()
+                    .data()
                     .par_chunks(last_dim)
                     .zip(committed_polys[0].get_base_field_vec().par_iter())
                     .map(|(chunk, &max)| {
@@ -675,7 +675,7 @@ where
         let max_values_guard = max_values.tensor()?;
         let merged_diff = input
             .slice_last_dim()
-            .zip(max_values_guard.get_data())
+            .zip(max_values_guard.data())
             .flat_map(|(row, row_max)| {
                 let current_max = row_max;
                 row.iter()
@@ -709,7 +709,7 @@ where
 
         // commit to max values
         let commit_data = max_values_guard
-            .get_data()
+            .data()
             .iter()
             .map(|v| ToField::<E>::to_field(v).as_bases()[0])
             .collect::<Vec<E::BaseField>>();
@@ -733,11 +733,11 @@ where
             ctx.commitment_ctx.batch_commit(vec![rmm, chunk_rmm])?
         };
 
-        let mut gen = LookupWitnessGen::<E, PCS>::default();
-        gen.insert_logup_witness(id, layer_commitment);
-        gen.insert_element_count(TableType::Range, element_count);
+        let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
+        witness_gen.insert_logup_witness(id, layer_commitment);
+        witness_gen.insert_element_count(TableType::Range, element_count);
 
-        Ok(gen)
+        Ok(witness_gen)
     }
 }
 
@@ -956,7 +956,7 @@ impl LogitsCtx {
         let column_beta = compute_betas_eval(column_point);
         let computed_eval =
             output
-                .get_data()
+                .data()
                 .iter()
                 .zip(beta)
                 .try_fold(E::ZERO, |sum, (token, b1)| {

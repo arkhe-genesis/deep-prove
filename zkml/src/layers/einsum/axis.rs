@@ -1553,7 +1553,7 @@ mod tests {
             let bias_tensor = Tensor::<Element>::random(&Shape::new(vec![i, l]));
             // Make the unpadded broadcasted bias tensor
             let broadcasted_data = bias_tensor
-                .get_data()
+                .data()
                 .chunks(l)
                 .flat_map(|row| row.iter().copied().cycle().take(j * l))
                 .collect::<Vec<Element>>();

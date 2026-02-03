@@ -263,7 +263,7 @@ impl RMSNorm<f32> {
         let eps = l.metadata_to_f32("norm_epsilon")?;
 
         // If alpha is all ones we can just set it to None
-        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0);
+        let trivial_alpha = alpha.data().iter().all(|&x| x == 1.0);
 
         if trivial_alpha {
             Self::new(None, eps, Some(alpha.shape().dim(-1)))
@@ -285,7 +285,7 @@ impl RMSNorm<f32> {
             .unwrap_or_default();
 
         // If alpha is all ones or zeroes we can just set it to None
-        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0 || x == 0.0f32);
+        let trivial_alpha = alpha.data().iter().all(|&x| x == 1.0 || x == 0.0f32);
 
         if trivial_alpha {
             Self::new(None, eps, Some(alpha.shape().dim(-1)))
@@ -304,7 +304,7 @@ impl RMSNorm<f32> {
             .get::<f32, _>("rms_norm_eps")
             .context("norm_epsilon not found")?;
         // If alpha is all ones or zeroes we can just set it to None
-        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0 || x == 0.0f32);
+        let trivial_alpha = alpha.data().iter().all(|&x| x == 1.0 || x == 0.0f32);
 
         if trivial_alpha {
             Self::new(None, eps, Some(alpha.shape().dim(-1)))
@@ -394,7 +394,7 @@ impl Evaluate<Element> for RMSNorm<Element> {
         ))?;
 
         let output_data = Tensor::try_from(input.clone())?
-            .get_data()
+            .data()
             .chunks(final_dim)
             .flat_map(|chunk| {
                 let sum_squares = chunk.iter().map(|x| *x * *x).sum::<Element>();
@@ -817,7 +817,7 @@ impl RMSNorm<Element> {
         let alpha_poly: MultilinearExtension<E> = if let Some(alpha) = self.alpha.as_ref() {
             std::iter::repeat_n(
                 alpha
-                    .get_data()
+                    .data()
                     .iter()
                     .map(<Element as ToField<E>>::to_field)
                     .collect::<Vec<E>>(),
@@ -886,12 +886,12 @@ impl RMSNorm<Element> {
 
         prover.add_witness_claim(node_id, vec![first_commit_claims, second_commit_claim]);
 
-        if self.alpha.is_some() {
+        if let Some(alpha) = &self.alpha {
             let common_claims = {
                 let point = io_point.iter().take(diff).copied().collect::<Vec<E>>();
                 let mut claims = HashMap::new();
                 claims.insert(
-                    self.alpha.as_ref().unwrap().commitment_id(),
+                    alpha.commitment_id(),
                     Claim::<E>::new(point.clone(), io_evaluations[2]),
                 );
                 claims
@@ -935,7 +935,7 @@ impl RMSNorm<Element> {
             "Could not prove RMSNorm because it had no quantisation data"
         ))?;
         let (range_check, lookup_input): (Vec<Element>, Vec<Element>) = input_tensor
-            .get_data()
+            .data()
             .chunks(self.normalisation_dim_size().next_power_of_two())
             .map(|chunk| {
                 let sum_squares = chunk.iter().map(|x| *x * *x).sum::<Element>();
@@ -1231,7 +1231,7 @@ mod tests {
             * (1.0f32 / RMSNORM_OUTPUT_SCALE_FACTOR as f32);
         let output_scaling = ScalingFactor::from_scale(output_scale, None);
         let quant_output_dequant = quant_output.to_native().dequantize(&output_scaling);
-        let a = quant_output_dequant.get_data();
+        let a = quant_output_dequant.data();
         let b = dequant_output.get_data();
         assert!(
             is_close_with_tolerance(a, &b, 5e-2_f32, 1e-1_f32),

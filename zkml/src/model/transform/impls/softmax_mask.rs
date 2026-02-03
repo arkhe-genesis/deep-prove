@@ -62,7 +62,7 @@ impl ModelTransform<Element> for SoftmaxMaskTransform {
         );
 
         // Now we can set the mask negative infinity value to be correct
-        let Layer::AttentionMask(ref mut mask) = input_node else {
+        let Layer::AttentionMask(mask) = input_node else {
             unreachable!()
         };
 

@@ -55,11 +55,9 @@ impl Gemma3 {
     }
 
     fn scale_norm(rmsnorm: &mut Norm<f32>) {
-        if let Norm::RMSNorm(rmsnorm) = rmsnorm {
-            if let Some(alpha) = rmsnorm.alpha.as_mut() {
-                for v in alpha.tensor_mut().iter_mut() {
-                    *v += 1.0;
-                }
+        if let Norm::RMSNorm(rmsnorm) = rmsnorm && let Some(alpha) = rmsnorm.alpha.as_mut() {
+            for v in alpha.tensor_mut().iter_mut() {
+                *v += 1.0;
             }
         }
     }
@@ -349,7 +347,7 @@ pub mod tests {
             total_cols
         );
 
-        let data = tensor.get_data();
+        let data = tensor.data();
         let mut result = Vec::with_capacity(rows * num_cols);
         for r in 0..rows {
             let row_start = r * total_cols;
@@ -394,7 +392,7 @@ pub mod tests {
         );
 
         let stride = shape.dim(1);
-        let data = actual.get_data();
+        let data = actual.data();
         ensure!(
             expected.data.len() == rows * cols,
             "{label} serialized data length {} does not match shape product {}",
@@ -477,13 +475,12 @@ pub mod tests {
             logits: Vec<f32>,
         }
         let argmax = |logits: &[f32]| -> usize {
-            let max_index = logits
+            logits
                 .iter()
                 .enumerate()
-                .max_by(|(_, &x), (_, &y)| x.partial_cmp(&y).unwrap())
+                .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
                 .unwrap()
-                .0;
-            max_index
+                .0
         };
 
         let logits: Vec<GemmaLogits> =
@@ -507,7 +504,7 @@ pub mod tests {
             let total_logits = deep_prove_logits.dim(0);
             let skip = (total_logits - 1) * vocab_size;
             // We only care about the logits of the final token
-            let computed_new_token = argmax(&deep_prove_logits.get_data()[skip..]);
+            let computed_new_token = argmax(&deep_prove_logits.data()[skip..]);
             let expected_new_token = argmax(&logit.logits);
             // CURRENTLY NOT WORKING BECAUSE GEMMA3 CONSTRUCTION IS INCORRECT
             assert!(
@@ -679,7 +676,7 @@ pub mod tests {
         // Debug: Print first row of embeddings from both Python and Rust
         let rust_emb = &embedding_outputs[0];
         let rust_shape = rust_emb.shape();
-        let rust_data = rust_emb.get_data();
+        let rust_data = rust_emb.data();
         let rust_embedding_output_first_row: Vec<f32> = rust_data[..hidden_size].to_vec();
 
         let python_first_row: Vec<f32> = python_embeddings.data[..hidden_size].to_vec();
@@ -702,7 +699,7 @@ pub mod tests {
         if let Layer::Embeddings(emb) = embedding_ref {
             let emb_matrix = emb.embedding_matrix();
             let emb_shape = emb_matrix.shape();
-            let emb_data = emb_matrix.get_data();
+            let emb_data = emb_matrix.data();
             println!("\n=== Embedding Matrix Weight Comparison ===");
             println!(
                 "Embedding matrix shape: {:?} (should be [vocab_size, hidden_dim])",
@@ -832,7 +829,7 @@ pub mod tests {
         if let Some(ref python_rmsnorm_alpha) = intermediates.pre_qkv_rmsnorm_alpha {
             if let Layer::RMSNorm(rmsnorm) = pre_qkv_norm_layer {
                 if let Some(ref rust_alpha_tensor) = rmsnorm.alpha {
-                    let rust_alpha_data = rust_alpha_tensor.get_data();
+                    let rust_alpha_data = rust_alpha_tensor.data();
                     println!("\n=== Pre-QKV RMSNorm Alpha (Weight) Comparison ===");
                     println!("Python alpha length: {}", python_rmsnorm_alpha.len());
                     println!("Rust alpha length: {}", rust_alpha_data.len());
@@ -1063,7 +1060,7 @@ pub mod tests {
 
         println!(
             "------- RUST Q (post-RoPE) [0:2] = {:?}",
-            &q_rope_outs[0].get_data()[256..256 + 10]
+            &q_rope_outs[0].data()[256..256 + 10]
         );
 
         // Compare Q post-RoPE

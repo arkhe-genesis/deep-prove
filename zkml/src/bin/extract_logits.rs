@@ -152,7 +152,7 @@ where
             .ok()
             .context("Failed to get logit tensor")?;
         let shape = logit_tensor.shape();
-        let data = to_float(logit_tensor.get_data(), *node_id)?;
+        let data = to_float(logit_tensor.data(), *node_id)?;
         let (seq_len, _vocab_size) = extract_dimensions(shape);
 
         return Ok(LogitsData { data, seq_len });
@@ -191,7 +191,7 @@ where
         .unwrap()
         .tensor()
         .unwrap()
-        .get_data()
+        .data()
         .iter()
         .skip(tokens.len())
         .map(|t| Token::from(zkml::Number::to_usize(t)))

@@ -56,7 +56,7 @@ impl ScalingFactor {
         quantized_domain: Option<(Element, Element)>,
     ) -> Self {
         let max_abs = t
-            .get_data()
+            .data()
             .iter()
             .fold(T::zero(), |a, b| a.cmp_max(b.absolute_value()));
         Self::from_absolute_max(max_abs.to_f32(), quantized_domain)
@@ -269,7 +269,7 @@ where
     fn to_field(&self) -> Tensor<F> {
         let shape = self.shape();
         let unpadded_shape = self.unpadded_shape();
-        let data = to_field::<T, F, _>(self.get_data());
+        let data = to_field::<T, F, _>(self.data());
         Tensor::new_with_unpadded_shape(shape.clone(), unpadded_shape.clone(), data)
             .expect("The data length hasn't changed so this should never fail")
     }

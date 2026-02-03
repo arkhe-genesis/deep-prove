@@ -16,7 +16,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use itertools::izip;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::Deref,
@@ -853,7 +853,11 @@ pub type ModelGraph<N> = Graph<Layer<N>, usize, usize, ()>;
 
 /// Represents a model
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Model<N> {
+#[serde(bound(serialize = "N: Serialize", deserialize = "N: DeserializeOwned"))]
+pub struct Model<N>
+where
+    N: TensorTypeParam,
+{
     /// The graph-representation of the model
     ///
     /// NOTE: two very important conventions:
@@ -868,7 +872,10 @@ pub struct Model<N> {
     unpadded_input_shapes: Vec<Shape>,
 }
 
-impl<N> Model<N> {
+impl<N> Model<N>
+where
+    N: TensorTypeParam,
+{
     /// Return an immutable reference to the underlying graph.
     pub fn graph(&self) -> &ModelGraph<N> {
         &self.graph
@@ -991,12 +998,7 @@ impl<N> Model<N> {
         }
         Ok(())
     }
-}
 
-impl<N> Model<N>
-where
-    N: TensorTypeParam,
-{
     /// Prepare the input tensors to be provided to the model according to the
     /// actual input shapes expected by the model
     pub fn prepare_inputs(&self, inputs: Vec<Tensor<N>>) -> Result<Vec<Tensor<N>>> {
@@ -1284,29 +1286,7 @@ where
     pub fn eval_order(&self) -> impl Iterator<Item = NodeId> + use<'_, N> {
         self.graph.forward_iter().map(|(id, _)| id)
     }
-}
 
-impl Model<f32> {
-    pub fn run_float(
-        &self,
-        inputs: Vec<Tensor<f32>>,
-        store: &mut GenStore,
-    ) -> Result<Vec<TensorHandle<f32>>> {
-        let input_handles = tensor_to_handles(&inputs, &self.graph, store)?;
-
-        let runner = BaseRunner {
-            store: store.clone(),
-        };
-        #[cfg(test)]
-        let runner = SanityCheckRunner { inner: runner };
-        let mut runner = HandleLifetimeRunner::new(runner, &self.graph);
-        self.run_with_runner(&mut runner, input_handles)?;
-
-        runner.model_outputs(&self.graph)
-    }
-}
-
-impl<N: TensorTypeParam> Model<N> {
     /// Run a single iteration of the model using the provided `runner`.
     pub fn run_with_runner<R>(
         &self,
@@ -1372,6 +1352,26 @@ impl<N: TensorTypeParam> Model<N> {
 
         trace.output = trace.graph_outputs(&self.graph)?;
         Ok(trace)
+    }
+}
+
+impl Model<f32> {
+    pub fn run_float(
+        &self,
+        inputs: Vec<Tensor<f32>>,
+        store: &mut GenStore,
+    ) -> Result<Vec<TensorHandle<f32>>> {
+        let input_handles = tensor_to_handles(&inputs, &self.graph, store)?;
+
+        let runner = BaseRunner {
+            store: store.clone(),
+        };
+        #[cfg(test)]
+        let runner = SanityCheckRunner { inner: runner };
+        let mut runner = HandleLifetimeRunner::new(runner, &self.graph);
+        self.run_with_runner(&mut runner, input_handles)?;
+
+        runner.model_outputs(&self.graph)
     }
 }
 
@@ -1831,7 +1831,7 @@ pub(crate) mod test {
             InferenceObserver::new_with_representative_input(vec![
                 repr_inputs
                     .iter()
-                    .map(|input| input.get_data().to_vec())
+                    .map(|input| input.data().to_vec())
                     .collect(),
             ])
         } else {

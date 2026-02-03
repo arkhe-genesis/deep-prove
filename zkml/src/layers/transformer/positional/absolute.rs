@@ -279,7 +279,7 @@ impl Absolute<Element> {
         let column_eq = compute_betas_eval(&sub_pos_claim.point()[row_num_vars..]).into_mle();
         // All of the rows in the positional matrix are fixed for the Sumcheck
         let fixed_positional = sub_pos
-            .get_data()
+            .data()
             .par_chunks(input.shape().dim(-1))
             .with_min_len(64)
             .map(|row| {

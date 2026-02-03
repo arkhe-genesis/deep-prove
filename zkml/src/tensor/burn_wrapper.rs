@@ -14,9 +14,7 @@ use burn::{
     nn::{LayerNormConfig, RmsNormConfig},
     tensor::{
         AsIndex, BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, SliceArg,
-        Tensor as BTensor, TensorData, activation,
-        ops::{ConvOptions, IntTensorOps},
-        s,
+        Tensor as BTensor, TensorData, activation, ops::ConvOptions, s,
     },
 };
 
@@ -1428,7 +1426,7 @@ where
         self,
         elem: T,
     ) -> Result<BTensor<Backend, D, burn::tensor::Bool>> {
-        anyhow::ensure!(
+        ensure!(
             self.rank() == D,
             "Unexpected tensor rank: {}, expected {}",
             self.rank(),
@@ -1666,9 +1664,6 @@ impl WrappedTensor<f32> {
         gamma: Self,
         beta: Self,
     ) -> Result<Self> {
-        // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
-        // instead of re-implementing everything ourselves.
-        // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/layer.rs.html#67
         let input_rank = input.rank();
         let Self::Rank2 {
             tensor: input,
@@ -1698,7 +1693,7 @@ impl WrappedTensor<f32> {
     }
 
     pub fn softmax(tensor: Self, dim: usize) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             dim < tensor.rank(),
             "Softmax dimension {dim} out of bounds, (tensor rank: {}).",
             tensor.rank()
@@ -1741,9 +1736,6 @@ impl WrappedTensor<f32> {
         epsilon: f64,
         gamma: Option<Self>,
     ) -> Result<Self> {
-        // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
-        // instead of re-implementing everything ourselves.
-        // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/rms.rs.html#71
         let config = RmsNormConfig::new(embedding_size).with_epsilon(epsilon);
         let device = Default::default();
         let norm = if let Some(gamma) = gamma {
@@ -1994,12 +1986,10 @@ impl WrappedModuleFn for WrappedTensor<Element> {
                 tensor: input,
                 unpadded_shape,
             } => {
-                let input = input.into_primitive();
-                let mask = Backend::int_lower_equal_elem(input.clone(), 0);
-                let out = Backend::int_mask_fill(input, mask, 0);
-                let out = BTensor::from_primitive(out);
+                let mask = input.clone().lower_equal_elem(0);
+
                 WrappedTensor::Rank1 {
-                    tensor: out,
+                    tensor: input.mask_fill(mask, 0),
                     unpadded_shape,
                 }
             }
@@ -2007,12 +1997,9 @@ impl WrappedModuleFn for WrappedTensor<Element> {
                 tensor: input,
                 unpadded_shape,
             } => {
-                let input = input.into_primitive();
-                let mask = Backend::int_lower_equal_elem(input.clone(), 0);
-                let out = Backend::int_mask_fill(input, mask, 0);
-                let out = BTensor::from_primitive(out);
+                let mask = input.clone().lower_equal_elem(0);
                 WrappedTensor::Rank2 {
-                    tensor: out,
+                    tensor: input.mask_fill(mask, 0),
                     unpadded_shape,
                 }
             }
@@ -2020,12 +2007,9 @@ impl WrappedModuleFn for WrappedTensor<Element> {
                 tensor: input,
                 unpadded_shape,
             } => {
-                let input = input.into_primitive();
-                let mask = Backend::int_lower_equal_elem(input.clone(), 0);
-                let out = Backend::int_mask_fill(input, mask, 0);
-                let out = BTensor::from_primitive(out);
+                let mask = input.clone().lower_equal_elem(0);
                 WrappedTensor::Rank3 {
-                    tensor: out,
+                    tensor: input.mask_fill(mask, 0),
                     unpadded_shape,
                 }
             }
@@ -2033,12 +2017,9 @@ impl WrappedModuleFn for WrappedTensor<Element> {
                 tensor: input,
                 unpadded_shape,
             } => {
-                let input = input.into_primitive();
-                let mask = Backend::int_lower_equal_elem(input.clone(), 0);
-                let out = Backend::int_mask_fill(input, mask, 0);
-                let out = BTensor::from_primitive(out);
+                let mask = input.clone().lower_equal_elem(0);
                 WrappedTensor::Rank4 {
-                    tensor: out,
+                    tensor: input.mask_fill(mask, 0),
                     unpadded_shape,
                 }
             }
@@ -2129,7 +2110,7 @@ where
     fn try_from(tensor: Tensor<T>) -> Result<Self> {
         let unpadded_shape = tensor.unpadded_shape().clone().into();
 
-        match tensor.rank() {
+        match tensor.shape().rank() {
             1 => Ok(WrappedTensor::Rank1 {
                 tensor: tensor.into_btensor::<1>(),
                 unpadded_shape,
@@ -2147,7 +2128,7 @@ where
                 unpadded_shape,
             }),
             _ => {
-                bail!("Unexpected tensor rank: {}", tensor.rank())
+                bail!("Unexpected tensor rank: {}", tensor.shape().rank())
             }
         }
     }

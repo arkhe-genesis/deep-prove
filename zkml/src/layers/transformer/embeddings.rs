@@ -406,7 +406,7 @@ where
         let mut reduced_one_hot = vec![E::ZERO; vocab_size];
 
         input
-            .get_data()
+            .data()
             .iter()
             .take(unpadded_length)
             .enumerate()
@@ -576,7 +576,7 @@ where
         );
         let (r1, r2) = one_hot_claim.point.split_at(vocab_nv as usize);
         let b1 = compute_betas_eval(r2);
-        let sum = input.get_data().iter().take(unpadded_length).zip(b1).fold(
+        let sum = input.data().iter().take(unpadded_length).zip(b1).fold(
             E::ZERO,
             |sum, (token, beta)| {
                 let token_value = token.to_canonical_u64_vec()[0] as usize;
@@ -708,12 +708,12 @@ mod tests {
             Tensor::<Element>::new(vec![5].into(), indices_elem.clone())?.to_field();
         let vocab_size = 6;
         let emb_size = 10;
-        let one_hot = one_hot_encoding(indices.get_data(), vocab_size);
+        let one_hot = one_hot_encoding(indices.data(), vocab_size);
         let expected_shape: Shape = vec![indices.shape().numel(), vocab_size].into();
         assert_eq!(*one_hot.shape(), expected_shape);
         assert_eq!(
-            one_hot.get_data(),
-            vec![
+            one_hot.data(),
+            &[
                 GoldilocksExt2::ONE,
                 GoldilocksExt2::ZERO,
                 GoldilocksExt2::ZERO,
@@ -800,10 +800,10 @@ mod tests {
             let seq_len = input.shape()[0];
             let vocab_size = emb.shape()[0];
             let emb_size = emb.shape()[1];
-            let emb_data = emb.get_data();
+            let emb_data = emb.data();
 
             let new_emb = input
-                .get_data()
+                .data()
                 .iter()
                 .flat_map(|v| {
                     let idx = v.to_usize();
@@ -843,9 +843,9 @@ mod tests {
             );
             let input = input.quantize(&scaling);
 
-            let emb_data = emb.get_data();
+            let emb_data = emb.data();
             let new_emb = input
-                .get_data()
+                .data()
                 .iter()
                 .flat_map(|v| {
                     let idx = v.to_usize();

@@ -304,8 +304,8 @@ fn compute_layer_ctx<E: ExtensionField>(
     );
     let (info, mut new_aux) = layer.step_info(id, ctx_aux.clone())?;
     // Retrieve any model polynomials that need to be committed
-    if new_aux.model_polys.is_some() {
-        for (poly_id, evals) in new_aux.model_polys.as_mut().unwrap().drain() {
+    if let Some(aux_model_polys) = &mut new_aux.model_polys {
+        for (poly_id, evals) in aux_model_polys.drain() {
             let num_vars = ceil_log2(evals.len());
             let mle =
                 MultilinearExtension::<E>::from_evaluations_vec(num_vars, to_base::<E, _>(evals));

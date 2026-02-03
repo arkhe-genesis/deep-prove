@@ -26,10 +26,10 @@ pub struct HadamardCtx<F: ExtensionField> {
 impl<F: ExtensionField> HadamardCtx<F> {
     pub fn new(v1: &Tensor<Element>, v2: &Tensor<Element>) -> Self {
         assert_eq!(v1.shape(), v2.shape());
-        let num_vars = if v1.get_data().len().is_power_of_two() {
-            v1.get_data().len().ilog2() as usize
+        let num_vars = if v1.data().len().is_power_of_two() {
+            v1.data().len().ilog2() as usize
         } else {
-            v1.get_data().len().next_power_of_two().ilog2() as usize
+            v1.data().len().next_power_of_two().ilog2() as usize
         };
         Self {
             sumcheck_aux: crate::util::from_mle_list_dimensions(&[vec![
@@ -90,14 +90,8 @@ pub fn prove<F: ExtensionField, T: Transcript<F>>(
     v1: &Tensor<Element>,
     v2: &Tensor<Element>,
 ) -> HadamardProof<F> {
-    assert_eq!(
-        output_claim.point.len(),
-        v1.get_data().len().ilog2() as usize
-    );
-    assert_eq!(
-        output_claim.point.len(),
-        v2.get_data().len().ilog2() as usize
-    );
+    assert_eq!(output_claim.point.len(), v1.data().len().ilog2() as usize);
+    assert_eq!(output_claim.point.len(), v2.data().len().ilog2() as usize);
     assert!(v1.shape().iter().all(|x| x.is_power_of_two()));
     assert!(v2.shape().iter().all(|x| x.is_power_of_two()));
     let beta_poly = compute_betas_eval(&output_claim.point).into_mle();

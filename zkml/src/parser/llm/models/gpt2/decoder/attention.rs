@@ -156,7 +156,7 @@ impl Load<SafeLoader> for GPT2Attention {
         // - K columns: [hidden_size, 2*hidden_size)
         // - V columns: [2*hidden_size, 3*hidden_size)
         let fused_tensor = fused_qkv_weight.tensor();
-        let fused_data = fused_tensor.get_data();
+        let fused_data = fused_tensor.data();
         let mut q_data = Vec::with_capacity(hidden_size * hidden_size);
         let mut k_data = Vec::with_capacity(hidden_size * hidden_size);
         let mut v_data = Vec::with_capacity(hidden_size * hidden_size);
@@ -219,7 +219,7 @@ impl Load<SafeLoader> for GPT2Attention {
         );
 
         let bias_tensor = fused_qkv_bias.tensor();
-        let bias_data = bias_tensor.get_data();
+        let bias_data = bias_tensor.data();
         // Split bias into Q, K, V components
         let q_bias = KeyedTensor::new(
             format!("{:?}.q", fused_qkv_bias.commitment_id()),
@@ -461,7 +461,7 @@ impl Load<JSONLoader> for GPT2Attention {
         );
         trace!("fused qkv: {fused_qkv_weight:?}");
         trace!("qkv full tensor {unfused_weights_data:?}");
-        trace!("q_weight {:?}", wq.get_data());
+        trace!("q_weight {:?}", wq.data());
 
         // Unfuse biases:
         // Expected shape of fused_qkv_bias is [3 * hidden_size].

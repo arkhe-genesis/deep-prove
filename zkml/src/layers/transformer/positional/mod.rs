@@ -586,7 +586,10 @@ impl Positional<f32> {
     pub fn from_json(l: &json::FileTensorLoader, c: &LLMConfig) -> anyhow::Result<Self> {
         let mut position_embd = l.get_tensor("position_embd.weight")?;
         position_embd.truncate_on_first_dim(c.context_length)?;
-        ensure!(position_embd.rank() == 2, "position_embd must be 2d");
+        ensure!(
+            position_embd.shape().rank() == 2,
+            "position_embd must be 2d"
+        );
         ensure!(
             position_embd.shape()[0] == c.context_length,
             "position_embd must have shape [0] [{}] vs given {:?}",

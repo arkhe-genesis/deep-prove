@@ -168,10 +168,12 @@ impl Softmax<Element> {
 
         let unpadded_input = input.reduce_to_shape(unpadded_input_shape)?;
 
-        let shape_2d: Shape = unpadded_input_shape[input.rank() - 2..].to_vec().into();
+        let shape_2d: Shape = unpadded_input_shape[input.shape().rank() - 2..]
+            .to_vec()
+            .into();
         let chunk_size = shape_2d.numel();
 
-        let total_2d_chunks = unpadded_input_shape[..input.rank() - 2]
+        let total_2d_chunks = unpadded_input_shape[..input.shape().rank() - 2]
             .iter()
             .product::<usize>();
 
@@ -179,9 +181,9 @@ impl Softmax<Element> {
 
         let shift_data_guard = shift_handle.tensor()?;
         let shifted_data = unpadded_input
-            .get_data()
+            .data()
             .chunks(final_dim_size)
-            .zip(shift_data_guard.get_data())
+            .zip(shift_data_guard.data())
             .flat_map(|(input_chunk, shift_elem)| {
                 input_chunk
                     .iter()
@@ -348,12 +350,12 @@ impl Softmax<Element> {
         );
         // The final rmm is the shift values, its width is just shift_shape[0]
 
-        let shift_chunk_size = shift_handle.shape()[input.rank() - 2..]
+        let shift_chunk_size = shift_handle.shape()[input.shape().rank() - 2..]
             .iter()
             .product::<usize>();
         let shift_chunk_diff = shift_chunk_size.next_power_of_two() - shift_chunk_size;
         let shift_evals = shift_data_guard
-            .get_data()
+            .data()
             .chunks(shift_chunk_size)
             .map(|chunk| {
                 chunk

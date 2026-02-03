@@ -110,7 +110,7 @@ impl Reshape {
                 new_dim.insert(*index, 1);
                 vec![Shape::new(new_dim)]
             }
-            Reshape::Full((ref new_dim, _)) => new_dim.clone(),
+            Reshape::Full((new_dim, _)) => new_dim.clone(),
             Reshape::Subspace(subspace) => input_shapes
                 .iter()
                 .map(|shape| {
@@ -190,7 +190,7 @@ impl OpInfo for Reshape {
     fn describe(&self) -> String {
         match self {
             Reshape::Squeeze(index) => format!("Reshape: squeeze({index})"),
-            Reshape::Full(ref new_dim) => format!("Reshape: fixed {new_dim:?}"),
+            Reshape::Full(new_dim) => format!("Reshape: fixed {new_dim:?}"),
             Reshape::Subspace(_) => "Reshape: dynamic".to_string(),
         }
     }
@@ -305,7 +305,7 @@ mod tests {
             .evaluate(&[&input.as_wrapped()])
             .expect("reshape shouldn't fail");
         assert_eq!(output.outputs[0].shape(), vec![3_usize, 2, 3].into());
-        assert_eq!(output.outputs[0].get_data(), input.get_data());
+        assert_eq!(&output.outputs[0].get_data(), input.data());
     }
 
     #[test]

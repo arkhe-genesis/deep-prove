@@ -17,13 +17,18 @@ use zkml::{
         onnx::FloatOnnxLoader,
     },
     quantization::{AbsoluteMax, InferenceTracker, InferenceTrackingMode},
+    tensor::TensorTypeParam,
 };
 
 #[cfg(test)]
 use zkml::model::SanityCheckRunner;
 
 type F = ff_ext::GoldilocksExt2;
-pub struct Snapshot<T> {
+
+pub struct Snapshot<T>
+where
+    T: TensorTypeParam,
+{
     pub model: Model<T>,
     pub store: GenStore,
     pub shapes: HashMap<NodeId, ShapeStep>,
@@ -185,7 +190,7 @@ impl GlobalContext {
                     .unwrap()
                     .tensor()
                     .unwrap()
-                    .get_data()
+                    .data()
                     .iter()
                     .map(|t| Token::from(t.to_usize()))
                     .collect::<Vec<_>>()
@@ -225,7 +230,7 @@ impl GlobalContext {
                     .unwrap()
                     .tensor()
                     .unwrap()
-                    .get_data()
+                    .data()
                     .iter()
                     .map(|t| Token::from(t.to_usize()))
                     .collect::<Vec<_>>()

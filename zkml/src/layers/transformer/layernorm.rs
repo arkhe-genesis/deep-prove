@@ -157,7 +157,7 @@ impl<N: Number> LayerNorm<N> {
             beta.shape(),
         );
         ensure!(
-            gamma.rank() == 1,
+            gamma.shape().rank() == 1,
             "Gamma and beta must be 1D. gamma {:?} beta {:?}",
             gamma.shape(),
             beta.shape(),
@@ -276,7 +276,7 @@ where
             quant_beta.shape(),
         );
         ensure!(
-            quant_gamma.rank() == 1,
+            quant_gamma.shape().rank() == 1,
             "Quantised gamma and beta must be 1D. gamma {:?} beta {:?}",
             quant_gamma.shape(),
             quant_beta.shape(),
@@ -482,8 +482,8 @@ impl Evaluate<Element> for LayerNorm<Element> {
         let unpadded_shape = input.unpadded_shape();
         let is_padded = shape.as_slice() != unpadded_shape.as_slice();
 
-        assert_eq!(self.gamma.rank(), 1, "Gamma must be 1D");
-        assert_eq!(self.beta.rank(), 1, "Beta must be 1D");
+        assert_eq!(self.gamma.shape().rank(), 1, "Gamma must be 1D");
+        assert_eq!(self.beta.shape().rank(), 1, "Beta must be 1D");
 
         let QuantisedLayerNormData {
             multiplier,
@@ -1159,7 +1159,7 @@ impl LayerNorm<Element> {
         let number_range_checks = (lut.range_check_bits() - 1) / *quantization::BIT_LEN + 1;
 
         let full_value_guard = full_value.tensor()?;
-        let full_value_data = full_value_guard.get_data();
+        let full_value_data = full_value_guard.data();
 
         let range_check_mask: Element = bit_to_mask(lut.range_check_bits());
         let lookup_input: Vec<Element> = full_value_data
@@ -1208,7 +1208,7 @@ impl LayerNorm<Element> {
                 });
 
         let lookup_output_guard = lookup_output.tensor()?;
-        let lookup_output_data = lookup_output_guard.get_data();
+        let lookup_output_data = lookup_output_guard.data();
 
         let inv_sqrt_element_count = lookup_input.iter().zip(lookup_output_data.iter()).fold(
             HashMap::<Element, u64>::new(),
@@ -1517,7 +1517,7 @@ mod tests {
             .clone();
 
         let quant_output_dequant = quant_output.to_native().dequantize(&output_scaling);
-        let a = quant_output_dequant.get_data();
+        let a = quant_output_dequant.data();
         let b = dequant_output.get_data();
         assert!(
             is_close_with_tolerance(a, &b, 5e-2_f32, 1e-1_f32),
@@ -1605,7 +1605,7 @@ mod tests {
         let final_dim = *input.shape().last().unwrap();
 
         let (inv_sqrt_output, full_value): (Vec<Element>, Vec<Element>) = input
-            .get_data()
+            .data()
             .chunks(final_dim)
             .map(|chunk| {
                 let sum_squares = chunk.iter().map(|x| *x * *x).sum::<Element>();
@@ -1620,12 +1620,12 @@ mod tests {
             .unzip();
 
         let output_data = input
-            .get_data()
+            .data()
             .chunks(final_dim)
             .zip(inv_sqrt_output.iter())
             .flat_map(|(input_chunk, denominator)| {
                 let sum = input_chunk.iter().sum::<Element>();
-                izip!(input_chunk, gamma.get_data(), beta.get_data())
+                izip!(input_chunk, gamma.data(), beta.data())
                     .map(|(&v, &gamma, &beta)| {
                         gamma * (*dim_size as Element * v - sum) * *denominator + beta
                     })

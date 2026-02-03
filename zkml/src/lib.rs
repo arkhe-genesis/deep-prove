@@ -5,6 +5,8 @@
 #![feature(exact_size_is_empty)]
 #![feature(mapped_lock_guards)]
 
+use std::{borrow::Borrow, cmp::Ordering, env, ops::Deref, str::FromStr};
+
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
 use ff_ext::{ExtensionField, FieldFrom};
 use itertools::Itertools;
@@ -12,10 +14,11 @@ use multilinear_extensions::mle::PointAndEval;
 use quantization::ToField;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Borrow, env, ops::Deref, str::FromStr};
 use transcript::{BasicTranscript, Transcript};
+
 mod backend;
 mod commit;
+mod fft;
 pub mod graph;
 pub mod inputs;
 pub mod iop;
@@ -30,7 +33,6 @@ pub mod quantization;
 pub mod shape;
 pub mod tensor;
 pub use crate::number::Number;
-use std::cmp::Ordering;
 
 // Re-exports
 pub use iop::{
@@ -348,7 +350,7 @@ mod test {
         let shape = &shapes[0];
         assert_eq!(shape.len(), 1);
         let input = Tensor::random(&vec![shape[0]].into());
-        println!("input: {:?}", input.get_data());
+        println!("input: {:?}", input.data());
         let inputs = model.prepare_inputs(vec![input])?;
 
         let trace = model.run(inputs, &mut GenStore::default()).unwrap();

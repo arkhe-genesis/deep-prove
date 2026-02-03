@@ -171,7 +171,7 @@ async fn run_one_shot_llm(
         .last()
         .and_then(|h| h.tensor().ok())
         .map(|t| {
-            t.get_data()
+            t.data()
                 .iter()
                 .map(|x| Token::from(x.to_usize()))
                 .collect::<Vec<_>>()

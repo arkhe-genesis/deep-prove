@@ -310,9 +310,9 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
         sd.input_shape_og = vec![nrows].into();
         if let Some(ref bias) = einsum.biases[0] {
             ensure!(
-                bias.get_data().len() == nrows,
+                bias.data().len() == nrows,
                 "Bias length {} does not match matrix width {}",
-                bias.get_data().len(),
+                bias.data().len(),
                 nrows,
             );
         }

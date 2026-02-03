@@ -482,7 +482,7 @@ where
             step_data.node_inputs[0]
                 .tensor()
                 .context("hydrating tensor")?
-                .get_data()
+                .data()
                 .iter()
                 .map(|&val| {
                     let tmp = val * self.fixed_point_multiplier + rounding_constant;
@@ -738,9 +738,16 @@ impl Requant {
         // We use this value to determine if any of the inputs are too large to be requantised (i.e. they fall outside the clamping table)
         let max_abs_val: Element = 1 << self.intermediate_bit_size;
         let res = input
-            .get_data()
-            .iter().enumerate()
-            .map(|(i,e)| {if e.abs() <= max_abs_val {Ok(self.apply(e))} else {Err(anyhow!("Could not apply requantisation, tensor element {i} had absolute value too large, given value: {e}, max value: {max_abs_val}"))}})
+            .data()
+            .iter()
+            .enumerate()
+            .map(|(i, el)| {
+                if el.abs() <= max_abs_val {
+                    Ok(self.apply(el))
+                } else {
+                    Err(anyhow!("Could not apply requantisation, tensor element {i} had absolute value too large, given value: {el}, max value: {max_abs_val}"))
+                }
+            })
             .collect::<Result<Vec<Element>, anyhow::Error>>()?;
 
         Tensor::<Element>::new(input.shape().clone(), res)
@@ -1138,7 +1145,7 @@ mod tests {
             .map(|input| {
                 // We use this value to determine if any of the inputs are too large to be requantised (i.e. they fall outside the clamping table)
                 let res = input
-                    .get_data()
+                    .data()
                     .iter()
                     .map(|elem| {
                         let max_abs_val: Element = 1 << layer.intermediate_bit_size;

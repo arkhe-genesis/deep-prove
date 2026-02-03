@@ -305,7 +305,7 @@ fn load_reshape<'a, I: Iterator<Item = &'a usize> + Sized>(
         node.name
     );
     let reshape_node = downcast_to::<AxisOp>(node)?;
-    let AxisOp::Reshape(_, ref current_shape, ref new_shape) = reshape_node else {
+    let AxisOp::Reshape(_, current_shape, new_shape) = reshape_node else {
         return err(format!("Reshape {} is not a Reshape node", node.name));
     };
     let current_shape: Shape = current_shape
@@ -525,7 +525,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
     let mut input_shape = vec![input_size_flattened];
 
     if weight_shape.len() > 2 {
-        let weight_size_flattened = weight.get_data().len();
+        let weight_size_flattened = weight.data().len();
         ensure_onnx!(
             weight_size_flattened % input_size_flattened == 0,
             "Weight size {} is not divisible by input size {}",
@@ -632,7 +632,7 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
                         .inputs
                         .iter()
                         .enumerate()
-                        .find(|(_i, &x)| x.node == node_id)
+                        .find(|(_i, x)| x.node == node_id)
                     {
                         Some((idx, ..)) => {
                             // Now we need to find the bias node, which is the other input to the Add node
@@ -779,7 +779,7 @@ fn check_conv2d_attributes(node: &Conv) -> Result<()> {
     };
     ensure_onnx!(strides.iter().all(|&x| x == 1), "Strides must be {}", 1);
     ensure_onnx!(strides.iter().all(|&x| x == 1), "Strides must be {}", 1);
-    let PaddingSpec::Explicit(ref pad0, ref pad1) = &node.pool_spec.padding else {
+    let PaddingSpec::Explicit(pad0, pad1) = &node.pool_spec.padding else {
         return err(format!("Conv has no pads: {}", node.name()));
     };
     ensure_onnx!(

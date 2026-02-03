@@ -8,6 +8,7 @@ use crate::{
     Claim, Element, NextPowerOfTwo, Prover, ScalingStrategy, Shape, VectorTranscript,
     backend::Conv2dConfig,
     commit::{compute_betas_eval, identity_eval},
+    fft::fft,
     graph::NodeId,
     iop::{context::ContextAux, prover::BatchFFTProof},
     layers::{LayerProof, hadamard, provable::ProvingData, requant::Requant},
@@ -16,9 +17,7 @@ use crate::{
     padding::{PaddingMode, ShapeInfo},
     quantization::{self, BIT_LEN, Quantize, ScalingFactor, ToElement, ToField},
     shape::filter_size,
-    tensor::{
-        CommitmentId, KeyedTensor, Tensor, TensorHandle, TensorTypeParam, WrappedTensor, fft,
-    },
+    tensor::{CommitmentId, KeyedTensor, Tensor, TensorHandle, TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
@@ -174,7 +173,7 @@ impl<T: Clone + Copy + Default> FilterTensor<T> {
     /// be altered without the underlying data being padded, the padding happens
     /// during layer evaluation.
     fn prepare_for_fft(&mut self, padded_input_shape: &Shape) -> Result<()> {
-        let FilterTensor::RawFilter(ref mut tensor) = self else {
+        let FilterTensor::RawFilter(tensor) = self else {
             unreachable!("filter already ready for FFT")
         };
 
@@ -258,7 +257,7 @@ impl<T> Filter<T> {
     /// wrapped tensor is not ready for FFT computation.
     fn as_pre_fft_tensor(&self) -> &Tensor<T> {
         match &self.tensor {
-            FilterTensor::RawFilter(ref tensor) => tensor,
+            FilterTensor::RawFilter(tensor) => tensor,
             FilterTensor::FftFilter { .. } => unreachable!("filter tensor is not in pre-FFT shape"),
         }
     }
@@ -269,8 +268,8 @@ impl<T> Filter<T> {
         match &self.tensor {
             FilterTensor::RawFilter(_) => unreachable!("filter tensor is not in FFT shape"),
             FilterTensor::FftFilter {
-                ref tensor,
-                ref pre_fft_shape,
+                tensor,
+                pre_fft_shape,
             } => (tensor, pre_fft_shape),
         }
     }
@@ -486,7 +485,7 @@ impl Filter<Element> {
         // new claim on this output.
         //
         // XXX: Deentagle ConvData and the result.
-        conv_data.set_output(result.get_data());
+        conv_data.set_output(result.data());
 
         Ok((result, conv_data))
     }
@@ -505,9 +504,9 @@ pub struct Convolution<T> {
 }
 impl<T> Convolution<T> {
     pub fn new(filter: KeyedTensor<T>, bias: KeyedTensor<T>) -> Result<Self> {
-        ensure!(bias.rank() == 1);
+        ensure!(bias.shape().rank() == 1);
         ensure!(filter.dim(0) == bias.shape()[0]);
-        ensure!(filter.rank() == 4);
+        ensure!(filter.shape().rank() == 4);
         Ok(Self {
             filter: Filter::new(filter),
             bias,
@@ -683,8 +682,8 @@ impl Convolution<Element> {
     /// Returns the maximum bitsize of the output of this layer
     fn output_bitsize(&self) -> usize {
         // 2^{BIT_LEN + log2(k_h * k_w * k_c)}
-        let (_k_n, k_c, k_h, k_w) = self.filter.as_pre_fft_tensor().get4d();
-        2 * (*quantization::BIT_LEN - 1) + ceil_log2(k_h * k_w * k_c + 1)
+        let shape = self.filter.as_pre_fft_tensor().shape().to_4d();
+        2 * (*quantization::BIT_LEN - 1) + ceil_log2(shape[1] * shape[2] * shape[3] + 1)
     }
 
     fn prove_batch_fft_weights<
@@ -822,7 +821,7 @@ impl Convolution<Element> {
             );
             info!(
                 "PROVE: conv_after_bias.data(): {:?}",
-                &conv_after_bias.get_data()[..30]
+                &conv_after_bias.data()[..30]
             );
             info!("PROVE: unpadded_output_shape: {unpadded_output_shape:?}");
             info!("PROVE: output.shape(): {:?}", output.shape());
@@ -1525,7 +1524,7 @@ fn clear_garbage<T: Number>(
     let strides = output_tensor.shape().strides();
 
     let padded_shape = output_tensor.shape();
-    let mut data = output_tensor.get_data().to_vec();
+    let mut data = output_tensor.data().to_vec();
     for channel in 0..padded_shape.dim(0) {
         for height in 0..padded_shape.dim(1) {
             for width in 0..padded_shape.dim(2) {
@@ -1616,12 +1615,14 @@ pub(crate) fn conv2d<T: Number>(
     stride: usize,
 ) -> Result<Tensor<T>> {
     // (N x C x H x W)
-    let (batch_size, channels_in, height_in, width_in) = input.get4d();
+    let [batch_size, channels_in, height_in, width_in] =
+        input.shape().to_4d().as_array().cloned().unwrap();
     // (M x C/group x kH x kW)
-    let (feature_maps, channels_out, kernel_height, kernel_width) = kernels.get4d();
+    let [feature_maps, channels_out, kernel_height, kernel_width] =
+        kernels.shape().to_4d().as_array().cloned().unwrap();
 
-    ensure!(input.rank() <= 4, "Supports at most 4D input.");
-    ensure!(kernels.rank() <= 4, "Supports at most 4D filters.");
+    ensure!(input.shape().rank() <= 4, "Supports at most 4D input.");
+    ensure!(kernels.shape().rank() <= 4, "Supports at most 4D filters.");
     ensure!(
         channels_in == channels_out,
         "Grouping is not supported, input channels {channels_in} and kernel {channels_out} must match! {:?} vs kernel {:?}",

@@ -296,8 +296,8 @@ where
                 field_vecs
             }
         };
-        // Commit to the witnes polys
-        let output_poly = to_base::<E, _>(output_tensors[0].get_data());
+        // Commit to the witness polys
+        let output_poly = to_base::<E, _>(output_tensors[0].data());
         column_evals.push(output_poly);
         let width = column_evals.len();
         let values = transpose(column_evals);
@@ -422,9 +422,9 @@ impl Pooling {
         PCS::ProverParam: Send + Sync,
     {
         ensure!(
-            input.rank() == 3,
+            input.shape().rank() == 3,
             "Maxpool needs 3D inputs, got {}",
-            input.rank()
+            input.shape().rank(),
         );
         let output_shapes = self.output_shapes(&[input.shape().clone()], PaddingMode::Padding)?;
         let num_vars = Self::num_vars_for_outputs(output_shapes.as_slice())?;
@@ -731,7 +731,7 @@ impl Maxpool2D {
             .into_par_iter()
             .map(|i| {
                 padded_input
-                    .get_data()
+                    .data()
                     .iter()
                     .skip(i)
                     .step_by(padded_input_shape[2] << 1)
@@ -789,7 +789,7 @@ impl Maxpool2D {
                 izip!(
                     even_merged[0].iter(),
                     odd_merged[0].iter(),
-                    padded_output.get_data()
+                    padded_output.data()
                 )
                 .map(|(e, o, data)| {
                     let e_field: E = (data - e).to_field();
@@ -873,12 +873,12 @@ mod tests {
 
             let padded_input_shape = padded_input.shape();
 
-            let num_vars = padded_input.get_data().len().ilog2() as usize;
-            let output_num_vars = padded_output.get_data().len().ilog2() as usize;
+            let num_vars = padded_input.data().len().ilog2() as usize;
+            let output_num_vars = padded_output.data().len().ilog2() as usize;
 
             let mle = MultilinearExtension::<'_, F>::from_evaluations_vec(
                 num_vars,
-                to_base::<F, _>(padded_input.get_data()),
+                to_base::<F, _>(padded_input.data()),
             );
 
             // This should give all possible combinations of fixing the lowest three bits in ascending order

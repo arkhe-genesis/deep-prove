@@ -528,7 +528,7 @@ impl RMSNorm<f32> {
             .or_else(|_| loader.get_tensor("norm.weight"))?;
         let eps = c.norm_epsilon;
         // If alpha is all ones or zeroes we can just set it to None
-        let trivial_alpha = alpha.get_data().iter().all(|&x| x == 1.0 || x == 0.0f32);
+        let trivial_alpha = alpha.data().iter().all(|&x| x == 1.0 || x == 0.0f32);
 
         if trivial_alpha {
             RMSNorm::new(None, eps, Some(alpha.shape().dim(-1)))

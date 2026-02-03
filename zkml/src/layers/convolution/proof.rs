@@ -4,6 +4,7 @@ use super::{
 use crate::{
     Claim, Element, Shape, VectorTranscript,
     commit::identity_eval,
+    fft::get_root_of_unity,
     graph::NodeId,
     iop::{context::ShapeStep, verifier::Verifier},
     layers::{
@@ -11,7 +12,7 @@ use crate::{
         provable::{OpInfo, VerifiableCtx},
     },
     padding::PaddingMode,
-    tensor::{CommitmentId, get_root_of_unity},
+    tensor::CommitmentId,
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};

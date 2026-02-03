@@ -841,17 +841,13 @@ impl Rope<Element> {
 
         let matrix_to_evals = match self.layout {
             RopeLayout::Adjacent => |matrix: &Tensor<Element>| {
-                matrix
-                    .get_data()
-                    .chunks(2)
-                    .map(|chunk| chunk[0])
-                    .collect_vec()
+                matrix.data().chunks(2).map(|chunk| chunk[0]).collect_vec()
             },
             RopeLayout::RotateHalf => |matrix: &Tensor<Element>| {
                 let rows = matrix.shape().dim(-1);
                 let half_rows = rows / 2;
                 matrix
-                    .get_data()
+                    .data()
                     .chunks(rows)
                     .flat_map(|chunk| chunk[..half_rows].to_vec())
                     .collect::<Vec<Element>>()
@@ -1231,9 +1227,9 @@ mod tests {
                         && k < unpadded_out_shape[2]
                     {
                         // check that corresponding entries in `output` and `padded_output` are the same
-                        let out_data = output.get_data()
+                        let out_data = output.data()
                             [i * unpadded_shape_strides[0] + j * unpadded_shape_strides[1] + k];
-                        let padded_out_data = padded_output.get_data()
+                        let padded_out_data = padded_output.data()
                             [i * padded_shape_strides[0] + j * padded_shape_strides[1] + k];
                         assert_eq!(out_data, padded_out_data);
                     }

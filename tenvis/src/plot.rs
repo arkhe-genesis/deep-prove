@@ -68,7 +68,7 @@ fn make_d2<T: TensorTypeParam>(model: &Model<T>) -> String {
                 let label = format!("{node_id}: {}", node.describe());
                 if merge {
                     let parent_elt = node2elt[&parents[0]];
-                    let Element::Block(ref mut items) = ax.get_mut(parent_elt).unwrap() else {
+                    let Element::Block(items) = ax.get_mut(parent_elt).unwrap() else {
                         unreachable!()
                     };
                     items.push(label);

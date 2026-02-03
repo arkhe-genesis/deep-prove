@@ -29,7 +29,7 @@
 //! can be proven via Sumcheck.
 
 use crate::{
-    Claim, Element, NextPowerOfTwo, Number, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Shape, Tensor,
     graph::NodeId,
     iop::{context::ContextAux, prover::Prover, verifier::Verifier},
     layers::{
@@ -70,7 +70,11 @@ pub(crate) mod verify;
 pub(crate) const EINSUM_LAYER: &str = "EINS";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EinSum<T> {
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub struct EinSum<T>
+where
+    T: TensorTypeParam,
+{
     /// The equation describing the einsum operation.
     pub(crate) equation: String,
     /// The parsed mapping of axes from the equation.
@@ -94,7 +98,10 @@ pub struct EinSum<T> {
     pub(crate) requantise: bool,
 }
 
-impl<T> EinSum<T> {
+impl<T> EinSum<T>
+where
+    T: TensorTypeParam,
+{
     /// Create a new EinSum layer from the given equation.
     /// The equation should be in the format:
     ///
@@ -270,7 +277,10 @@ impl PadOp for EinSum<Element> {
     }
 }
 
-impl<N: Number> OpInfo for EinSum<N> {
+impl<N> OpInfo for EinSum<N>
+where
+    N: TensorTypeParam,
+{
     fn output_shapes(
         &self,
         input_shapes: &[Shape],

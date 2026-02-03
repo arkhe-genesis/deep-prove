@@ -62,7 +62,11 @@ pub mod transformer;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
-pub enum Layer<T> {
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub enum Layer<T>
+where
+    T: TensorTypeParam,
+{
     Convolution(Convolution<T>),
     Activation(Activation<T>),
     // this is the output quant info. Since we always do a requant layer after each dense,
@@ -82,7 +86,11 @@ pub enum Layer<T> {
     AttentionMask(AttentionMask<T>),
     Logits(Logits),
 }
-impl<T> Layer<T> {
+
+impl<T> Layer<T>
+where
+    T: TensorTypeParam,
+{
     pub fn short_name(&self) -> &str {
         let r = match self {
             Layer::Convolution(_) => CONVOLUTION_LAYER,
@@ -104,9 +112,28 @@ impl<T> Layer<T> {
         assert_eq!(r.len(), 4, "layer short name must be 4 chars long: {r}");
         r
     }
-}
 
-impl<T: TensorTypeParam> Layer<T> {
+    /// Convert a layer to a string only containing its kind
+    pub fn as_kind_str(&self) -> &'static str {
+        match self {
+            Layer::Convolution(_) => "convolution",
+            Layer::Activation(_) => "activation",
+            Layer::Requant(_) => "requant",
+            Layer::Pooling(_) => "pooling",
+            Layer::Flatten(_) => "flatten",
+            Layer::EinSum(_) => "einsum",
+            Layer::LayerNorm(_) => "layer-norm",
+            Layer::RMSNorm(_) => "rms-norm",
+            Layer::Softmax(_) => "softmax",
+            Layer::Add(_) => "add",
+            Layer::Reshape(_) => "reshape",
+            Layer::Embeddings(_) => "embeddings",
+            Layer::Positional(_) => "positional",
+            Layer::Logits(_) => "logits",
+            Layer::AttentionMask(_) => "attention-mask",
+        }
+    }
+
     /// Resets the internal state of the layer if any
     pub fn reset(&self) {
         if let Layer::Positional(pos) = self {
@@ -163,29 +190,6 @@ where
     Positional(PositionalProof<E>),
     AttentionMask(AttentionMaskProof<E>),
     Dummy, // To be used for non-provable layers
-}
-
-impl<T> Layer<T> {
-    /// Convert a layer to a string only containing its kind
-    pub fn as_kind_str(&self) -> &'static str {
-        match self {
-            Layer::Convolution(_) => "convolution",
-            Layer::Activation(_) => "activation",
-            Layer::Requant(_) => "requant",
-            Layer::Pooling(_) => "pooling",
-            Layer::Flatten(_) => "flatten",
-            Layer::EinSum(_) => "einsum",
-            Layer::LayerNorm(_) => "layer-norm",
-            Layer::RMSNorm(_) => "rms-norm",
-            Layer::Softmax(_) => "softmax",
-            Layer::Add(_) => "add",
-            Layer::Reshape(_) => "reshape",
-            Layer::Embeddings(_) => "embeddings",
-            Layer::Positional(_) => "positional",
-            Layer::Logits(_) => "logits",
-            Layer::AttentionMask(_) => "attention-mask",
-        }
-    }
 }
 
 impl<E: ExtensionField> LayerCtx<E> {
@@ -876,7 +880,11 @@ where
         }
     }
 }
-impl<T: TensorTypeParam> std::fmt::Display for Layer<T> {
+
+impl<T> std::fmt::Display for Layer<T>
+where
+    T: TensorTypeParam,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.describe())
     }

@@ -2,6 +2,7 @@ use super::{ChallengeStorage, Proof, TableProof};
 use crate::{
     Claim, Element, InitTranscript, Tensor,
     commit::{compute_betas_eval, mmcs_context, same_poly},
+    fft::get_root_of_unity,
     graph::{
         Node, NodeId, NodeInput, NodeOutput, PortId,
         executor::{Executor, SequentialExecutor},
@@ -32,7 +33,7 @@ use crate::{
     measure,
     model::{Model, Trace},
     quantization::ToField,
-    tensor::{CommitmentId, get_root_of_unity},
+    tensor::CommitmentId,
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use either::Either;

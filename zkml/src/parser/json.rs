@@ -29,7 +29,7 @@ pub fn unfuse_crate_tensors(
     expected_chunk_len_elements: usize,
     num_chunks: usize,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
-    let data = fused_tensor.get_data();
+    let data = fused_tensor.data();
     let total_elements = data.len();
 
     ensure!(
@@ -114,20 +114,15 @@ impl FileTensorLoader {
         new
     }
 
-    fn full_key(&self, key: &str) -> String {
-        format!("{}{}", self.prefix, key)
-    }
-
-    fn resolve_key(&self, key: &str) -> Option<&JsonTensor> {
-        self.content.tensors.get(&self.full_key(key))
-    }
-
     pub fn get_tensor(&self, key: &str) -> anyhow::Result<KeyedTensor<f32>> {
+        let full_key = format!("{}{}", self.prefix, key);
         let tensor = self
-            .resolve_key(key)
+            .content
+            .tensors
+            .get(&full_key)
             .ok_or_else(|| anyhow::anyhow!("tensor not found: {key}"))?;
         Ok(KeyedTensor::new(
-            self.full_key(key),
+            full_key,
             Tensor::new(tensor.shape.clone(), tensor.data.clone())?,
         ))
     }

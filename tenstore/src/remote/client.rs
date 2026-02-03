@@ -250,10 +250,8 @@ where
                     if let Some(sub) = self.prefetching.remove(&storage_key).expect("Prefetching in-progress must have a map entry") {
                         // If the rx is closed there's nothing left to do
                         let _ = sub.send(result);
-                    } else if let Ok(data) = result {
-                        if let Err(err) = self.local_store.store(storage_key, data){
-                            error!("Failed to store prefetched data locally: {err}")
-                        }
+                    } else if let Ok(data) = result && let Err(err) = self.local_store.store(storage_key, data) {
+                        error!("Failed to store prefetched data locally: {err}")
                     }
                 },
                 // Handle cmds from the client

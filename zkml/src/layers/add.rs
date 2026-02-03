@@ -568,18 +568,14 @@ mod test {
         )
         .unwrap();
 
-        let close_to_float = is_close_with_tolerance(
-            computed_result.get_data(),
-            t3.get_data(),
-            1e-2_f32,
-            1e-1_f32,
-        );
+        let close_to_float =
+            is_close_with_tolerance(computed_result.data(), t3.data(), 1e-2_f32, 1e-1_f32);
 
         assert!(
             close_to_float,
             "output is not close to float: float {:?} vs computed {:?}",
-            t3.get_data(),
-            computed_result.get_data()
+            t3.data(),
+            computed_result.data()
         );
     }
 

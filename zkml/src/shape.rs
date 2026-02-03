@@ -492,6 +492,37 @@ impl Shape {
 
         Ok(slices)
     }
+
+    /// Converts a coordinate into an index.
+    ///
+    /// # Error
+    ///
+    /// - If the accessor dimensionality doesn't match the shape.
+    pub(crate) fn get_idx(&self, accessors: Vec<usize>) -> anyhow::Result<usize> {
+        ensure!(self.len() == accessors.len());
+        let idx = accessors
+            .iter()
+            .zip(self.strides())
+            .map(|(pos, stride)| pos * stride)
+            .sum();
+        Ok(idx)
+    }
+
+    /// Converts the shape to four dimensions.
+    pub fn to_4d(&self) -> Self {
+        let mut shape = self.0.clone();
+
+        // XXX: shouldnt this be <= 4?
+        if shape.len() == 3 {
+            shape.insert(0, 1)
+        }
+
+        while shape.len() != 4 {
+            shape.push(1);
+        }
+
+        Self(shape)
+    }
 }
 
 impl FromIterator<usize> for Shape {

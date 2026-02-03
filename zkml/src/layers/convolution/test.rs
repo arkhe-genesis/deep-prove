@@ -130,10 +130,10 @@ fn test_conv_unpadded_to_padded() {
     let (valid, _garbage) = split_garbage(&fft_output, output.shape());
     assert_eq!(
         valid,
-        output.get_data().to_vec(),
+        output.data().to_vec(),
         "valid {:?} is not equal to {:?}",
         &valid[..40],
-        &output.get_data()[..40]
+        &output.data()[..40]
     );
     // make sure the shape matches between what we can compute from unpadded and the actual fft output
     let exp_output_shape = conv2d_shape(&input_shape, &conv_shape_og);
@@ -153,7 +153,7 @@ fn test_conv_unpadded_to_padded() {
     let hadamard_cleared = reconstructed_fft_tensor
         .to_flatten()
         .mul(&hadamard_clearing);
-    assert_eq!(hadamard_cleared.get_data(), fft_output.get_data());
+    assert_eq!(hadamard_cleared.data(), fft_output.data());
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn convolution_test_simple_element() {
         .pad_to_shape(Shape::from(fft_result.shape()))
         .unwrap();
 
-    assert_eq!(conv2d_result.get_data(), fft_result.get_data());
+    assert_eq!(conv2d_result.data(), &fft_result.get_data());
 }
 
 #[test]
@@ -230,7 +230,7 @@ fn convolution_test_random_element() {
         .pad_to_shape(Shape::from(fft_result.shape()))
         .unwrap();
 
-    assert_eq!(conv2d_result.get_data(), fft_result.get_data());
+    assert_eq!(conv2d_result.data(), &fft_result.get_data());
 }
 
 struct Input<T> {
@@ -315,7 +315,7 @@ proptest! {
         const THRESHOLD: f32 = 1e-3;
         #[cfg(feature = "gpu")]
         const THRESHOLD: f32 = 1e-2;
-        result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
+        result.outputs()[0].get_data().iter().zip(expected.data().iter()).try_for_each(|(left, right)| {
             prop_assert!(
                 (left - right).abs() < THRESHOLD,
                 "Actual: {left}, Expected: {right}",
@@ -337,7 +337,7 @@ proptest! {
         const THRESHOLD: f32 = 1e-3;
         #[cfg(feature = "gpu")]
         const THRESHOLD: f32 = 1e-2;
-        result.outputs()[0].get_data().iter().zip(expected.get_data().iter()).try_for_each(|(left, right)| {
+        result.outputs()[0].get_data().iter().zip(expected.data().iter()).try_for_each(|(left, right)| {
             prop_assert!(
                 (left - right).abs() < THRESHOLD,
                 "Actual: {left}, Expected: {right}",
@@ -384,6 +384,6 @@ proptest! {
         let cleared_tensor2 = clear_garbage(&padded, &og_shape).unwrap();
 
         // The shapes are different, to_flatten creates a 1D tensor, compare only the data.
-        assert_eq!(cleared_tensor1.get_data(), cleared_tensor2.get_data());
+        assert_eq!(cleared_tensor1.data(), cleared_tensor2.data());
     }
 }

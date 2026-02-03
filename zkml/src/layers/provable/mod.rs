@@ -397,7 +397,7 @@ where
         for (i, (input, claim)) in inputs.iter().zip(claims).enumerate() {
             let computed = input
                 .as_ref()
-                .get_data()
+                .data()
                 .to_vec()
                 .into_mle()
                 .evaluate(&claim.point);

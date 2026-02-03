@@ -5,6 +5,7 @@ use crate::{
         transformer::{layernorm::LayerNorm, rmsnorm::RMSNorm},
     },
     parser::{gguf, llm::LLMConfig, safe},
+    tensor::TensorTypeParam,
 };
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,10 @@ pub enum Norm<N: Number> {
     RMSNorm(RMSNorm<N>),
 }
 
-impl<N: Number> Norm<N> {
+impl<N> Norm<N>
+where
+    N: TensorTypeParam,
+{
     pub fn to_layer(self) -> Layer<N> {
         match self {
             Norm::LayerNorm(layer) => Layer::LayerNorm(layer),

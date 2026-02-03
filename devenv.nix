@@ -65,7 +65,7 @@ in
   languages.rust = {
     enable = true;
     channel = "nightly";
-    version = "2025-08-08";
+    version = "2026-01-27";
     mold.enable = pkgs.stdenv.isLinux;
     rustflags = "--cfg tokio_unstable"; # Needed for metrics
   };

@@ -171,8 +171,7 @@ where
         // the first key value pair we visit.
         let mut model_claims = std::mem::take(&mut self.model_claims);
         let (sumcheck_proof, sumcheck_evals) =
-            if ctx.model_commitment.is_some() && !model_claims.is_empty() {
-                let model_commitment = ctx.model_commitment.as_ref().unwrap();
+            if let Some(ref model_commitment) = ctx.model_commitment && !model_claims.is_empty() {
                 let ModelSumcheckProof {
                     model_claim,
                     sumcheck_proof,

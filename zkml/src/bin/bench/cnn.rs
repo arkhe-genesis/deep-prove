@@ -200,7 +200,7 @@ fn run_float_model(raw_inputs: &InputJSON, model: &Model<f32>) -> Result<f32> {
         // Run the model in float mode
         let inputs = model.load_input_flat(vec![input.clone()])?;
         let outputs = model.run_float(inputs, &mut GenStore::default())?;
-        let accuracy = argmax_compare(expected, outputs[0].tensor()?.get_data());
+        let accuracy = argmax_compare(expected, outputs[0].tensor()?.data());
         accuracies.push(accuracy);
         debug!(
             "Float Run {}/{}: Accuracy: {}",
@@ -350,7 +350,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         //}
 
         let output = trace.outputs().first().context("Trace with no outputs")?;
-        let accuracy = argmax_compare(&given_output, output.tensor()?.get_data());
+        let accuracy = argmax_compare(&given_output, output.tensor()?.data());
         accuracies.push(accuracy);
 
         info!(

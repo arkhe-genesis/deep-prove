@@ -342,7 +342,7 @@ impl ModelChunk {
                     GroupType::Incoming => step_data.input_tensor_at(port.target_port.into())?,
                     GroupType::Outgoing => step_data.output_tensor_at(port.source_port.into())?,
                 };
-                let matrix_values = transpose(vec![to_base::<E, _>(tensor.get_data())]);
+                let matrix_values = transpose(vec![to_base::<E, _>(tensor.data())]);
                 let rmm = RowMajorMatrix::new_by_inner_matrix(
                     ceno_p3::matrix::dense::DenseMatrix::new(matrix_values.concat(), 1),
                     InstancePaddingStrategy::Default,

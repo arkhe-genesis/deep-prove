@@ -31,7 +31,7 @@ impl ModelTransform<f32> for GPT2RMSNorm {
             let node = &model.graph[node_id];
 
             // If the node isn't a LayerNorm, do nothing
-            let Some(Layer::<f32>::LayerNorm(ref layer_norm)) = node.as_inner() else {
+            let Some(Layer::<f32>::LayerNorm(layer_norm)) = node.as_inner() else {
                 continue;
             };
 
@@ -285,9 +285,9 @@ fn mean_subtracted_matrix(matrix: &KeyedTensor<f32>) -> anyhow::Result<KeyedTens
 
 fn mean_subtracted_tensor(tensor: &Tensor<f32>, dim: usize) -> Result<Tensor<f32>> {
     ensure!(
-        dim < tensor.rank(),
+        dim < tensor.shape().rank(),
         "Dimension {dim} out of bounds for tensor of rank {}",
-        tensor.rank()
+        tensor.shape().rank()
     );
     let shape = tensor.shape();
     let dim_size = shape.dim(dim);
