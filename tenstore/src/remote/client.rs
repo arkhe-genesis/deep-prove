@@ -11,6 +11,7 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+use telemetry::reqwest_inject_trace_headers;
 use tokio::{
     select,
     sync::{mpsc, oneshot},
@@ -361,15 +362,15 @@ where
             .spawn(format!("clean-up/{run_id}").into(), async move {
                 retry_async_operation(
                     move || {
-                        let client = reqwest::Client::new();
-                        client
-                            .post(
+                        reqwest_inject_trace_headers(
+                            reqwest::Client::new().post(
                                 server_addr
                                     .join(&format!("/tenstore/{run_id}"))
                                     .unwrap()
                                     .as_str(),
-                            )
-                            .send()
+                            ),
+                        )
+                        .send()
                     },
                     || format!("failed to clean-up remote store for {run_id}"),
                 )
@@ -432,10 +433,15 @@ where
     }
 
     async fn fetch(server_addr: Url, run_id: Uuid, key: K) -> Result<Vec<u8>> {
+        let _ = tracing::info_span!(
+            "tenstore_fetch",
+            run_id = run_id.to_string(),
+            key = key.to_string()
+        );
         let fetch_url = server_addr.join(&format!("/tenstore/{run_id}/{key}"))?;
 
         let response = retry_async_operation(
-            || reqwest::get(fetch_url.as_str()),
+            || reqwest_inject_trace_headers(reqwest::Client::new().get(fetch_url.as_str())).send(),
             || format!("fetching {run_id}/{key}"),
         )
         .await
@@ -455,6 +461,11 @@ where
         data: Vec<u8>,
         res_tx: oneshot::Sender<Result<()>>,
     ) {
+        let _ = tracing::info_span!(
+            "tenstore_put",
+            run_id = run_id.to_string(),
+            key = key.to_string()
+        );
         let put_url = self
             .server_addr
             .join(&format!("/tenstore/{run_id}/{key}"))
@@ -468,9 +479,7 @@ where
         let encoded = encoder.finish().context("converting to base64").unwrap();
         let result = retry_async_operation(
             || {
-                let client = reqwest::Client::new();
-                client
-                    .put(put_url.as_str())
+                reqwest_inject_trace_headers(reqwest::Client::new().put(put_url.as_str()))
                     .json(&json!({
                             "tensor": str::from_utf8(&encoded).expect("base64, so valid UTF8")
                     }))

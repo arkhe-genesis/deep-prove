@@ -121,7 +121,7 @@ impl ConnContext {
     fn ack_job(&self, job_id: i64) -> anyhow::Result<()> {
         retry_operation(
             || {
-                telemetry::inject_trace_headers(ureq::get(
+                telemetry::ureq_inject_trace_headers(ureq::get(
                     self.gw_url
                         .join(&format!("/api/v1/jobs/{}/{job_id}/ack", self.worker_name))
                         .unwrap()
@@ -148,7 +148,7 @@ impl ConnContext {
         );
         retry_operation(
             || {
-                telemetry::inject_trace_headers(ureq::put(
+                telemetry::ureq_inject_trace_headers(ureq::put(
                     self.gw_url
                         .join(&format!("/api/v1/jobs/{}/{job_id}/proof", self.worker_name))
                         .unwrap()
@@ -172,7 +172,7 @@ impl ConnContext {
     fn submit_error(&self, job_id: i64, err_msg: &str) -> anyhow::Result<()> {
         retry_operation(
             || {
-                telemetry::inject_trace_headers(ureq::put(
+                telemetry::ureq_inject_trace_headers(ureq::put(
                     self.gw_url
                         .join(&format!("/api/v1/jobs/{}/{job_id}/error", self.worker_name))
                         .unwrap()

@@ -3,6 +3,7 @@ pub use disabled::*;
 
 #[cfg(not(feature = "otel"))]
 mod disabled {
+    use reqwest::RequestBuilder as ReqwestBuilder;
     use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, layer::SubscriberExt, registry};
     use ureq::RequestBuilder;
 
@@ -44,7 +45,11 @@ mod disabled {
         None
     }
 
-    pub fn inject_trace_headers<T>(req: RequestBuilder<T>) -> RequestBuilder<T> {
+    pub fn ureq_inject_trace_headers<T>(req: RequestBuilder<T>) -> RequestBuilder<T> {
+        req
+    }
+
+    pub fn reqwest_inject_trace_headers(req: ReqwestBuilder) -> ReqwestBuilder {
         req
     }
 
@@ -64,7 +69,7 @@ mod enabled {
         propagation::{Extractor, Injector},
         trace::{TraceContextExt, TracerProvider as _},
     };
-    use opentelemetry_otlp::{self, Protocol, SpanExporter, WithExportConfig, WithHttpConfig};
+    use opentelemetry_otlp::{self, Protocol, SpanExporter, WithExportConfig};
     use opentelemetry_sdk::{
         Resource,
         propagation::TraceContextPropagator,
@@ -74,7 +79,7 @@ mod enabled {
         },
     };
     use opentelemetry_semantic_conventions::resource;
-    use reqwest::Client;
+    use reqwest::RequestBuilder as ReqwestBuilder;
     use tracing::{Span, field};
     use tracing_opentelemetry::{OpenTelemetryLayer, OpenTelemetrySpanExt, layer};
     use tracing_subscriber::{
@@ -121,7 +126,6 @@ mod enabled {
 
         let exporter = match SpanExporter::builder()
             .with_http()
-            .with_http_client(Client::new())
             .with_endpoint(endpoint)
             .with_timeout(Duration::from_secs(10))
             .with_protocol(Protocol::HttpJson)
@@ -232,7 +236,16 @@ mod enabled {
     }
 
     /// Inject the current trace headers into a ureq request builder.
-    pub fn inject_trace_headers<T>(req: RequestBuilder<T>) -> RequestBuilder<T> {
+    pub fn ureq_inject_trace_headers<T>(req: RequestBuilder<T>) -> RequestBuilder<T> {
+        let mut req = req;
+        for (k, v) in current_trace_headers() {
+            req = req.header(&k, &v);
+        }
+        req
+    }
+
+    /// Inject the current trace headers into a ureq request builder.
+    pub fn reqwest_inject_trace_headers(req: ReqwestBuilder) -> ReqwestBuilder {
         let mut req = req;
         for (k, v) in current_trace_headers() {
             req = req.header(&k, &v);
