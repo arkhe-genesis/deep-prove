@@ -195,20 +195,20 @@ struct Args {
     #[command(subcommand)]
     run_mode: RunMode,
 
-    /// Tensor store kind. One of: temporary, local, remote
-    #[arg(long, value_enum, required = true)]
+    /// Tensor store kind.
+    #[arg(long, env, value_enum, required = true)]
     tensor_store: TenStoreKind,
 
-    /// Tensor store in-memory cache size in bytes. Defaults to 1 MiB
-    #[arg(long, default_value = "1048576")]
+    /// Tensor store in-memory cache size in bytes; defaults to 1 MiB.
+    #[arg(long, env, default_value = "1048576")]
     store_cache_size: usize,
 
     /// Tensor store file-system cache root dir
-    #[arg(long)]
+    #[arg(long, env)]
     store_root_dir: Option<PathBuf>,
 
     /// Tensor remote store server address.
-    #[arg(long, default_value = "http://localhost:4000")]
+    #[arg(long, env, default_value = "http://localhost:4000")]
     store_server_addr: Option<url::Url>,
 }
 

@@ -48,6 +48,8 @@ in
     LD_LIBRARY_PATH = "${pkgs.zlib}/lib:${pkgs.openblas}/lib:${pkgs.stdenv.cc.cc.lib}/lib";
     # Point NLTK to pre-installed data in nix store
     NLTK_DATA = "${nltk-data}";
+    OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318";
+    OTEL_SERVICE_NAME="dp-worker";
   };
 
   # https://devenv.sh/tasks/
