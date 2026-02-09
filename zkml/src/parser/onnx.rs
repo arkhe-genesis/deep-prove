@@ -684,7 +684,10 @@ fn load_gemm<'a, I: Iterator<Item = &'a usize> + Sized>(
         })
         .transpose()?;
 
-    let dense = crate::layers::einsum::EinSum::new_dense(weight, bias_tensor)?;
+    let dense = crate::layers::einsum::EinSum::new_dense(
+        weight.into(),
+        bias_tensor.map(|tensor| tensor.into()),
+    )?;
 
     // we put the bias id if present so next layers refer to it and not the gemm node
     let zkml_node_id = model.graph_mut().add_inner(Layer::EinSum(dense))?;

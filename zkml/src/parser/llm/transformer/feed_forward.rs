@@ -58,8 +58,8 @@ impl LayerInsertion for FeedForwardNetwork {
 
                 let glu_einsum = EinSum::<f32>::new(
                     format!("{}->{}", input_terms, output_terms),
-                    vec![Some(gate_tensor), Some(up)],
-                    vec![None, up_bias],
+                    vec![Some(gate_tensor.into()), Some(up.into())],
+                    vec![None, up_bias.map(|tensor| tensor.into())],
                 )?;
                 model.add_consecutive_layer(Layer::EinSum(glu_einsum), previous_node_id)?
             }
@@ -76,8 +76,8 @@ impl LayerInsertion for FeedForwardNetwork {
 
                 let einsum = EinSum::<f32>::new(
                     format!("{}->{}", input_terms, output_terms),
-                    vec![Some(up)],
-                    vec![up_bias],
+                    vec![Some(up.into())],
+                    vec![up_bias.map(|tensor| tensor.into())],
                 )?;
                 model.add_consecutive_layer(Layer::EinSum(einsum), previous_node_id)?
             }
@@ -114,8 +114,8 @@ impl LayerInsertion for FeedForwardNetwork {
         };
         let down_einsum = EinSum::<f32>::new(
             format!("{}->{}", down_input_terms, down_output_terms),
-            vec![Some(down)],
-            vec![down_bias],
+            vec![Some(down.into())],
+            vec![down_bias.map(|tensor| tensor.into())],
         )?;
         let down_id =
             model.add_consecutive_layer(Layer::EinSum(down_einsum), Some(activation_id))?;

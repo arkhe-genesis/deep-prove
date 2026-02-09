@@ -11,7 +11,7 @@ use crate::{
         },
     },
     model::{LayerInsertion, Model},
-    tensor::KeyedTensor,
+    tensor::TensorHandle,
 };
 
 use anyhow::{Result, ensure};
@@ -77,8 +77,8 @@ pub trait AttentionMechanism {
     /// Builds the QKV projection EinSum layer.
     fn build_qkv_einsum(
         equation: String,
-        weights: Vec<KeyedTensor<f32>>,
-        biases: Vec<Option<KeyedTensor<f32>>>,
+        weights: Vec<TensorHandle<f32>>,
+        biases: Vec<Option<TensorHandle<f32>>>,
     ) -> Result<EinSum<f32>> {
         ensure!(
             weights.len() == 3,
@@ -104,8 +104,8 @@ pub trait AttentionMechanism {
     /// Builds the output projection EinSum layer.
     fn build_output_einsum(
         equation: String,
-        weight: Vec<KeyedTensor<f32>>,
-        bias: Vec<Option<KeyedTensor<f32>>>,
+        weight: Vec<TensorHandle<f32>>,
+        bias: Vec<Option<TensorHandle<f32>>>,
     ) -> Result<EinSum<f32>> {
         ensure!(
             weight.len() == 1,
@@ -119,10 +119,10 @@ pub trait AttentionMechanism {
     }
 
     /// Getter for the QKV weight and bias tensors.
-    fn qkv_tensors(&self) -> (Vec<KeyedTensor<f32>>, Vec<Option<KeyedTensor<f32>>>);
+    fn qkv_tensors(&self) -> (Vec<TensorHandle<f32>>, Vec<Option<TensorHandle<f32>>>);
 
     /// Getter for the output projection weight and bias tensors.
-    fn out_tensors(&self) -> (KeyedTensor<f32>, Option<KeyedTensor<f32>>);
+    fn out_tensors(&self) -> (TensorHandle<f32>, Option<TensorHandle<f32>>);
 
     /// Getter for the attention span of the attention mechanism.
     fn attention_span(&self) -> AttentionSpan;

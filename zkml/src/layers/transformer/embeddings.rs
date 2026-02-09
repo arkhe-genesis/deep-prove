@@ -1,6 +1,6 @@
 use std::iter::once;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use either::Either;
 use ff_ext::ExtensionField;
 use itertools::Itertools;
@@ -29,11 +29,10 @@ use crate::{
         },
     },
     model::Step,
-    number::Number,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     parser::{gguf, json},
     quantization::Quantize,
-    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, TensorHandle, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
@@ -42,8 +41,12 @@ use crate::{
 pub const EMBEDDINGS_LAYER: &str = "EMBD";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Embeddings<N> {
-    pub(crate) mat: KeyedTensor<N>,
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub struct Embeddings<T>
+where
+    T: TensorTypeParam,
+{
+    pub(crate) mat: TensorHandle<T>,
     pub(crate) emb_size: usize,
     pub(crate) vocab_size: usize,
 }
@@ -67,24 +70,19 @@ pub struct EmbeddingsProof<E: ExtensionField> {
     individual_claims: Vec<E>,
 }
 
-impl<N: Number> Embeddings<N> {
-    pub fn new(emb: KeyedTensor<N>) -> anyhow::Result<Self> {
+impl<N> Embeddings<N>
+where
+    N: TensorTypeParam,
+{
+    pub fn new(emb: TensorHandle<N>) -> anyhow::Result<Self> {
         let emb_size = emb.shape()[1];
         let vocab_size = emb.shape()[0];
 
         Ok(Self {
-            mat: emb,
+            mat: emb.wrapped_tensor_variant()?,
             emb_size,
             vocab_size,
         })
-    }
-
-    fn embedding_matrix_key(&self) -> CommitmentId {
-        self.mat.commitment_id()
-    }
-
-    pub(crate) fn embedding_matrix(&self) -> &Tensor<N> {
-        &self.mat.tensor
     }
 
     /// Split the point over which the 2d output tensor is evaluated into 2 sub-points:
@@ -199,8 +197,8 @@ impl Evaluate<f32> for Embeddings<f32> {
 
         let input = inputs[0];
 
-        let weights = WrappedTensor::try_from(self.embedding_matrix())?;
-        let res = weights.select(0, input.clone().int())?;
+        let weights = self.mat.wrapped_tensor()?;
+        let res = weights.clone().select(0, input.clone().int())?;
 
         Ok(LayerOut::from_tensor(res))
     }
@@ -220,8 +218,7 @@ impl Evaluate<Element> for Embeddings<Element> {
         // than doing the matmul with one hot encoding. Proving however will generate
         // the one hot encoding and do the matmul.
 
-        let weights = WrappedTensor::try_from(self.embedding_matrix())
-            .context("Failed to create wrapped tensor for embedding matrix")?;
+        let weights = self.mat.wrapped_tensor()?;
 
         let indices = if input.is_padded() {
             input.clone().reduce_to_unpadded_shape()?
@@ -229,7 +226,7 @@ impl Evaluate<Element> for Embeddings<Element> {
             input.clone()
         };
 
-        let res = weights.select(0, indices)?;
+        let res = weights.clone().select(0, indices)?;
 
         let out = if input.is_padded() {
             res.pad_next_power_of_two()
@@ -257,7 +254,7 @@ impl PadOp for Embeddings<Element> {
             "embeddings only support 1d tensors"
         );
         // Need the unpadded_output_shape
-        let emb_size = self.embedding_matrix().unpadded_shape().dim(-1);
+        let emb_size = self.mat.unpadded_shape().dim(-1);
         let output_unpadded_shape = Shape::new(vec![shape_data.input_shape_og[0], emb_size]);
         let padded_output_shape = output_unpadded_shape.next_power_of_two();
 
@@ -282,23 +279,18 @@ impl ProveInfo for Embeddings<Element> {
         id: NodeId,
         mut aux: ContextAux,
     ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+        let tensor = self.mat.wrapped_tensor()?;
+        let data = Vec::from(tensor.clone().pad_next_power_of_two());
+
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
-        aux.model_polys = Some(
-            once((
-                self.embedding_matrix_key(),
-                self.embedding_matrix()
-                    .pad_next_power_of_two()
-                    .data()
-                    .to_vec(),
-            ))
-            .collect(),
-        );
+        aux.model_polys = Some(once((CommitmentId::from(self.mat.storage_key()), data)).collect());
+
         Ok((
             LayerCtx::Embeddings(EmbeddingsCtx {
                 id,
                 vocab_size: self.vocab_size,
                 emb_size: self.emb_size,
-                embedding_key: self.embedding_matrix_key(),
+                embedding_key: CommitmentId::from(self.mat.storage_key()),
             }),
             aux,
         ))
@@ -348,7 +340,8 @@ impl QuantizeOp for Embeddings<f32> {
             vocab_size,
         } = self;
 
-        let scale_factor = ScalingFactor::from_absolute_max(mat.max_abs(), None);
+        let max_abs = mat.max_abs()?;
+        let scale_factor = ScalingFactor::from_absolute_max(max_abs, None);
         let quantised_mat = mat.quantize(&scale_factor);
         let qemb = Embeddings {
             mat: quantised_mat,
@@ -416,7 +409,7 @@ where
 
         let reduced_one_hot = Tensor::new(vec![1, vocab_size].into(), reduced_one_hot)?;
 
-        let embedding_matrix = self.embedding_matrix();
+        let embedding_matrix = Tensor::try_from(&self.mat)?;
 
         ensure!(
             vocab_size == embedding_matrix.nrows_2d()?,
@@ -467,7 +460,7 @@ where
 
         prover.add_common_claims(
             node_id,
-            once((self.embedding_matrix_key(), embedding_claim)).collect(),
+            once((CommitmentId::from(self.mat.storage_key()), embedding_claim)).collect(),
         );
 
         prover.push_proof(
@@ -607,11 +600,11 @@ where
 impl Embeddings<f32> {
     pub fn from_json(l: &json::FileTensorLoader) -> anyhow::Result<Self> {
         let emb_tensor = l.get_tensor("token_embd.weight")?;
-        Embeddings::new(emb_tensor)
+        Embeddings::new(emb_tensor.into())
     }
     pub fn from_loader(loader: &gguf::FileTensorLoader) -> anyhow::Result<Self> {
         let emb_tensor = loader.get_tensor("token_embd.weight")?;
-        Embeddings::new(emb_tensor)
+        Embeddings::new(emb_tensor.into())
     }
     pub fn from_safetensors_loader(
         loader: &crate::parser::safe::FileTensorLoader,
@@ -622,7 +615,7 @@ impl Embeddings<f32> {
             .or_else(|_| loader.get_tensor("token_embd.weight"))
             .or_else(|_| loader.get_tensor("tok_embeddings.weight"))
             .or_else(|_| loader.get_tensor("wte.weight"))?;
-        Embeddings::new(emb_tensor)
+        Embeddings::new(emb_tensor.into())
     }
 }
 
@@ -633,10 +626,10 @@ mod tests {
     use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};
-    use tenstore::GenStore;
+    use tenstore::{GenStore, StorageKey};
 
     use crate::{
-        Element,
+        Element, Number,
         layers::Layer,
         model::{Model, test::prove_model_with},
         quantization::{Quantize, ToField},
@@ -677,8 +670,11 @@ mod tests {
             Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
 
         let embeddings_value = Tensor::random(&Shape::new(vec![vocab_size, emb_size]));
-        let embeddings =
-            Embeddings::new(KeyedTensor::new("embeddings_mat", embeddings_value.clone()))?;
+        let embeddings = Embeddings::new(TensorHandle::from_tensor(
+            StorageKey::from("embeddings_mat"),
+            GenStore::new_empty(),
+            embeddings_value.clone(),
+        ))?;
         let _ = model
             .add_consecutive_layer(Layer::Embeddings(embeddings), None)
             .unwrap();
@@ -748,7 +744,11 @@ mod tests {
         );
 
         let emb = Tensor::<Element>::random(&vec![vocab_size, 10].into());
-        let embeddings = Embeddings::new(KeyedTensor::new("embeddings_mat", emb.clone()))?;
+        let embeddings = Embeddings::new(TensorHandle::from_tensor(
+            StorageKey::from("embeddings_mat"),
+            GenStore::new_empty(),
+            emb.clone(),
+        ))?;
         let input = Tensor::new(vec![seq_len].into(), indices_elem.clone()).unwrap();
         let out = embeddings.evaluate(&[&input.as_wrapped()])?;
         let expected_shape = Shape::new(vec![seq_len, emb_size]);
@@ -773,7 +773,11 @@ mod tests {
         };
         let table = (0..vocab_size).flat_map(emb_vector).collect::<Vec<_>>();
         let emb_tensor = Tensor::new(vec![vocab_size, emb_size].into(), table)?;
-        let embeddings = Embeddings::new(KeyedTensor::new("embeddings_mat", emb_tensor))?;
+        let embeddings = Embeddings::new(TensorHandle::from_tensor(
+            StorageKey::from("embeddings_mat"),
+            GenStore::new_empty(),
+            emb_tensor,
+        ))?;
 
         // generate random indices
         let input_data = generate_unique_random_indices(seq_len, vocab_size)
@@ -818,12 +822,11 @@ mod tests {
             let out_shape = Shape::new(vec![seq_len, emb_size]);
             let expected = Tensor::new(out_shape, new_emb).unwrap();
 
-            let layer = Embeddings::<f32>::new(
-                KeyedTensor::new(
-                    "embeddings_mat",
-                    emb
-                )
-            ).unwrap();
+            let layer = Embeddings::new(TensorHandle::from_tensor(
+                StorageKey::from("embeddings_mat"),
+                GenStore::new_empty(),
+                emb,
+            )).unwrap();
             let computed = layer.evaluate(&[&input.as_wrapped()]).unwrap();
 
             prop_assert_eq!(expected, computed.outputs[0].to_native());
@@ -860,12 +863,11 @@ mod tests {
             let out_shape = Shape::new(vec![seq_len, emb_size]);
             let expected = Tensor::new(out_shape, new_emb).unwrap();
 
-            let layer = Embeddings::<Element>::new(
-                KeyedTensor::new(
-                    "embeddings_mat",
-                    emb
-                )
-            ).unwrap();
+            let layer = Embeddings::new(TensorHandle::from_tensor(
+                StorageKey::from("embeddings_mat"),
+                GenStore::new_empty(),
+                emb,
+            )).unwrap();
             let computed = layer.evaluate(&[&input.as_wrapped()]).unwrap();
 
             prop_assert_eq!(expected, computed.outputs[0].to_native());

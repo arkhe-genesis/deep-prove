@@ -100,7 +100,7 @@ impl Load<SafeLoader> for GPT2Decoder {
         let eps = config_json
             .get::<f32, _>("layer_norm_epsilon")
             .context("layer_norm_epsilon not found")?;
-        let pre_attention_layernorm = LayerNorm::new(ln1_weight, ln1_bias, eps)?;
+        let pre_attention_layernorm = LayerNorm::new(ln1_weight.into(), ln1_bias.into(), eps)?;
 
         // Load attention mechanism
         // Don't add "attn." prefix because GPT2Attention::from_loader adds it internally
@@ -121,7 +121,7 @@ impl Load<SafeLoader> for GPT2Decoder {
             structure.generic.embedding_size,
             ln2_bias.shape()
         );
-        let pre_ffn_layernorm = LayerNorm::new(ln2_weight, ln2_bias, eps)?;
+        let pre_ffn_layernorm = LayerNorm::new(ln2_weight.into(), ln2_bias.into(), eps)?;
 
         // Load feed forward network (MLP)
         // Reference: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py#L301

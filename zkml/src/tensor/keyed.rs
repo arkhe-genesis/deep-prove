@@ -3,11 +3,7 @@ use std::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 use tenstore::StorageKey;
 
-use crate::{
-    ScalingFactor, Tensor,
-    quantization::Quantize,
-    tensor::{CommitmentId, TensorTypeParam, WrappedTensor},
-};
+use crate::{ScalingFactor, Tensor, quantization::Quantize, tensor::CommitmentId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyedTensor<T> {
@@ -43,11 +39,6 @@ impl<T> KeyedTensor<T> {
     /// Returns a reference to the internal [Tensor].
     pub fn tensor(&self) -> &Tensor<T> {
         &self.tensor
-    }
-
-    /// Sets the value of `tensor`.
-    pub(crate) fn set_tensor(&mut self, tensor: Tensor<T>) {
-        self.tensor = tensor;
     }
 
     /// Returns a mutable reference to the internal [Tensor].
@@ -89,19 +80,6 @@ impl<T: Copy + Default> KeyedTensor<T> {
             key: self.key.clone(),
             tensor,
         }
-    }
-}
-
-impl<T> KeyedTensor<T>
-where
-    T: TensorTypeParam,
-{
-    pub(crate) fn from_wrapped_tensor(
-        tensor: WrappedTensor<T>,
-        key: StorageKey<T>,
-    ) -> anyhow::Result<Self> {
-        let tensor = Tensor::try_from(tensor)?;
-        Ok(Self { tensor, key })
     }
 }
 

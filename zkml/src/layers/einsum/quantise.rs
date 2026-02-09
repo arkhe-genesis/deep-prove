@@ -3,15 +3,32 @@
 use crate::{
     ScalingFactor,
     layers::{provable::QuantizeOutput, requant::Requant},
-    quantization::{
-        self, Quantize, bias_scaling_matmul, model_scaling_factor_from_tensor_and_bias,
-    },
+    quantization::{self, Quantize, bias_scaling_matmul},
 };
 
 use super::*;
 
 use itertools::izip;
 use multilinear_extensions::util::ceil_log2;
+
+/// Returns the scaling factors for the main tensor and for the bias tensor. These are the "model" scaling factors, or
+/// S2 in the formula S1 * S2 / S3.
+pub fn model_scaling_factor_from_tensor_and_bias(
+    input: &ScalingFactor,
+    main: &TensorHandle<f32>,
+    bias: Option<&TensorHandle<f32>>,
+) -> anyhow::Result<(ScalingFactor, ScalingFactor)> {
+    let max_weight = main.max_abs()?;
+    let max_value = if let Some(bias) = bias {
+        let max_bias = bias.max_abs()?;
+        max_weight.max(max_bias)
+    } else {
+        max_weight
+    };
+    let main_sf = ScalingFactor::from_absolute_max(max_value, None);
+    let bias_sf = bias_scaling_matmul(input, &main_sf);
+    Ok((main_sf, bias_sf))
+}
 
 impl EinSum<f32> {
     pub(crate) fn quantise(
@@ -82,8 +99,9 @@ impl EinSum<f32> {
                     let (weight_scaling, bias_scaling) = model_scaling_factor_from_tensor_and_bias(
                         &lhs_input_scaling,
                         weight_tensor,
-                        bias_opt.as_ref().map(|t| t.tensor()),
-                    );
+                        bias_opt.as_ref(),
+                    )
+                    .unwrap();
                     let quantized_weight = weight_tensor.quantize(&weight_scaling);
                     let quantized_bias = bias_opt.as_ref().map(|bias| bias.quantize(&bias_scaling));
                     // If `self.requantise` is set to `true` we include a requantisation step after evaluation

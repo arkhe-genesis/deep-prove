@@ -1,6 +1,6 @@
 //! Module that provides methods for generating [`EinsSumContext`] from an [`EinSum`] layer.
 use super::*;
-use crate::{Element, iop::context::ContextAux};
+use crate::{Element, Tensor, iop::context::ContextAux};
 use anyhow::Result;
 use either::Either;
 use multilinear_extensions::Expression;
@@ -46,10 +46,13 @@ impl EinSum<Element> {
                     .iter()
                     .chain(self.biases.iter())
                     .filter_map(|tensor_opt| {
-                        tensor_opt.as_ref().map(|t| {
+                        tensor_opt.as_ref().map(|tensor| {
                             (
-                                t.commitment_id(),
-                                t.tensor().pad_next_power_of_two().into_data(),
+                                CommitmentId::from(tensor.storage_key()),
+                                Tensor::try_from(tensor)
+                                    .unwrap()
+                                    .pad_next_power_of_two()
+                                    .into_data(),
                             )
                         })
                     })
@@ -64,12 +67,20 @@ impl EinSum<Element> {
         let constant_keys = self
             .constant_tensors
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.commitment_id()))
+            .map(|tensor_opt| {
+                tensor_opt
+                    .as_ref()
+                    .map(|tensor| CommitmentId::from(tensor.storage_key()))
+            })
             .collect();
         let bias_keys = self
             .biases
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.commitment_id()))
+            .map(|tensor_opt| {
+                tensor_opt
+                    .as_ref()
+                    .map(|tensor| CommitmentId::from(tensor.storage_key()))
+            })
             .collect();
 
         Ok((

@@ -27,7 +27,7 @@ use crate::{
         },
     },
     quantization::ToField,
-    tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, TensorHandle, TensorSlice, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Ok, Result, bail, ensure};
 use ff_ext::ExtensionField;
@@ -97,18 +97,26 @@ impl PositionalCache {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Positional<N> {
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub struct Positional<T>
+where
+    T: TensorTypeParam,
+{
     /// The `cache` is used to store the current sequence length during inference with caching.
     /// It is an [`Option`] because some `PositionalVariant`s do not require caching (RoPE).
     cache: Option<Arc<Mutex<PositionalCache>>>,
-    pub(crate) variant: PositionalVariant<N>,
+    pub(crate) variant: PositionalVariant<T>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum PositionalVariant<N> {
-    Absolute(Absolute<N>),
-    Rope(Rope<N>),
+pub(crate) enum PositionalVariant<T>
+where
+    T: TensorTypeParam,
+{
+    Absolute(Absolute<T>),
+    Rope(Rope<T>),
 }
 
 impl<N: TensorTypeParam> Positional<N> {
@@ -161,8 +169,11 @@ impl<N: TensorTypeParam> Positional<N> {
         }
     }
 
-    pub fn new_absolute(matrix: KeyedTensor<N>) -> Self {
-        Self::new_from_variant(PositionalVariant::Absolute(Absolute::new(matrix)))
+    pub fn new_absolute(matrix: TensorHandle<N>) -> anyhow::Result<Self> {
+        let absolute = Absolute::new(matrix)?;
+        Ok(Self::new_from_variant(PositionalVariant::Absolute(
+            absolute,
+        )))
     }
 
     pub fn new_rope(
@@ -195,8 +206,8 @@ impl<N: TensorTypeParam> Positional<N> {
     }
 
     pub fn new_rope_from_matrices(
-        cosine_matrix: KeyedTensor<N>,
-        sine_matrix: KeyedTensor<N>,
+        cosine_matrix: TensorHandle<N>,
+        sine_matrix: TensorHandle<N>,
         layout: RopeLayout,
     ) -> anyhow::Result<Self> {
         Ok(Self::new_from_variant(PositionalVariant::Rope(Rope::new(
@@ -579,7 +590,7 @@ impl Positional<f32> {
                     c.generic.embedding_size,
                     position_embd.shape()
                 );
-                Ok(Self::new_absolute(position_embd))
+                Ok(Self::new_absolute(position_embd.into())?)
             }
         }
     }
@@ -602,7 +613,7 @@ impl Positional<f32> {
             c.embedding_size,
             position_embd.shape()
         );
-        Ok(Self::new_absolute(position_embd))
+        Ok(Self::new_absolute(position_embd.into())?)
     }
     pub fn from_safetensors_loader(
         loader: &crate::parser::safe::FileTensorLoader,
@@ -646,7 +657,7 @@ impl Positional<f32> {
                     structure.generic.embedding_size,
                     position_embd.shape()
                 );
-                Ok(Self::new_absolute(position_embd))
+                Ok(Self::new_absolute(position_embd.into())?)
             }
         }
     }
@@ -839,6 +850,8 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
 
 #[cfg(test)]
 mod tests {
+    use tenstore::GenStore;
+
     use crate::{
         Element, NextPowerOfTwo, Tensor,
         layers::{
@@ -846,7 +859,7 @@ mod tests {
             transformer::positional::{Positional, PositionalVariant},
         },
         padding::{ShapeData, ShapeInfo},
-        tensor::KeyedTensor,
+        tensor::TensorHandle,
     };
 
     #[test]
@@ -856,11 +869,12 @@ mod tests {
         let embedding_size = 45;
         let input_shape = vec![seq_len, embedding_size];
         let matrix_shape = vec![context_length, embedding_size];
-        let positional_matrix = KeyedTensor::new(
-            "absolute_positional_mat",
+        let positional_matrix = TensorHandle::from_tensor(
+            "absolute_positional_mat".into(),
+            GenStore::new_empty(),
             Tensor::<Element>::random(&matrix_shape.into()),
         );
-        let pos = Positional::new_absolute(positional_matrix.clone());
+        let pos = Positional::new_absolute(positional_matrix.clone()).unwrap();
 
         let mut si = ShapeInfo::from(vec![ShapeData::new(input_shape.into())].as_slice());
 
@@ -875,15 +889,14 @@ mod tests {
         assert_eq!(*padded_shape, positional_matrix.shape().next_power_of_two());
 
         // check that padded positional matrix has the same data of original matrix
+        let padded_tensor = Tensor::try_from(padded_pos.positional.clone()).unwrap();
+        let tensor = Tensor::try_from(positional_matrix).unwrap();
         for i in 0..padded_shape[0] {
             for j in 0..padded_shape[1] {
                 if i < padded_pos.unpadded_shape[0] && j < padded_pos.unpadded_shape[1] {
-                    assert_eq!(
-                        padded_pos.positional.get_2d(i, j),
-                        positional_matrix.get_2d(i, j)
-                    );
+                    assert_eq!(padded_tensor.get_2d(i, j), tensor.get_2d(i, j));
                 } else {
-                    assert_eq!(padded_pos.positional.get_2d(i, j), 0);
+                    assert_eq!(padded_tensor.get_2d(i, j), 0);
                 }
             }
         }

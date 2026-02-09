@@ -533,7 +533,7 @@ impl RMSNorm<f32> {
         if trivial_alpha {
             RMSNorm::new(None, eps, Some(alpha.shape().dim(-1)))
         } else {
-            RMSNorm::new(Some(alpha), eps, None)
+            RMSNorm::new(Some(alpha.into()), eps, None)
         }
     }
 }

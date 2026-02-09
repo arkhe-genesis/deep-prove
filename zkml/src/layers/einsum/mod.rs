@@ -29,7 +29,7 @@
 //! can be proven via Sumcheck.
 
 use crate::{
-    Claim, Element, NextPowerOfTwo, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Shape,
     graph::NodeId,
     iop::{context::ContextAux, prover::Prover, verifier::Verifier},
     layers::{
@@ -43,7 +43,7 @@ use crate::{
     model::Step,
     padding::{PaddingMode, pad_einsum},
     quantization::{ScalingFactor, ScalingStrategy},
-    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, anyhow, ensure};
 use axis::{AxesMapping, AxisType, Dimension};
@@ -83,11 +83,11 @@ where
     pub evaluation_info: EvaluationInformation3D,
     /// The constant tensors to be used in the operation, if any.
     /// These correspond to the inputs in the equation that are not provided as inputs to the layer
-    pub constant_tensors: Vec<Option<KeyedTensor<T>>>,
+    pub constant_tensors: Vec<Option<TensorHandle<T>>>,
     /// This vector holds the unpadded constant tensor shapes, if any.
     pub constant_unpadded_shapes: Vec<Option<Shape>>,
     /// The biases to be added after the einsum operation, if any.
-    pub biases: Vec<Option<KeyedTensor<T>>>,
+    pub biases: Vec<Option<TensorHandle<T>>>,
     /// This vector holds the unpadded bias tensor shapes, if any.
     pub bias_unpadded_shapes: Vec<Option<Shape>>,
     /// Tells us if we are running padded or unpadded
@@ -119,9 +119,27 @@ where
     /// Currently we limit the number of inputs to be at most 4.
     pub fn new(
         equation: String,
-        constant_tensors: Vec<Option<KeyedTensor<T>>>,
-        biases: Vec<Option<KeyedTensor<T>>>,
+        constant_tensors: Vec<Option<TensorHandle<T>>>,
+        biases: Vec<Option<TensorHandle<T>>>,
     ) -> Result<Self> {
+        let constant_tensors = constant_tensors
+            .into_iter()
+            .map(|constant_opt| {
+                constant_opt
+                    .map(|handle| handle.wrapped_tensor_variant())
+                    .transpose()
+            })
+            .collect::<Result<Vec<Option<TensorHandle<T>>>>>()?;
+
+        let biases = biases
+            .into_iter()
+            .map(|bias_opt| {
+                bias_opt
+                    .map(|handle| handle.wrapped_tensor_variant())
+                    .transpose()
+            })
+            .collect::<Result<Vec<Option<TensorHandle<T>>>>>()?;
+
         let mapping: AxesMapping = AxesMapping::from_string(&equation)?;
         let evaluation_info = EvaluationInformation3D::new(&mapping)?;
         // Ensure the number of constant tensors and biases matches the number of inputs in the equation
@@ -158,7 +176,7 @@ where
         // Store the unpadded shapes of the constant tensors and biases
         let constant_unpadded_shapes = constant_tensors
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.shape().clone()))
+            .map(|handle_opt| handle_opt.as_ref().map(|handle| handle.shape().clone()))
             .collect::<Vec<_>>();
 
         // Now we have to compute the bias shapes to ensure they are compatible with the output shapes
@@ -167,13 +185,17 @@ where
             .into_iter()
             .enumerate()
             .map(|(output_id, bias)| {
-                if let Some(bias) = bias {
-                    let KeyedTensor { key, tensor } = bias;
-                    let new_shape =
-                        mapping.compute_new_bias_shape(output_id, bias_id, tensor.shape())?;
+                if let Some(mut bias) = bias {
+                    let wrapped = bias.take_wrapped_tensor()?;
+                    let new_shape = mapping.compute_new_bias_shape(
+                        output_id,
+                        bias_id,
+                        &wrapped.shape().into(),
+                    )?;
                     bias_id += 1;
-                    let data = tensor.into_data();
-                    Ok(Some(KeyedTensor::new(key, Tensor::new(new_shape, data)?)))
+                    let reshaped = wrapped.reshape(new_shape.into())?;
+                    bias.set_wrapped_tensor(reshaped)?;
+                    Ok(Some(bias))
                 } else {
                     Ok(None)
                 }
@@ -182,8 +204,9 @@ where
 
         let bias_unpadded_shapes = biases
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.shape().clone()))
+            .map(|handle_opt| handle_opt.as_ref().map(|handle| handle.shape().clone()))
             .collect::<Vec<_>>();
+
         Ok(Self {
             equation,
             mapping,
@@ -568,10 +591,11 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
 
 #[cfg(test)]
 mod tests {
-    use tenstore::GenStore;
+    use tenstore::{GenStore, StorageKey};
     use transcript::BasicTranscript;
 
     use crate::{
+        Tensor,
         layers::Layer,
         model::{
             Model,
@@ -594,7 +618,11 @@ mod tests {
             vec![vec![max_stack, a, b].into()],
             PaddingMode::NoPadding,
         );
-        let weight = KeyedTensor::new("weight", Tensor::random(&vec![b, c].into()));
+        let weight = TensorHandle::from_tensor(
+            StorageKey::from("weight"),
+            GenStore::new_empty(),
+            Tensor::random(&Shape::new(vec![b, c])),
+        );
         let einsum = EinSum::new(
             "A(ijk)@B(kl)->C(ijl)".to_string(),
             vec![Some(weight)],
@@ -648,7 +676,8 @@ mod tests {
             PaddingMode::NoPadding,
         );
         let bias = Tensor::<f32>::random(&vec![d].into());
-        let keyed_bias = KeyedTensor::new("bias1", bias);
+        let keyed_bias =
+            TensorHandle::from_tensor(StorageKey::from("bias1"), GenStore::new_empty(), bias);
         let einsum = EinSum::new(
             "A(ij)@B(kj)->C(ik)+BIAS(k)".to_string(),
             vec![None],
@@ -700,7 +729,11 @@ mod tests {
             vec![input_shape_left, input_shape_right],
             PaddingMode::NoPadding,
         );
-        let bias = KeyedTensor::new("qkv_bias.q", Tensor::random(&vec![5, 18].into()));
+        let bias = TensorHandle::from_tensor(
+            StorageKey::new("qkv_bias.q"),
+            GenStore::new_empty(),
+            Tensor::random(&Shape::new(vec![5, 18])),
+        );
         let einsum = EinSum::new(
             "A(ijk)@B(ikl)->C(ijl)+BIAS(il)".to_string(),
             vec![None],
@@ -730,21 +763,36 @@ mod tests {
 
         let input_shape = vec![num_inputs, embedding_size].into();
 
-        let q = KeyedTensor::new(
-            "qkv_weight.q",
+        let q = TensorHandle::from_tensor(
+            StorageKey::new("qkv_weight.q"),
+            GenStore::new_empty(),
             Tensor::random(&vec![embedding_size, hidden_size].into()),
         );
-        let q_bias = KeyedTensor::new("qkv_bias.q", Tensor::random(&vec![hidden_size].into()));
-        let k = KeyedTensor::new(
-            "qkv_weight.k",
+        let q_bias = TensorHandle::from_tensor(
+            StorageKey::new("qkv_bias.q"),
+            GenStore::new_empty(),
+            Tensor::random(&vec![hidden_size].into()),
+        );
+        let k = TensorHandle::from_tensor(
+            StorageKey::new("qkv_weight.k"),
+            GenStore::new_empty(),
             Tensor::random(&vec![embedding_size, hidden_size].into()),
         );
-        let k_bias = KeyedTensor::new("qkv_bias.k", Tensor::random(&vec![hidden_size].into()));
-        let v = KeyedTensor::new(
-            "qkv_weight.v",
+        let k_bias = TensorHandle::from_tensor(
+            StorageKey::new("qkv_bias.k"),
+            GenStore::new_empty(),
+            Tensor::random(&vec![hidden_size].into()),
+        );
+        let v = TensorHandle::from_tensor(
+            StorageKey::new("qkv_weight.v"),
+            GenStore::new_empty(),
             Tensor::random(&vec![embedding_size, hidden_size].into()),
         );
-        let v_bias = KeyedTensor::new("qkv_bias.v", Tensor::random(&vec![hidden_size].into()));
+        let v_bias = TensorHandle::from_tensor(
+            StorageKey::new("qkv_bias.v"),
+            GenStore::new_empty(),
+            Tensor::random(&vec![hidden_size].into()),
+        );
 
         let einsum_layer = EinSum::<f32>::new(
             "X(se)@WQ(eh):WK(eh):WV(eh)->Q(sh)+BIAS(h):K(sh)+BIAS(h):V(sh)+BIAS(h)".to_string(),

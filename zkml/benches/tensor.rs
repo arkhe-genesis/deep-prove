@@ -85,7 +85,7 @@ mod scalar_mul_f32_op {
         let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size]);
         let left = Tensor::<Element>::random(&shape);
-        bencher.bench(|| left.scalar_mul_f32(3));
+        bencher.bench(|| left.mul_scalar(3));
     }
 }
 
@@ -115,7 +115,7 @@ mod max_value_op {
         let size = 1 << args.pow2;
         let shape = Shape::new(vec![size, size]);
         let left = Tensor::<Element>::random(&shape);
-        bencher.bench(|| left.max_value());
+        bencher.bench(|| left.max());
     }
 }
 

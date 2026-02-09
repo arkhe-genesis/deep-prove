@@ -16,8 +16,9 @@ use crate::{
         transformer::positional::{Positional, PositionalCache, PositionalCtx, PositionalProof},
     },
     model::Step,
+    padding::ShapeInfo,
     quantization::{Quantize, ToField},
-    tensor::{CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, TensorHandle, TensorSlice, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
@@ -33,7 +34,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     iter::once,
-    ops::Deref,
     sync::{Arc, Mutex},
 };
 use sumcheck::{
@@ -69,10 +69,14 @@ pub struct AbsoluteCtx {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Absolute<N> {
-    pub(crate) positional: KeyedTensor<N>,
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub struct Absolute<T>
+where
+    T: TensorTypeParam,
+{
+    pub(crate) positional: TensorHandle<T>,
     pub(super) unpadded_shape: Shape,
-    add_layer: Add<N>,
+    add_layer: Add<T>,
 }
 
 impl<N: TensorTypeParam> Absolute<N> {
@@ -81,39 +85,44 @@ impl<N: TensorTypeParam> Absolute<N> {
         num_vars.0 + num_vars.1
     }
 
-    pub(super) fn new(matrix: KeyedTensor<N>) -> Self {
+    pub(super) fn new(matrix: TensorHandle<N>) -> anyhow::Result<Self> {
         let unpadded_shape = matrix.shape().clone();
-        Self {
-            positional: matrix,
+        Ok(Self {
+            positional: matrix.wrapped_tensor_variant()?,
             unpadded_shape,
             add_layer: Add::new(),
-        }
+        })
     }
 }
 
-impl<N> Absolute<N> {
+impl<T> Absolute<T>
+where
+    T: TensorTypeParam,
+{
     pub(super) fn evaluate(
         &self,
-        input: &WrappedTensor<N>,
+        input: &WrappedTensor<T>,
         positional_cache: &Arc<Mutex<PositionalCache>>,
-    ) -> anyhow::Result<LayerOut<N>>
+    ) -> anyhow::Result<LayerOut<T>>
     where
-        N: TensorTypeParam,
-        Add<N>: Evaluate<N>,
+        Add<T>: Evaluate<T>,
     {
         let past_length = positional_cache.lock().unwrap().seq_len;
 
         let is_padded = input.is_padded();
 
+        let start = past_length;
+        let end = start + input.unpadded_shape().dims[0];
         let sliced = self
             .positional
-            .slice_2d(past_length, past_length + input.unpadded_shape().dims[0])?;
-        let sub_bt = WrappedTensor::try_from(sliced)?;
+            .wrapped_tensor()?
+            .clone()
+            .slice_2d(start, end);
 
         let sub_bt = if is_padded {
-            sub_bt.pad_next_power_of_two()
+            sliced.pad_next_power_of_two()
         } else {
-            sub_bt
+            sliced
         };
 
         positional_cache
@@ -141,9 +150,8 @@ impl Absolute<f32> {
         output_scalings: &[ScalingFactor],
         unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Absolute<Element>>> {
-        // quantize positional matrix
-        let max = self.positional.max_abs();
-        let pos_scaling = ScalingFactor::from_absolute_max(max, None);
+        let max_abs = self.positional.max_abs()?;
+        let pos_scaling = ScalingFactor::from_absolute_max(max_abs, None);
 
         ensure!(
             output_scalings.len() == 1,
@@ -181,7 +189,7 @@ impl Absolute<f32> {
 }
 
 impl PadOp for Absolute<Element> {
-    fn pad_node(mut self, _si: &mut crate::padding::ShapeInfo) -> anyhow::Result<Self>
+    fn pad_node(mut self, _shape_info: &mut ShapeInfo) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -207,8 +215,10 @@ impl Absolute<Element> {
                 .unwrap_or_default()
                 .into_iter()
                 .chain(once((
-                    self.positional.commitment_id(),
-                    self.positional.tensor().pad_next_power_of_two().into_data(),
+                    self.positional.storage_key().into(),
+                    Tensor::try_from(&self.positional)?
+                        .pad_next_power_of_two()
+                        .into_data(),
                 )))
                 .collect(),
         );
@@ -218,7 +228,7 @@ impl Absolute<Element> {
             unpadded_shape: self.unpadded_shape.clone(),
             num_vars_positional_matrix: self.num_vars(),
             node_id: id,
-            positional_key: self.positional.commitment_id(),
+            positional_key: self.positional.storage_key().into(),
         };
 
         Ok((ctx, aux))
@@ -241,8 +251,10 @@ impl Absolute<Element> {
     {
         let input = &step_data.input_tensors()?[0];
 
-        // derive sub-matrix to be added to input. ToDo: place it in proving data
-        let matrix_slice = TensorSlice::from(self.positional.deref());
+        // derive sub-matrix to be added to input.
+        // TODO: place it in proving data
+        let tensor = Tensor::try_from(&self.positional)?;
+        let matrix_slice = TensorSlice::from(&tensor);
 
         let masked_sub_pos = matrix_slice
             .slice_over_first_dim(0, input.unpadded_shape()[0])
@@ -333,16 +345,19 @@ impl Absolute<Element> {
                 sub_pos_claim,
                 output_claim,
                 &matrix_slice,
-                &self.positional,
+                tensor.as_ref(),
                 input.shape()[0],
                 prover.transcript,
             )?;
 
         prover.add_common_claims(
             node_id,
-            [(self.positional.commitment_id(), positional_matrix_claim)]
-                .into_iter()
-                .collect(),
+            [(
+                self.positional.storage_key().into(),
+                positional_matrix_claim,
+            )]
+            .into_iter()
+            .collect(),
         );
 
         prover.push_proof(
@@ -476,7 +491,9 @@ mod tests {
         model::{Model, test::prove_model},
         padding::{PaddingMode, ShapeData, ShapeInfo},
         quantization::{AbsoluteMax, Quantize, ScalingFactor},
-        tensor::{KeyedTensor, TensorSlice, TensorTypeParam, is_close_with_tolerance},
+        tensor::{
+            KeyedTensor, TensorHandle, TensorSlice, TensorTypeParam, is_close_with_tolerance,
+        },
     };
     use proptest::prelude::*;
 
@@ -493,19 +510,15 @@ mod tests {
         let mut model =
             Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
 
-        // build positional matrix
         let matrix_shape = vec![context_length, embedding_size];
-        let positional_matrix = KeyedTensor::new(
+        let positional_matrix = TensorHandle::from_tensor(
             StorageKey::new("absolute_positional_mat"),
+            GenStore::new_empty(),
             Tensor::random(&matrix_shape.into()),
         );
 
-        let _ = model
-            .add_consecutive_layer(
-                Layer::Positional(Positional::new_absolute(positional_matrix)),
-                None,
-            )
-            .unwrap();
+        let positional = Layer::Positional(Positional::new_absolute(positional_matrix).unwrap());
+        let _ = model.add_consecutive_layer(positional, None).unwrap();
 
         model.automatic_output_labelling().unwrap();
 
@@ -556,7 +569,7 @@ mod tests {
         #[test]
         fn test_absolute_f32(input in input::<f32>()) {
             let Input { seq_len, embedding_size, input, pos, .. } = input.clone();
-            let layer = Absolute::<f32>::new(pos.clone());
+            let layer = Absolute::<f32>::new(pos.clone().into()).unwrap();
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer
@@ -580,7 +593,7 @@ mod tests {
         #[test]
         fn test_absolute_element(input in input::<f32>()) {
             let Input { seq_len, input, pos, embedding_size, .. } = input.clone();
-            let layer = Absolute::<f32>::new(pos.clone());
+            let layer = Absolute::<f32>::new(pos.clone().into()).unwrap();
             let input_sf = ScalingFactor::from_tensor(&input, None);
             let shape = crate::Shape::new(vec![seq_len, embedding_size]);
             let output_sf = ScalingFactor::from_tensor(&input, None);
@@ -598,13 +611,14 @@ mod tests {
             let input_q = input.quantize(&input_sf);
 
             let (pos_q, add_q) = (layer_q.positional.clone(), &layer_q.add_layer);
-            let sub_slice = TensorSlice::from(pos_q.deref()).slice_over_first_dim(0, seq_len);
+            let tensor = pos_q.tensor_variant().unwrap();
+            let tensor = tensor.tensor().unwrap();
+            let sub_slice = TensorSlice::from(tensor.deref()).slice_over_first_dim(0, seq_len);
 
             let sub_pos_q = Tensor::new(sub_slice.get_shape(), sub_slice.get_data().to_vec()).unwrap();
 
             let cache = Arc::new(Mutex::new(PositionalCache::new()));
             let out = layer_q
-
                 .evaluate(&input_q.as_wrapped(),&cache)
                 .expect("quantized absolute evaluate should succeed")
                 .outputs
@@ -624,7 +638,7 @@ mod tests {
         fn test_absolute_padding_prop(input in input::<Element>()) {
             let Input { seq_len, embedding_size, pos: positional_matrix, .. } = input.clone();
 
-            let layer = Absolute::<Element>::new(positional_matrix.clone());
+            let layer = Absolute::<Element>::new(positional_matrix.clone().into()).unwrap();
 
             let mut si = ShapeInfo::from(vec![ShapeData::new(vec![seq_len, embedding_size].into())].as_slice());
             let padded_layer = PadOp::pad_node(layer, &mut si).expect("pad_node should succeed");
@@ -633,12 +647,13 @@ mod tests {
             prop_assert_eq!(&padded_layer.unpadded_shape, positional_matrix.shape());
             prop_assert_eq!(padded_shape, &positional_matrix.shape().next_power_of_two());
 
+            let tensor = Tensor::try_from(padded_layer.positional.clone()).unwrap();
             for i in 0..padded_shape[0] {
                 for j in 0..padded_shape[1] {
                     if i < padded_layer.unpadded_shape[0] && j < padded_layer.unpadded_shape[1] {
-                        prop_assert_eq!(padded_layer.positional.get_2d(i, j), positional_matrix.get_2d(i, j));
+                        prop_assert_eq!(tensor.get_2d(i, j), positional_matrix.get_2d(i, j));
                     } else {
-                        prop_assert_eq!(padded_layer.positional.get_2d(i, j), 0);
+                        prop_assert_eq!(tensor.get_2d(i, j), 0);
                     }
                 }
             }
@@ -652,9 +667,10 @@ mod tests {
             let input_shape = vec![seq_len, embedding_size];
             let mut model = Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
 
+            let positional = Layer::Positional(Positional::new_absolute(positional_matrix.into()).unwrap());
             model
-                .add_consecutive_layer(Layer::Positional(Positional::new_absolute(positional_matrix)), None)
-                .expect("add layer");
+                .add_consecutive_layer(positional, None)
+                .unwrap();
             model.automatic_output_labelling().expect("route output");
 
             let _ = prove_model(model, &mut GenStore::default()).expect("prove model");

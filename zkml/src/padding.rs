@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::{
-    Element, NextPowerOfTwo, Shape, Tensor,
+    Element, NextPowerOfTwo, Shape,
     graph::{Node, NodeInput, NodeOutput, order_by_in_port},
     layers::{
         einsum::EinSum,
@@ -16,6 +16,7 @@ use crate::{
         reshape::Reshape,
     },
     model::Model,
+    tensor::TensorHandle,
 };
 
 #[derive(Clone, Debug)]
@@ -26,18 +27,18 @@ pub enum GarbagePad {
 impl GarbagePad {
     fn pad_matrix_to_ignore_garbage(
         &self,
-        matrix: &mut Tensor<Element>,
+        matrix: &mut TensorHandle<Element>,
         padded_matrix_shape: Shape,
     ) -> Result<()> {
         match self {
             GarbagePad::Convolution(previous_shape) => {
-                let previous_input_shape_og = previous_shape.0.clone();
-                let previous_input_shape_padded = previous_shape.1.clone();
-                *matrix = matrix.pad_matrix_to_ignore_garbage(
-                    &previous_input_shape_og,
-                    &previous_input_shape_padded,
+                let wrapped = matrix.take_wrapped_tensor()?;
+                let padded = wrapped.pad_matrix_to_ignore_garbage(
+                    &previous_shape.0,
+                    &previous_shape.1,
                     &padded_matrix_shape,
                 )?;
+                matrix.set_wrapped_tensor(padded)?;
             }
         }
 
@@ -309,10 +310,11 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
         let nrows = matrix_shape.nrows();
         sd.input_shape_og = vec![nrows].into();
         if let Some(ref bias) = einsum.biases[0] {
+            let wrapped = bias.wrapped_tensor()?;
             ensure!(
-                bias.data().len() == nrows,
-                "Bias length {} does not match matrix width {}",
-                bias.data().len(),
+                wrapped.shape().num_elements() == nrows,
+                "Bias shape {} does not match matrix width {}",
+                wrapped.shape(),
                 nrows,
             );
         }
@@ -324,16 +326,16 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             sd.input_shape_padded = vec![sd.input_shape_padded.product()].into();
             sd.input_shape_og = vec![sd.input_shape_og.product()].into();
         }
-        let mut new_cols = matrix.ncols_2d()?;
-        if matrix.ncols_2d()? != sd.input_shape_padded.dim(0) {
-            if matrix.ncols_2d()? < sd.input_shape_padded.dim(0) {
+        let mut new_cols = matrix.shape().ncols_2d();
+        if matrix.shape().ncols_2d() != sd.input_shape_padded.dim(0) {
+            if matrix.shape().ncols_2d() < sd.input_shape_padded.dim(0) {
                 new_cols = sd.input_shape_padded.dim(0);
             } else {
                 // If we have too many columns, we can't shrink without losing information
                 anyhow::bail!(
                     "EinSum layer matrix has more columns ({}) than previous layer output size ({}).
                             Cannot shrink without losing information.",
-                    matrix.ncols_2d()?,
+                    matrix.shape().ncols_2d(),
                     sd.input_shape_padded.dim(0)
                 );
             }
@@ -342,20 +344,25 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
         // be needing at least input shape of total size 4 due to usage of lookups.
         // current logup gkr implementation requires at least 2 variables for poly.
         let ncols = pad_minimum(new_cols);
-        let nrows = pad_minimum(matrix.nrows_2d()?);
+        let nrows = pad_minimum(matrix.shape().nrows_2d());
 
         if let Some(garbage_pad) = sd.ignore_garbage_pad.as_ref() {
-            garbage_pad.pad_matrix_to_ignore_garbage(&mut matrix, vec![nrows, ncols].into())?;
+            garbage_pad
+                .pad_matrix_to_ignore_garbage(&mut matrix, Shape::new(vec![nrows, ncols]))?;
             sd.ignore_garbage_pad = None;
         } else {
-            matrix.reshape_to_fit_inplace_2d(vec![nrows, ncols].into())?;
+            let wrapped = matrix.take_wrapped_tensor()?;
+            let reshaped = wrapped.reshape(Shape::new(vec![nrows, ncols]).into())?;
+            matrix.set_wrapped_tensor(reshaped)?;
         }
 
-        let bias = if let Some(bias) = einsum.biases[0].clone() {
-            Some(bias.try_map_tensor(|t| t.pad_1d(nrows))?)
-        } else {
-            None
-        };
+        let bias = einsum.biases[0].clone().map(|mut handle| {
+            let wrapped = handle.take_wrapped_tensor().unwrap();
+            let shape = Shape::new(vec![nrows]);
+            let reshaped = wrapped.pad(shape.into(), 0).unwrap();
+            handle.set_wrapped_tensor(reshaped).unwrap();
+            handle
+        });
 
         let EinSum::<Element> {
             equation,

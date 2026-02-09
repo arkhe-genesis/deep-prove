@@ -46,19 +46,23 @@ impl Gemma3 {
 
     fn scale_embeddings(llm_config: &LLMConfig, llm_model: &mut LLMModel<Gemma3Decoder>) {
         let normalizer_factor = (llm_config.hidden_size as f32).sqrt();
-        let scaled = llm_model
-            .embeddings
-            .mat
-            .tensor()
-            .scalar_mul_f32(normalizer_factor);
-        llm_model.embeddings.mat.set_tensor(scaled);
+        let mat = &llm_model.embeddings.mat;
+
+        // temporarily take ownership of the tensor, this allows for modify in place
+        let scaled = mat
+            .take_wrapped_tensor()
+            .unwrap()
+            .mul_scalar(normalizer_factor);
+        llm_model.embeddings.mat.set_wrapped_tensor(scaled).unwrap();
     }
 
     fn scale_norm(rmsnorm: &mut Norm<f32>) {
-        if let Norm::RMSNorm(rmsnorm) = rmsnorm && let Some(alpha) = rmsnorm.alpha.as_mut() {
-            for v in alpha.tensor_mut().iter_mut() {
-                *v += 1.0;
-            }
+        if let Norm::RMSNorm(rmsnorm) = rmsnorm
+            && let Some(alpha) = rmsnorm.alpha.as_mut()
+        {
+            let tensor = alpha.take_wrapped_tensor().unwrap();
+            let scaled = tensor.add_scalar(1.0);
+            alpha.set_wrapped_tensor(scaled).unwrap();
         }
     }
 }
@@ -697,13 +701,12 @@ pub mod tests {
 
         // Also check if we can access the embedding matrix weights directly
         if let Layer::Embeddings(emb) = embedding_ref {
-            let emb_matrix = emb.embedding_matrix();
-            let emb_shape = emb_matrix.shape();
-            let emb_data = emb_matrix.data();
+            let emb_shape = emb.mat.shape();
+            let emb_data = Vec::try_from(&emb.mat)?;
             println!("\n=== Embedding Matrix Weight Comparison ===");
             println!(
                 "Embedding matrix shape: {:?} (should be [vocab_size, hidden_dim])",
-                emb_shape
+                emb_shape,
             );
 
             // Compare static embedding for token 0 from Python vs Rust
@@ -829,7 +832,7 @@ pub mod tests {
         if let Some(ref python_rmsnorm_alpha) = intermediates.pre_qkv_rmsnorm_alpha {
             if let Layer::RMSNorm(rmsnorm) = pre_qkv_norm_layer {
                 if let Some(ref rust_alpha_tensor) = rmsnorm.alpha {
-                    let rust_alpha_data = rust_alpha_tensor.data();
+                    let rust_alpha_data = Vec::try_from(rust_alpha_tensor).unwrap();
                     println!("\n=== Pre-QKV RMSNorm Alpha (Weight) Comparison ===");
                     println!("Python alpha length: {}", python_rmsnorm_alpha.len());
                     println!("Rust alpha length: {}", rust_alpha_data.len());

@@ -20,7 +20,7 @@ use crate::{
         },
         safe::{ConfigJSON, FileTensorLoader as SafeLoader},
     },
-    tensor::KeyedTensor,
+    tensor::TensorHandle,
 };
 
 use super::scale_norm;
@@ -33,10 +33,10 @@ pub struct Gemma3Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    wq: KeyedTensor<f32>,
-    wk: KeyedTensor<f32>,
-    wv: KeyedTensor<f32>,
-    wo: KeyedTensor<f32>,
+    wq: TensorHandle<f32>,
+    wk: TensorHandle<f32>,
+    wv: TensorHandle<f32>,
+    wo: TensorHandle<f32>,
     span: AttentionSpan,
     q_norm: Option<RMSNorm<f32>>,
     k_norm: Option<RMSNorm<f32>>,
@@ -76,14 +76,14 @@ impl AttentionMechanism for Gemma3Attention {
         false
     }
 
-    fn qkv_tensors(&self) -> (Vec<KeyedTensor<f32>>, Vec<Option<KeyedTensor<f32>>>) {
+    fn qkv_tensors(&self) -> (Vec<TensorHandle<f32>>, Vec<Option<TensorHandle<f32>>>) {
         (
             vec![self.wq.clone(), self.wk.clone(), self.wv.clone()],
             vec![None, None, None],
         )
     }
 
-    fn out_tensors(&self) -> (KeyedTensor<f32>, Option<KeyedTensor<f32>>) {
+    fn out_tensors(&self) -> (TensorHandle<f32>, Option<TensorHandle<f32>>) {
         (self.wo.clone(), None)
     }
 
@@ -250,10 +250,10 @@ impl Load<GGUFLoader> for Gemma3Attention {
             num_heads,
             num_kv_heads: num_groups,
             head_dim: head_size,
-            wq,
-            wk,
-            wv,
-            wo,
+            wq: wq.into(),
+            wk: wk.into(),
+            wv: wv.into(),
+            wo: wo.into(),
             span,
             q_norm: Some(q_norm),
             k_norm: Some(k_norm),
@@ -364,10 +364,10 @@ impl Load<SafeLoader> for Gemma3Attention {
             num_heads,
             num_kv_heads: num_groups,
             head_dim: head_size,
-            wq,
-            wk,
-            wv,
-            wo,
+            wq: wq.into(),
+            wk: wk.into(),
+            wv: wv.into(),
+            wo: wo.into(),
             span,
             q_norm: Some(q_norm),
             k_norm: Some(k_norm),

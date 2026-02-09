@@ -1,6 +1,9 @@
-use crate::parser::{
-    Load,
-    llm::models::{LLMModelLoader, gpt2::decoder::GPT2Decoder},
+use crate::{
+    parser::{
+        Load,
+        llm::models::{LLMModelLoader, gpt2::decoder::GPT2Decoder},
+    },
+    tensor::KeyedTensor,
 };
 
 use crate::{
@@ -227,7 +230,8 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
         let eps = cfg
             .get::<f32, _>("layer_norm_epsilon")
             .context("layer_norm_epsilon not found")?;
-        let final_norm = Norm::LayerNorm(LayerNorm::new(ln_f_weight, ln_f_bias, eps)?);
+        let final_norm =
+            Norm::LayerNorm(LayerNorm::new(ln_f_weight.into(), ln_f_bias.into(), eps)?);
 
         // Final projection (reuses embeddings matrix)
         let input_terms = "X(se)@WE(ve)";
@@ -238,8 +242,12 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
             "O(sv)"
         };
         let equation = format!("{input_terms}->{output_terms}");
-        let proj_weights = embeddings.mat.clone();
-        let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
+        let proj_weights = KeyedTensor::try_from(&embeddings.mat)?;
+        let final_proj = EinSum::<f32>::new(
+            equation,
+            vec![Some(proj_weights.into())],
+            vec![proj_bias.map(|tensor| tensor.into())],
+        )?;
 
         let llm_model = LLMModel::new(
             embeddings,

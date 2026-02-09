@@ -990,7 +990,7 @@ mod test {
             Model,
             test::{prove_model, prove_model_with},
         },
-        tensor::{KeyedTensor, Tensor},
+        tensor::Tensor,
     };
     use proptest::prelude::*;
     use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -1079,9 +1079,10 @@ mod test {
         let einsum = Layer::EinSum(
             EinSum::new_matmul(
                 None,
-                Some(KeyedTensor::new(
-                    "embedding_matrix",
-                    Tensor::random(&vec![hidden_size, vocab_size].into()),
+                Some(TensorHandle::from_tensor(
+                    StorageKey::from("embedding_matrix"),
+                    GenStore::new_empty(),
+                    Tensor::random(&Shape::new(vec![hidden_size, vocab_size])),
                 )),
                 false,
                 None,

@@ -756,7 +756,7 @@ where
 
             self.storagekey_to_handle.insert(
                 handle.storage_key().clone(),
-                handle.clone().into_wrapped_tensor()?,
+                handle.clone().wrapped_tensor_variant()?,
             );
         }
 
@@ -1299,7 +1299,7 @@ where
     {
         let inputs = inputs
             .into_iter()
-            .map(|handle| handle.into_wrapped_tensor())
+            .map(|handle| handle.wrapped_tensor_variant())
             .collect::<Result<Vec<_>, _>>()?;
         runner.model_inputs(&self.graph, &inputs)?;
 
@@ -1445,7 +1445,7 @@ pub(crate) mod test {
     use ff_ext::GoldilocksExt2;
     use itertools::Itertools;
 
-    use tenstore::GenStore;
+    use tenstore::{GenStore, StorageKey};
     use transcript::BasicTranscript;
 
     pub type F = GoldilocksExt2;
@@ -1476,7 +1476,6 @@ pub(crate) mod test {
             let mut last_node_id = None;
             for selector in 0..num_dense_layers {
                 if selector % MOD_SELECTOR == SELECTOR_DENSE {
-                    // if true {
                     // last row becomes new column
                     let (nrows, ncols): (usize, usize) = (rng.gen_range(3..15), last_row);
                     last_row = nrows;
@@ -2117,9 +2116,10 @@ pub(crate) mod test {
             .add_inner(Layer::EinSum(
                 EinSum::new_matmul(
                     None,
-                    Some(KeyedTensor::new(
-                        "first_out_weight",
-                        Tensor::random(&vec![13, 9].into()),
+                    Some(TensorHandle::from_tensor(
+                        StorageKey::from("first_out_weight"),
+                        GenStore::new_empty(),
+                        Tensor::random(&Shape::new(vec![13, 9])),
                     )),
                     false,
                     None,
@@ -2132,9 +2132,10 @@ pub(crate) mod test {
             .add_inner(Layer::EinSum(
                 EinSum::new_matmul(
                     None,
-                    Some(KeyedTensor::new(
-                        "second_out_weight",
-                        Tensor::random(&vec![13, 13].into()),
+                    Some(TensorHandle::from_tensor(
+                        StorageKey::from("second_out_weight"),
+                        GenStore::new_empty(),
+                        Tensor::random(&Shape::new(vec![13, 13])),
                     )),
                     false,
                     None,
@@ -2161,8 +2162,16 @@ pub(crate) mod test {
         let input_shape = vec![17, 14].into();
         let weight_shape = vec![14, 17].into();
         let bias_shape = vec![17].into();
-        let matmul_weight = KeyedTensor::new("matmul_weight", Tensor::random(&weight_shape));
-        let bias = KeyedTensor::new("matmul_bias", Tensor::random(&bias_shape));
+        let matmul_weight = TensorHandle::from_tensor(
+            StorageKey::new("matmul_weight"),
+            GenStore::new_empty(),
+            Tensor::random(&weight_shape),
+        );
+        let bias = TensorHandle::from_tensor(
+            StorageKey::new("matmul_bias"),
+            GenStore::new_empty(),
+            Tensor::random(&bias_shape),
+        );
         let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
         let first_layer_id = model
             .add_consecutive_layer(

@@ -15,7 +15,7 @@ use crate::{
             transformer::attention_layer::{AttentionCacheConfig, AttentionMechanism},
         },
     },
-    tensor::KeyedTensor,
+    tensor::{KeyedTensor, TensorHandle},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -26,14 +26,14 @@ pub struct GPT2Attention {
     max_context_length: usize,
     num_heads: usize,
     head_dim: usize,
-    wq: KeyedTensor<f32>,
-    q_bias: KeyedTensor<f32>,
-    wk: KeyedTensor<f32>,
-    k_bias: KeyedTensor<f32>,
-    wv: KeyedTensor<f32>,
-    v_bias: KeyedTensor<f32>,
-    wo: KeyedTensor<f32>,
-    o_bias: KeyedTensor<f32>,
+    wq: TensorHandle<f32>,
+    q_bias: TensorHandle<f32>,
+    wk: TensorHandle<f32>,
+    k_bias: TensorHandle<f32>,
+    wv: TensorHandle<f32>,
+    v_bias: TensorHandle<f32>,
+    wo: TensorHandle<f32>,
+    o_bias: TensorHandle<f32>,
 }
 
 impl AttentionMechanism for GPT2Attention {
@@ -64,7 +64,8 @@ impl AttentionMechanism for GPT2Attention {
     fn uses_out_bias(&self) -> bool {
         true
     }
-    fn qkv_tensors(&self) -> (Vec<KeyedTensor<f32>>, Vec<Option<KeyedTensor<f32>>>) {
+
+    fn qkv_tensors(&self) -> (Vec<TensorHandle<f32>>, Vec<Option<TensorHandle<f32>>>) {
         let weights = vec![self.wq.clone(), self.wk.clone(), self.wv.clone()];
         let biases = vec![
             Some(self.q_bias.clone()),
@@ -74,7 +75,7 @@ impl AttentionMechanism for GPT2Attention {
         (weights, biases)
     }
 
-    fn out_tensors(&self) -> (KeyedTensor<f32>, Option<KeyedTensor<f32>>) {
+    fn out_tensors(&self) -> (TensorHandle<f32>, Option<TensorHandle<f32>>) {
         (self.wo.clone(), Some(self.o_bias.clone()))
     }
 
@@ -280,14 +281,14 @@ impl Load<SafeLoader> for GPT2Attention {
             max_context_length: structure.generic.context_length,
             num_heads: structure.generic.num_heads,
             head_dim: structure.generic.head_size,
-            wq,
-            q_bias,
-            wk,
-            k_bias,
-            wv,
-            v_bias,
-            wo,
-            o_bias,
+            wq: wq.into(),
+            q_bias: q_bias.into(),
+            wk: wk.into(),
+            k_bias: k_bias.into(),
+            wv: wv.into(),
+            v_bias: v_bias.into(),
+            wo: wo.into(),
+            o_bias: o_bias.into(),
         })
     }
 }
@@ -385,14 +386,14 @@ impl Load<GGUFLoader> for GPT2Attention {
             max_context_length: c.generic.context_length,
             num_heads: c.generic.num_heads,
             head_dim: c.generic.head_size,
-            wq,
-            q_bias,
-            wk,
-            k_bias,
-            wv,
-            v_bias,
-            wo,
-            o_bias,
+            wq: wq.into(),
+            q_bias: q_bias.into(),
+            wk: wk.into(),
+            k_bias: k_bias.into(),
+            wv: wv.into(),
+            v_bias: v_bias.into(),
+            wo: wo.into(),
+            o_bias: o_bias.into(),
         })
     }
 }
@@ -545,14 +546,14 @@ impl Load<JSONLoader> for GPT2Attention {
             max_context_length: structure.context_length,
             num_heads: structure.num_heads,
             head_dim: structure.head_size,
-            wq,
-            q_bias,
-            wk,
-            k_bias,
-            wv,
-            v_bias,
-            wo,
-            o_bias,
+            wq: wq.into(),
+            q_bias: q_bias.into(),
+            wk: wk.into(),
+            k_bias: k_bias.into(),
+            wv: wv.into(),
+            v_bias: v_bias.into(),
+            wo: wo.into(),
+            o_bias: o_bias.into(),
         })
     }
 }

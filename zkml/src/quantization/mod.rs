@@ -51,15 +51,13 @@ impl ScalingFactor {
     pub fn from_absolute_max(abs_max: f32, quantized_domain: Option<(Element, Element)>) -> Self {
         Self::from_span(-(abs_max.abs()), abs_max.abs(), quantized_domain)
     }
-    pub fn from_tensor<T: MinMax>(
-        t: &Tensor<T>,
+
+    pub fn from_tensor<T: Number>(
+        tensor: &Tensor<T>,
         quantized_domain: Option<(Element, Element)>,
     ) -> Self {
-        let max_abs = t
-            .data()
-            .iter()
-            .fold(T::zero(), |a, b| a.cmp_max(b.absolute_value()));
-        Self::from_absolute_max(max_abs.to_f32(), quantized_domain)
+        let max_abs = tensor.max_abs();
+        Self::from_absolute_max(max_abs.to_f32().unwrap(), quantized_domain)
     }
 
     pub fn from_span(min: f32, max: f32, quantized_domain: Option<(Element, Element)>) -> Self {
@@ -173,25 +171,6 @@ pub fn split_scale_into_multiplier(s: f32) -> (i32, f32) {
         m * 2f32.powf(-shift)
     );
     (shift as i32, m)
-}
-
-/// Returns the scaling factors for the main tensor and for the bias tensor. These are the "model" scaling factors, or
-/// S2 in the formula S1 * S2 / S3.
-pub fn model_scaling_factor_from_tensor_and_bias(
-    input: &ScalingFactor,
-    main: &Tensor<f32>,
-    bias: Option<&Tensor<f32>>,
-) -> (ScalingFactor, ScalingFactor) {
-    let max_weight = main.max_abs();
-    let max_value = if let Some(bias) = bias {
-        let max_bias = bias.max_abs();
-        max_weight.max(max_bias)
-    } else {
-        max_weight
-    };
-    let main_sf = ScalingFactor::from_absolute_max(max_value, None);
-    let bias_sf = bias_scaling_matmul(input, &main_sf);
-    (main_sf, bias_sf)
 }
 
 pub fn bias_scaling_matmul(input: &ScalingFactor, model: &ScalingFactor) -> ScalingFactor {

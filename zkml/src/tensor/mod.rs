@@ -533,6 +533,33 @@ impl Tensor<Element> {
     }
 }
 
+impl Tensor<f32> {
+    /// Transforms this tensor by centering its rows around the mean.
+    ///
+    /// This has the effect of making the mean of a row equal to zero.
+    fn mean_center_rows(&self) -> Self {
+        let shape = self.shape();
+        let row_size = shape.dim(-1);
+
+        let subtract_mean_matrix = (0..row_size)
+            .flat_map(|i| {
+                (0..row_size).map(move |j| if i == j { row_size as f32 - 1.0 } else { -1.0 })
+            })
+            .collect::<Vec<f32>>();
+
+        let subtract_mean_tensor =
+            Tensor::new(Shape::new(vec![row_size, row_size]), subtract_mean_matrix)
+                .expect("Failed to create mean subtraction tensor");
+        let mut modified_matrix = self
+            .matmul(&subtract_mean_tensor)
+            .expect("Failed to right-multiply by mean subtraction matrix");
+        modified_matrix
+            .iter_mut()
+            .for_each(|x| *x /= row_size as f32);
+        modified_matrix
+    }
+}
+
 impl<F: ExtensionField> Tensor<F> {
     /// Clone this [Tensor] and convert into a [MultilinearExtension].
     ///
@@ -663,18 +690,18 @@ impl<T: Number> Tensor<T> {
         self.find_maximum().position
     }
 
-    /// Returns the largest value in the [Tensor].
+    /// Find the maximum value.
     ///
     /// ```rust
     /// # use zkml::{Tensor, Shape, Element};
     /// let tensor = Tensor::<Element>::new(Shape::new(vec![4, 2]), vec![3, 1, 0, 11, 7, 11, 9, 2]).unwrap();
-    /// assert_eq!(tensor.max_value(), 11);
+    /// assert_eq!(tensor.max(), 11);
     /// ```
-    pub fn max_value(&self) -> T {
+    pub fn max(&self) -> T {
         self.find_maximum().value
     }
 
-    /// Returns the the largest absolute element in the [Tensor].
+    /// Find the maximum absolute value.
     ///
     /// ```rust
     /// # use zkml::{Tensor, Shape, Element};
@@ -690,16 +717,9 @@ impl<T: Number> Tensor<T> {
     }
 
     /// Scalar multiplication with f32.
-    pub fn scalar_mul_f32<N2: Number>(&self, scalar: N2) -> Tensor<T> {
-        let scalar = scalar.to_f32().expect("Failed to convert scalar to f32");
-        let scaled = self
-            .data
-            .par_iter()
-            .map(|x| T::from_f32(x.to_f32()? * scalar))
-            .collect::<anyhow::Result<Vec<_>>>()
-            .expect("Failed to scale tensor");
+    pub fn mul_scalar(&self, scalar: T) -> Tensor<T> {
         Tensor {
-            data: scaled,
+            data: self.data.par_iter().map(|x| *x * scalar).collect(),
             shape: self.shape.clone(),
             unpadded_shape: self.unpadded_shape.clone(),
         }
@@ -926,6 +946,7 @@ impl<T: Number> Tensor<T> {
         convolution::conv2d(self, kernels, bias, stride)
     }
 
+    /// Converts this [Tensor] to f32.
     pub fn to_f32(&self) -> anyhow::Result<Tensor<f32>> {
         Ok(Tensor {
             data: self
@@ -937,6 +958,7 @@ impl<T: Number> Tensor<T> {
             unpadded_shape: self.unpadded_shape.clone(),
         })
     }
+
     /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
     /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular matrix must be square)
     /// - `num_matrices` specifies how many matrices to make
@@ -977,7 +999,8 @@ impl<T: Number> Tensor<T> {
         Tensor::<T>::new(vec![num_matrices, matrix_dim, matrix_dim].into(), data)
     }
 
-    pub fn min_value(&self) -> T {
+    /// Find the minimum value.
+    pub fn min(&self) -> T {
         self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
     }
 
@@ -1010,15 +1033,28 @@ impl<T: Number> Tensor<T> {
         })
     }
 
-    // slice the tensor on the second dimension
-    // dim2_start inclusive
-    // dim2_end exclusive
-    // TODO: refactor to take generic shape dimensions where to slice ... or just use burn API tensor
-    pub fn slice_2d(&self, dim2_start: usize, dim2_end: usize) -> Result<Self> {
+    /// Slice the tensor on the first dimension.
+    ///
+    /// # Arguments
+    ///
+    /// - start: New start for the first dimension, inclusive.
+    /// - end: New end for the first dimension, exclusive.
+    pub fn slice_2d(&self, start: usize, end: usize) -> Result<Self> {
         ensure!(self.shape.len() == 2);
-        let range = dim2_start * self.shape[1]..dim2_end * self.shape[1];
-        let data = self.data[range].to_vec();
-        let new_shape: Shape = vec![dim2_end - dim2_start, self.shape[1]].into();
+        ensure!(start < end);
+        ensure!(end <= self.shape[0] + 1);
+
+        let range_start = start * self.shape[1];
+        let range_end = end * self.shape[1];
+        let data = self.data[range_start..range_end].to_vec();
+
+        let new_shape = Shape::new(vec![end - start, self.shape[1]]);
+        debug_assert!(
+            new_shape.numel() == data.len(),
+            "{new_shape:?} data.len(): {} start: {start} end: {end}",
+            data.len(),
+        );
+
         Ok(Self {
             data,
             shape: new_shape.clone(),

@@ -1,5 +1,4 @@
 use crate::{
-    Number,
     layers::{
         Layer,
         transformer::{layernorm::LayerNorm, rmsnorm::RMSNorm},
@@ -19,9 +18,12 @@ pub enum NormType {
     RMSNorm,
 }
 #[derive(Debug, Clone)]
-pub enum Norm<N: Number> {
-    LayerNorm(LayerNorm<N>),
-    RMSNorm(RMSNorm<N>),
+pub enum Norm<T>
+where
+    T: TensorTypeParam,
+{
+    LayerNorm(LayerNorm<T>),
+    RMSNorm(RMSNorm<T>),
 }
 
 impl<N> Norm<N>

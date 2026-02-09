@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Deref,
-    sync::{Arc, RwLock},
 };
 use tenstore::GenStore;
 use tracing::{debug, info, warn};
@@ -141,13 +140,12 @@ impl ScalingStrategy for InferenceObserver {
                 .map(|(i, (input_tensor, unpadded_shape))| {
                     let input_node_id = model.graph().input_node_id(i)?;
                     let wrapped_tensor = WrappedTensor::try_from(input_tensor)?;
-                    let handle = TensorHandle::WrappedTensor {
-                        storage_key: input_node_id.output_at(0).to_storage_key(),
-                        store: store.clone(),
-                        wrapped_tensor: Arc::new(RwLock::new(Some(wrapped_tensor))),
-                        unpadded_shape: unpadded_shape.clone(),
-                        shape: unpadded_shape.clone(),
-                    };
+                    let handle = TensorHandle::from_wrapped_tensor_with_unpadded_shape(
+                        input_node_id.output_at(0).to_storage_key(),
+                        store.clone(),
+                        wrapped_tensor,
+                        unpadded_shape.clone(),
+                    );
                     Ok(handle)
                 })
                 .collect::<Result<Vec<_>>>()?;

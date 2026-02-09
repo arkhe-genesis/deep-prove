@@ -74,8 +74,13 @@ impl EinSum<Element> {
         let field_constants = self
             .constant_tensors
             .iter()
-            .map(|t| t.as_ref().map(|tensor| tensor.tensor().to_field()))
-            .collect::<Vec<Option<Tensor<E>>>>();
+            .map(|tensor_opt| {
+                tensor_opt
+                    .as_ref()
+                    .map(|tensor| Ok(Tensor::try_from(tensor)?.to_field()))
+                    .transpose()
+            })
+            .collect::<Result<Vec<Option<Tensor<E>>>>>()?;
 
         let mut full_inputs = Vec::with_capacity(field_constants.len() + 1);
         full_inputs.push(first_input);
@@ -194,8 +199,8 @@ impl EinSum<Element> {
             .enumerate()
             .filter_map(|(output_id, (bias_opt, split_point))| {
                 if let Some(bias) = bias_opt.as_ref() {
-                    let key = bias.commitment_id();
-                    let bias_field: Tensor<E> = bias.to_field();
+                    let key = CommitmentId::from(bias.storage_key());
+                    let bias_field: Tensor<E> = Tensor::try_from(bias).unwrap().to_field();
                     let bias_poly = bias_field.to_mle();
                     let bias_point = self
                         .mapping
@@ -239,7 +244,10 @@ impl EinSum<Element> {
                     .fold(E::ZERO, |acc, (coeff, eval)| acc + *coeff * *eval);
 
                 if let Some(weight) = weight_opt.as_ref() {
-                    Either::Right((weight.commitment_id(), Claim::<E>::new(full_point, eval)))
+                    Either::Right((
+                        CommitmentId::from(weight.storage_key()),
+                        Claim::<E>::new(full_point, eval),
+                    ))
                 } else {
                     Either::Left(Claim::<E>::new(full_point, eval))
                 }

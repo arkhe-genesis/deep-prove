@@ -25,7 +25,6 @@ use crate::{
         },
     },
     model::Step,
-    number::Number,
     padding::PaddingMode,
     parser::{
         gguf, json,
@@ -34,10 +33,10 @@ use crate::{
     },
     quantization::{self, Quantize, ToField},
     shape::Shape,
-    tensor::{CommitmentId, KeyedTensor, TensorTypeParam, WrappedTensor},
+    tensor::{CommitmentId, TensorHandle, TensorTypeParam, WrappedTensor},
     to_base,
 };
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use ark_std::Zero;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -71,14 +70,18 @@ pub(crate) const RMSNORM_SCALE_FACTOR: usize = 1 << LOG_RMSNORM_SCALE_FACTOR;
 /// The scale factor of the outputs of the inverse square root lookup tables lookup
 pub(crate) const RMSNORM_OUTPUT_SCALE_FACTOR: usize = 1 << 10;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Struct storing all information needed to perform RMSNorm. The `alpha` field
 /// is normally learned parameters that are applied elementwise. The `eps` field is used for normalisation when calculating
 /// the inverse square root.
-pub struct RMSNorm<N> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub struct RMSNorm<T>
+where
+    T: TensorTypeParam,
+{
     /// Each element of the normalisation dimension is multiplied elementwise by this, we use
     /// an [`Option`] because it may be the case the weights are all 1 and then we don't want to apply this tensor.
-    pub alpha: Option<KeyedTensor<N>>,
+    pub alpha: Option<TensorHandle<T>>,
     /// Normalisation factor
     pub eps: f32,
     /// The size of the dimension we normalise over
@@ -87,9 +90,9 @@ pub struct RMSNorm<N> {
     pub quant_info: Option<QuantisedRMSNormData>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Copy)]
 /// This struct is used to store information used when evaluating the quantised version of [`RMSNorm`] on
 /// [`Element`]s.
+#[derive(Debug, Clone, Serialize, Deserialize, Copy)]
 pub struct QuantisedRMSNormData {
     /// The [`ScalingFactor`] of the inputs
     input_scale_factor: ScalingFactor,
@@ -105,8 +108,8 @@ pub struct QuantisedRMSNormData {
     top_chunk_scalar_log: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 /// Struct used to store Softmax table data
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RMSTableData {
     /// This is the result of calling [`f32::to_bits`] on the epsilon value.
     eps_bits: u32,
@@ -143,14 +146,25 @@ impl RMSTableData {
     }
 }
 
-impl<N: Number> RMSNorm<N> {
+impl<T> RMSNorm<T>
+where
+    T: TensorTypeParam,
+{
     /// Create a new [`RMSNorm`] layer with the given `alpha` and `eps` values.
-    pub fn new(alpha: Option<KeyedTensor<N>>, eps: f32, dim_size: Option<usize>) -> Result<Self> {
-        if alpha.is_none() && dim_size.is_none() {
-            return Err(anyhow::anyhow!("Must provide either alpha or dim_size"));
-        }
-        // Unwrap is safe because we check one of alpha or dim_size is Some
-        let dim_size = dim_size.unwrap_or_else(|| alpha.as_ref().map(|a| a.shape()[0]).unwrap());
+    pub fn new(alpha: Option<TensorHandle<T>>, eps: f32, dim_size: Option<usize>) -> Result<Self> {
+        let (dim_size, alpha) = match (dim_size, alpha) {
+            (None, None) => bail!("Must provide either alpha or dim_size"),
+            (Some(dim_size), None) => (dim_size, None),
+            (Some(dim_size), Some(alpha)) => {
+                let alpha = alpha.wrapped_tensor_variant()?;
+                (dim_size, Some(alpha))
+            }
+            (None, Some(alpha)) => {
+                let alpha = alpha.wrapped_tensor_variant()?;
+                (alpha.shape()[0], Some(alpha))
+            }
+        };
+
         Ok(Self {
             alpha,
             eps,
@@ -170,11 +184,7 @@ impl<N: Number> RMSNorm<N> {
     }
 }
 
-impl<N> RMSNorm<N>
-where
-    N: Number,
-    N: Quantize<Output = Element>,
-{
+impl RMSNorm<f32> {
     /// Quantise the layer. To do this we want to have a common scale factor so that lookup tables can be reused, so we use the
     /// constant [`RMSNORM_SCALE_FACTOR`] as the input column scale factor. We need to work out how big the table needs to be to cover
     /// all of our possible inputs.
@@ -254,9 +264,7 @@ where
             intermediate_bit_size,
         ))
     }
-}
 
-impl RMSNorm<f32> {
     pub fn from_json(l: &json::FileTensorLoader, _c: &LLMConfig) -> anyhow::Result<Self> {
         trace!("from_json: current path: {:?}", l.prefix);
         let alpha = l.get_tensor("norm.weight")?;
@@ -268,7 +276,7 @@ impl RMSNorm<f32> {
         if trivial_alpha {
             Self::new(None, eps, Some(alpha.shape().dim(-1)))
         } else {
-            Self::new(Some(alpha), eps, None)
+            Self::new(Some(alpha.into()), eps, None)
         }
     }
 
@@ -290,7 +298,7 @@ impl RMSNorm<f32> {
         if trivial_alpha {
             Self::new(None, eps, Some(alpha.shape().dim(-1)))
         } else {
-            Self::new(Some(alpha), eps, None)
+            Self::new(Some(alpha.into()), eps, None)
         }
     }
 
@@ -309,7 +317,7 @@ impl RMSNorm<f32> {
         if trivial_alpha {
             Self::new(None, eps, Some(alpha.shape().dim(-1)))
         } else {
-            Self::new(Some(alpha), eps, None)
+            Self::new(Some(alpha.into()), eps, None)
         }
     }
 }
@@ -353,14 +361,13 @@ impl Evaluate<f32> for RMSNorm<f32> {
         let alpha_opt = self
             .alpha
             .as_ref()
-            .map(WrappedTensor::try_from)
+            .map(TensorHandle::wrapped_tensor)
             .transpose()?;
 
-        let output = WrappedTensor::rms_norm_forward(
-            input.clone(),
+        let output = input.clone().rms_norm_forward(
             self.dim_size,
             self.eps as f64,
-            alpha_opt,
+            alpha_opt.as_deref().cloned(),
         )?;
         Ok(LayerOut::from_tensor(output))
     }
@@ -393,6 +400,8 @@ impl Evaluate<Element> for RMSNorm<Element> {
             "Cannot evaluate RMSNorm, input didn't have a shape"
         ))?;
 
+        // XXX: GPU accelerate this
+        let alpha = self.alpha.as_ref().map(Vec::try_from).transpose()?;
         let output_data = Tensor::try_from(input.clone())?
             .data()
             .chunks(final_dim)
@@ -401,10 +410,10 @@ impl Evaluate<Element> for RMSNorm<Element> {
                 let full_value = multiplier * sum_squares;
                 let inv_sqrt = full_value >> range_check_bits;
                 let denominator = lut.table_output(inv_sqrt);
-                if let Some(alpha) = self.alpha.as_ref() {
+                if let Some(alpha) = alpha.as_ref() {
                     chunk
                         .iter()
-                        .zip(alpha.data())
+                        .zip(alpha)
                         .map(|(&v, &alpha)| alpha * v * denominator)
                         .collect::<Vec<Element>>()
                 } else {
@@ -441,9 +450,10 @@ impl QuantizeOp for RMSNorm<f32> {
             input_scaling.len()
         );
         let input_scaling_factor = input_scaling[0];
-        // Now we construct the `model_scaling` from `self.alpha`
+
         let model_scaling = if let Some(alpha) = self.alpha.as_ref() {
-            ScalingFactor::from_tensor(alpha, None)
+            let max_abs = alpha.max_abs()?;
+            ScalingFactor::from_absolute_max(max_abs, None)
         } else {
             ScalingFactor::default()
         };
@@ -592,8 +602,8 @@ impl ProveInfo for RMSNorm<Element> {
                 aux.model_polys = {
                     let mut model_polys = HashMap::new();
                     model_polys.insert(
-                        self.alpha.as_ref().unwrap().commitment_id(),
-                        alpha.data().to_vec(),
+                        CommitmentId::from(alpha.storage_key()),
+                        Vec::try_from(alpha)?,
                     );
                     Some(model_polys)
                 };
@@ -619,7 +629,10 @@ impl ProveInfo for RMSNorm<Element> {
                     top_chunk_scalar_log: *top_chunk_scalar_log,
                     lookup_ctx,
                     sumcheck_expression: vec![expr],
-                    alpha_key: self.alpha.as_ref().map(|a| a.commitment_id()),
+                    alpha_key: self
+                        .alpha
+                        .as_ref()
+                        .map(|alpha| CommitmentId::from(alpha.storage_key())),
                 }),
                 aux,
             ))
@@ -815,10 +828,9 @@ impl RMSNorm<Element> {
         );
 
         let alpha_poly: MultilinearExtension<E> = if let Some(alpha) = self.alpha.as_ref() {
+            let data = Vec::try_from(alpha)?;
             std::iter::repeat_n(
-                alpha
-                    .data()
-                    .iter()
+                data.iter()
                     .map(<Element as ToField<E>>::to_field)
                     .collect::<Vec<E>>(),
                 1 << logup_vars,
@@ -891,7 +903,7 @@ impl RMSNorm<Element> {
                 let point = io_point.iter().take(diff).copied().collect::<Vec<E>>();
                 let mut claims = HashMap::new();
                 claims.insert(
-                    alpha.commitment_id(),
+                    CommitmentId::from(alpha.storage_key()),
                     Claim::<E>::new(point.clone(), io_evaluations[2]),
                 );
                 claims
@@ -1159,7 +1171,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use tenstore::GenStore;
+    use tenstore::{GenStore, StorageKey};
 
     use crate::{
         init_test_logging_default,
@@ -1171,12 +1183,16 @@ mod tests {
 
     use super::*;
 
-    impl<N: Number> RMSNorm<N> {
+    impl<T> RMSNorm<T>
+    where
+        T: TensorTypeParam,
+    {
         pub fn random(size: usize, layer_name: Option<CommitmentId>) -> Self {
             let layer_name = layer_name.unwrap_or("rmsnorm".to_string().into());
-            let alpha = KeyedTensor::new(
-                format!("alpha_{layer_name}"),
-                Tensor::<N>::random(&vec![size].into()),
+            let alpha = TensorHandle::from_tensor(
+                StorageKey::from(format!("alpha_{layer_name}")),
+                GenStore::new_empty(),
+                Tensor::<T>::random(&vec![size].into()),
             );
             let eps = 1e-5;
             Self::new(Some(alpha), eps, Some(size)).unwrap()
@@ -1202,13 +1218,17 @@ mod tests {
 
     #[test]
     fn test_quantise_rmsnorm() {
-        let rmsnorm = RMSNorm::random(100, None);
+        let rmsnorm = RMSNorm::<f32>::random(100, None);
+
         // Make a random float input tensor and derive the input ScalingFactor
         let input_tensor = Tensor::<f32>::random(&vec![2, 100].into());
         let input_scaling = ScalingFactor::from_tensor(&input_tensor, None);
-        let model_scaling = ScalingFactor::from_tensor(rmsnorm.alpha.as_ref().unwrap(), None);
+        let max_abs = rmsnorm.alpha.as_ref().unwrap().max_abs().unwrap();
+        let model_scaling = ScalingFactor::from_absolute_max(max_abs, None);
+
         // Construct the quantised RMSNorm
         let (quant_rmsnorm, _) = rmsnorm.quantise(input_scaling, model_scaling).unwrap();
+
         // We quantise the float input to obtain `quant_tensor` and then we dequantise to obtain `dequant_input`
         // this lets us run quantised evaluation and floating point evaluation and compare the outputs.
         let quant_tensor = input_tensor.quantize(&input_scaling);

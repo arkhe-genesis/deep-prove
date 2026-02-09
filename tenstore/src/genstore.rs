@@ -42,6 +42,9 @@ pub enum GenStoreKind {
 
     /// A remote store combined with a local-store for caching.
     Remote(Arc<Mutex<RemoteStore>>),
+
+    /// An empty store
+    Empty,
 }
 
 impl std::fmt::Debug for GenStoreKind {
@@ -50,6 +53,7 @@ impl std::fmt::Debug for GenStoreKind {
             GenStoreKind::Local(mutex) => write!(f, "{:?}", mutex.lock().unwrap()),
             GenStoreKind::Tmp(mutex) => write!(f, "{:?}", mutex.lock().unwrap()),
             GenStoreKind::Remote(mutex) => write!(f, "{:?}", mutex.lock().unwrap()),
+            GenStoreKind::Empty => write!(f, "GenStore::Empty"),
         }
     }
 }
@@ -58,6 +62,13 @@ impl GenStore {
     pub fn new_kind(kind: GenStoreKind) -> Self {
         Self {
             kind,
+            run_id: Uuid::new_v4(),
+        }
+    }
+
+    pub fn new_empty() -> Self {
+        Self {
+            kind: GenStoreKind::Empty,
             run_id: Uuid::new_v4(),
         }
     }
@@ -142,6 +153,7 @@ impl GenStore {
             GenStoreKind::Tmp(store) => {
                 store.lock().unwrap().clean_up(self.run_id)?;
             }
+            GenStoreKind::Empty => panic!("Cant call cleanup on empty store"),
         }
         Ok(())
     }
@@ -167,7 +179,7 @@ impl GenericStore for GenStore {
         T: for<'a> Deserialize<'a>,
     {
         match &self.kind {
-            GenStoreKind::Local(_) | GenStoreKind::Tmp(_) => {
+            GenStoreKind::Local(_) | GenStoreKind::Tmp(_) | GenStoreKind::Empty => {
                 // No-op
                 Ok(())
             }
@@ -183,6 +195,7 @@ impl GenericStore for GenStore {
             GenStoreKind::Local(store) => store.lock().unwrap().fetch(self.run_id, storage_key),
             GenStoreKind::Tmp(store) => store.lock().unwrap().fetch(self.run_id, storage_key),
             GenStoreKind::Remote(store) => store.lock().unwrap().fetch(self.run_id, storage_key),
+            GenStoreKind::Empty => panic!("Cant call fetch on empty store"),
         }
     }
 
@@ -198,6 +211,7 @@ impl GenericStore for GenStore {
             GenStoreKind::Remote(store) => {
                 store.lock().unwrap().store(self.run_id, storage_key, data)
             }
+            GenStoreKind::Empty => panic!("Cant call store on empty store"),
         }
     }
 }

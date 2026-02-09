@@ -196,12 +196,13 @@ mod convolution_layer {
 
 #[divan::bench_group]
 mod embeddings_layer {
+    use tenstore::{GenStore, StorageKey};
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::embeddings::Embeddings},
         number::Number,
         quantization::Quantize,
-        tensor::{KeyedTensor, WrappedTensor},
+        tensor::{TensorHandle, WrappedTensor},
     };
 
     use crate::{Args, default_sizes, get_results};
@@ -220,8 +221,12 @@ mod embeddings_layer {
 
         let input = WrappedTensor::try_from(input.quantize(&scaling)).unwrap();
 
-        let layer =
-            Embeddings::<Element>::new(KeyedTensor::new("embedding_matrix", emb.clone())).unwrap();
+        let layer = Embeddings::<Element>::new(TensorHandle::from_tensor(
+            StorageKey::from("embedding_matrix"),
+            GenStore::new_empty(),
+            emb,
+        ))
+        .unwrap();
 
         // warm up
         let out = layer
@@ -244,8 +249,12 @@ mod embeddings_layer {
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
 
-        let layer =
-            Embeddings::<f32>::new(KeyedTensor::new("embeddings_matrix", emb.clone())).unwrap();
+        let layer = Embeddings::<f32>::new(TensorHandle::from_tensor(
+            StorageKey::from("embedding_matrix"),
+            GenStore::new_empty(),
+            emb,
+        ))
+        .unwrap();
 
         // warm up
         let out = layer
@@ -461,10 +470,11 @@ mod logits_layer {
 mod norm_layer {
     use std::ops::Range;
 
+    use tenstore::{GenStore, StorageKey};
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::layernorm::LayerNorm},
-        tensor::{KeyedTensor, WrappedTensor},
+        tensor::{TensorHandle, WrappedTensor},
     };
 
     use crate::{DATA_SIZE_POWS, get_results};
@@ -490,15 +500,17 @@ mod norm_layer {
         let dim0 = 1 << args.dim0_pow2;
         let dim1 = 1 << args.dim1_pow2;
 
-        let gamma = KeyedTensor::new(
-            "norm_gamma",
-            Tensor::<Element>::random(&Shape::new(vec![dim1])),
+        let gamma = TensorHandle::from_tensor(
+            StorageKey::from("norm_gamma"),
+            GenStore::new_empty(),
+            Tensor::<f32>::random(&Shape::new(vec![dim1])),
         );
-        let beta = KeyedTensor::new(
-            "norm_beta",
-            Tensor::<Element>::random(&Shape::new(vec![dim1])),
+        let beta = TensorHandle::from_tensor(
+            StorageKey::from("norm_beta"),
+            GenStore::new_empty(),
+            Tensor::<f32>::random(&Shape::new(vec![dim1])),
         );
-        let layer = LayerNorm::<Element>::new(gamma, beta, EPS).unwrap();
+        let layer = LayerNorm::<f32>::new(gamma, beta, EPS).unwrap();
 
         let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
 
@@ -523,8 +535,16 @@ mod norm_layer {
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
 
-        let gamma = KeyedTensor::new("norm_gamma", Tensor::<f32>::random(&Shape::new(vec![dim1])));
-        let beta = KeyedTensor::new("norm_beta", Tensor::<f32>::random(&Shape::new(vec![dim1])));
+        let gamma = TensorHandle::from_tensor(
+            StorageKey::from("norm_gamma"),
+            GenStore::new_empty(),
+            Tensor::<f32>::random(&Shape::new(vec![dim1])),
+        );
+        let beta = TensorHandle::from_tensor(
+            StorageKey::from("norm_beta"),
+            GenStore::new_empty(),
+            Tensor::<f32>::random(&Shape::new(vec![dim1])),
+        );
         let layer = LayerNorm::<f32>::new(gamma, beta, EPS).unwrap();
 
         // warm up
@@ -540,6 +560,7 @@ mod norm_layer {
 
 #[divan::bench_group]
 mod positional_absolute_layer {
+    use tenstore::GenStore;
     use zkml::{
         ScalingFactor, ScalingStrategy, Shape, Tensor,
         layers::{
@@ -548,7 +569,7 @@ mod positional_absolute_layer {
         },
         padding::PaddingMode,
         quantization::{AbsoluteMax, Quantize},
-        tensor::{KeyedTensor, WrappedTensor},
+        tensor::{TensorHandle, WrappedTensor},
     };
 
     use crate::{Args, default_sizes, get_results};
@@ -558,15 +579,16 @@ mod positional_absolute_layer {
         let size = 1 << args.pow2; // emb = size
         let context = size * 2;
 
-        let pos = KeyedTensor::new(
-            "positional_absolute_mat",
+        let pos = TensorHandle::from_tensor(
+            "positional_absolute_mat".into(),
+            GenStore::new_empty(),
             Tensor::<f32>::random(&Shape::new(vec![context, size])),
         );
         let input_f32 = Tensor::<f32>::random(&Shape::new(vec![size, size]));
         let input_scaling = ScalingFactor::from_tensor(&input_f32, None);
         let input = WrappedTensor::try_from(input_f32.quantize(&input_scaling)).unwrap();
 
-        let base_layer = Positional::<f32>::new_absolute(pos.clone());
+        let base_layer = Positional::<f32>::new_absolute(pos.clone()).unwrap();
         let input_shapes = vec![Shape::new(vec![size, size])];
         let unpadded_output_shapes = base_layer
             .output_shapes(&input_shapes, PaddingMode::NoPadding)
@@ -613,13 +635,14 @@ mod positional_absolute_layer {
         let size = 1 << args.pow2; // emb = size
         let context = size * 2;
 
-        let pos = KeyedTensor::new(
-            "positional_absolute_mat",
+        let pos = TensorHandle::from_tensor(
+            "positional_absolute_mat".into(),
+            GenStore::new_empty(),
             Tensor::<f32>::random(&Shape::new(vec![context, size])),
         );
 
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size, size]));
-        let layer = Positional::<f32>::new_absolute(pos.clone());
+        let layer = Positional::<f32>::new_absolute(pos.clone()).unwrap();
 
         // warm up
         let out = layer
@@ -954,8 +977,12 @@ mod einsum_layer {
 
         let einsum_layer = EinSum::<Element>::new(
             "X(se)@WQ(eh):WK(eh):WV(eh)->Q(sh)+BIAS(h):K(sh)+BIAS(h):V(sh)+BIAS(h)".to_string(),
-            vec![Some(q), Some(k), Some(v)],
-            vec![Some(q_bias), Some(k_bias), Some(v_bias)],
+            vec![Some(q.into()), Some(k.into()), Some(v.into())],
+            vec![
+                Some(q_bias.into()),
+                Some(k_bias.into()),
+                Some(v_bias.into()),
+            ],
         )
         .unwrap();
 
@@ -991,8 +1018,12 @@ mod einsum_layer {
 
         let einsum_layer = EinSum::<f32>::new(
             "X(se)@WQ(eh):WK(eh):WV(eh)->Q(sh)+BIAS(h):K(sh)+BIAS(h):V(sh)+BIAS(h)".to_string(),
-            vec![Some(q), Some(k), Some(v)],
-            vec![Some(q_bias), Some(k_bias), Some(v_bias)],
+            vec![Some(q.into()), Some(k.into()), Some(v.into())],
+            vec![
+                Some(q_bias.into()),
+                Some(k_bias.into()),
+                Some(v_bias.into()),
+            ],
         )
         .unwrap();
 

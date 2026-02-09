@@ -29,7 +29,7 @@ use crate::{
         Load,
         llm::{config::LLMStructure, transformer::Norm},
     },
-    tensor::TensorTypeParam,
+    tensor::{KeyedTensor, TensorTypeParam},
 };
 
 #[derive(
@@ -187,12 +187,16 @@ where
             "O(sv)"
         };
         let equation = format!("{input_terms}->{output_terms}");
-        let mut proj_weights = embeddings.mat.clone();
+        let mut proj_weights = KeyedTensor::try_from(&embeddings.mat)?;
         // We need to modify the key to avoid conflicts between the embeddings matrix and the final projection
         // the embeddings matrix is scaled _after_ parsing the model, but the final projection is *not* scaled
         // so in effect, these are two different tensors and thus need to be represented by two different keys
-        proj_weights.key = StorageKey::from(format!("{}_final_proj", proj_weights.key));
-        let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
+        proj_weights.key = StorageKey::from(format!("{}_final_proj", proj_weights.storage_key()));
+        let final_proj = EinSum::<f32>::new(
+            equation,
+            vec![Some(proj_weights.into())],
+            vec![proj_bias.map(|tensor| tensor.into())],
+        )?;
 
         Ok(Self::new(
             embeddings,
@@ -209,6 +213,7 @@ where
     T: Load<SafeLoader, Config = (LLMStructure, ConfigJSON)> + LayerInsertion,
 {
     type Config = (LLMStructure, ConfigJSON);
+
     fn from_loader(loader: &SafeLoader, loader_config: &Self::Config) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -241,12 +246,16 @@ where
             "O(sv)"
         };
         let equation = format!("{input_terms}->{output_terms}");
-        let mut proj_weights = embeddings.mat.clone();
+        let mut proj_weights = KeyedTensor::try_from(&embeddings.mat)?;
         // We need to modify the key to avoid conflicts between the embeddings matrix and the final projection
         // the embeddings matrix is scaled _after_ parsing the model, but the final projection is *not* scaled
         // so in effect, these are two different tensors and thus need to be represented by two different keys
         proj_weights.key = StorageKey::from(format!("{}_final_proj", proj_weights.key));
-        let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
+        let final_proj = EinSum::<f32>::new(
+            equation,
+            vec![Some(proj_weights.into())],
+            vec![proj_bias.map(|tensor| tensor.into())],
+        )?;
 
         Ok(Self::new(
             embeddings,
@@ -286,8 +295,12 @@ where
             "O(sv)"
         };
         let equation = format!("{input_terms}->{output_terms}");
-        let proj_weights = embeddings.mat.clone();
-        let final_proj = EinSum::<f32>::new(equation, vec![Some(proj_weights)], vec![proj_bias])?;
+        let proj_weights = KeyedTensor::try_from(&embeddings.mat)?;
+        let final_proj = EinSum::<f32>::new(
+            equation,
+            vec![Some(proj_weights.into())],
+            vec![proj_bias.map(|tensor| tensor.into())],
+        )?;
         Ok(Self::new(
             embeddings, positional, blocks, final_norm, final_proj,
         ))

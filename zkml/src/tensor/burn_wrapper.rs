@@ -13,7 +13,7 @@ use burn::{
     module::Param,
     nn::{LayerNormConfig, RmsNormConfig},
     tensor::{
-        AsIndex, BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, SliceArg,
+        AsIndex, BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, Slice, SliceArg,
         Tensor as BTensor, TensorData, activation, ops::ConvOptions, s,
     },
 };
@@ -488,6 +488,32 @@ where
     /// Find the maximum absolute value.
     pub fn max_abs(self) -> Self {
         let tensor = delegate_plain!(self, max_abs);
+
+        // fix the unpadded shape, the final tensor shape is `[1]`
+        let unpadded_shape = tensor.shape();
+
+        WrappedTensor::Rank1 {
+            tensor,
+            unpadded_shape,
+        }
+    }
+
+    /// Find the maximum value.
+    pub fn max(self) -> Self {
+        let tensor = delegate_plain!(self, max);
+
+        // fix the unpadded shape, the final tensor shape is `[1]`
+        let unpadded_shape = tensor.shape();
+
+        WrappedTensor::Rank1 {
+            tensor,
+            unpadded_shape,
+        }
+    }
+
+    /// Find the minimum value.
+    pub fn min(self) -> Self {
+        let tensor = delegate_plain!(self, min);
 
         // fix the unpadded shape, the final tensor shape is `[1]`
         let unpadded_shape = tensor.shape();
@@ -1079,7 +1105,10 @@ where
     }
 
     /// Returns a tensor containing the elements selected from the given ranges.
-    pub fn slice<R: Clone + SliceArg>(self, ranges: R) -> Self {
+    pub fn slice<R>(self, ranges: R) -> Self
+    where
+        R: Clone + SliceArg,
+    {
         fn to_shape<R: SliceArg>(shape: &BShape, ranges: R) -> BShape {
             let slices = ranges.into_slices(shape);
             let dims: Vec<usize> = slices
@@ -1120,6 +1149,33 @@ where
                 unpadded_shape: to_shape(&unpadded_shape, ranges),
             },
         }
+    }
+
+    /// Returns a new tensor with the specified dimension sliced.
+    pub fn slice_dim<S>(self, dim: usize, slice: S) -> Self
+    where
+        S: Into<Slice>,
+    {
+        let slice = slice.into();
+        let mut result = delegate!(self, slice_dim, dim, slice);
+
+        // fix the unpadded shape, apply the transform operation for it too
+        let mut unpadded_shape = result.unpadded_shape().clone();
+        let dim_size = slice.output_size(unpadded_shape[dim]);
+        unpadded_shape[dim] = dim_size;
+        result.set_unpadded_shape(unpadded_shape);
+
+        result
+    }
+
+    /// Slice the tensor on the first dimension.
+    ///
+    /// # Arguments
+    ///
+    /// - start: New start for the first dimension, inclusive.
+    /// - end: New end for the first dimension, exclusive.
+    pub fn slice_2d(self, start: usize, end: usize) -> Self {
+        self.slice_dim(0, start..end)
     }
 
     /// Returns the size of the given dimension.
@@ -1285,63 +1341,88 @@ where
         }
     }
 
-    /// Pads the tensor to the next power-of-two.
-    pub fn pad_next_power_of_two(self) -> Self {
-        let BShape { dims } = self.shape();
-        let shape = BShape {
-            dims: dims.next_power_of_two(),
-        };
+    /// Pads the tensor to the new shape.
+    pub fn pad(self, new_shape: BShape, pad_value: T) -> anyhow::Result<Self> {
+        let curr_shape = self.shape();
+
+        ensure!(
+            curr_shape.rank() == new_shape.rank(),
+            "The new shape must have the same rank",
+        );
+        ensure!(
+            curr_shape
+                .iter()
+                .zip(new_shape.iter())
+                .all(|(curr, new)| curr <= new),
+            "Padding must maintain or increase existing dimensions",
+        );
+
         match self {
             WrappedTensor::Rank1 {
                 tensor,
                 unpadded_shape,
             } => {
                 #[allow(clippy::single_range_in_vec_init)]
-                let ranges = [0..dims[0]];
-                let out = BTensor::full(shape, T::zero(), &Default::default());
-                let out = out.slice_assign(ranges, tensor);
-                WrappedTensor::Rank1 {
-                    tensor: out,
+                let copy_slices = [0..curr_shape[0]];
+                let out = BTensor::full(new_shape, pad_value, &tensor.device());
+                let tensor = out.slice_assign(copy_slices, tensor);
+                Ok(WrappedTensor::Rank1 {
+                    tensor,
                     unpadded_shape,
-                }
+                })
             }
             WrappedTensor::Rank2 {
                 tensor,
                 unpadded_shape,
             } => {
-                let ranges = [0..dims[0], 0..dims[1]];
-                let out = BTensor::full(shape, T::zero(), &Default::default());
-                let out = out.slice_assign(ranges, tensor);
-                WrappedTensor::Rank2 {
-                    tensor: out,
+                let copy_slices = [0..curr_shape[0], 0..curr_shape[1]];
+                let out = BTensor::full(new_shape, pad_value, &tensor.device());
+                let tensor = out.slice_assign(copy_slices, tensor);
+                Ok(WrappedTensor::Rank2 {
+                    tensor,
                     unpadded_shape,
-                }
+                })
             }
             WrappedTensor::Rank3 {
                 tensor,
                 unpadded_shape,
             } => {
-                let ranges = [0..dims[0], 0..dims[1], 0..dims[2]];
-                let out = BTensor::full(shape, T::zero(), &Default::default());
-                let out = out.slice_assign(ranges, tensor);
-                WrappedTensor::Rank3 {
-                    tensor: out,
+                let copy_slices = [0..curr_shape[0], 0..curr_shape[1], 0..curr_shape[2]];
+                let out = BTensor::full(new_shape, pad_value, &tensor.device());
+                let tensor = out.slice_assign(copy_slices, tensor);
+                Ok(WrappedTensor::Rank3 {
+                    tensor,
                     unpadded_shape,
-                }
+                })
             }
             WrappedTensor::Rank4 {
                 tensor,
                 unpadded_shape,
             } => {
-                let ranges = [0..dims[0], 0..dims[1], 0..dims[2], 0..dims[3]];
-                let out = BTensor::full(shape, T::zero(), &Default::default());
-                let out = out.slice_assign(ranges, tensor);
-                WrappedTensor::Rank4 {
-                    tensor: out,
+                let copy_slices = [
+                    0..curr_shape[0],
+                    0..curr_shape[1],
+                    0..curr_shape[2],
+                    0..curr_shape[3],
+                ];
+                let out = BTensor::full(new_shape, pad_value, &tensor.device());
+                let tensor = out.slice_assign(copy_slices, tensor);
+                Ok(WrappedTensor::Rank4 {
+                    tensor,
                     unpadded_shape,
-                }
+                })
             }
         }
+    }
+
+    /// Pads the tensor to the next power-of-two.
+    pub fn pad_next_power_of_two(self) -> Self {
+        let BShape { dims } = self.shape();
+        let shape = BShape {
+            dims: dims.next_power_of_two(),
+        };
+        self.pad(shape, T::default())
+            .expect("next_power_of_two makes all dimensions equal-or-greater")
     }
 
     /// Pads a matrix so it can be used with the output of a FFT-based
@@ -1658,17 +1739,17 @@ impl WrappedTensor<f32> {
     }
 
     pub fn layer_norm(
-        input: Self,
+        self,
         embedding_size: usize,
         epsilon: f64,
         gamma: Self,
         beta: Self,
     ) -> Result<Self> {
-        let input_rank = input.rank();
+        let input_rank = self.rank();
         let Self::Rank2 {
             tensor: input,
             unpadded_shape,
-        } = input
+        } = self
         else {
             bail!("Unexpected input rank: {input_rank}, expected 2.")
         };
@@ -1731,7 +1812,7 @@ impl WrappedTensor<f32> {
     }
 
     pub fn rms_norm_forward(
-        input: Self,
+        self,
         embedding_size: usize,
         epsilon: f64,
         gamma: Option<Self>,
@@ -1750,7 +1831,7 @@ impl WrappedTensor<f32> {
             config.init(&device)
         };
 
-        match input {
+        match self {
             WrappedTensor::Rank1 {
                 tensor: input,
                 unpadded_shape,
@@ -2186,6 +2267,15 @@ where
     }
 }
 
+impl<T> From<WrappedTensor<T>> for Vec<T>
+where
+    T: TensorTypeParam,
+{
+    fn from(tensor: WrappedTensor<T>) -> Self {
+        tensor.get_data()
+    }
+}
+
 impl<T> TryFrom<&KeyedTensor<T>> for WrappedTensor<T>
 where
     T: TensorTypeParam,
@@ -2406,6 +2496,22 @@ mod test {
         );
     }
 
+    #[derive(Debug)]
+    struct Slice2d {
+        x: usize,
+        y: usize,
+        start: usize,
+        end: usize,
+    }
+
+    fn slice_2d_args() -> impl Strategy<Value = Slice2d> {
+        (1usize..1024, 1usize..1024)
+            .prop_flat_map(|(x, y)| (Just(x), Just(y), 0..x))
+            // +1 because end is exclusive
+            .prop_flat_map(|(x, y, start)| (Just(x), Just(y), Just(start), start + 1..x + 1))
+            .prop_map(|(x, y, start, end)| Slice2d { x, y, start, end })
+    }
+
     proptest! {
         #[test]
         fn test_mean_center_rows(col_size in 4usize..20, row_size in 4usize..20, num_cols in 4usize..20) {
@@ -2427,7 +2533,7 @@ mod test {
 
                 for (value_centered, value) in centered_row.iter().zip(row.iter()) {
                     let diff = value_centered - (value - mean);
-                    assert!(diff.abs() < 2e-6, "Difference is too large: {diff}");
+                    prop_assert!(diff.abs() < 2e-6, "Difference is too large: {diff}");
                 }
             }
         }
@@ -2441,7 +2547,8 @@ mod test {
             let centered = wrapped.mean_center_rows();
             let mean = centered.mean_dim(0);
             let max = mean.max_abs().get_data()[0];
-            assert!(max < 1e-6);
+
+            prop_assert!(max < 1e-6);
         }
 
         #[test]
@@ -2452,7 +2559,8 @@ mod test {
             let centered = wrapped.mean_center_rows();
             let mean = centered.mean_dim(1);
             let max = mean.max_abs().get_data()[0];
-            assert!(max < 1e-6);
+
+            prop_assert!(max < 1e-6);
         }
 
         #[test]
@@ -2463,7 +2571,8 @@ mod test {
             let centered = wrapped.mean_center_rows();
             let mean = centered.mean_dim(2);
             let max = mean.max_abs().get_data()[0];
-            assert!(max < 1e-6);
+
+            prop_assert!(max < 1e-6);
         }
 
         #[test]
@@ -2480,7 +2589,21 @@ mod test {
             let to_compare = WrappedTensor::try_from(scaled_tensor).unwrap();
             let diff = scaled_wrapped.sub(to_compare).unwrap().max_abs().get_data()[0];
 
-            assert!(diff == 0, "Wrapped tensor scaling doesnt agree with native Tensor");
+            prop_assert!(diff == 0, "Wrapped tensor scaling doesnt agree with native Tensor");
+        }
+
+        #[test]
+        fn test_slice_2d(args in slice_2d_args()) {
+            let shape = Shape::new(vec![args.x, args.y]);
+            let tensor = Tensor::<f32>::random(&shape);
+            let wrapped = WrappedTensor::try_from(&tensor).unwrap();
+
+            let tensor = tensor.slice_2d(args.start, args.end).unwrap();
+            let wrapped = wrapped.slice_2d(args.start, args.end);
+
+            let to_compare = Tensor::try_from(wrapped).unwrap();
+
+            prop_assert!(tensor == to_compare, "{tensor:?} {to_compare:?}");
         }
     }
 }

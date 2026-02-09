@@ -21,7 +21,7 @@ use crate::{
     padding::PaddingMode,
     quantization::{self, Quantize, ToField},
     tensor::{
-        CommitmentId, KeyedTensor, TensorSlice, TensorTypeParam, WrappedTensor,
+        CommitmentId, TensorHandle, TensorSlice, TensorTypeParam, WrappedTensor,
         is_close_with_tolerance,
     },
     to_bit_sequence_le,
@@ -45,6 +45,7 @@ use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
 };
+use tenstore::{GenStore, StorageKey};
 use tracing::warn;
 use transcript::Transcript;
 
@@ -279,9 +280,13 @@ impl RopeLayout {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Rope<N> {
-    pub(super) cosine_matrix: KeyedTensor<N>,
-    pub(super) sine_matrix: KeyedTensor<N>,
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub struct Rope<T>
+where
+    T: TensorTypeParam,
+{
+    pub(super) cosine_matrix: TensorHandle<T>,
+    pub(super) sine_matrix: TensorHandle<T>,
     pub(super) unpadded_shape: Shape,
     pub(super) layout: RopeLayout,
     concatenation_cache: Option<Arc<Mutex<ConcatenationCache>>>,
@@ -326,17 +331,19 @@ impl<N: TensorTypeParam> Rope<N> {
             }
         }
 
-        let cosine_matrix = KeyedTensor::new(
-            format!("{}_cosine", base_id),
+        let cosine_matrix = TensorHandle::from_tensor(
+            StorageKey::from(format!("{}_cosine", base_id)),
+            GenStore::new_empty(),
             Tensor::new(matrix_shape.clone(), cosine_data)?,
         );
-        let sine_matrix = KeyedTensor::new(
-            format!("{}_sine", base_id),
+        let sine_matrix = TensorHandle::from_tensor(
+            StorageKey::from(format!("{}_sine", base_id)),
+            GenStore::new_empty(),
             Tensor::new(matrix_shape.clone(), sine_data)?,
         );
         Ok(Self {
-            cosine_matrix,
-            sine_matrix,
+            cosine_matrix: cosine_matrix.wrapped_tensor_variant()?,
+            sine_matrix: sine_matrix.wrapped_tensor_variant()?,
             unpadded_shape: matrix_shape,
             layout,
             concatenation_cache: None,
@@ -364,8 +371,8 @@ impl<N: TensorTypeParam> Rope<N> {
     }
 
     pub(crate) fn new(
-        cosine_matrix: KeyedTensor<N>,
-        sine_matrix: KeyedTensor<N>,
+        cosine_matrix: TensorHandle<N>,
+        sine_matrix: TensorHandle<N>,
         layout: RopeLayout,
     ) -> Result<Self> {
         ensure!(
@@ -384,8 +391,8 @@ impl<N: TensorTypeParam> Rope<N> {
             );
         }
         Ok(Self {
-            cosine_matrix,
-            sine_matrix,
+            cosine_matrix: cosine_matrix.wrapped_tensor_variant()?,
+            sine_matrix: sine_matrix.wrapped_tensor_variant()?,
             unpadded_shape: matrix_shape,
             layout,
             concatenation_cache: None,
@@ -483,8 +490,13 @@ impl<N: TensorTypeParam> Rope<N> {
         let input = input.tensor()?;
         let input_shape = input.shape().clone();
         let unpadded_input_shape = input.unpadded_shape().clone();
-        let cosine_matrix_slice = TensorSlice::from(self.cosine_matrix.deref());
-        let sine_matrix_slice = TensorSlice::from(self.sine_matrix.deref());
+
+        let cosine_matrix = Tensor::try_from(&self.cosine_matrix)?;
+        let sine_matrix = Tensor::try_from(&self.sine_matrix)?;
+
+        let cosine_matrix_slice = TensorSlice::from(&cosine_matrix);
+        let sine_matrix_slice = TensorSlice::from(&sine_matrix);
+
         let sub_cos_matrix = cosine_matrix_slice
             .slice_over_first_dim(0, input_shape.dim(-2))
             .to_field();
@@ -595,7 +607,7 @@ impl<N: TensorTypeParam> Rope<N> {
                 sub_cos_claim,
                 output_claim,
                 &cosine_matrix_slice,
-                &self.cosine_matrix,
+                &cosine_matrix,
                 input_shape.dim(-2),
                 prover.transcript,
             )?;
@@ -606,7 +618,7 @@ impl<N: TensorTypeParam> Rope<N> {
             sub_sin_claim,
             output_claim,
             &sine_matrix_slice,
-            &self.sine_matrix,
+            &sine_matrix,
             input_shape.dim(-2),
             prover.transcript,
         )?;
@@ -621,8 +633,8 @@ impl<N: TensorTypeParam> Rope<N> {
         };
 
         let commons_claims = [
-            (self.cosine_matrix.commitment_id(), cosine_claim),
-            (self.sine_matrix.commitment_id(), sine_claim),
+            (self.cosine_matrix.storage_key().into(), cosine_claim),
+            (self.sine_matrix.storage_key().into(), sine_claim),
         ]
         .into_iter()
         .collect();
@@ -638,7 +650,10 @@ impl<N: TensorTypeParam> Rope<N> {
     }
 }
 
-impl<N> Rope<N> {
+impl<N> Rope<N>
+where
+    N: TensorTypeParam,
+{
     pub(super) fn evaluate(
         &self,
         input: &WrappedTensor<N>,
@@ -667,23 +682,24 @@ impl<N> Rope<N> {
         let feature_size = input_shape.dims[input_shape.rank() - 1];
         let current_seq_len = input_shape.dims[input_shape.rank() - 2];
 
-        let const_tens_map = match is_padded {
-            true => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
-                WrappedTensor::try_from(const_tensor)?.reduce_to_unpadded_shape()
-            },
-            false => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
-                WrappedTensor::try_from(const_tensor)
-            },
+        let cosine_matrix = self.cosine_matrix.wrapped_tensor()?;
+        let sine_matrix = self.sine_matrix.wrapped_tensor()?;
+
+        let (cosine_matrix, sine_matrix) = if is_padded {
+            (
+                cosine_matrix.clone().reduce_to_unpadded_shape()?,
+                sine_matrix.clone().reduce_to_unpadded_shape()?,
+            )
+        } else {
+            (cosine_matrix.clone(), sine_matrix.clone())
         };
 
         let past_length = positional_cache.lock().unwrap().seq_len;
-        let cosine_matrix_bt = const_tens_map(&self.cosine_matrix)?;
-        let sine_matrix_bt = const_tens_map(&self.sine_matrix)?;
-        let cosine_slice_bt = cosine_matrix_bt.slice([
+        let cosine_slice_bt = cosine_matrix.slice([
             past_length..(past_length + current_seq_len),
             0..feature_size,
         ]);
-        let sine_slice_bt = sine_matrix_bt.slice([
+        let sine_slice_bt = sine_matrix.slice([
             past_length..(past_length + current_seq_len),
             0..feature_size,
         ]);
@@ -757,23 +773,30 @@ impl Rope<f32> {
         node_id: NodeId,
         input_scaling: ScalingFactor,
     ) -> anyhow::Result<QuantizeOutput<Rope<Element>>> {
+        let cosine_matrix = self.cosine_matrix.wrapped_tensor()?;
+        let sine_matrix = self.sine_matrix.wrapped_tensor()?;
+
         // compute scaling factor for cosine and sine matrices
-        let max_cos = self.cosine_matrix.max_value();
-        let max_sin = self.sine_matrix.max_value();
+        let max_cos = cosine_matrix.clone().max().get_data()[0];
+        let max_sin = sine_matrix.clone().max().get_data()[0];
+
         // check that the maximum values are close
         if !is_close_with_tolerance(&[max_cos], &[max_sin], 1e-3, 0.0) {
             warn!(
                 "Maximum values are too distant for cosine/sine matrices in positional rope with id {node_id}"
             );
         }
-        let min_cos = self.cosine_matrix.min_value();
-        let min_sin = self.sine_matrix.min_value();
+
+        let min_cos = cosine_matrix.clone().min().get_data()[0];
+        let min_sin = sine_matrix.clone().min().get_data()[0];
+
         // check that the minimum values are close
         if !is_close_with_tolerance(&[min_cos], &[min_sin], 1e-3, 0.0) {
             warn!(
                 "Minimum values are too distant for cosine/sine matrices in positional rope with id {node_id}"
             );
         }
+
         // compute the scaling factor for both matrices
         let matrix_scale =
             ScalingFactor::from_span(min_cos.min(min_sin), max_cos.max(max_sin), None);
@@ -840,28 +863,34 @@ impl Rope<Element> {
         // of the polynomial being committed is halved
 
         let matrix_to_evals = match self.layout {
-            RopeLayout::Adjacent => |matrix: &Tensor<Element>| {
-                matrix.data().chunks(2).map(|chunk| chunk[0]).collect_vec()
+            RopeLayout::Adjacent => |matrix: &TensorHandle<Element>| {
+                Ok(matrix
+                    .wrapped_tensor()?
+                    .get_data()
+                    .chunks(2)
+                    .map(|chunk| chunk[0])
+                    .collect_vec())
             },
-            RopeLayout::RotateHalf => |matrix: &Tensor<Element>| {
+            RopeLayout::RotateHalf => |matrix: &TensorHandle<Element>| {
                 let rows = matrix.shape().dim(-1);
                 let half_rows = rows / 2;
-                matrix
-                    .data()
+                Ok(matrix
+                    .wrapped_tensor()?
+                    .get_data()
                     .chunks(rows)
                     .flat_map(|chunk| chunk[..half_rows].to_vec())
-                    .collect::<Vec<Element>>()
+                    .collect::<Vec<Element>>())
             },
         };
         aux.model_polys = Some(
             [
                 (
-                    self.cosine_matrix.commitment_id(),
-                    matrix_to_evals(&self.cosine_matrix),
+                    CommitmentId::from(self.cosine_matrix.storage_key()),
+                    matrix_to_evals(&self.cosine_matrix)?,
                 ),
                 (
-                    self.sine_matrix.commitment_id(),
-                    matrix_to_evals(&self.sine_matrix),
+                    CommitmentId::from(self.sine_matrix.storage_key()),
+                    matrix_to_evals(&self.sine_matrix)?,
                 ),
             ]
             .into_iter()
@@ -873,8 +902,8 @@ impl Rope<Element> {
             unpadded_shape: self.unpadded_shape.clone(),
             node_id: id,
             num_vars_positional_matrix: num_vars,
-            cosine_key: self.cosine_matrix.commitment_id(),
-            sine_key: self.sine_matrix.commitment_id(),
+            cosine_key: CommitmentId::from(self.cosine_matrix.storage_key()),
+            sine_key: CommitmentId::from(self.sine_matrix.storage_key()),
             layout: self.layout,
         };
 
@@ -1089,24 +1118,13 @@ mod tests {
             let num_angles = rng.gen_range(16..768);
             let angles = random_angles(num_angles);
             let max_context_length = rng.gen_range(2..1024);
-            println!("Testing for {num_angles} angles and context length {max_context_length}");
-            let rope = Rope::<f32>::build_from_angles(
+            let _rope = Rope::<f32>::build_from_angles(
                 angles,
                 "rope_angles".to_string().into(),
                 max_context_length,
                 RopeLayout::Adjacent,
             )
             .unwrap();
-            println!(
-                "Max cos: {}, Max sin: {}",
-                rope.cosine_matrix.max_value(),
-                rope.sine_matrix.max_value(),
-            );
-            println!(
-                "Min cos: {}, Min sin: {}",
-                rope.cosine_matrix.min_value(),
-                rope.sine_matrix.min_value(),
-            );
         }
     }
 
@@ -1295,7 +1313,6 @@ mod tests {
             let out = layer
                 .evaluate(&input.as_wrapped(), &cache)
                 .expect("rope evaluate").outputs.into_iter().next().unwrap();
-
 
             let mut expected = Vec::with_capacity(seq_len * embedding_size);
             let in_data = input.data();

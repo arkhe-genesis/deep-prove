@@ -6,17 +6,20 @@ use tenstore::StorageKey;
 
 use super::*;
 
-impl<N: TensorTypeParam> EinSum<N> {
+impl<T> EinSum<T>
+where
+    T: TensorTypeParam,
+{
     /// Constructs a dense (fully-connected) layer with the given weight matrix and optional bias.
-    pub fn new_dense(matrix: KeyedTensor<N>, bias: Option<KeyedTensor<N>>) -> Result<EinSum<N>> {
+    pub fn new_dense(matrix: TensorHandle<T>, bias: Option<TensorHandle<T>>) -> Result<EinSum<T>> {
         let input_eq = "A(j)@W(ij)".to_string();
         let mut output_equation = "O(i)".to_string();
         if let Some(ref bbias) = bias {
-            ensure!(matrix.nrows_2d()? == bbias.shape()[0]);
+            ensure!(matrix.shape().nrows_2d() == bbias.shape()[0]);
             output_equation = "O(i)+BIAS(i)".to_string();
         }
 
-        EinSum::<N>::new(
+        EinSum::<T>::new(
             format!("{input_eq}->{output_equation}"),
             vec![Some(matrix)],
             vec![bias],
@@ -26,11 +29,11 @@ impl<N: TensorTypeParam> EinSum<N> {
     /// Constructs a matrix multiplication layer with the given left and right matrices, optional bias,
     /// and an option to specify whether the right matrix would require transposition.
     pub fn new_matmul(
-        left_matrix: Option<KeyedTensor<N>>,
-        right_matrix: Option<KeyedTensor<N>>,
+        left_matrix: Option<TensorHandle<T>>,
+        right_matrix: Option<TensorHandle<T>>,
         transpose_right: bool,
-        bias: Option<KeyedTensor<N>>,
-    ) -> Result<EinSum<N>> {
+        bias: Option<TensorHandle<T>>,
+    ) -> Result<EinSum<T>> {
         let output_equation = if bias.is_some() {
             "O(ij)+BIAS(j)".to_string()
         } else {
@@ -43,7 +46,7 @@ impl<N: TensorTypeParam> EinSum<N> {
                 } else {
                     "A(ik)@B(kj)".to_string()
                 };
-                EinSum::<N>::new(
+                EinSum::<T>::new(
                     format!("{input_equation}->{output_equation}"),
                     vec![None],
                     vec![bias],
@@ -55,7 +58,7 @@ impl<N: TensorTypeParam> EinSum<N> {
                 } else {
                     "A(ik)@W(kj)".to_string()
                 };
-                EinSum::<N>::new(
+                EinSum::<T>::new(
                     format!("{input_equation}->{output_equation}"),
                     vec![Some(weight)],
                     vec![bias],
@@ -70,7 +73,7 @@ impl<N: TensorTypeParam> EinSum<N> {
                 } else {
                     "B(kj)@W(ik)".to_string()
                 };
-                EinSum::<N>::new(
+                EinSum::<T>::new(
                     format!("{input_equation}->{output_equation}"),
                     vec![Some(weight)],
                     vec![bias],
@@ -83,18 +86,23 @@ impl<N: TensorTypeParam> EinSum<N> {
     }
 
     #[cfg(test)]
-    pub fn random_dense(shape: Shape, layer_name: Option<StorageKey<N>>) -> Self {
+    pub fn random_dense(shape: Shape, layer_name: Option<StorageKey<T>>) -> Self {
+        use crate::Tensor;
+        use tenstore::GenStore;
+
         assert_eq!(shape.len(), 2);
         let (nrows, ncols) = (shape[0], shape[1]);
         let layer_name = layer_name.unwrap_or("dense".to_string().into());
-        let matrix = KeyedTensor::new(
-            format!("{layer_name}_weight"),
-            Tensor::<N>::random(&vec![nrows, ncols].into()),
+        let matrix = TensorHandle::from_tensor(
+            StorageKey::from(format!("{layer_name}_weight")),
+            GenStore::new_empty(),
+            Tensor::<T>::random(&vec![nrows, ncols].into()),
         );
 
-        let bias = KeyedTensor::new(
-            format!("{layer_name}_bias"),
-            Tensor::<N>::random(&vec![nrows].into()),
+        let bias = TensorHandle::from_tensor(
+            StorageKey::from(format!("{layer_name}_bias")),
+            GenStore::new_empty(),
+            Tensor::<T>::random(&vec![nrows].into()),
         );
         Self::new_dense(matrix, Some(bias)).unwrap()
     }

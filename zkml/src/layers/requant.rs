@@ -1096,13 +1096,13 @@ impl<E: ExtensionField> RequantCtx<E> {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use tenstore::GenStore;
+    use tenstore::{GenStore, StorageKey};
 
     use crate::{
         init_test_logging_default,
         layers::{Layer, einsum::EinSum},
         model::{Model, test::prove_model},
-        tensor::KeyedTensor,
+        tensor::TensorHandle,
     };
 
     use super::*;
@@ -1118,12 +1118,14 @@ mod tests {
         let mut model =
             Model::new_from_input_shapes(vec![first_input_shape.into()], PaddingMode::NoPadding);
 
-        let mat = KeyedTensor::new(
-            "requant_matmul_weight",
+        let mat = TensorHandle::from_tensor(
+            StorageKey::from("requant_matmul_weight"),
+            GenStore::new_empty(),
             Tensor::<f32>::random(&matrix_shape),
         );
-        let bias = KeyedTensor::new(
-            "requant_matmul_bias",
+        let bias = TensorHandle::from_tensor(
+            StorageKey::from("requant_matmul_bias"),
+            GenStore::new_empty(),
             Tensor::<f32>::random(&vec![d].into()),
         );
         let einsum = EinSum::new_matmul(None, Some(mat), false, Some(bias)).unwrap();

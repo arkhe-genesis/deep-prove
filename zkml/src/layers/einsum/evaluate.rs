@@ -32,7 +32,7 @@ where
         // Prepare the input tensors, applying permutations and reshaping as needed
         let mut unpadded_inputs_iter = inputs
             .iter()
-            .map(|&input_tens| input_tens.clone().reduce_to_unpadded_shape())
+            .map(|&wrapped| wrapped.clone().reduce_to_unpadded_shape())
             .collect::<Result<Vec<WrappedTensor<N>>>>()?
             .into_iter();
 
@@ -41,17 +41,17 @@ where
             .next()
             .ok_or(anyhow!("No input tensors provided"))?;
 
-        let mut unpadded_inputs: Vec<WrappedTensor<N>> = Vec::with_capacity(inputs.len());
-        let mut unpadded_shapes: Vec<Shape> = Vec::with_capacity(inputs.len());
+        let mut unpadded_inputs = Vec::with_capacity(inputs.len());
+        let mut unpadded_shapes = Vec::with_capacity(inputs.len());
         unpadded_shapes.push(Shape::from(lhs_input.shape()));
         unpadded_inputs.push(lhs_input);
-        for constant in self.constant_tensors.iter() {
+        for constant in &self.constant_tensors {
             let next = if let Some(const_tensor) = constant {
-                let tensor = WrappedTensor::try_from(const_tensor)?;
+                let tensor = const_tensor.wrapped_tensor()?;
                 if self.padded {
-                    tensor.reduce_to_unpadded_shape()?
+                    tensor.clone().reduce_to_unpadded_shape()?
                 } else {
-                    tensor
+                    tensor.clone()
                 }
             } else {
                 unpadded_inputs_iter
@@ -150,15 +150,6 @@ where
         // and then permute if required
         let intermediate_shapes = self.mapping.intermediate_shapes(shapes)?;
 
-        let const_tens_map = match self.padded {
-            true => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
-                WrappedTensor::try_from(const_tensor)?.reduce_to_unpadded_shape()
-            },
-            false => |const_tensor: &KeyedTensor<N>| -> Result<WrappedTensor<N>> {
-                WrappedTensor::try_from(const_tensor)
-            },
-        };
-
         izip!(
             intermediate_results,
             intermediate_shapes,
@@ -186,8 +177,15 @@ where
                 };
                 // Add the bias if provided
                 let with_bias = if let Some(bias_tensor) = bias {
-                    let wrapped_bias = const_tens_map(bias_tensor)?;
-                    permuted.add(wrapped_bias)?
+                    let unpadded_bias = if self.padded {
+                        bias_tensor
+                            .wrapped_tensor()?
+                            .clone()
+                            .reduce_to_unpadded_shape()?
+                    } else {
+                        bias_tensor.wrapped_tensor()?.clone()
+                    };
+                    permuted.add(unpadded_bias)?
                 } else {
                     permuted
                 };
@@ -515,9 +513,10 @@ impl Permutation {
 #[cfg(test)]
 mod tests {
     use ark_std::rand::Rng;
+    use tenstore::{GenStore, StorageKey};
 
     use super::*;
-    use crate::{Element, rng_from_env_or_random, tensor::IntoBTensor};
+    use crate::{Element, Tensor, rng_from_env_or_random, tensor::IntoBTensor};
     use burn::tensor::Tensor as BurnTensor;
 
     const TEST_CASES: usize = 5;
@@ -591,7 +590,11 @@ mod tests {
             let c_shape = Shape::new(vec![dim1, dim3]);
             let bias_shape = Shape::new(vec![dim3]);
             let bias = Tensor::<N>::random(&bias_shape);
-            let keyed_bias = KeyedTensor::new("BIAS", bias.clone());
+            let keyed_bias = TensorHandle::from_tensor(
+                StorageKey::from("BIAS"),
+                GenStore::new_empty(),
+                bias.clone(),
+            );
             let einsum: EinSum<N> = EinSum::new(
                 "A(ab)@B(bc)->C(ac)+BIAS(c)".to_string(),
                 vec![None],
@@ -799,9 +802,21 @@ mod tests {
             let wk = Tensor::<N>::random(&wk_shape);
             let wv = Tensor::<N>::random(&wv_shape);
 
-            let keyed_wq = KeyedTensor::new("WQ", wq.clone());
-            let keyed_wk = KeyedTensor::new("WK", wk.clone());
-            let keyed_wv = KeyedTensor::new("WV", wv.clone());
+            let keyed_wq = TensorHandle::from_tensor(
+                StorageKey::from("WQ"),
+                GenStore::new_empty(),
+                wq.clone(),
+            );
+            let keyed_wk = TensorHandle::from_tensor(
+                StorageKey::from("WK"),
+                GenStore::new_empty(),
+                wk.clone(),
+            );
+            let keyed_wv = TensorHandle::from_tensor(
+                StorageKey::from("WV"),
+                GenStore::new_empty(),
+                wv.clone(),
+            );
 
             let einsum: EinSum<N> = EinSum::new(
                 "X(se)@WQ(ehd):WK(ed):WV(ed)->Q(hsd):K(sd):V(sd)".to_string(),
@@ -887,9 +902,21 @@ mod tests {
             let wk = Tensor::<N>::random(&wk_shape);
             let wv = Tensor::<N>::random(&wv_shape);
 
-            let keyed_wq = KeyedTensor::new("WQ".to_string(), wq.clone());
-            let keyed_wk = KeyedTensor::new("WK".to_string(), wk.clone());
-            let keyed_wv = KeyedTensor::new("WV".to_string(), wv.clone());
+            let keyed_wq = TensorHandle::from_tensor(
+                StorageKey::from("WQ"),
+                GenStore::new_empty(),
+                wq.clone(),
+            );
+            let keyed_wk = TensorHandle::from_tensor(
+                StorageKey::from("WK"),
+                GenStore::new_empty(),
+                wk.clone(),
+            );
+            let keyed_wv = TensorHandle::from_tensor(
+                StorageKey::from("WV"),
+                GenStore::new_empty(),
+                wv.clone(),
+            );
 
             let mut einsum: EinSum<N> = EinSum::new(
                 "X(se)@WQ(ehgd):WK(ehd):WV(ehd)->Q(ghsd):K(hsd):V(hsd)".to_string(),

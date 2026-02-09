@@ -773,41 +773,20 @@ mod test {
         const MAX_CONTEXT: usize = 10;
         init_test_logging("debug");
 
-        // Load the model file
-        // let model_path = std::path::PathBuf::from("assets/scripts/llms/toy_gpt2.gguf");
-        // Load the model file
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let cache_filename = {
-            let mut hasher = blake3::Hasher::new();
-            hasher
-                .update_mmap(&model_path)
-                .context("hashing model file")?;
-            let hash = hasher.finalize();
-            format!("cache-{GPT2_Q8_0}-{hash}.bin")
-        };
+        let (driver, _metadata) = Driver::load_from_model(
+            GPT2::new(),
+            &RawGGUF::new(model_path.clone()),
+            Some(MAX_CONTEXT),
+        )?
+        .into_provable_llm(None)?;
 
-        // Generate or load the prover & verifier contexts
-        #[allow(clippy::type_complexity)]
-        let (driver, prover_ctx, verifier_ctx): (
-            _,
-            ProverContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
-            LLMVerifierContext<GoldilocksExt2, Pcs<GoldilocksExt2>>,
-        ) = file_cache::deserialize_or_create_with(&cache_filename, || {
-            let (driver, _metadata) = Driver::load_from_model(
-                GPT2::new(),
-                &RawGGUF::new(model_path.clone()),
-                Some(MAX_CONTEXT),
-            )?
-            .into_provable_llm(None)?;
+        let (prover_ctx, verifier_ctx) = driver
+            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+            .with_max_context(MAX_CONTEXT);
 
-            let (prover_ctx, verifier_ctx) = driver
-                .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
-                .with_max_context(MAX_CONTEXT);
-
-            Ok((driver, prover_ctx, verifier_ctx))
-        })?;
         driver.model.describe();
-        // Generate the trace
+
         let mut store = GenStore::default();
         let sentence = "The sky is";
         let tokenizer = GPT2::new().load_tokenizer(&RawGGUF::new(model_path))?;
