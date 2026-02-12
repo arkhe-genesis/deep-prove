@@ -6,31 +6,23 @@ pub use burn_wrapper::{
 
 use crate::{
     NextPowerOfTwo, ScalingFactor,
-    backend::Backend,
     layers::convolution,
     number::Number,
     quantization::{Dequantize, Quantize},
     shape::Shape,
 };
 use anyhow::{Result, bail, ensure};
-use burn::tensor::{Int, Tensor as BTensor};
 use ceno_p3::field::Field;
 use ff_ext::{ExtensionField, GoldilocksExt2};
-use itertools::Itertools;
 use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
-use rayon::{
-    iter::{
-        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-        IntoParallelRefMutIterator, ParallelIterator,
-    },
-    prelude::ParallelSlice,
-    slice::ParallelSliceMut,
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cmp::{Ordering, PartialEq, min},
+    cmp::{PartialEq, min},
     fmt::{self, Debug},
-    ops::Range,
 };
 
 pub use commitment_id::CommitmentId;
@@ -38,9 +30,7 @@ pub use handle::TensorHandle;
 pub use keyed::KeyedTensor;
 pub use slice::TensorSlice;
 
-use crate::{
-    Element, layers::pooling::MAXPOOL2D_KERNEL_SIZE, quantization::ToField, to_bit_sequence_le,
-};
+use crate::{Element, layers::pooling::MAXPOOL2D_KERNEL_SIZE, quantization::ToField};
 
 mod burn_wrapper;
 mod commitment_id;
@@ -116,45 +106,6 @@ macro_rules! auto_vec_binop {
     }}
 }
 
-/// Macro to apply an operation to each element of an array.
-///
-/// The expanded code is intended to be easily vectorisable, by using the
-/// `as_chunks` api.
-macro_rules! auto_vec_op {
-    ($data: expr, $op: expr) => {{
-        let mut result = Vec::with_capacity($data.len());
-        let spare_result = result.spare_capacity_mut();
-        assert!(
-            spare_result.len() >= $data.len(),
-            "Preallocated vector must have enough capacity"
-        );
-
-        let (left_chunks, left_remainder) = $data.as_chunks::<AUTO_VECTORISATION_CHUNK>();
-        let (result_chunks, result_remainder) =
-            spare_result.as_chunks_mut::<AUTO_VECTORISATION_CHUNK>();
-
-        (left_chunks, result_chunks)
-            .into_par_iter()
-            .for_each(|(left, result)| {
-                for i in 0..AUTO_VECTORISATION_CHUNK {
-                    result[i].write($op(left[i]));
-                }
-            });
-
-        // Handle remainder data
-        for pos in 0..left_remainder.len() {
-            result_remainder[pos].write($op(left_remainder[pos]));
-        }
-
-        // Safety: the memory was initialised above
-        unsafe {
-            result.set_len($data.len());
-        }
-
-        result
-    }};
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, derive_more::Index, derive_more::IndexMut)]
 pub struct Tensor<T> {
     // Indexing the `Tensor` indexes the underlying storage.
@@ -171,8 +122,50 @@ impl<T> Tensor<T> {
         Self::new_with_unpadded_shape(shape.clone(), shape, data)
     }
 
+    /// Return an immutable reference to this tensor data.
+    pub fn data(&self) -> &Vec<T> {
+        &self.data
+    }
+
+    /// Returns a reference to the tensor's [Shape].
+    pub fn shape(&self) -> &Shape {
+        assert!(!self.shape.is_empty(), "Empty tensor");
+        &self.shape
+    }
+}
+
+impl<T> Tensor<T>
+where
+    T: Number,
+{
+    pub fn random(shape: &Shape) -> Self {
+        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
+    }
+}
+
+impl<T> Tensor<T>
+where
+    T: std::ops::Add<Output = T> + Copy + Send + Sync,
+{
+    /// Element-wise addition
+    pub fn add(&self, other: &Tensor<T>) -> Tensor<T> {
+        auto_vec_binop!(self, other, +)
+    }
+}
+
+impl<T> Tensor<T>
+where
+    T: std::ops::Mul<Output = T> + Copy + Send + Sync,
+{
+    /// Element-wise multiplication
+    pub fn mul(&self, other: &Tensor<T>) -> Tensor<T> {
+        auto_vec_binop!(self, other, *)
+    }
+}
+
+impl<T> Tensor<T> {
     /// Create a new tensor with given shape, unpadded shape and data
-    pub fn new_with_unpadded_shape(
+    pub(crate) fn new_with_unpadded_shape(
         shape: Shape,
         unpadded_shape: Shape,
         data: Vec<T>,
@@ -193,7 +186,7 @@ impl<T> Tensor<T> {
 
     /// Create a new tensor with the given shapes & data, not ensuring that they
     /// actually match.
-    pub fn new_unchecked(shape: Shape, data: Vec<T>) -> Self {
+    pub(crate) fn new_unchecked(shape: Shape, data: Vec<T>) -> Self {
         Self {
             data,
             shape: shape.clone(),
@@ -201,51 +194,22 @@ impl<T> Tensor<T> {
         }
     }
 
-    /// Return an immutable reference to this tensor data.
-    pub fn data(&self) -> &Vec<T> {
-        &self.data
-    }
-
     /// Consume this tensore, returning its backing.
-    pub fn into_data(self) -> Vec<T> {
+    pub(crate) fn into_data(self) -> Vec<T> {
         self.data
     }
 
     /// Mutable Iterator over the data in the tensor
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.data.iter_mut()
     }
 
     /// Returns an iterator that yields slices of the last dimension.
     ///
     /// For a tensor of shape `[2, 3, 3]`, it will yield 6 slices `2 * 3` of 3 elements each.
-    pub fn slice_last_dim(&self) -> impl Iterator<Item = &[T]> {
+    pub(crate) fn slice_last_dim(&self) -> impl Iterator<Item = &[T]> {
         let (it, _) = self.slice_on_dim(self.shape.len() - 2);
         it
-    }
-
-    /// Consumes this tensor and returns a new one with the given dimensions flattened.
-    ///
-    /// # Panics
-    ///
-    /// If the given dimensions are out-of-bounds.
-    pub fn flatten(mut self, dims: Range<usize>) -> Self {
-        self.shape = self.shape.flatten(dims);
-        self
-    }
-
-    /// Returns a zero-copy logical flatten of all leading dimensions into rows while preserving the last dimension.
-    /// For shape [d0,d1,...,dk-1, last] this yields (data slice, rows = d0*..*dk-1, last_dim = last).
-    pub fn flatten_leading_dims_view(&self) -> (&[T], usize, usize) {
-        let rank = self.shape.len();
-        assert!(rank >= 2, "Need rank >=2 to flatten leading dims view");
-        let last_dim = self.shape.dim(rank - 1);
-        let rows: usize = if rank == 2 {
-            self.shape.dim(0)
-        } else {
-            (0..rank - 1).map(|d| self.shape.dim(d)).product()
-        };
-        (&self.data, rows, last_dim)
     }
 
     /// Returns an iterator of slices whose length corresponds to the subspace
@@ -256,7 +220,7 @@ impl<T> Tensor<T> {
     /// If dim is the last dimension, it will simply yield a slice of the whole tensor.
     /// The shape returned is the shape of each slice. The shape is the same as the shape of the tensor
     /// if the dim is the last dimension or more
-    pub fn slice_on_dim(&self, dim: usize) -> (impl Iterator<Item = &[T]>, Shape) {
+    pub(crate) fn slice_on_dim(&self, dim: usize) -> (impl Iterator<Item = &[T]>, Shape) {
         assert!(
             dim < self.shape.len(),
             "can't slice on dim {:?} if shape is {:?}",
@@ -272,90 +236,23 @@ impl<T> Tensor<T> {
         (self.data.chunks(stride), shape)
     }
 
-    // Concatenate the other tensor to the first one.
-    // RESTRICTIOn: self shape is [a1,a2...,an] we
-    // expect other shape to be [a2...,an] OR [1, a2...,an]
-    // The new shape of self will be [a1+1,...an]
-    // In other words, we only concatenate another vector if it's exactly size of the highest dimension
-    // If it's 2d, then we expect other to be a vector
-    pub fn concat(&mut self, other: Self) -> Result<()> {
-        // make sure that the all dimension but the highest one are the same
-        let common_shape = self.shape.len().min(other.shape.len());
-        let added_higher = if common_shape < self.shape.len() {
-            ensure!(
-                self.shape
-                    .iter()
-                    .rev()
-                    .zip(other.shape.iter().rev())
-                    .take(common_shape)
-                    .all(|(a, b)| a == b)
-            );
-            ensure!(common_shape + 1 == self.shape.len());
-            1
-        } else {
-            ensure!(common_shape == self.shape.len());
-            *other.shape.first().unwrap()
-        };
-        // then the new shape has this higher dimension + 1 simply
-        // common_shape since 0-based indexing
-        *self.shape.get_mut(0).unwrap() += added_higher;
-        self.data.extend(other.data);
-
-        Ok(())
-    }
-
-    /// Adds a new dimension to the tensor with size 1.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is larger than the shape size.
-    pub fn unsqueeze(self, index: usize) -> Self {
-        let new_shape = self.shape.insert(index, 1);
-        Self {
-            data: self.data,
-            shape: new_shape,
-            unpadded_shape: self.unpadded_shape,
-        }
-    }
-
-    /// Removes a dimension from the tensor.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is larger than the shape size, or if the
-    /// removed dimension size is not 1.
-    pub fn squeeze(mut self, index: usize) -> Result<Self> {
-        ensure!(
-            self.shape[index] == 1,
-            "The dimension to be squeezed must have a value of 1"
-        );
-        self.shape.remove(index);
-        Ok(self)
-    }
-
     /// Get the number of rows from the matrix
-    pub fn nrows_2d(&self) -> Result<usize> {
+    pub(crate) fn nrows_2d(&self) -> Result<usize> {
         Ok(self.shape().nrows_2d())
     }
 
     /// Get the number of cols from the matrix
-    pub fn ncols_2d(&self) -> Result<usize> {
+    pub(crate) fn ncols_2d(&self) -> Result<usize> {
         Ok(self.shape().ncols_2d())
     }
 
-    /// Returns a reference to the tensor's [Shape].
-    pub fn shape(&self) -> &Shape {
-        assert!(!self.shape.is_empty(), "Empty tensor");
-        &self.shape
-    }
-
     /// Returns a reference to the tensor's original unpadded [Shape].
-    pub fn unpadded_shape(&self) -> &Shape {
+    pub(crate) fn unpadded_shape(&self) -> &Shape {
         &self.unpadded_shape
     }
 
     /// Returns a mutable reference to the tensor's [Shape].
-    pub fn shape_mut(&mut self) -> &mut Shape {
+    pub(crate) fn shape_mut(&mut self) -> &mut Shape {
         &mut self.shape
     }
 
@@ -364,11 +261,11 @@ impl<T> Tensor<T> {
     /// # Panics
     ///
     /// If the shape rank is lower-or-equal to `dim`.
-    pub fn dim(&self, dim: usize) -> usize {
+    pub(crate) fn dim(&self, dim: usize) -> usize {
         self.shape[dim]
     }
 
-    pub fn truncate_on_first_dim(&mut self, new_size: usize) -> anyhow::Result<()> {
+    pub(crate) fn truncate_on_first_dim(&mut self, new_size: usize) -> anyhow::Result<()> {
         let shape = self.shape();
         let first_dim = shape[0];
         ensure!(
@@ -381,61 +278,6 @@ impl<T> Tensor<T> {
         self.shape[0] = new_size;
         self.unpadded_shape[0] = new_size;
         Ok(())
-    }
-
-    pub fn matrix_from_coeffs(data: Vec<Vec<T>>) -> anyhow::Result<Self> {
-        let n_rows = data.len();
-        let n_cols = data.first().expect("at least one row in a matrix").len();
-        let data = data.into_iter().flatten().collect::<Vec<_>>();
-        if data.len() != n_rows * n_cols {
-            bail!(
-                "Number of rows and columns do not match with the total number of values in the Vec<Vec<>>"
-            );
-        };
-        let shape: Shape = vec![n_rows, n_cols].into();
-
-        Ok(Self {
-            data,
-            shape: shape.clone(),
-            unpadded_shape: shape,
-        })
-    }
-
-    /// Returns the boolean iterator indicating the given row in the right endianness to be
-    /// evaluated by an MLE
-    pub fn row_to_boolean_2d<F: ExtensionField>(
-        &self,
-        row: usize,
-    ) -> Result<impl Iterator<Item = F>> {
-        ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
-        let (nvars_rows, _) = self.shape().num_vars_2d();
-        Ok(to_bit_sequence_le(row, nvars_rows).map(|b| F::from_canonical_u64(b as u64)))
-    }
-
-    /// Returns the boolean iterator indicating the given row in the right endianness to be
-    /// evaluated by an MLE
-    pub fn col_to_boolean_2d<F: ExtensionField>(
-        &self,
-        col: usize,
-    ) -> Result<impl Iterator<Item = F>> {
-        ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
-        let (_, nvars_col) = self.shape().num_vars_2d();
-        Ok(to_bit_sequence_le(col, nvars_col).map(|b| F::from_canonical_u64(b as u64)))
-    }
-
-    /// From a given row and a given column, return the vector of field elements in the right
-    /// format to evaluate the MLE.
-    /// little endian so we need to read cols before rows
-    pub fn position_to_boolean_2d<F: ExtensionField>(
-        &self,
-        row: usize,
-        col: usize,
-    ) -> Result<Vec<F>> {
-        ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
-        Ok(self
-            .col_to_boolean_2d(col)?
-            .chain(self.row_to_boolean_2d(row)?)
-            .collect_vec())
     }
 
     /// Reshape the tensor, ensuring that the new shape is compatible with the
@@ -458,21 +300,10 @@ impl<T> Tensor<T> {
         Ok(())
     }
 
-    /// Force-set the tensor shape, not checking that the new shape is
-    /// compatible with the tensor cardinality.
-    pub fn reshape_unchecked(&mut self, new_shape: Shape) {
-        self.shape = new_shape;
-    }
-
     /// Chainable version of [`reshape`]
-    pub fn reshaped(mut self, new_shape: Shape) -> Result<Tensor<T>> {
+    pub(crate) fn reshaped(mut self, new_shape: Shape) -> Result<Tensor<T>> {
         self.reshape(new_shape)?;
         Ok(self)
-    }
-
-    /// Flattens the tensor into a 1D.
-    pub fn to_1d(&mut self) {
-        self.shape = Shape::new(vec![self.shape.product()]);
     }
 }
 
@@ -483,20 +314,6 @@ impl<T> AsRef<Tensor<T>> for Tensor<T> {
 }
 
 impl Tensor<Element> {
-    /// Returns the maximum size in bits possible if this tensor is treated as a matrix inside
-    /// a matrix vector/matrix multiplication. It requires the optional inputs to specify the range
-    // of the quantized values in `self` and in the other matrix being multiplied with `self`
-    pub fn matmul_output_bitsize(
-        &self,
-        quantized_self_input_range: Option<usize>,
-        quantized_other_input_range: Option<usize>,
-    ) -> Result<usize> {
-        ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
-        Ok(self
-            .shape
-            .matmul_output_bitsize(quantized_self_input_range, quantized_other_input_range))
-    }
-
     /// Converts this [Tensor<Element>] into [MultilinearExtension].
     ///
     /// This will convert the element into an extension field and convert that
@@ -507,7 +324,7 @@ impl Tensor<Element> {
     /// # Panics
     ///
     /// If the input is not a 2D tensor or if either dimension is not a power of two.
-    pub fn to_2d_mle<F: ExtensionField>(&self) -> Result<MultilinearExtension<'static, F>> {
+    pub(crate) fn to_2d_mle<F: ExtensionField>(&self) -> Result<MultilinearExtension<'static, F>> {
         Tensor::<F>::from(self).into_mle_2d()
     }
 
@@ -523,13 +340,8 @@ impl Tensor<Element> {
     /// # Panics
     ///
     /// If the number of elements in the Tensor is not a power of two.
-    pub fn to_field_mle<F: ExtensionField>(&self) -> MultilinearExtension<'static, F> {
+    pub(crate) fn to_field_mle<F: ExtensionField>(&self) -> MultilinearExtension<'static, F> {
         Tensor::<F>::from(self).into_mle()
-    }
-
-    /// Consumes this tensor and creates a [burn::tensor::Tensor].
-    pub fn to_btensor<const D: usize>(&self) -> BTensor<Backend, D, Int> {
-        IntoBTensor::to_btensor(self)
     }
 }
 
@@ -537,7 +349,7 @@ impl Tensor<f32> {
     /// Transforms this tensor by centering its rows around the mean.
     ///
     /// This has the effect of making the mean of a row equal to zero.
-    fn mean_center_rows(&self) -> Self {
+    pub(crate) fn mean_center_rows(&self) -> Self {
         let shape = self.shape();
         let row_size = shape.dim(-1);
 
@@ -560,11 +372,14 @@ impl Tensor<f32> {
     }
 }
 
-impl<F: ExtensionField> Tensor<F> {
+impl<F> Tensor<F>
+where
+    F: ExtensionField,
+{
     /// Clone this [Tensor] and convert into a [MultilinearExtension].
     ///
     /// see [Tensor::into_mle_2d].
-    pub fn to_mle_2d(&self) -> Result<MultilinearExtension<'static, F>> {
+    pub(crate) fn to_mle_2d(&self) -> Result<MultilinearExtension<'static, F>> {
         self.clone().into_mle_2d()
     }
 
@@ -576,7 +391,7 @@ impl<F: ExtensionField> Tensor<F> {
     ///
     /// - If the tensor is not 2D.
     /// - If either dimension is not a power-of-two.
-    pub fn into_mle_2d(self) -> Result<MultilinearExtension<'static, F>> {
+    pub(crate) fn into_mle_2d(self) -> Result<MultilinearExtension<'static, F>> {
         ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
         ensure!(
             self.nrows_2d()?.is_power_of_two(),
@@ -597,11 +412,14 @@ impl<F: ExtensionField> Tensor<F> {
     }
 }
 
-impl<F: Field> Tensor<F> {
+impl<F> Tensor<F>
+where
+    F: Field,
+{
     /// Clone this [Tensor] and convert into a [MultilinearExtension].
     ///
     /// see [Tensor::into_mle].
-    pub fn to_mle<E: ExtensionField>(&self) -> MultilinearExtension<'_, E> {
+    pub(crate) fn to_mle<E: ExtensionField>(&self) -> MultilinearExtension<'_, E> {
         self.data.clone().into_mle()
     }
 
@@ -612,20 +430,26 @@ impl<F: Field> Tensor<F> {
     /// # Panics
     ///
     /// - If the number of elements in the tensor is not a power of two.
-    pub fn into_mle<E: ExtensionField>(self) -> MultilinearExtension<'static, E> {
+    pub(crate) fn into_mle<E: ExtensionField>(self) -> MultilinearExtension<'static, E> {
         self.data.into_mle()
     }
 }
 
-impl<F: ExtensionField> From<&Tensor<Element>> for Tensor<F> {
+impl<F> From<&Tensor<Element>> for Tensor<F>
+where
+    F: ExtensionField,
+{
     fn from(value: &Tensor<Element>) -> Self {
         value.to_field()
     }
 }
 
-impl<T: Clone> Tensor<T> {
+impl<T> Tensor<T>
+where
+    T: Clone,
+{
     /// Create a copy of the data and flatten the tensor's shape.
-    pub fn to_flatten(&self) -> Self {
+    pub(crate) fn to_flatten(&self) -> Self {
         let new_data = self.data.to_vec();
         let new_shape = vec![new_data.len()];
         Self {
@@ -636,97 +460,25 @@ impl<T: Clone> Tensor<T> {
     }
 }
 
-struct ArgMax<T> {
-    /// The biggest value in the tensor.
-    value: T,
-
-    /// The position of the biggest value.
-    position: usize,
-}
-
-impl<T: Number> Tensor<T> {
-    /// Finds the maximum value in the tensor and returns its value and position.
-    fn find_maximum(&self) -> ArgMax<T> {
-        let (position, value) = self.data.par_iter().cloned().enumerate().reduce(
-            || (usize::MAX, T::MIN),
-            |acc, (position, value)| match acc.1.compare(&value) {
-                Ordering::Less => (position, value),
-                _ => acc,
-            },
-        );
-
-        ArgMax { value, position }
-    }
-
+impl<T> Tensor<T>
+where
+    T: Number,
+{
     /// Instantiate a new tensor with `shape` initialised to `default`.
-    pub fn zeros(shape: Shape) -> Self {
+    pub(crate) fn zeros(shape: Shape) -> Self {
         Self::initialised(shape, T::zero())
     }
 
-    /// Creates a new [Tensor] with `shape` initialised to `T::unit`.
-    ///
-    /// ```rust
-    /// # use zkml::{Tensor, Shape, Element};
-    /// let shape = Shape::new(vec![2, 2]);
-    /// let tensor = Tensor::<Element>::one(shape);
-    /// assert_eq!(tensor.data().as_slice(), [1, 1, 1, 1]);
-    /// ```
-    pub fn one(shape: Shape) -> Self {
-        Tensor {
-            data: vec![T::unit(); shape.numel()],
-            shape: shape.clone(),
-            unpadded_shape: shape,
-        }
-    }
-
-    /// Returns the first position of the largest element in the [Tensor].
-    ///
-    /// ```rust
-    /// # use zkml::{Tensor, Shape, Element};
-    /// let tensor = Tensor::<Element>::new(Shape::new(vec![4, 2]), vec![3, 1, 0, 11, 7, 11, 9, 2]).unwrap();
-    /// assert_eq!(tensor.argmax(), 3);
-    /// ```
-    pub fn argmax(&self) -> usize {
-        self.find_maximum().position
-    }
-
-    /// Find the maximum value.
-    ///
-    /// ```rust
-    /// # use zkml::{Tensor, Shape, Element};
-    /// let tensor = Tensor::<Element>::new(Shape::new(vec![4, 2]), vec![3, 1, 0, 11, 7, 11, 9, 2]).unwrap();
-    /// assert_eq!(tensor.max(), 11);
-    /// ```
-    pub fn max(&self) -> T {
-        self.find_maximum().value
-    }
-
     /// Find the maximum absolute value.
-    ///
-    /// ```rust
-    /// # use zkml::{Tensor, Shape, Element};
-    /// let tensor = Tensor::<Element>::new(Shape::new(vec![7]), vec![3, 1, 0, -11, 7, 9,
-    /// 2]).unwrap();
-    /// assert_eq!(tensor.max_abs(), 11);
-    /// ```
-    pub fn max_abs(&self) -> T {
+    pub(crate) fn max_abs(&self) -> T {
         self.data
             .par_iter()
             .cloned()
             .reduce(|| T::zero(), |max, x| max.cmp_max(&x.absolute_value()))
     }
 
-    /// Scalar multiplication with f32.
-    pub fn mul_scalar(&self, scalar: T) -> Tensor<T> {
-        Tensor {
-            data: self.data.par_iter().map(|x| *x * scalar).collect(),
-            shape: self.shape.clone(),
-            unpadded_shape: self.unpadded_shape.clone(),
-        }
-    }
-
     /// Perform matrix-matrix multiplication
-    pub fn matmul(&self, other: &Tensor<T>) -> Result<Tensor<T>> {
+    pub(crate) fn matmul(&self, other: &Tensor<T>) -> Result<Tensor<T>> {
         ensure!(
             self.shape.is_matrix() && other.shape.is_matrix(),
             "Both tensors must be 2D for matrix multiplication."
@@ -758,32 +510,8 @@ impl<T: Number> Tensor<T> {
         Ok(result)
     }
 
-    /// Perform matrix-vector multiplication
-    pub fn matvec(&self, vector: &Tensor<T>) -> Result<Tensor<T>> {
-        ensure!(self.shape.is_matrix(), "First argument must be a matrix.");
-        ensure!(
-            vector.shape.is_vector(),
-            "Second argument must be a vector."
-        );
-
-        let (m, n) = (self.shape[0], self.shape[1]);
-        let vec_len = vector.shape[0];
-
-        ensure!(n == vec_len, "Matrix columns must match vector size.");
-
-        let mut result = Tensor::zeros(vec![m].into());
-
-        result.data.par_iter_mut().enumerate().for_each(|(i, res)| {
-            *res = (0..n)
-                .map(|j| self.data[i * n + j] * vector.data[j])
-                .sum::<T>();
-        });
-
-        Ok(result)
-    }
-
     /// Transpose the matrix (2D tensor)
-    pub fn transpose(&self) -> Result<Tensor<T>> {
+    pub(crate) fn transpose(&self) -> Result<Tensor<T>> {
         ensure!(self.shape.is_matrix(), "Tensor is not a matrix.");
         let (m, n) = (self.shape[0], self.shape[1]);
 
@@ -800,35 +528,8 @@ impl<T: Number> Tensor<T> {
 
         Ok(result)
     }
-    /// Concatenate a matrix (2D tensor) with a vector (1D tensor) as columns
-    pub fn concat_matvec_col(&self, vector: &Tensor<T>) -> Result<Tensor<T>> {
-        ensure!(self.shape.is_matrix(), "First tensor is not a matrix.");
-        ensure!(vector.shape.is_vector(), "Second tensor is not a vector.");
 
-        let (rows, cols) = (self.shape[0], self.shape[1]);
-        let vector_len = vector.shape[0];
-
-        ensure!(
-            rows == vector_len,
-            "Matrix row count must match vector length."
-        );
-
-        let new_cols = cols + 1;
-        let mut result = Tensor::zeros(vec![rows, new_cols].into());
-
-        result
-            .data
-            .par_chunks_mut(new_cols)
-            .enumerate()
-            .for_each(|(i, row)| {
-                row[..cols].copy_from_slice(&self.data[i * cols..(i + 1) * cols]); // Copy matrix row
-                row[cols] = vector.data[i]; // Append vector element as the last column
-            });
-
-        Ok(result)
-    }
-
-    pub fn maxpool2d(&self, kernel_size: usize, stride: usize) -> Result<Tensor<T>> {
+    pub(crate) fn maxpool2d(&self, kernel_size: usize, stride: usize) -> Result<Tensor<T>> {
         ensure!(
             kernel_size == MAXPOOL2D_KERNEL_SIZE,
             "Maxpool2D works only for kernel size {MAXPOOL2D_KERNEL_SIZE}"
@@ -887,57 +588,8 @@ impl<T: Number> Tensor<T> {
         })
     }
 
-    // Replaces every value of a tensor with the maxpool of its kernel
-    pub fn padded_maxpool2d(&self) -> Result<(Tensor<T>, Tensor<T>)> {
-        let kernel_size = MAXPOOL2D_KERNEL_SIZE;
-        let stride = MAXPOOL2D_KERNEL_SIZE;
-
-        let maxpool_result = self.maxpool2d(kernel_size, stride)?;
-
-        let dims: usize = self.shape().rank();
-        ensure!(dims >= 2, "Input tensor must have at least 2 dimensions.");
-
-        let (h, w) = (self.shape[dims - 2], self.shape[dims - 1]);
-
-        ensure!(
-            h % MAXPOOL2D_KERNEL_SIZE == 0,
-            "Currently works only with kernel size {MAXPOOL2D_KERNEL_SIZE}"
-        );
-        ensure!(
-            w % MAXPOOL2D_KERNEL_SIZE == 0,
-            "Currently works only with stride size {MAXPOOL2D_KERNEL_SIZE}"
-        );
-
-        let outer_dims: usize = self.shape[..dims - 2].iter().product();
-        let maxpool_h = (h - kernel_size) / stride + 1;
-        let maxpool_w = (w - kernel_size) / stride + 1;
-
-        let padded_maxpool_data: Vec<T> = (0..outer_dims * h * w)
-            .into_par_iter()
-            .map(|out_idx| {
-                let n = out_idx / (h * w);
-                let i_full = (out_idx / w) % h;
-                let j_full = out_idx % w;
-
-                let i = i_full / stride;
-                let j = j_full / stride;
-
-                let maxpool_idx = n * maxpool_h * maxpool_w + i * maxpool_w + j;
-                maxpool_result.data[maxpool_idx]
-            })
-            .collect();
-
-        let padded_maxpool_tensor = Tensor {
-            data: padded_maxpool_data,
-            shape: self.shape().clone(),
-            unpadded_shape: self.unpadded_shape.clone(),
-        };
-
-        Ok((self.maxpool2d(kernel_size, stride)?, padded_maxpool_tensor))
-    }
-
-    // Applies a 2-dimensional convolution.
-    pub fn conv2d(
+    /// Applies a 2-dimensional convolution.
+    pub(crate) fn conv2d(
         &self,
         kernels: &Tensor<T>,
         bias: &Tensor<T>,
@@ -946,142 +598,10 @@ impl<T: Number> Tensor<T> {
         convolution::conv2d(self, kernels, bias, stride)
     }
 
-    /// Converts this [Tensor] to f32.
-    pub fn to_f32(&self) -> anyhow::Result<Tensor<f32>> {
-        Ok(Tensor {
-            data: self
-                .data
-                .iter()
-                .map(Number::to_f32)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            shape: self.shape.clone(),
-            unpadded_shape: self.unpadded_shape.clone(),
-        })
-    }
-
-    /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
-    /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular matrix must be square)
-    /// - `num_matrices` specifies how many matrices to make
-    /// - `diag` specifies the "offset" for the diagonal, an offset of `1` means we keep two `1`s on the first row instead of 1, and offset of `-1` means all `zeroes`
-    pub fn tril(matrix_dim: usize, num_matrices: usize, diag: i32) -> Result<Tensor<T>> {
-        Self::tri(matrix_dim, num_matrices, diag, T::unit(), T::default())
-    }
-
-    /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
-    /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular matrix must be square)
-    /// - `num_matrices` specifies how many matrices to make
-    /// - `diag` specifies the "offset" for the diagonal, an offset of `1` means we keep two `lower_val`s on the first row instead of 1, and offset of `-1` means all `upper_val`
-    /// - `lower_val` specifies the value to fill the lower triangular part with
-    /// - `upper_val` specifies the value to fill the upper triangular part with
-    pub fn tri(
-        matrix_dim: usize,
-        num_matrices: usize,
-        diag: i32,
-        lower_val: T,
-        upper_val: T,
-    ) -> Result<Tensor<T>> {
-        // We make one matrix and then just clone it
-        let data = (0i32..matrix_dim as i32)
-            .flat_map(|i| {
-                if (i + diag).is_negative() {
-                    vec![upper_val; matrix_dim]
-                } else {
-                    std::iter::repeat_n(lower_val, (i + diag + 1) as usize)
-                        .chain(std::iter::repeat(upper_val))
-                        .take(matrix_dim)
-                        .collect::<Vec<T>>()
-                }
-            })
-            .cycle()
-            .take(num_matrices * matrix_dim * matrix_dim)
-            .collect::<Vec<T>>();
-
-        Tensor::<T>::new(vec![num_matrices, matrix_dim, matrix_dim].into(), data)
-    }
-
-    /// Find the minimum value.
-    pub fn min(&self) -> T {
-        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
-    }
-
-    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
-        Ok(Self {
-            data: self
-                .data
-                .iter()
-                .map(f)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            shape: self.shape.clone(),
-            unpadded_shape: self.unpadded_shape.clone(),
-        })
-    }
-
-    // slice on the third dimension.
-    // start inclusive, end exclusive
-    pub fn slice_3d(&self, start: usize, end: usize) -> Result<Self> {
-        ensure!(self.shape.len() == 3);
-        ensure!(start < self.shape[0]);
-        ensure!(end <= self.shape[0]);
-        let blocks = self.shape[1] * self.shape[2];
-        let sliced = self.data[blocks * start..blocks * end].to_vec();
-        let shape: Shape = vec![end - start, self.shape[1], self.shape[2]].into();
-
-        Ok(Self {
-            data: sliced,
-            shape: shape.clone(),
-            unpadded_shape: shape,
-        })
-    }
-
-    /// Slice the tensor on the first dimension.
-    ///
-    /// # Arguments
-    ///
-    /// - start: New start for the first dimension, inclusive.
-    /// - end: New end for the first dimension, exclusive.
-    pub fn slice_2d(&self, start: usize, end: usize) -> Result<Self> {
-        ensure!(self.shape.len() == 2);
-        ensure!(start < end);
-        ensure!(end <= self.shape[0] + 1);
-
-        let range_start = start * self.shape[1];
-        let range_end = end * self.shape[1];
-        let data = self.data[range_start..range_end].to_vec();
-
-        let new_shape = Shape::new(vec![end - start, self.shape[1]]);
-        debug_assert!(
-            new_shape.numel() == data.len(),
-            "{new_shape:?} data.len(): {} start: {start} end: {end}",
-            data.len(),
-        );
-
-        Ok(Self {
-            data,
-            shape: new_shape.clone(),
-            unpadded_shape: new_shape,
-        })
-    }
-
-    #[cfg(test)]
-    pub fn any(shape: Shape) -> impl proptest::prelude::Strategy<Value = Self> {
-        use proptest::prelude::*;
-        let size = shape.product();
-        let data = proptest::collection::vec(T::any(), size);
-        data.prop_map(move |data| Self {
-            data,
-            shape: shape.clone(),
-            unpadded_shape: shape.clone(),
-        })
-    }
-
-    pub fn random(shape: &Shape) -> Self {
-        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
-    }
-
     /// Creates a random matrix with a given number of rows and cols.
     /// NOTE: doesn't take a rng as argument because to generate it in parallel it needs be sync +
     /// sync which is not true for basic rng core.
-    pub fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
+    pub(crate) fn random_seed(shape: &Shape, seed: Option<u64>) -> Self {
         let seed = seed.unwrap_or_else(crate::seed_from_env_or_rng); // Use provided seed or default
         let mut rng = <crate::StdRng as ark_std::rand::SeedableRng>::seed_from_u64(seed);
         let size = shape.product();
@@ -1095,62 +615,12 @@ impl<T: Number> Tensor<T> {
     }
 }
 
-impl<T: TensorTypeParam> Tensor<T> {
-    /// Pads a matrix so it can be used with the output of a FFT-based
-    /// convolution.
-    ///
-    /// The FFT-based convolution has all dimensions of the original convolution
-    /// padded to the next power of 2. This method performs an equivalent
-    /// padding to the a matrix, so it can be multiplied against the FFT based
-    /// convolution. This is used to transform a dense layer that comes after a
-    /// FFT-convolution, and ensure the vec-matrix multiplication is performed
-    /// correctly.
-    ///
-    /// Given a convolution result `X` and a matrix `M`, the FFT-based
-    /// convolution is such that`X' = fft(X)`, here `M` is padded to `M'` such
-    /// that `M * X == M' * X'`, ensuring the result remains consistent despite
-    /// the padding in `X'`.
-    pub fn pad_matrix_to_ignore_garbage(
-        &self,
-        conv_shape_og: &Shape,
-        conv_shape_pad: &Shape,
-        matrix_shape_pad: &Shape,
-    ) -> Result<Self> {
-        let wrapped = WrappedTensor::try_from(self)?;
-        let result = wrapped.pad_matrix_to_ignore_garbage(
-            conv_shape_og,
-            conv_shape_pad,
-            matrix_shape_pad,
-        )?;
-        Tensor::try_from(result)
-    }
-
-    #[cfg(test)]
-    pub fn into_wrapped(self) -> WrappedTensor<T> {
-        WrappedTensor::try_from(&self).unwrap()
-    }
-
-    #[cfg(test)]
-    pub fn as_wrapped(&self) -> WrappedTensor<T> {
-        WrappedTensor::try_from(self).unwrap()
-    }
-}
-
-impl<T: Clone + Default> Tensor<T> {
-    pub fn pad_1d(mut self, new_len: usize) -> Result<Self> {
-        ensure!(
-            self.shape.len() == 1,
-            "pad_1d only works for 1d tensors, e.g. vectors"
-        );
-        self.data.resize(new_len, Default::default());
-        self.shape[0] = new_len;
-        Ok(self)
-    }
-}
-
-impl<T: Copy> Tensor<T> {
+impl<T> Tensor<T>
+where
+    T: Copy,
+{
     /// Instantiate a new tensor with `shape` initialised to `default`.
-    pub fn initialised(shape: Shape, default: T) -> Self {
+    pub(crate) fn initialised(shape: Shape, default: T) -> Self {
         Tensor {
             data: vec![default; shape.numel()],
             shape: shape.clone(),
@@ -1159,7 +629,7 @@ impl<T: Copy> Tensor<T> {
     }
 
     /// Retrieves an element using (N, C, H, W) indexing
-    pub fn get_at_4d(&self, n: usize, c: usize, h: usize, w: usize) -> Result<T> {
+    pub(crate) fn get_at_4d(&self, n: usize, c: usize, h: usize, w: usize) -> Result<T> {
         ensure!(self.shape.len() <= 4);
 
         let shape = self.shape.to_4d();
@@ -1170,16 +640,6 @@ impl<T: Copy> Tensor<T> {
             .sum();
 
         Ok(self.data[idx])
-    }
-
-    /// Returns the value at the specified coordinate.
-    ///
-    /// # Error
-    ///
-    /// - If the accessor dimensionality doesn't match the shape.
-    pub fn get(&self, accessors: Vec<usize>) -> Result<T> {
-        let flat_index = self.shape().get_idx(accessors)?;
-        Ok(self.data[flat_index])
     }
 }
 
@@ -1271,89 +731,14 @@ where
     }
 }
 
-impl<T: Copy + Default> Tensor<T> {
-    /// Permute a tensor.
-    ///
-    /// The tensor's dimensions will be moved according to `order`. The `i`-th
-    /// entry in the `order` vector specifies which dimension of the original
-    /// tensor should become the `i`-th dimension of the output tensor.
-    ///
-    /// ```
-    /// # use zkml::{Tensor, Shape};
-    /// let tensor = Tensor::<i64>::random(&Shape::new(vec![2,3,5]));
-    /// let permuted = tensor.permute3d(&[2,1,0]).unwrap();
-    /// assert_eq!(tensor.dim(0), permuted.dim(2));
-    /// assert_eq!(tensor.dim(1), permuted.dim(1));
-    /// assert_eq!(tensor.dim(2), permuted.dim(0));
-    /// ```
-    pub fn permute3d(&self, order: &[usize]) -> Result<Self> {
-        ensure!(
-            self.shape().rank() == 3,
-            "Current tensor must be 3D. got {}",
-            self.shape().rank(),
-        );
-        ensure!(
-            order.len() == 3,
-            "New order must be 3D. got {}",
-            order.len(),
-        );
-        let count = order.iter().filter(|x| **x < 3).sorted().dedup().count();
-        ensure!(
-            count == 3,
-            "Order must have unique elements 0, 1, 2. got {order:?}",
-        );
-
-        // Special case, do nothing
-        if order == [0, 1, 2] {
-            return Ok(self.clone());
-        }
-
-        let new_shape = Shape::new(vec![
-            self.dim(order[0]),
-            self.dim(order[1]),
-            self.dim(order[2]),
-        ]);
-
-        // reverse map from old position of a dimension to its new position
-        let old_to_new = [
-            order.iter().position(|v| *v == 0).unwrap(),
-            order.iter().position(|v| *v == 1).unwrap(),
-            order.iter().position(|v| *v == 2).unwrap(),
-        ];
-        let new_strides = new_shape.strides();
-        let reverse_strides = [
-            new_strides[old_to_new[0]],
-            new_strides[old_to_new[1]],
-            new_strides[old_to_new[2]],
-        ];
-
-        let (a, b, c) = (self.dim(0), self.dim(1), self.dim(2));
-        let mut pos = 0;
-        let mut data = vec![T::default(); self.shape.numel()];
-
-        for i in 0..a {
-            for j in 0..b {
-                for k in 0..c {
-                    let new_loc =
-                        i * reverse_strides[0] + j * reverse_strides[1] + k * reverse_strides[2];
-
-                    data[new_loc] = self.data[pos];
-                    pos += 1;
-                }
-            }
-        }
-
-        Ok(Self {
-            data,
-            shape: new_shape,
-            unpadded_shape: self.unpadded_shape.clone(),
-        })
-    }
-
+impl<T> Tensor<T>
+where
+    T: Copy + Default,
+{
     /// Copies the sub-slice `new_shape` from this tensor.
     ///
     /// Returns a new [Tensor] with shape `new_shape` initialised from `self`.
-    pub fn reduce_to_shape(&self, new_shape: &Shape) -> Result<Self> {
+    pub(crate) fn reduce_to_shape(&self, new_shape: &Shape) -> Result<Self> {
         ensure!(
             self.shape().rank() >= new_shape.rank(),
             "The target shape must be smaller than the current",
@@ -1408,12 +793,12 @@ impl<T: Copy + Default> Tensor<T> {
     }
 
     /// Pads the tensor to the next power-of-two.
-    pub fn pad_next_power_of_two(&self) -> Self {
+    pub(crate) fn pad_next_power_of_two(&self) -> Self {
         self.pad_next_power_of_two_with_value(T::default())
     }
 
     /// Pads the tensor to the next power-of-two using the specified value for padding.
-    pub fn pad_next_power_of_two_with_value(&self, value: T) -> Self {
+    pub(crate) fn pad_next_power_of_two_with_value(&self, value: T) -> Self {
         let new_shape = self.shape().next_power_of_two();
 
         // Pre allocate the necessary capacity
@@ -1443,7 +828,7 @@ impl<T: Copy + Default> Tensor<T> {
     ///
     /// If the `target_shape` differs in rank or has a dimension smaller than
     /// the current tensor.
-    pub fn pad_to_shape(&mut self, target_shape: Shape) -> Result<()> {
+    pub(crate) fn pad_to_shape(&mut self, target_shape: Shape) -> Result<()> {
         self.pad_to_shape_with_value(target_shape, T::default())
     }
 
@@ -1456,7 +841,7 @@ impl<T: Copy + Default> Tensor<T> {
     ///
     /// If the `target_shape` differs in rank or has a dimension smaller than
     /// the current tensor.
-    pub fn pad_to_shape_with_value(&mut self, target_shape: Shape, value: T) -> Result<()> {
+    pub(crate) fn pad_to_shape_with_value(&mut self, target_shape: Shape, value: T) -> Result<()> {
         ensure!(
             target_shape.rank() == self.shape.rank(),
             "Target shape must have the same rank as the current tensor. current {:?} target {:?}",
@@ -1584,214 +969,26 @@ impl<T: Copy + Default> Tensor<T> {
     }
 }
 
-impl<T: Default> Tensor<T> {
-    pub fn map_data<O, F: Fn(&T) -> O>(&self, f: F) -> Tensor<O> {
+impl<T> Tensor<T>
+where
+    T: Default,
+{
+    pub(crate) fn map_data<O, F: Fn(&T) -> O>(&self, f: F) -> Tensor<O> {
         Tensor {
             data: self.data.iter().map(f).collect(),
             shape: self.shape.clone(),
             unpadded_shape: self.unpadded_shape.clone(),
         }
     }
-
-    pub fn insert_at_dim(mut self, dim: usize, index: usize, value: T) -> Result<Self> {
-        if self.data.len() == index {
-            self.data.push(value);
-            *self.shape.get_mut(dim).unwrap() += 1;
-        } else if self.data.len() > index {
-            self.data[index] = value;
-        } else {
-            bail!(
-                "Cannot insert at index {index} in tensor with data length {}",
-                self.data.len()
-            );
-        }
-        Ok(self)
-    }
-
-    /// The new shape of self will be [S1_1+S2_1,S1,...Sn]
-    /// In other words, we only concatenate another vector if it's exactly size of the highest dimension
-    pub fn concat_from_unpadded(
-        &mut self,
-        self_unpadded_first_dim: usize,
-        other: Self,
-        other_unpadded_first_dim: usize,
-    ) -> anyhow::Result<()> {
-        ensure!(
-            self.shape().rank() == other.shape().rank(),
-            "self and other shapes must have the same length"
-        );
-        ensure!(
-            self.shape()
-                .iter()
-                .zip(other.shape().iter())
-                .skip(1)
-                .all(|(a, b)| a == b),
-            "self and other shapes must have the same dimensions"
-        );
-        ensure!(
-            other.shape().numel() == other.data().len(),
-            "The other tensor data length is not equal to the other shape product"
-        );
-
-        // 0-based indexing
-        let max_stride: usize = self.shape().iter().skip(1).product();
-        let init_pos = self_unpadded_first_dim * max_stride;
-        let mut pos = init_pos;
-        let end_of_slice = self.data().len();
-        // only take the non-padded part of the other tensor
-        for new_v in other
-            .data
-            .into_iter()
-            .take(other_unpadded_first_dim * max_stride)
-        {
-            if pos >= end_of_slice {
-                self.data.push(new_v);
-            } else {
-                self.data[pos] = new_v;
-            }
-            pos += 1;
-        }
-        ensure!(
-            pos.is_multiple_of(max_stride),
-            "The part going beyond must be a multiple of the stride"
-        );
-        // how many times have we added a "big" chunk to the recipient, and therefore by how much to increase the new shape
-        let new_dim = self_unpadded_first_dim + (pos - init_pos) / max_stride;
-        // we only update the shape for the part that goes beyond the existing padding
-        if new_dim > self.shape.dim(0) {
-            self.shape.set_dim(0, new_dim);
-            self.data.resize_with(self.shape.numel(), Default::default);
-        }
-        ensure!(
-            self.data().len() == self.shape().product(),
-            "The new data length {} is not equal to the new shape product {}",
-            self.data().len(),
-            self.shape().product()
-        );
-        Ok(())
-    }
 }
 
-impl<T: Default + Copy + Send + Sync> Tensor<T> {
-    /// Reshapes the matrix to have at least the specified dimensions while preserving all data.
-    pub fn reshape_to_fit_inplace_2d(&mut self, new_shape: Shape) -> Result<()> {
-        ensure!(self.shape().rank() == 2, "Tensor is not matrix");
-        ensure!(new_shape.rank() == 2, "New shape for tensor is not matrix");
-
-        let old_rows = self.shape()[0];
-        let old_cols = self.shape()[1];
-        let new_rows = new_shape[0];
-        let new_cols = new_shape[1];
-
-        ensure!(
-            new_rows >= old_rows,
-            "Cannot shrink matrix rows from {old_rows} to {new_rows} - would lose information",
-        );
-        ensure!(
-            new_cols >= old_cols,
-            "Cannot shrink matrix columns from {old_cols} to {new_cols} - would lose information",
-        );
-
-        let new_data: Vec<T> = (0..new_rows * new_cols)
-            .into_par_iter()
-            .map(|idx| {
-                let i = idx / new_cols;
-                let j = idx % new_cols;
-                if i < old_rows && j < old_cols {
-                    self.data[i * old_cols + j]
-                } else {
-                    T::default() // Zero or default for padding
-                }
-            })
-            .collect();
-
-        self.shape = new_shape;
-        self.data = new_data;
-
-        Ok(())
-    }
-}
-
-impl<T: std::ops::Add<Output = T> + Copy + Send + Sync> Tensor<T> {
-    /// Element-wise addition
-    pub fn add(&self, other: &Tensor<T>) -> Tensor<T> {
-        auto_vec_binop!(self, other, +)
-    }
-
-    /// Add a vector to each sub-tensor of the second dimension of the tensor
-    /// If self is 2d, then add a vector to each row of self.
-    pub fn add_dim2(&self, other: &Tensor<T>) -> Tensor<T> {
-        assert!(self.shape.len() == 2, "Tensor is not a matrix");
-        assert!(other.shape.len() == 1, "Tensor is not a vector");
-        assert!(
-            self.shape[1] == other.shape[0],
-            "Shape mismatch for addition2: {:?} != {:?}",
-            self.shape,
-            other.shape
-        );
-        let data = self
-            .data
-            .par_chunks(self.shape[1])
-            .flat_map_iter(|chunk| chunk.iter().zip(other.data.iter()).map(|(a, b)| *a + *b))
-            .collect::<Vec<_>>();
-        Tensor {
-            shape: self.shape.clone(),
-            data,
-            unpadded_shape: self.unpadded_shape.clone(),
-        }
-    }
-}
-
-impl<T: std::ops::Sub<Output = T> + Copy + Send + Sync> Tensor<T> {
-    /// Element-wise subtraction
-    pub fn sub(&self, other: &Tensor<T>) -> Tensor<T> {
-        auto_vec_binop!(self, other, -)
-    }
-}
-
-impl<T: std::ops::Mul<Output = T> + Copy + Send + Sync> Tensor<T> {
-    /// Element-wise multiplication
-    pub fn mul(&self, other: &Tensor<T>) -> Tensor<T> {
-        auto_vec_binop!(self, other, *)
-    }
-
-    /// Scalar multiplication
-    pub fn scalar_mul(&self, scalar: &T) -> Tensor<T> {
-        let scalar = *scalar;
-
-        let data = auto_vec_op!(self.data, |el| el * scalar);
-
-        Tensor {
-            data,
-            shape: self.shape.clone(),
-            unpadded_shape: self.unpadded_shape.clone(),
-        }
-    }
-}
-
-// taken from https://docs.pytorch.org/docs/stable/generated/torch.isclose.html
 /// Determines whether two slices of `f32` values are element-wise close within
 /// the specified absolute (`atol`) and relative (`rtol`) tolerances.
 ///
 /// The condition checked is the same as PyTorch's `torch.isclose`:
 /// `|a - b| <= atol + rtol * |b|` for every corresponding element.
-///
-/// # Examples
-///
-/// ```
-/// use zkml::tensor::is_close_with_tolerance;
-///
-/// // For 10% relative tolerance (0.1 = 10%)
-/// let a = [1.0, 2.0, 3.0];
-/// let b = [1.1, 2.2, 3.3]; // 10% difference
-/// assert!(is_close_with_tolerance(&a, &b, 0.0, 0.1));
-///
-/// // For 1e-6 absolute tolerance
-/// let c = [1.0, 2.0, 3.0];
-/// let d = [1.000001, 2.000001, 3.000001]; // 1e-6 difference
-/// assert!(is_close_with_tolerance(&c, &d, 1e-6, 0.0));
-/// ```
-pub fn is_close_with_tolerance(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
+pub(crate) fn is_close_with_tolerance(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
+    // taken from https://docs.pytorch.org/docs/stable/generated/torch.isclose.html
     if a.len() != b.len() {
         return false;
     }
@@ -1804,162 +1001,632 @@ pub fn is_close_with_tolerance(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bo
 
 /// Backwards-compatible wrapper that uses the historical default tolerances
 /// (`atol = 1e-8`, `rtol = 1e-5`).
-pub fn is_close(a: &[f32], b: &[f32]) -> bool {
+pub(crate) fn is_close(a: &[f32], b: &[f32]) -> bool {
     is_close_with_tolerance(a, b, 1e-8_f32, 1e-5_f32)
-}
-/// Function used to get the broadcasted shape of two [Tensors][`Tensor`].
-/// To be able to broadcast two [Tensors][`Tensor`] the shapes must be compatible in each dimension, this means either:
-///     1) The two dimensions are equal
-///     2) One of the dimensions is 1
-/// If one [`Tensor`] has fewer dimensions than the other we can prepend its [`Shape`] with `1`s. For example if we have shapes
-/// `[5, 7, 2]` and `[7, 1]` then let us write `[x, y, z]` for the currently unknown broadcasted shape, the broadcasting process works as follows:
-///     1) Prepend `1` to the second [`Shape`] so that we have `[5, 7, 2]` and `[1, 7, 1]`
-///     2) Compare the two shape arrays from back to front and apply our rules above:
-///         i) `2` and `1` are not equal, but one of them is `1` so we set the final dim (`z`) in the broadcasted shape to `2` giving us `[x, y, 2]`
-///         ii) Here both dims are `7` so because they are equal the broadcasted shape at `7` will also be `7` giving us `[x, 7, 2]`
-///         iii) Finally we have `5` and `1`, since one of the dims is `1` we take the larger of the two giving `x = 5`
-/// This gives us a final broadcasted shape of `[5, 7, 2]`.
-///
-/// As another example if we have a [`Tensor`] `A` with shape `[4, 1]` and values `[1, 2, 3, 4]` and we have another [`Tensor`] `B` with shape `[3]` and values `[10, 11, 12]`
-/// then brodcasting them to the same shape results in:
-/// ```ignore
-///       A:  [1, 1, 1,       B:  [10, 11, 12
-///            2, 2, 2,            10, 11, 12
-///            3, 3, 3,            10, 11, 12
-///            4, 4, 4]            10, 11, 12]
-/// ```
-pub fn get_broadcasted_shape(shape_a: &Shape, shape_b: &Shape) -> anyhow::Result<Shape> {
-    // Compare the length of both inputs and match on the result
-    let rank_a = shape_a.len();
-    let rank_b = shape_b.len();
-
-    let compatibility = |a: usize, b: usize, index: usize| -> anyhow::Result<usize> {
-        match (a, b) {
-            // One of a or b is 1 so we return the value that is not 1
-            (1, dim) | (dim, 1) => Ok(dim),
-            // Both dims are the same so we return that value
-            (dim_a, dim_b) if dim_a == dim_b => Ok(dim_a),
-            // Any other case returns an error
-            _ => Err(anyhow::anyhow!(
-                "Cannot broadcast shapes as dimensions (a:{a}, b:{b}) were incompatible at index: {index}"
-            )),
-        }
-    };
-
-    match rank_a.cmp(&rank_b) {
-        Ordering::Less => {
-            // shape_a is shorter so we work out the difference and prepend with that many 1s
-            let diff = rank_b - rank_a;
-
-            let padded_shape_a = std::iter::repeat_n(1usize, diff)
-                .chain(shape_a.iter().copied())
-                .collect::<Vec<usize>>();
-
-            // Now we iterate over both choosing the maximum each time
-            shape_b
-                .iter()
-                .zip(padded_shape_a.iter())
-                .enumerate()
-                .map(|(index, (&b_dim, &a_dim))| compatibility(a_dim, b_dim, index))
-                .collect::<Result<Vec<usize>, anyhow::Error>>()
-                .map(Shape::from)
-        }
-        Ordering::Equal => {
-            // The ranks are equal so we just iterate over both choosing the max each time
-            shape_b
-                .iter()
-                .zip(shape_a.iter())
-                .enumerate()
-                .map(|(index, (&b_dim, &a_dim))| compatibility(a_dim, b_dim, index))
-                .collect::<Result<Vec<usize>, anyhow::Error>>()
-                .map(Shape::from)
-        }
-        Ordering::Greater => {
-            // shape_a has larger rank so we prepend 1s to shape b
-            let diff = rank_a - rank_b;
-
-            let padded_shape_b = std::iter::repeat_n(1usize, diff)
-                .chain(shape_b.iter().copied())
-                .collect::<Vec<usize>>();
-            // Now we iterate over both choosing the maximum each time
-            shape_a
-                .iter()
-                .zip(padded_shape_b.iter())
-                .enumerate()
-                .map(|(index, (&a_dim, &b_dim))| compatibility(a_dim, b_dim, index))
-                .collect::<Result<Vec<usize>, anyhow::Error>>()
-                .map(Shape::from)
-        }
-    }
-}
-
-/// Checks `conv2d_tensor` and `fft_tensor` have the same result.
-///
-/// The contents of `conv2d_tensor` must come from a [Tensor::conv2d]
-/// operation and have no padding. The `fff_tensor` must be the result of
-/// [Tensor::fft_conv]. This utility will skip the garbage values of the fft.
-///
-/// expected is std conv2d (kw, nx-nw+1, nx-nw+1)
-/// fft_tensor is results from fft conv (kw, nx, nx)
-#[cfg(test)]
-pub(crate) fn check_tensor_consistency(
-    conv2d_tensor: &Tensor<Element>,
-    fft_tensor: &Tensor<Element>,
-) {
-    assert_eq!(
-        fft_tensor.shape().rank(),
-        3,
-        "FFT tensor should not have batching. shape {:?}",
-        fft_tensor.shape(),
-    );
-    assert_eq!(
-        conv2d_tensor.shape().rank(),
-        3,
-        "Tensor should not have batching. shape {:?}",
-        conv2d_tensor.shape(),
-    );
-    assert_eq!(
-        fft_tensor.shape()[1],
-        fft_tensor.shape()[2],
-        "FFT tensor should have same height and width. shape {:?}",
-        fft_tensor.shape(),
-    );
-    assert!(
-        fft_tensor.shape()[2].is_power_of_two(),
-        "FFT tensor should have a power-of-two height and width. shape {:?}",
-        fft_tensor.shape(),
-    );
-
-    let fft_strides = fft_tensor.shape().strides();
-    let strides = conv2d_tensor.shape().strides();
-    for channel in 0..conv2d_tensor.shape[0] {
-        for height in 0..conv2d_tensor.shape[1] {
-            for width in 0..conv2d_tensor.shape[2] {
-                let expected_pos = channel * strides[0] + height * strides[1] + width * strides[2];
-                let fft_pos =
-                    channel * fft_strides[0] + height * fft_strides[1] + width * fft_strides[2];
-
-                assert!(
-                    conv2d_tensor.data[expected_pos] == fft_tensor.data[fft_pos],
-                    "Error in tensor consistency. channel {channel} height {height} width {width} got {} expected {}",
-                    fft_tensor.data[fft_pos],
-                    conv2d_tensor.data[expected_pos],
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod test {
+    use std::cmp::Ordering;
+
     use ark_std::rand::Rng;
     use ff_ext::{FieldFrom, GoldilocksExt2};
+    use itertools::Itertools;
     use ndarray::{Array, Ix2, Order};
+    use rayon::slice::{ParallelSlice, ParallelSliceMut};
 
-    use crate::{rng_from_env_or_random, testing::random_field_vector, to_field};
+    use crate::{
+        rng_from_env_or_random, testing::random_field_vector, to_bit_sequence_le, to_field,
+    };
 
     use super::*;
     use proptest::prelude::*;
+
+    /// Macro to apply an operation to each element of an array.
+    ///
+    /// The expanded code is intended to be easily vectorisable, by using the
+    /// `as_chunks` api.
+    macro_rules! auto_vec_op {
+        ($data: expr, $op: expr) => {{
+            let mut result = Vec::with_capacity($data.len());
+            let spare_result = result.spare_capacity_mut();
+            assert!(
+                spare_result.len() >= $data.len(),
+                "Preallocated vector must have enough capacity"
+            );
+
+            let (left_chunks, left_remainder) = $data.as_chunks::<AUTO_VECTORISATION_CHUNK>();
+            let (result_chunks, result_remainder) =
+                spare_result.as_chunks_mut::<AUTO_VECTORISATION_CHUNK>();
+
+            (left_chunks, result_chunks)
+                .into_par_iter()
+                .for_each(|(left, result)| {
+                    for i in 0..AUTO_VECTORISATION_CHUNK {
+                        result[i].write($op(left[i]));
+                    }
+                });
+
+            // Handle remainder data
+            for pos in 0..left_remainder.len() {
+                result_remainder[pos].write($op(left_remainder[pos]));
+            }
+
+            // Safety: the memory was initialised above
+            unsafe {
+                result.set_len($data.len());
+            }
+
+            result
+        }};
+    }
+
+    impl<T: Number> Tensor<T> {
+        /// Returns the first position of the largest element in the [Tensor].
+        ///
+        /// ```rust
+        /// # use zkml::{Tensor, Shape, Element};
+        /// let tensor = Tensor::<Element>::new(Shape::new(vec![4, 2]), vec![3, 1, 0, 11, 7, 11, 9, 2]).unwrap();
+        /// assert_eq!(tensor.argmax(), 3);
+        /// ```
+        pub(crate) fn argmax(&self) -> usize {
+            let (position, _value) = self.data.par_iter().cloned().enumerate().reduce(
+                || (usize::MAX, T::MIN),
+                |acc, (position, value)| match acc.1.compare(&value) {
+                    Ordering::Less => (position, value),
+                    _ => acc,
+                },
+            );
+
+            position
+        }
+
+        /// Perform matrix-vector multiplication
+        pub(crate) fn matvec(&self, vector: &Tensor<T>) -> Result<Tensor<T>> {
+            ensure!(self.shape.is_matrix(), "First argument must be a matrix.");
+            ensure!(
+                vector.shape.is_vector(),
+                "Second argument must be a vector."
+            );
+
+            let (m, n) = (self.shape[0], self.shape[1]);
+            let vec_len = vector.shape[0];
+
+            ensure!(n == vec_len, "Matrix columns must match vector size.");
+
+            let mut result = Tensor::zeros(vec![m].into());
+
+            result.data.par_iter_mut().enumerate().for_each(|(i, res)| {
+                *res = (0..n)
+                    .map(|j| self.data[i * n + j] * vector.data[j])
+                    .sum::<T>();
+            });
+
+            Ok(result)
+        }
+
+        /// Concatenate a matrix (2D tensor) with a vector (1D tensor) as columns
+        pub(crate) fn concat_matvec_col(&self, vector: &Tensor<T>) -> Result<Tensor<T>> {
+            ensure!(self.shape.is_matrix(), "First tensor is not a matrix.");
+            ensure!(vector.shape.is_vector(), "Second tensor is not a vector.");
+
+            let (rows, cols) = (self.shape[0], self.shape[1]);
+            let vector_len = vector.shape[0];
+
+            ensure!(
+                rows == vector_len,
+                "Matrix row count must match vector length."
+            );
+
+            let new_cols = cols + 1;
+            let mut result = Tensor::zeros(vec![rows, new_cols].into());
+
+            result
+                .data
+                .par_chunks_mut(new_cols)
+                .enumerate()
+                .for_each(|(i, row)| {
+                    row[..cols].copy_from_slice(&self.data[i * cols..(i + 1) * cols]); // Copy matrix row
+                    row[cols] = vector.data[i]; // Append vector element as the last column
+                });
+
+            Ok(result)
+        }
+
+        /// Replaces every value of a tensor with the maxpool of its kernel
+        pub(crate) fn padded_maxpool2d(&self) -> Result<(Tensor<T>, Tensor<T>)> {
+            let kernel_size = MAXPOOL2D_KERNEL_SIZE;
+            let stride = MAXPOOL2D_KERNEL_SIZE;
+
+            let maxpool_result = self.maxpool2d(kernel_size, stride)?;
+
+            let dims: usize = self.shape().rank();
+            ensure!(dims >= 2, "Input tensor must have at least 2 dimensions.");
+
+            let (h, w) = (self.shape[dims - 2], self.shape[dims - 1]);
+
+            ensure!(
+                h % MAXPOOL2D_KERNEL_SIZE == 0,
+                "Currently works only with kernel size {MAXPOOL2D_KERNEL_SIZE}"
+            );
+            ensure!(
+                w % MAXPOOL2D_KERNEL_SIZE == 0,
+                "Currently works only with stride size {MAXPOOL2D_KERNEL_SIZE}"
+            );
+
+            let outer_dims: usize = self.shape[..dims - 2].iter().product();
+            let maxpool_h = (h - kernel_size) / stride + 1;
+            let maxpool_w = (w - kernel_size) / stride + 1;
+
+            let padded_maxpool_data: Vec<T> = (0..outer_dims * h * w)
+                .into_par_iter()
+                .map(|out_idx| {
+                    let n = out_idx / (h * w);
+                    let i_full = (out_idx / w) % h;
+                    let j_full = out_idx % w;
+
+                    let i = i_full / stride;
+                    let j = j_full / stride;
+
+                    let maxpool_idx = n * maxpool_h * maxpool_w + i * maxpool_w + j;
+                    maxpool_result.data[maxpool_idx]
+                })
+                .collect();
+
+            let padded_maxpool_tensor = Tensor {
+                data: padded_maxpool_data,
+                shape: self.shape().clone(),
+                unpadded_shape: self.unpadded_shape.clone(),
+            };
+
+            Ok((self.maxpool2d(kernel_size, stride)?, padded_maxpool_tensor))
+        }
+
+        /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
+        /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular matrix must be square)
+        /// - `num_matrices` specifies how many matrices to make
+        /// - `diag` specifies the "offset" for the diagonal, an offset of `1` means we keep two `1`s on the first row instead of 1, and offset of `-1` means all `zeroes`
+        pub(crate) fn tril(matrix_dim: usize, num_matrices: usize, diag: i32) -> Result<Tensor<T>> {
+            Self::tri(matrix_dim, num_matrices, diag, T::unit(), T::default())
+        }
+
+        /// Makes a [`Tensor`] that is a batch of lower triangular matrices.
+        /// - `matrix_dim` the number specifying the dimensions of each individual matrix (lower triangular matrix must be square)
+        /// - `num_matrices` specifies how many matrices to make
+        /// - `diag` specifies the "offset" for the diagonal, an offset of `1` means we keep two `lower_val`s on the first row instead of 1, and offset of `-1` means all `upper_val`
+        /// - `lower_val` specifies the value to fill the lower triangular part with
+        /// - `upper_val` specifies the value to fill the upper triangular part with
+        pub(crate) fn tri(
+            matrix_dim: usize,
+            num_matrices: usize,
+            diag: i32,
+            lower_val: T,
+            upper_val: T,
+        ) -> Result<Tensor<T>> {
+            // We make one matrix and then just clone it
+            let data = (0i32..matrix_dim as i32)
+                .flat_map(|i| {
+                    if (i + diag).is_negative() {
+                        vec![upper_val; matrix_dim]
+                    } else {
+                        std::iter::repeat_n(lower_val, (i + diag + 1) as usize)
+                            .chain(std::iter::repeat(upper_val))
+                            .take(matrix_dim)
+                            .collect::<Vec<T>>()
+                    }
+                })
+                .cycle()
+                .take(num_matrices * matrix_dim * matrix_dim)
+                .collect::<Vec<T>>();
+
+            Tensor::<T>::new(vec![num_matrices, matrix_dim, matrix_dim].into(), data)
+        }
+
+        /// slice on the third dimension.
+        /// start inclusive, end exclusive
+        pub(crate) fn slice_3d(&self, start: usize, end: usize) -> Result<Self> {
+            ensure!(self.shape.len() == 3);
+            ensure!(start < self.shape[0]);
+            ensure!(end <= self.shape[0]);
+            let blocks = self.shape[1] * self.shape[2];
+            let sliced = self.data[blocks * start..blocks * end].to_vec();
+            let shape: Shape = vec![end - start, self.shape[1], self.shape[2]].into();
+
+            Ok(Self {
+                data: sliced,
+                shape: shape.clone(),
+                unpadded_shape: shape,
+            })
+        }
+
+        /// Slice the tensor on the first dimension.
+        ///
+        /// # Arguments
+        ///
+        /// - start: New start for the first dimension, inclusive.
+        /// - end: New end for the first dimension, exclusive.
+        pub(crate) fn slice_2d(&self, start: usize, end: usize) -> Result<Self> {
+            ensure!(self.shape.len() == 2);
+            ensure!(start < end);
+            ensure!(end <= self.shape[0] + 1);
+
+            let range_start = start * self.shape[1];
+            let range_end = end * self.shape[1];
+            let data = self.data[range_start..range_end].to_vec();
+
+            let new_shape = Shape::new(vec![end - start, self.shape[1]]);
+            debug_assert!(
+                new_shape.numel() == data.len(),
+                "{new_shape:?} data.len(): {} start: {start} end: {end}",
+                data.len(),
+            );
+
+            Ok(Self {
+                data,
+                shape: new_shape.clone(),
+                unpadded_shape: new_shape,
+            })
+        }
+
+        pub(crate) fn any(shape: Shape) -> impl proptest::prelude::Strategy<Value = Self> {
+            use proptest::prelude::*;
+            let size = shape.product();
+            let data = proptest::collection::vec(T::any(), size);
+            data.prop_map(move |data| Self {
+                data,
+                shape: shape.clone(),
+                unpadded_shape: shape.clone(),
+            })
+        }
+    }
+
+    impl<T: TensorTypeParam> Tensor<T> {
+        pub(crate) fn into_wrapped(self) -> WrappedTensor<T> {
+            WrappedTensor::try_from(&self).unwrap()
+        }
+
+        pub(crate) fn as_wrapped(&self) -> WrappedTensor<T> {
+            WrappedTensor::try_from(self).unwrap()
+        }
+
+        /// Pads a matrix so it can be used with the output of a FFT-based
+        /// convolution.
+        ///
+        /// The FFT-based convolution has all dimensions of the original convolution
+        /// padded to the next power of 2. This method performs an equivalent
+        /// padding to the a matrix, so it can be multiplied against the FFT based
+        /// convolution. This is used to transform a dense layer that comes after a
+        /// FFT-convolution, and ensure the vec-matrix multiplication is performed
+        /// correctly.
+        ///
+        /// Given a convolution result `X` and a matrix `M`, the FFT-based
+        /// convolution is such that`X' = fft(X)`, here `M` is padded to `M'` such
+        /// that `M * X == M' * X'`, ensuring the result remains consistent despite
+        /// the padding in `X'`.
+        pub(crate) fn pad_matrix_to_ignore_garbage(
+            &self,
+            conv_shape_og: &Shape,
+            conv_shape_pad: &Shape,
+            matrix_shape_pad: &Shape,
+        ) -> Result<Self> {
+            let wrapped = WrappedTensor::try_from(self)?;
+            let result = wrapped.pad_matrix_to_ignore_garbage(
+                conv_shape_og,
+                conv_shape_pad,
+                matrix_shape_pad,
+            )?;
+            Tensor::try_from(result)
+        }
+    }
+
+    impl<T> Tensor<T>
+    where
+        T: Default,
+    {
+        /// The new shape of self will be [S1_1+S2_1,S1,...Sn]
+        /// In other words, we only concatenate another vector if it's exactly size of the highest dimension
+        pub(crate) fn concat_from_unpadded(
+            &mut self,
+            self_unpadded_first_dim: usize,
+            other: Self,
+            other_unpadded_first_dim: usize,
+        ) -> anyhow::Result<()> {
+            ensure!(
+                self.shape().rank() == other.shape().rank(),
+                "self and other shapes must have the same length"
+            );
+            ensure!(
+                self.shape()
+                    .iter()
+                    .zip(other.shape().iter())
+                    .skip(1)
+                    .all(|(a, b)| a == b),
+                "self and other shapes must have the same dimensions"
+            );
+            ensure!(
+                other.shape().numel() == other.data().len(),
+                "The other tensor data length is not equal to the other shape product"
+            );
+
+            // 0-based indexing
+            let max_stride: usize = self.shape().iter().skip(1).product();
+            let init_pos = self_unpadded_first_dim * max_stride;
+            let mut pos = init_pos;
+            let end_of_slice = self.data().len();
+            // only take the non-padded part of the other tensor
+            for new_v in other
+                .data
+                .into_iter()
+                .take(other_unpadded_first_dim * max_stride)
+            {
+                if pos >= end_of_slice {
+                    self.data.push(new_v);
+                } else {
+                    self.data[pos] = new_v;
+                }
+                pos += 1;
+            }
+            ensure!(
+                pos.is_multiple_of(max_stride),
+                "The part going beyond must be a multiple of the stride"
+            );
+            // how many times have we added a "big" chunk to the recipient, and therefore by how much to increase the new shape
+            let new_dim = self_unpadded_first_dim + (pos - init_pos) / max_stride;
+            // we only update the shape for the part that goes beyond the existing padding
+            if new_dim > self.shape.dim(0) {
+                self.shape.set_dim(0, new_dim);
+                self.data.resize_with(self.shape.numel(), Default::default);
+            }
+            ensure!(
+                self.data().len() == self.shape().product(),
+                "The new data length {} is not equal to the new shape product {}",
+                self.data().len(),
+                self.shape().product()
+            );
+            Ok(())
+        }
+    }
+
+    impl<T> Tensor<T>
+    where
+        T: Copy + Default,
+    {
+        /// Permute a tensor.
+        ///
+        /// The tensor's dimensions will be moved according to `order`. The `i`-th
+        /// entry in the `order` vector specifies which dimension of the original
+        /// tensor should become the `i`-th dimension of the output tensor.
+        ///
+        /// ```
+        /// # use zkml::{Tensor, Shape};
+        /// let tensor = Tensor::<i64>::random(&Shape::new(vec![2,3,5]));
+        /// let permuted = tensor.permute3d(&[2,1,0]).unwrap();
+        /// assert_eq!(tensor.dim(0), permuted.dim(2));
+        /// assert_eq!(tensor.dim(1), permuted.dim(1));
+        /// assert_eq!(tensor.dim(2), permuted.dim(0));
+        /// ```
+        pub(crate) fn permute3d(&self, order: &[usize]) -> Result<Self> {
+            ensure!(
+                self.shape().rank() == 3,
+                "Current tensor must be 3D. got {}",
+                self.shape().rank(),
+            );
+            ensure!(
+                order.len() == 3,
+                "New order must be 3D. got {}",
+                order.len(),
+            );
+            let count = order.iter().filter(|x| **x < 3).sorted().dedup().count();
+            ensure!(
+                count == 3,
+                "Order must have unique elements 0, 1, 2. got {order:?}",
+            );
+
+            // Special case, do nothing
+            if order == [0, 1, 2] {
+                return Ok(self.clone());
+            }
+
+            let new_shape = Shape::new(vec![
+                self.dim(order[0]),
+                self.dim(order[1]),
+                self.dim(order[2]),
+            ]);
+
+            // reverse map from old position of a dimension to its new position
+            let old_to_new = [
+                order.iter().position(|v| *v == 0).unwrap(),
+                order.iter().position(|v| *v == 1).unwrap(),
+                order.iter().position(|v| *v == 2).unwrap(),
+            ];
+            let new_strides = new_shape.strides();
+            let reverse_strides = [
+                new_strides[old_to_new[0]],
+                new_strides[old_to_new[1]],
+                new_strides[old_to_new[2]],
+            ];
+
+            let (a, b, c) = (self.dim(0), self.dim(1), self.dim(2));
+            let mut pos = 0;
+            let mut data = vec![T::default(); self.shape.numel()];
+
+            for i in 0..a {
+                for j in 0..b {
+                    for k in 0..c {
+                        let new_loc = i * reverse_strides[0]
+                            + j * reverse_strides[1]
+                            + k * reverse_strides[2];
+
+                        data[new_loc] = self.data[pos];
+                        pos += 1;
+                    }
+                }
+            }
+
+            Ok(Self {
+                data,
+                shape: new_shape,
+                unpadded_shape: self.unpadded_shape.clone(),
+            })
+        }
+    }
+
+    impl<T> Tensor<T>
+    where
+        T: Copy,
+    {
+        /// Returns the value at the specified coordinate.
+        ///
+        /// # Error
+        ///
+        /// - If the accessor dimensionality doesn't match the shape.
+        pub(crate) fn get(&self, accessors: Vec<usize>) -> Result<T> {
+            let flat_index = self.shape().get_idx(accessors)?;
+            Ok(self.data[flat_index])
+        }
+    }
+
+    impl<T> Tensor<T>
+    where
+        T: std::ops::Add<Output = T> + Copy + Send + Sync,
+    {
+        /// Add a vector to each sub-tensor of the second dimension of the tensor
+        /// If self is 2d, then add a vector to each row of self.
+        pub(crate) fn add_dim2(&self, other: &Tensor<T>) -> Tensor<T> {
+            assert!(self.shape.len() == 2, "Tensor is not a matrix");
+            assert!(other.shape.len() == 1, "Tensor is not a vector");
+            assert!(
+                self.shape[1] == other.shape[0],
+                "Shape mismatch for addition2: {:?} != {:?}",
+                self.shape,
+                other.shape
+            );
+            let data = self
+                .data
+                .par_chunks(self.shape[1])
+                .flat_map_iter(|chunk| chunk.iter().zip(other.data.iter()).map(|(a, b)| *a + *b))
+                .collect::<Vec<_>>();
+            Tensor {
+                shape: self.shape.clone(),
+                data,
+                unpadded_shape: self.unpadded_shape.clone(),
+            }
+        }
+    }
+
+    impl<T> Tensor<T>
+    where
+        T: std::ops::Sub<Output = T> + Copy + Send + Sync,
+    {
+        /// Element-wise subtraction
+        pub(crate) fn sub(&self, other: &Tensor<T>) -> Tensor<T> {
+            auto_vec_binop!(self, other, -)
+        }
+    }
+
+    impl<T> Tensor<T>
+    where
+        T: std::ops::Mul<Output = T> + Copy + Send + Sync,
+    {
+        /// Scalar multiplication
+        pub(crate) fn scalar_mul(&self, scalar: &T) -> Tensor<T> {
+            let scalar = *scalar;
+
+            let data = auto_vec_op!(self.data, |el| el * scalar);
+
+            Tensor {
+                data,
+                shape: self.shape.clone(),
+                unpadded_shape: self.unpadded_shape.clone(),
+            }
+        }
+    }
+
+    impl<T> Tensor<T> {
+        /// Concatenate the other tensor to the first one.
+        /// RESTRICTIOn: self shape is [a1,a2...,an] we
+        /// expect other shape to be [a2...,an] OR [1, a2...,an]
+        /// The new shape of self will be [a1+1,...an]
+        /// In other words, we only concatenate another vector if it's exactly size of the highest dimension
+        /// If it's 2d, then we expect other to be a vector
+        pub(crate) fn concat(&mut self, other: Self) -> Result<()> {
+            // make sure that the all dimension but the highest one are the same
+            let common_shape = self.shape.len().min(other.shape.len());
+            let added_higher = if common_shape < self.shape.len() {
+                ensure!(
+                    self.shape
+                        .iter()
+                        .rev()
+                        .zip(other.shape.iter().rev())
+                        .take(common_shape)
+                        .all(|(a, b)| a == b)
+                );
+                ensure!(common_shape + 1 == self.shape.len());
+                1
+            } else {
+                ensure!(common_shape == self.shape.len());
+                *other.shape.first().unwrap()
+            };
+            // then the new shape has this higher dimension + 1 simply
+            // common_shape since 0-based indexing
+            *self.shape.get_mut(0).unwrap() += added_higher;
+            self.data.extend(other.data);
+
+            Ok(())
+        }
+
+        /// Returns the boolean iterator indicating the given row in the right endianness to be
+        /// evaluated by an MLE
+        pub(crate) fn row_to_boolean_2d<F: ExtensionField>(
+            &self,
+            row: usize,
+        ) -> Result<impl Iterator<Item = F>> {
+            ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
+            let (nvars_rows, _) = self.shape().num_vars_2d();
+            Ok(to_bit_sequence_le(row, nvars_rows).map(|b| F::from_canonical_u64(b as u64)))
+        }
+
+        /// Returns the boolean iterator indicating the given row in the right endianness to be
+        /// evaluated by an MLE
+        pub(crate) fn col_to_boolean_2d<F: ExtensionField>(
+            &self,
+            col: usize,
+        ) -> Result<impl Iterator<Item = F>> {
+            ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
+            let (_, nvars_col) = self.shape().num_vars_2d();
+            Ok(to_bit_sequence_le(col, nvars_col).map(|b| F::from_canonical_u64(b as u64)))
+        }
+
+        /// From a given row and a given column, return the vector of field elements in the right
+        /// format to evaluate the MLE.
+        /// little endian so we need to read cols before rows
+        pub(crate) fn position_to_boolean_2d<F: ExtensionField>(
+            &self,
+            row: usize,
+            col: usize,
+        ) -> Result<Vec<F>> {
+            ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
+            Ok(self
+                .col_to_boolean_2d(col)?
+                .chain(self.row_to_boolean_2d(row)?)
+                .collect_vec())
+        }
+
+        /// Removes a dimension from the tensor.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `index` is larger than the shape size, or if the
+        /// removed dimension size is not 1.
+        pub(crate) fn squeeze(mut self, index: usize) -> Result<Self> {
+            ensure!(
+                self.shape[index] == 1,
+                "The dimension to be squeezed must have a value of 1"
+            );
+            self.shape.remove(index);
+            Ok(self)
+        }
+    }
 
     #[test]
     fn test_tensor_basic_ops() {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::tensor::{KeyedTensor, check_tensor_consistency};
+use crate::tensor::KeyedTensor;
 use ff_ext::GoldilocksExt2;
 use proptest::prelude::*;
 use std::{fmt::Debug, ops::Range};
@@ -28,6 +28,62 @@ fn split_garbage(
         }
     }
     (valid, garbage)
+}
+
+/// Checks `conv2d_tensor` and `fft_tensor` have the same result.
+///
+/// The contents of `conv2d_tensor` must come from a [Tensor::conv2d]
+/// operation and have no padding. The `fff_tensor` must be the result of
+/// [Tensor::fft_conv]. This utility will skip the garbage values of the fft.
+///
+/// expected is std conv2d (kw, nx-nw+1, nx-nw+1)
+/// fft_tensor is results from fft conv (kw, nx, nx)
+pub(crate) fn check_tensor_consistency(
+    conv2d_tensor: &Tensor<Element>,
+    fft_tensor: &Tensor<Element>,
+) {
+    assert_eq!(
+        fft_tensor.shape().rank(),
+        3,
+        "FFT tensor should not have batching. shape {:?}",
+        fft_tensor.shape(),
+    );
+    assert_eq!(
+        conv2d_tensor.shape().rank(),
+        3,
+        "Tensor should not have batching. shape {:?}",
+        conv2d_tensor.shape(),
+    );
+    assert_eq!(
+        fft_tensor.shape()[1],
+        fft_tensor.shape()[2],
+        "FFT tensor should have same height and width. shape {:?}",
+        fft_tensor.shape(),
+    );
+    assert!(
+        fft_tensor.shape()[2].is_power_of_two(),
+        "FFT tensor should have a power-of-two height and width. shape {:?}",
+        fft_tensor.shape(),
+    );
+
+    let fft_strides = fft_tensor.shape().strides();
+    let strides = conv2d_tensor.shape().strides();
+    for channel in 0..conv2d_tensor.shape()[0] {
+        for height in 0..conv2d_tensor.shape()[1] {
+            for width in 0..conv2d_tensor.shape()[2] {
+                let expected_pos = channel * strides[0] + height * strides[1] + width * strides[2];
+                let fft_pos =
+                    channel * fft_strides[0] + height * fft_strides[1] + width * fft_strides[2];
+
+                assert!(
+                    conv2d_tensor.data()[expected_pos] == fft_tensor.data()[fft_pos],
+                    "Error in tensor consistency. channel {channel} height {height} width {width} got {} expected {}",
+                    fft_tensor.data()[fft_pos],
+                    conv2d_tensor.data()[expected_pos],
+                );
+            }
+        }
+    }
 }
 
 #[test]

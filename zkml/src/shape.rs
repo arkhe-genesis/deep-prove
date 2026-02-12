@@ -493,21 +493,6 @@ impl Shape {
         Ok(slices)
     }
 
-    /// Converts a coordinate into an index.
-    ///
-    /// # Error
-    ///
-    /// - If the accessor dimensionality doesn't match the shape.
-    pub(crate) fn get_idx(&self, accessors: Vec<usize>) -> anyhow::Result<usize> {
-        ensure!(self.len() == accessors.len());
-        let idx = accessors
-            .iter()
-            .zip(self.strides())
-            .map(|(pos, stride)| pos * stride)
-            .sum();
-        Ok(idx)
-    }
-
     /// Converts the shape to four dimensions.
     pub fn to_4d(&self) -> Self {
         let mut shape = self.0.clone();
@@ -577,11 +562,29 @@ impl IntoI32 for i32 {
 #[cfg(test)]
 mod test {
     use crate::{Shape, rng_from_env_or_random};
+    use anyhow::ensure;
     use ark_std::{UniformRand, rand::Rng};
     use itertools::izip;
     use std::panic::catch_unwind;
 
     use ff_ext::GoldilocksExt2 as F;
+
+    impl Shape {
+        /// Converts a coordinate into an index.
+        ///
+        /// # Error
+        ///
+        /// - If the accessor dimensionality doesn't match the shape.
+        pub(crate) fn get_idx(&self, accessors: Vec<usize>) -> anyhow::Result<usize> {
+            ensure!(self.len() == accessors.len());
+            let idx = accessors
+                .iter()
+                .zip(self.strides())
+                .map(|(pos, stride)| pos * stride)
+                .sum();
+            Ok(idx)
+        }
+    }
 
     #[test]
     fn test_shape() {

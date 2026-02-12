@@ -82,6 +82,41 @@ impl<T> TensorHandle<T>
 where
     T: TensorTypeParam + Serialize + for<'a> Deserialize<'a>,
 {
+    /// Returns a reference to the cached [`Tensor`].
+    ///
+    /// NOTE: If the [`Tensor`] is not cached, this will load the data from
+    /// the store.
+    pub fn tensor(&self) -> anyhow::Result<MappedRwLockReadGuard<'_, Tensor<T>>> {
+        match self {
+            TensorHandle::WrappedTensor(..) => {
+                bail!("Tensor is unavailable for a wrapped tensor handler")
+            }
+            TensorHandle::Tensor(InnerTensor { tensor, .. }) => loop {
+                {
+                    // scope for the read guard, it must be dropped before load can run
+                    let guard = tensor.read().expect("Lock should not be poisoned");
+                    if guard.is_some() {
+                        let res = RwLockReadGuard::map(guard, |v| match v {
+                            Some(v) => v,
+                            None => {
+                                unreachable!(
+                                    "The option was checked above, this is in a read only region"
+                                )
+                            }
+                        });
+                        return Ok(res);
+                    }
+                }
+                self.load()?;
+            },
+        }
+    }
+}
+
+impl<T> TensorHandle<T>
+where
+    T: TensorTypeParam + Serialize + for<'a> Deserialize<'a>,
+{
     /// Creates a [TensorHandle] from a [Tensor].
     pub fn from_tensor(
         storage_key: StorageKey<Vec<T>>,
@@ -98,7 +133,12 @@ where
             unpadded_shape,
         })
     }
+}
 
+impl<T> TensorHandle<T>
+where
+    T: TensorTypeParam + Serialize + for<'a> Deserialize<'a>,
+{
     /// Takes ownership of the inner [WrappedTensor].
     pub(crate) fn take_wrapped_tensor(&self) -> anyhow::Result<WrappedTensor<T>> {
         match self {
@@ -155,33 +195,6 @@ where
                     storage_key,
                     store,
                     wrapped_tensor: Arc::new(RwLock::new(wrapped_tensor)),
-                    shape,
-                    unpadded_shape,
-                }))
-            }
-        }
-    }
-
-    /// Ensures this is a [Tensor] variant, copying data if available.
-    pub fn tensor_variant(self) -> anyhow::Result<Self> {
-        match self {
-            result @ TensorHandle::Tensor { .. } => Ok(result),
-            TensorHandle::WrappedTensor(InnerWrappedTensor {
-                storage_key,
-                store,
-                wrapped_tensor,
-                shape,
-                unpadded_shape,
-            }) => {
-                let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
-                let tensor = match guard.deref() {
-                    Some(wrapped_tensor) => Some(wrapped_tensor.try_into()?),
-                    None => None,
-                };
-                Ok(TensorHandle::Tensor(InnerTensor {
-                    storage_key,
-                    store,
-                    tensor: Arc::new(RwLock::new(tensor)),
                     shape,
                     unpadded_shape,
                 }))
@@ -302,42 +315,14 @@ where
         Ok(())
     }
 
-    /// Returns a reference to the cached [`Tensor`].
-    ///
-    /// NOTE: If the [`Tensor`] is not cached, this will load the data from
-    /// the store.
-    pub fn tensor(&self) -> anyhow::Result<MappedRwLockReadGuard<'_, Tensor<T>>> {
-        match self {
-            TensorHandle::WrappedTensor(..) => {
-                bail!("Tensor is unavailable for a wrapped tensor handler")
-            }
-            TensorHandle::Tensor(InnerTensor { tensor, .. }) => loop {
-                {
-                    // scope for the read guard, it must be dropped before load can run
-                    let guard = tensor.read().expect("Lock should not be poisoned");
-                    if guard.is_some() {
-                        let res = RwLockReadGuard::map(guard, |v| match v {
-                            Some(v) => v,
-                            None => {
-                                unreachable!(
-                                    "The option was checked above, this is in a read only region"
-                                )
-                            }
-                        });
-                        return Ok(res);
-                    }
-                }
-                self.load()?;
-            },
-        }
-    }
-
     /// Returns a reference to the cached [`WrappedTensor`].
     ///
     /// NOTE: If the [`WrappedTensor`] is not cached, it will be created, to create
     /// the tensor the corresponding [`Tensor`] must be available, if it is not, the
     /// data will be loaded from the store.
-    pub fn wrapped_tensor(&self) -> anyhow::Result<MappedRwLockReadGuard<'_, WrappedTensor<T>>> {
+    pub(crate) fn wrapped_tensor(
+        &self,
+    ) -> anyhow::Result<MappedRwLockReadGuard<'_, WrappedTensor<T>>> {
         match self {
             TensorHandle::WrappedTensor(InnerWrappedTensor { wrapped_tensor, .. }) => loop {
                 {
@@ -451,7 +436,7 @@ where
     }
 
     /// Pads the tensor to the next power-of-two.
-    pub fn pad_next_power_of_two(&self) -> Self {
+    pub(crate) fn pad_next_power_of_two(&self) -> Self {
         match self {
             TensorHandle::WrappedTensor(InnerWrappedTensor {
                 storage_key,
@@ -518,7 +503,7 @@ where
 }
 
 impl TensorHandle<f32> {
-    pub fn mean_center_rows(&self) -> Self {
+    pub(crate) fn mean_center_rows(&self) -> Self {
         match self {
             TensorHandle::WrappedTensor(InnerWrappedTensor {
                 storage_key,
@@ -812,6 +797,51 @@ where
                 .map(|tensor| Ok(KeyedTensor::new(storage_key.cast(), tensor.clone())))
                 .context("TensorHandle::Tensor is dry")
                 .flatten(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ops::Deref,
+        sync::{Arc, RwLock},
+    };
+
+    use crate::tensor::{
+        TensorHandle, TensorTypeParam,
+        handle::{InnerTensor, InnerWrappedTensor},
+    };
+
+    impl<T> TensorHandle<T>
+    where
+        T: TensorTypeParam,
+    {
+        /// Ensures this is a [Tensor] variant, copying data if available.
+        pub(crate) fn tensor_variant(self) -> anyhow::Result<Self> {
+            match self {
+                result @ TensorHandle::Tensor { .. } => Ok(result),
+                TensorHandle::WrappedTensor(InnerWrappedTensor {
+                    storage_key,
+                    store,
+                    wrapped_tensor,
+                    shape,
+                    unpadded_shape,
+                }) => {
+                    let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
+                    let tensor = match guard.deref() {
+                        Some(wrapped_tensor) => Some(wrapped_tensor.try_into()?),
+                        None => None,
+                    };
+                    Ok(TensorHandle::Tensor(InnerTensor {
+                        storage_key,
+                        store,
+                        tensor: Arc::new(RwLock::new(tensor)),
+                        shape,
+                        unpadded_shape,
+                    }))
+                }
+            }
         }
     }
 }

@@ -192,8 +192,37 @@ impl<T> WrappedTensor<T>
 where
     T: TensorTypeParam,
 {
+    /// Returns a `Vec` with the elements from this tensor.
+    ///
+    /// NOTE: This is a blocking call that will cause synchronization with the
+    /// acceleration hardware. For external GPUs this will wait for the tensor
+    /// to be computed and then download the resulting data from the card.
+    pub fn get_data(&self) -> Vec<T> {
+        self.clone().to_data().into_vec().unwrap()
+    }
+
+    /// Converts the tensor into a primitive tensor.
+    pub fn into_primitive(self) -> <T::Kind as BTensorKind<Backend>>::Primitive {
+        delegate_plain!(self, into_primitive)
+    }
+
+    /// Returns a [WrappedTensor] filled with random data of `shape`.
+    pub fn random(shape: &Shape) -> Self {
+        Self::try_from(Tensor::random(shape)).unwrap()
+    }
+
+    /// Returns a copy of this tensor's [BShape].
+    pub fn shape(&self) -> BShape {
+        delegate_plain!(self, shape)
+    }
+}
+
+impl<T> WrappedTensor<T>
+where
+    T: TensorTypeParam,
+{
     /// Returns the wrapped tensor's rank.
-    pub const fn rank(&self) -> usize {
+    pub(crate) const fn rank(&self) -> usize {
         match self {
             Self::Rank1 { .. } => 1,
             Self::Rank2 { .. } => 2,
@@ -202,16 +231,11 @@ where
         }
     }
 
-    /// Returns a copy of this tensor's [BShape].
-    pub fn shape(&self) -> BShape {
-        delegate_plain!(self, shape)
-    }
-
     /// Reshape the tensor to have the given shape.
     ///
     /// NOTE: This will change the `unpadded_shape` accordingly, as if a similar
     /// operation was applied to a tensor of that shape.
-    pub fn reshape(self, new_shape: BShape) -> Result<WrappedTensor<T>> {
+    pub(crate) fn reshape(self, new_shape: BShape) -> Result<WrappedTensor<T>> {
         let new_unpadded = if !self.is_padded() {
             new_shape.clone()
         } else {
@@ -274,7 +298,7 @@ where
     }
 
     /// Returns a reference to the `unpadded_shape`.
-    pub fn unpadded_shape(&self) -> &BShape {
+    pub(crate) fn unpadded_shape(&self) -> &BShape {
         match self {
             WrappedTensor::Rank1 { unpadded_shape, .. } => unpadded_shape,
             WrappedTensor::Rank2 { unpadded_shape, .. } => unpadded_shape,
@@ -284,7 +308,7 @@ where
     }
 
     /// Returns a mutable reference to the `unpadded_shape`.
-    pub fn unpadded_shape_mut(&mut self) -> &mut BShape {
+    pub(crate) fn unpadded_shape_mut(&mut self) -> &mut BShape {
         match self {
             WrappedTensor::Rank1 { unpadded_shape, .. } => unpadded_shape,
             WrappedTensor::Rank2 { unpadded_shape, .. } => unpadded_shape,
@@ -294,7 +318,7 @@ where
     }
 
     /// Set the `unpadded_shape`.
-    pub fn set_unpadded_shape(&mut self, new_shape: BShape) {
+    pub(crate) fn set_unpadded_shape(&mut self, new_shape: BShape) {
         match self {
             WrappedTensor::Rank1 { unpadded_shape, .. } => *unpadded_shape = new_shape,
             WrappedTensor::Rank2 { unpadded_shape, .. } => *unpadded_shape = new_shape,
@@ -304,12 +328,12 @@ where
     }
 
     /// `True` if the `unpadded_shape` and `shape` differ.
-    pub fn is_padded(&self) -> bool {
+    pub(crate) fn is_padded(&self) -> bool {
         self.unpadded_shape() != &self.shape()
     }
 
     /// Creates a tensor from [TensorData].
-    pub fn from_data(data: TensorData) -> Result<Self> {
+    pub(crate) fn from_data(data: TensorData) -> Result<Self> {
         let rank = data.shape.len();
         let unpadded_shape = BShape::from(&data.shape);
         let out = match rank {
@@ -339,26 +363,12 @@ where
     /// NOTE: This is a blocking call that will cause synchronization with the
     /// acceleration hardware. For external GPUs this will wait for the tensor
     /// to be computed and then download the resulting data from the card.
-    pub fn to_data(&self) -> TensorData {
+    pub(crate) fn to_data(&self) -> TensorData {
         delegate_plain!(self, to_data)
     }
 
-    /// Returns a `Vec` with the elements from this tensor.
-    ///
-    /// NOTE: This is a blocking call that will cause synchronization with the
-    /// acceleration hardware. For external GPUs this will wait for the tensor
-    /// to be computed and then download the resulting data from the card.
-    pub fn get_data(&self) -> Vec<T> {
-        self.clone().to_data().into_vec().unwrap()
-    }
-
-    /// Converts the tensor into a primitive tensor.
-    pub fn into_primitive(self) -> <T::Kind as BTensorKind<Backend>>::Primitive {
-        delegate_plain!(self, into_primitive)
-    }
-
     /// Concatenates all tensors into a new one along the given dimension.
-    pub fn cat(tensors: Vec<Self>, dim: usize) -> Result<Self> {
+    pub(crate) fn cat(tensors: Vec<Self>, dim: usize) -> Result<Self> {
         ensure!(tensors.len() > 1, "There must be at least one tensor");
 
         let mut unpadded_shape = tensors[0].unpadded_shape().clone();
@@ -425,68 +435,8 @@ where
         }
     }
 
-    /// Attempts to split the tensor into a specified number of chunks along a
-    /// given dimension.
-    ///
-    /// May return less chunks than requested if the tensor size is not
-    /// divisible by the number of chunks.
-    pub fn chunk(self, chunks: usize, dim: usize) -> Result<Vec<Self>> {
-        ensure!(
-            dim < self.rank(),
-            "Chunk dimension {dim} out of bounds for tensor of rank {}",
-            self.rank(),
-        );
-
-        let original_shape = self.shape();
-        let original_unpadded = self.unpadded_shape().clone();
-
-        // Every dimension should have at least one non padding element.
-        // XXX: Unclear what exactly should be the rule here, this is a relaxed approach.
-        let padding = original_shape.dims[dim] - original_unpadded.dims[dim];
-        ensure!(
-            padding <= chunks,
-            "Chunk must not be larger than the padding to include at least one non-padding element",
-        );
-
-        let mut out: Vec<Self> = match self {
-            WrappedTensor::Rank1 { tensor, .. } => tensor
-                .chunk(chunks, dim)
-                .into_iter()
-                .map(WrappedTensor::from)
-                .collect(),
-            WrappedTensor::Rank2 { tensor, .. } => tensor
-                .chunk(chunks, dim)
-                .into_iter()
-                .map(WrappedTensor::from)
-                .collect(),
-            WrappedTensor::Rank3 { tensor, .. } => tensor
-                .chunk(chunks, dim)
-                .into_iter()
-                .map(WrappedTensor::from)
-                .collect(),
-            WrappedTensor::Rank4 { tensor, .. } => tensor
-                .chunk(chunks, dim)
-                .into_iter()
-                .map(WrappedTensor::from)
-                .collect(),
-        };
-
-        // fix the unpadded shape, compute the equivalent shape after chunking
-        if original_shape != original_unpadded {
-            let last = out.last_mut().expect("At least one tensor");
-
-            let new_size = original_unpadded.dims[dim] % chunks;
-            let mut new_unpadded_shape = last.unpadded_shape().clone();
-            new_unpadded_shape.dims[dim] = new_size;
-
-            last.set_unpadded_shape(new_unpadded_shape);
-        }
-
-        Ok(out)
-    }
-
     /// Find the maximum absolute value.
-    pub fn max_abs(self) -> Self {
+    pub(crate) fn max_abs(self) -> Self {
         let tensor = delegate_plain!(self, max_abs);
 
         // fix the unpadded shape, the final tensor shape is `[1]`
@@ -499,7 +449,7 @@ where
     }
 
     /// Find the maximum value.
-    pub fn max(self) -> Self {
+    pub(crate) fn max(self) -> Self {
         let tensor = delegate_plain!(self, max);
 
         // fix the unpadded shape, the final tensor shape is `[1]`
@@ -512,7 +462,7 @@ where
     }
 
     /// Find the minimum value.
-    pub fn min(self) -> Self {
+    pub(crate) fn min(self) -> Self {
         let tensor = delegate_plain!(self, min);
 
         // fix the unpadded shape, the final tensor shape is `[1]`
@@ -528,7 +478,7 @@ where
     ///
     /// For a 2D tensor, this is the standard matrix transpose. For `D > 2`, the transpose is
     /// applied on the last two dimensions. For example, the transpose of a tensor with shape
-    pub fn transpose(self) -> Self {
+    pub(crate) fn transpose(self) -> Self {
         let mut result = delegate!(self, transpose);
 
         // fix the unpadded shape, apply the transform operation for it too
@@ -542,7 +492,7 @@ where
 
     /// Squeeze the tensor along the given dimension, removing the specified dimension
     /// of size one, and effectively reducing the rank of the tensor by one.
-    pub fn squeeze(self, dim: usize) -> Result<Self> {
+    pub(crate) fn squeeze(self, dim: usize) -> Result<Self> {
         let mut unpadded_shape = self.unpadded_shape().clone();
         ensure!(
             unpadded_shape.dims.remove(dim) == 1,
@@ -569,7 +519,7 @@ where
     }
 
     /// Select tensor elements along the given dimension corresponding to the given indices.
-    pub fn select(
+    pub(crate) fn select(
         self,
         dim: impl AsIndex,
         indices: WrappedTensor<Element>,
@@ -609,57 +559,39 @@ where
 
     /// Applies element wise addition operation.
     #[allow(clippy::should_implement_trait)]
-    pub fn add(self, other: Self) -> Result<Self> {
+    pub(crate) fn add(self, other: Self) -> Result<Self> {
         delegate_binop!(self, add, other)
     }
 
     /// Applies element wise addition operation with a scalar.
-    pub fn add_scalar(self, other: T) -> Self {
+    pub(crate) fn add_scalar(self, other: T) -> Self {
         delegate!(self, add_scalar, other)
     }
 
     /// Applies element wise subtraction operation.
     #[allow(clippy::should_implement_trait)]
-    pub fn sub(self, other: Self) -> Result<Self> {
+    pub(crate) fn sub(self, other: Self) -> Result<Self> {
         delegate_binop!(self, sub, other)
-    }
-
-    /// Applies element wise subtraction operation with a scalar.
-    #[allow(clippy::should_implement_trait)]
-    pub fn sub_scalar(self, other: T) -> Self {
-        delegate!(self, sub_scalar, other)
     }
 
     /// Applies element wise multiplication operation.
     #[allow(clippy::should_implement_trait)]
-    pub fn mul(self, other: Self) -> Result<Self> {
+    pub(crate) fn mul(self, other: Self) -> Result<Self> {
         delegate_binop!(self, mul, other)
     }
 
     /// Applies element wise multiplication operation with a scalar.
-    pub fn mul_scalar(self, other: T) -> Self {
+    pub(crate) fn mul_scalar(self, other: T) -> Self {
         delegate!(self, mul_scalar, other)
     }
 
-    /// Applies element wise division operation.
-    #[allow(clippy::should_implement_trait)]
-    pub fn div(self, other: Self) -> Result<Self> {
-        delegate_binop!(self, div, other)
-    }
-
     /// Applies element wise division operation with a scalar.
-    pub fn div_scalar(self, other: T) -> Self {
+    pub(crate) fn div_scalar(self, other: T) -> Self {
         delegate!(self, div_scalar, other)
     }
 
-    /// Switch sign of each element in the tensor.
-    #[allow(clippy::should_implement_trait)]
-    pub fn neg(self) -> Self {
-        delegate!(self, neg)
-    }
-
     /// Applies the matrix multiplication operation.
-    pub fn matmul(self, other: Self) -> Result<Self> {
+    pub(crate) fn matmul(self, other: Self) -> Result<Self> {
         fn batch_dim(left_dim: usize, right_dim: usize) -> usize {
             if left_dim == right_dim {
                 left_dim
@@ -766,32 +698,27 @@ where
     }
 
     /// Clamp element wise between the given min and max values.
-    pub fn clamp(self, min: T, max: T) -> Self {
+    pub(crate) fn clamp(self, min: T, max: T) -> Self {
         delegate!(self, clamp, min, max)
     }
 
     /// Clamp element wise over a minimum value.
-    pub fn clamp_min(self, min: T) -> Self {
+    pub(crate) fn clamp_min(self, min: T) -> Self {
         delegate!(self, clamp_min, min)
     }
 
     /// Clamp element wise over a maximum value.
-    pub fn clamp_max(self, max: T) -> Self {
+    pub(crate) fn clamp_max(self, max: T) -> Self {
         delegate!(self, clamp_max, max)
     }
 
     /// Aggregate all elements along the given dimension or axis in the tensor with the sum operation.
-    pub fn sum_dim(self, dim: isize) -> Self {
+    pub(crate) fn sum_dim(self, dim: isize) -> Self {
         delegate!(self, sum_dim, dim)
     }
 
-    /// Returns a new tensor with the same shape and device as the current tensor filled with the provided value.
-    pub fn full_like(self, fill_value: T) -> Self {
-        delegate!(self, full_like, fill_value)
-    }
-
     /// Find the maximum value along the given dimension.
-    pub fn max_dim(self, dim: isize) -> Self {
+    pub(crate) fn max_dim(self, dim: isize) -> Self {
         let mut result = delegate!(self, max_dim, dim);
 
         // fix the unpadded shape, apply the transform operation for it too
@@ -805,31 +732,8 @@ where
         result
     }
 
-    /// Aggregate all elements along the given *dimension* or *axis* in the
-    /// tensor with the mean operation.
-    pub fn mean_dim(self, dim: isize) -> Self {
-        let mut result = delegate!(self, mean_dim, dim);
-
-        // fix the unpadded shape, apply the transform operation for it too
-        let dim = if dim < 0 {
-            (result.rank() as isize) + dim
-        } else {
-            dim
-        };
-        result.unpadded_shape_mut()[dim as usize] = 1;
-
-        result
-    }
-
-    /// Perform matrix-vector multiplication
-    pub fn matvec(self, other: Self) -> anyhow::Result<Self> {
-        let rank = other.shape().rank();
-        let other = other.unsqueeze_dim(rank)?;
-        self.matmul(other)?.squeeze(rank)
-    }
-
     /// Flatten the tensor into 1D shape.
-    pub fn flatten_1d(self) -> Self {
+    pub(crate) fn flatten_1d(self) -> Self {
         let end_dim = self.rank() - 1;
         let unpadded_shape = self.unpadded_shape().clone().flatten();
         let tensor = delegate_plain!(self, flatten, 0, end_dim);
@@ -840,7 +744,7 @@ where
     }
 
     /// Flatten the tensor along a given range of dimensions into 2 dimensions.
-    pub fn flatten_to_dim_2(self, start_dim: usize, end_dim: usize) -> Self {
+    pub(crate) fn flatten_to_dim_2(self, start_dim: usize, end_dim: usize) -> Self {
         let mut unpadded_shape = self.unpadded_shape().clone();
         let new_size = unpadded_shape.dims.drain(start_dim..=end_dim).product();
         unpadded_shape.dims.insert(start_dim, new_size);
@@ -852,7 +756,7 @@ where
     }
 
     ///  Find the maximum value along the given dimension.
-    pub fn max_dim_with_indices(self, dim: usize) -> (Self, WrappedTensor<Element>) {
+    pub(crate) fn max_dim_with_indices(self, dim: usize) -> (Self, WrappedTensor<Element>) {
         // XXX: fix unpadded shapes
         match self {
             WrappedTensor::Rank1 {
@@ -923,7 +827,7 @@ where
     }
 
     /// Unsqueeze the current tensor. Create new leading dimensions to fit 2 dimensions.
-    pub fn unsqueeze_dim_2(self) -> Self {
+    pub(crate) fn unsqueeze_dim_2(self) -> Self {
         let mut unpadded_shape = self.unpadded_shape().clone();
         while unpadded_shape.len() != 2 {
             unpadded_shape.dims.insert(0, 1);
@@ -936,22 +840,8 @@ where
         }
     }
 
-    /// Unsqueeze the current tensor. Create new leading dimensions to fit 3 dimensions.
-    pub fn unsqueeze_dim_3(self) -> Self {
-        let mut unpadded_shape = self.unpadded_shape().clone();
-        while unpadded_shape.len() != 3 {
-            unpadded_shape.dims.insert(0, 1);
-        }
-
-        let tensor = delegate_plain!(self, unsqueeze, (3),);
-        WrappedTensor::Rank3 {
-            tensor,
-            unpadded_shape,
-        }
-    }
-
     /// Unsqueeze the current tensor. Create new leading dimensions to fit 4 dimensions.
-    pub fn unsqueeze_dim_4(self) -> Self {
+    pub(crate) fn unsqueeze_dim_4(self) -> Self {
         let mut unpadded_shape = self.unpadded_shape().clone();
         while unpadded_shape.len() != 4 {
             unpadded_shape.dims.insert(0, 1);
@@ -965,7 +855,7 @@ where
     }
 
     /// Creates a new tensor with a dimension of size one inserted at the specified position.
-    pub fn unsqueeze_dim(self, dim: usize) -> Result<Self> {
+    pub(crate) fn unsqueeze_dim(self, dim: usize) -> Result<Self> {
         let mut unpadded_shape = self.unpadded_shape().clone();
         unpadded_shape.dims.insert(dim, 1);
 
@@ -988,7 +878,7 @@ where
     }
 
     /// Iterate over slices of tensors alongside a given dimension.
-    pub fn iter_dim(self, dim: usize) -> DimIter<T> {
+    pub(crate) fn iter_dim(self, dim: usize) -> DimIter<T> {
         match self {
             WrappedTensor::Rank1 {
                 tensor,
@@ -1022,7 +912,7 @@ where
     }
 
     /// Permute the dimensions of the tensor.
-    pub fn permute(self, axes: &[isize]) -> Result<Self> {
+    pub(crate) fn permute(self, axes: &[isize]) -> Result<Self> {
         let out = match self {
             WrappedTensor::Rank1 {
                 tensor,
@@ -1105,7 +995,7 @@ where
     }
 
     /// Returns a tensor containing the elements selected from the given ranges.
-    pub fn slice<R>(self, ranges: R) -> Self
+    pub(crate) fn slice<R>(self, ranges: R) -> Self
     where
         R: Clone + SliceArg,
     {
@@ -1152,7 +1042,7 @@ where
     }
 
     /// Returns a new tensor with the specified dimension sliced.
-    pub fn slice_dim<S>(self, dim: usize, slice: S) -> Self
+    pub(crate) fn slice_dim<S>(self, dim: usize, slice: S) -> Self
     where
         S: Into<Slice>,
     {
@@ -1174,14 +1064,14 @@ where
     ///
     /// - start: New start for the first dimension, inclusive.
     /// - end: New end for the first dimension, exclusive.
-    pub fn slice_2d(self, start: usize, end: usize) -> Self {
+    pub(crate) fn slice_2d(self, start: usize, end: usize) -> Self {
         self.slice_dim(0, start..end)
     }
 
     /// Returns the size of the given dimension.
     ///
     /// When given a negative `dim` indexes from the back.
-    pub fn dim(&self, dim: isize) -> Result<usize> {
+    pub(crate) fn dim(&self, dim: isize) -> Result<usize> {
         match self {
             WrappedTensor::Rank1 { tensor, .. } => {
                 let dim = if dim < 0 {
@@ -1235,7 +1125,10 @@ where
     }
 
     /// Broadcast the tensor to the given shape.
-    pub fn expand<const D: usize, S: Clone + BroadcastArgs<D, D>>(self, shape: S) -> Result<Self> {
+    pub(crate) fn expand<const D: usize, S: Clone + BroadcastArgs<D, D>>(
+        self,
+        shape: S,
+    ) -> Result<Self> {
         let unpadded_shape = shape.clone().into_shape(self.unpadded_shape());
         let shape = shape.into_shape(&self.shape());
 
@@ -1264,7 +1157,7 @@ where
     /// Copies the sub-slice `shape` from this tensor.
     ///
     /// Returns a new [Tensor] with shape `shape` initialised from `self`.
-    pub fn reduce_to_shape(self, shape: &BShape) -> Result<Self> {
+    pub(crate) fn reduce_to_shape(self, shape: &BShape) -> Result<Self> {
         let out = match shape.num_dims() {
             1 => self.slice(shape.dims::<1>().map(|i| 0..i)),
             2 => self.slice(shape.dims::<2>().map(|i| 0..i)),
@@ -1275,32 +1168,12 @@ where
         Ok(out)
     }
 
-    pub fn reduce_to_unpadded_shape(self) -> Result<Self> {
+    pub(crate) fn reduce_to_unpadded_shape(self) -> Result<Self> {
         let unpadded_shape = self.unpadded_shape().clone();
         self.reduce_to_shape(&unpadded_shape)
     }
 
-    /// Update the given tensor with the value where the mask is true.
-    pub fn mask_fill_4d(
-        self,
-        mask: BTensor<Backend, 4, burn::tensor::Bool>,
-        value: T,
-    ) -> Result<Self> {
-        let input_rank = self.rank();
-        let Self::Rank4 {
-            tensor,
-            unpadded_shape,
-        } = self
-        else {
-            bail!("Unexpected input rank: {input_rank}, expected 4.")
-        };
-        Ok(WrappedTensor::Rank4 {
-            tensor: tensor.mask_fill(mask, value),
-            unpadded_shape,
-        })
-    }
-
-    pub fn mask_fill(
+    pub(crate) fn mask_fill(
         self,
         mask: BTensor<Backend, 2, burn::tensor::Bool>,
         value: T,
@@ -1342,7 +1215,7 @@ where
     }
 
     /// Pads the tensor to the new shape.
-    pub fn pad(self, new_shape: BShape, pad_value: T) -> anyhow::Result<Self> {
+    pub(crate) fn pad(self, new_shape: BShape, pad_value: T) -> anyhow::Result<Self> {
         let curr_shape = self.shape();
 
         ensure!(
@@ -1416,7 +1289,7 @@ where
     }
 
     /// Pads the tensor to the next power-of-two.
-    pub fn pad_next_power_of_two(self) -> Self {
+    pub(crate) fn pad_next_power_of_two(self) -> Self {
         let BShape { dims } = self.shape();
         let shape = BShape {
             dims: dims.next_power_of_two(),
@@ -1439,7 +1312,7 @@ where
     /// convolution is such that`X' = fft(X)`, here `M` is padded to `M'` such
     /// that `M * X == M' * X'`, ensuring the result remains consistent despite
     /// the padding in `X'`.
-    pub fn pad_matrix_to_ignore_garbage(
+    pub(crate) fn pad_matrix_to_ignore_garbage(
         self,
         conv_shape_og: &Shape,
         conv_shape_pad: &Shape,
@@ -1498,12 +1371,7 @@ where
         })
     }
 
-    /// Returns a [WrappedTensor] filled with random data of `shape`.
-    pub fn random(shape: &Shape) -> Self {
-        Self::try_from(Tensor::random(shape)).unwrap()
-    }
-
-    pub fn equal_elem<const D: usize>(
+    pub(crate) fn equal_elem<const D: usize>(
         self,
         elem: T,
     ) -> Result<BTensor<Backend, D, burn::tensor::Bool>> {
@@ -1550,7 +1418,7 @@ where
     /// Transforms this tensor by centering its rows around the mean.
     ///
     /// This has the effect of making the mean of a row equal to zero.
-    pub fn mean_center_rows(self) -> Self {
+    pub(crate) fn mean_center_rows(self) -> Self {
         match self {
             WrappedTensor::Rank1 {
                 tensor,
@@ -1609,45 +1477,45 @@ where
 
     /// Utility to make tests more readable
     #[cfg(test)]
-    pub fn to_native(&self) -> Tensor<T> {
+    pub(crate) fn to_native(&self) -> Tensor<T> {
         Tensor::try_from(self.clone()).unwrap()
     }
 }
 
 impl WrappedTensor<f32> {
     /// Applies element wise root square operation.
-    pub fn sqrt(self) -> Self {
+    pub(crate) fn sqrt(self) -> Self {
         delegate!(self, sqrt)
     }
 
     /// Applies reciprocal operation (or multiplicative inverse) element wise.
-    pub fn recip(self) -> Self {
+    pub(crate) fn recip(self) -> Self {
         delegate!(self, recip)
     }
 
     /// Applies element wise round operation.
-    pub fn round(self) -> Self {
+    pub(crate) fn round(self) -> Self {
         delegate!(self, round)
     }
 
     /// Returns a new tensor with the same shape and device as the current tensor and the data cast to Integer.
-    pub fn int(self) -> WrappedTensor<Element> {
+    pub(crate) fn int(self) -> WrappedTensor<Element> {
         delegate!(self, int)
     }
 
     /// Performs exp element-wise on the tensor.
-    pub fn exp(self) -> Self {
+    pub(crate) fn exp(self) -> Self {
         delegate!(self, exp)
     }
 
     /// Performs ln (natural logarithm) element-wise on the tensor.
-    pub fn log(self) -> Self {
+    pub(crate) fn log(self) -> Self {
         delegate!(self, log)
     }
 
     /// Applies the Gaussian Error Linear Units function as described in the paper
     /// [Gaussian Error Linear Units (GELUs)](https://arxiv.org/pdf/1606.08415v3.pdf).
-    pub fn gelu(input: Self) -> Self {
+    pub(crate) fn gelu(input: Self) -> Self {
         match input {
             WrappedTensor::Rank1 {
                 tensor,
@@ -1680,7 +1548,7 @@ impl WrappedTensor<f32> {
         }
     }
 
-    pub fn conv2d(
+    pub(crate) fn conv2d(
         input: Self,
         weight: Self,
         bias: Option<Self>,
@@ -1715,7 +1583,7 @@ impl WrappedTensor<f32> {
         })
     }
 
-    pub fn max_pool2d(
+    pub(crate) fn max_pool2d(
         input: Self,
         kernel_size: [usize; 2],
         stride: [usize; 2],
@@ -1738,7 +1606,7 @@ impl WrappedTensor<f32> {
         })
     }
 
-    pub fn layer_norm(
+    pub(crate) fn layer_norm(
         self,
         embedding_size: usize,
         epsilon: f64,
@@ -1773,7 +1641,7 @@ impl WrappedTensor<f32> {
         })
     }
 
-    pub fn softmax(tensor: Self, dim: usize) -> Result<Self> {
+    pub(crate) fn softmax(tensor: Self, dim: usize) -> Result<Self> {
         ensure!(
             dim < tensor.rank(),
             "Softmax dimension {dim} out of bounds, (tensor rank: {}).",
@@ -1811,7 +1679,7 @@ impl WrappedTensor<f32> {
         }
     }
 
-    pub fn rms_norm_forward(
+    pub(crate) fn rms_norm_forward(
         self,
         embedding_size: usize,
         epsilon: f64,
@@ -1878,21 +1746,21 @@ impl WrappedTensor<f32> {
 
 impl WrappedTensor<Element> {
     /// Applies the bitwise right shift operation with the scalar.
-    pub fn bitwise_right_shift_scalar(self, other: Element) -> Self {
+    pub(crate) fn bitwise_right_shift_scalar(self, other: Element) -> Self {
         delegate!(self, bitwise_right_shift_scalar, other)
     }
 
     /// Applies the bitwise left shift operation with the scalar.
-    pub fn bitwise_left_shift_scalar(self, other: Element) -> Self {
+    pub(crate) fn bitwise_left_shift_scalar(self, other: Element) -> Self {
         delegate!(self, bitwise_left_shift_scalar, other)
     }
 
     /// Convert the element tensor into a float tensor.
-    pub fn float(self) -> WrappedTensor<f32> {
+    pub(crate) fn float(self) -> WrappedTensor<f32> {
         delegate!(self, float)
     }
 
-    pub fn conv2d(x: Self, weight: Self, bias: Self, options: Conv2dConfig) -> Result<Self> {
+    pub(crate) fn conv2d(x: Self, weight: Self, bias: Self, options: Conv2dConfig) -> Result<Self> {
         let x_rank = x.rank();
         let Self::Rank4 {
             tensor: input,
@@ -1916,7 +1784,7 @@ impl WrappedTensor<Element> {
         })
     }
 
-    pub fn max_pool2d(input: Self, config: Maxpool2dConfig) -> Result<Self> {
+    pub(crate) fn max_pool2d(input: Self, config: Maxpool2dConfig) -> Result<Self> {
         let input_rank = input.rank();
         let Self::Rank4 {
             tensor: input,
@@ -2410,6 +2278,27 @@ where
 mod test {
     use super::*;
     use proptest::prelude::*;
+
+    impl<T> WrappedTensor<T>
+    where
+        T: TensorTypeParam,
+    {
+        /// Aggregate all elements along the given *dimension* or *axis* in the
+        /// tensor with the mean operation.
+        pub(crate) fn mean_dim(self, dim: isize) -> Self {
+            let mut result = delegate!(self, mean_dim, dim);
+
+            // fix the unpadded shape, apply the transform operation for it too
+            let dim = if dim < 0 {
+                (result.rank() as isize) + dim
+            } else {
+                dim
+            };
+            result.unpadded_shape_mut()[dim as usize] = 1;
+
+            result
+        }
+    }
 
     #[test]
     fn test_tensor_next_pow_of_two() {

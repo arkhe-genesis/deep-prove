@@ -21,32 +21,24 @@ impl<T> KeyedTensor<T> {
             tensor,
         }
     }
+}
 
+impl<T> KeyedTensor<T> {
     /// Returns a reference to this tensor's [StorageKey].
-    pub fn storage_key(&self) -> &StorageKey<T> {
+    pub(crate) fn storage_key(&self) -> &StorageKey<T> {
         &self.key
     }
 
-    pub fn commitment_id(&self) -> CommitmentId {
+    pub(crate) fn commitment_id(&self) -> CommitmentId {
         (&self.key).into()
     }
 
-    /// Consumes the [KeyedTensor] and returns the internal [Tensor].
-    pub fn into_tensor(self) -> Tensor<T> {
-        self.tensor
-    }
-
     /// Returns a reference to the internal [Tensor].
-    pub fn tensor(&self) -> &Tensor<T> {
+    pub(crate) fn tensor(&self) -> &Tensor<T> {
         &self.tensor
     }
 
-    /// Returns a mutable reference to the internal [Tensor].
-    pub fn tensor_mut(&mut self) -> &mut Tensor<T> {
-        &mut self.tensor
-    }
-
-    pub fn try_map_tensor<U>(
+    pub(crate) fn try_map_tensor<U>(
         self,
         f: impl FnOnce(Tensor<T>) -> anyhow::Result<Tensor<U>>,
     ) -> anyhow::Result<KeyedTensor<U>> {
@@ -56,30 +48,9 @@ impl<T> KeyedTensor<T> {
         })
     }
 
-    pub fn try_new_map_tensor<U>(
-        &self,
-        f: impl FnOnce(&Tensor<T>) -> anyhow::Result<Tensor<U>>,
-    ) -> anyhow::Result<KeyedTensor<U>> {
-        Ok(KeyedTensor {
-            key: self.key.cast::<U>(),
-            tensor: f(&self.tensor)?,
-        })
-    }
-
     /// Consumes the [KeyedTensor] and returns its parts.
     pub(crate) fn into_parts(self) -> (Tensor<T>, StorageKey<T>) {
         (self.tensor, self.key)
-    }
-}
-
-impl<T: Copy + Default> KeyedTensor<T> {
-    /// Pads the tensor to the next power-of-two.
-    pub fn pad_next_power_of_two(&self) -> Self {
-        let tensor = self.tensor.pad_next_power_of_two();
-        Self {
-            key: self.key.clone(),
-            tensor,
-        }
     }
 }
 
@@ -107,6 +78,18 @@ where
         KeyedTensor {
             key: self.key.cast::<<T as Quantize>::Output>(),
             tensor: self.tensor.quantize(scaling),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Tensor, tensor::KeyedTensor};
+
+    impl<T> KeyedTensor<T> {
+        /// Consumes the [KeyedTensor] and returns the internal [Tensor].
+        pub(crate) fn into_tensor(self) -> Tensor<T> {
+            self.tensor
         }
     }
 }
