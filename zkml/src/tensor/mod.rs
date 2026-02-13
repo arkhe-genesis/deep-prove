@@ -199,11 +199,6 @@ impl<T> Tensor<T> {
         self.data
     }
 
-    /// Mutable Iterator over the data in the tensor
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.data.iter_mut()
-    }
-
     /// Returns an iterator that yields slices of the last dimension.
     ///
     /// For a tensor of shape `[2, 3, 3]`, it will yield 6 slices `2 * 3` of 3 elements each.
@@ -345,33 +340,6 @@ impl Tensor<Element> {
     }
 }
 
-impl Tensor<f32> {
-    /// Transforms this tensor by centering its rows around the mean.
-    ///
-    /// This has the effect of making the mean of a row equal to zero.
-    pub(crate) fn mean_center_rows(&self) -> Self {
-        let shape = self.shape();
-        let row_size = shape.dim(-1);
-
-        let subtract_mean_matrix = (0..row_size)
-            .flat_map(|i| {
-                (0..row_size).map(move |j| if i == j { row_size as f32 - 1.0 } else { -1.0 })
-            })
-            .collect::<Vec<f32>>();
-
-        let subtract_mean_tensor =
-            Tensor::new(Shape::new(vec![row_size, row_size]), subtract_mean_matrix)
-                .expect("Failed to create mean subtraction tensor");
-        let mut modified_matrix = self
-            .matmul(&subtract_mean_tensor)
-            .expect("Failed to right-multiply by mean subtraction matrix");
-        modified_matrix
-            .iter_mut()
-            .for_each(|x| *x /= row_size as f32);
-        modified_matrix
-    }
-}
-
 impl<F> Tensor<F>
 where
     F: ExtensionField,
@@ -475,39 +443,6 @@ where
             .par_iter()
             .cloned()
             .reduce(|| T::zero(), |max, x| max.cmp_max(&x.absolute_value()))
-    }
-
-    /// Perform matrix-matrix multiplication
-    pub(crate) fn matmul(&self, other: &Tensor<T>) -> Result<Tensor<T>> {
-        ensure!(
-            self.shape.is_matrix() && other.shape.is_matrix(),
-            "Both tensors must be 2D for matrix multiplication."
-        );
-        let (m, n) = (self.shape[0], self.shape[1]);
-        let (n2, p) = (other.shape[0], other.shape[1]);
-        ensure!(
-            n == n2,
-            "Matrix multiplication shape mismatch: {:?} cannot be multiplied with {:?}",
-            self.shape,
-            other.shape
-        );
-
-        let mut result = Tensor::zeros(vec![m, p].into());
-
-        result
-            .data
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(index, res)| {
-                let i = index / p;
-                let j = index % p;
-
-                *res = (0..n)
-                    .map(|k| self.data[i * n + k] * other.data[k * p + j])
-                    .sum::<T>();
-            });
-
-        Ok(result)
     }
 
     /// Transpose the matrix (2D tensor)
@@ -1081,6 +1016,39 @@ mod test {
             position
         }
 
+        /// Perform matrix-matrix multiplication
+        pub(crate) fn matmul(&self, other: &Tensor<T>) -> Result<Tensor<T>> {
+            ensure!(
+                self.shape.is_matrix() && other.shape.is_matrix(),
+                "Both tensors must be 2D for matrix multiplication."
+            );
+            let (m, n) = (self.shape[0], self.shape[1]);
+            let (n2, p) = (other.shape[0], other.shape[1]);
+            ensure!(
+                n == n2,
+                "Matrix multiplication shape mismatch: {:?} cannot be multiplied with {:?}",
+                self.shape,
+                other.shape
+            );
+
+            let mut result = Tensor::zeros(vec![m, p].into());
+
+            result
+                .data
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(index, res)| {
+                    let i = index / p;
+                    let j = index % p;
+
+                    *res = (0..n)
+                        .map(|k| self.data[i * n + k] * other.data[k * p + j])
+                        .sum::<T>();
+                });
+
+            Ok(result)
+        }
+
         /// Perform matrix-vector multiplication
         pub(crate) fn matvec(&self, vector: &Tensor<T>) -> Result<Tensor<T>> {
             ensure!(self.shape.is_matrix(), "First argument must be a matrix.");
@@ -1480,7 +1448,7 @@ mod test {
         /// # Error
         ///
         /// - If the accessor dimensionality doesn't match the shape.
-        pub(crate) fn get(&self, accessors: Vec<usize>) -> Result<T> {
+        pub(crate) fn get(&self, accessors: impl AsRef<[usize]>) -> Result<T> {
             let flat_index = self.shape().get_idx(accessors)?;
             Ok(self.data[flat_index])
         }
@@ -2302,8 +2270,8 @@ mod test {
             for j in 0..3 {
                 for k in 0..3 {
                     let [new_i, new_j, new_k] = [j, i, k];
-                    let expected = tensor.get(vec![i, j, k]).unwrap();
-                    let given = permuted.get(vec![new_i, new_j, new_k]).unwrap();
+                    let expected = tensor.get([i, j, k]).unwrap();
+                    let given = permuted.get([new_i, new_j, new_k]).unwrap();
                     assert_eq!(expected, given);
                 }
             }

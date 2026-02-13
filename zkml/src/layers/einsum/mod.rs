@@ -12,12 +12,11 @@
 //! their axes, the axes appear after a tensor name inside the parenthesis. The
 //! optional keyword `BIAS` is reserved for bias tensors.
 //!
-//! The left hand side must a single `@` identifier the first input, this input
-//! cannot be a constant tensor, the input tensor is followed by an arbitrary
-//! number of inputs separated by `:` which are either constant or witness
-//! tensors.
+//! The left hand side must have a single `@` separator, isolating the first input.
+//! The input cannot be a constant tensor, it is followed by an arbitrary number
+//! of tensos separated by `:` which are either constant or witness tensors.
 //!
-//! The right hand size is composed of expressions with an optional `BIAS`
+//! The right hand size is composed of an expressions with an optional `BIAS`
 //! expression, the `BIAS` dimensions must be a subset of its addition pair. E.g
 //! `Q(sh)` or with bias `Q(sh)+BIAS(h)`.
 //!

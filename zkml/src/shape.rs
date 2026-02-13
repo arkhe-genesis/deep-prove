@@ -575,7 +575,8 @@ mod test {
         /// # Error
         ///
         /// - If the accessor dimensionality doesn't match the shape.
-        pub(crate) fn get_idx(&self, accessors: Vec<usize>) -> anyhow::Result<usize> {
+        pub(crate) fn get_idx(&self, accessors: impl AsRef<[usize]>) -> anyhow::Result<usize> {
+            let accessors = accessors.as_ref();
             ensure!(self.len() == accessors.len());
             let idx = accessors
                 .iter()

@@ -192,7 +192,24 @@ fn positional_was_previous_layer(model: &mut Model<f32>, input_node_id: NodeId) 
 /// a square matrix with `(row_size - 1) / row_size` along the diagonal and `-1 / row_size` everywhere else.
 fn modify_matrix_subtract_mean(node: &mut Layer<f32>) -> Result<()> {
     match node {
-        Layer::<f32>::Positional(positional) => modify_positional(positional),
+        Layer::<f32>::Positional(positional) => {
+            *positional = match &mut positional.variant {
+                PositionalVariant::Absolute(absolute) => {
+                    let Absolute::<f32> { positional, .. } = absolute;
+                    let wrapped_tensor = positional.take_wrapped_tensor()?;
+                    let centered = wrapped_tensor.mean_center_rows();
+                    let mut handle = positional.clone();
+                    handle.set_wrapped_tensor(centered)?;
+                    Positional::new_absolute(handle)?
+                }
+                PositionalVariant::Rope(_) => {
+                    bail!(
+                        "Transformation not implemented for Rope, expected to be applicable only with Absolute positional encoding"
+                    );
+                }
+            };
+            Ok(())
+        }
         Layer::<f32>::Embeddings(embeddings) => {
             // temporarily take ownership of the tensor, this allows for modify in place
             let tensor = embeddings.mat.take_wrapped_tensor()?;
@@ -200,125 +217,54 @@ fn modify_matrix_subtract_mean(node: &mut Layer<f32>) -> Result<()> {
             embeddings.mat.set_wrapped_tensor(centered)?;
             Ok(())
         }
-        Layer::<f32>::EinSum(einsum) => modify_einsum(einsum),
+        Layer::<f32>::EinSum(einsum) => {
+            let axes = einsum.mapping.get_final_output_axes();
+
+            let dims_to_modify = axes
+                .iter()
+                .enumerate()
+                .map(|(i, axis)| {
+                    if let Dimension::Present(rhs_dim) = axis.rhs_inputs[i] {
+                        Ok(rhs_dim)
+                    } else {
+                        Err(anyhow!("Expected RHS dimension to be present in Einsum"))
+                    }
+                })
+                .collect::<Result<Vec<usize>>>()?;
+
+            einsum
+                .constant_tensors
+                .iter_mut()
+                .zip(dims_to_modify)
+                .try_for_each(|(opt_tensor, dim)| {
+                    if let Some(mut handle) = opt_tensor.take() {
+                        let wrapped = handle.take_wrapped_tensor()?;
+                        let centered = wrapped.mean_center_dim(dim);
+                        handle.set_wrapped_tensor(centered)?;
+                        *opt_tensor = Some(handle);
+                        Ok(())
+                    } else {
+                        bail!("Expected constant tensor in Einsum to modify")
+                    }
+                })?;
+
+            einsum.biases.iter_mut().try_for_each(|opt_tensor| {
+                if let Some(handle) = opt_tensor {
+                    let wrapped = handle.take_wrapped_tensor()?;
+                    let shape = wrapped.shape();
+                    let flatten = wrapped.flatten_1d();
+                    let centered = flatten.mean_center_rows();
+                    let result = centered.reshape(shape)?;
+                    handle.set_wrapped_tensor(result)?;
+                }
+                Ok(())
+            })
+        }
         other => bail!(
             "Expected MatMul, Positional or Embeddings operation, found {}",
             other.short_name()
         ),
     }
-}
-
-/// Modify the constant tensors in an [`EinSum`] layer so that the output has rows with mean 0.
-fn modify_einsum(einsum: &mut EinSum<f32>) -> Result<()> {
-    let axes = einsum.mapping.get_final_output_axes();
-
-    let dims_to_modify = axes
-        .iter()
-        .enumerate()
-        .map(|(i, axis)| {
-            if let Dimension::Present(rhs_dim) = axis.rhs_inputs[i] {
-                Ok(rhs_dim)
-            } else {
-                Err(anyhow!("Expected RHS dimension to be present in Einsum"))
-            }
-        })
-        .collect::<Result<Vec<usize>>>()?;
-
-    einsum
-        .constant_tensors
-        .iter_mut()
-        .zip(dims_to_modify)
-        .try_for_each(|(opt_tensor, dim)| {
-            if let Some(mut handle) = opt_tensor.take() {
-                let tensor = Tensor::try_from(&handle)?;
-                let mean = mean_subtracted_tensor(&tensor, dim)?;
-                let wrapped_mean = WrappedTensor::try_from(mean)?;
-                handle.set_wrapped_tensor(wrapped_mean)?;
-                *opt_tensor = Some(handle);
-                Ok(())
-            } else {
-                bail!("Expected constant tensor in Einsum to modify")
-            }
-        })?;
-
-    einsum.biases.iter_mut().try_for_each(|opt_tensor| {
-        if let Some(handle) = opt_tensor {
-            let wrapped = handle.take_wrapped_tensor()?;
-            let shape = wrapped.shape();
-            let flatten = wrapped.flatten_1d();
-            let centered = flatten.mean_center_rows();
-            let result = centered.reshape(shape)?;
-            handle.set_wrapped_tensor(result)?;
-        }
-        Ok(())
-    })
-}
-
-/// Modify the positional encodings in a [`Positional`] layer so that the output has rows with mean 0.
-fn modify_positional(positional_layer: &mut Positional<f32>) -> Result<()> {
-    // Match on the type of positional encoding, we expect `Learned` here
-    *positional_layer = match &positional_layer.variant {
-        PositionalVariant::Absolute(absolute) => {
-            let Absolute::<f32> { positional, .. } = absolute;
-            Positional::new_absolute(positional.mean_center_rows())?
-        }
-        PositionalVariant::Rope(_) => {
-            bail!(
-                "Transformation not implemented for Rope, expected to be applicable only with Absolute positional encoding"
-            );
-        }
-    };
-    Ok(())
-}
-
-fn mean_subtracted_tensor(tensor: &Tensor<f32>, dim: usize) -> Result<Tensor<f32>> {
-    ensure!(
-        dim < tensor.shape().rank(),
-        "Dimension {dim} out of bounds for tensor of rank {}",
-        tensor.shape().rank()
-    );
-    let shape = tensor.shape();
-    let dim_size = shape.dim(dim);
-
-    // TODO: GPU accelerate this
-    let subtract_mean_matrix = (0..dim_size)
-        .flat_map(|i| {
-            (0..dim_size).map(move |j| {
-                if i == j {
-                    (dim_size as f32 - 1.0) / dim_size as f32
-                } else {
-                    -1.0 / dim_size as f32
-                }
-            })
-        })
-        .collect::<Vec<f32>>();
-
-    let mut input_chars = ('a'..).take(shape.rank()).collect::<Vec<char>>();
-    input_chars[dim] = 'm';
-
-    let mut output_chars = input_chars.clone();
-    output_chars[dim] = 'n';
-
-    let input_dims = input_chars.iter().collect::<String>();
-    let output_dims = output_chars.iter().collect::<String>();
-
-    let equation = format!("I({input_dims})@M(mn)->O({output_dims})");
-
-    let subtract_mean_tensor =
-        Tensor::new(Shape::new(vec![dim_size, dim_size]), subtract_mean_matrix)?;
-
-    let einsum = EinSum::<f32>::new(equation, vec![None], vec![None])?;
-    let wrapped = WrappedTensor::try_from(tensor)?;
-    let wrapped_mean = WrappedTensor::try_from(subtract_mean_tensor)?;
-    let mut output = einsum.evaluate_internal(&[&wrapped, &wrapped_mean])?;
-
-    let out = output.remove(0);
-    let data: Vec<f32> = out
-        .to_data()
-        .to_vec()
-        .map_err(|e| anyhow!("Couldn't extract data from tensor: {e:?}"))?;
-
-    Tensor::new(shape.clone(), data)
 }
 
 /// This function is used to modify a [`MatMul`] or [`QKV`] layer to absorb the weights and biases from the preceding [`LayerNorm`].
@@ -451,7 +397,6 @@ fn rescale_einsum(
 
 #[cfg(test)]
 mod tests {
-    use ark_std::rand::Rng;
     use tenstore::GenStore;
 
     use crate::{
@@ -466,64 +411,12 @@ mod tests {
                 tokenizer::TokenizerLoader,
             },
         },
-        rng_from_env_or_random,
         tensor::is_close_with_tolerance,
         testing::Pcs,
     };
 
     use super::*;
     use ff_ext::GoldilocksExt2;
-
-    #[test]
-    fn test_mean_subtracted_tensor() -> anyhow::Result<()> {
-        let mut rng = rng_from_env_or_random();
-        for dim in 0..3 {
-            let shape = Shape::new(vec![
-                rng.gen_range(4..10),
-                rng.gen_range(4..10),
-                rng.gen_range(4..10),
-            ]);
-            let tensor = Tensor::<f32>::random(&shape);
-            let modified_tensor = mean_subtracted_tensor(&tensor, dim)?;
-
-            let iter_shape = shape.clone();
-            let mut indices = vec![0; shape.rank()];
-            let total_iters = shape.numel() / shape.dim(dim);
-            for _ in 0..total_iters {
-                let mut sum = 0.0;
-                for i in 0..shape.dim(dim) {
-                    indices[dim] = i;
-                    sum += tensor.get(indices.clone())?;
-                }
-                let mean = sum / shape.dim(dim) as f32;
-                for i in 0..shape.dim(dim) {
-                    indices[dim] = i;
-                    let modified_value = modified_tensor.get(indices.clone())?;
-                    let original_value = tensor.get(indices.clone())?;
-                    let expected_value = original_value - mean;
-                    let diff = modified_value - expected_value;
-                    assert!(
-                        diff.abs() < 1e-6,
-                        "Difference is too large at index {:?}: {diff}",
-                        indices
-                    );
-                }
-                // Increment indices for next iteration
-                for i in (0..shape.rank()).rev() {
-                    if i == dim {
-                        continue;
-                    }
-                    indices[i] += 1;
-                    if indices[i] < iter_shape.dim(i) {
-                        break;
-                    } else {
-                        indices[i] = 0;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 
     #[test]
     fn test_gpt2_replace() -> anyhow::Result<()> {

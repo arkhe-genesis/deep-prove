@@ -1419,13 +1419,21 @@ where
     ///
     /// This has the effect of making the mean of a row equal to zero.
     pub(crate) fn mean_center_rows(self) -> Self {
+        let rank = self.rank();
+        self.mean_center_dim(rank - 1)
+    }
+
+    /// Transforms this tensor by centering its rows around the mean.
+    ///
+    /// This has the effect of making the mean of a row equal to zero.
+    pub(crate) fn mean_center_dim(self, dim: usize) -> Self {
         match self {
             WrappedTensor::Rank1 {
                 tensor,
                 unpadded_shape,
             } => {
-                let mean = tensor.clone().mean_dim(0);
-                let row_mean = mean.repeat_dim(0, tensor.shape()[0]);
+                let mean = tensor.clone().mean_dim(dim);
+                let row_mean = mean.repeat_dim(dim, tensor.shape()[dim]);
                 let centered = tensor - row_mean;
 
                 WrappedTensor::Rank1 {
@@ -1437,8 +1445,8 @@ where
                 tensor,
                 unpadded_shape,
             } => {
-                let mean = tensor.clone().mean_dim(1);
-                let row_mean = mean.repeat_dim(1, tensor.shape()[1]);
+                let mean = tensor.clone().mean_dim(dim);
+                let row_mean = mean.repeat_dim(dim, tensor.shape()[dim]);
                 let centered = tensor - row_mean;
 
                 WrappedTensor::Rank2 {
@@ -1450,8 +1458,8 @@ where
                 tensor,
                 unpadded_shape,
             } => {
-                let mean = tensor.clone().mean_dim(2);
-                let row_mean = mean.repeat_dim(2, tensor.shape()[2]);
+                let mean = tensor.clone().mean_dim(dim);
+                let row_mean = mean.repeat_dim(dim, tensor.shape()[dim]);
                 let centered = tensor - row_mean;
 
                 WrappedTensor::Rank3 {
@@ -1463,8 +1471,8 @@ where
                 tensor,
                 unpadded_shape,
             } => {
-                let mean = tensor.clone().mean_dim(3);
-                let row_mean = mean.repeat_dim(3, tensor.shape()[3]);
+                let mean = tensor.clone().mean_dim(dim);
+                let row_mean = mean.repeat_dim(dim, tensor.shape()[dim]);
                 let centered = tensor - row_mean;
 
                 WrappedTensor::Rank4 {
@@ -2403,7 +2411,7 @@ mod test {
 
     proptest! {
         #[test]
-        fn test_mean_center_rows(col_size in 4usize..20, row_size in 4usize..20, num_cols in 4usize..20) {
+        fn proptest_mean_center_rows(col_size in 4usize..20, row_size in 4usize..20, num_cols in 4usize..20) {
             let shape = Shape::new(vec![col_size, row_size]);
             let matrix = Tensor::<f32>::random(&shape);
             let centered = WrappedTensor::try_from(&matrix).unwrap().mean_center_rows();
@@ -2428,7 +2436,7 @@ mod test {
         }
 
         #[test]
-        fn test_mean_center_1d(x in 1usize..=1024) {
+        fn proptest_mean_center_1d(x in 1usize..=1024) {
             let shape = Shape::new(vec![x]);
             let tensor = Tensor::<f32>::random(&shape);
             let wrapped = WrappedTensor::try_from(tensor).unwrap();
@@ -2441,7 +2449,7 @@ mod test {
         }
 
         #[test]
-        fn test_mean_center_2d(x in 1usize..=1024, y in 1usize..=1024) {
+        fn proptest_mean_center_2d(x in 1usize..=1024, y in 1usize..=1024) {
             let shape = Shape::new(vec![x, y]);
             let tensor = Tensor::<f32>::random(&shape);
             let wrapped = WrappedTensor::try_from(tensor).unwrap();
@@ -2453,7 +2461,7 @@ mod test {
         }
 
         #[test]
-        fn test_mean_center_3d(x in 1usize..=256, y in 1usize..=256, z in 1usize..=256) {
+        fn proptest_mean_center_3d(x in 1usize..=256, y in 1usize..=256, z in 1usize..=256) {
             let shape = Shape::new(vec![x, y, z]);
             let tensor = Tensor::<f32>::random(&shape);
             let wrapped = WrappedTensor::try_from(tensor).unwrap();
@@ -2465,7 +2473,7 @@ mod test {
         }
 
         #[test]
-        fn test_quantize(x in 1usize..=1024) {
+        fn proptest_quantize(x in 1usize..=1024) {
             let shape = Shape::new(vec![x]);
             let tensor = Tensor::<f32>::random(&shape);
             let wrapped = WrappedTensor::try_from(&tensor).unwrap();
@@ -2482,7 +2490,7 @@ mod test {
         }
 
         #[test]
-        fn test_slice_2d(args in slice_2d_args()) {
+        fn proptest_slice_2d(args in slice_2d_args()) {
             let shape = Shape::new(vec![args.x, args.y]);
             let tensor = Tensor::<f32>::random(&shape);
             let wrapped = WrappedTensor::try_from(&tensor).unwrap();
@@ -2493,6 +2501,51 @@ mod test {
             let to_compare = Tensor::try_from(wrapped).unwrap();
 
             prop_assert!(tensor == to_compare, "{tensor:?} {to_compare:?}");
+        }
+
+        #[test]
+        fn proptest_mean_subtracted_tensor(x in 4usize..10, y in 4usize..10, z in 4usize..10, dim in 0usize..3) {
+            let shape = Shape::new(vec![x, y, z]);
+            let tensor = Tensor::<f32>::random(&shape);
+
+            let wrapped = WrappedTensor::try_from(&tensor).unwrap();
+            let centered = wrapped.mean_center_dim(dim);
+            let modified_tensor = Tensor::try_from(centered).unwrap();
+
+            let mut indices = vec![0; shape.rank()];
+            let total_iters = shape.numel() / shape.dim(dim);
+            for _ in 0..total_iters {
+                let mut sum = 0.0;
+                for i in 0..shape.dim(dim) {
+                    indices[dim] = i;
+                    sum += tensor.get(&indices).unwrap();
+                }
+                let mean = sum / shape.dim(dim) as f32;
+                for i in 0..shape.dim(dim) {
+                    indices[dim] = i;
+                    let modified_value = modified_tensor.get(&indices).unwrap();
+                    let original_value = tensor.get(&indices).unwrap();
+                    let expected_value = original_value - mean;
+                    let diff = modified_value - expected_value;
+                    assert!(
+                        diff.abs() < 1e-6,
+                        "Difference is too large at index {:?}: {diff}",
+                        indices
+                    );
+                }
+                // Increment indices for next iteration
+                for i in (0..shape.rank()).rev() {
+                    if i == dim {
+                        continue;
+                    }
+                    indices[i] += 1;
+                    if indices[i] < shape.dim(i) {
+                        break;
+                    } else {
+                        indices[i] = 0;
+                    }
+                }
+            }
         }
     }
 }
