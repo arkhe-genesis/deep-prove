@@ -12,6 +12,7 @@ let
 in
 {
   cachix.enable = false;
+  dotenv.enable = true;
 
   packages = [
     # General dev.
