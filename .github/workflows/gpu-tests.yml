@@ -23,7 +23,7 @@ concurrency:
 jobs:
   changes:
     name: Check for changes in zkML sources
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-cpx22  
     permissions:
       pull-requests: read
       contents: read
@@ -56,7 +56,13 @@ jobs:
         || github.event_name == 'push'
 
     runs-on: ['gpu']
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - name: Setup sccache
+        uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
+
       - name: Sanity check
         if: always()
         run: |
@@ -124,3 +130,6 @@ jobs:
             parser::llm::models::gpt2::tests::test_safe_gpt2_load_model
         env:
           IN_CI: "true"
+
+      - name: Show sccache stats
+        run: sccache --show-stats

@@ -12,7 +12,7 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-cpx22  
     permissions:
       contents: write
       issues: write
@@ -36,3 +36,5 @@ jobs:
           source-dir: zkml/docs/book
           umbrella-dir: zkml/pr-preview
           pages-base-path: zkml
+
+          

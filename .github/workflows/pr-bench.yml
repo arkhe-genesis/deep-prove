@@ -15,12 +15,21 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ['nix']
     permissions:
       pull-requests: read
     outputs:
       should_run: ${{ steps.filter.outputs.watches }}
+    runs-on: ['arc-runner-ccx63']
     steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils git-lfs
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install devenv
+        run: |
+          nix profile install nixpkgs#devenv --accept-flake-config
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -43,8 +52,22 @@ jobs:
     permissions:
       pull-requests: write
       contents: read
-    runs-on: ['nix']
+      id-token: write
+    runs-on: ['arc-runner-ccx63']
     steps:
+      - name: Setup sccache
+        uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils git-lfs
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install devenv
+        run: |
+          nix profile install nixpkgs#devenv --accept-flake-config
+
       - name: Sanity check
         if: always()
         run: |
@@ -89,6 +112,9 @@ jobs:
           --github-actions '${{ secrets.GITHUB_TOKEN }}' \
           "cargo bench --bench prove-model"
 
+      - name: Show sccache stats
+        run: sccache --show-stats
+
   gpu_benchmark_pr_branch:
     name: PR GPU Benchmarking
     needs: changes
@@ -101,8 +127,22 @@ jobs:
     permissions:
       pull-requests: write
       contents: read
+      id-token: write
     runs-on: ['gpu']
     steps:
+      - name: Setup sccache
+        uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils git-lfs
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install devenv
+        run: |
+          nix profile install nixpkgs#devenv --accept-flake-config
+
       - name: Sanity check
         if: always()
         run: |
@@ -153,3 +193,6 @@ jobs:
           --adapter rust_criterion \
           --github-actions '${{ secrets.GITHUB_TOKEN }}' \
           "cargo bench --bench prove-model --features cuda -- inference"
+
+      - name: Show sccache stats
+        run: sccache --show-stats

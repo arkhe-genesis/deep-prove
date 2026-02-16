@@ -15,12 +15,21 @@ concurrency:
 jobs:
   evaluate-models:
     name: Evaluate ZKML Models
-    runs-on: ['nix']
     permissions:
       contents: read
       pull-requests: write
 
+    runs-on: ['arc-runner-ccx63']
     steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils git-lfs
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install devenv
+        run: |
+          nix profile install nixpkgs#devenv --accept-flake-config
       - name: Sanity check
         if: always()
         run: |

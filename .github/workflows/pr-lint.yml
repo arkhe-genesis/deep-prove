@@ -15,7 +15,7 @@ permissions:
 jobs:
   main:
     name: Lint PR title
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-cpx22  
     steps:
       - id: lint_pr_title
         uses: amannn/action-semantic-pull-request@v5

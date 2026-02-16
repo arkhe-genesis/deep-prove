@@ -7,7 +7,7 @@ on:
 
 jobs:
   create-release:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-cpx22  
     if: startsWith( github.event.head_commit.message, 'release:' )
     steps:
       - uses: actions/checkout@v5

@@ -1,6 +1,7 @@
 name: "Rust tests & lint"
 permissions:
   contents: read
+  id-token: write
 
 on:
   push:
@@ -23,7 +24,7 @@ concurrency:
 jobs:
   changes:
     name: Check for changes in zkML sources
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-cpx22  
     permissions:
       pull-requests: read
       contents: read
@@ -47,12 +48,25 @@ jobs:
     name: Tests
     needs: changes
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
-    runs-on: ['nix']
+    runs-on: ['arc-runner-ccx53']
     steps:
+      - name: Setup sccache
+        uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
+
       - name: Sanity check
         if: always()
         run: |
           [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils git-lfs
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install devenv
+        run: |
+          nix profile install nixpkgs#devenv --accept-flake-config
 
       - uses: actions/checkout@v4
         with:
@@ -94,11 +108,25 @@ jobs:
         shell: devenv shell bash -- -e {0}
         run: cargo test --doc
 
+      - name: Show sccache stats
+        run: sccache --show-stats
+
   linting:
     needs: changes
-    runs-on: ['nix']
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
+    runs-on: ['arc-runner-ccx63']
     steps:
+      - name: Setup sccache
+        uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils git-lfs
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install devenv
+        run: |
+          nix profile install nixpkgs#devenv --accept-flake-config
       - name: Sanity check
         if: always()
         run: |
@@ -116,3 +144,6 @@ jobs:
       - name: Rust Format
         shell: devenv shell bash -- -e {0}
         run: cargo fmt --all
+
+      - name: Show sccache stats
+        run: sccache --show-stats
