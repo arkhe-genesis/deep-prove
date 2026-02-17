@@ -6,7 +6,7 @@ on:
 
 jobs:
   changes:
-    runs-on: ["nix"]
+    runs-on: arc-runner-cpx22
     outputs:
       should_run: ${{ steps.filter.outputs.watches }}
     steps:
@@ -17,7 +17,6 @@ jobs:
           filters: |
             watches:
               - 'zkml/**'
-              - 'mpcs/**'
               - '.github/workflows/main-bench.yml'
 
   cpu_benchmark_master_branch:
@@ -43,9 +42,7 @@ jobs:
         run: |
           nix profile install nixpkgs#devenv --accept-flake-config
       - name: Sanity check
-        if: always()
-        run: |
-          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+        run: [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
 
       - uses: actions/checkout@v4
         with:

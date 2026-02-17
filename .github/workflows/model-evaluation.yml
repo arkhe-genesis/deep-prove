@@ -13,8 +13,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: arc-runner-cpx22
+    outputs:
+      should_run: ${{ steps.filter.outputs.watches }}
+    steps:
+      - name: Sanity check
+        run: [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            watches:
+              - 'zkml/**'
+              - '.github/workflows/model-evaluation.yml'
+
   evaluate-models:
     name: Evaluate ZKML Models
+    needs: changes
+    if: ${{ needs.changes.outputs.should_run == 'true' }}
     permissions:
       contents: read
       pull-requests: write
