@@ -170,18 +170,20 @@ where
         // Now we arrange the model claims in the correct order, we iterate over the model_comms_map in reverse so the largest number of variables is
         // the first key value pair we visit.
         let mut model_claims = std::mem::take(&mut self.model_claims);
-        let (sumcheck_proof, sumcheck_evals) =
-            if let Some(ref model_commitment) = ctx.model_commitment && !model_claims.is_empty() {
-                let ModelSumcheckProof {
-                    model_claim,
-                    sumcheck_proof,
-                    sumcheck_evals,
-                } = Self::model_polys_sumcheck::<T>(&mut model_claims, ctx, transcript)?;
-                rounds.push(ProverClaim::new(model_commitment, model_claim));
-                (sumcheck_proof, sumcheck_evals)
-            } else {
-                (IOPProof::<E>::default(), vec![])
-            };
+        let (sumcheck_proof, sumcheck_evals) = if let Some(ref model_commitment) =
+            ctx.model_commitment
+            && !model_claims.is_empty()
+        {
+            let ModelSumcheckProof {
+                model_claim,
+                sumcheck_proof,
+                sumcheck_evals,
+            } = Self::model_polys_sumcheck::<T>(&mut model_claims, ctx, transcript)?;
+            rounds.push(ProverClaim::new(model_commitment, model_claim));
+            (sumcheck_proof, sumcheck_evals)
+        } else {
+            (IOPProof::<E>::default(), vec![])
+        };
 
         // Make the PCS batch proof
         let pcs_proof = PCS::batch_open(

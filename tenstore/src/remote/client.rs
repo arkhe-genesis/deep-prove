@@ -375,8 +375,10 @@ where
                     || format!("failed to clean-up remote store for {run_id}"),
                 )
                 .await
+                .context("calling clean-up for remote store")?
+                .error_for_status()
                 .map(|_| ())
-                .context("cleaning-up remote store")
+                .context("cleaning up remote store")
             })
             .expect("to spawn clean-up task");
     }
@@ -445,6 +447,8 @@ where
             || format!("fetching {run_id}/{key}"),
         )
         .await
+        .with_context(|| format!("calling fetch for {run_id}/{key}"))?
+        .error_for_status()
         .with_context(|| format!("fetching {run_id}/{key}"))?;
 
         zstd::stream::decode_all(DecoderReader::new(
@@ -488,8 +492,13 @@ where
             || format!("storing {run_id}/{key}"),
         )
         .await
-        .with_context(|| format!("storing remotely {run_id}/{key}"))
-        .map(|_| ());
+        .with_context(|| format!("calling store for {run_id}/{key}"))
+        .and_then(|r| {
+            r.error_for_status()
+                .map(|_| ())
+                .with_context(|| format!("storing {run_id}/{key}"))
+        });
+
         res_tx.send(result).expect("sending back put result");
     }
 }

@@ -139,7 +139,9 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> CommitmentVerifier<E
 
         // First we verify the Sumcheck proof that allows us to open all of the model polynomials at the same point
         let mut model_claims = std::mem::take(&mut self.model_claims);
-        if let Some(model_commitment) = &ctx.model_commitment && !model_claims.is_empty() {
+        if let Some(model_commitment) = &ctx.model_commitment
+            && !model_claims.is_empty()
+        {
             let model_claim = Self::verify_model_sumcheck(
                 &mut model_claims,
                 sumcheck_proof,

@@ -118,7 +118,9 @@ impl Store for S3Store {
             let cache_path = fs_cache
                 .as_ref()
                 .map(|cache| cache.path().join(key.to_string()));
-            if let Some(path) = &cache_path && fs::try_exists(&path).await.context("access FS cache")? {
+            if let Some(path) = &cache_path
+                && fs::try_exists(&path).await.context("access FS cache")?
+            {
                 let bytes = fs::read(path).await?;
                 let value = serde_json::from_slice::<Params>(&bytes)
                     .context("decoding params value from FS cache")?;
@@ -166,7 +168,9 @@ impl Store for S3Store {
                 .as_ref()
                 .map(|cache| cache.path().join(key.to_string()));
 
-            if let Some(path) = cache_path && !fs::try_exists(&path).await.context("access FS cache")? {
+            if let Some(path) = cache_path
+                && !fs::try_exists(&path).await.context("access FS cache")?
+            {
                 fs::create_dir_all(&path)
                     .await
                     .context("create FS cache dirs")?;
@@ -213,7 +217,9 @@ impl Store for S3Store {
             let cache_path = fs_cache
                 .as_ref()
                 .map(|cache| cache.path().join(key.to_string()));
-            if let Some(path) = &cache_path && fs::try_exists(&path).await.context("access FS cache")? {
+            if let Some(path) = &cache_path
+                && fs::try_exists(&path).await.context("access FS cache")?
+            {
                 let bytes = fs::read(path).await?;
                 let value = serde_json::from_slice::<ScaledModel>(&bytes)
                     .context("decoding scaled model value from FS cache")?;
