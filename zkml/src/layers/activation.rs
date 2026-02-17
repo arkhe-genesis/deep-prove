@@ -138,12 +138,16 @@ pub struct GeGlu<N>(Activation<N>);
 impl<N> Activation<N> {
     /// The port index for the "up" projection input when used in a GLU.
     pub const UP_INPUT_INDEX: usize = 1;
+
     /// The port index for the "gate" input when used in a GLU.
     pub const GATE_INPUT_INDEX: usize = 0;
+
+    /// Returns a new rectified linear activation.
     pub fn new_relu() -> Self {
         Self::Plain(ActivationLayer::Relu(Relu))
     }
 
+    /// Returns a new gaussian error activation.
     pub fn new_gelu() -> Self {
         Self::Plain(ActivationLayer::Gelu(GELU::new()))
     }
@@ -158,6 +162,7 @@ impl<N> Activation<N> {
         Self::Plain(activation_type)
     }
 
+    /// Returns a Gated GELU.
     pub fn new_geglu() -> GeGlu<N> {
         GeGlu(Self::GLU(ActivationLayer::Gelu(GELU::new())))
     }
@@ -179,28 +184,26 @@ where
 }
 
 impl<N> GeGlu<N> {
-    // Position expected in the set of layer inputs for the input value that is passed through Gelu
+    /// Position expected in the set of layer inputs for the input value that is passed through Gelu
     pub const GELU_INPUT_INDEX: usize = 0;
-    // Position expected in the set of layers inputs for the input value that is multiplied to the output of Gelu
+
+    /// Position expected in the set of layers inputs for the input value that is multiplied to the output of Gelu
     pub const LINEAR_INPUT_INDEX: usize = 1;
 }
 
 impl ActivationLayer<f32> {
     fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> Result<Vec<WrappedTensor<f32>>> {
-        match self {
-            ActivationLayer::Relu(_relu) => Ok(inputs
+        let result = match self {
+            ActivationLayer::Relu(_relu) => inputs
                 .iter()
-                .map(|tensor| WrappedTensor::relu((*tensor).clone()))
-                .collect::<Vec<_>>()),
-            ActivationLayer::Gelu(gelu) => inputs
+                .map(|wrapped| (*wrapped).clone().relu())
+                .collect::<Vec<_>>(),
+            ActivationLayer::Gelu(_gelu) => inputs
                 .iter()
-                .map(|input| {
-                    let mut outputs = gelu.evaluate(&[input])?.outputs;
-                    ensure!(outputs.len() == 1);
-                    Ok(outputs.pop().unwrap())
-                })
-                .collect::<anyhow::Result<Vec<_>>>(),
-        }
+                .map(|wrapped| (*wrapped).clone().gelu())
+                .collect::<Vec<_>>(),
+        };
+        Ok(result)
     }
 
     fn quantize_op<S: ScalingStrategy>(
@@ -224,7 +227,7 @@ impl ActivationLayer<Element> {
         match self {
             ActivationLayer::Relu(_relu) => Ok(inputs
                 .iter()
-                .map(|tensor| WrappedTensor::relu((*tensor).clone()))
+                .map(|tensor| (*tensor).clone().relu())
                 .collect()),
             ActivationLayer::Gelu(g) => {
                 let Some(quant_data) = g.quant_data else {
@@ -235,7 +238,7 @@ impl ActivationLayer<Element> {
                     .map(|input| {
                         let input = (*input).clone().mul_scalar(quant_data.multiplier);
                         let input = input.float().div_scalar(GELU_SCALE_FACTOR as f32);
-                        let output = WrappedTensor::gelu(input);
+                        let output = input.gelu();
                         let output = output.clone().mul_scalar(*quantization::MAX as f32);
                         output.clone().round().int()
                     })
@@ -866,14 +869,8 @@ impl<E: ExtensionField> ActivationCtx<E> {
     }
 }
 
-#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Copy, Serialize, Deserialize)]
 pub struct Relu;
-
-impl Default for Relu {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl Relu {
     pub fn new() -> Relu {
@@ -906,7 +903,7 @@ impl Relu {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct GELU<N> {
     quant_data: Option<GELUQuantData>,
     _n: PhantomData<N>,
@@ -949,28 +946,12 @@ impl GELUQuantData {
     }
 }
 
-impl<N> Default for GELU<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<N> GELU<N> {
     pub fn new() -> Self {
         Self {
             quant_data: None,
             _n: PhantomData,
         }
-    }
-}
-
-impl Evaluate<f32> for GELU<f32> {
-    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> anyhow::Result<LayerOut<f32>> {
-        let output_tensors: Vec<WrappedTensor<f32>> = inputs
-            .par_iter()
-            .map(|tensor| WrappedTensor::gelu((*tensor).clone()))
-            .collect();
-        Ok(LayerOut::from_vec(output_tensors))
     }
 }
 
@@ -1102,7 +1083,7 @@ mod test {
 
     #[test]
     fn test_activation_gelu_evaluate_f32() -> anyhow::Result<()> {
-        let gelu = GELU::<f32>::new();
+        let gelu = Activation::<f32>::new_gelu();
         let input_data = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
         let input_tensor = Tensor::new(vec![1, input_data.len()].into(), input_data.clone())
             .unwrap()

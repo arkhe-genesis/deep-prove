@@ -669,7 +669,7 @@ impl ModelChunk {
             let edge = self.edge(edge_id)?;
             let source_node_id = edge.source();
             edge.ports().iter().try_for_each(|port| {
-                let source_port = NodeOutput::new(source_node_id, port.source_port);
+                let source_port = NodeOutput::new(*source_node_id, port.source_port);
                 let claim = claims_by_port
                     .get(&source_port)
                     .ok_or(anyhow!("Claim not found for source port: {source_port}"))?;
@@ -1065,7 +1065,7 @@ fn add_edges_to_chunk_subgraphs<E: ExtensionField>(
             subgraphs[*chunk].add_edge_raw_with_id(*edge_id, edge.clone())?;
             if let Some(o) = target_node.as_output() {
                 // we also add output node `o` to the chunk subgraph
-                return subgraphs[*chunk].add_node_with_id(target_id, Node::Output(*o));
+                return subgraphs[*chunk].add_node_with_id(*target_id, Node::Output(*o));
             }
         }
         let chunk = nodes_map
@@ -1080,7 +1080,7 @@ fn add_edges_to_chunk_subgraphs<E: ExtensionField>(
             // we also add input node `i` to the chunk subgraph, only if the same
             // input node has not already been added to the subgraph of `chunk` earlier
             if subgraphs[*chunk].node(source_id).is_none() {
-                subgraphs[*chunk].add_node_with_id(source_id, Node::Input(*i))?;
+                subgraphs[*chunk].add_node_with_id(*source_id, Node::Input(*i))?;
             }
         }
         anyhow::Ok(())

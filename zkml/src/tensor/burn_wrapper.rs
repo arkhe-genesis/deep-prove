@@ -1523,8 +1523,8 @@ impl WrappedTensor<f32> {
 
     /// Applies the Gaussian Error Linear Units function as described in the paper
     /// [Gaussian Error Linear Units (GELUs)](https://arxiv.org/pdf/1606.08415v3.pdf).
-    pub(crate) fn gelu(input: Self) -> Self {
-        match input {
+    pub(crate) fn gelu(self) -> Self {
+        match self {
             WrappedTensor::Rank1 {
                 tensor,
                 unpadded_shape,
@@ -1557,16 +1557,16 @@ impl WrappedTensor<f32> {
     }
 
     pub(crate) fn conv2d(
-        input: Self,
+        self,
         weight: Self,
         bias: Option<Self>,
         options: ConvOptions<2>,
     ) -> Result<Self> {
-        let input_rank = input.rank();
+        let input_rank = self.rank();
         let Self::Rank4 {
             tensor: input,
             unpadded_shape,
-        } = input
+        } = self
         else {
             bail!("Unexpected input rank: {input_rank}, expected 4.")
         };
@@ -1592,17 +1592,17 @@ impl WrappedTensor<f32> {
     }
 
     pub(crate) fn max_pool2d(
-        input: Self,
+        self,
         kernel_size: [usize; 2],
         stride: [usize; 2],
         padding: [usize; 2],
         dilation: [usize; 2],
     ) -> Result<Self> {
-        let input_rank = input.rank();
+        let input_rank = self.rank();
         let Self::Rank4 {
             tensor,
             unpadded_shape,
-        } = input
+        } = self
         else {
             bail!("Unexpected input rank: {input_rank}, expected 4.")
         };
@@ -1649,13 +1649,13 @@ impl WrappedTensor<f32> {
         })
     }
 
-    pub(crate) fn softmax(tensor: Self, dim: usize) -> Result<Self> {
+    pub(crate) fn softmax(self, dim: usize) -> Result<Self> {
         ensure!(
-            dim < tensor.rank(),
+            dim < self.rank(),
             "Softmax dimension {dim} out of bounds, (tensor rank: {}).",
-            tensor.rank()
+            self.rank(),
         );
-        match tensor {
+        match self {
             WrappedTensor::Rank1 {
                 tensor,
                 unpadded_shape,
@@ -1768,12 +1768,12 @@ impl WrappedTensor<Element> {
         delegate!(self, float)
     }
 
-    pub(crate) fn conv2d(x: Self, weight: Self, bias: Self, options: Conv2dConfig) -> Result<Self> {
-        let x_rank = x.rank();
+    pub(crate) fn conv2d(self, weight: Self, bias: Self, options: Conv2dConfig) -> Result<Self> {
+        let x_rank = self.rank();
         let Self::Rank4 {
             tensor: input,
             unpadded_shape,
-        } = x
+        } = self
         else {
             bail!("Unexpected x rank: {x_rank}, expected 4.")
         };
@@ -1792,12 +1792,12 @@ impl WrappedTensor<Element> {
         })
     }
 
-    pub(crate) fn max_pool2d(input: Self, config: Maxpool2dConfig) -> Result<Self> {
-        let input_rank = input.rank();
+    pub(crate) fn max_pool2d(self, config: Maxpool2dConfig) -> Result<Self> {
+        let input_rank = self.rank();
         let Self::Rank4 {
             tensor: input,
             unpadded_shape,
-        } = input
+        } = self
         else {
             bail!("Unexpected input rank: {input_rank}, expected 4.")
         };
@@ -1830,17 +1830,17 @@ impl Quantize for WrappedTensor<Element> {
 }
 
 pub trait WrappedModuleFn {
-    fn linear(input: Self, weight: Self, bias: Option<Self>) -> Result<Self>
+    fn linear(self, weight: Self, bias: Option<Self>) -> Result<Self>
     where
         Self: Sized;
 
     /// Applies the rectified linear unit function element-wise
     /// as described in the paper [Deep Learning using Rectified Linear Units (ReLU)](https://arxiv.org/pdf/1803.08375).
-    fn relu(input: Self) -> Self;
+    fn relu(self) -> Self;
 }
 
 impl WrappedModuleFn for WrappedTensor<f32> {
-    fn linear(input: Self, weight: Self, bias: Option<Self>) -> Result<Self> {
+    fn linear(self, weight: Self, bias: Option<Self>) -> Result<Self> {
         let weight_rank = weight.rank();
         let Self::Rank2 { tensor: weight, .. } = weight else {
             bail!("Unexpected weight rank: {weight_rank}, expected 2.")
@@ -1855,7 +1855,7 @@ impl WrappedModuleFn for WrappedTensor<f32> {
             }
             None => None,
         };
-        let out = match input {
+        let out = match self {
             WrappedTensor::Rank1 {
                 tensor: input,
                 unpadded_shape,
@@ -1890,8 +1890,8 @@ impl WrappedModuleFn for WrappedTensor<f32> {
 
     /// Applies the rectified linear unit function element-wise
     /// as described in the paper [Deep Learning using Rectified Linear Units (ReLU)](https://arxiv.org/pdf/1803.08375).
-    fn relu(input: Self) -> Self {
-        match input {
+    fn relu(self) -> Self {
+        match self {
             WrappedTensor::Rank1 {
                 tensor: input,
                 unpadded_shape,
@@ -1925,8 +1925,8 @@ impl WrappedModuleFn for WrappedTensor<f32> {
 }
 
 impl WrappedModuleFn for WrappedTensor<Element> {
-    fn linear(input: Self, weight: Self, bias: Option<Self>) -> Result<Self> {
-        let input = input.unsqueeze_dim(1)?;
+    fn linear(self, weight: Self, bias: Option<Self>) -> Result<Self> {
+        let input = self.unsqueeze_dim(1)?;
         let matmul = weight.transpose().matmul(input)?;
         let matmul = matmul.squeeze(1)?;
         let out = if let Some(bias) = bias {
@@ -1937,8 +1937,8 @@ impl WrappedModuleFn for WrappedTensor<Element> {
         Ok(out)
     }
 
-    fn relu(input: Self) -> Self {
-        match input {
+    fn relu(self) -> Self {
+        match self {
             WrappedTensor::Rank1 {
                 tensor: input,
                 unpadded_shape,

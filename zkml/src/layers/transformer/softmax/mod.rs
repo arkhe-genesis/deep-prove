@@ -479,7 +479,7 @@ impl Evaluate<f32> for Softmax<f32> {
             .clone()
             .flatten_to_dim_2(0, input.rank() - 2)
             .mul_scalar(self.scalar);
-        let out = WrappedTensor::softmax(b_input, 1)?;
+        let out = b_input.softmax(1)?;
         let out = out.reshape(input.shape())?;
 
         Ok(LayerOut::from_tensor(out))

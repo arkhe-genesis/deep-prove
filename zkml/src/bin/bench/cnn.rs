@@ -17,7 +17,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use zkml::parser::onnx::FloatOnnxLoader;
 
 use serde::{Deserialize, Serialize};
-use zkml::{Element, Prover, argmax, verify};
+use zkml::{Element, Prover, verify};
 
 use rmp_serde::encode::to_vec_named;
 
@@ -61,6 +61,25 @@ struct Args {
 // Helper function to parse a single usize
 fn parse_usize(s: &str) -> Result<usize, String> {
     s.trim().parse().map_err(|e| format!("Invalid index: {e}"))
+}
+
+fn argmax<T: PartialOrd>(v: &[T]) -> Option<usize> {
+    if v.is_empty() {
+        return None;
+    }
+
+    let mut max_index = 0;
+    let mut max_value = &v[0];
+
+    for (i, value) in v.iter().enumerate().skip(1) {
+        // Only update if strictly greater, ensuring we take the first maximum in ties
+        if value > max_value {
+            max_index = i;
+            max_value = value;
+        }
+    }
+
+    Some(max_index)
 }
 
 pub fn main() -> anyhow::Result<()> {

@@ -5,14 +5,13 @@
 #![feature(exact_size_is_empty)]
 #![feature(mapped_lock_guards)]
 
-use std::{borrow::Borrow, cmp::Ordering, env, ops::Deref, str::FromStr};
+use std::{borrow::Borrow, env, ops::Deref, str::FromStr};
 
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
 use ff_ext::{ExtensionField, FieldFrom};
 use itertools::Itertools;
 use multilinear_extensions::mle::PointAndEval;
 use quantization::ToField;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use transcript::{BasicTranscript, Transcript};
 
@@ -85,12 +84,6 @@ pub fn default_transcript<E: ExtensionField>() -> BasicTranscript<E> {
     BasicTranscript::new(b"m2vec")
 }
 
-pub fn pad_vector<E: ExtensionField>(mut v: Vec<E>) -> Vec<E> {
-    if !v.len().is_power_of_two() {
-        v.resize(v.len().next_power_of_two(), E::ZERO);
-    }
-    v
-}
 /// Returns the bit sequence of num of bit_length length.
 pub(crate) fn to_bit_sequence_le(
     num: usize,
@@ -128,29 +121,6 @@ pub fn eval_infinitizer_mle<F: ExtensionField + FieldFrom<u64>>(
     <Element as ToField<F>>::to_field(&minus_infinity)
         * (F::ONE - eval_zeroifier_mle(column_point, row_point))
 }
-#[allow(dead_code)]
-pub(crate) fn try_unzip<I, C, T, E>(iter: I) -> Result<C, E>
-where
-    I: IntoIterator<Item = Result<T, E>>,
-    C: Extend<T> + Default,
-{
-    iter.into_iter().try_fold(C::default(), |mut c, r| {
-        c.extend([r?]);
-        Ok(c)
-    })
-}
-#[allow(dead_code)]
-pub(crate) fn try_unzip_parallel<I, C, T, E>(iter: I) -> Result<C, E>
-where
-    I: ParallelIterator<Item = Result<T, E>>,
-    C: Extend<T> + Default + Send,
-    E: Send,
-    T: Send,
-{
-    // ToDo: remove need to collect into vector first
-    let v = iter.collect::<Vec<_>>();
-    try_unzip(v)
-}
 
 pub trait VectorTranscript<E: ExtensionField> {
     fn read_challenges(&mut self, n: usize) -> Vec<E>;
@@ -176,25 +146,6 @@ impl<E: ExtensionField> InitTranscript for BasicTranscript<E> {
     }
 }
 
-pub fn argmax<T: PartialOrd>(v: &[T]) -> Option<usize> {
-    if v.is_empty() {
-        return None;
-    }
-
-    let mut max_index = 0;
-    let mut max_value = &v[0];
-
-    for (i, value) in v.iter().enumerate().skip(1) {
-        // Only update if strictly greater, ensuring we take the first maximum in ties
-        if value > max_value {
-            max_index = i;
-            max_value = value;
-        }
-    }
-
-    Some(max_index)
-}
-
 /// Converts an iterator of elements to the base field.
 pub(crate) fn to_base<E, I>(iter: I) -> Vec<E::BaseField>
 where
@@ -217,27 +168,6 @@ where
     E: ExtensionField,
 {
     iter.into_iter().map(|v| v.borrow().to_field()).collect()
-}
-
-/// Returns the maximum element in the slice `v`, and the position in `v`
-/// where such maximum element is located; in other words, it returns
-/// (max(v), argmax(v))
-pub fn max_in_slice<N: Number>(v: &[N]) -> Option<(N, usize)> {
-    if v.is_empty() {
-        return None;
-    }
-    Some(
-        v.iter()
-            .enumerate()
-            .fold((N::MIN, 0), |acc, x| match acc.0.compare(x.1) {
-                Ordering::Less => (*x.1, x.0),
-                _ => acc,
-            }),
-    )
-}
-
-pub fn argmax_slice<N: Number>(v: &[N]) -> Option<usize> {
-    max_in_slice(v).map(|m| m.1)
 }
 
 pub trait NextPowerOfTwo {

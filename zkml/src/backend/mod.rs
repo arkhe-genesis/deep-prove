@@ -63,7 +63,7 @@ pub(crate) trait ZKMLBackend: burn::tensor::backend::Backend {
         ))
     }
 
-    /// Conv2D implementation over integers (only floats are supported by burn)
+    /// Max Pool2d implementation over integers (only floats are supported by burn)
     fn zkml_max_pool2d_i(
         input: IntTensor<Self>,
         config: Maxpool2dConfig,

@@ -151,7 +151,7 @@ pub fn main_loop<R: GraphRuner>(num_workers: usize, mut runner: R) -> anyhow::Re
         inputs
             .into_iter()
             .fold(Vec::new(), |mut ios, (node_input, chunk_prover_io)| {
-                ios.push((node_input.node_id, chunk_prover_io));
+                ios.push((node_input.node_id(), chunk_prover_io));
                 ios
             });
     println!("graph: {:#?}", graph);

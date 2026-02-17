@@ -1089,7 +1089,7 @@ where
                 for port in edge.ports().iter() {
                     acc.entry(port.source_port)
                         .or_insert(Vec::new())
-                        .push((edge.target(), port.target_port));
+                        .push((*edge.target(), port.target_port));
                 }
                 acc
             });

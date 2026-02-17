@@ -380,7 +380,7 @@ mod distributed {
             inputs
                 .into_iter()
                 .fold(Vec::new(), |mut ios, (node_input, chunk_prover_io)| {
-                    ios.push((node_input.node_id, chunk_prover_io));
+                    ios.push((node_input.node_id(), chunk_prover_io));
                     ios
                 });
         let partitions = graph.partition_by_color(flat_inputs)?;

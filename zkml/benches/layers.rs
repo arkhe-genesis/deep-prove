@@ -335,7 +335,7 @@ mod flatten_layer {
 mod gelu_layer {
     use zkml::{
         Shape,
-        layers::{activation::GELU, provable::Evaluate},
+        layers::{activation::Activation, provable::Evaluate},
         tensor::WrappedTensor,
     };
 
@@ -345,7 +345,34 @@ mod gelu_layer {
     fn f32(bencher: divan::Bencher, args: Args) {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
-        let layer = GELU::<f32>::new();
+        let layer = Activation::<f32>::new_gelu();
+
+        // warm up
+        let out = layer.evaluate(&[&input]).expect("GeLU should succeed");
+        let _ = get_results(out);
+
+        bencher.bench(|| {
+            let out = layer.evaluate(&[&input]).expect("GeLU should succeed");
+            get_results(out)
+        });
+    }
+}
+
+#[divan::bench_group]
+mod relu_layer {
+    use zkml::{
+        Shape,
+        layers::{activation::Activation, provable::Evaluate},
+        tensor::WrappedTensor,
+    };
+
+    use crate::{Args, default_sizes, get_results};
+
+    #[divan::bench(args = default_sizes(), threads = false)]
+    fn f32(bencher: divan::Bencher, args: Args) {
+        let size = 1 << args.pow2;
+        let input = WrappedTensor::<f32>::random(&Shape::new(vec![size]));
+        let layer = Activation::<f32>::new_relu();
 
         // warm up
         let out = layer.evaluate(&[&input]).expect("GeLU should succeed");

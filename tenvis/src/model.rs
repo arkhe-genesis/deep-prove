@@ -47,12 +47,12 @@ pub fn shape_steps<T: TensorTypeParam>(
                             .flat_map(|(_, e)| e.feeds())
                             .map(|feed| {
                                 let ShapeStep { output_shapes, .. } = shapes
-                                    .get(&feed.source.node_id)
+                                    .get(&feed.source().node_id())
                                     .with_context(|| {
-                                        format!("fetching shape step for {:?}", feed.source)
+                                        format!("fetching shape step for {:?}", feed.source())
                                     })
                                     .unwrap();
-                                (feed.target, output_shapes[feed.source.port].clone())
+                                (*feed.target(), output_shapes[*feed.source().port()].clone())
                             }),
                     )
                     .collect::<Vec<_>>();
@@ -119,7 +119,7 @@ pub(crate) fn show_tracks<N: TensorTypeParam>(
                 model
                     .incoming_feeds(current_node_id)
                     .into_iter()
-                    .map(|feed| { format!("{:?}", feed.source) })
+                    .map(|feed| { format!("{:?}", feed.source()) })
                     .collect::<Vec<_>>()
                     .join(", "),
                 current_node.describe()
@@ -133,17 +133,17 @@ pub(crate) fn show_tracks<N: TensorTypeParam>(
         } else {
             let mut outputs = outgoings.clone();
             outputs.sort_by(|f1, f2| {
-                f1.source
-                    .node_id
-                    .cmp(&f2.target.node_id)
-                    .then(f1.target.port.cmp(&f2.target.port))
+                f1.source()
+                    .node_id()
+                    .cmp(&f2.target().node_id())
+                    .then(f1.target().port().cmp(&f2.target().port()))
             });
             outputs.dedup();
 
             for (i, output) in outputs.into_iter().enumerate() {
                 if i == 0 {
                     hanging
-                        .entry(output.target.node_id)
+                        .entry(output.target().node_id())
                         .or_default()
                         .push((current_node_id, main_track_id));
                 } else {
@@ -152,7 +152,7 @@ pub(crate) fn show_tracks<N: TensorTypeParam>(
                         TrackId::from(next_track_id),
                     ));
                     hanging
-                        .entry(output.target.node_id)
+                        .entry(output.target().node_id())
                         .or_default()
                         .push((current_node_id, TrackId::from(next_track_id)));
                     next_track_id += 1;

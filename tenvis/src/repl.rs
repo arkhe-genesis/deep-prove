@@ -78,7 +78,7 @@ impl Repl {
                     .outgoing_feeds(*node_id)
                     .into_iter()
                     .map(|feed| {
-                        let source = feed.source;
+                        let source = *feed.source();
                         let min_max = snap
                             .min_max
                             .scaling_range(source)
@@ -89,7 +89,8 @@ impl Repl {
                             format!(
                                 "{:<15}{source}: {} {}",
                                 min_max,
-                                snap.shapes[&feed.source.node_id].output_shapes[feed.source.port],
+                                snap.shapes[&feed.source().node_id()].output_shapes
+                                    [*feed.source().port()],
                                 node.describe()
                             ),
                         )
@@ -106,7 +107,7 @@ impl Repl {
         let addr = &addrs[key_id];
         let key: StorageKey<Vec<T>> = addr.to_storage_key();
         let data = snap.store.clone().fetch(&key)?;
-        let shape = snap.shapes[&addr.node_id].output_shapes[*addr.port].to_owned();
+        let shape = snap.shapes[&addr.node_id()].output_shapes[*addr.port()].to_owned();
         let tensor = if shape.numel() == data.len() {
             Tensor::new(shape.clone(), data)?
         } else if shape.next_power_of_two().numel() == data.len() {

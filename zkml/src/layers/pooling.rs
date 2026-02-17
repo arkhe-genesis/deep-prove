@@ -142,7 +142,7 @@ impl Evaluate<Element> for Pooling {
                     kernel_size: maxpool2d.kernel_size,
                     stride: maxpool2d.stride,
                 };
-                let mut result = WrappedTensor::<Element>::max_pool2d(binput, config)?;
+                let mut result = binput.max_pool2d(config)?;
 
                 for _ in 0..rank_difference {
                     result = result.squeeze(0)?;
@@ -175,13 +175,7 @@ impl Evaluate<f32> for Pooling {
                 let padding = [0, 0];
                 let dilation = [1, 1];
 
-                let mut result = WrappedTensor::<f32>::max_pool2d(
-                    binput,
-                    kernel_size,
-                    stride,
-                    padding,
-                    dilation,
-                )?;
+                let mut result = binput.max_pool2d(kernel_size, stride, padding, dilation)?;
 
                 for _ in 0..rank_difference {
                     result = result.squeeze(0)?;

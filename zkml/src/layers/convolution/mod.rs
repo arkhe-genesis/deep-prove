@@ -1209,8 +1209,7 @@ impl Evaluate<f32> for Convolution<f32> {
         let weight = WrappedTensor::try_from(tensor)?;
         let bias = WrappedTensor::try_from(&self.bias)?;
 
-        let res = WrappedTensor::<f32>::conv2d(
-            input,
+        let res = input.conv2d(
             weight,
             Some(bias),
             ConvOptions {
@@ -1274,7 +1273,7 @@ impl Evaluate<Element> for Convolution<Element> {
 
         // Compute the convolution using the traditional convolution hardware accelerated.
         let config = Conv2dConfig { stride: 1 };
-        let conv_output = WrappedTensor::<Element>::conv2d(input, kernels, bias, config)?;
+        let conv_output = input.conv2d(kernels, bias, config)?;
 
         let conv_output = conv_output.squeeze(0)?;
         // conv2d always return a 4D tensor
