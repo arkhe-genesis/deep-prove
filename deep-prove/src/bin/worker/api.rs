@@ -103,9 +103,6 @@ pub async fn serve(args: RunMode, tenstore: GenStore) -> anyhow::Result<()> {
                         }
                         Err(err) => error!("failed to generate proof: {err:?}"),
                     }
-                    if let Err(err) = job_tenstore.clean_up() {
-                        error!("failed to clean-up tensor store: {err:?}");
-                    }
                 } else {
                     trace!("no proof request");
                 }

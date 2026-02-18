@@ -661,11 +661,12 @@ where
                 Ok(outputs)
             })? // then, we compute the claims for each output
             .into_iter()
-            .map(|(port_id, tensor)| {
+            .map(|(port_id, tensor): (_, Tensor<E>)| {
                 // For the output, we manually evaluate the MLE and check if it's the same as what prover
                 // gave. Note prover could ellude that but it's simpler to avoid that special check right
                 // now.
-                (port_id, compute_claim(self.transcript, tensor))
+                let claim = compute_claim(self.transcript, tensor);
+                (port_id, claim)
             }).collect::<HashMap<_,_>>();
 
         // `chunk_output_claims` is a map storing claims related to the subset of input ports of layers in the model

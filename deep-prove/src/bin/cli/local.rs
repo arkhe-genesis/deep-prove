@@ -1,5 +1,6 @@
 use crate::{Command, Executor};
 use anyhow::{Context, bail};
+use memmap2::Mmap;
 use std::io::Write;
 use tracing::{error, info};
 use ureq::http::status::StatusCode;
@@ -18,7 +19,7 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
         Command::Submit { onnx, inputs } => {
             let input = Input::from_file(&inputs).context("loading input")?;
             let model_file = std::fs::File::open(&onnx).context("opening model file")?;
-            let model = unsafe { memmap2::Mmap::map(&model_file) }
+            let model = unsafe { Mmap::map(&model_file) }
                 .context("mmap-ing model file")?
                 .to_vec();
             let scaling_strategy = ScalingStrategyKind::AbsoluteMax;
@@ -82,7 +83,8 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Request { .. } => bail!("`request` is not supported"),
+        Command::OnnxRequest { .. } => bail!("`onnx-request` is not supported"),
+        Command::LlmRequest { .. } => bail!("`llm-request` is not supported"),
         Command::Cancel { .. } => bail!("`cancel` is not supported"),
     }
     Ok(())

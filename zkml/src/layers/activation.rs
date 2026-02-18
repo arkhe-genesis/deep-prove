@@ -96,6 +96,10 @@ impl ActivationHandle {
             activation_output: handle,
         }
     }
+
+    pub(crate) fn attach_store(&mut self, store: tenstore::GenStore) {
+        self.activation_output.attach_store(store);
+    }
 }
 
 /// Currently holds the poly info for the output polynomial of the RELU

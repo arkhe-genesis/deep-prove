@@ -164,6 +164,14 @@ impl GenStore {
         new_store.run_id = Uuid::new_v4();
         new_store
     }
+
+    /// This allows multiple workers to share the same tensor store namespace when
+    /// processing chunks that belong to the same plan.
+    pub fn with_run_id(&self, id: &str) -> Self {
+        let mut new_store = self.clone();
+        new_store.run_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, id.as_bytes());
+        new_store
+    }
 }
 
 impl Default for GenStore {

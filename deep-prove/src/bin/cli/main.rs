@@ -1,9 +1,9 @@
-use anyhow::Context;
+use anyhow::{Context, bail};
 use bincode::serde::decode_from_slice;
 use clap::{Parser, Subcommand, ValueEnum};
 use deep_prove::middleware::{
     llm::LlmOneShotOutput,
-    v1::{DeepProveRequest as DeepProveRequestV1, Output},
+    v1::{DeepProveRequest as DeepProveRequestV1, LlmOutput, Output},
 };
 use redact::Secret;
 use std::{fs, path::PathBuf};
@@ -92,8 +92,8 @@ enum Command {
         inputs: PathBuf,
     },
 
-    /// Submit inputs to be proved for an existing model.
-    Request {
+    /// Submit ONNX model inputs to be proved.
+    OnnxRequest {
         /// The user-facing name of this request. Will default to a timestamp if not set.
         #[arg(short = 'p', long = "pretty")]
         pretty_name: Option<String>,
@@ -105,6 +105,29 @@ enum Command {
         /// Path to the inputs to prove inference for.
         #[arg(short, long)]
         inputs: PathBuf,
+
+        /// The maximal price to pay (in $LA) for the task to be executed.
+        #[arg(long)]
+        max_fee: u128,
+    },
+
+    /// Submit an LLM prompt to be proved.
+    LlmRequest {
+        /// The user-facing name of this request. Will default to a timestamp if not set.
+        #[arg(short = 'p', long = "pretty")]
+        pretty_name: Option<String>,
+
+        /// The ID of the model to prove the inference for.
+        #[arg(short, long)]
+        model_id: usize,
+
+        /// The prompt text for LLM inference.
+        #[arg(long)]
+        prompt: String,
+
+        /// Maximum number of new tokens to generate.
+        #[arg(long, default_value_t = 8)]
+        max_new_tokens: usize,
 
         /// The maximal price to pay (in $LA) for the task to be executed.
         #[arg(long)]
@@ -145,7 +168,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Executor::Verify { proof } => {
             let _span = info_span!("dp_cli_verify", proof_path = %proof.display()).entered();
-            info!("verifying proof in `{}`", proof.display());
             verify_proof(proof)
         }
     }
@@ -155,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
 pub enum ProofFormat {
     Json,
     Bin,
+    Msgpack,
 }
 
 fn verify_proof(proof: PathBuf) -> anyhow::Result<()> {
@@ -165,16 +188,42 @@ fn verify_proof(proof: PathBuf) -> anyhow::Result<()> {
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
+        .as_deref()
     {
-        Some(ext) if ext == "json" => ProofFormat::Json,
-        _ => ProofFormat::Bin,
+        Some("json") => ProofFormat::Json,
+        Some("msgpack" | "mp") => ProofFormat::Msgpack,
+        Some("bin") => ProofFormat::Bin,
+        Some(other) => bail!(
+            "unknown proof file extension '.{other}'. Supported extensions: .msgpack, .mp, .json, .bin"
+        ),
+        None => {
+            bail!("proof file has no extension. Supported extensions: .msgpack, .mp, .json, .bin")
+        }
     };
 
-    match format {
+    let result = match format {
         ProofFormat::Json => {
             let outputs: Vec<Output> =
                 serde_json::from_slice(&bytes).context("deserializing ONNX proof (JSON)")?;
+            info!("verifying ONNX proof (JSON) with {} outputs", outputs.len());
             outputs.into_iter().try_fold((), |_, o| o.proof.verify())
+        }
+        ProofFormat::Msgpack => {
+            if let Ok(outputs) = rmp_serde::from_slice::<Vec<Output>>(&bytes) {
+                info!(
+                    "verifying ONNX proof (msgpack) with {} outputs",
+                    outputs.len()
+                );
+                outputs.into_iter().try_fold((), |_, o| o.proof.verify())
+            } else if let Ok(outputs) = rmp_serde::from_slice::<Vec<LlmOutput>>(&bytes) {
+                info!(
+                    "verifying LLM proof (msgpack) with {} outputs",
+                    outputs.len()
+                );
+                outputs.into_iter().try_fold((), |_, o| o.proof.verify())
+            } else {
+                bail!("failed to deserialize proof as either ONNX or LLM format (msgpack)")
+            }
         }
         ProofFormat::Bin => {
             let (llm, _) =
@@ -192,5 +241,10 @@ fn verify_proof(proof: PathBuf) -> anyhow::Result<()> {
             llm.verifier
                 .verify(llm.proof.proof, llm.tokens, llm.proof.io)
         }
+    };
+
+    if result.is_ok() {
+        info!("Proof verified successfully");
     }
+    result
 }

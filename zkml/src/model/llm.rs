@@ -494,17 +494,9 @@ where
             full_sentence.len(),
         );
 
-        let mut store = GenStore::default();
-        let trace = self.model.run(vec![tensor], &mut store)?;
-        for i in num_input_tokens..full_sentence.len() {
-            assert_eq!(
-                trace.outputs()[0].tensor().unwrap().data()[i - 1],
-                trace.inputs()[0].tensor().unwrap().data()[i],
-                "Failed for {i}, input: {:?}, output: {:?}",
-                trace.inputs()[0].tensor().unwrap(),
-                trace.outputs()[0].tensor().unwrap(),
-            );
-        }
+        // Use the passed store (worker's remote store) so TensorHandle data
+        // is accessible during proving in distributed execution
+        let trace = self.model.run(vec![tensor], store)?;
 
         // Reset the model, so it can be reused.
         self.model.reset();

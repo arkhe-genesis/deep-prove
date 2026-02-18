@@ -6,7 +6,7 @@ use crate::graph::{NodeInput, NodeOutput};
 use anyhow::Context;
 use crossbeam_channel::unbounded;
 use rayon::scope;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A trait defining execution strategies for computational graphs.
 ///
@@ -57,7 +57,7 @@ pub trait Executor<N: ExecNode, C> {
         scheduler: GraphScheduler<N, C>,
         input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
-    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>>;
+    ) -> anyhow::Result<BTreeMap<NodeOutput, N::IO>>;
 }
 
 /// An executor that runs nodes sequentially in dependency order.
@@ -101,9 +101,9 @@ where
         mut scheduler: GraphScheduler<N, C>,
         input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
-    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
+    ) -> anyhow::Result<BTreeMap<NodeOutput, N::IO>> {
         let mut ready_nodes = scheduler.init_nodes(input_data)?;
-        let mut outputs = HashMap::new();
+        let mut outputs = BTreeMap::new();
         while !scheduler.is_done() {
             let node_outputs = ready_nodes
                 .iter_mut()
@@ -176,13 +176,13 @@ where
         scheduler: GraphScheduler<N, C>,
         input_data: HashMap<NodeInput, N::IO>,
         context: &N::Context,
-    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
+    ) -> anyhow::Result<BTreeMap<NodeOutput, N::IO>> {
         // Release all to keep the threadpool busy
         let mut scheduler = scheduler.with_release_policy(ReleasePolicy::All);
         let mut ready_nodes = scheduler.init_nodes(input_data)?;
 
-        scope(move |s| -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
-            let mut outputs = HashMap::new();
+        scope(move |s| -> anyhow::Result<BTreeMap<NodeOutput, N::IO>> {
+            let mut outputs = BTreeMap::new();
             let (tx, rx) = unbounded();
 
             while !scheduler.is_done() {

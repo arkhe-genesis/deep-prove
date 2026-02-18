@@ -92,6 +92,17 @@ impl ProvingHandle {
             ProvingData::None => ProvingHandle::None,
         }
     }
+
+    pub(crate) fn attach_store(&mut self, store: GenStore) {
+        match self {
+            ProvingHandle::Convolution(handle) => handle.attach_store(store),
+            ProvingHandle::Softmax(handle) => handle.attach_store(store),
+            ProvingHandle::LayerNorm(handle) => handle.attach_store(store),
+            ProvingHandle::ArgMax(handle) => handle.attach_store(store),
+            ProvingHandle::Activation(handle) => handle.attach_store(store),
+            ProvingHandle::None => {}
+        }
+    }
 }
 
 /// Identifier for an intermediate tensor of a layer, i.e., a tensor which is neither an

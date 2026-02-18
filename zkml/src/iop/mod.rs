@@ -110,6 +110,16 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> From<Vec<ChunkProof<
     }
 }
 
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Proof<E, PCS> {
+    pub fn num_chunks(&self) -> usize {
+        self.chunk_proofs.len()
+    }
+
+    pub fn into_chunk_proofs(self) -> Vec<ChunkProof<E, PCS>> {
+        self.chunk_proofs
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub struct TableProof<E: ExtensionField, PCS>

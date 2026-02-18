@@ -482,20 +482,37 @@ where
         &mut self,
         output: PartitionOutput<N, C>,
     ) -> anyhow::Result<()> {
+        self.set_child_output(output.from, output.output)
+    }
+
+    /// Injects an output from a child partition directly using the color and IO data.
+    ///
+    /// This method is useful when you have deserialized partition output data
+    /// and need to inject it into the scheduler without constructing the full `PartitionOutput` type.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - The color of the child partition that produced this output
+    /// * `output` - The actual IO data produced by the child partition
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output is not expected by the current partition
+    /// (i.e., if `from` is not in the current partition's `child_partition` map).
+    pub fn set_child_output(&mut self, from: C, output: N::IO) -> anyhow::Result<()> {
         if self.partitions.is_empty() {
             return Ok(());
         }
         let next_partition = self.partitions.first().unwrap();
-        if next_partition.child_partition.contains_key(&output.from) {
+        if next_partition.child_partition.contains_key(&from) {
             // we know the output is expected so we save it internally, and
             // it'll be used at the next run if all outputs of all child
             // partitions have been received.
-            self.pending_child_outputs
-                .insert(output.from, output.output);
+            self.pending_child_outputs.insert(from, output);
         } else {
             bail!(
                 "output of child partition {:?} not expected for current partition {:?}",
-                output.from,
+                from,
                 next_partition.color
             );
         }

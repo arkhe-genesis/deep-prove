@@ -149,6 +149,11 @@ impl LayerNormHandle {
             full_value,
         }
     }
+
+    pub(crate) fn attach_store(&mut self, store: tenstore::GenStore) {
+        self.lookup_output.attach_store(store.clone());
+        self.full_value.attach_store(store);
+    }
 }
 
 impl<T> LayerNorm<T>

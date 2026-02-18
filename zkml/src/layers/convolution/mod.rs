@@ -148,6 +148,10 @@ impl ConvFFTHandle {
         let handle = TensorHandle::from_wrapped_tensor(storage_key, store, conv_fftdata.input);
         Self { handle }
     }
+
+    pub(crate) fn attach_store(&mut self, store: tenstore::GenStore) {
+        self.handle.attach_store(store);
+    }
 }
 
 /// The filter weights, a 4D tensor of the shape `(feature_maps, channels_out,

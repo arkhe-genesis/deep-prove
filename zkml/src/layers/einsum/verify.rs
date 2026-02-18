@@ -96,11 +96,11 @@ impl<E: ExtensionField> EinSumContext<E> {
             |(mut split_points, mut claim_evaluations, mut bias_claims),
              (output_id, (claim, output_shape, unpadded_output_shape, bias_opt, bias_id))| {
                 if bias_opt.is_some() {
-                    let bias_eval = bias_evals_iter
+                    let bias_eval_from_proof = bias_evals_iter
                         .next()
                         .ok_or(anyhow!("Not enough bias evaluations in proof"))?;
                     let split_point = output_shape.split_point(claim.point())?;
-                    let (bias_eval, bias_claim) = self.mapping.compute_bias_evaluation::<E>(output_id, bias_usize_id, &split_point, *bias_eval, unpadded_output_shape)?;
+                    let (bias_eval, bias_claim) = self.mapping.compute_bias_evaluation::<E>(output_id, bias_usize_id, &split_point, *bias_eval_from_proof, unpadded_output_shape)?;
                     bias_usize_id += 1;
                     let claim_evaluation = claim.evaluation() - bias_eval;
                     claim_evaluations.push(claim_evaluation);

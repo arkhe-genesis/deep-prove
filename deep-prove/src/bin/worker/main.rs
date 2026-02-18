@@ -5,7 +5,7 @@ use deep_prove::{
         v1::{self, DeepProveRequest as DeepProveRequestV1, T},
         v2::Provable,
     },
-    store::{self, MemStore, S3Store, Store},
+    store::{self, Store},
 };
 use std::path::PathBuf;
 use tenstore::GenStore;
@@ -28,7 +28,7 @@ mod lpn;
 async fn run_model_v1<S: Store>(
     model: DeepProveRequestV1,
     mut model_data_store: S,
-    mut tenstore: GenStore,
+    tenstore: GenStore,
     proof_id: String,
 ) -> Result<Vec<v1::Output>> {
     info!("Proving inference");
@@ -147,12 +147,16 @@ async fn run_model_v1<S: Store>(
         let mut proofs = vec![];
         for (i, input) in inputs.into_iter().enumerate() {
             debug!(input_index = i, proof_id = %proof_id, "Running input");
+            // Ensure per-input runs don't reuse cached layer state or tensor-store pages
+            // to avoid cross-input contamination when proving multiple inputs in a row.
+            model.reset();
+            let mut run_store = tenstore.start_new_run();
             let input_tensors = model
                 .load_input_flat(vec![input])
                 .context("loading flat inputs")?;
 
             let trace = model
-                .run(input_tensors, &mut tenstore)
+                .run(input_tensors, &mut run_store)
                 .context(format!("Running inference for input {}", i + 1))?;
             let output_handles = trace.outputs();
             let outputs = output_handles
@@ -360,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
         TenStoreKind::Remote => GenStore::new_remote(
             store_root_dir.context("Must specify cache dir for local store")?,
             store_cache_size,
-            store_server_addr.context("Must server address for remote store")?,
+            store_server_addr.context("Must specify server address for remote store")?,
         ),
     }?;
 
@@ -369,12 +373,6 @@ async fn main() -> anyhow::Result<()> {
         api_args @ RunMode::LocalApi { .. } => api::serve(api_args, tenstore).await,
         http_args @ RunMode::Http { .. } => lpn::http::run(http_args, tenstore).await,
     }
-}
-
-#[derive(Clone)]
-enum StoreKind {
-    S3(S3Store),
-    Mem(MemStore),
 }
 
 #[derive(Copy, Clone, clap::ValueEnum)]

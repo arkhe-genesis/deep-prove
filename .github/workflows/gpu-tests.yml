@@ -23,7 +23,7 @@ concurrency:
 jobs:
   changes:
     name: Check for changes in zkML sources
-    runs-on: arc-runner-cpx22  
+    runs-on: arc-runner-cpx22
     permissions:
       pull-requests: read
       contents: read
@@ -60,22 +60,15 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Setup sccache
-        uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
-
       - name: Sanity check
-        if: always()
-        run: |
-          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+        run: [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
 
       - uses: actions/checkout@v4
         with:
           lfs: true
 
       - name: Force-check LFS
-        run: |
-          git lfs install --local
-          git lfs pull
+        run: git lfs pull
 
       - name: Set RNG seed
         run: |
@@ -130,6 +123,3 @@ jobs:
             parser::llm::models::gpt2::tests::test_safe_gpt2_load_model
         env:
           IN_CI: "true"
-
-      - name: Show sccache stats
-        run: sccache --show-stats

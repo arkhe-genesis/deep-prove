@@ -1,15 +1,13 @@
-use super::{ModelFetcher, WorkerResources, instantiate_store};
-use crate::{RunMode, StoreKind};
-use anyhow::{Context, anyhow, bail, ensure};
+use super::{WorkerResources, instantiate_store, proving::process_job};
+use crate::RunMode;
+use anyhow::{Context, anyhow, ensure};
 use base64::{Engine, prelude::BASE64_STANDARD};
-use deep_prove::middleware::{v1, v2};
+use deep_prove::middleware::v2;
 use exponential_backoff::Backoff;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tenstore::GenStore;
 use tracing::{debug, error, info, info_span, warn};
 use url::Url;
-use zkml::quantization::ScalingStrategyKind;
 
 const ATTEMPTS: u32 = 5;
 const MIN_WAIT_MS: u64 = 1000;
@@ -190,49 +188,6 @@ impl ConnContext {
     }
 }
 
-async fn process_job(
-    job: v2::GwToWorker,
-    store: &mut StoreKind,
-    tenstore: GenStore,
-    fetcher: &ModelFetcher,
-) -> anyhow::Result<Vec<u8>> {
-    let span = info_span!("process_job", proof_id = job.job_id, s3_key = %job.s3_key);
-    let _entered = span.enter();
-    let model_mmap = fetcher
-        .fetch(&job.s3_key)
-        .await
-        .context("downloading model artifact")?;
-    let model_file_hash = format!("{:X}", Sha256::digest(model_mmap.as_ref()));
-    let request = v1::DeepProveRequest {
-        model: model_mmap.as_ref().to_vec(),
-        model_file_hash: Some(model_file_hash),
-        input: job.input,
-        scaling_strategy: ScalingStrategyKind::AbsoluteMax,
-        scaling_input_hash: None,
-    };
-
-    let result = match store {
-        StoreKind::S3(store) => {
-            let span = tracing::info_span!("dp_worker_prove_inference", proof_id = %job.job_id);
-            let _entered = span.enter();
-            crate::run_model_v1(request, store.clone(), tenstore, job.job_id.to_string()).await
-        }
-        StoreKind::Mem(store) => {
-            let span = tracing::info_span!("dp_worker_prove_inference", proof_id = %job.job_id);
-            let _entered = span.enter();
-            crate::run_model_v1(request, store.clone(), tenstore, job.job_id.to_string()).await
-        }
-    };
-
-    match result {
-        Ok(proofs) => Ok(rmp_serde::to_vec(&proofs).unwrap()),
-
-        Err(err) => {
-            bail!("failed to run model: {err:?}");
-        }
-    }
-}
-
 pub async fn run(args: crate::RunMode, tenstore: GenStore) -> anyhow::Result<()> {
     let RunMode::Http {
         gw_url,
@@ -264,10 +219,7 @@ pub async fn run(args: crate::RunMode, tenstore: GenStore) -> anyhow::Result<()>
         humansize::format_size(max_job_size, humansize::BINARY)
     );
 
-    let WorkerResources {
-        mut store,
-        model_fetcher,
-    } = instantiate_store(&s3_args, model_cache_dir.clone())
+    let WorkerResources { model_fetcher } = instantiate_store(&s3_args, model_cache_dir.clone())
         .context("initializing worker resources")?;
     let conn = ConnContext::new(gw_url, worker_name, address, max_job_size);
 
@@ -324,20 +276,24 @@ pub async fn run(args: crate::RunMode, tenstore: GenStore) -> anyhow::Result<()>
         }
 
         // 4. Process job & submit proof
-        match process_job(job, &mut store, job_tenstore.clone(), &model_fetcher).await {
+        match process_job(job, job_tenstore.clone(), &model_fetcher).await {
             Ok(proof) => {
-                conn.submit_proof(job_id, &proof)
-                    .context("submitting proofs to gateway")?;
-                info!("submitted proof for job #{job_id}");
+                if proof.is_empty() {
+                    let err_msg = format!("proof payload empty for job {job_id}");
+                    conn.submit_error(job_id, &err_msg)
+                        .context("submitting error to gateway")?;
+                    info!("submitted error for job #{job_id}");
+                } else {
+                    conn.submit_proof(job_id, &proof)
+                        .context("submitting proofs to gateway")?;
+                    info!("submitted proof for job #{job_id}");
+                }
             }
             Err(err) => {
                 conn.submit_error(job_id, &format!("{err:?}"))
                     .context("submitting error to gateway")?;
-                info!("submitted error for job #{job_id}");
+                error!("submitted error: {err:?} for job #{job_id}");
             }
-        }
-        if let Err(err) = job_tenstore.clean_up() {
-            error!("failed to clean-up tensor store: {err:?}");
         }
     }
 }

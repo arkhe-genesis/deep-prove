@@ -130,23 +130,8 @@ jobs:
       id-token: write
     runs-on: ['gpu']
     steps:
-      - name: Setup sccache
-        uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xz-utils git-lfs
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - name: Install devenv
-        run: |
-          nix profile install nixpkgs#devenv --accept-flake-config
-
       - name: Sanity check
-        if: always()
-        run: |
-          [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
+        run: [ -f $HOME/.gitconfig ] && echo "Removing gitconfig" && rm ${HOME}/.gitconfig || exit 0
 
       - uses: actions/checkout@v4
         with:

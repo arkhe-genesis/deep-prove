@@ -2,11 +2,11 @@ use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
 use zkml::{
+    IO, Proof as ZkmlProof,
     model::llm::{LLMProof, LLMVerifierContext},
     parser::llm::Token,
 };
 
-/// Extension field and PCS aliases used for LLM proofs.
 pub type F = GoldilocksExt2;
 pub type Pcs = Basefold<F, BasefoldRSParams>;
 
@@ -20,4 +20,18 @@ pub struct LlmOneShotOutput {
     pub llm_response: Option<String>,
     pub proof: LLMProof<F, Pcs>,
     pub verifier: LLMVerifierContext<F, Pcs>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LlmProvable {
+    pub proof: ZkmlProof<F, Pcs>,
+    pub io: IO<F>,
+    pub ctx: LLMVerifierContext<F, Pcs>,
+    pub user_tokens: Vec<Token>,
+}
+
+impl LlmProvable {
+    pub fn verify(self) -> anyhow::Result<()> {
+        self.ctx.verify(self.proof, self.user_tokens, self.io)
+    }
 }

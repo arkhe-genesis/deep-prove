@@ -84,6 +84,12 @@ impl ArgmaxHandle {
 
         Self { max_values }
     }
+
+    pub(crate) fn attach_store(&mut self, store: tenstore::GenStore) {
+        self.max_values
+            .iter_mut()
+            .for_each(|handle| handle.attach_store(store.clone()));
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

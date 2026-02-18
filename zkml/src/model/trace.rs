@@ -224,6 +224,7 @@ where
             .outputs
             .iter_mut()
             .for_each(|handle| handle.attach_store(store.clone()));
+        self.node_outputs.proving_data.attach_store(store);
     }
 
     /// Returns the input tensor handles of the node

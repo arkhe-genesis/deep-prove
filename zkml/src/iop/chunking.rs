@@ -78,7 +78,7 @@ pub struct ModelChunk {
 
 /// Data type employed to represent a set of incoming or outgoing edges of a chunk;
 /// The edges are grouped according to the chunk they are connected to
-pub(crate) type EdgesGroup = HashMap<ChunkID, BTreeSet<EdgeId>>;
+pub(crate) type EdgesGroup = BTreeMap<ChunkID, BTreeSet<EdgeId>>;
 
 // Specify whether a group of boundary edges of a chunk are incoming or outgoing edges
 #[derive(Clone, Copy, Debug)]
@@ -92,8 +92,8 @@ impl ModelChunk {
         Self {
             subgraph,
             chunk_id: chunk_id.into(),
-            incoming_edges: HashMap::new(),
-            outgoing_edges: HashMap::new(),
+            incoming_edges: BTreeMap::new(),
+            outgoing_edges: BTreeMap::new(),
         }
     }
 
@@ -118,7 +118,7 @@ impl ModelChunk {
     ) -> anyhow::Result<EdgesGroup> {
         let input_wires = self.incoming_edges()?;
         input_wires.into_iter().try_fold(
-            HashMap::<ChunkID, BTreeSet<EdgeId>>::new(),
+            BTreeMap::<ChunkID, BTreeSet<EdgeId>>::new(),
             |mut incoming_edges, edge_id| {
                 let edge = self.subgraph.edge(&edge_id).ok_or(anyhow!(
                     "Edge {edge_id} not found in subgraph of chunk {}",
@@ -144,7 +144,7 @@ impl ModelChunk {
     ) -> anyhow::Result<EdgesGroup> {
         let output_wires = self.outgoing_edges()?;
         output_wires.into_iter().try_fold(
-            HashMap::<ChunkID, BTreeSet<EdgeId>>::new(),
+            BTreeMap::<ChunkID, BTreeSet<EdgeId>>::new(),
             |mut outgoing_edges, edge_id| {
                 let edge = self.subgraph.edge(&edge_id).ok_or(anyhow!(
                     "Edge {edge_id} not found in subgraph of chunk {}",

@@ -193,6 +193,7 @@ where
                 Ok(vec![ProverGraphIO::ChunkProof(chunk_proof?)])
             }
             ProverGraphNode::Final => {
+                // BTreeMap in executor ensures deterministic ordering by NodeOutput
                 let outputs = inputs
                     .into_iter()
                     .map(|output| {

@@ -2,6 +2,7 @@ use crate::LocalStore;
 use anyhow::{Context, Result, anyhow};
 use base64::{prelude::BASE64_STANDARD, read::DecoderReader, write::EncoderWriter};
 use exponential_backoff::Backoff;
+use reqwest::StatusCode;
 use serde_json::json;
 use std::{
     borrow::Cow,
@@ -19,7 +20,16 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 use url::Url;
+use urlencoding::encode;
 use uuid::Uuid;
+
+use crate::StoreError;
+use sha2::{Digest, Sha256};
+
+fn hashed_tensor_key<K: Display>(key: &K) -> String {
+    let digest = Sha256::digest(key.to_string().as_bytes());
+    format!("{digest:x}")
+}
 
 pub async fn retry_async_operation<F, Fut, T, E: std::fmt::Debug>(
     func: F,
@@ -440,22 +450,36 @@ where
             run_id = run_id.to_string(),
             key = key.to_string()
         );
-        let fetch_url = server_addr.join(&format!("/tenstore/{run_id}/{key}"))?;
+        let path_key = hashed_tensor_key(&key);
+        let fetch_url = server_addr.join(&format!("/tenstore/{run_id}/{}", encode(&path_key)))?;
 
         let response = retry_async_operation(
             || reqwest_inject_trace_headers(reqwest::Client::new().get(fetch_url.as_str())).send(),
             || format!("fetching {run_id}/{key}"),
         )
         .await
-        .with_context(|| format!("calling fetch for {run_id}/{key}"))?
-        .error_for_status()
-        .with_context(|| format!("fetching {run_id}/{key}"))?;
+        .with_context(|| format!("calling fetch for {run_id}/{key}"))?;
 
-        zstd::stream::decode_all(DecoderReader::new(
-            response.bytes().await?.to_vec().as_slice(),
-            &BASE64_STANDARD,
-        ))
-        .with_context(|| format!("decoding {run_id}/{key}"))
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(anyhow!(StoreError::RemoteKeyNotFound));
+        }
+        if let Err(err) = response.error_for_status_ref() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read body".to_string());
+            error!("fetching {run_id}/{key}: HTTP {status} - {body}");
+            return Err(err)
+                .with_context(|| format!("fetching {run_id}/{key}: HTTP {status} - {body}"));
+        }
+        let response = response
+            .error_for_status()
+            .with_context(|| format!("fetching {run_id}/{key}"))?;
+
+        let bytes = response.bytes().await?;
+        zstd::stream::decode_all(DecoderReader::new(bytes.as_ref(), &BASE64_STANDARD))
+            .with_context(|| format!("decoding {run_id}/{key} ({} bytes)", bytes.len()))
     }
 
     async fn put(
@@ -470,9 +494,10 @@ where
             run_id = run_id.to_string(),
             key = key.to_string()
         );
+        let path_key = hashed_tensor_key(key);
         let put_url = self
             .server_addr
-            .join(&format!("/tenstore/{run_id}/{key}"))
+            .join(&format!("/tenstore/{run_id}/{}", encode(&path_key)))
             .unwrap();
 
         let mut encoder = EncoderWriter::new(Vec::with_capacity(data.len()), &BASE64_STANDARD);
@@ -481,24 +506,37 @@ where
             .unwrap();
 
         let encoded = encoder.finish().context("converting to base64").unwrap();
-        let result = retry_async_operation(
-            || {
-                reqwest_inject_trace_headers(reqwest::Client::new().put(put_url.as_str()))
-                    .json(&json!({
-                            "tensor": str::from_utf8(&encoded).expect("base64, so valid UTF8")
-                    }))
-                    .send()
-            },
-            || format!("storing {run_id}/{key}"),
-        )
-        .await
-        .with_context(|| format!("calling store for {run_id}/{key}"))
-        .and_then(|r| {
-            r.error_for_status()
-                .map(|_| ())
-                .with_context(|| format!("storing {run_id}/{key}"))
-        });
+        let result: Result<()> = async {
+            let response = retry_async_operation(
+                || {
+                    reqwest_inject_trace_headers(reqwest::Client::new().put(put_url.as_str()))
+                        .json(&json!({
+                                "tensor": str::from_utf8(&encoded).expect("base64, so valid UTF8")
+                        }))
+                        .send()
+                },
+                || format!("storing {run_id}/{key}"),
+            )
+            .await
+            .with_context(|| format!("calling store for {run_id}/{key}"))?;
 
+            if let Err(err) = response.error_for_status_ref() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "failed to read body".to_string());
+                error!("storing {run_id}/{key}: HTTP {status} - {body}");
+                return Err(err)
+                    .with_context(|| format!("storing {run_id}/{key}: HTTP {status} - {body}"));
+            }
+
+            response
+                .error_for_status()
+                .with_context(|| format!("storing {run_id}/{key}"))
+                .map(|_| ())
+        }
+        .await;
         res_tx.send(result).expect("sending back put result");
     }
 }

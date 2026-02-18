@@ -54,7 +54,16 @@ impl RemoteStore {
                 run_id,
                 local::InternalKey::from_storage_key_with_run_id(run_id, key),
             )
-            .map_err(StoreError::RemoteStoreError)?;
+            .map_err(|err| {
+                if matches!(
+                    err.downcast_ref::<StoreError>(),
+                    Some(StoreError::RemoteKeyNotFound)
+                ) {
+                    StoreError::KeyUnknown
+                } else {
+                    StoreError::RemoteStoreError(err)
+                }
+            })?;
         let data: T = rmp_serde::from_slice(&bytes).map_err(StoreError::DeserializationError)?;
         Ok(data)
     }

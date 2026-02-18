@@ -828,6 +828,9 @@ impl Requant {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
+        // Use ctx.requant derived from the cached quantized+padded model to be consistent with the verifier
+        let requant = &ctx.requant;
+
         let layer_commitment = prover.lookup_witness(id)?;
         let logup_inputs = ctx
             .lookup_ctx
@@ -838,7 +841,7 @@ impl Requant {
         let logup_batch_proof = batch_multiple_sizes_prove(&logup_inputs, prover.transcript)?;
         let logup_point = logup_batch_proof.output_claims()[0].point.clone();
 
-        let eq_mles = if self.number_of_zero_chunks() != 0 {
+        let eq_mles = if requant.number_of_zero_chunks() != 0 {
             let sign_challenges = (0..last_claim.point.len())
                 .map(|_| {
                     prover
@@ -863,10 +866,10 @@ impl Requant {
             .sample_and_append_challenge(b"batching")
             .elements;
 
-        let (number_shifted_chunks, _, _) = self.shifted_chunks_data();
+        let (number_shifted_chunks, _, _) = requant.shifted_chunks_data();
         let either_mles = layer_polys
             .iter()
-            .skip(number_shifted_chunks + self.number_of_zero_chunks())
+            .skip(number_shifted_chunks + requant.number_of_zero_chunks())
             .map(|p| Either::Left(p.as_ref()))
             .chain(eq_mles.iter().map(Either::Left))
             .collect::<Vec<Either<_, _>>>();
@@ -880,7 +883,7 @@ impl Requant {
 
         let (claim_acc_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
         let evals = state.get_mle_flatten_final_evaluations();
-        let evaluations = if self.number_of_zero_chunks() != 0 {
+        let evaluations = if requant.number_of_zero_chunks() != 0 {
             evals[..evals.len() - 3].to_vec()
         } else {
             evals[..evals.len() - 2].to_vec()
@@ -900,12 +903,13 @@ impl Requant {
             .iter()
             .skip(number_shifted_chunks + 1)
             .step_by(2)
-            .take(self.number_of_zero_chunks())
+            .take(requant.number_of_zero_chunks())
             .map(|c| c.eval)
             .collect::<Vec<E>>();
         let logup_value_eval = logup_claims[number_shifted_chunks].eval
             - E::from_canonical_u64(1 << (*quantization::BIT_LEN - 1));
-        let input_eval = self.recombine_claims(logup_value_eval, &shifted_claims, &zero_in_evals);
+        let input_eval =
+            requant.recombine_claims(logup_value_eval, &shifted_claims, &zero_in_evals);
         let input_claim = Claim::<E>::new(logup_point.clone(), input_eval);
 
         // Add all the commitments to the commitment prover

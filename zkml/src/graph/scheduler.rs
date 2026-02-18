@@ -430,7 +430,7 @@ where
         &mut self,
         node_id: NodeId,
         outputs: &[N::IO],
-    ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
+    ) -> anyhow::Result<BTreeMap<NodeOutput, N::IO>> {
         ensure!(
             self.running_nodes.remove(&node_id),
             "{node_id} was not running"

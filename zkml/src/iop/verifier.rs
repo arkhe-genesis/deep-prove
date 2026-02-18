@@ -27,7 +27,7 @@ use itertools::Itertools;
 use mpcs::{Point, PolynomialCommitmentScheme};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use tracing::{info, info_span, trace};
+use tracing::{info_span, trace};
 use transcript::Transcript;
 
 /// What the verifier must have besides the proof
@@ -195,7 +195,8 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
                 // For the output, we manually evaluate the MLE and check if it's the same as what prover
                 // gave. Note prover could ellude that but it's simpler to avoid that special check right
                 // now.
-                (port_id, compute_claim(self.transcript, tensor))
+                let claim = compute_claim(self.transcript, tensor);
+                (port_id, claim)
             }).collect::<HashMap<_,_>>();
 
         let chunk_output_claims = proof
@@ -274,7 +275,6 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
 
                         let my_claims = {
                             if layer.is_provable() {
-                                // we verify the proof
                                 layer
                                     .verify(
                                         node_proof,
@@ -428,7 +428,6 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
             "Final denominator was zero, lookup arguments are invalid"
         );
 
-        info!("Proof verified successfully");
         Ok(())
     }
 

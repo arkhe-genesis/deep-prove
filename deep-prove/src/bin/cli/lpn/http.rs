@@ -2,9 +2,10 @@ use alloy::{hex, signers::local::PrivateKeySigner};
 use alloy_signer::SignerSync;
 use anyhow::{Context, bail};
 use axum::http::StatusCode;
+use base64::{Engine, prelude::BASE64_STANDARD};
 use deep_prove::middleware::v2::{ClientToGw, TaskClass};
 use serde_json::json;
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, time::SystemTime};
 use tracing::{error, info};
 use url::Url;
 use zeroize::Zeroize;
@@ -92,48 +93,32 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
 
     match command {
         Command::Submit { .. } => bail!("`submit` is not supported"),
-        Command::Request {
+        Command::OnnxRequest {
             pretty_name,
             model_id,
             inputs,
             max_fee,
         } => {
             let input = Input::from_file(&inputs).context("loading input")?;
-
-            let request = ClientToGw {
-                pretty_name: pretty_name.unwrap_or_else(|| {
-                    format!(
-                        "{model_id}-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .expect("you're not Dr. Who -- come back to the forward-flowing time")
-                            .as_secs()
-                    )
-                }),
-                class: TaskClass::RunOnnx {
-                    model_id: model_id.try_into().context("`model_id` is too large")?,
-                    input,
-                },
-                max_fee,
+            let task_class = TaskClass::RunOnnx {
+                model_id: model_id.try_into().context("`model_id` is too large")?,
+                input,
             };
-
-            // build the API endpoint request and send the whole thing
-            let mut resp = ureq::post(gw_url.join("/api/v1/prove/tasks")?.as_str())
-                .header("authorization", &token)
-                .send_json(request)
-                .context("calling API")?;
-            match resp.status() {
-                StatusCode::CREATED => {
-                    info!("[CREATED] {}", resp.body_mut().read_to_string()?);
-                }
-                c => {
-                    error!(
-                        "failed to send request: [{}] {}",
-                        c.as_str(),
-                        resp.body_mut().read_to_string()?
-                    );
-                }
-            }
+            send_request(&gw_url, &token, pretty_name, task_class, max_fee)?;
+        }
+        Command::LlmRequest {
+            pretty_name,
+            model_id,
+            prompt,
+            max_new_tokens,
+            max_fee,
+        } => {
+            let task_class = TaskClass::RunLlm {
+                model_id: model_id.try_into().context("`model_id` is too large")?,
+                prompt,
+                max_new_tokens,
+            };
+            send_request(&gw_url, &token, pretty_name, task_class, max_fee)?;
         }
         Command::Fetch { filename } => {
             let mut resp = ureq::get(gw_url.join("/api/v1/prove/proof")?.as_str())
@@ -143,9 +128,34 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
 
             match resp.status() {
                 StatusCode::OK => {
+                    // GW returns JSON: {"id": task_id, "proof": "<base64_encoded_proof>"}
+                    // The proof field contains Base64-encoded msgpack bytes
+                    let json_response: serde_json::Value = serde_json::from_slice(
+                        &resp
+                            .body_mut()
+                            .with_config()
+                            .limit(MAX_PROOF_SIZE)
+                            .read_to_vec()?,
+                    )
+                    .context("parsing JSON response")?;
+
+                    let task_id = json_response.get("id").and_then(|v| v.as_str());
+                    info!("fetching proof for task_id: {:?}", task_id);
+
+                    let proof_bytes = BASE64_STANDARD
+                        .decode(
+                            json_response
+                                .get("proof")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("missing 'proof' field in response")
+                                })?,
+                        )
+                        .context("decoding Base64 proof")?;
+
                     let filename = filename.unwrap_or_else(|| {
                         format!(
-                            "{}.bin",
+                            "{}.msgpack",
                             std::time::SystemTime::now()
                                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                                 .unwrap()
@@ -154,15 +164,9 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
                     });
                     std::fs::File::create(&filename)
                         .context("failed to create proof file")?
-                        .write_all(
-                            resp.body_mut()
-                                .with_config()
-                                .limit(MAX_PROOF_SIZE)
-                                .read_to_vec()?
-                                .as_slice(),
-                        )
+                        .write_all(&proof_bytes)
                         .context("failed to write proof")?;
-                    info!("proof written to {filename}");
+                    info!("proof written to {filename} ({} bytes)", proof_bytes.len());
                 }
                 StatusCode::NO_CONTENT => {
                     info!("no proof ready");
@@ -201,5 +205,48 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn send_request(
+    gw_url: &Url,
+    token: &str,
+    pretty_name: Option<String>,
+    class: TaskClass,
+    max_fee: u128,
+) -> anyhow::Result<()> {
+    let model_id = match &class {
+        TaskClass::RunOnnx { model_id, .. } | TaskClass::RunLlm { model_id, .. } => model_id,
+    };
+    let request = ClientToGw {
+        pretty_name: pretty_name.unwrap_or_else(|| {
+            format!(
+                "{model_id}-{}",
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("you're not Dr. Who -- come back to the forward-flowing time")
+                    .as_secs()
+            )
+        }),
+        class,
+        max_fee,
+    };
+
+    let mut resp = ureq::post(gw_url.join("/api/v1/prove/tasks")?.as_str())
+        .header("authorization", token)
+        .send_json(request)
+        .context("calling API")?;
+    match resp.status() {
+        StatusCode::CREATED => {
+            info!("[CREATED] {}", resp.body_mut().read_to_string()?);
+        }
+        c => {
+            error!(
+                "failed to send request: [{}] {}",
+                c.as_str(),
+                resp.body_mut().read_to_string()?
+            );
+        }
+    }
     Ok(())
 }

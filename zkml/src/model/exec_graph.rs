@@ -19,6 +19,7 @@ use crate::{
         prover_graph::{LocalProverCtx, ProverGraphIO, ProverGraphNode},
     },
     model::{Model, Trace, llm::Driver},
+    quantization::ModelMetadata,
 };
 
 /// Context for the execution graph used for distributed proving
@@ -88,6 +89,10 @@ where
 {
     pub(crate) ctx: ProverContext<E, PCS>,
     pub(crate) engine: InferenceEngine,
+    /// Model metadata for input/output scaling. Required for input quantization.
+    /// This field is optional for backward compatibility with existing serialized data.
+    #[serde(default)]
+    pub(crate) metadata: Option<ModelMetadata>,
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SerializableGraphCtx<E, PCS>
@@ -95,7 +100,39 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub fn new(ctx: ProverContext<E, PCS>, engine: InferenceEngine) -> Self {
-        Self { ctx, engine }
+        Self {
+            ctx,
+            engine,
+            metadata: None,
+        }
+    }
+
+    /// Create a new SerializableGraphCtx with model metadata for input scaling.
+    /// The metadata is required when the context will be cached and reused for
+    /// different inputs.
+    pub fn new_with_metadata(
+        ctx: ProverContext<E, PCS>,
+        engine: InferenceEngine,
+        metadata: ModelMetadata,
+    ) -> Self {
+        Self {
+            ctx,
+            engine,
+            metadata: Some(metadata),
+        }
+    }
+
+    /// Get the model metadata for input/output scaling.
+    /// Returns an error if metadata is not available (older cached context).
+    pub fn metadata(&self) -> anyhow::Result<&ModelMetadata> {
+        self.metadata
+            .as_ref()
+            .ok_or_else(|| anyhow!("Model metadata not available in cached context"))
+    }
+
+    /// Get a reference to the inference engine.
+    pub fn engine(&self) -> &InferenceEngine {
+        &self.engine
     }
 
     /// Build the full execution graph context from `SerializableGraphCtx`,
@@ -137,6 +174,36 @@ pub enum ExecGraphIO<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
     Prover(ProverGraphIO<E, PCS>),
     // Model IO output to be provided to the verifier
     ModelIO(IO<E>),
+}
+
+/// A serializable intermediate output for GW mediated distributed execution.
+///
+/// This struct mirrors `PartitionOutput` but uses concrete types that can be
+/// serialized/deserialized across network boundaries without lifetime parameters.
+/// It is used for storing intermediate outputs in the GW DB and passing
+/// them between workers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+pub struct SerializablePartitionOutput<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+    /// The color/chunk_id of the partition that produced this output
+    pub from: usize,
+    /// The color/chunk_id of the partition that should receive this output.
+    /// `None` indicates this is a final output of the entire computation.
+    pub to: Option<usize>,
+    /// The actual output data produced by the partition
+    pub output: ExecGraphIO<E, PCS>,
+}
+
+impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SerializablePartitionOutput<E, PCS> {
+    /// Create a new serializable partition output
+    pub fn new(from: usize, to: Option<usize>, output: ExecGraphIO<E, PCS>) -> Self {
+        Self { from, to, output }
+    }
+
+    /// Returns true if this output represents the final result of the computation.
+    pub fn is_final_output(&self) -> bool {
+        self.to.is_none()
+    }
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ExecGraphIO<E, PCS> {
@@ -218,7 +285,7 @@ where
                     bail!("Expected tensors as input for inference task")
                 };
                 let trace = ctx.engine.run(input.input_tensors, &mut input.store)?;
-                let io = trace.to_verifier_io()?;
+                let io: IO<E> = trace.to_verifier_io()?;
                 Ok(vec![
                     ExecGraphIO::Prover(ProverGraphIO::ProverSplitInput(trace)),
                     ExecGraphIO::ModelIO(io),
@@ -363,7 +430,7 @@ mod tests {
     use ff_ext::GoldilocksExt2;
     use rayon::scope;
     use serde::{Serialize, de::DeserializeOwned};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use tenstore::GenStore;
     use transcript::BasicTranscript;
 
@@ -433,13 +500,13 @@ mod tests {
             scheduler: GraphScheduler<N, C>,
             input_data: HashMap<NodeInput, N::IO>,
             context: &N::Context,
-        ) -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
+        ) -> anyhow::Result<BTreeMap<NodeOutput, N::IO>> {
             // Release all to keep the threadpool busy
             let mut scheduler = scheduler.with_release_policy(ReleasePolicy::All);
             let mut ready_nodes = scheduler.init_nodes(input_data)?;
 
-            scope(move |s| -> anyhow::Result<HashMap<NodeOutput, N::IO>> {
-                let mut outputs = HashMap::new();
+            scope(move |s| -> anyhow::Result<BTreeMap<NodeOutput, N::IO>> {
+                let mut outputs = BTreeMap::new();
                 let (tx, rx) = unbounded();
 
                 while !scheduler.is_done() {

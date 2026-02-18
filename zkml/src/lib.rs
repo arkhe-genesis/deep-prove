@@ -35,7 +35,7 @@ pub use crate::number::Number;
 
 // Re-exports
 pub use iop::{
-    Proof, ProverContext,
+    ChunkProof, Proof, ProverContext,
     claim::Claim,
     prover::Prover,
     verifier::{IO, verify},

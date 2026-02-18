@@ -10,6 +10,9 @@ pub enum StoreError {
     #[error("page is unknown")]
     KeyUnknown,
 
+    #[error("remote key not found")]
+    RemoteKeyNotFound,
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
