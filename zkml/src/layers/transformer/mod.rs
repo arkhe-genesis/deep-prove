@@ -4,8 +4,7 @@ use crate::{
     tensor::{TensorTypeParam, WrappedTensor},
 };
 
-use burn::tensor::TensorData;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod attention_mask;
 pub mod embeddings;
@@ -16,22 +15,84 @@ pub mod rmsnorm;
 pub mod softmax;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConcatenationCache {
-    cached_tensor: Option<TensorData>,
-    rank: usize,
-    concatenation_dim: usize,
+#[serde(bound(serialize = "N: Serialize", deserialize = "N: DeserializeOwned"))]
+pub struct ConcatenationCache<N: TensorTypeParam> {
+    cached_tensor: Option<WrappedTensor<N>>,
+    caching_info: CachingInfo,
     padding_mode: PaddingMode,
 }
 
-impl ConcatenationCache {
-    pub fn new(rank: usize, concatenation_dim: usize, padding_mode: PaddingMode) -> Self {
-        Self {
-            cached_tensor: None,
+#[derive(Debug, Clone, Serialize, Deserialize, Copy)]
+enum CachingInfo {
+    /// Used in cases where the cache will know for sure the shape of the tensor it is
+    /// caching before run time
+    Static {
+        rank: usize,
+        concatenation_dim: usize,
+    },
+    /// Used in cases like Softmax caching where we only know that we are caching on the second last dimension, but
+    /// aren't sure how many total dimensions there are.
+    Dynamic(isize),
+}
+
+impl CachingInfo {
+    fn new_static(rank: usize, concatenation_dim: usize) -> CachingInfo {
+        CachingInfo::Static {
             rank,
             concatenation_dim,
+        }
+    }
+
+    fn new_dynamic(concatenation_dim: isize) -> CachingInfo {
+        CachingInfo::Dynamic(concatenation_dim)
+    }
+
+    fn get_concatenation_dim(&self, tensor_rank: usize) -> anyhow::Result<usize> {
+        match self {
+            CachingInfo::Static {
+                concatenation_dim, ..
+            } => Ok(*concatenation_dim),
+            CachingInfo::Dynamic(concatenation_dim) => {
+                if *concatenation_dim < 0 {
+                    let rank_isize = tensor_rank as isize;
+                    let dim = rank_isize + concatenation_dim;
+                    anyhow::ensure!(
+                        dim >= 0isize,
+                        "Could not acquire concatenation dimension in ConcatenationCache, provided tensor had rank to small, rank: {tensor_rank}, concatenation_dim: {concatenation_dim}"
+                    );
+                    Ok(dim as usize)
+                } else {
+                    let dim = *concatenation_dim as usize;
+                    anyhow::ensure!(
+                        dim < tensor_rank,
+                        "Could not acquire concatenation dimension in ConcatenationCache, provided tensor had rank to small, rank: {tensor_rank}, concatenation_dim: {concatenation_dim}"
+                    );
+                    Ok(dim)
+                }
+            }
+        }
+    }
+}
+
+impl<N: TensorTypeParam> ConcatenationCache<N> {
+    pub fn new(rank: usize, concatenation_dim: usize, padding_mode: PaddingMode) -> Self {
+        let caching_info = CachingInfo::new_static(rank, concatenation_dim);
+        Self {
+            cached_tensor: None,
+            caching_info,
             padding_mode,
         }
     }
+
+    pub fn new_dynamic(concatenation_dim: isize, padding_mode: PaddingMode) -> Self {
+        let caching_info = CachingInfo::new_dynamic(concatenation_dim);
+        Self {
+            cached_tensor: None,
+            caching_info,
+            padding_mode,
+        }
+    }
+
     pub fn reset(&mut self) {
         self.cached_tensor = None;
     }
@@ -39,7 +100,11 @@ impl ConcatenationCache {
         self.cached_tensor.is_some()
     }
 
-    pub fn concatenate<N: TensorTypeParam>(
+    fn get_concatenation_dim(&self, tensor_rank: usize) -> anyhow::Result<usize> {
+        self.caching_info.get_concatenation_dim(tensor_rank)
+    }
+
+    pub fn concatenate(
         &mut self,
         new_tensor: WrappedTensor<N>,
     ) -> anyhow::Result<WrappedTensor<N>> {
@@ -50,17 +115,21 @@ impl ConcatenationCache {
             new_tensor.reduce_to_shape(&unpadded_shape)?
         };
 
+        // We retrieve the concatenation dim here to enforce that the tensor to be cached is valid.
+        let rank = reduced.rank();
+        let concatenation_dim = self.get_concatenation_dim(rank)?;
+
         let output = if self.is_initialized() {
             let mut placeholder = None;
             std::mem::swap(&mut placeholder, &mut self.cached_tensor);
 
             // Unwrap is safe because we are initialised
-            let cached_tensor = WrappedTensor::from_data(placeholder.unwrap())?;
-            let catted = WrappedTensor::cat(vec![cached_tensor, reduced], self.concatenation_dim)?;
-            self.cached_tensor = Some(catted.clone().to_data());
+            let cached_tensor = placeholder.unwrap();
+            let catted = WrappedTensor::cat(vec![cached_tensor, reduced], concatenation_dim)?;
+            self.cached_tensor = Some(catted.clone());
             catted
         } else {
-            self.cached_tensor = Some(reduced.clone().to_data());
+            self.cached_tensor = Some(reduced.clone());
             reduced
         };
 
@@ -72,28 +141,28 @@ impl ConcatenationCache {
 
     /// Given a [`Shape`], returns the next shape after concatenation.
     /// Here `padding_mode` determines whether to pad the new shape to the next power of two.
-    pub fn next_shape(&self, shape: Shape, padding_mode: PaddingMode) -> Shape {
+    pub fn next_shape(&self, shape: Shape, padding_mode: PaddingMode) -> anyhow::Result<Shape> {
         let mut new_shape = shape;
-        new_shape[self.concatenation_dim] += self.current_sequence_length();
+        let rank = new_shape.rank();
+        let concatenation_dim = self.get_concatenation_dim(rank)?;
+        new_shape[concatenation_dim] += self.current_sequence_length();
         if let PaddingMode::Padding = padding_mode {
             new_shape = new_shape.next_power_of_two();
         }
-        new_shape
+        Ok(new_shape)
     }
 
-    pub fn get_cached<N: TensorTypeParam>(&self) -> anyhow::Result<WrappedTensor<N>> {
+    pub fn get_cached(&self) -> anyhow::Result<WrappedTensor<N>> {
         if let PaddingMode::NoPadding = self.padding_mode {
-            let inner_data = self
-                .cached_tensor
+            self.cached_tensor
                 .clone()
-                .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))?;
-            WrappedTensor::from_data(inner_data)
+                .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))
         } else {
-            let inner_data = self
+            let inner = self
                 .cached_tensor
                 .clone()
                 .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))?;
-            WrappedTensor::from_data(inner_data).map(|t| t.pad_next_power_of_two())
+            Ok(inner.pad_next_power_of_two())
         }
     }
 
@@ -105,13 +174,25 @@ impl ConcatenationCache {
 
     pub fn current_sequence_length(&self) -> usize {
         if let Some(tensor) = &self.cached_tensor {
-            tensor.shape[self.concatenation_dim]
+            let rank = tensor.rank();
+
+            // Unwrap is safe because if initialised we have already checked that we can get the concatenation dim
+            let concatenation_dim = self.get_concatenation_dim(rank).unwrap();
+            tensor.dim(concatenation_dim as isize).unwrap()
         } else {
             0
         }
     }
 
     pub fn cache_info(&self) -> (usize, usize) {
-        (self.rank, self.concatenation_dim)
+        match self.caching_info {
+            CachingInfo::Static {
+                rank,
+                concatenation_dim,
+            } => (rank, concatenation_dim),
+            CachingInfo::Dynamic(..) => {
+                panic!("Should not be accessing caching info for Dynamic variant")
+            }
+        }
     }
 }

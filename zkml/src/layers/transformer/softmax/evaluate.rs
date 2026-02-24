@@ -8,6 +8,19 @@ impl Softmax<Element> {
         &self,
         input: &WrappedTensor<Element>,
     ) -> Result<WrappedTensor<Element>> {
+        if self.shift_cache_initialised() {
+            // The cache is initialised, if the current cache sequence length matches
+            // the last two dimensions of the shape then just use the cached tensor. Otherwise
+            // calculate the new row shift and add it to the cache.
+            let shift_cache = self.shift_cache.lock().unwrap();
+            let current_sequence_length = shift_cache.current_sequence_length();
+            let second_last_dim = input.dim(-2)?;
+            let last_dim = input.dim(-1)?;
+            let dims_equal = second_last_dim == last_dim;
+            if dims_equal && current_sequence_length == last_dim {
+                return shift_cache.get_cached();
+            }
+        }
         let QuantisedSoftmaxData {
             input_scaling_factor,
             temperature,
@@ -45,11 +58,15 @@ impl Softmax<Element> {
             .log();
 
         let quantising_scalar = temperature / input_scaling_factor.scale();
-        log_sum_exp
+        let shift_tensor = log_sum_exp
             .mul_scalar(-quantising_scalar)
             .round()
             .int()
-            .sub(dim_maxes)
+            .sub(dim_maxes)?;
+
+        let mut cache = self.shift_cache.lock().unwrap();
+        let _ = cache.concatenate(shift_tensor.clone());
+        Ok(shift_tensor)
     }
 
     pub(crate) fn evaluate_internal(
@@ -125,6 +142,118 @@ impl Softmax<Element> {
                 proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
                 tracked_layer_data: Default::default(),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{backend::Backend, quantization::Quantize};
+    use burn::tensor::{Bool, Tensor as BTensor};
+    use proptest::prelude::*;
+
+    #[derive(Clone)]
+    struct Input {
+        pub heads: usize,
+        pub n: usize,
+        pub flat_floats: Vec<f32>,
+    }
+
+    impl std::fmt::Debug for Input {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Input")
+                .field("heads", &self.heads)
+                .field("n", &self.n)
+                .finish()
+        }
+    }
+
+    fn input_strategy() -> impl Strategy<Value = Input> {
+        (1usize..=4_usize, 128usize..=256_usize).prop_flat_map(|(heads, n)| {
+            prop::collection::vec(-4.0f32..4.0f32, heads * n * n).prop_map(move |v| Input {
+                heads,
+                n,
+                flat_floats: v,
+            })
+        })
+    }
+
+    proptest! {
+        /// Checks that [`Softmax::calculate_shift_data_new`] produces the same integer
+        /// shift when processing a full `[heads, n, n]` causally-masked attention matrix all
+        /// at once as when processing each query position individually with only its valid
+        /// prefix (`[heads, 1, row+1]`).
+        ///
+        /// This exactly mirrors the full-trace vs cached-trace scenario: the full trace calls
+        /// `calculate_shift_data_new` once on the entire `[heads, n, n]` matrix (with the
+        /// upper triangle set to `neg_inf`), whereas the cached trace calls it n times, each
+        /// time on `[heads, 1, row+1]` containing only the valid context logits for that
+        /// query position across all heads. A counterexample proves the discrepancy is real;
+        /// passing builds confidence it is not.
+        #[test]
+        fn prop_shift_matches_row_by_row(
+            input in input_strategy()
+        ) {
+            let Input { heads, n, flat_floats} = input;
+            let max_context = n.next_power_of_two().max(4);
+
+            // Derive the scaling factor from all heads*n*n float values, as a real Q@K^T
+            // quantisation step would (before masking).
+            let float_matrix = Tensor::new(vec![heads, n, n].into(), flat_floats.clone()).unwrap();
+            let scaling = ScalingFactor::from_tensor(&float_matrix, None);
+            // Skip degenerate matrices where all values are identical (scale ≈ 0).
+            prop_assume!(scaling.scale() > 0.0);
+
+            let quant_matrix = float_matrix.quantize(&scaling);
+
+            // Build quantised Softmax using the same input scaling.
+            let softmax = Softmax::<f32>::new(max_context)
+                .quantise(scaling, *quantization::BIT_LEN)
+                .unwrap();
+            let neg_inf = softmax.quant_info().unwrap().quantised_negative_infinity();
+            // Skip if any valid logit coincides with the sentinel.
+            prop_assume!(quant_matrix.data().iter().all(|&v| v != neg_inf));
+
+            // Build the full [heads, n, n] causal matrix: upper triangle of each head's
+            // [n, n] attention matrix set to neg_inf.  All heads share the same causal
+            // pattern, which is what the 3-D mask branch in calculate_shift_data_new
+            // assumes (it reads the mask from the first head only).
+            let mask = BTensor::<Backend, 2, Bool>::tril_mask([n, n], 0, &Default::default());
+            let wrapped_quant = WrappedTensor::try_from(quant_matrix).unwrap();
+            let casual_tensor = wrapped_quant.mask_fill(mask, neg_inf).unwrap();
+
+            // Cached-trace: for each query position, process [heads, 1, row+1] — all heads
+            // together but only the valid key prefix for that position.
+            let mut all_row_shifts = Vec::<Vec<Element>>::with_capacity(n);
+            for (row, full_row_tensor) in casual_tensor.clone().iter_dim(1).enumerate() {
+                let valid_len = row + 1;
+                let row_tensor = full_row_tensor.slice_dim(2, 0..valid_len);
+
+                // Output has shape [heads, 1, 1] — one shift value per head.
+                let row_shift = softmax.calculate_shift_data_new(&row_tensor).unwrap();
+                let row_shift_val: Vec<Element> = row_shift.to_data().to_vec().unwrap();
+
+                all_row_shifts.push(row_shift_val);
+
+            }
+
+            // Full-trace: process all heads and rows at once.
+            // Output shift tensor has shape [heads, n, 1], laid out as heads*n elements.
+            let full_shifts = softmax.calculate_shift_data_new(&casual_tensor).unwrap();
+            let full_shift_data: Vec<Element> = full_shifts.to_data().to_vec().unwrap();
+
+            for (row, row_shift_val) in all_row_shifts.into_iter().enumerate() {
+                for head in 0..heads {
+                    let full_val = full_shift_data[head * n + row];
+                    let cached_val = row_shift_val[head];
+                    prop_assert_eq!(
+                        full_val, cached_val,
+                        "head={} row={} shift mismatch: full={}, cached={}, n={}, heads={}",
+                        head, row, full_val, cached_val, n, heads,
+                    );
+                }
+            }
         }
     }
 }

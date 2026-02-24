@@ -16,6 +16,7 @@ use crate::{
             QuantizeOutput, VerifiableCtx,
         },
         requant::FIXED_POINT_SCALE,
+        transformer::ConcatenationCache,
     },
     lookup::{
         context::{
@@ -50,7 +51,10 @@ use multilinear_extensions::{
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    sync::{Arc, Mutex},
+};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -68,10 +72,14 @@ pub mod verify;
 pub const SOFTMAX_LAYER: &str = "SFTM";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "N: Serialize", deserialize = "N: DeserializeOwned"))]
 /// Stores data about the Softmax operation, which is used to map a tensor of values to a tensor of probability distributions.
 /// This is done by picking a dimension to normalise over and calculating
 ///             `x -> exp(scale * x) / (\sum_{i \in dim} exp(scale * x_{i}))`.
-pub struct Softmax<N> {
+pub struct Softmax<N>
+where
+    N: TensorTypeParam,
+{
     // By default, it's equal to 1
     /// In the floating point case this is the factor we multiply by before exponentiating, when thought of as a Boltzmann distribution this is
     /// often referred to as the "Temperature".
@@ -82,6 +90,11 @@ pub struct Softmax<N> {
     pub(crate) max_size: usize,
     /// This is the extra information required to compute the quantised version, it defaults to [`None`].
     quant_info: Option<QuantisedSoftmaxData>,
+    /// Transient shift cache populated by a full-trace call (`dim[-2] > 1`) and consumed by
+    /// subsequent cached-trace calls (`dim[-2] == 1`). Skipped during (de)serialisation so
+    /// that it is always reset to `None` on load; the next full-trace call repopulates it.
+    #[serde(skip_serializing)]
+    shift_cache: Arc<Mutex<ConcatenationCache<N>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Copy)]
@@ -280,6 +293,10 @@ impl<N: TensorTypeParam> Softmax<N> {
             scalar: N::unit(),
             max_size: context_length,
             quant_info: None,
+            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<N>::new_dynamic(
+                -2,
+                PaddingMode::NoPadding,
+            ))),
         }
     }
 
@@ -288,6 +305,10 @@ impl<N: TensorTypeParam> Softmax<N> {
             scalar: scale,
             max_size: max_context_size,
             quant_info: None,
+            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<N>::new_dynamic(
+                -2,
+                PaddingMode::NoPadding,
+            ))),
         }
     }
     /// Method to quantise the [`Softmax`] operation, this takes in the input scaling factor and the intermediate bit size.
@@ -360,6 +381,10 @@ impl<N: TensorTypeParam> Softmax<N> {
             scalar: 1,
             max_size: self.max_size,
             quant_info: Some(quant_info),
+            shift_cache: Arc::new(Mutex::new(ConcatenationCache::new_dynamic(
+                -2,
+                PaddingMode::NoPadding,
+            ))),
         })
     }
     /// Getter for the [`QuantisedSoftmaxData`] if it exists
@@ -372,6 +397,23 @@ impl<N: TensorTypeParam> Softmax<N> {
             scalar: scale,
             ..self
         }
+    }
+
+    /// Returns whether the shift cache has been initialised
+    pub fn shift_cache_initialised(&self) -> bool {
+        self.shift_cache.lock().unwrap().is_initialized()
+    }
+
+    /// Appends data to the [shift_cache][Self::shift_cache]
+    pub fn update_shift_cache(&self, shift_tensor: WrappedTensor<N>) -> Result<()> {
+        let mut cache = self.shift_cache.lock().unwrap();
+        let _ = cache.concatenate(shift_tensor)?;
+        Ok(())
+    }
+
+    /// Resets the [shift_cache][Self::shift_cache]
+    pub fn reset_cache(&self) {
+        self.shift_cache.lock().unwrap().reset();
     }
 
     /// Method to calculate the scale factors, error and required size for the [`ExpTable`] in order to prform quantised [`Softmax`].
@@ -490,7 +532,7 @@ impl Evaluate<f32> for Softmax<f32> {
     }
 }
 
-impl<N> OpInfo for Softmax<N> {
+impl<N: TensorTypeParam> OpInfo for Softmax<N> {
     fn output_shapes(
         &self,
         input_shapes: &[Shape],

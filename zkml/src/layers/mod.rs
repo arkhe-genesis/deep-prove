@@ -136,10 +136,11 @@ where
 
     /// Resets the internal state of the layer if any
     pub fn reset(&self) {
-        if let Layer::Positional(pos) = self {
-            pos.reset_cache();
-        } else if let Layer::EinSum(einsum) = self {
-            einsum.reset_caches();
+        match self {
+            Layer::Positional(pos) => pos.reset_cache(),
+            Layer::EinSum(einsum) => einsum.reset_caches(),
+            Layer::Softmax(softmax) => softmax.reset_cache(),
+            _ => (),
         }
     }
 }

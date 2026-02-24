@@ -178,6 +178,23 @@ impl EinSum<f32> {
             },
         );
 
+        let caches = self
+            .caches
+            .into_iter()
+            .map(|opt_cache| {
+                opt_cache.map(|cache| {
+                    let mut cache = cache.lock().unwrap();
+                    cache.reset();
+                    let (rank, concatenation_dim) = cache.cache_info();
+                    Arc::new(Mutex::new(ConcatenationCache::<Element>::new(
+                        rank,
+                        concatenation_dim,
+                        PaddingMode::NoPadding,
+                    )))
+                })
+            })
+            .collect::<Vec<_>>();
+
         let quantized_op = EinSum {
             equation: self.equation,
             mapping: self.mapping,
@@ -187,7 +204,7 @@ impl EinSum<f32> {
             biases: quant_biases,
             bias_unpadded_shapes: self.bias_unpadded_shapes,
             padded: self.padded,
-            caches: self.caches,
+            caches,
             requantise: self.requantise,
         };
 

@@ -289,7 +289,7 @@ where
     pub(super) sine_matrix: TensorHandle<T>,
     pub(super) unpadded_shape: Shape,
     pub(super) layout: RopeLayout,
-    concatenation_cache: Option<Arc<Mutex<ConcatenationCache>>>,
+    concatenation_cache: Option<Arc<Mutex<ConcatenationCache<T>>>>,
 }
 
 impl<N: TensorTypeParam> Rope<N> {
@@ -450,7 +450,7 @@ impl<N: TensorTypeParam> Rope<N> {
             input_shapes
                 .iter()
                 .map(|shape| cache.next_shape(shape.clone(), padding_mode))
-                .collect::<Vec<Shape>>()
+                .collect::<Result<Vec<Shape>>>()?
         } else {
             input_shapes.to_vec()
         };
@@ -729,7 +729,7 @@ where
         if let Some(concat_cache) = &self.concatenation_cache {
             let mut cache = concat_cache.lock().unwrap();
 
-            let cached = cache.concatenate::<N>(output)?;
+            let cached = cache.concatenate(output)?;
             Ok(LayerOut::from_tensor(cached))
         } else if is_padded {
             Ok(LayerOut::from_tensor(output.pad_next_power_of_two()))
@@ -820,16 +820,23 @@ impl Rope<f32> {
         let output_bit_size = 2 * *quantization::BIT_LEN + 1; // +1 because we are adding 2 products of items with `quantization::BIT_LEN` bits
         let requant = Requant::from_multiplier(multiplier, output_bit_size);
 
-        if let Some(cache) = &self.concatenation_cache {
+        let concatenation_cache = self.concatenation_cache.map(|cache| {
             let mut cache = cache.lock().unwrap();
             cache.reset();
-        }
+            let (rank, concatenation_dim) = cache.cache_info();
+            Arc::new(Mutex::new(ConcatenationCache::<Element>::new(
+                rank,
+                concatenation_dim,
+                PaddingMode::NoPadding,
+            )))
+        });
+
         let quantized_rope = Rope {
             cosine_matrix: self.cosine_matrix.quantize(&matrix_scale),
             sine_matrix: self.sine_matrix.quantize(&matrix_scale),
             unpadded_shape: self.unpadded_shape,
             layout: self.layout,
-            concatenation_cache: self.concatenation_cache,
+            concatenation_cache,
         };
 
         Ok(QuantizeOutput::new(quantized_rope, output_scalings).with_requant(requant)?)

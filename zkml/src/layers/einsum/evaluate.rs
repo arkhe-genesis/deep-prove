@@ -193,7 +193,7 @@ where
                 match cache_opt {
                     Some(cache) => {
                         let mut cache = cache.lock().unwrap();
-                        cache.concatenate::<N>(with_bias)
+                        cache.concatenate(with_bias)
                     }
                     None => Ok(if self.padded {
                         with_bias.pad_next_power_of_two()

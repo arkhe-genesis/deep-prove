@@ -92,7 +92,7 @@ where
     /// Tells us if we are running padded or unpadded
     pub(crate) padded: bool,
     /// used if the outputs of the einsum need to be cached
-    pub caches: Vec<Option<Arc<Mutex<ConcatenationCache>>>>,
+    pub caches: Vec<Option<Arc<Mutex<ConcatenationCache<T>>>>>,
     /// Flag to indicate if a requantisation step should be inserted after this layer
     pub(crate) requantise: bool,
 }
@@ -352,7 +352,7 @@ where
 
         let output_shapes = self.mapping.output_shapes(&full_input_shapes)?;
 
-        let with_caching = output_shapes
+        output_shapes
             .into_iter()
             .zip(self.caches.iter())
             .map(|(shape, cache_opt)| {
@@ -360,11 +360,10 @@ where
                     let c_lock = cache.lock().unwrap();
                     c_lock.next_shape(shape, padding_mode)
                 } else {
-                    shape
+                    Ok(shape)
                 }
             })
-            .collect::<Vec<Shape>>();
-        Ok(with_caching)
+            .collect::<Result<Vec<Shape>>>()
     }
 
     fn num_outputs(&self, _num_inputs: usize) -> Result<usize> {

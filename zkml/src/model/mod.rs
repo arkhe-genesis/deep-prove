@@ -1059,6 +1059,17 @@ where
         }
     }
 
+    /// iterates over all layers and resets their internal state if any,
+    /// skipping any layers whose short name is in the provided list
+    pub fn reset_selective(&self, to_skip: &[&str]) {
+        for (_, node) in self.graph.inner_nodes() {
+            if to_skip.contains(&node.short_name()) {
+                continue;
+            }
+            node.reset();
+        }
+    }
+
     /// Build the inputs tensors, according to the expected input shapes,
     /// from a set of flat data
     pub fn load_input_flat(&self, input: Vec<Vec<N>>) -> Result<Vec<Tensor<N>>> {

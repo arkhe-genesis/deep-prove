@@ -285,7 +285,7 @@ where
     /// Generate a setence.
     ///
     /// Notes:
-    /// - The setence is limited by the EOS token or the context length.
+    /// - The sentence is limited by the EOS token or the context length.
     /// - The returned trace contains the whole sequence.
     /// - The layer runner will be used for each token infernece, but not for
     ///   the trace generation.
@@ -307,7 +307,7 @@ where
     /// Generate a sentence.
     ///
     /// Notes:
-    /// - The setence is limited by the EOS token or the context length.
+    /// - The sentence is limited by the EOS token or the context length.
     /// - The returned trace contains the whole sequence.
     pub fn run_elements_with_tracker<E>(
         &self,
@@ -335,7 +335,7 @@ where
     /// Generate a sentence.
     ///
     /// Notes:
-    /// - The setence is limited by the EOS token or the context length.
+    /// - The sentence is limited by the EOS token or the context length.
     /// - The returned trace contains the whole sequence.
     /// - The layer runner will be used for each token inferenece, but not for
     ///   the trace generation.
@@ -487,7 +487,8 @@ where
 
         // Reset the model and its caches, otherwise a single token is
         // generated.
-        self.model.reset();
+        self.model
+            .reset_selective(&[crate::layers::transformer::softmax::SOFTMAX_LAYER]);
 
         info!(
             "Running last iteration (heavy) with {} tokens",
