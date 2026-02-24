@@ -6,7 +6,7 @@ use deep_prove::middleware::v2;
 use exponential_backoff::Backoff;
 use serde_json::json;
 use tenstore::GenStore;
-use tracing::{debug, error, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use url::Url;
 
 const ATTEMPTS: u32 = 5;
@@ -266,34 +266,39 @@ pub async fn run(args: crate::RunMode, tenstore: GenStore) -> anyhow::Result<()>
             .map(|v| ("traceparent".to_string(), v.clone()))
             .collect();
         telemetry::set_parent_from_headers(&job_span, &trace_headers);
-        let _entered = job_span.enter();
-        info!("received job #{job_id} to execute");
 
-        // 3. ACK job
-        match conn.ack_job(job_id) {
-            Ok(_) => debug!("ACK-ed job #{job_id}"),
-            Err(err) => error!("failed to ACK job: {err:?}"),
-        }
+        async {
+            info!("received job #{job_id} to execute");
 
-        // 4. Process job & submit proof
-        match process_job(job, job_tenstore.clone(), &model_fetcher).await {
-            Ok(proof) => {
-                if proof.is_empty() {
-                    let err_msg = format!("proof payload empty for job {job_id}");
-                    conn.submit_error(job_id, &err_msg)
+            // 3. ACK job
+            match conn.ack_job(job_id) {
+                Ok(_) => debug!("ACK-ed job #{job_id}"),
+                Err(err) => error!("failed to ACK job: {err:?}"),
+            }
+
+            // 4. Process job & submit proof
+            match process_job(job, job_tenstore.clone(), &model_fetcher).await {
+                Ok(proof) => {
+                    if proof.is_empty() {
+                        let err_msg = format!("proof payload empty for job {job_id}");
+                        conn.submit_error(job_id, &err_msg)
+                            .context("submitting error to gateway")?;
+                        info!("submitted error for job #{job_id}");
+                    } else {
+                        conn.submit_proof(job_id, &proof)
+                            .context("submitting proofs to gateway")?;
+                        info!("submitted proof for job #{job_id}");
+                    }
+                }
+                Err(err) => {
+                    conn.submit_error(job_id, &format!("{err:?}"))
                         .context("submitting error to gateway")?;
-                    info!("submitted error for job #{job_id}");
-                } else {
-                    conn.submit_proof(job_id, &proof)
-                        .context("submitting proofs to gateway")?;
-                    info!("submitted proof for job #{job_id}");
+                    error!("submitted error: {err:?} for job #{job_id}");
                 }
             }
-            Err(err) => {
-                conn.submit_error(job_id, &format!("{err:?}"))
-                    .context("submitting error to gateway")?;
-                error!("submitted error: {err:?} for job #{job_id}");
-            }
+            Ok::<_, anyhow::Error>(())
         }
+        .instrument(job_span)
+        .await?;
     }
 }

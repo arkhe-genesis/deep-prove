@@ -6,7 +6,7 @@ use ff_ext::GoldilocksExt2;
 use mpcs::{Basefold, BasefoldRSParams};
 use std::{collections::HashMap, sync::Arc};
 use tenstore::GenStore;
-use tracing::{info, info_span, warn};
+use tracing::{Instrument, info, info_span, warn};
 use transcript::BasicTranscript;
 use zkml::{
     graph::{
@@ -51,20 +51,21 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
         chunk.partition.len(),
     );
 
-    let ctx: SerializableGraphCtx<F, Pcs> =
-        rmp_serde::from_slice(ctx_bytes).context("failed to deserialize SerializableGraphCtx")?;
-    info!("run_chunk_partition: deserialized SerializableGraphCtx successfully");
+    let ctx: SerializableGraphCtx<F, Pcs> = {
+        let _guard = info_span!("deserialize_ctx", bytes = ctx_bytes.len()).entered();
+        rmp_serde::from_slice(ctx_bytes).context("failed to deserialize SerializableGraphCtx")?
+    };
 
-    let mut partitions: Vec<ChunkPartition> = rmp_serde::from_slice(
-        &BASE64_STANDARD
-            .decode(&chunk.partition)
-            .context("failed to decode partition from Base64")?,
-    )
-    .context("failed to deserialize partitions")?;
-    info!(
-        "run_chunk_partition: deserialized {} partitions",
-        partitions.len()
-    );
+    let mut partitions: Vec<ChunkPartition> = {
+        let _guard = info_span!("deserialize_partitions").entered();
+        rmp_serde::from_slice(
+            &BASE64_STANDARD
+                .decode(&chunk.partition)
+                .context("failed to decode partition from Base64")?,
+        )
+        .context("failed to deserialize partitions")?
+    };
+    info!("deserialized {} partitions", partitions.len());
 
     // Attach the shared tensor store to partition inputs so that the
     // inference results are stored in a location accessible by other chunks.
@@ -79,15 +80,24 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
     }
 
     // Create the partition scheduler with ThreadPoolExecutor for parallel execution
-    let tenstore_for_ctx = tenstore.clone();
-    let mut scheduler = PartitionScheduler::<_, _, ThreadPoolExecutor>::new(
-        partitions,
-        ctx.to_full_ctx(tenstore_for_ctx),
-        (),
-    )?;
+    let mut scheduler = {
+        let _guard = info_span!("build_scheduler", num_partitions = partitions.len()).entered();
+        let tenstore_for_ctx = tenstore.clone();
+        PartitionScheduler::<_, _, ThreadPoolExecutor>::new(
+            partitions,
+            ctx.to_full_ctx(tenstore_for_ctx),
+            (),
+        )?
+    };
 
     // For non-source partitions, inject dependency outputs before execution
-    if !chunk.is_source {
+    if !chunk.is_source && !chunk.dependency_outputs.is_empty() {
+        let _guard = info_span!(
+            "inject_dependencies",
+            num_deps = chunk.dependency_outputs.len()
+        )
+        .entered();
+
         for (dep_chunk_id, dep_output_b64) in &chunk.dependency_outputs {
             let decoded_bytes = BASE64_STANDARD.decode(dep_output_b64).with_context(|| {
                 format!(
@@ -125,35 +135,53 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
     // Execute partitions and collect outputs
     // Intermediate outputs (to != None) are destined for other partitions
     // Final outputs (to == None) represent completed computation (proof + IO)
-    let mut final_outputs: Vec<ExecGraphIO<F, Pcs>> = Vec::new();
-    let mut intermediate_outputs: Vec<SerializablePartitionOutput<F, Pcs>> = Vec::new();
+    let (final_outputs, mut intermediate_outputs) = {
+        let _guard = info_span!("execute_partitions").entered();
+        let mut final_outputs: Vec<ExecGraphIO<F, Pcs>> = Vec::new();
+        let mut intermediate_outputs: Vec<SerializablePartitionOutput<F, Pcs>> = Vec::new();
+        let mut partition_idx = 0u32;
 
-    while !scheduler.is_done() {
-        let outputs = scheduler.try_run_partition()?;
-        if outputs.is_empty() {
-            warn!(
-                "partition returned no outputs but is_done=false for chunk {}",
-                chunk.chunk_id
-            );
-            break;
-        }
-
-        for output in outputs {
-            if output.is_final_output() {
-                final_outputs.push(output.output);
-            } else {
-                intermediate_outputs.push(SerializablePartitionOutput::new(
-                    output.from,
-                    output.to,
-                    output.output,
-                ));
+        while !scheduler.is_done() {
+            let outputs = {
+                let _part_guard =
+                    info_span!("run_partition", partition_idx, color = %scheduler.color).entered();
+                scheduler.try_run_partition()?
+            };
+            if outputs.is_empty() {
+                warn!(
+                    "partition returned no outputs but is_done=false for chunk {}",
+                    chunk.chunk_id
+                );
+                break;
             }
+
+            for output in outputs {
+                if output.is_final_output() {
+                    final_outputs.push(output.output);
+                } else {
+                    intermediate_outputs.push(SerializablePartitionOutput::new(
+                        output.from,
+                        output.to,
+                        output.output,
+                    ));
+                }
+            }
+            partition_idx += 1;
         }
-    }
+
+        (final_outputs, intermediate_outputs)
+    };
 
     if final_outputs.is_empty() && intermediate_outputs.is_empty() {
         bail!("chunk {} produced no outputs", chunk.chunk_id)
     }
+
+    let _guard = info_span!(
+        "serialize_outputs",
+        num_final = final_outputs.len(),
+        num_intermediate = intermediate_outputs.len()
+    )
+    .entered();
 
     for output in final_outputs {
         intermediate_outputs.push(SerializablePartitionOutput::new(
@@ -171,16 +199,17 @@ async fn resolve_context(
     fetcher: &ModelFetcher,
     label: &str,
 ) -> anyhow::Result<v2::ChunkContext> {
-    info!(
-        "{}: fetching context from S3 for key: {}",
-        label, graph_ctx_key
-    );
-    let mmap = fetcher
-        .fetch_graph_context_mmap(graph_ctx_key)
-        .await
-        .with_context(|| format!("{}: fetching plan context from S3", label))?;
-    info!("{}: mmap'd context ({} bytes)", label, mmap.len());
-    Ok(v2::ChunkContext::new(Arc::new(mmap)))
+    let span = info_span!("resolve_context", s3_key = graph_ctx_key);
+    async {
+        let mmap = fetcher
+            .fetch_graph_context_mmap(graph_ctx_key)
+            .await
+            .with_context(|| format!("{}: fetching plan context from S3", label))?;
+        info!("{}: mmap'd context ({} bytes)", label, mmap.len());
+        Ok(v2::ChunkContext::new(Arc::new(mmap)))
+    }
+    .instrument(span)
+    .await
 }
 
 pub(super) async fn process_job(
@@ -198,181 +227,214 @@ pub(super) async fn process_job(
         // Handle aggregation jobs
         v2::JobPayload::Aggregation(ref agg_job) => {
             let span = info_span!("process_aggregation", plan_id = %agg_job.plan_id);
-            let _entered = span.enter();
 
-            // Decode and process chunk outputs to extract ChunkProofs and ModelIO
-            let mut chunk_outputs_map: HashMap<usize, Vec<SerializablePartitionOutput<F, Pcs>>> =
-                HashMap::new();
-            let mut model_io: Option<zkml::IO<F>> = None;
+            async {
+                // Decode and process chunk outputs to extract ChunkProofs and ModelIO
+                let (chunk_outputs_map, io) = {
+                    let _guard = info_span!(
+                        "decode_chunk_proofs",
+                        num_chunks = agg_job.chunk_proofs.len()
+                    )
+                    .entered();
 
-            for (i, proof_b64) in agg_job.chunk_proofs.iter().enumerate() {
-                let outputs: Vec<SerializablePartitionOutput<F, Pcs>> = rmp_serde::from_slice(
-                    &BASE64_STANDARD
-                        .decode(proof_b64)
-                        .with_context(|| format!("failed to decode chunk proof {}", i))?,
-                )
-                .with_context(|| format!("failed to deserialize chunk {} outputs", i))?;
+                    let mut chunk_outputs_map: HashMap<
+                        usize,
+                        Vec<SerializablePartitionOutput<F, Pcs>>,
+                    > = HashMap::new();
+                    let mut model_io: Option<zkml::IO<F>> = None;
 
-                for output in &outputs {
-                    // Extract ModelIO from chunk 0's outputs
-                    if let ExecGraphIO::ModelIO(io) = &output.output
-                        && model_io.is_none()
-                    {
-                        model_io = Some(io.clone());
+                    for (i, proof_b64) in agg_job.chunk_proofs.iter().enumerate() {
+                        let outputs: Vec<SerializablePartitionOutput<F, Pcs>> =
+                            rmp_serde::from_slice(
+                                &BASE64_STANDARD.decode(proof_b64).with_context(|| {
+                                    format!("failed to decode chunk proof {}", i)
+                                })?,
+                            )
+                            .with_context(|| {
+                                format!("failed to deserialize chunk {} outputs", i)
+                            })?;
+
+                        for output in &outputs {
+                            if let ExecGraphIO::ModelIO(io) = &output.output
+                                && model_io.is_none()
+                            {
+                                model_io = Some(io.clone());
+                            }
+                        }
+
+                        for output in outputs {
+                            chunk_outputs_map
+                                .entry(output.from)
+                                .or_default()
+                                .push(output);
+                        }
                     }
-                }
 
-                // Group outputs by their source chunk_id
-                for output in outputs {
-                    chunk_outputs_map
-                        .entry(output.from)
-                        .or_default()
-                        .push(output);
-                }
-            }
+                    let io =
+                        model_io.ok_or_else(|| anyhow!("no ModelIO found in chunk outputs"))?;
+                    (chunk_outputs_map, io)
+                };
 
-            let io = model_io.ok_or_else(|| anyhow!("no ModelIO found in chunk outputs"))?;
+                let ctx = resolve_context(&agg_job.graph_ctx_key, fetcher, "aggregation").await?;
 
-            let ctx = resolve_context(&agg_job.graph_ctx_key, fetcher, "aggregation").await?;
+                let aggregation_partition = agg_job
+                    .aggregation_partition
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("aggregation_partition is required"))?;
 
-            let aggregation_partition = agg_job
-                .aggregation_partition
-                .as_ref()
-                .ok_or_else(|| anyhow!("aggregation_partition is required"))?;
+                let agg = v2::AggregationPayload::from_job(
+                    agg_job.clone(),
+                    ctx,
+                    aggregation_partition.clone(),
+                );
 
-            let agg = v2::AggregationPayload::from_job(
-                agg_job.clone(),
-                ctx,
-                aggregation_partition.clone(),
-            );
+                let tenstore_for_agg = tenstore.with_run_id(&agg.plan_id);
 
-            // Set run_id from plan_id so we use the same tensor store namespace
-            let tenstore_for_agg = tenstore.with_run_id(&agg.plan_id);
-            let mut dependency_outputs: HashMap<String, String> = HashMap::new();
+                let chunk_payload = {
+                    let _guard = info_span!(
+                        "build_aggregation_payload",
+                        num_chunk_outputs = chunk_outputs_map.len()
+                    )
+                    .entered();
 
-            // Package ChunkProof outputs from each chunk as dependency_outputs
-            for (chunk_id, outputs) in &chunk_outputs_map {
-                if *chunk_id != 0 {
-                    let mut chunk_proofs: Vec<_> = outputs
+                    let mut dependency_outputs: HashMap<String, String> = HashMap::new();
+
+                    for (chunk_id, outputs) in &chunk_outputs_map {
+                        if *chunk_id != 0 {
+                            let mut chunk_proofs: Vec<_> = outputs
+                                .iter()
+                                .filter(|o| {
+                                    matches!(
+                                        &o.output,
+                                        ExecGraphIO::Prover(ProverGraphIO::ChunkProof(_))
+                                    ) && o.to == Some(0)
+                                })
+                                .cloned()
+                                .collect();
+
+                            for proof_output in &mut chunk_proofs {
+                                proof_output.output.attach_store(tenstore_for_agg.clone());
+                            }
+
+                            if !chunk_proofs.is_empty() {
+                                let serialized =
+                                    rmp_serde::to_vec(&chunk_proofs).with_context(|| {
+                                        format!("failed to serialize chunk {} outputs", chunk_id)
+                                    })?;
+                                dependency_outputs.insert(
+                                    chunk_id.to_string(),
+                                    BASE64_STANDARD.encode(&serialized),
+                                );
+                            }
+                        }
+                    }
+
+                    v2::ChunkPayload {
+                        plan_id: agg.plan_id.clone(),
+                        chunk_id: 0,
+                        partition: agg.aggregation_partition.clone(),
+                        ctx: agg.ctx.clone(),
+                        dependencies: dependency_outputs
+                            .keys()
+                            .filter_map(|k| k.parse().ok())
+                            .collect(),
+                        is_source: false,
+                        dependency_outputs,
+                        user_tokens: agg.user_tokens.clone(),
+                        max_context: None,
+                    }
+                };
+
+                let result = run_chunk_partition(chunk_payload, tenstore_for_agg)?;
+
+                let _guard = info_span!("serialize_aggregated_proof").entered();
+
+                let outputs: Vec<SerializablePartitionOutput<F, Pcs>> =
+                    rmp_serde::from_slice(&result)
+                        .context("failed to deserialize chunk 0 aggregation outputs")?;
+
+                let proof = outputs
+                    .into_iter()
+                    .find_map(|output| {
+                        if let ExecGraphIO::Prover(ProverGraphIO::FinalProof(p)) = output.output {
+                            Some(p)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| anyhow!("no FinalProof found in chunk 0 aggregation output"))?;
+
+                if agg.is_llm() {
+                    let user_tokens: Vec<Token> = agg
+                        .user_tokens
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("missing user_tokens for LLM aggregation"))?
                         .iter()
-                        .filter(|o| {
-                            matches!(&o.output, ExecGraphIO::Prover(ProverGraphIO::ChunkProof(_)))
-                                && o.to == Some(0)
-                        })
-                        .cloned()
+                        .map(|&t| Token::from(t as u64))
                         .collect();
 
-                    // Attach store to each ChunkProof's internal Trace
-                    for proof_output in &mut chunk_proofs {
-                        proof_output.output.attach_store(tenstore_for_agg.clone());
-                    }
+                    let verifier_ctx: LLMVerifierContext<F, Pcs> = rmp_serde::from_slice(
+                        &BASE64_STANDARD
+                            .decode(&agg.serialized_verifier_ctx)
+                            .context("failed to decode LLM verifier context")?,
+                    )
+                    .context("failed to deserialize LLM verifier context")?;
 
-                    if !chunk_proofs.is_empty() {
-                        let serialized = rmp_serde::to_vec(&chunk_proofs).with_context(|| {
-                            format!("failed to serialize chunk {} outputs", chunk_id)
-                        })?;
-                        dependency_outputs
-                            .insert(chunk_id.to_string(), BASE64_STANDARD.encode(&serialized));
-                    }
+                    let outputs = vec![v1::LlmOutput {
+                        outputs: vec![],
+                        proof: llm::LlmProvable {
+                            proof,
+                            io,
+                            ctx: verifier_ctx,
+                            user_tokens,
+                        },
+                    }];
+                    rmp_serde::to_vec(&outputs).context("failed to serialize aggregated LLM proof")
+                } else {
+                    let verifier_ctx: VerifierContext<F, Pcs> = rmp_serde::from_slice(
+                        &BASE64_STANDARD
+                            .decode(&agg.serialized_verifier_ctx)
+                            .context("failed to decode verifier context")?,
+                    )
+                    .context("failed to deserialize verifier context")?;
+
+                    let outputs = vec![v1::Output {
+                        outputs: vec![],
+                        proof: v2::Provable {
+                            proof,
+                            io,
+                            ctx: verifier_ctx,
+                        },
+                    }];
+                    rmp_serde::to_vec(&outputs).context("failed to serialize aggregated proof")
                 }
             }
-
-            let chunk_payload = v2::ChunkPayload {
-                plan_id: agg.plan_id.clone(),
-                chunk_id: 0,
-                partition: agg.aggregation_partition.clone(),
-                ctx: agg.ctx.clone(),
-                dependencies: dependency_outputs
-                    .keys()
-                    .filter_map(|k| k.parse().ok())
-                    .collect(),
-                is_source: false,
-                dependency_outputs,
-                user_tokens: agg.user_tokens.clone(),
-                max_context: None,
-            };
-
-            let result = run_chunk_partition(chunk_payload, tenstore_for_agg)?;
-
-            let outputs: Vec<SerializablePartitionOutput<F, Pcs>> = rmp_serde::from_slice(&result)
-                .context("failed to deserialize chunk 0 aggregation outputs")?;
-
-            let proof = outputs
-                .into_iter()
-                .find_map(|output| {
-                    if let ExecGraphIO::Prover(ProverGraphIO::FinalProof(p)) = output.output {
-                        Some(p)
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow!("no FinalProof found in chunk 0 aggregation output"))?;
-
-            if agg.is_llm() {
-                let user_tokens: Vec<Token> = agg
-                    .user_tokens
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("missing user_tokens for LLM aggregation"))?
-                    .iter()
-                    .map(|&t| Token::from(t as u64))
-                    .collect();
-
-                let verifier_ctx: LLMVerifierContext<F, Pcs> = rmp_serde::from_slice(
-                    &BASE64_STANDARD
-                        .decode(&agg.serialized_verifier_ctx)
-                        .context("failed to decode LLM verifier context")?,
-                )
-                .context("failed to deserialize LLM verifier context")?;
-
-                let outputs = vec![v1::LlmOutput {
-                    outputs: vec![],
-                    proof: llm::LlmProvable {
-                        proof,
-                        io,
-                        ctx: verifier_ctx,
-                        user_tokens,
-                    },
-                }];
-                rmp_serde::to_vec(&outputs).context("failed to serialize aggregated LLM proof")
-            } else {
-                let verifier_ctx: VerifierContext<F, Pcs> = rmp_serde::from_slice(
-                    &BASE64_STANDARD
-                        .decode(&agg.serialized_verifier_ctx)
-                        .context("failed to decode verifier context")?,
-                )
-                .context("failed to deserialize verifier context")?;
-
-                let outputs = vec![v1::Output {
-                    outputs: vec![],
-                    proof: v2::Provable {
-                        proof,
-                        io,
-                        ctx: verifier_ctx,
-                    },
-                }];
-                rmp_serde::to_vec(&outputs).context("failed to serialize aggregated proof")
-            }
+            .instrument(span)
+            .await
         }
 
         // Handle chunk jobs
         v2::JobPayload::Chunk(job) => {
             let span = info_span!("process_chunk", plan_id = %job.plan_id, chunk_id = job.chunk_id);
-            let _entered = span.enter();
 
-            let ctx = resolve_context(
-                &job.graph_ctx_key,
-                fetcher,
-                &format!("chunk {}", job.chunk_id),
-            )
-            .await?;
+            async {
+                let ctx = resolve_context(
+                    &job.graph_ctx_key,
+                    fetcher,
+                    &format!("chunk {}", job.chunk_id),
+                )
+                .await?;
 
-            // Convert wire struct to runtime struct
-            let chunk = v2::ChunkPayload::from_job(job, ctx);
+                // Convert wire struct to runtime struct
+                let chunk = v2::ChunkPayload::from_job(job, ctx);
 
-            // Set run_id from plan_id so all chunks share the same tensor store namespace
-            let tenstore_for_chunk = tenstore.with_run_id(&chunk.plan_id);
+                // Set run_id from plan_id so all chunks share the same tensor store namespace
+                let tenstore_for_chunk = tenstore.with_run_id(&chunk.plan_id);
 
-            run_chunk_partition(chunk, tenstore_for_chunk)
+                run_chunk_partition(chunk, tenstore_for_chunk)
+            }
+            .instrument(span)
+            .await
         }
     }
 }

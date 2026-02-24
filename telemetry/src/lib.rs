@@ -166,7 +166,7 @@ mod enabled {
                 tracing::subscriber::set_global_default(
                     registry()
                         .with(otel_layer.with_filter(LevelFilter::TRACE))
-                        .with(filter.clone())
+                        .with(filter)
                         .with(
                             fmt::layer()
                                 .json()
@@ -183,7 +183,7 @@ mod enabled {
                 tracing::subscriber::set_global_default(
                     registry()
                         .with(otel_layer.with_filter(LevelFilter::TRACE))
-                        .with(filter.clone())
+                        .with(filter)
                         .with(
                             fmt::layer()
                                 .pretty()
@@ -198,6 +198,34 @@ mod enabled {
                 .expect("Setting up logging failed");
                 return Some(guard);
             }
+        }
+
+        // Fallback for production: if OTEL_EXPORTER_OTLP_ENDPOINT is not set for the worker, disable OTEL but set up logging to avoid silent disabling.
+        if json {
+            tracing::subscriber::set_global_default(
+                registry().with(filter).with(
+                    fmt::layer()
+                        .json()
+                        .with_level(true)
+                        .with_file(true)
+                        .with_line_number(true)
+                        .with_target(true),
+                ),
+            )
+            .expect("Setting up logging failed");
+        } else {
+            tracing::subscriber::set_global_default(
+                registry().with(filter).with(
+                    fmt::layer()
+                        .pretty()
+                        .compact()
+                        .with_level(true)
+                        .with_file(true)
+                        .with_line_number(true)
+                        .with_target(true),
+                ),
+            )
+            .expect("Setting up logging failed");
         }
         None
     }

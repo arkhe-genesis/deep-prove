@@ -7,6 +7,7 @@ use anyhow::Context;
 use crossbeam_channel::unbounded;
 use rayon::scope;
 use std::collections::{BTreeMap, HashMap};
+use tracing::info_span;
 
 /// A trait defining execution strategies for computational graphs.
 ///
@@ -181,14 +182,28 @@ where
         let mut scheduler = scheduler.with_release_policy(ReleasePolicy::All);
         let mut ready_nodes = scheduler.init_nodes(input_data)?;
 
+        let caller_span = tracing::Span::current();
         scope(move |s| -> anyhow::Result<BTreeMap<NodeOutput, N::IO>> {
+            // Re-enter the caller's span on the rayon thread so that
+            // child spans are properly parented under the calling context.
+            let _caller_guard = caller_span.enter();
+
             let mut outputs = BTreeMap::new();
             let (tx, rx) = unbounded();
 
             while !scheduler.is_done() {
                 for mut node in ready_nodes {
                     let tx = tx.clone();
+                    let parent_span = tracing::Span::current();
                     s.spawn(move |_| {
+                        let _parent = parent_span.enter();
+                        let desc = node.node.describe();
+                        let _guard = info_span!(
+                            "exec_node",
+                            node_id = %node.node_id,
+                            desc = %desc,
+                        )
+                        .entered();
                         match node.run(context) {
                             Ok(output) => tx.send((node.node_id, Ok(output))).expect(
                                 "Sender channel closed unexpectedly, can not send node result",
