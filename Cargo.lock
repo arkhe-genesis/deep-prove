@@ -5331,7 +5331,7 @@ checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
 [[package]]
 name = "mem-track"
 version = "0.1.0"
-source = "git+https://github.com/hackaugusto/mem-track?branch=main#d4a4982474694eaac4204e957ad81c6a5f6277a1"
+source = "git+https://github.com/hackaugusto/mem-track?branch=main#7586dd0d6cb8b6c7b3aee58a2acf4060933fb819"
 dependencies = [
  "addr2line",
  "arrayvec",

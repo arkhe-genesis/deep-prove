@@ -139,7 +139,6 @@ mod track {
         env,
         fs::OpenOptions,
         io::{BufWriter, Write},
-        sync::atomic::{AtomicBool, Ordering},
         thread,
     };
 
@@ -155,7 +154,7 @@ mod track {
     static ALLOCATOR: GlobalPeakTracker<FlameAlloc<System>> =
         GlobalPeakTracker::init(FlameAlloc::init(System));
 
-    static IS_FLAME_GRAPH_ENABLED: AtomicBool = AtomicBool::new(false);
+    const MB: usize = 1024 * 1024;
 
     /// Collects memory metrics from the custom global allocator.
     ///
@@ -174,17 +173,11 @@ mod track {
 
     /// Enables the flame graph and clean any data.
     pub(crate) fn flame_graph_enable() {
-        assert_eq!(
-            Ok(false),
-            IS_FLAME_GRAPH_ENABLED.compare_exchange(
-                false,
-                true,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ),
+        let _graph = ALLOCATOR.inner().global_flame_graph();
+        assert!(
+            !ALLOCATOR.inner().is_enabled(),
             "Can not have two flame graphs being collected at the same time",
         );
-        let _graph = ALLOCATOR.inner().global_flame_graph();
         ALLOCATOR.inner().enable();
     }
 
@@ -198,17 +191,11 @@ mod track {
     /// If `flame_graph_enable` wasn't called.
     pub(crate) fn flame_graph() {
         if let Ok(file_prefix) = env::var("FLAMEGRAPH") {
-            let graph = ALLOCATOR.inner().disable();
-            assert_eq!(
-                Ok(true),
-                IS_FLAME_GRAPH_ENABLED.compare_exchange(
-                    true,
-                    false,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ),
+            assert!(
+                ALLOCATOR.inner().is_enabled(),
                 "Must have called flame_graph_enable",
             );
+            let graph = ALLOCATOR.inner().disable();
             let iterator = graph.iter();
 
             for i in 0..128 {
@@ -223,7 +210,13 @@ mod track {
                         s.spawn(move || {
                             let mut file =
                                 BufWriter::new(GzEncoder::new(file, Compression::default()));
-                            let _ = format_flame_graph(&mut file, iterator, |v| v.bytes_allocated);
+                            let _ = format_flame_graph(&mut file, iterator, |v| {
+                                if v.bytes_allocated >= MB {
+                                    Some(v.bytes_allocated)
+                                } else {
+                                    None
+                                }
+                            });
                             let _ = file.flush();
                         });
 
@@ -234,7 +227,13 @@ mod track {
                         {
                             let mut file =
                                 BufWriter::new(GzEncoder::new(file, Compression::default()));
-                            let _ = format_flame_graph(&mut file, graph.iter(), |v| v.alloc_calls);
+                            let _ = format_flame_graph(&mut file, graph.iter(), |v| {
+                                if v.alloc_calls >= 1024 {
+                                    Some(v.alloc_calls)
+                                } else {
+                                    None
+                                }
+                            });
                             let _ = file.flush();
                         }
                     });
