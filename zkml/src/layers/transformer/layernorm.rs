@@ -154,6 +154,13 @@ impl LayerNormHandle {
         self.lookup_output.attach_store(store.clone());
         self.full_value.attach_store(store);
     }
+
+    pub(crate) fn isolate(&self) -> LayerNormHandle {
+        Self {
+            lookup_output: self.lookup_output.isolate(),
+            full_value: self.full_value.isolate(),
+        }
+    }
 }
 
 impl<T> LayerNorm<T>

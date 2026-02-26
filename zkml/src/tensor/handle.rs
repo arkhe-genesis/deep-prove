@@ -139,6 +139,50 @@ impl<T> TensorHandle<T>
 where
     T: TensorTypeParam + Serialize + for<'a> Deserialize<'a>,
 {
+    /// Creates a new handle, isolated from its source.
+    ///
+    /// The returned tensor will keep the original data alive, even if the
+    /// original handle is dried. This is achieved by creating a new inner
+    /// tensor copy, instead of copying the existing arc lock.
+    pub(crate) fn isolate(&self) -> Self {
+        match self {
+            TensorHandle::WrappedTensor(InnerWrappedTensor {
+                storage_key,
+                store,
+                wrapped_tensor,
+                shape,
+                unpadded_shape,
+            }) => {
+                let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
+                let wrapped_tensor = guard.deref().clone();
+                TensorHandle::WrappedTensor(InnerWrappedTensor {
+                    storage_key: storage_key.clone(),
+                    store: store.clone(),
+                    wrapped_tensor: Arc::new(RwLock::new(wrapped_tensor)),
+                    shape: shape.clone(),
+                    unpadded_shape: unpadded_shape.clone(),
+                })
+            }
+            TensorHandle::Tensor(InnerTensor {
+                storage_key,
+                store,
+                tensor,
+                shape,
+                unpadded_shape,
+            }) => {
+                let guard = tensor.read().expect("Lock should not be poisioned");
+                let tensor = guard.deref().clone();
+                TensorHandle::Tensor(InnerTensor {
+                    storage_key: storage_key.clone(),
+                    store: store.clone(),
+                    tensor: Arc::new(RwLock::new(tensor)),
+                    shape: shape.clone(),
+                    unpadded_shape: unpadded_shape.clone(),
+                })
+            }
+        }
+    }
+
     /// Takes ownership of the inner [WrappedTensor].
     pub(crate) fn take_wrapped_tensor(&self) -> anyhow::Result<WrappedTensor<T>> {
         match self {
@@ -170,6 +214,35 @@ where
                 Ok(())
             }
             TensorHandle::Tensor(..) => bail!("Not a wrapped tensor variant"),
+        }
+    }
+
+    /// Ensures this is a [Tensor] variant.
+    ///
+    /// NOTE: For external GPU this will perform an download of the data.
+    pub(crate) fn tensor_variant(self) -> anyhow::Result<Self> {
+        match self {
+            TensorHandle::WrappedTensor(InnerWrappedTensor {
+                storage_key,
+                store,
+                wrapped_tensor,
+                shape,
+                unpadded_shape,
+            }) => {
+                let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
+                let tensor = match guard.deref() {
+                    Some(wrapped_tensor) => Some(wrapped_tensor.try_into()?),
+                    None => None,
+                };
+                Ok(TensorHandle::Tensor(InnerTensor {
+                    storage_key,
+                    store,
+                    tensor: Arc::new(RwLock::new(tensor)),
+                    shape,
+                    unpadded_shape,
+                }))
+            }
+            result @ TensorHandle::Tensor(..) => Ok(result),
         }
     }
 
@@ -750,51 +823,6 @@ where
                 .map(|tensor| Ok(KeyedTensor::new(storage_key.cast(), tensor.clone())))
                 .context("TensorHandle::Tensor is dry")
                 .flatten(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        ops::Deref,
-        sync::{Arc, RwLock},
-    };
-
-    use crate::tensor::{
-        TensorHandle, TensorTypeParam,
-        handle::{InnerTensor, InnerWrappedTensor},
-    };
-
-    impl<T> TensorHandle<T>
-    where
-        T: TensorTypeParam,
-    {
-        /// Ensures this is a [Tensor] variant, copying data if available.
-        pub(crate) fn tensor_variant(self) -> anyhow::Result<Self> {
-            match self {
-                result @ TensorHandle::Tensor { .. } => Ok(result),
-                TensorHandle::WrappedTensor(InnerWrappedTensor {
-                    storage_key,
-                    store,
-                    wrapped_tensor,
-                    shape,
-                    unpadded_shape,
-                }) => {
-                    let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
-                    let tensor = match guard.deref() {
-                        Some(wrapped_tensor) => Some(wrapped_tensor.try_into()?),
-                        None => None,
-                    };
-                    Ok(TensorHandle::Tensor(InnerTensor {
-                        storage_key,
-                        store,
-                        tensor: Arc::new(RwLock::new(tensor)),
-                        shape,
-                        unpadded_shape,
-                    }))
-                }
-            }
         }
     }
 }

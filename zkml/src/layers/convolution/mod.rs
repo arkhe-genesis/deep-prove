@@ -152,6 +152,12 @@ impl ConvFFTHandle {
     pub(crate) fn attach_store(&mut self, store: tenstore::GenStore) {
         self.handle.attach_store(store);
     }
+
+    pub(crate) fn isolate(&self) -> ConvFFTHandle {
+        Self {
+            handle: self.handle.isolate(),
+        }
+    }
 }
 
 /// The filter weights, a 4D tensor of the shape `(feature_maps, channels_out,

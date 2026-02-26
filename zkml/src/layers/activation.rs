@@ -100,6 +100,12 @@ impl ActivationHandle {
     pub(crate) fn attach_store(&mut self, store: tenstore::GenStore) {
         self.activation_output.attach_store(store);
     }
+
+    pub(crate) fn isolate(&self) -> ActivationHandle {
+        Self {
+            activation_output: self.activation_output.isolate(),
+        }
+    }
 }
 
 /// Currently holds the poly info for the output polynomial of the RELU

@@ -282,7 +282,7 @@ where
         result
     }
 
-    /// Generate a setence.
+    /// Generate a sentence.
     ///
     /// Notes:
     /// - The sentence is limited by the EOS token or the context length.
@@ -299,7 +299,6 @@ where
         };
         #[cfg(test)]
         let runner = SanityCheckRunner { inner: runner };
-        let runner = HandleLifetimeRunner::new(runner, &self.model.graph);
 
         self.run_elements_with_runner(input_tensor, store, runner)
     }
@@ -327,7 +326,6 @@ where
         };
         #[cfg(test)]
         let runner = SanityCheckRunner { inner: runner };
-        let runner = HandleLifetimeRunner::new(runner, &self.model.graph);
 
         self.run_elements_with_runner(input_tensor, store, runner)
     }
@@ -343,7 +341,7 @@ where
         &self,
         input_tensor: Tensor<N>,
         store: &mut GenStore,
-        mut runner: HandleLifetimeRunner<I, N>,
+        runner: I,
     ) -> anyhow::Result<Trace<N>>
     where
         HandleLifetimeRunner<I, N>: LayerRunner<N, ()>,
@@ -351,6 +349,8 @@ where
     {
         let input_data = input_tensor.data().to_vec();
         let num_input_tokens = input_data.len();
+
+        let mut runner = HandleLifetimeRunner::new(runner, &self.model.graph);
 
         // -1 because we at least want to generate ONE token
         ensure!(
@@ -498,6 +498,16 @@ where
         // Use the passed store (worker's remote store) so TensorHandle data
         // is accessible during proving in distributed execution
         let trace = self.model.run(vec![tensor], store)?;
+
+        for i in num_input_tokens..full_sentence.len() {
+            debug_assert_eq!(
+                trace.outputs()[0].tensor().unwrap().data()[i - 1],
+                trace.inputs()[0].tensor().unwrap().data()[i],
+                "Failed for {i}, input: {:?}, output: {:?}",
+                trace.inputs()[0].tensor().unwrap(),
+                trace.outputs()[0].tensor().unwrap(),
+            );
+        }
 
         // Reset the model, so it can be reused.
         self.model.reset();

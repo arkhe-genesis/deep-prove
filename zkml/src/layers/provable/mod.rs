@@ -103,6 +103,25 @@ impl ProvingHandle {
             ProvingHandle::None => {}
         }
     }
+
+    pub(crate) fn isolate(&self) -> ProvingHandle {
+        match self {
+            ProvingHandle::Convolution(conv_ffthandle) => {
+                ProvingHandle::Convolution(conv_ffthandle.isolate())
+            }
+            ProvingHandle::Softmax(softmax_handle) => {
+                ProvingHandle::Softmax(softmax_handle.isolate())
+            }
+            ProvingHandle::LayerNorm(layer_norm_handle) => {
+                ProvingHandle::LayerNorm(layer_norm_handle.isolate())
+            }
+            ProvingHandle::ArgMax(argmax_handle) => ProvingHandle::ArgMax(argmax_handle.isolate()),
+            ProvingHandle::Activation(activation_handle) => {
+                ProvingHandle::Activation(activation_handle.isolate())
+            }
+            ProvingHandle::None => ProvingHandle::None,
+        }
+    }
 }
 
 /// Identifier for an intermediate tensor of a layer, i.e., a tensor which is neither an

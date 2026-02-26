@@ -90,6 +90,16 @@ impl ArgmaxHandle {
             .iter_mut()
             .for_each(|handle| handle.attach_store(store.clone()));
     }
+
+    pub(crate) fn isolate(&self) -> ArgmaxHandle {
+        Self {
+            max_values: self
+                .max_values
+                .iter()
+                .map(|handle| handle.isolate())
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

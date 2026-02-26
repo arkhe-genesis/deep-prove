@@ -285,6 +285,12 @@ impl SoftmaxHandle {
     pub(crate) fn attach_store(&mut self, store: tenstore::GenStore) {
         self.shift_handle.attach_store(store);
     }
+
+    pub(crate) fn isolate(&self) -> SoftmaxHandle {
+        Self {
+            shift_handle: self.shift_handle.isolate(),
+        }
+    }
 }
 
 impl<N: TensorTypeParam> Softmax<N> {
