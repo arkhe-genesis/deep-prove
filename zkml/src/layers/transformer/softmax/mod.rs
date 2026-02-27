@@ -71,6 +71,13 @@ pub mod verify;
 /// The short name used to identify the Softmax layer
 pub const SOFTMAX_LAYER: &str = "SFTM";
 
+fn default_shift_cache<N: TensorTypeParam>() -> Arc<Mutex<ConcatenationCache<N>>> {
+    Arc::new(Mutex::new(ConcatenationCache::new_dynamic(
+        -2,
+        PaddingMode::NoPadding,
+    )))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "N: Serialize", deserialize = "N: DeserializeOwned"))]
 /// Stores data about the Softmax operation, which is used to map a tensor of values to a tensor of probability distributions.
@@ -93,7 +100,7 @@ where
     /// Transient shift cache populated by a full-trace call (`dim[-2] > 1`) and consumed by
     /// subsequent cached-trace calls (`dim[-2] == 1`). Skipped during (de)serialisation so
     /// that it is always reset to `None` on load; the next full-trace call repopulates it.
-    #[serde(skip_serializing)]
+    #[serde(skip, default = "default_shift_cache")]
     shift_cache: Arc<Mutex<ConcatenationCache<N>>>,
 }
 
