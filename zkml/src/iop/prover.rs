@@ -25,10 +25,10 @@ use crate::{
     },
     lookup::{
         context::{
-            GenerateWitness, LookupContext, LookupWitness, TableType,
-            generate_lookup_witness_for_chunk,
+            GenerateWitness, LookupContext, LookupWitness, generate_lookup_witness_for_chunk,
         },
-        logup_gkr::prover::batch_multiple_sizes_prove,
+        logup_gkr::prover::new_batch_multiple_sizes_prove,
+        table::Table,
     },
     measure,
     model::{Model, Trace},
@@ -184,15 +184,10 @@ where
         )
     }
 
-    pub(crate) fn add_table_claim(
-        &mut self,
-        table_type: &TableType,
-        chunk_id: ChunkID,
-        claim: Claim<E>,
-    ) {
+    pub(crate) fn add_table_claim(&mut self, table: &Table, chunk_id: ChunkID, claim: Claim<E>) {
         let table_node_id = chunk_id.0.into();
         self.commit_prover
-            .add_table_claim(table_node_id, table_type, claim);
+            .add_table_claim(table_node_id, table, claim);
     }
 
     pub(crate) fn add_witness_claim(&mut self, node_id: NodeId, claims: Vec<(Point<E>, Vec<E>)>) {
@@ -226,7 +221,7 @@ where
                 .create_logup_inputs::<PCS, E>(multiplicity_witness, &self.challenge_storage)?;
             let multiplicity_commit = PCS::get_pure_commitment(multiplicity_witness);
             // Run LogUp batch proving for all the tables at once
-            let logup_batch_proof = batch_multiple_sizes_prove(&logup_inputs, self.transcript)?;
+            let logup_batch_proof = new_batch_multiple_sizes_prove(&logup_inputs, self.transcript)?;
 
             // Now we takes the evals and append the correct values for commitment opening
             let all_claims = logup_batch_proof.output_claims();
@@ -242,8 +237,8 @@ where
                     (vec![], vec![]),
                     |(mut acc, mut claims_acc), (tt, table_claims)| {
                         let mul_point = table_claims[0].point.clone();
-                        let mul_eval = table_claims[0].eval;
-                        if tt.has_committed_claims() {
+                        let mul_eval = table_claims[0].evaluation();
+                        if tt.commit_output_column() {
                             claims_acc.push((tt, table_claims.last().unwrap().clone()));
                         }
                         acc.push((mul_point, mul_eval));

@@ -1,6 +1,10 @@
-use crate::quantization;
+use crate::{
+    NextPowerOfTwo, commit::compute_betas_eval, eval_zeroifier_mle, quantization,
+    to_bit_sequence_le,
+};
 use anyhow::{Result, ensure};
 use ff_ext::ExtensionField;
+use itertools::izip;
 use multilinear_extensions::util::ceil_log2;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -507,6 +511,128 @@ impl Shape {
         }
 
         Self(shape)
+    }
+    /// Computes the "broadcasting evaluation" for a given shape and point.
+    /// For example if the full shape is [x, y, z] and we have a claim for a tensor with shape [1, y, z]
+    /// then this function computes the evaluation of `lt(x, r_x)` where `r_x` is the point for the first dimension.
+    pub fn broadcasting_evaluation<E: ExtensionField>(
+        &self,
+        dim_points: &[&[E]],
+        unbroadcast_shape_slice: &[usize],
+    ) -> Result<E> {
+        ensure!(
+            unbroadcast_shape_slice.len() == self.rank(),
+            "Unbroadcast shape slice length {} does not match shape rank {}",
+            unbroadcast_shape_slice.len(),
+            self.rank()
+        );
+
+        ensure!(
+            dim_points.len() == self.rank(),
+            "Dimension points length {} does not match shape rank {}",
+            dim_points.len(),
+            self.rank()
+        );
+
+        // Now we compute the broadcasting evaluation, if a dimension is unbroadcasted (size 1)
+        // we compute the lt evaluation for that dimension and multiply them all together.
+        // If the dimension is not unbroadcasted we ensure that the dimension sizes agree and then skip.
+        let mut eval = E::ONE;
+
+        for (&full_dim, &unbroadcast_dim, &point) in izip!(
+            self.iter(),
+            unbroadcast_shape_slice.iter(),
+            dim_points.iter()
+        ) {
+            if unbroadcast_dim == 1 {
+                // Dimension is unbroadcasted, compute lt evaluation
+                let dim_size_bits = to_bit_sequence_le(full_dim - 1, point.len())
+                    .map(E::from_canonical_usize)
+                    .collect::<Vec<E>>();
+                eval *= eval_zeroifier_mle(point, &dim_size_bits);
+            } else {
+                // Dimension is not unbroadcasted, ensure sizes agree
+                ensure!(
+                    full_dim == unbroadcast_dim,
+                    "Dimension size {} does not match unbroadcasted dimension size {}",
+                    full_dim,
+                    unbroadcast_dim
+                );
+            }
+        }
+        Ok(eval)
+    }
+
+    /// Given a point and an UNPADDED [`Shape`], computes the evaluation point for the 2D sub tensors and the batching challenges for said sub tensors.
+    pub fn compute_eq_point_and_batching_challenges<E: ExtensionField>(
+        &self,
+        point: &[E],
+    ) -> Result<(Vec<E>, Vec<E>)> {
+        let padded_shape = self.next_power_of_two();
+        let total_vars = ceil_log2(padded_shape.numel());
+
+        ensure!(
+            point.len() == total_vars,
+            "Point length {} does not match total variables {}",
+            point.len(),
+            total_vars
+        );
+
+        let rank = self.rank();
+        let dims_to_skip = rank.saturating_sub(2);
+
+        padded_shape
+            .split_point(point)?
+            .into_iter()
+            .zip(self.iter())
+            .enumerate()
+            .try_fold(
+                (Vec::<E>::new(), vec![E::ONE]),
+                |(mut eq_points, mut batching_challenges), (i, (dim_point, &dim_size))| {
+                    if i < dims_to_skip {
+                        // Compute eq_poly evaluations for batching challenges
+                        let evals = compute_betas_eval(dim_point);
+                        batching_challenges = batching_challenges
+                            .into_iter()
+                            .flat_map(|c| {
+                                evals
+                                    .iter()
+                                    .take(dim_size)
+                                    .map(|e| c * *e)
+                                    .collect::<Vec<E>>()
+                            })
+                            .collect::<Vec<E>>();
+                        Ok((eq_points, batching_challenges))
+                    } else {
+                        eq_points = [dim_point, eq_points.as_slice()].concat();
+                        Ok((eq_points, batching_challenges))
+                    }
+                },
+            )
+    }
+
+    /// Method that converts a coordinate into an index for this shape
+    pub fn get_index(&self, coordinate: &[usize]) -> Result<usize> {
+        ensure!(
+            coordinate.len() == self.rank(),
+            "Coordinate length {} does not match shape rank {}",
+            coordinate.len(),
+            self.rank()
+        );
+        let strides = self.strides();
+        coordinate.iter().zip(strides.iter()).enumerate().try_fold(
+            0,
+            |acc, (dim, (&coord, &stride))| {
+                ensure!(
+                    coord < self.dim(dim),
+                    "Coordinate {} at dimension {} is out of bounds for dimension size {}",
+                    coord,
+                    dim,
+                    self.dim(dim)
+                );
+                Ok(acc + coord * stride)
+            },
+        )
     }
 }
 

@@ -4,6 +4,7 @@
 #![feature(min_specialization)]
 #![feature(exact_size_is_empty)]
 #![feature(mapped_lock_guards)]
+#![feature(associated_type_defaults)]
 
 use std::{borrow::Borrow, env, ops::Deref, str::FromStr};
 

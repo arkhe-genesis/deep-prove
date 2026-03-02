@@ -1,7 +1,10 @@
 use crate::{
     parser::{
         Load,
-        llm::models::{LLMModelLoader, gpt2::decoder::GPT2Decoder},
+        llm::{
+            metadata::LLMMetadata,
+            models::{LLMModelLoader, gpt2::decoder::GPT2Decoder},
+        },
     },
     tensor::KeyedTensor,
 };
@@ -16,7 +19,7 @@ use crate::{
         json,
         json::RawJSON,
         llm::{
-            HFTokenizer, LLMConfig, LLMModel,
+            HFTokenizer, LLMConfig, LLMIR,
             config::{AttentionConfig, AttentionHeadType, LLMStructure, PositionalConfig},
             tokenizer::TokenizerLoader,
             transformer::NormType,
@@ -32,7 +35,7 @@ pub mod decoder;
 /// Loader for the GPT2 family of models.
 /// For more information about GPT2, see
 /// https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Copy)]
 pub struct GPT2 {
     /// Current hack to avoid committing to huge positional matrix
     max_ctx_length: Option<usize>,
@@ -46,7 +49,7 @@ impl GPT2 {
 
 impl<DataFormat> LLMModelLoader<DataFormat> for GPT2
 where
-    GPT2: ModelLoader<DataFormat, ModelConfig = LLMConfig>,
+    GPT2: ModelLoader<DataFormat, Metadata = LLMMetadata>,
 {
     fn with_max_context_length(self, max_ctx_length: usize) -> Self
     where
@@ -69,6 +72,7 @@ pub const GPT2_VARIANTS: &[&str] = &[
 pub const GPT2_NAME: &str = "gpt2";
 pub const GPT2_GGUF_NAME: &str = GPT2_NAME;
 pub const GPT2_Q8_0: &str = "gpt2.Q8_0.gguf";
+pub const GPT2_SAFE_MODEL: &str = "openai-community/gpt2";
 
 pub fn is_gpt2_model(names: &[String]) -> bool {
     names
@@ -92,44 +96,42 @@ impl TokenizerLoader<RawSafeTensors> for GPT2 {
 }
 
 impl ModelLoader<RawGGUF> for GPT2 {
-    type ModelConfig = LLMConfig;
+    type Metadata = LLMMetadata;
 
     fn model_name(&self) -> String {
         GPT2_NAME.to_string()
     }
 
-    fn parse(&self, raw: &RawGGUF) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
+    fn parse(&self, raw: &RawGGUF) -> anyhow::Result<(Model<f32>, Self::Metadata)> {
         let loader = raw.loader()?;
         let config = LLMConfig::from_gguf(&loader, "gpt2", self.max_ctx_length)?;
         let structure = gpt2_structure(&config);
-        let model = LLMModel::<GPT2Decoder>::from_loader(&loader, &structure)?;
+        let model = LLMIR::<GPT2Decoder>::from_loader(&loader, &structure)?;
         // even though the llm runtime doesn't care about the model input shape, which is designed for "static" input shapes, we still
         // need to provide one.
         let init_user_shape = Shape::from(vec![1]);
-        let model = model.into_provable_model(init_user_shape)?;
-        Ok((model, config))
+        model.into_model(config, init_user_shape)
     }
 }
 
 impl ModelLoader<RawJSON> for GPT2 {
-    type ModelConfig = LLMConfig;
+    type Metadata = LLMMetadata;
 
     fn model_name(&self) -> String {
         GPT2_NAME.to_string()
     }
 
-    fn parse(&self, raw: &RawJSON) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
+    fn parse(&self, raw: &RawJSON) -> anyhow::Result<(Model<f32>, Self::Metadata)> {
         let loader = json::FileTensorLoader::new_from_path(&raw.0)?;
-        let config = LLMConfig::from_json(&loader, self.max_ctx_length)?;
-        let model = LLMModel::<GPT2Decoder>::from_loader(&loader, &config)?;
+        let config = LLMConfig::from_json(&loader, None)?;
+        let model = LLMIR::<GPT2Decoder>::from_loader(&loader, &config)?;
         let init_user_shape = Shape::from(vec![1]);
-        let model = model.into_provable_model(init_user_shape)?;
-        Ok((model, config))
+        model.into_model(config, init_user_shape)
     }
 }
 
 impl ModelLoader<RawSafeTensors> for GPT2 {
-    type ModelConfig = LLMConfig;
+    type Metadata = LLMMetadata;
 
     fn model_name(&self) -> String {
         GPT2_NAME.to_string()
@@ -154,7 +156,18 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
     /// Conv1D stores weights as (in_features, out_features) and computes `output = input @ weight`.
     /// This differs from PyTorch's `nn.Linear` which stores (out_features, in_features) and computes
     /// `output = input @ weight.T`.
-    fn parse(&self, raw: &RawSafeTensors) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
+    fn parse(&self, raw: &RawSafeTensors) -> anyhow::Result<(Model<f32>, Self::Metadata)> {
+        use crate::{
+            layers::{
+                einsum::EinSum,
+                transformer::{
+                    embeddings::Embeddings, normalisation::layernorm::LayerNorm,
+                    positional::Positional,
+                },
+            },
+            parser::llm::transformer::Norm,
+        };
+
         let cfg = raw.read_config_json()?;
 
         let hidden_size = cfg.get("n_embd").context("n_embd not found")?;
@@ -168,10 +181,20 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
         let vocab_size = cfg.get("vocab_size").context("vocab_size not found")?;
         let eos_token: usize = cfg.get("eos_token_id").context("eos_token_id not found")?;
 
+        // The GPT2 SafeTensors ConfigJSON does not contain intermediate size,
+        // So we load the first feed-forward layer bias to determine it.
+        let loader = safe::FileTensorLoader::from_path(raw.model_path())?;
+
+        let intermediate_size = loader
+            .get_tensor("h.0.mlp.c_fc.bias")
+            .map(|t| t.shape().numel())
+            .context("Could not load first FFN bias in GPT2")?;
+
         let llm_config = LLMConfig {
             model_name: "gpt2".to_string(),
             hidden_size,
             embedding_size,
+            intermediate_size,
             num_heads,
             head_size: hidden_size / num_heads,
             num_block,
@@ -185,19 +208,7 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
             eos_token: eos_token.into(),
         };
 
-        use crate::{
-            layers::{
-                einsum::EinSum,
-                transformer::{
-                    embeddings::Embeddings, layernorm::LayerNorm, positional::Positional,
-                },
-            },
-            parser::llm::transformer::Norm,
-        };
-
         let structure = gpt2_structure(&llm_config);
-
-        let loader = safe::FileTensorLoader::from_path(raw.model_path())?;
 
         // GPT-2 SafeTensors use "transformer.h.{i}." prefix instead of "model.layers.{i}."
         // so we manually load all components with the correct prefixes
@@ -249,7 +260,7 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
             vec![proj_bias.map(|tensor| tensor.into())],
         )?;
 
-        let llm_model = LLMModel::new(
+        let llm_model = LLMIR::new(
             embeddings,
             global_positional,
             blocks,
@@ -258,8 +269,7 @@ impl ModelLoader<RawSafeTensors> for GPT2 {
         );
 
         let init_user_shape = Shape::from(vec![1]);
-        let model = llm_model.into_provable_model(init_user_shape)?;
-        Ok((model, llm_config))
+        llm_model.into_model(llm_config, init_user_shape)
     }
 }
 
@@ -308,7 +318,9 @@ pub mod tests {
     fn test_gpt2_load_gguf_model() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(GPT2_Q8_0)?;
         let mygguf = RawGGUF::new(model_path);
-        let (model, config) = GPT2::new().parse(&mygguf)?;
+        let gpt2 = GPT2::new();
+        let (model, md) = gpt2.parse(&mygguf)?;
+        let config = md.config;
         assert_eq!(config.num_heads, 12);
         assert_eq!(config.num_block, 12);
         assert_eq!(config.embedding_size, 768);
@@ -336,8 +348,9 @@ pub mod tests {
     #[test]
     fn test_safe_gpt2_load_model() -> anyhow::Result<()> {
         let raw = RawSafeTensors::from_hugging_face_cached(GPT2_SAFE_MODEL)?;
-        let (model, config) = GPT2::new().parse(&raw)?;
+        let (model, md) = GPT2::new().parse(&raw)?;
 
+        let config = md.config;
         assert_eq!(config.num_heads, 12);
         assert_eq!(config.num_block, 12);
         assert_eq!(config.embedding_size, 768);

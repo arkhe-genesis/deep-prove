@@ -76,6 +76,8 @@ where
 {
     /// The equation describing the einsum operation.
     pub(crate) equation: String,
+    /// An optional name to give the einsum layer (for instance to identify it as an attention projection).
+    pub(crate) name: Option<String>,
     /// The parsed mapping of axes from the equation.
     pub mapping: AxesMapping,
     /// The evaluation info for the einsum operation, this is derived from the mapping.
@@ -208,6 +210,7 @@ where
 
         Ok(Self {
             equation,
+            name: None,
             mapping,
             evaluation_info,
             constant_tensors,
@@ -218,6 +221,19 @@ where
             caches: vec![None; output_count],
             requantise: true,
         })
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    pub fn check_name(&self, name: &str) -> bool {
+        if let Some(layer_name) = &self.name {
+            layer_name == name
+        } else {
+            false
+        }
     }
 
     pub fn with_caches(&mut self, concatenation_dims: Vec<Option<usize>>) -> Result<()> {
@@ -260,6 +276,7 @@ where
         Ok(())
     }
 
+    /// Reset the caches used for concatenation.
     pub fn reset_caches(&self) {
         self.caches.iter().for_each(|cache| {
             if let Some(c) = cache {
@@ -277,6 +294,14 @@ where
     pub fn disable_requantisation(mut self) -> Self {
         self.requantise = false;
         self
+    }
+
+    /// Disable requantisation after evaluation when quantised.
+    pub fn no_requant(self) -> Self {
+        Self {
+            requantise: false,
+            ..self
+        }
     }
 }
 
@@ -407,6 +432,7 @@ impl QuantizeOp for EinSum<f32> {
             "Output scaling for EinSum layer different from {}",
             self.mapping.output_count()
         );
+
         self.quantise(input_scaling, output_scalings, unpadded_input_shapes)
     }
 }

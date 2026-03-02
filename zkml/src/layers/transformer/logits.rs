@@ -16,16 +16,17 @@ use crate::{
         },
     },
     lookup::{
-        context::{LayerLookupContext, LookupWitnessGen, TableType},
+        context::LookupWitnessGen,
         logup_gkr::{
-            prover::batch_multiple_sizes_prove,
-            structs::{LogUpBatchProof, LogUpInput},
-            verifier::verify_logup_proof_multiple_sizes,
+            prover::new_batch_multiple_sizes_prove,
+            structs::{LogUpBatchProof, LogUpInput, LogUpVerifierInstance},
+            verifier::new_verify_logup_proof_multiple_sizes,
         },
+        table::{SHIFT_CHECK_TABLE_BIT_SIZE, Table},
     },
     model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
-    quantization::{self, ToField},
+    quantization::ToField,
     tensor::{TensorHandle, WrappedTensor},
     to_base, to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -104,8 +105,15 @@ impl ArgmaxHandle {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogitsCtx {
-    pub(crate) lookup_ctx: LayerLookupContext,
     node_id: NodeId,
+    range_check_chunks: usize,
+}
+
+impl LogitsCtx {
+    /// Getter for the lookup tables used in this layer.
+    pub fn lookup_tables(&self) -> Vec<Table> {
+        vec![Table::new_shift_check()]
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,9 +129,6 @@ pub struct LogitsProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
 }
 
 impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LogitsProof<E, PCS> {
-    pub(crate) fn get_lookup_data(&self) -> (Vec<E>, Vec<E>) {
-        self.logup_proof.fractional_outputs()
-    }
     pub(crate) fn write_commitment<T: Transcript<E>>(
         &self,
         transcript: &mut T,
@@ -243,8 +248,8 @@ impl Logits {
             Logits::Argmax(Some(data)) => {
                 let bit_size = data.input_bit_size + 1; // +1 since this is the upper bound for max - input values
                 // ensure that `bit_size` is at least `quantization::BIT_LEN`
-                let bit_size = bit_size.max(*quantization::BIT_LEN);
-                bit_size.div_ceil(*quantization::BIT_LEN)
+                let bit_size = bit_size.max(SHIFT_CHECK_TABLE_BIT_SIZE);
+                bit_size.div_ceil(SHIFT_CHECK_TABLE_BIT_SIZE)
             }
             Logits::Argmax(None) => {
                 unimplemented!("Range check chunks not implemented for unquantized logits")
@@ -256,10 +261,10 @@ impl Logits {
         &self,
         committed_polys: &[ArcMultilinearExtension<E>],
         challenge_storage: &ChallengeStorage<E>,
-        tt: &TableType,
         input: Tensor<E>,
         unpadded_dim_size: usize,
     ) -> anyhow::Result<LogUpInput<E>> {
+        let table = Table::new_shift_check();
         let column_evals = if committed_polys.len() == 1 {
             let input_shape = input.shape();
             let last_dim = input_shape.dim(input_shape.len() - 1);
@@ -292,16 +297,16 @@ impl Logits {
         };
 
         let (constant_challenge, column_separation_challenge) = challenge_storage
-            .get_challenges_by_name(&tt.name())
+            .get_challenges_by_name(&table.name())
             .ok_or(anyhow!(
                 "No challenges found for Table Type: {}, cannot prove Logits ArgMax",
-                tt.name()
+                table.name()
             ))?;
         LogUpInput::<E>::new_lookup(
             column_evals,
             constant_challenge,
             column_separation_challenge,
-            tt.num_columns(),
+            table.num_columns(),
         )
         .map_err(|e| anyhow!("{e:?}"))
     }
@@ -311,7 +316,7 @@ impl Logits {
     ) -> anyhow::Result<Claim<E>> {
         ensure!(!logup_claims.is_empty());
         let point = logup_claims[0].point.clone();
-        let multiplier = E::from_canonical_u64(1 << *quantization::BIT_LEN);
+        let multiplier = E::from_canonical_u64(1 << SHIFT_CHECK_TABLE_BIT_SIZE);
         let eval = logup_claims
             .iter()
             .try_fold((E::ZERO, E::ONE), |(eval, factor), claim| {
@@ -383,12 +388,10 @@ impl ProveInfo for Logits {
 
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
 
-        let lookup_ctx =
-            LayerLookupContext::new(vec![TableType::Range], vec![self.range_check_chunks()]);
         Ok((
             LayerCtx::Logits(LogitsCtx {
-                lookup_ctx,
                 node_id: id,
+                range_check_chunks: self.range_check_chunks(),
             }),
             aux,
         ))
@@ -468,7 +471,7 @@ where
     fn prove<T: transcript::Transcript<E>>(
         &self,
         node_id: NodeId,
-        ctx: &Self::Ctx,
+        _ctx: &Self::Ctx,
         _last_claims: Vec<&Claim<E>>,
         step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
@@ -499,11 +502,10 @@ where
         let logup_input = self.build_lookup_input(
             &layer_polys,
             &prover.challenge_storage,
-            &ctx.lookup_ctx.tables[0],
             input.to_field(),
             unpadded_dim_size,
         )?;
-        let logup_batch_proof = batch_multiple_sizes_prove(&[logup_input], prover.transcript)?;
+        let logup_batch_proof = new_batch_multiple_sizes_prove(&[logup_input], prover.transcript)?;
 
         // get the claim about the difference between max_values and input data
         let output_claims = logup_batch_proof.output_claims();
@@ -713,8 +715,8 @@ where
                 merged_diff
                     .iter()
                     .map(|v| {
-                        let shifted = v >> (i * (*quantization::BIT_LEN));
-                        let mask = (1i64 << (*quantization::BIT_LEN)) - 1;
+                        let shifted = v >> (i * SHIFT_CHECK_TABLE_BIT_SIZE);
+                        let mask = (1i64 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1;
                         let value = shifted & mask;
                         *element_count.entry(value).or_default() += 1;
                         value
@@ -750,8 +752,12 @@ where
         };
 
         let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
-        witness_gen.insert_logup_witness(id, layer_commitment);
-        witness_gen.insert_element_count(TableType::Range, element_count);
+        witness_gen.insert_layer_witness_data(
+            id,
+            layer_commitment,
+            vec![Table::new_shift_check()],
+            vec![element_count],
+        );
 
         Ok(witness_gen)
     }
@@ -789,19 +795,60 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         verifier: &mut Verifier<E, T, PCS>,
         shape_step: &ShapeStep,
     ) -> anyhow::Result<Vec<Claim<E>>> {
-        let batch_claim =
-            verify_logup_proof_multiple_sizes(&proof.logup_proof, verifier.transcript)?;
+        ensure!(
+            shape_step.padded_input_shape.len() == 1,
+            "Expected 1 padded input shape when verifying Logits layer, found {}",
+            shape_step.padded_input_shape.len(),
+        );
 
-        self.lookup_ctx
-            .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
+        let input_shape = &shape_step.padded_input_shape[0];
+
+        let full_vars = ceil_log2(input_shape.numel());
+        let table = Table::new_shift_check();
+        let (constant_challenge, column_separation_challenge) = verifier
+            .challenge_storage
+            .get_challenges_by_name(&table.name())
+            .ok_or(anyhow!(
+                "Cannot verify Argmax, cannot get {} table challenges",
+                table.name()
+            ))?;
+        let num_range_checks = self.range_check_chunks;
+        let instances = vec![
+            LogUpVerifierInstance::new(
+                constant_challenge,
+                column_separation_challenge,
+                table.num_columns(),
+                crate::lookup::logup_gkr::structs::ProofType::Lookup,
+                full_vars - 1,
+            );
+            num_range_checks
+        ];
+
+        // Append the fractional outputs to the verifier
+        let (numerators, denominators) = proof.logup_proof.fractional_outputs();
+        let (shift_num, shift_denom) = verifier
+            .numerators_and_denominators
+            .entry(table.name())
+            .or_insert((E::ZERO, E::ONE));
+        for (num, denom) in numerators.iter().zip(denominators.iter()) {
+            ensure!(
+                *denom != E::ZERO,
+                "Denominator in fractional output for Logits layer lookup cannot be zero"
+            );
+            *shift_num = *num * *shift_denom + *shift_num * *denom;
+            *shift_denom *= *denom;
+        }
+        let batch_claim = new_verify_logup_proof_multiple_sizes(
+            &proof.logup_proof,
+            &instances,
+            verifier.transcript,
+        )?;
 
         let poly_claims = batch_claim
             .poly_evals()
             .iter()
             .map(|eval| Claim::new(batch_claim.point().to_vec(), *eval))
             .collect::<Vec<Claim<E>>>();
-
-        let num_range_checks = self.lookup_ctx.instances_per_table[0];
 
         ensure!(
             poly_claims.len() == num_range_checks,
@@ -810,13 +857,6 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
             poly_claims.len(),
         );
 
-        ensure!(
-            shape_step.padded_input_shape.len() == 1,
-            "Expected 1 padded input shape when verifying Logits layer, found {}",
-            shape_step.padded_input_shape.len(),
-        );
-
-        let input_shape = &shape_step.padded_input_shape[0];
         let num_row_vars = (0..input_shape.rank() - 1)
             .map(|d| input_shape.dim(d))
             .product::<usize>()

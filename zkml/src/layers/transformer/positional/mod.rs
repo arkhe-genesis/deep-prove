@@ -119,6 +119,14 @@ where
     Rope(Rope<T>),
 }
 
+impl<N: TensorTypeParam> PositionalVariant<N> {
+    #[allow(dead_code)]
+    /// Create a new absolute positional variant
+    pub fn new_absolute(absolute: Absolute<N>) -> Self {
+        PositionalVariant::Absolute(absolute)
+    }
+}
+
 impl<N: TensorTypeParam> Positional<N> {
     pub fn shape(&self) -> Shape {
         match &self.variant {

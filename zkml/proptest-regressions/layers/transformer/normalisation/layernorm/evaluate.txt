@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc b3ee7c752c8cbb9ed1068791abcf964bda1417fb163c467f21429cc9aa165826 # shrinks to (shape, data, expected) = ([1, 2], [8.0, 1007.0], [1.0])
+cc bdc2c568637492b100b57495bf814da7f7b89d3ca0467ce558e3ee573bed9cb6 # shrinks to input = Input { input: [36×32×2], beta: [2], gamma: [2] }

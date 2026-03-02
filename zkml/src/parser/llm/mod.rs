@@ -1,5 +1,7 @@
 pub mod config;
+use crate::parser::llm::metadata::{LLMMetadata, TransformerMetadata};
 
+pub mod metadata;
 pub mod models;
 pub mod tokenizer;
 pub mod transformer;
@@ -19,14 +21,15 @@ use crate::{
         Layer,
         einsum::EinSum,
         transformer::{
-            embeddings::Embeddings, layernorm::LayerNorm, logits::Logits, positional::Positional,
+            embeddings::Embeddings, logits::Logits, normalisation::layernorm::LayerNorm,
+            positional::Positional,
         },
     },
-    model::{LayerInsertion, Model},
+    model::Model,
     number::Number,
     padding::PaddingMode,
     parser::{
-        Load,
+        LayerInsertion, Load,
         llm::{config::LLMStructure, transformer::Norm},
     },
     tensor::{KeyedTensor, TensorTypeParam},
@@ -93,8 +96,11 @@ impl Token {
     }
 }
 
+/// Intermediate representation of a LLM model.
+/// This is used to store the model weight in generic way before transforming it into the graph representation.
+/// It is a common representation that can be used to build the final model.
 #[derive(Debug, Clone)]
-pub struct LLMModel<T> {
+pub struct LLMIR<T> {
     pub embeddings: Embeddings<f32>,
     pub global_positional: Option<Positional<f32>>,
     pub blocks: Vec<T>,
@@ -104,7 +110,7 @@ pub struct LLMModel<T> {
     pub final_proj: EinSum<f32>,
 }
 
-impl<T> LLMModel<T> {
+impl<T> LLMIR<T> {
     pub fn new(
         embeddings: Embeddings<f32>,
         global_positional: Option<Positional<f32>>,
@@ -122,37 +128,62 @@ impl<T> LLMModel<T> {
     }
 }
 
-impl<T: LayerInsertion> LLMModel<T> {
+/// The generic T holds the logic to create attention layers.
+impl<T: LayerInsertion<Metadata = TransformerMetadata>> LLMIR<T> {
     /// Creates a Model<f32> from the [`LLMModel`].
-    pub fn into_provable_model(self, user_input_shape: Shape) -> anyhow::Result<Model<f32>> {
+    pub fn into_model(
+        self,
+        llm_config: LLMConfig,
+        user_input_shape: Shape,
+    ) -> anyhow::Result<(Model<f32>, LLMMetadata)> {
         let mut model =
             Model::new_from_input_shapes(vec![user_input_shape], PaddingMode::NoPadding);
 
-        let mut last_node_id =
-            Some(model.add_consecutive_layer(Layer::Embeddings(self.embeddings), None)?);
-        if let Some(positional) = self.global_positional {
+        let embeddings_id =
+            model.add_consecutive_layer(Layer::Embeddings(self.embeddings), None)?;
+        let mut last_node_id = Some(embeddings_id);
+        let positional_id = if let Some(positional) = self.global_positional {
             last_node_id =
                 Some(model.add_consecutive_layer(Layer::Positional(positional), last_node_id)?);
-        }
+            last_node_id
+        } else {
+            None
+        };
+
+        let mut transformers = Vec::with_capacity(self.blocks.len());
         for block in self.blocks {
-            last_node_id = Some(block.add_to_model(&mut model, last_node_id)?);
+            let (id, metadata) = block.add_to_model(&mut model, last_node_id)?;
+            transformers.push(metadata);
+            last_node_id = Some(id);
         }
         last_node_id = Some(model.add_consecutive_layer(self.final_norm.to_layer(), last_node_id)?);
 
-        last_node_id =
-            Some(model.add_consecutive_layer(
+        let final_proj_id =
+            model.add_consecutive_layer(
                 Layer::EinSum(
                     self.final_proj.disable_requantisation() // we can skip requantisation here since we can handle bigger values in Argmax
-                ), last_node_id)?);
+                ), last_node_id)?;
 
-        model.add_consecutive_layer(Layer::Logits(Logits::new_argmax()), last_node_id)?;
+        let logits_id = model
+            .add_consecutive_layer(Layer::Logits(Logits::new_argmax()), Some(final_proj_id))?;
         model.automatic_output_labelling()?;
-        Ok(model)
+        let metadata = LLMMetadata {
+            config: llm_config,
+            transformers,
+            embeddings: embeddings_id,
+            positional: positional_id,
+            final_proj: final_proj_id,
+            logits: final_proj_id,
+            argmax: logits_id,
+        };
+        Ok((model, metadata))
     }
 }
 
-impl<T> Load<GGUFLoader> for LLMModel<T>
+impl<T> Load<GGUFLoader> for LLMIR<T>
 where
+    // Note we don't care about the metadata here as we're only building the IR.
+    // The final graph model is when we care about the metadata.
     T: Load<GGUFLoader, Config = LLMStructure> + LayerInsertion,
 {
     type Config = LLMStructure;
@@ -208,7 +239,7 @@ where
     }
 }
 
-impl<T> Load<SafeLoader> for LLMModel<T>
+impl<T> Load<SafeLoader> for LLMIR<T>
 where
     T: Load<SafeLoader, Config = (LLMStructure, ConfigJSON)> + LayerInsertion,
 {
@@ -267,7 +298,7 @@ where
     }
 }
 
-impl<T> Load<JSONLoader> for LLMModel<T>
+impl<T> Load<JSONLoader> for LLMIR<T>
 where
     T: Load<JSONLoader, Config = LLMConfig> + LayerInsertion,
 {

@@ -1,20 +1,20 @@
 //! Defines the decoder only transformer used in the GPT-2 model.
 
+use std::marker::PhantomData;
+
 use crate::{
     graph::NodeId,
     layers::{
-        Layer,
-        activation::{ActivationLayer, GELU},
-        add::Add,
-        transformer::layernorm::LayerNorm,
+        Layer, activation::ActivationLayer, add::Add,
+        transformer::normalisation::layernorm::LayerNorm,
     },
-    model::{LayerInsertion, Model},
+    model::Model,
     parser::{
-        Load,
+        LayerInsertion, Load,
         gguf::FileTensorLoader as GGUFLoader,
         json::FileTensorLoader as JSONLoader,
         llm::{
-            ConfigJSON, LLMConfig, SafeLoader, config::LLMStructure,
+            ConfigJSON, LLMConfig, SafeLoader, config::LLMStructure, metadata::TransformerMetadata,
             models::gpt2::decoder::attention::GPT2Attention,
             transformer::feed_forward::FeedForwardNetwork,
         },
@@ -33,11 +33,12 @@ pub struct GPT2Decoder {
 }
 
 impl LayerInsertion for GPT2Decoder {
+    type Metadata = TransformerMetadata;
     fn add_to_model(
         self,
         model: &mut Model<f32>,
         previous_node_id: Option<NodeId>,
-    ) -> Result<NodeId> {
+    ) -> Result<(NodeId, Self::Metadata)> {
         // First we check that there is a previous node to connect to, a transformer block should never be the first node
         ensure!(
             previous_node_id.is_some(),
@@ -55,7 +56,8 @@ impl LayerInsertion for GPT2Decoder {
             .add_consecutive_layer(Layer::LayerNorm(pre_attention_layernorm), previous_node_id)?;
         // Unwrap is safe because we have checked for previous_node_id above
         let residual_id = previous_node_id.unwrap();
-        let post_attention_id = attention_mechanism.add_to_model(model, Some(initial_norm_id))?;
+        let (post_attention_id, attention_md) =
+            attention_mechanism.add_to_model(model, Some(initial_norm_id))?;
 
         let add_id = model.graph_mut().add_inner(Layer::Add(Add::<f32>::new()))?;
         model.add_edge(residual_id, add_id, (0, 0))?;
@@ -64,12 +66,17 @@ impl LayerInsertion for GPT2Decoder {
         let pre_ffn_norm_id =
             model.add_consecutive_layer(Layer::LayerNorm(pre_ffn_layernorm), Some(add_id))?;
 
-        let post_ffn_id = feed_forward.add_to_model(model, Some(pre_ffn_norm_id))?;
+        let (post_ffn_id, ffn_md) = feed_forward.add_to_model(model, Some(pre_ffn_norm_id))?;
         let final_add_id = model.graph_mut().add_inner(Layer::Add(Add::<f32>::new()))?;
         model.add_edge(add_id, final_add_id, (0, 0))?;
         model.add_edge(post_ffn_id, final_add_id, (0, 1))?;
 
-        Ok(final_add_id)
+        let md = TransformerMetadata {
+            norm_id: initial_norm_id,
+            transformer: attention_md,
+            ffn: ffn_md,
+        };
+        Ok((final_add_id, md))
     }
 }
 
@@ -159,7 +166,7 @@ impl Load<SafeLoader> for GPT2Decoder {
                 up_bias,
                 down,
                 down_bias,
-                activation: ActivationLayer::Gelu(GELU::new()),
+                activation: ActivationLayer::Gelu(None, PhantomData),
             }
         };
 
@@ -224,7 +231,7 @@ impl Load<GGUFLoader> for GPT2Decoder {
                 up_bias,
                 down,
                 down_bias,
-                activation: ActivationLayer::Gelu(GELU::new()),
+                activation: ActivationLayer::Gelu(None, PhantomData),
             }
         };
 
@@ -271,7 +278,7 @@ impl Load<JSONLoader> for GPT2Decoder {
                 up_bias: Some(up_bias),
                 down,
                 down_bias: Some(down_bias),
-                activation: ActivationLayer::Gelu(GELU::new()),
+                activation: ActivationLayer::Gelu(None, PhantomData),
             }
         };
 

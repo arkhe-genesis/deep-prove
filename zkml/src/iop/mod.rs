@@ -171,7 +171,6 @@ where
             .iter()
             .map(|table_type| {
                 let challenge = table_type.generate_challenge(transcript);
-
                 (table_type.name(), challenge)
             })
             .collect::<HashMap<String, E>>();
@@ -220,7 +219,7 @@ mod test {
 
     #[test]
     fn test_prover_steps_generic() {
-        init_test_logging_default();
+        init_test_logging("debug");
         use crate::StdRng;
         use ark_std::rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(4);

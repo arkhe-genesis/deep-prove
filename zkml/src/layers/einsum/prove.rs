@@ -311,7 +311,11 @@ impl EinSum<Element> {
         } else {
             let lhs_input_point =
                 reconstruct_full_point(&lhs_points[0], &einsum_sumcheck_point, &input_shapes[0]);
-            let lhs_input_eval = einsum_evaluations[0];
+            let lhs_input_eval = stacking_coeffs[0]
+                .iter()
+                .zip(einsum_evaluations[..stacking_size].iter())
+                .fold(E::ZERO, |acc, (coeff, eval)| acc + *coeff * *eval);
+
             let lhs_input_claim = Claim::new(lhs_input_point, lhs_input_eval);
 
             let einsum_proof = EinSumProof {

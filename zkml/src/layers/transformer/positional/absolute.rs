@@ -17,7 +17,7 @@ use crate::{
     },
     model::Step,
     padding::ShapeInfo,
-    quantization::{Quantize, ToField},
+    quantization::{self, Quantize, ToField},
     tensor::{CommitmentId, TensorHandle, TensorSlice, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -150,8 +150,21 @@ impl Absolute<f32> {
         output_scalings: &[ScalingFactor],
         unpadded_output_shapes: &[Shape],
     ) -> anyhow::Result<QuantizeOutput<Absolute<Element>>> {
-        let max_abs = self.positional.max_abs()?;
-        let pos_scaling = ScalingFactor::from_absolute_max(max_abs, None);
+        // quantize positional matrix
+        let max = self.positional.max_abs()?;
+
+        // We pick the domain size to be the largest multiple of quantization::BIT_LEN that is less than or equal to 24.
+        let mut multiple = 1usize;
+        while (multiple + 1) * *quantization::BIT_LEN <= 24 {
+            multiple += 1;
+        }
+        let multiple_bit_size = multiple * *quantization::BIT_LEN;
+
+        let shift = multiple_bit_size - 1;
+        let pos_domain_min: Element = -1 << shift;
+        let pos_domain_max: Element = (1 << shift) - 1;
+        let pos_scaling =
+            ScalingFactor::from_absolute_max(max, Some((pos_domain_min, pos_domain_max)));
 
         ensure!(
             output_scalings.len() == 1,

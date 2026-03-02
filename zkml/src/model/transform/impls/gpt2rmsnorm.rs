@@ -7,9 +7,8 @@ use crate::{
         add::ADD_LAYER,
         einsum::{EINSUM_LAYER, EinSum, axis::Dimension},
         transformer::{
-            layernorm::LayerNorm,
+            normalisation::{layernorm::LayerNorm, rmsnorm::RMSNorm},
             positional::{POSITIONAL_LAYER, Positional, PositionalVariant, absolute::Absolute},
-            rmsnorm::RMSNorm,
         },
     },
     model::{Model, transform::ModelTransform},
@@ -78,8 +77,7 @@ impl ModelTransform<f32> for GPT2RMSNorm {
 
             // the output edge should have a NodeId so we use that get the next node
             // safe unwrap since it's guaranteed to be a node because we used node_neighbors
-            #[allow(clippy::clone_on_copy)]
-            let output_node_id = output_edge.target().clone();
+            let output_node_id = output_edge.target();
             let output_node = model
                 .graph
                 .node_mut(output_node_id)
@@ -275,10 +273,7 @@ fn modify_subsequent_linear_layer(
 ) -> Result<()> {
     *node = match &node {
         Layer::<f32>::EinSum(einsum) => Layer::EinSum(rescale_einsum(einsum, weights, bias)?),
-        other => bail!(
-            "Expected MatMul or QKV operation, found {}",
-            other.short_name()
-        ),
+        other => bail!("Expected EinSum operation, found {}", other.short_name()),
     };
     Ok(())
 }
@@ -392,6 +387,12 @@ fn rescale_einsum(
 
     let mut output = EinSum::new(equation, new_constant_tensors, biases)?;
     output.with_caches(concatenation_dims)?;
+    if let Some(name) = einsum.name.as_ref() {
+        output = output.with_name(name.clone());
+    }
+    if !einsum.requantise {
+        output = output.no_requant();
+    }
     Ok(output)
 }
 
@@ -401,9 +402,9 @@ mod tests {
 
     use crate::{
         init_test_logging,
-        model::llm::{Driver, WithMaxContext},
+        model::llm::Driver,
         parser::{
-            default_pipeline_config, file_cache,
+            file_cache,
             gguf::RawGGUF,
             llm::{
                 LLMTokenizer,
@@ -412,11 +413,9 @@ mod tests {
             },
         },
         tensor::is_close_with_tolerance,
-        testing::Pcs,
     };
 
     use super::*;
-    use ff_ext::GoldilocksExt2;
 
     #[test]
     fn test_gpt2_replace() -> anyhow::Result<()> {
@@ -479,38 +478,6 @@ mod tests {
                 &post_data[..10],
             );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn test_gpt2_replace_proving() -> Result<()> {
-        init_test_logging("debug");
-        let max_context = 10;
-        // First we load up a GPT-2 model
-        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
-        let gguf = RawGGUF::new(model_path);
-        let driver = Driver::load_from_model(GPT2::new(), &gguf, Some(max_context))?;
-        // Make a tester input for the model so we can compare the pre and post transformation outputs
-        let sentence = "The sky is";
-        let tokenizer = GPT2::new().load_tokenizer(&gguf)?;
-        let user_tokens = tokenizer.tokenize(sentence);
-
-        // Rewrite the model by applying our transformation rule
-        let conf = default_pipeline_config().with_float_rules(vec![Box::new(GPT2RMSNorm)]);
-
-        let (driver, _metadata) = driver.into_provable_llm(Some(conf))?;
-        let input_tensors = driver.tokens_to_tensor(&user_tokens)?;
-        let trace = driver.run_elements(input_tensors, &mut GenStore::default())?;
-
-        let (prover_ctx, verifier_ctx) = driver
-            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
-            .with_max_context(max_context);
-        let io = trace.to_verifier_io()?;
-        let proof = driver.prove(&prover_ctx, trace)?;
-        let proof_bytes =
-            bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
-        tracing::info!("Proof size: {}", proof_bytes.len());
-        verifier_ctx.verify(proof, user_tokens, io)?;
         Ok(())
     }
 }

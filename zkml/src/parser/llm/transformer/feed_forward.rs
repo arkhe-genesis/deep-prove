@@ -5,11 +5,16 @@ use crate::{
         activation::{Activation, ActivationLayer},
         einsum::EinSum,
     },
-    model::{LayerInsertion, Model},
+    model::Model,
+    parser::{LayerInsertion, llm::metadata::FFNGraphID},
     tensor::KeyedTensor,
 };
 
 use anyhow::Result;
+
+pub(crate) const FEED_FORWARD_UP_EINSUM_NAME: &str = "ffn_up_einsum";
+pub(crate) const FEED_FORWARD_GATE_EINSUM_NAME: &str = "ffn_gate_einsum";
+pub(crate) const FEED_FORWARD_DOWN_EINSUM_NAME: &str = "ffn_down_einsum";
 
 #[derive(Debug, Clone)]
 /// A general configuration for a feed-forward network (FFN) layer in a transformer model.
@@ -29,11 +34,12 @@ pub struct FeedForwardNetwork {
 }
 
 impl LayerInsertion for FeedForwardNetwork {
+    type Metadata = FFNGraphID;
     fn add_to_model(
         self,
         model: &mut Model<f32>,
         previous_node_id: Option<NodeId>,
-    ) -> Result<NodeId> {
+    ) -> Result<(NodeId, Self::Metadata)> {
         // First we create the initial EinSum node
         let FeedForwardNetwork {
             gate,
@@ -60,7 +66,9 @@ impl LayerInsertion for FeedForwardNetwork {
                     format!("{}->{}", input_terms, output_terms),
                     vec![Some(gate_tensor.into()), Some(up.into())],
                     vec![None, up_bias.map(|tensor| tensor.into())],
-                )?;
+                )?
+                .no_requant()
+                .with_name(FEED_FORWARD_GATE_EINSUM_NAME.to_owned());
                 model.add_consecutive_layer(Layer::EinSum(glu_einsum), previous_node_id)?
             }
             None => {
@@ -78,7 +86,9 @@ impl LayerInsertion for FeedForwardNetwork {
                     format!("{}->{}", input_terms, output_terms),
                     vec![Some(up.into())],
                     vec![up_bias.map(|tensor| tensor.into())],
-                )?;
+                )?
+                .no_requant()
+                .with_name(FEED_FORWARD_UP_EINSUM_NAME.to_owned());
                 model.add_consecutive_layer(Layer::EinSum(einsum), previous_node_id)?
             }
         };
@@ -116,9 +126,17 @@ impl LayerInsertion for FeedForwardNetwork {
             format!("{}->{}", down_input_terms, down_output_terms),
             vec![Some(down.into())],
             vec![down_bias.map(|tensor| tensor.into())],
-        )?;
+        )?
+        .no_requant()
+        .with_name(FEED_FORWARD_DOWN_EINSUM_NAME.to_owned());
         let down_id =
             model.add_consecutive_layer(Layer::EinSum(down_einsum), Some(activation_id))?;
-        Ok(down_id)
+        let ffn_graph_id = FFNGraphID {
+            up_id: up_einsum_id,
+            down_id,
+            activation_id,
+            uses_glu: use_gate,
+        };
+        Ok((down_id, ffn_graph_id))
     }
 }

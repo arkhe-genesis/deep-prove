@@ -3,7 +3,7 @@ use crate::{
     graph::NodeId,
     iop::context::{ContextAux, ShapeStep},
     layers::{
-        activation::{ACTIVATION_LAYER, Activation, ActivationHandle, ActivationProof},
+        activation::{ACTIVATION_LAYER, Activation, ActivationProof},
         add::{ADD_LAYER, Add, AddCtx, AddProof},
         convolution::{CONVOLUTION_LAYER, ConvFFTHandle, Convolution},
         einsum::{EINSUM_LAYER, EinSum, EinSumContext, EinSumProof},
@@ -17,16 +17,21 @@ use crate::{
                 ATTENTION_MASK_LAYER, AttentionMask, AttentionMaskCtx, AttentionMaskProof,
             },
             embeddings::{EMBEDDINGS_LAYER, Embeddings, EmbeddingsCtx, EmbeddingsProof},
-            layernorm::{
-                LAYERNORM_LAYER, LayerNorm, LayerNormCtx, LayerNormHandle, LayerNormProof,
-            },
             logits::{ArgmaxHandle, LOGITS_LAYER, Logits, LogitsCtx, LogitsProof},
+            normalisation::{
+                layernorm::{
+                    LAYERNORM_LAYER, LayerNorm, LayerNormCtx, LayerNormProof,
+                    evaluate::LayerNormHandle,
+                },
+                rmsnorm::{
+                    RMSNORM_LAYER, RMSNorm, RMSNormCtx, RMSNormProof, evaluate::RMSNormHandle,
+                },
+            },
             positional::{POSITIONAL_LAYER, Positional, PositionalCtx, PositionalProof},
-            rmsnorm::{RMSNORM_LAYER, RMSNorm, RMSNormCtx, RMSNormProof},
             softmax::{SOFTMAX_LAYER, Softmax, SoftmaxCtx, SoftmaxHandle, SoftmaxProof},
         },
     },
-    lookup::context::{LayerLookupContext, LookupWitnessGen},
+    lookup::{context::LookupWitnessGen, table::Table},
     model::Step,
     padding::{PaddingMode, ShapeInfo},
     quantization::{ModelMetadata, ScalingFactor},
@@ -140,6 +145,8 @@ where
             Layer::Positional(pos) => pos.reset_cache(),
             Layer::EinSum(einsum) => einsum.reset_caches(),
             Layer::Softmax(softmax) => softmax.reset_cache(),
+            Layer::LayerNorm(layer_norm) => layer_norm.reset_cache(),
+            Layer::RMSNorm(rms_norm) => rms_norm.reset_cache(),
             _ => (),
         }
     }
@@ -154,12 +161,12 @@ where
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 pub enum LayerCtx<E: ExtensionField> {
     Convolution(ConvCtx),
-    Activation(ActivationCtx<E>),
-    Requant(RequantCtx<E>),
+    Activation(ActivationCtx),
+    Requant(RequantCtx),
     Pooling(PoolingCtx),
     EinSum(EinSumContext<E>),
-    LayerNorm(LayerNormCtx<E>),
-    RMSNorm(RMSNormCtx<E>),
+    LayerNorm(LayerNormCtx),
+    RMSNorm(RMSNormCtx),
     Flatten,
     Add(AddCtx),
     Softmax(SoftmaxCtx),
@@ -245,23 +252,26 @@ impl<E: ExtensionField> LayerCtx<E> {
         ))
     }
 
-    pub(crate) fn lookup_context(&self) -> Option<&LayerLookupContext> {
+    pub(crate) fn lookup_tables(&self) -> Option<Vec<Table>> {
         match self {
             LayerCtx::Convolution(_) => None,
-            LayerCtx::Activation(activation_ctx) => Some(&activation_ctx.lookup_context),
-            LayerCtx::Requant(requant_ctx) => Some(&requant_ctx.lookup_ctx),
-            LayerCtx::Pooling(pooling_ctx) => Some(&pooling_ctx.lookup_ctx),
+            LayerCtx::Activation(activation_ctx) => {
+                let inner_op = activation_ctx.op.activation_type();
+                Some(inner_op.lookup_tables())
+            }
+            LayerCtx::Requant(requant_ctx) => Some(requant_ctx.lookup_tables()),
+            LayerCtx::Pooling(pooling_ctx) => Some(pooling_ctx.lookup_tables()),
             LayerCtx::EinSum(_) => None,
-            LayerCtx::LayerNorm(layer_norm_ctx) => Some(&layer_norm_ctx.lookup_ctx),
-            LayerCtx::RMSNorm(rmsnorm_ctx) => Some(&rmsnorm_ctx.lookup_ctx),
+            LayerCtx::LayerNorm(layernorm_ctx) => Some(layernorm_ctx.lookup_tables()),
+            LayerCtx::RMSNorm(rmsnorm_ctx) => Some(rmsnorm_ctx.lookup_tables()),
             LayerCtx::Flatten => None,
             LayerCtx::Add(_) => None,
-            LayerCtx::Softmax(softmax_ctx) => Some(&softmax_ctx.lookup_ctx),
+            LayerCtx::Softmax(softmax_ctx) => Some(softmax_ctx.lookup_tables()),
             LayerCtx::Reshape(_) => None,
             LayerCtx::Embeddings(_) => None,
             LayerCtx::Positional(_) => None,
             LayerCtx::AttentionMask(_) => None,
-            LayerCtx::Logits(logits_ctx) => Some(&logits_ctx.lookup_ctx),
+            LayerCtx::Logits(logits_ctx) => Some(logits_ctx.lookup_tables()),
         }
     }
 }
@@ -315,9 +325,9 @@ where
         }
     }
 
-    pub fn try_activation_data(&self) -> Option<&ActivationHandle> {
+    pub fn try_rmsnorm_data(&self) -> Option<&RMSNormHandle> {
         match self.proving_data {
-            ProvingHandle::Activation(ref data) => Some(data),
+            ProvingHandle::RMSNorm(ref rmsnorm_data) => Some(rmsnorm_data),
             _ => None,
         }
     }
@@ -855,29 +865,6 @@ where
             Self::Dummy => "Dummy".to_string(),
             Self::AttentionMask(_) => "AttentionMask".to_string(),
             Self::EinSum(_) => "EinSum".to_string(),
-        }
-    }
-
-    pub fn get_lookup_data(&self) -> Option<(Vec<E>, Vec<E>)> {
-        match self {
-            LayerProof::Add(_) => None,
-            LayerProof::LayerNorm(proof) => Some(proof.get_lookup_data()),
-            LayerProof::RMSNorm(proof) => Some(proof.get_lookup_data()),
-            LayerProof::Softmax(proof) => Some(proof.get_lookup_data()),
-            LayerProof::Logits(proof) => Some(proof.get_lookup_data()),
-            LayerProof::Positional(_) => None,
-            LayerProof::Embeddings(..) => None,
-            LayerProof::Convolution(..) => None,
-            LayerProof::Dummy => None,
-            LayerProof::Activation(ActivationProof { lookup, .. }) => {
-                Some(lookup.fractional_outputs())
-            }
-            LayerProof::Pooling(PoolingProof { lookup, .. }) => Some(lookup.fractional_outputs()),
-            LayerProof::Requant(RequantProof { logup_proof, .. }) => {
-                Some(logup_proof.fractional_outputs())
-            }
-            LayerProof::AttentionMask(_) => None,
-            LayerProof::EinSum(_) => None,
         }
     }
 }

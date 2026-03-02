@@ -1,8 +1,5 @@
 use super::{
-    LayerCtx, LayerProof,
-    flatten::Flatten,
-    requant::Requant,
-    transformer::{layernorm::LayerNormData, softmax::SoftmaxData},
+    LayerCtx, LayerProof, flatten::Flatten, requant::Requant, transformer::softmax::SoftmaxData,
 };
 use crate::{
     Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
@@ -12,11 +9,13 @@ use crate::{
         verifier::Verifier,
     },
     layers::{
-        activation::{ActivationData, ActivationHandle},
         convolution::{ConvFFTData, ConvFFTHandle},
         transformer::{
-            layernorm::LayerNormHandle,
             logits::{ArgmaxData, ArgmaxHandle},
+            normalisation::{
+                layernorm::{LayerNormProvingData, evaluate::LayerNormHandle},
+                rmsnorm::{RMSNormProvingData, evaluate::RMSNormHandle},
+            },
             softmax::SoftmaxHandle,
         },
     },
@@ -44,12 +43,12 @@ pub enum ProvingData {
     Convolution(ConvFFTData),
     /// Data from evaluation of softmax.
     Softmax(SoftmaxData),
-    /// Data from evaluation of layernorm.
-    LayerNorm(LayerNormData),
-    /// Data from evaluation of logits.
+    /// Variant used for extra data used to prove [LayerNorm][`crate::layers::transformer::normalisation::layernorm::LayerNorm`]
+    LayerNorm(LayerNormProvingData),
+    /// Variant used for extra data used to prove [RMSNorm][`crate::layers::transformer::normalisation::rmsnorm::RMSNorm`]
+    RMSNorm(RMSNormProvingData),
+    /// Variant used for extra data used to prove [ArgMax][`crate::layers::transformer::logits::Logits`]
     ArgMax(ArgmaxData),
-    /// Data from evaluation of activation.
-    Activation(ActivationData),
     /// No extra data
     None,
 }
@@ -62,8 +61,8 @@ pub enum ProvingHandle {
     Convolution(ConvFFTHandle),
     Softmax(SoftmaxHandle),
     LayerNorm(LayerNormHandle),
+    RMSNorm(RMSNormHandle),
     ArgMax(ArgmaxHandle),
-    Activation(ActivationHandle),
     None,
 }
 
@@ -83,12 +82,12 @@ impl ProvingHandle {
             ProvingData::LayerNorm(layer_norm_data) => {
                 ProvingHandle::LayerNorm(LayerNormHandle::new(storage_key, layer_norm_data, store))
             }
+            ProvingData::RMSNorm(rms_norm_data) => {
+                ProvingHandle::RMSNorm(RMSNormHandle::new(storage_key, rms_norm_data, store))
+            }
             ProvingData::ArgMax(argmax_data) => {
                 ProvingHandle::ArgMax(ArgmaxHandle::new(storage_key, argmax_data, store))
             }
-            ProvingData::Activation(activation_data) => ProvingHandle::Activation(
-                ActivationHandle::new(storage_key, activation_data, store),
-            ),
             ProvingData::None => ProvingHandle::None,
         }
     }
@@ -98,8 +97,8 @@ impl ProvingHandle {
             ProvingHandle::Convolution(handle) => handle.attach_store(store),
             ProvingHandle::Softmax(handle) => handle.attach_store(store),
             ProvingHandle::LayerNorm(handle) => handle.attach_store(store),
+            ProvingHandle::RMSNorm(handle) => handle.attach_store(store),
             ProvingHandle::ArgMax(handle) => handle.attach_store(store),
-            ProvingHandle::Activation(handle) => handle.attach_store(store),
             ProvingHandle::None => {}
         }
     }
@@ -115,10 +114,10 @@ impl ProvingHandle {
             ProvingHandle::LayerNorm(layer_norm_handle) => {
                 ProvingHandle::LayerNorm(layer_norm_handle.isolate())
             }
-            ProvingHandle::ArgMax(argmax_handle) => ProvingHandle::ArgMax(argmax_handle.isolate()),
-            ProvingHandle::Activation(activation_handle) => {
-                ProvingHandle::Activation(activation_handle.isolate())
+            ProvingHandle::RMSNorm(rms_norm_handle) => {
+                ProvingHandle::RMSNorm(rms_norm_handle.isolate())
             }
+            ProvingHandle::ArgMax(argmax_handle) => ProvingHandle::ArgMax(argmax_handle.isolate()),
             ProvingHandle::None => ProvingHandle::None,
         }
     }
@@ -211,9 +210,15 @@ impl<T: TensorTypeParam> LayerOut<T> {
         }
     }
 
-    pub fn try_layernorm_data(&self) -> Option<&LayerNormData> {
+    pub fn try_layernorm_data(&self) -> Option<&LayerNormProvingData> {
         match self.proving_data {
             ProvingData::LayerNorm(ref layernorm_data) => Some(layernorm_data),
+            _ => None,
+        }
+    }
+    pub fn try_rmsnorm_data(&self) -> Option<&RMSNormProvingData> {
+        match self.proving_data {
+            ProvingData::RMSNorm(ref rmsnorm_data) => Some(rmsnorm_data),
             _ => None,
         }
     }

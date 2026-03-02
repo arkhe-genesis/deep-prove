@@ -6,6 +6,7 @@ pub mod safe;
 
 use crate::{
     Element, ScalingStrategy, Shape,
+    graph::NodeId,
     model::Model,
     padding::pad_model,
     quantization::{InferenceObserver, ModelMetadata},
@@ -35,6 +36,15 @@ pub fn default_pipeline_config() -> PipelineConfig<'static, InferenceObserver> {
 }
 
 impl<'a, S: ScalingStrategy> PipelineConfig<'a, S> {
+    pub fn new() -> Self {
+        Self {
+            float_rules: Vec::new(),
+            quantized_rules: Vec::new(),
+            input_shapes: None,
+            quant_strategy: None,
+            store: None,
+        }
+    }
     pub fn with_float_rules(mut self, rules: Vec<Box<dyn ModelTransform<f32>>>) -> Self {
         self.float_rules = rules;
         self
@@ -58,16 +68,16 @@ impl<'a, S: ScalingStrategy> PipelineConfig<'a, S> {
 }
 ///// Trait for loading a model from a given format.
 pub trait ModelLoader<DataFormat> {
-    /// The configuration of the model.
+    /// The metadata of the model.
     /// Often, there are some subtle parameters that are not reflected directly in the "graph" of the model itself.
-    /// For example, for LLM models, the configuration is the LLMConfig that contains information like the maximum
+    /// For example, for LLM models, the configuration in the LLMConfig contains information like the maximum
     /// context length, the vocabulary size etc. For generic ONNX models, there is no external configuration.
-    type ModelConfig;
+    type Metadata;
     /// The main method a loader must implement. A model loader can only parse for the explicit format of the model it supports.
     /// For example, Gemma3 derived models can be loaded from `[GGUFFormat]` format or `[SafeTensorsFormat]` format.
     /// Note the returned model is only loaded in float. One must use `[to_quantized]` to quantize the model into a model
     /// ready to proven.
-    fn parse(&self, raw: &DataFormat) -> anyhow::Result<(Model<f32>, Self::ModelConfig)>;
+    fn parse(&self, raw: &DataFormat) -> anyhow::Result<(Model<f32>, Self::Metadata)>;
     fn model_name(&self) -> String;
 }
 
@@ -79,6 +89,18 @@ pub trait Load<Loader> {
     fn from_loader(loader: &Loader, config: &Self::Config) -> anyhow::Result<Self>
     where
         Self: Sized;
+}
+
+/// Trait used to define an operation, or sequence of operations that can be added to a [`Model`].
+pub trait LayerInsertion {
+    type Metadata = ();
+    /// Adds the layer to the provided model, connecting it to the previous node if provided.
+    /// Returns the [`NodeId`] of the last layer added.
+    fn add_to_model(
+        self,
+        model: &mut Model<f32>,
+        previous_node_id: Option<NodeId>,
+    ) -> anyhow::Result<(NodeId, Self::Metadata)>;
 }
 
 /// Convert a float model into a quantized model using the given pipeline configuration.

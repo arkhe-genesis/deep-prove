@@ -1,19 +1,11 @@
 //! File containing code for generating the LogUp GKR circuit
 
-use std::collections::{BTreeSet, HashMap};
-
 use ark_std::Zero;
 use either::Either;
 use ff_ext::ExtensionField;
 
 use itertools::izip;
-use multilinear_extensions::{
-    Expression,
-    mle::{ArcMultilinearExtension, MultilinearExtension},
-    util::ceil_log2,
-};
-
-use crate::lookup::logup_gkr::structs::ProofType;
+use multilinear_extensions::{Expression, mle::MultilinearExtension, util::ceil_log2};
 
 use super::structs::Fraction;
 
@@ -28,12 +20,43 @@ pub enum LogUpLayer<E: ExtensionField> {
     /// This is the first layer of the GKR protocol when proving a fractional sumcheck for a table.
     /// The numerator is the multiplicity polynomial and the denominator is the merged table polynomial.
     InitialTable {
-        numerator: Vec<E>,
-        denominator: Vec<E>,
+        numerator: Vec<E::BaseField>,
+        constant_challenge: E,
+        column_separation_challenge: E,
+        denominator_columns: Vec<Vec<E::BaseField>>,
     },
     /// This is the first layer of the GKR protocol when proving a fractional sumcheck for a set of lookups.
     /// The numerators will all be `-1` on this layer so we only store the denominator which is the merged lookups.
-    InitialLookup { denominator: Vec<E> },
+    InitialLookup {
+        constant_challenge: E,
+        column_separation_challenge: E,
+        denominator_columns: Vec<Vec<E::BaseField>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MLEsAndExpressions<'a, E: ExtensionField> {
+    pub(crate) mles: Vec<MultilinearExtension<'a, E>>,
+    pub(crate) sumcheck_expression: Expression<E>,
+    pub(crate) claim_expression: Expression<E>,
+}
+
+impl<E: ExtensionField> MLEsAndExpressions<'_, E> {
+    pub fn mles(&self) -> &Vec<MultilinearExtension<'_, E>> {
+        &self.mles
+    }
+
+    pub fn sumcheck_expression(&self) -> &Expression<E> {
+        &self.sumcheck_expression
+    }
+
+    pub fn claim_expression(&self) -> &Expression<E> {
+        &self.claim_expression
+    }
+
+    pub fn num_witnesses(&self) -> u16 {
+        self.mles.len() as u16
+    }
 }
 
 impl<E: ExtensionField> LogUpLayer<E> {
@@ -41,9 +64,15 @@ impl<E: ExtensionField> LogUpLayer<E> {
     pub fn num_vars(&self) -> usize {
         // We right shift the denominator length by 1 because at each level of the GKR circuit the polynomials we run the sumcheck over have half the length
         match self {
-            LogUpLayer::Generic { denominator, .. }
-            | LogUpLayer::InitialTable { denominator, .. }
-            | LogUpLayer::InitialLookup { denominator } => ceil_log2(denominator.len() >> 1),
+            LogUpLayer::Generic { denominator, .. } => ceil_log2(denominator.len() >> 1),
+            LogUpLayer::InitialTable {
+                denominator_columns,
+                ..
+            }
+            | LogUpLayer::InitialLookup {
+                denominator_columns,
+                ..
+            } => ceil_log2(denominator_columns[0].len() >> 1),
         }
     }
 
@@ -65,10 +94,6 @@ impl<E: ExtensionField> LogUpLayer<E> {
             LogUpLayer::Generic {
                 numerator,
                 denominator,
-            }
-            | LogUpLayer::InitialTable {
-                numerator,
-                denominator,
             } => {
                 // Split the numerator and denominator at the halfway point and sum the fractions
                 let (num1, num2) = numerator.split_at(half_layer_size);
@@ -86,14 +111,65 @@ impl<E: ExtensionField> LogUpLayer<E> {
                     denominator: next_denominator,
                 })
             }
-            LogUpLayer::InitialLookup { denominator } => {
-                // In this case we only need to split the denominator polynomial in half as the numerators are all -1
-                let (denom1, denom2) = denominator.split_at(half_layer_size);
-                let (next_numerator, next_denominator): (Vec<E>, Vec<E>) = denom1
+            LogUpLayer::InitialTable {
+                numerator,
+                constant_challenge,
+                column_separation_challenge,
+                denominator_columns,
+            } => {
+                let (num1, num2) = numerator.split_at(half_layer_size);
+                let (next_numerator, next_denominator): (Vec<E>, Vec<E>) = num1
                     .iter()
-                    .zip(denom2.iter())
-                    .map(|(d1, d2)| {
-                        (Fraction::<E>::new(-E::ONE, *d1) + Fraction::<E>::new(-E::ONE, *d2))
+                    .zip(num2.iter())
+                    .enumerate()
+                    .map(|(i, (&n1, &n2))| {
+                        let (denom1, denom2, _) = denominator_columns
+                            .iter()
+                            .map(|col| (col[i], col[i + half_layer_size]))
+                            .fold(
+                                (*constant_challenge, *constant_challenge, E::ONE),
+                                |(acc1, acc2, chal_acc), (val1, val2)| {
+                                    (
+                                        acc1 + chal_acc * E::from_base(val1),
+                                        acc2 + chal_acc * E::from_base(val2),
+                                        chal_acc * *column_separation_challenge,
+                                    )
+                                },
+                            );
+
+                        (Fraction::<E>::new(E::from_base(n1), denom1)
+                            + Fraction::<E>::new(E::from_base(n2), denom2))
+                        .as_tuple()
+                    })
+                    .unzip();
+                Some(LogUpLayer::Generic {
+                    numerator: next_numerator,
+                    denominator: next_denominator,
+                })
+            }
+            LogUpLayer::InitialLookup {
+                constant_challenge,
+                column_separation_challenge,
+                denominator_columns,
+            } => {
+                // In this case we only need to split the denominator polynomial in half as the numerators are all -1
+                let (next_numerator, next_denominator): (Vec<E>, Vec<E>) = (0..half_layer_size)
+                    .map(|i| {
+                        let (d1, d2, _) = denominator_columns
+                            .iter()
+                            .map(|col| (col[i], col[i + half_layer_size]))
+                            .fold(
+                                (*constant_challenge, *constant_challenge, E::ONE),
+                                |(acc1, acc2, chal_acc), (val1, val2)| {
+                                    (
+                                        acc1 + chal_acc * E::from_base(val1),
+                                        acc2 + chal_acc * E::from_base(val2),
+                                        chal_acc * *column_separation_challenge,
+                                    )
+                                },
+                            );
+
+                        (Fraction::<E>::new(-E::ONE, d1) + Fraction::<E>::new(-E::ONE, d2))
                             .as_tuple()
                     })
                     .unzip();
@@ -129,68 +205,55 @@ impl<E: ExtensionField> LogUpLayer<E> {
             LogUpLayer::Generic {
                 numerator,
                 denominator,
-            }
-            | LogUpLayer::InitialTable {
-                numerator,
-                denominator,
             } => [numerator.as_slice(), denominator.as_slice()].concat(),
-            LogUpLayer::InitialLookup { denominator } => denominator.to_vec(),
+            LogUpLayer::InitialLookup {
+                denominator_columns,
+                ..
+            } => denominator_columns
+                .iter()
+                .flat_map(|col| col.iter().map(|v| E::from_base(*v)))
+                .collect(),
+            LogUpLayer::InitialTable {
+                numerator,
+                denominator_columns,
+                ..
+            } => [
+                numerator.as_slice(),
+                denominator_columns.concat().as_slice(),
+            ]
+            .concat()
+            .into_iter()
+            .map(|v| E::from_base(v))
+            .collect(),
         }
     }
 
-    /// Gets the Densemultlinear extensions for this [`LogUpLayer`] in the order
-    /// numerator low part, numerator high part, denominator low part, denominator high part.
-    /// In the initial lookup case it is just the two denominator MLEs.
-    pub fn get_mles(&self) -> Vec<ArcMultilinearExtension<'_, E>> {
+    pub fn layer_proving_info(
+        &self,
+        layer_count: usize,
+        initial_witness_id: u16,
+    ) -> MLEsAndExpressions<'_, E> {
+        // Get the number of variables for this layer
         let num_vars = self.num_vars();
         let half_layer_size = 1 << num_vars;
+
+        // build the claim expression which is used to link to the previous layer to this one, common to all layer types
+        let claim_num_low_id = layer_count as u16 * 4;
+        let claim_num_high_id = claim_num_low_id + 1;
+        let claim_denom_low_id = claim_num_high_id + 1;
+        let claim_denom_high_id = claim_denom_low_id + 1;
+        let claim_expression = Expression::Challenge(0u16, layer_count, E::ONE, E::ZERO)
+            * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                * (Expression::WitIn(claim_num_high_id) - Expression::WitIn(claim_num_low_id))
+                + Expression::WitIn(claim_num_low_id)
+                + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                    * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                        * (Expression::WitIn(claim_denom_high_id)
+                            - Expression::WitIn(claim_denom_low_id))
+                        + Expression::WitIn(claim_denom_low_id)));
+
         match self {
             LogUpLayer::Generic {
-                numerator,
-                denominator,
-            }
-            | LogUpLayer::InitialTable {
-                numerator,
-                denominator,
-            } => {
-                let (num_low, num_high) = numerator.split_at(half_layer_size);
-                let (denom_low, denom_high) = denominator.split_at(half_layer_size);
-                let num_low_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, num_low).into();
-                let num_high_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, num_high).into();
-                let denom_low_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, denom_low).into();
-                let denom_high_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, denom_high).into();
-
-                vec![num_low_mle, num_high_mle, denom_low_mle, denom_high_mle]
-            }
-            LogUpLayer::InitialLookup { denominator } => {
-                let (denom_low, denom_high) = denominator.split_at(half_layer_size);
-                let denom_low_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, denom_low).into();
-
-                let denom_high_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, denom_high).into();
-
-                vec![denom_low_mle, denom_high_mle]
-            }
-        }
-    }
-
-    /// Gets the Densemultlinear extensions for this [`LogUpLayer`] in the order
-    /// numerator low part, numerator high part, denominator low part, denominator high part.
-    /// In the initial lookup case it is just the two denominator MLEs.
-    pub fn new_get_mles(&self) -> Vec<MultilinearExtension<'_, E>> {
-        let num_vars = self.num_vars();
-        let half_layer_size = 1 << num_vars;
-        match self {
-            LogUpLayer::Generic {
-                numerator,
-                denominator,
-            }
-            | LogUpLayer::InitialTable {
                 numerator,
                 denominator,
             } => {
@@ -205,17 +268,231 @@ impl<E: ExtensionField> LogUpLayer<E> {
                 let denom_high_mle =
                     MultilinearExtension::from_evaluations_ext_slice(num_vars, denom_high);
 
-                vec![num_low_mle, num_high_mle, denom_low_mle, denom_high_mle]
+                let mles = vec![num_low_mle, num_high_mle, denom_low_mle, denom_high_mle];
+
+                let num_low_id = initial_witness_id;
+                let num_high_id = num_low_id + 1;
+                let denom_low_id = num_high_id + 1;
+                let denom_high_id = denom_low_id + 1;
+
+                // build the sumcheck expression which is used to prove this layer links to the next one
+                let sumcheck_expr = Expression::Challenge(0u16, layer_count, E::ONE, E::ZERO)
+                    * (Expression::WitIn(num_low_id) * Expression::WitIn(denom_high_id)
+                        + Expression::WitIn(num_high_id) * Expression::WitIn(denom_low_id)
+                        + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                            * Expression::WitIn(denom_low_id)
+                            * Expression::WitIn(denom_high_id));
+
+                MLEsAndExpressions {
+                    mles,
+                    sumcheck_expression: sumcheck_expr,
+                    claim_expression,
+                }
             }
-            LogUpLayer::InitialLookup { denominator } => {
-                let (denom_low, denom_high) = denominator.split_at(half_layer_size);
-                let denom_low_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, denom_low);
+            LogUpLayer::InitialTable {
+                numerator,
+                constant_challenge,
+                column_separation_challenge,
+                denominator_columns,
+            } => {
+                let (num_low, num_high) = numerator.split_at(half_layer_size);
+                let num_low_mle = MultilinearExtension::from_evaluations_slice(num_vars, num_low);
+                let num_high_mle = MultilinearExtension::from_evaluations_slice(num_vars, num_high);
 
-                let denom_high_mle =
-                    MultilinearExtension::from_evaluations_ext_slice(num_vars, denom_high);
+                let (denom_low_mles, denom_high_mles) = denominator_columns.iter().fold(
+                    (vec![], vec![]),
+                    |(mut low, mut high), column| {
+                        let (denom_low, denom_high) = column.split_at(half_layer_size);
+                        low.push(MultilinearExtension::from_evaluations_slice(
+                            num_vars, denom_low,
+                        ));
+                        high.push(MultilinearExtension::from_evaluations_slice(
+                            num_vars, denom_high,
+                        ));
+                        (low, high)
+                    },
+                );
 
-                vec![denom_low_mle, denom_high_mle]
+                let num_low_id = initial_witness_id;
+                let num_high_id = num_low_id + 1;
+                // Now we make the denominator expressions
+                let column_count = denominator_columns.len() as u16;
+                let constant_expr = Expression::Constant(Either::Right(*constant_challenge));
+                let (denom_low_expr, denom_high_expr, _) = (0..denominator_columns.len()).fold(
+                    (constant_expr.clone(), constant_expr.clone(), E::ONE),
+                    |(acc_low, acc_high, chal_acc), i| {
+                        let chal_expr = Expression::Constant(Either::Right(chal_acc));
+                        (
+                            acc_low
+                                + chal_expr.clone() * Expression::WitIn(num_high_id + 1 + i as u16),
+                            acc_high
+                                + chal_expr
+                                    * Expression::WitIn(num_high_id + 1 + column_count + i as u16),
+                            chal_acc * *column_separation_challenge,
+                        )
+                    },
+                );
+
+                // build the sumcheck expression which is used to prove this layer links to the next one
+                let sumcheck_expr = Expression::Challenge(0u16, layer_count, E::ONE, E::ZERO)
+                    * (Expression::WitIn(num_low_id) * denom_high_expr.clone()
+                        + Expression::WitIn(num_high_id) * denom_low_expr.clone()
+                        + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                            * denom_low_expr.clone()
+                            * denom_high_expr.clone());
+
+                let mut mles = vec![num_low_mle, num_high_mle];
+                mles.extend(denom_low_mles);
+                mles.extend(denom_high_mles);
+                MLEsAndExpressions {
+                    mles,
+                    sumcheck_expression: sumcheck_expr,
+                    claim_expression,
+                }
+            }
+            LogUpLayer::InitialLookup {
+                constant_challenge,
+                column_separation_challenge,
+                denominator_columns,
+            } => {
+                let (denom_low_mles, denom_high_mles) = denominator_columns.iter().fold(
+                    (vec![], vec![]),
+                    |(mut low, mut high), column| {
+                        let (denom_low, denom_high) = column.split_at(half_layer_size);
+                        low.push(MultilinearExtension::from_evaluations_slice(
+                            num_vars, denom_low,
+                        ));
+                        high.push(MultilinearExtension::from_evaluations_slice(
+                            num_vars, denom_high,
+                        ));
+                        (low, high)
+                    },
+                );
+
+                // Now we make the denominator expressions
+                let column_count = denominator_columns.len() as u16;
+                let constant_expr = Expression::Constant(Either::Right(*constant_challenge));
+                let (denom_low_expr, denom_high_expr, _) = (0..denominator_columns.len()).fold(
+                    (constant_expr.clone(), constant_expr.clone(), E::ONE),
+                    |(acc_low, acc_high, chal_acc), i| {
+                        let chal_expr = Expression::Constant(Either::Right(chal_acc));
+                        (
+                            acc_low
+                                + chal_expr.clone()
+                                    * Expression::WitIn(initial_witness_id + i as u16),
+                            acc_high
+                                + chal_expr
+                                    * Expression::WitIn(
+                                        initial_witness_id + column_count + i as u16,
+                                    ),
+                            chal_acc * *column_separation_challenge,
+                        )
+                    },
+                );
+                // The numerator is all -1 so we can use a constant expression
+
+                // build the sumcheck expression which is used to prove this layer links to the next one
+                let sumcheck_expr = Expression::Challenge(0u16, layer_count, E::ONE, E::ZERO)
+                    * (-denom_high_expr.clone() - denom_low_expr.clone()
+                        + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                            * denom_low_expr.clone()
+                            * denom_high_expr.clone());
+
+                let mut mles = denom_low_mles;
+                mles.extend(denom_high_mles);
+                MLEsAndExpressions {
+                    mles,
+                    sumcheck_expression: sumcheck_expr,
+                    claim_expression,
+                }
+            }
+        }
+    }
+
+    pub fn final_eval_count(&self) -> usize {
+        match self {
+            LogUpLayer::InitialLookup {
+                denominator_columns,
+                ..
+            } => denominator_columns.len() * 2,
+            LogUpLayer::InitialTable {
+                denominator_columns,
+                ..
+            } => denominator_columns.len() * 2 + 2,
+            LogUpLayer::Generic { .. } => 0,
+        }
+    }
+
+    pub fn denominator_column_count(&self) -> usize {
+        match self {
+            LogUpLayer::InitialLookup {
+                denominator_columns,
+                ..
+            }
+            | LogUpLayer::InitialTable {
+                denominator_columns,
+                ..
+            } => denominator_columns.len(),
+            LogUpLayer::Generic { .. } => 0,
+        }
+    }
+
+    pub fn combine_final_evals(
+        &self,
+        evals: &[E],
+        batching_challenge: E,
+    ) -> anyhow::Result<Vec<E>> {
+        match self {
+            LogUpLayer::InitialLookup {
+                denominator_columns,
+                ..
+            } => {
+                // In this case the evals are expected to be all of the low parts of the denominator followed by all of the high parts
+                let total_columns = denominator_columns.len();
+                anyhow::ensure!(
+                    evals.len() == total_columns * 2,
+                    "Expected {} final evaluations but got {}",
+                    total_columns * 2,
+                    evals.len()
+                );
+                let (low_evals, high_evals) = evals.split_at(total_columns);
+                low_evals
+                    .iter()
+                    .zip(high_evals.iter())
+                    .map(|(&low, &high)| {
+                        let combined_eval = batching_challenge * (high - low) + low;
+                        Ok(combined_eval)
+                    })
+                    .collect()
+            }
+            LogUpLayer::InitialTable {
+                denominator_columns,
+                ..
+            } => {
+                let total_columns = denominator_columns.len();
+                anyhow::ensure!(
+                    evals.len() == total_columns * 2 + 2,
+                    "Expected {} final evaluations but got {}",
+                    total_columns * 2 + 2,
+                    evals.len()
+                );
+                let (numerator_evals, rest) = evals.split_at(2);
+                let (low_evals, high_evals) = rest.split_at(total_columns);
+                let numerator_eval = batching_challenge * (numerator_evals[1] - numerator_evals[0])
+                    + numerator_evals[0];
+                let combined_evals: Vec<E> = std::iter::once(numerator_eval)
+                    .chain(
+                        low_evals
+                            .iter()
+                            .zip(high_evals.iter())
+                            .map(|(&low, &high)| batching_challenge * (high - low) + low),
+                    )
+                    .collect();
+
+                Ok(combined_evals)
+            }
+            LogUpLayer::Generic { .. } => {
+                anyhow::bail!("combine_final_evals should only be called on initial layers")
             }
         }
     }
@@ -245,31 +522,16 @@ impl<E: ExtensionField> LogUpCircuit<E> {
         constant_challenge: E,
         column_separation_challenge: E,
     ) -> LogUpCircuit<E> {
-        let challenge_powers = std::iter::successors(Some(E::ONE), |prev| {
-            Some(*prev * column_separation_challenge)
-        })
-        .take(lookup_columns.len())
-        .collect::<Vec<E>>();
-
-        let length = lookup_columns[0].len();
-
-        let denominator = (0..length)
-            .map(|i| {
-                lookup_columns
-                    .iter()
-                    .zip(challenge_powers.iter())
-                    .fold(constant_challenge, |acc, (col, challenge)| {
-                        acc + *challenge * col[i]
-                    })
-            })
-            .collect::<Vec<E>>();
-
-        let initial_layer = LogUpLayer::InitialLookup { denominator };
+        let initial_layer = LogUpLayer::InitialLookup {
+            constant_challenge,
+            column_separation_challenge,
+            denominator_columns: lookup_columns.to_vec(),
+        };
 
         LogUpCircuit::<E>::new(initial_layer)
     }
 
-    /// Crates a new [`LogUpCircuit`] for a table variant, the inputs to this function are:
+    /// Creates a new [`LogUpCircuit`] for a table variant, the inputs to this function are:
     /// - `table_evals`, a series of slices of equal length that represent the columns of the table,
     /// - `multiplicities`, a slice of [`E::BaseField`] elements that are the evaluations of the multiplicity poly,
     /// - `constant_challenge`, the first term of the LogUp denominator,
@@ -280,31 +542,11 @@ impl<E: ExtensionField> LogUpCircuit<E> {
         constant_challenge: E,
         column_separation_challenge: E,
     ) -> LogUpCircuit<E> {
-        let challenge_powers = std::iter::successors(Some(E::ONE), |prev| {
-            Some(*prev * column_separation_challenge)
-        })
-        .take(table_columns.len())
-        .collect::<Vec<E>>();
-
-        let length = table_columns[0].len();
-        let numerator = multiplicities
-            .iter()
-            .map(|&val| E::from(val))
-            .collect::<Vec<E>>();
-        let denominator = (0..length)
-            .map(|i| {
-                table_columns
-                    .iter()
-                    .zip(challenge_powers.iter())
-                    .fold(constant_challenge, |acc, (col, challenge)| {
-                        acc + *challenge * col[i]
-                    })
-            })
-            .collect::<Vec<E>>();
-
         let initial_layer = LogUpLayer::InitialTable {
-            numerator,
-            denominator,
+            numerator: multiplicities.to_vec(),
+            constant_challenge,
+            column_separation_challenge,
+            denominator_columns: table_columns.to_vec(),
         };
 
         LogUpCircuit::<E>::new(initial_layer)
@@ -325,152 +567,23 @@ impl<E: ExtensionField> LogUpCircuit<E> {
     pub fn layers(&self) -> &[LogUpLayer<E>] {
         &self.layers
     }
-}
 
-pub(crate) fn construct_logup_expressions<E: ExtensionField>(
-    variables_set: &BTreeSet<usize>,
-    evals_set: &HashMap<usize, Vec<Vec<E>>>,
-    total_layers: usize,
-) -> (Vec<Expression<E>>, Vec<Expression<E>>) {
-    let mut layer_count = 0u16;
-    variables_set
-        .iter()
-        .rev()
-        .map(|size| {
-            let count = evals_set.get(size).unwrap().len();
-            let multiplier = E::from_canonical_u64(1 << (total_layers - *size));
-            let claim_expr_multiplier = Expression::Constant(Either::Right(multiplier));
-            let (sumcheck_expr, claim_expr) = (0..count).fold(
-                (
-                    Expression::Constant(Either::Right(E::ZERO)),
-                    Expression::Constant(Either::Right(E::ZERO)),
-                ),
-                |(sumcheck_acc, claim_acc), _| {
-                    let num_low_id = 4 * layer_count;
-                    let num_high_id = num_low_id + 1;
-                    let denom_low_id = num_high_id + 1;
-                    let denom_high_id = denom_low_id + 1;
-                    let sumcheck_expr =
-                        Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
-                            * (Expression::WitIn(num_low_id) * Expression::WitIn(denom_high_id)
-                                + Expression::WitIn(num_high_id) * Expression::WitIn(denom_low_id)
-                                + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
-                                    * Expression::WitIn(denom_low_id)
-                                    * Expression::WitIn(denom_high_id));
+    pub fn final_eval_count(&self) -> anyhow::Result<usize> {
+        self.layers
+            .first()
+            .ok_or(anyhow::anyhow!("No Layers in LogUpCircuit"))
+            .map(|layer| layer.final_eval_count())
+    }
 
-                    let claim_expr =
-                        Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
-                            * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
-                                * (Expression::WitIn(num_high_id) - Expression::WitIn(num_low_id))
-                                + Expression::WitIn(num_low_id)
-                                + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
-                                    * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
-                                        * (Expression::WitIn(denom_high_id)
-                                            - Expression::WitIn(denom_low_id))
-                                        + Expression::WitIn(denom_low_id)));
-                    layer_count += 1;
-                    (sumcheck_acc + sumcheck_expr, claim_acc + claim_expr)
-                },
-            );
-            (sumcheck_expr, claim_expr * claim_expr_multiplier)
-        })
-        .unzip()
-}
-
-pub(crate) fn construct_final_round_logup_expressions<E: ExtensionField>(
-    variables_set: &BTreeSet<usize>,
-    evals_set: &HashMap<usize, Vec<Vec<E>>>,
-) -> Vec<Expression<E>> {
-    let mut layer_count = 0u16;
-    variables_set
-        .iter()
-        .rev()
-        .map(|size| {
-            let count = evals_set.get(size).unwrap().len();
-
-            (0..count).fold(
-                Expression::Constant(Either::Right(E::ZERO)),
-                |sumcheck_acc, _| {
-                    let denom_low_id = 2 * layer_count;
-                    let denom_high_id = denom_low_id + 1;
-                    let sumcheck_expr =
-                        Expression::Challenge(0u16, layer_count as usize, -E::ONE, E::ZERO)
-                            * (Expression::WitIn(denom_low_id)
-                                + Expression::WitIn(denom_high_id)
-                                + Expression::Challenge(1u16, 1, -E::ONE, E::ZERO)
-                                    * Expression::WitIn(denom_low_id)
-                                    * Expression::WitIn(denom_high_id));
-
-                    layer_count += 1;
-                    sumcheck_acc + sumcheck_expr
-                },
-            )
-        })
-        .collect()
-}
-
-pub(crate) fn construct_final_round_claim_expression<E: ExtensionField>(
-    variables_set: &BTreeSet<usize>,
-    evals_set: &HashMap<usize, Vec<Vec<E>>>,
-    proof_type: ProofType,
-) -> Vec<Expression<E>> {
-    let mut layer_count = 0u16;
-    match proof_type {
-        ProofType::Table => variables_set
-            .iter()
-            .rev()
-            .map(|size| {
-                let count = evals_set.get(size).unwrap().len();
-
-                (0..count).fold(
-                    Expression::Constant(Either::Right(E::ZERO)),
-                    |sumcheck_acc, _| {
-                        let num_low_id = 4 * layer_count;
-                        let num_high_id = num_low_id + 1;
-                        let denom_low_id = num_high_id + 1;
-                        let denom_high_id = denom_low_id + 1;
-
-                        let claim_expr =
-                            Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
-                                * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
-                                    * (Expression::WitIn(num_high_id)
-                                        - Expression::WitIn(num_low_id))
-                                    + Expression::WitIn(num_low_id)
-                                    + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
-                                        * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
-                                            * (Expression::WitIn(denom_high_id)
-                                                - Expression::WitIn(denom_low_id))
-                                            + Expression::WitIn(denom_low_id)));
-                        layer_count += 1;
-                        sumcheck_acc + claim_expr
-                    },
-                )
-            })
-            .collect(),
-        ProofType::Lookup => variables_set
-            .iter()
-            .rev()
-            .map(|size| {
-                let count = evals_set.get(size).unwrap().len();
-
-                (0..count).fold(
-                    Expression::Constant(Either::Right(E::ZERO)),
-                    |sumcheck_acc, _| {
-                        let denom_low_id = 2 * layer_count;
-                        let denom_high_id = denom_low_id + 1;
-
-                        let claim_expr =
-                            Expression::Challenge(0u16, layer_count as usize, E::ONE, E::ZERO)
-                                * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
-                                    * (Expression::WitIn(denom_high_id)
-                                        - Expression::WitIn(denom_low_id))
-                                    + Expression::WitIn(denom_low_id));
-                        layer_count += 1;
-                        sumcheck_acc + claim_expr
-                    },
-                )
-            })
-            .collect(),
+    pub fn combine_final_evals(
+        &self,
+        evals: &[E],
+        batching_challenge: E,
+    ) -> anyhow::Result<Vec<E>> {
+        self.layers
+            .first()
+            .ok_or(anyhow::anyhow!("No Layers in LogUpCircuit"))
+            .and_then(|layer| layer.combine_final_evals(evals, batching_challenge))
     }
 }
 

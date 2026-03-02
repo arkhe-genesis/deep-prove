@@ -6,13 +6,15 @@ use std::{
     ops::{Add, AddAssign, Mul, MulAssign},
 };
 
+use anyhow::{Result, anyhow, ensure};
+use either::Either;
 use ff_ext::ExtensionField;
-use multilinear_extensions::mle::MultilinearExtension;
+use multilinear_extensions::{Expression, mle::MultilinearExtension};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sumcheck::structs::IOPProof;
 use transcript::Transcript;
 
-use super::{circuit::LogUpCircuit, error::LogUpError};
+use super::circuit::LogUpCircuit;
 use crate::Claim;
 use rayon::prelude::*;
 
@@ -156,27 +158,22 @@ impl<E: ExtensionField> LogUpInput<E> {
         constant_challenge: E,
         column_separation_challenge: E,
         columns_per_instance: usize,
-    ) -> Result<LogUpInput<E>, LogUpError> {
-        if column_evals.is_empty() {
-            return Err(LogUpError::ParameterError(
-                "No column evals were provided for Lookup input".to_string(),
-            ));
-        }
+    ) -> Result<LogUpInput<E>> {
+        ensure!(
+            !column_evals.is_empty(),
+            "No column evals were provided for Lookup input"
+        );
 
         // Unwrap is safe
         let first_evals_len = column_evals.first().unwrap().len();
-
-        if !first_evals_len.is_power_of_two() {
-            return Err(LogUpError::PolynomialError(format!(
-                "Need a power of two number of evaluations got: {first_evals_len}"
-            )));
-        }
+        ensure!(
+            first_evals_len.is_power_of_two(),
+            "Need a power of two number of evaluations got: {first_evals_len}"
+        );
 
         column_evals.iter().skip(1).try_for_each(|evals| {
             if evals.len() != first_evals_len {
-                Err(LogUpError::ParameterError(
-                    "All sets of evaluations should be the same length".to_string(),
-                ))
+                Err(anyhow!("All sets of evaluations should be the same length"))
             } else {
                 Ok(())
             }
@@ -195,39 +192,33 @@ impl<E: ExtensionField> LogUpInput<E> {
         multiplicities: Vec<E::BaseField>,
         constant_challenge: E,
         column_separation_challenge: E,
-    ) -> Result<LogUpInput<E>, LogUpError> {
-        if column_evals.is_empty() {
-            return Err(LogUpError::ParameterError(
-                "No column evals were provided for Lookup input".to_string(),
-            ));
-        }
+    ) -> Result<LogUpInput<E>> {
+        ensure!(
+            !column_evals.is_empty(),
+            "No column evals were provided for Lookup input"
+        );
 
         // Unwrap is safe
         let first_evals_len = column_evals.first().unwrap().len();
 
-        if !first_evals_len.is_power_of_two() {
-            return Err(LogUpError::PolynomialError(format!(
-                "Need a power of two number of evaluations got: {first_evals_len}"
-            )));
-        }
+        ensure!(
+            first_evals_len.is_power_of_two(),
+            "Need a power of two number of evaluations got: {first_evals_len}"
+        );
 
         column_evals.iter().skip(1).try_for_each(|evals| {
             if evals.len() != first_evals_len {
-                Err(LogUpError::ParameterError(
-                    "All sets of evaluations should be the same length".to_string(),
-                ))
+                Err(anyhow!("All sets of evaluations should be the same length"))
             } else {
                 Ok(())
             }
         })?;
-
-        if multiplicities.len() != first_evals_len {
-            return Err(LogUpError::PolynomialError(format!(
-                "Multiplicities length was not equal to column evaluations length, multiplicities: {}, columns: {}",
-                multiplicities.len(),
-                first_evals_len
-            )));
-        }
+        ensure!(
+            multiplicities.len() == first_evals_len,
+            "Multiplicities length was not equal to column evaluations length, multiplicities: {}, columns: {}",
+            multiplicities.len(),
+            first_evals_len
+        );
 
         Ok(LogUpInput::Table {
             column_evals,
@@ -245,7 +236,7 @@ impl<E: ExtensionField> LogUpInput<E> {
         }
     }
 
-    pub fn make_circuits(&self) -> Vec<LogUpCircuit<E>> {
+    pub fn make_new_circuits(&self) -> Vec<LogUpCircuit<E>> {
         match self {
             LogUpInput::Lookup {
                 column_evals,
@@ -313,6 +304,251 @@ impl<E: ExtensionField> LogUpInput<E> {
 }
 
 #[derive(Clone, Debug, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+/// Information that is supplied by the verifier based on what they expect in order to verify a [`LogUpBatchProof`].
+pub struct LogUpVerifierInstance<E> {
+    /// The constant challenge used to combine columns.
+    constant_challenge: E,
+    /// The column separation challenge used to combine columns.
+    column_separation_challenge: E,
+    /// The number of columns in this instance.
+    num_columns: usize,
+    /// Whether this instance is a lookup or table instance.
+    instance_type: ProofType,
+    /// The number of variables in this instance.
+    num_vars: usize,
+}
+
+pub struct InstanceExpressions<E: ExtensionField> {
+    pub(crate) sumcheck_expression: Expression<E>,
+    pub(crate) claim_expression: Expression<E>,
+}
+
+impl<E: ExtensionField> LogUpVerifierInstance<E> {
+    /// Create a new instance of a [`LogUpVerifierInstance`].
+    pub fn new(
+        constant_challenge: E,
+        column_separation_challenge: E,
+        num_columns: usize,
+        instance_type: ProofType,
+        num_vars: usize,
+    ) -> LogUpVerifierInstance<E> {
+        LogUpVerifierInstance {
+            constant_challenge,
+            column_separation_challenge,
+            num_columns,
+            instance_type,
+            num_vars,
+        }
+    }
+
+    /// Getter for the constant challenge.
+    pub fn constant_challenge(&self) -> E {
+        self.constant_challenge
+    }
+    /// Getter for the column separation challenge.
+    pub fn column_separation_challenge(&self) -> E {
+        self.column_separation_challenge
+    }
+    /// Getter for the number of columns.
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+    /// Getter for the instance type.
+    pub fn instance_type(&self) -> ProofType {
+        self.instance_type
+    }
+    /// Getter for the number of variables.
+    pub fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    /// Get the number of evaluations needed in the final round for this instance.
+    pub fn num_final_round_evals(&self) -> usize {
+        match self.instance_type() {
+            ProofType::Lookup => 2 * self.num_columns(),
+            ProofType::Table => 2 * (1 + self.num_columns()),
+        }
+    }
+
+    /// Method that calculates the contribution of this instance to the final claim in the GKR circuit.
+    /// It returns the contribution to the claim along with the full evaluations of the polynomials at the final round.
+    pub fn final_claim(
+        &self,
+        final_round_evals: &[E],
+        batching_challenge: E,
+        sumcheck_point: &[E],
+    ) -> anyhow::Result<Vec<Claim<E>>> {
+        let point_length = sumcheck_point.len();
+        match self.instance_type() {
+            ProofType::Lookup => {
+                let (low_evals, high_evals) = final_round_evals.split_at(self.num_columns());
+                let output_claims = low_evals
+                    .iter()
+                    .zip(high_evals.iter())
+                    .map(|(&low, &high)| {
+                        let eval = batching_challenge * (high - low) + low;
+                        Claim::<E>::new(
+                            // self.num_vars() + 1 is subtracted because the final layer of the GKR circuit is over 1 fewer variable than the full column MLEs
+                            sumcheck_point[point_length - 1 - self.num_vars()..].to_vec(),
+                            eval,
+                        )
+                    })
+                    .collect::<Vec<Claim<E>>>();
+
+                Ok(output_claims)
+            }
+            ProofType::Table => {
+                let (multiplicity_evals, table_column_evals) = final_round_evals.split_at(2);
+
+                let (low_evals, high_evals) = table_column_evals.split_at(self.num_columns());
+                let multiplicity_claim = batching_challenge
+                    * (multiplicity_evals[1] - multiplicity_evals[0])
+                    + multiplicity_evals[0];
+                let output_claims = std::iter::once(multiplicity_claim)
+                    .chain(
+                        low_evals
+                            .iter()
+                            .zip(high_evals.iter())
+                            .map(|(&low, &high)| batching_challenge * (high - low) + low),
+                    )
+                    .map(|eval| {
+                        Claim::<E>::new(
+                            // self.num_vars() + 1 is subtracted because the final layer of the GKR circuit is over 1 fewer variable than the full column MLEs
+                            sumcheck_point[point_length - 1 - self.num_vars()..].to_vec(),
+                            eval,
+                        )
+                    })
+                    .collect::<Vec<Claim<E>>>();
+
+                Ok(output_claims)
+            }
+        }
+    }
+
+    pub fn instance_expressions(
+        &self,
+        layer_count: &mut usize,
+        initial_witness_id: &mut u16,
+        is_final_round: bool,
+    ) -> InstanceExpressions<E> {
+        // build the claim expression which is used to link to the previous layer to this one, common to all layer types
+        let claim_num_low_id = *layer_count as u16 * 4;
+        let claim_num_high_id = claim_num_low_id + 1;
+        let claim_denom_low_id = claim_num_high_id + 1;
+        let claim_denom_high_id = claim_denom_low_id + 1;
+        let claim_expression = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
+            * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                * (Expression::WitIn(claim_num_high_id) - Expression::WitIn(claim_num_low_id))
+                + Expression::WitIn(claim_num_low_id)
+                + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                    * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                        * (Expression::WitIn(claim_denom_high_id)
+                            - Expression::WitIn(claim_denom_low_id))
+                        + Expression::WitIn(claim_denom_low_id)));
+
+        if !is_final_round {
+            let num_low_id = *initial_witness_id;
+            let num_high_id = num_low_id + 1;
+            let denom_low_id = num_high_id + 1;
+            let denom_high_id = denom_low_id + 1;
+
+            // build the sumcheck expression which is used to prove this layer links to the next one
+            let sumcheck_expr = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
+                * (Expression::WitIn(num_low_id) * Expression::WitIn(denom_high_id)
+                    + Expression::WitIn(num_high_id) * Expression::WitIn(denom_low_id)
+                    + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                        * Expression::WitIn(denom_low_id)
+                        * Expression::WitIn(denom_high_id));
+            // Increment the layer count and witness id for the next call
+            *layer_count += 1;
+            *initial_witness_id += 4;
+            InstanceExpressions {
+                sumcheck_expression: sumcheck_expr,
+                claim_expression,
+            }
+        } else {
+            match self.instance_type() {
+                ProofType::Table => {
+                    let num_low_id = *initial_witness_id;
+                    let num_high_id = num_low_id + 1;
+                    // Now we make the denominator expressions
+                    let constant_expr =
+                        Expression::Constant(Either::Right(self.constant_challenge()));
+                    let (denom_low_expr, denom_high_expr, _) = (0..self.num_columns() as u16).fold(
+                        (constant_expr.clone(), constant_expr.clone(), E::ONE),
+                        |(acc_low, acc_high, chal_acc), i| {
+                            let chal_expr = Expression::Constant(Either::Right(chal_acc));
+                            (
+                                acc_low
+                                    + chal_expr.clone() * Expression::WitIn(num_high_id + 1 + i),
+                                acc_high
+                                    + chal_expr
+                                        * Expression::WitIn(
+                                            num_high_id + 1 + self.num_columns() as u16 + i,
+                                        ),
+                                chal_acc * self.column_separation_challenge(),
+                            )
+                        },
+                    );
+
+                    // build the sumcheck expression which is used to prove this layer links to the next one
+                    let sumcheck_expr = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
+                        * (Expression::WitIn(num_low_id) * denom_high_expr.clone()
+                            + Expression::WitIn(num_high_id) * denom_low_expr.clone()
+                            + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                                * denom_low_expr.clone()
+                                * denom_high_expr.clone());
+                    // Increment the layer count and witness id for the next call
+                    *layer_count += 1;
+                    *initial_witness_id += (2 * (1 + self.num_columns())) as u16;
+                    InstanceExpressions {
+                        sumcheck_expression: sumcheck_expr,
+                        claim_expression,
+                    }
+                }
+                ProofType::Lookup => {
+                    // Now we make the denominator expressions
+                    let constant_expr =
+                        Expression::Constant(Either::Right(self.constant_challenge()));
+                    let (denom_low_expr, denom_high_expr, _) = (0..self.num_columns() as u16).fold(
+                        (constant_expr.clone(), constant_expr.clone(), E::ONE),
+                        |(acc_low, acc_high, chal_acc), i| {
+                            let chal_expr = Expression::Constant(Either::Right(chal_acc));
+                            (
+                                acc_low
+                                    + chal_expr.clone()
+                                        * Expression::WitIn(*initial_witness_id + i),
+                                acc_high
+                                    + chal_expr
+                                        * Expression::WitIn(
+                                            *initial_witness_id + self.num_columns() as u16 + i,
+                                        ),
+                                chal_acc * self.column_separation_challenge(),
+                            )
+                        },
+                    );
+                    // The numerator is all -1 so we can use a constant expression
+
+                    // build the sumcheck expression which is used to prove this layer links to the next one
+                    let sumcheck_expr = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
+                        * (-denom_high_expr.clone() - denom_low_expr.clone()
+                            + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                                * denom_low_expr.clone()
+                                * denom_high_expr.clone());
+                    // Increment the layer count and witness id for the next call
+                    *layer_count += 1;
+                    *initial_witness_id += (2 * self.num_columns()) as u16;
+                    InstanceExpressions {
+                        sumcheck_expression: sumcheck_expr,
+                        claim_expression,
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProofType {
     Lookup,
     Table,
@@ -334,6 +570,8 @@ pub struct LogUpBatchProof<E: ExtensionField> {
     pub proof_type: ProofType,
     /// How many variables each instance is.
     pub num_vars_per_instance: Vec<usize>,
+    /// The number of denominator columns for each instance.
+    pub num_denominator_columns_per_instance: Vec<usize>,
 }
 
 impl<E: ExtensionField> LogUpBatchProof<E> {
@@ -380,42 +618,9 @@ impl<E: ExtensionField> LogUpBatchProof<E> {
     pub fn final_round_evals(&self) -> Vec<E> {
         self.round_evaluations.last().unwrap().clone()
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct LogUpVerifierClaim<E: ExtensionField> {
-    claims: Vec<Claim<E>>,
-    numerators: Vec<E>,
-    denominators: Vec<E>,
-}
-
-impl<E: ExtensionField> LogUpVerifierClaim<E> {
-    pub fn new(
-        claims: Vec<Claim<E>>,
-        numerators: Vec<E>,
-        denominators: Vec<E>,
-    ) -> LogUpVerifierClaim<E> {
-        LogUpVerifierClaim {
-            claims,
-            numerators,
-            denominators,
-        }
-    }
-
-    pub fn claims(&self) -> &[Claim<E>] {
-        &self.claims
-    }
-
-    pub fn numerators(&self) -> &[E] {
-        &self.numerators
-    }
-
-    pub fn denominators(&self) -> &[E] {
-        &self.denominators
-    }
 
     pub fn point(&self) -> &[E] {
-        &self.claims[0].point
+        self.output_claims[0].point()
     }
 }
 
@@ -423,14 +628,12 @@ impl<E: ExtensionField> LogUpVerifierClaim<E> {
 pub struct LogUpBatchVerifierClaim<E: ExtensionField> {
     /// This is the final claim returned by the GKR circuit
     claim: E,
+    /// The output claims about the individual polynomials
+    output_claims: Vec<Claim<E>>,
     /// The full point for the final claims
     point: Vec<E>,
     /// All poly evaluations in order
     poly_evals: Vec<E>,
-    /// Final alpha challenge
-    alpha: E,
-    /// Final lambda challenge
-    lambda: E,
     numerators: Vec<E>,
     denominators: Vec<E>,
 }
@@ -438,19 +641,17 @@ pub struct LogUpBatchVerifierClaim<E: ExtensionField> {
 impl<E: ExtensionField> LogUpBatchVerifierClaim<E> {
     pub fn new(
         claim: E,
+        output_claims: Vec<Claim<E>>,
         point: Vec<E>,
         poly_evals: Vec<E>,
-        alpha: E,
-        lambda: E,
         numerators: Vec<E>,
         denominators: Vec<E>,
     ) -> LogUpBatchVerifierClaim<E> {
         LogUpBatchVerifierClaim {
             claim,
+            output_claims,
             point,
             poly_evals,
-            alpha,
-            lambda,
             numerators,
             denominators,
         }
@@ -472,12 +673,10 @@ impl<E: ExtensionField> LogUpBatchVerifierClaim<E> {
         self.claim
     }
 
-    pub fn alpha(&self) -> E {
-        self.alpha
+    pub fn output_claims(&self) -> &[Claim<E>] {
+        &self.output_claims
     }
-    pub fn lambda(&self) -> E {
-        self.lambda
-    }
+
     pub fn poly_evals(&self) -> &[E] {
         &self.poly_evals
     }

@@ -6,8 +6,8 @@ use crate::{
         Layer,
         transformer::{
             attention_mask::AttentionSpan,
+            normalisation::rmsnorm::RMSNorm,
             positional::{Positional, RopeLayout},
-            rmsnorm::RMSNorm,
         },
     },
     model::Model,

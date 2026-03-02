@@ -76,8 +76,8 @@ where
         // Check that the input shapes are compatible with the einsum equation
         self.mapping.check_shapes(shapes).with_context(|| {
             format!(
-                "Error occurred during shape checking of Einsum with equation {}",
-                self.equation
+                "Error occurred during shape checking of Einsum with equation {}, shapes: {:?}",
+                self.equation, shapes
             )
         })?;
 

@@ -1,10 +1,61 @@
 //! Code for evaluating a Softmax layer.
 
+use crate::lookup::operation::LookupOp;
+
 use super::*;
 
 impl Softmax<Element> {
+    pub(crate) fn evaluate_internal(
+        &self,
+        inputs: &[&WrappedTensor<Element>],
+    ) -> Result<LayerOut<Element>> {
+        // First we check that we have some quantisation info.
+        ensure!(
+            self.quant_info.is_some(),
+            "Could not evaluate quantised softmax because the operation has not been quantised"
+        );
+        // Check that we only have one input
+        ensure!(
+            inputs.len() == 1,
+            "Expected a single input to quantised softmax, got: {}",
+            inputs.len()
+        );
+
+        // Since we have checked that quant info exists this unwrap is safe
+        let quant_info = self.quant_info().ok_or(anyhow!(
+            "Attempted to evaluate quantised Softmax with no QuantisedSoftmaxData present"
+        ))?;
+
+        // Reduce the input to its unpadded shape if necessary
+        let input = if inputs[0].is_padded() {
+            inputs[0].clone().reduce_to_unpadded_shape()?
+        } else {
+            inputs[0].clone()
+        };
+
+        let shift_tensor = self.calculate_shift_data(&input)?;
+        let input = input
+            .mul_scalar(quant_info.fixed_point_multiplier())
+            .sub(shift_tensor.clone())?;
+        let output_tensor = quant_info.apply(input, &quant_info.lut)?;
+
+        if inputs[0].is_padded() {
+            Ok(LayerOut {
+                outputs: vec![output_tensor.pad_next_power_of_two()],
+                proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
+                tracked_layer_data: Default::default(),
+            })
+        } else {
+            Ok(LayerOut {
+                outputs: vec![output_tensor],
+                proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
+                tracked_layer_data: Default::default(),
+            })
+        }
+    }
+
     /// Method that given a quantised input [`Tensor`] calculates the `shift` we apply along each dim and returns the unpadded tensor as the result.
-    pub(crate) fn calculate_shift_data_new(
+    pub(crate) fn calculate_shift_data(
         &self,
         input: &WrappedTensor<Element>,
     ) -> Result<WrappedTensor<Element>> {
@@ -21,13 +72,16 @@ impl Softmax<Element> {
                 return shift_cache.get_cached();
             }
         }
-        let QuantisedSoftmaxData {
-            input_scaling_factor,
-            temperature,
-            ..
-        } = self.quant_info().ok_or(anyhow!("Attempted to calculate shift data for quantised Softmax with no QuantisedSoftmaxData present"))?;
-        // Unwrap is safe here because previous line would have errored if quant_info was None
-        let negative_infinity = self.quant_info().unwrap().quantised_negative_infinity();
+
+        // Get the quant info
+        let quant_info = self.quant_info().ok_or(anyhow!(
+            "Could not calculate quantised softmax shift data as there was no quantisation data"
+        ))?;
+        let input_scaling_factor = quant_info.input_scaling_factor;
+        let temperature = quant_info.temperature;
+        let lut = quant_info.lut;
+
+        let negative_infinity = quant_info.quantised_negative_infinity();
 
         let scalar = input_scaling_factor.scale() / temperature;
         let input_mask = match input.rank() {
@@ -57,92 +111,61 @@ impl Softmax<Element> {
             .sum_dim(-1)
             .log();
 
-        let quantising_scalar = temperature / input_scaling_factor.scale();
-        let shift_tensor = log_sum_exp
-            .mul_scalar(-quantising_scalar)
+        let min_table_float = 1.0f32 / (lut.input_scale_factor() * 2.0f32);
+        let rescaled_dim_maxes = match dim_maxes.rank() {
+            2 => {
+                let tensor_zeroes = Tensor::<Element>::zeros(dim_maxes.shape().into());
+                let zeroes = WrappedTensor::try_from(tensor_zeroes)?;
+                let mask_2d = log_sum_exp
+                    .clone()
+                    .abs()
+                    .lower_equal_elem::<2>(min_table_float)?;
+
+                let rounding_sub = zeroes.mask_fill(mask_2d, quant_info.rounding_constant())?;
+                dim_maxes
+                    .mul_scalar(quant_info.fixed_point_multiplier())
+                    .add(rounding_sub)?
+            }
+            3 => {
+                let tensor_zeroes = Tensor::<Element>::zeros(dim_maxes.shape().into());
+                let zeroes = WrappedTensor::try_from(tensor_zeroes)?;
+                let mask_3d = log_sum_exp
+                    .clone()
+                    .abs()
+                    .lower_equal_elem::<3>(min_table_float)?;
+
+                let rounding_sub = zeroes.mask_fill_3d(mask_3d, quant_info.rounding_constant())?;
+                dim_maxes
+                    .mul_scalar(quant_info.fixed_point_multiplier())
+                    .add(rounding_sub)?
+            }
+            4 => {
+                let tensor_zeroes = Tensor::<Element>::zeros(dim_maxes.shape().into());
+                let zeroes = WrappedTensor::try_from(tensor_zeroes)?;
+                let mask_4d = log_sum_exp
+                    .clone()
+                    .abs()
+                    .lower_equal_elem::<4>(min_table_float)?;
+
+                let rounding_sub = zeroes.mask_fill_4d(mask_4d, quant_info.rounding_constant())?;
+                dim_maxes
+                    .mul_scalar(quant_info.fixed_point_multiplier())
+                    .add(rounding_sub)?
+            }
+            unsupported_rank => bail!("Unsupported input rank: {unsupported_rank}"),
+        };
+
+        let rescaled_log_sum_exp = log_sum_exp.mul_scalar(lut.input_scale_factor());
+
+        let shift_tensor = rescaled_log_sum_exp
+            .mul_scalar((1u64 << quant_info.right_shift()) as f32)
             .round()
             .int()
-            .sub(dim_maxes)?;
+            .add(rescaled_dim_maxes)?;
 
         let mut cache = self.shift_cache.lock().unwrap();
         let _ = cache.concatenate(shift_tensor.clone());
         Ok(shift_tensor)
-    }
-
-    pub(crate) fn evaluate_internal(
-        &self,
-        inputs: &[&WrappedTensor<Element>],
-    ) -> Result<LayerOut<Element>> {
-        // First we check that we have some quantisation info.
-        ensure!(
-            self.quant_info.is_some(),
-            "Could not evaluate quantised softmax because the operation has not been quantised"
-        );
-        // Check that we only have one input
-        ensure!(
-            inputs.len() == 1,
-            "Expected a single input to quantised softmax, got: {}",
-            inputs.len()
-        );
-
-        // Since we have checked that quant info exists this unwrap is safe
-        let QuantisedSoftmaxData {
-            lut,
-            right_shift,
-            fixed_point_multiplier,
-            ..
-        } = self.quant_info().unwrap();
-        let rounding: Element = 1 << (*right_shift - 1);
-
-        // Reduce the input to its unpadded shape if necessary
-        let maybe_padded_input = inputs[0].clone();
-        let shape = maybe_padded_input.shape();
-        let unpadded_shape = maybe_padded_input.unpadded_shape();
-        let padded = shape.as_slice() != unpadded_shape.as_slice();
-        let input = if padded {
-            maybe_padded_input.reduce_to_unpadded_shape()?
-        } else {
-            maybe_padded_input
-        };
-        let shape = input.shape();
-        let shift_tensor = self.calculate_shift_data_new(&input)?;
-
-        let rescaled_input = input
-            .add(shift_tensor.clone())?
-            .mul_scalar(*fixed_point_multiplier)
-            .add_scalar(rounding)
-            .bitwise_right_shift_scalar(*right_shift as Element);
-
-        let rescaled_input_data: Vec<Element> = rescaled_input.to_data().to_vec().map_err(|e| {
-            anyhow!("Failed to convert rescaled_input to Vec<Element> in Softmax: {e:?}")
-        })?;
-        let output_data = rescaled_input_data
-            .into_iter()
-            .map(|intermediate| {
-                if intermediate <= -(1 << lut.table_bit_size()) {
-                    0
-                } else {
-                    lut.table_output(intermediate)
-                }
-            })
-            .collect::<Vec<Element>>();
-
-        let output_tensor =
-            WrappedTensor::<Element>::from_data(TensorData::new(output_data, shape))?;
-
-        if padded {
-            Ok(LayerOut {
-                outputs: vec![output_tensor.pad_next_power_of_two()],
-                proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
-                tracked_layer_data: Default::default(),
-            })
-        } else {
-            Ok(LayerOut {
-                outputs: vec![output_tensor],
-                proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
-                tracked_layer_data: Default::default(),
-            })
-        }
     }
 }
 
@@ -209,7 +232,7 @@ mod tests {
 
             // Build quantised Softmax using the same input scaling.
             let softmax = Softmax::<f32>::new(max_context)
-                .quantise(scaling, *quantization::BIT_LEN)
+                .quantise(scaling)
                 .unwrap();
             let neg_inf = softmax.quant_info().unwrap().quantised_negative_infinity();
             // Skip if any valid logit coincides with the sentinel.
@@ -217,7 +240,7 @@ mod tests {
 
             // Build the full [heads, n, n] causal matrix: upper triangle of each head's
             // [n, n] attention matrix set to neg_inf.  All heads share the same causal
-            // pattern, which is what the 3-D mask branch in calculate_shift_data_new
+            // pattern, which is what the 3-D mask branch in calculate_shift_data
             // assumes (it reads the mask from the first head only).
             let mask = BTensor::<Backend, 2, Bool>::tril_mask([n, n], 0, &Default::default());
             let wrapped_quant = WrappedTensor::try_from(quant_matrix).unwrap();
@@ -231,7 +254,7 @@ mod tests {
                 let row_tensor = full_row_tensor.slice_dim(2, 0..valid_len);
 
                 // Output has shape [heads, 1, 1] — one shift value per head.
-                let row_shift = softmax.calculate_shift_data_new(&row_tensor).unwrap();
+                let row_shift = softmax.calculate_shift_data(&row_tensor).unwrap();
                 let row_shift_val: Vec<Element> = row_shift.to_data().to_vec().unwrap();
 
                 all_row_shifts.push(row_shift_val);
@@ -240,7 +263,7 @@ mod tests {
 
             // Full-trace: process all heads and rows at once.
             // Output shift tensor has shape [heads, n, 1], laid out as heads*n elements.
-            let full_shifts = softmax.calculate_shift_data_new(&casual_tensor).unwrap();
+            let full_shifts = softmax.calculate_shift_data(&casual_tensor).unwrap();
             let full_shift_data: Vec<Element> = full_shifts.to_data().to_vec().unwrap();
 
             for (row, row_shift_val) in all_row_shifts.into_iter().enumerate() {

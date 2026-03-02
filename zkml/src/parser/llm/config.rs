@@ -22,6 +22,8 @@ pub struct LLMConfig {
     pub embedding_size: usize,
     /// Size of the attention layer matrices.
     pub hidden_size: usize,
+    /// The size of the rows in the feed forward network layers.
+    pub intermediate_size: usize,
     /// The number of "heads" that are used within each attention layer.
     pub num_heads: usize,
     /// The size of each head. Note it's not always equal to the hidden_size / num_heads.
@@ -103,6 +105,9 @@ impl LLMConfig {
         let hidden_size = l
             .metadata::<usize>(&l.hidden_size_key(model_name))
             .context("hidden_size_key not found")?;
+        let intermediate_size = l
+            .metadata::<usize>(&l.feed_forward_intermediate_size_key(model_name))
+            .context("feed_forward_intermediate_size_key not found")?;
         let num_heads = l
             .metadata::<usize>(&l.num_heads_key(model_name))
             .context("num_heads_key not found")?;
@@ -142,6 +147,7 @@ impl LLMConfig {
             model_name: model_name.to_string(),
             hidden_size,
             embedding_size,
+            intermediate_size,
             num_heads,
             head_size,
             context_length: if let Some(max_context) = max_context_length {
@@ -162,6 +168,7 @@ impl LLMConfig {
     ) -> anyhow::Result<Self> {
         let hidden_size = l.metadata_to_u32("hidden_dim")? as usize;
         let embedding_size = hidden_size;
+        let intermediate_size = 4 * hidden_size;
         let num_heads = l.metadata_to_u32("num_attention_heads")? as usize;
         let num_blocks = l.metadata_to_u32("num_hidden_layers")? as usize;
         let context_length = l.metadata_to_u32("max_seq_len")? as usize;
@@ -172,6 +179,7 @@ impl LLMConfig {
         Ok(Self {
             model_name: "gpt2".to_string(),
             embedding_size,
+            intermediate_size,
             hidden_size,
             num_heads,
             head_size: hidden_size / num_heads,

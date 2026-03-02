@@ -249,6 +249,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             bias_unpadded_shapes,
             caches,
             requantise,
+            name,
             ..
         } = einsum;
 
@@ -286,6 +287,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
 
         Ok(EinSum {
             equation,
+            name,
             mapping,
             evaluation_info,
             constant_tensors: padded_constant_tensors,
@@ -366,6 +368,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
 
         let EinSum::<Element> {
             equation,
+            name,
             mapping,
             evaluation_info,
             constant_tensors: _,
@@ -380,6 +383,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
         let constant_unpadded_shapes = vec![Some(matrix.unpadded_shape().clone())];
         Ok(EinSum {
             equation,
+            name,
             mapping,
             evaluation_info,
             constant_tensors: vec![Some(matrix)],

@@ -154,7 +154,7 @@ pub mod test {
 
     use crate::parser::{
         Load,
-        llm::{LLMConfig, LLMModel, models::gpt2::decoder::GPT2Decoder},
+        llm::{LLMConfig, LLMIR, models::gpt2::decoder::GPT2Decoder},
     };
     use std::path::PathBuf;
 
@@ -184,9 +184,9 @@ pub mod test {
         println!("loader keys: {:?}", loader.content.metadata.keys());
         let config = LLMConfig::from_json(&loader, None)?;
         println!("tiny gpt2 config: {config:?}");
-        let model = LLMModel::<GPT2Decoder>::from_loader(&loader, &config)?;
+        let model = LLMIR::<GPT2Decoder>::from_loader(&loader, &config)?;
         let init_user_shape = Shape::from(vec![1]);
-        let model = model.into_provable_model(init_user_shape)?;
+        let (model, _) = model.into_model(config, init_user_shape)?;
         let input = Tensor::new(Shape::from(vec![1]), vec![512.0])?;
         model.run_float(vec![input], &mut GenStore::default())?;
         Ok(())

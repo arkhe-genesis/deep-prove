@@ -4,6 +4,10 @@
 //! The main usage of a driver for now is to run the LLM forward loop until a specific token or
 //! the maximum context length is reached. It will also be used to prepend a system model correctly.
 
+use crate::{
+    parser::llm::{HFTokenizer, metadata::LLMMetadata},
+    quantization::{LLMInferenceObserver, llm_quant::FPTransformModel},
+};
 use std::{
     fmt::Display,
     ops::Deref,
@@ -16,7 +20,7 @@ use std::{
 };
 
 use crate::{
-    Element, IO, Proof, Prover, ProverContext, Shape, Tensor,
+    Element, IO, Proof, Prover, ProverContext, ScalingStrategy, Shape, Tensor,
     graph::executor::{Executor, SequentialExecutor},
     iop::{
         chunking::{ChunkingStrategy, DefaultChunkingStrategy},
@@ -32,7 +36,7 @@ use crate::{
     padding::PaddingMode,
     parser::{
         PipelineConfig, default_pipeline_config,
-        llm::{LLMConfig, Token, models::LLMModelLoader},
+        llm::{Token, models::LLMModelLoader},
         to_quantized,
     },
     quantization::{InferenceObserver, InferenceTracker, ModelMetadata, ToElement},
@@ -66,7 +70,7 @@ where
     PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
 {
     pub verifier_ctx: VerifierContext<E, PCS>,
-    pub config: LLMConfig,
+    pub md: LLMMetadata,
     pub max_context: Option<usize>,
 }
 
@@ -112,40 +116,22 @@ where
 /// The main struct responsible for generating the trace and the proof related
 /// to LLM proving. This requires a wrapper on top of the model to drive the
 /// auto regressive loop correctly.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(bound(serialize = "N: Serialize", deserialize = "N: DeserializeOwned"))]
 pub struct Driver<N>
 where
     N: TensorTypeParam,
 {
     pub model: Model<N>,
-    config: LLMConfig,
-    max_context: Option<usize>,
-    padding_mode: PaddingMode,
+    pub md: LLMMetadata,
+    pub(crate) max_context: Option<usize>,
+    pub(crate) padding_mode: PaddingMode,
 }
 
-impl<N> Driver<N>
-where
-    N: TensorTypeParam,
-{
-    /// Creates a new [Driver]
-    pub fn new(
-        model: Model<N>,
-        config: LLMConfig,
-        max_context: Option<usize>,
-        padding_mode: PaddingMode,
-    ) -> Self {
-        Self {
-            model,
-            config,
-            max_context,
-            padding_mode,
-        }
-    }
-
+impl<N: TensorTypeParam> Driver<N> {
     /// Returns the vocabulary size of the model
     pub fn vocab_size(&self) -> usize {
-        self.config.vocab_size
+        self.md.vocab_size()
     }
 }
 
@@ -170,10 +156,10 @@ impl Driver<f32> {
         if let Some(max_context) = max_context {
             model_type = model_type.with_max_context_length(max_context);
         }
-        let (model, config) = model_type.parse(data_format)?;
+        let (model, md) = model_type.parse(data_format)?;
         Ok(Self {
             model,
-            config,
+            md,
             max_context,
             padding_mode: PaddingMode::NoPadding,
         })
@@ -187,7 +173,7 @@ impl Driver<f32> {
         self,
         mut pipeline_config: Option<PipelineConfig<'a, InferenceObserver>>,
     ) -> anyhow::Result<(Driver<Element>, ModelMetadata)> {
-        let numel = self.max_context.unwrap_or(self.config.context_length);
+        let numel = self.max_context.unwrap_or(self.md.context_length());
         let n_inputs = 1;
         let representative_inputs = (0..n_inputs)
             .map(|_| {
@@ -216,8 +202,71 @@ impl Driver<f32> {
         Ok((
             Driver {
                 model: quantized_model,
-                config: self.config,
+                md: self.md,
                 max_context: self.max_context,
+                padding_mode: PaddingMode::Padding,
+            },
+            metadata,
+        ))
+    }
+
+    /// Quantizes and pads this model using a specific pipeline configuration.
+    ///
+    /// The result can be serialized and deserialized at will to serve
+    /// inference+proving for this model.
+    pub fn into_provable_llm_with_strategy<'a, S: ScalingStrategy>(
+        self,
+        mut pipeline_config: PipelineConfig<'a, S>,
+    ) -> anyhow::Result<(Driver<Element>, ModelMetadata)> {
+        let numel = self.max_context.unwrap_or(self.md.context_length());
+
+        if pipeline_config.input_shapes.is_none() {
+            pipeline_config = pipeline_config.with_input_shapes(vec![Shape::from(vec![numel])]);
+        }
+
+        let (mut quantized_model, metadata) = to_quantized(self.model, pipeline_config)?;
+        // just set to one because we run one token after another to derive the full trace.
+        quantized_model.input_shapes = vec![Shape::from(vec![1])];
+        Ok((
+            Driver {
+                model: quantized_model,
+                md: self.md,
+                max_context: self.max_context,
+                padding_mode: PaddingMode::Padding,
+            },
+            metadata,
+        ))
+    }
+
+    pub fn into_provable_llm_with_transform<M: FPTransformModel>(
+        self,
+        tokeniser: &HFTokenizer,
+    ) -> anyhow::Result<(Driver<Element>, ModelMetadata)> {
+        let max_context = self.max_context;
+        let md = self.md.clone();
+
+        let llm_inference_observer =
+            LLMInferenceObserver::new_with_tokeniser(tokeniser.clone(), self.md.clone(), None);
+
+        let representative_input_length = if let Some(length) = max_context {
+            length
+        } else {
+            llm_inference_observer.get_representative_input_length()
+        };
+
+        let pipeline_config = PipelineConfig::<LLMInferenceObserver>::new()
+            .with_input_shapes(vec![Shape::from(vec![representative_input_length])])
+            .with_strategy(llm_inference_observer);
+
+        let adapted_driver = M::adapt_model(self)?;
+        let (mut quantized_model, metadata) = to_quantized(adapted_driver.model, pipeline_config)?;
+        // just set to one because we run one token after another to derive the full trace.
+        quantized_model.input_shapes = vec![Shape::from(vec![1])];
+        Ok((
+            Driver {
+                model: quantized_model,
+                md,
+                max_context,
                 padding_mode: PaddingMode::Padding,
             },
             metadata,
@@ -240,7 +289,7 @@ where
     pub fn random_sequence(&self, len: usize) -> Vec<Token> {
         let mut rng = crate::rng_from_env_or_random();
         (0..len)
-            .map(|_| Token::from(rng.gen_range(0..self.config.vocab_size)))
+            .map(|_| Token::from(rng.gen_range(0..self.md.vocab_size())))
             .collect()
     }
 
@@ -251,7 +300,7 @@ where
     /// If the number of tokens exceeds the current configured `context_length`.
     pub fn tokens_to_tensor(&self, input: &[Token]) -> anyhow::Result<Tensor<N>> {
         ensure!(
-            input.len() < self.config.context_length,
+            input.len() < self.md.config.context_length - 1,
             "Input sequence length must be less than the context length",
         );
         let input_tokens = input
@@ -354,13 +403,13 @@ where
 
         // -1 because we at least want to generate ONE token
         ensure!(
-            num_input_tokens < self.config.context_length - 1,
+            num_input_tokens < self.md.context_length() - 1,
             "Input sequence length must be at least one fewer than the context length",
         );
 
-        let max_window = self.max_context.unwrap_or(self.config.context_length);
+        let max_window = self.max_context.unwrap_or(self.md.context_length());
         ensure!(
-            num_input_tokens < max_window,
+            num_input_tokens <= max_window,
             "max window {} is smaller than prompt token count {}",
             max_window,
             num_input_tokens,
@@ -368,7 +417,7 @@ where
 
         let is_valid_vocab = input_data
             .iter()
-            .all(|t| Number::to_usize(t) < self.config.vocab_size);
+            .all(|t| Number::to_usize(t) < self.md.vocab_size());
         ensure!(
             is_valid_vocab,
             "Input tokens must be less than the vocabulary size",
@@ -393,7 +442,7 @@ where
         // This thread waits for the results
         let (tx, rx) = mpsc::sync_channel::<WrappedTensor<N>>(10);
         let stop = Arc::new(AtomicBool::new(false));
-        let eos_token: N = self.config.eos_token.as_tensor_type_param();
+        let eos_token: N = self.md.config.eos_token.as_tensor_type_param();
         let handle = {
             let stop = Arc::clone(&stop);
             thread::spawn(move || -> anyhow::Result<Vec<N>> {
@@ -498,6 +547,66 @@ where
         // Use the passed store (worker's remote store) so TensorHandle data
         // is accessible during proving in distributed execution
         let trace = self.model.run(vec![tensor], store)?;
+        let argmax_id = self.md.argmax;
+        let vocab_size = self.md.vocab_size();
+        // If the number of input tokens is less than the max window size then
+        // check that the outputs are correctly shifted.
+        if num_input_tokens < max_window {
+            let output_data = trace.outputs()[0]
+                .tensor()
+                .context("Output tensor should have data")?
+                .data()
+                .to_vec();
+            let input_data = trace.inputs()[0]
+                .tensor()
+                .context("Input tensor should have data")?
+                .data()
+                .to_vec();
+            for i in num_input_tokens..full_sentence.len() {
+                if output_data[i - 1] != input_data[i] {
+                    let logits_input = trace
+                        .get_step(&argmax_id)
+                        .ok_or(anyhow!("No logits step present in trace"))?
+                        .inputs()[0]
+                        .tensor()?;
+                    let logits_shape = logits_input.shape();
+                    let current_row = logits_input.data()[(i - 1) * logits_shape.dim(-1)
+                        ..(i - 1) * logits_shape.dim(-1) + vocab_size]
+                        .to_vec();
+
+                    let value_chosen = crate::number::Number::to_usize(&output_data[i - 1]);
+                    let input_chosen = crate::number::Number::to_usize(&input_data[i]);
+                    let mut row_with_indices = current_row
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .collect::<Vec<(usize, N)>>();
+                    row_with_indices.sort_by(|a, b| b.1.cmp(&a.1));
+
+                    assert_eq!(
+                        current_row[value_chosen],
+                        current_row[input_chosen],
+                        "Logits output chosen {} value {}, input chosen {} value {}, logits row: {},first 10 sorted: {:?}, shape:{:?} input: {:?}, output: {:?}",
+                        value_chosen,
+                        current_row[value_chosen],
+                        input_chosen,
+                        current_row[input_chosen],
+                        i,
+                        &row_with_indices[..10],
+                        logits_shape,
+                        &input_data[num_input_tokens..],
+                        &output_data[num_input_tokens - 1..],
+                    );
+                }
+                assert_eq!(
+                    output_data[i - 1],
+                    input_data[i],
+                    "Failed for {i}, input: {:?}, output: {:?}",
+                    &input_data[num_input_tokens..],
+                    &output_data[num_input_tokens - 1..],
+                );
+            }
+        }
 
         for i in num_input_tokens..full_sentence.len() {
             debug_assert_eq!(
@@ -531,7 +640,7 @@ impl Driver<Element> {
     {
         // compute shapes for all possible input sequence lengths
         let max_input_shapes = vec![Shape::new(vec![
-            self.config.context_length.next_power_of_two(),
+            self.md.context_length().next_power_of_two(),
         ])];
         ensure!(
             max_input_shapes.len() == 1,
@@ -548,7 +657,7 @@ impl Driver<Element> {
             prover_ctx,
             LLMVerifierContext {
                 verifier_ctx,
-                config: self.config.clone(),
+                md: self.md.clone(),
                 max_context: self.max_context,
             },
         ))
@@ -572,7 +681,7 @@ impl Driver<Element> {
             prover_ctx,
             LLMVerifierContext {
                 verifier_ctx,
-                config: self.config.clone(),
+                md: self.md.clone(),
                 // The verifier should put itself the max context here
                 max_context: None,
             },
@@ -679,7 +788,7 @@ where
     {
         let span = info_span!(
             "zkml_llm_verify",
-            max_context = self.max_context.unwrap_or(self.config.context_length),
+            max_context = self.max_context.unwrap_or(self.md.config.context_length),
             input_tokens = inference_output.input.len(),
             output_tensors = inference_output.output.len()
         );
@@ -692,7 +801,7 @@ where
         // 0. check the size of the output
         let output = inference_output.output[0].clone();
         let padded_max_len = output.shape().numel();
-        let max_window = self.max_context.unwrap_or(self.config.context_length);
+        let max_window = self.max_context.unwrap_or(self.md.context_length());
 
         // in any case, the output needs to be less than the max context length
         ensure!(
@@ -700,7 +809,7 @@ where
             "output length is greater than the padded maximum context length"
         );
         // get the actual output length: could be either `max_window`, or when an eos token is found
-        let eos_token = self.config.eos_token;
+        let eos_token = self.md.config.eos_token;
         let eos_token_found = output
             .data()
             .iter()
@@ -769,6 +878,7 @@ mod test {
     use anyhow::Context;
     use ark_std::rand::Rng;
     use ff_ext::GoldilocksExt2;
+
     use tenstore::GenStore;
     use tracing::info;
 
@@ -898,7 +1008,7 @@ mod test {
         let gguf = RawGGUF::new(model_path.clone());
         let driver = Driver::load_from_model(Gemma3::new(), &gguf, Some(CONTEXT_SIZE))?;
 
-        println!("LLM DRIVER: config: {:?}", driver.config);
+        println!("LLM DRIVER: config: {:?}", driver.md.config);
 
         let mut store = GenStore::default();
         let sentence = "The sky is";
@@ -930,7 +1040,7 @@ mod test {
             Driver::load_from_model(Gemma3::new(), &gguf, Some(CONTEXT_SIZE))?
                 .into_provable_llm(None)?;
 
-        println!("LLM DRIVER: config: {:?}", driver.config);
+        println!("LLM DRIVER: config: {:?}", driver.md.config);
 
         let mut store = GenStore::default();
         let sentence = "The sky is";
@@ -984,7 +1094,7 @@ mod test {
             Ok((driver, prover_ctx, verifier_ctx))
         })?;
 
-        println!("LLM DRIVER: config: {:?}", driver.config);
+        println!("LLM DRIVER: config: {:?}", driver.md.config);
         // Generate the trace
         let mut store = GenStore::default();
         let sentence = "The sky is";

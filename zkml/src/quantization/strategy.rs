@@ -25,6 +25,9 @@ use tracing::{debug, info, warn};
 #[cfg(test)]
 use crate::model::SanityCheckRunner;
 
+pub mod llm;
+pub mod llm_tracker;
+
 /// Trait for quantizing a float-based model into a quantized model. The current implementation
 /// simply looks at the absolute maximum value of the model and uses that as the scaling factor
 /// to quantize the model, one scaling factor per layer.
@@ -109,8 +112,14 @@ impl ScalingStrategy for InferenceObserver {
         let unpadded_input_shapes = model.unpadded_input_shapes();
         let input_samples: Vec<Vec<Tensor<f32>>> = if self.input_samples.is_empty() {
             warn!("No representative inputs provided, generating random ones");
-            let inputs = unpadded_input_shapes.iter().map(Tensor::random).collect();
-            vec![inputs]
+            (0..10)
+                .map(|_| {
+                    unpadded_input_shapes
+                        .iter()
+                        .map(Tensor::random)
+                        .collect::<Vec<Tensor<f32>>>()
+                })
+                .collect::<Vec<Vec<Tensor<f32>>>>()
         } else {
             info!(
                 "Using the {} provided representative inputs to quantize model",
@@ -161,6 +170,7 @@ impl ScalingStrategy for InferenceObserver {
             let runner = SanityCheckRunner { inner: runner };
             let mut runner = HandleLifetimeRunner::new(runner, model.graph());
             model.run_with_runner(&mut runner, input_handles)?;
+            model.reset();
         }
 
         // Get the scaling factor of the input
@@ -256,8 +266,8 @@ impl InferenceTrackingAccumulator {
                 (p.quantile() as f32, q.quantile() as f32)
             }
             InferenceTrackingAccumulator::NSigmas(n, variance) => (
-                variance.mean() as f32 - n * variance.sample_variance() as f32,
-                variance.mean() as f32 + n * variance.sample_variance() as f32,
+                variance.mean() as f32 - n * variance.sample_variance().sqrt() as f32,
+                variance.mean() as f32 + n * variance.sample_variance().sqrt() as f32,
             ),
         }
     }
@@ -511,7 +521,14 @@ fn quantize_model<S: ScalingStrategy>(
                     );
                     Node::Input(i)
                 }
-                Node::Output(o) => Node::Output(o),
+                Node::Output(o) => {
+                    let sfs = incoming_feeds
+                        .iter()
+                        .map(|feed| md.get_output_layer_scaling(feed.source))
+                        .collect::<Result<Vec<_>>>()?;
+                    md.insert_layer_scalings(node_id, vec![], sfs);
+                    Node::Output(o)
+                }
             })
         })?;
     let mut model = Model::new_from_shapes(input_not_padded_shapes, input_shapes, quantized_graph);
@@ -535,6 +552,10 @@ fn quantize_model<S: ScalingStrategy>(
         model.graph().input_node_ids(),
         model.graph().output_node_ids(),
     )?;
-    info!("Quantized model with {} layers", model.graph().node_count());
+    info!(
+        "Quantized model with {} layers, output node ids: {:?}",
+        model.graph().node_count(),
+        model.graph().output_node_ids()
+    );
     Ok((model, md))
 }

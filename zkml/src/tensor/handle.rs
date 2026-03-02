@@ -10,7 +10,7 @@ use tenstore::{GenStore, GenericStore, StorageKey, StoreError};
 
 use crate::{
     Element, NextPowerOfTwo, ScalingFactor, Shape, Tensor,
-    quantization::Quantize,
+    quantization::{Dequantize, Quantize},
     tensor::{KeyedTensor, TensorTypeParam, WrappedTensor},
 };
 
@@ -259,7 +259,7 @@ where
                 shape,
                 unpadded_shape,
             }) => {
-                let guard = tensor.read().expect("Lock should not be poisioned");
+                let guard = tensor.read().expect("Lock should not be poisoned");
                 let wrapped_tensor = match guard.deref() {
                     Some(tensor) => Some(tensor.try_into()?),
                     None => None,
@@ -427,13 +427,11 @@ where
     pub(crate) fn dry(&self) {
         match self {
             TensorHandle::WrappedTensor(InnerWrappedTensor { wrapped_tensor, .. }) => {
-                let mut guard = wrapped_tensor
-                    .write()
-                    .expect("Lock should not be poisioned");
+                let mut guard = wrapped_tensor.write().expect("Lock should not be poisoned");
                 *guard = None;
             }
             TensorHandle::Tensor(InnerTensor { tensor, .. }) => {
-                let mut guard = tensor.write().expect("Lock should not be poisioned");
+                let mut guard = tensor.write().expect("Lock should not be poisoned");
                 *guard = None;
             }
         }
@@ -518,7 +516,7 @@ where
                 shape,
                 unpadded_shape,
             }) => {
-                let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
+                let guard = wrapped_tensor.read().expect("Lock should not be poisoned");
                 let wrapped_tensor = guard
                     .as_ref()
                     .map(|wrapped_tensor| wrapped_tensor.clone().pad_next_power_of_two());
@@ -528,7 +526,7 @@ where
                     store: store.clone(),
                     wrapped_tensor: Arc::new(RwLock::new(wrapped_tensor)),
                     shape: shape.next_power_of_two(),
-                    unpadded_shape: unpadded_shape.next_power_of_two(),
+                    unpadded_shape: unpadded_shape.clone(),
                 })
             }
             TensorHandle::Tensor(InnerTensor {
@@ -538,7 +536,7 @@ where
                 shape,
                 unpadded_shape,
             }) => {
-                let guard = tensor.read().expect("Lock should not be poisioned");
+                let guard = tensor.read().expect("Lock should not be poisoned");
                 let tensor = guard
                     .as_ref()
                     .map(|tensor| tensor.clone().pad_next_power_of_two());
@@ -548,7 +546,7 @@ where
                     store: store.clone(),
                     tensor: Arc::new(RwLock::new(tensor)),
                     shape: shape.next_power_of_two(),
-                    unpadded_shape: unpadded_shape.next_power_of_two(),
+                    unpadded_shape: unpadded_shape.clone(),
                 })
             }
         }
@@ -559,7 +557,7 @@ where
             TensorHandle::WrappedTensor(inner_wrapped_tensor) => Ok(inner_wrapped_tensor
                 .wrapped_tensor
                 .read()
-                .expect("Lock should not be posioned")
+                .expect("Lock should not be poisoned")
                 .clone()
                 .context("Wrapped tensor is dried")?
                 .max_abs()
@@ -567,7 +565,7 @@ where
             TensorHandle::Tensor(inner_tensor) => Ok(inner_tensor
                 .tensor
                 .read()
-                .expect("Lock should not be poisioned")
+                .expect("Lock should not be poisoned")
                 .as_ref()
                 .context("Tensor is dried")?
                 .max_abs()),
@@ -625,7 +623,7 @@ impl Quantize for TensorHandle<f32> {
                 shape,
                 unpadded_shape,
             }) => {
-                let guard = wrapped_tensor.read().expect("Lock should not be posioned");
+                let guard = wrapped_tensor.read().expect("Lock should not be poisoned");
                 let wrapped_tensor = guard
                     .as_ref()
                     .map(|wrapped_tensor| wrapped_tensor.quantize(scaling));
@@ -644,7 +642,7 @@ impl Quantize for TensorHandle<f32> {
                 shape,
                 unpadded_shape,
             }) => {
-                let guard = tensor.read().expect("Lock should not be posioned");
+                let guard = tensor.read().expect("Lock should not be poisoned");
                 let tensor = guard.as_ref().map(|tensor| tensor.quantize(scaling));
                 TensorHandle::Tensor(InnerTensor {
                     storage_key: storage_key.cast(),
@@ -670,7 +668,7 @@ impl Quantize for TensorHandle<Element> {
                 shape,
                 unpadded_shape,
             }) => {
-                let guard = wrapped_tensor.read().expect("Lock should not be posioned");
+                let guard = wrapped_tensor.read().expect("Lock should not be poisoned");
                 let wrapped_tensor = guard
                     .as_ref()
                     .map(|wrapped_tensor| wrapped_tensor.quantize(scaling));
@@ -689,8 +687,52 @@ impl Quantize for TensorHandle<Element> {
                 shape,
                 unpadded_shape,
             }) => {
-                let guard = tensor.read().expect("Lock should not be posioned");
+                let guard = tensor.read().expect("Lock should not be poisoned");
                 let tensor = guard.as_ref().map(|tensor| tensor.quantize(scaling));
+                TensorHandle::Tensor(InnerTensor {
+                    storage_key: storage_key.cast(),
+                    store: store.clone(),
+                    tensor: Arc::new(RwLock::new(tensor)),
+                    shape: shape.clone(),
+                    unpadded_shape: unpadded_shape.clone(),
+                })
+            }
+        }
+    }
+}
+
+impl Dequantize for TensorHandle<Element> {
+    type Output = TensorHandle<f32>;
+    fn dequantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        match self {
+            TensorHandle::WrappedTensor(InnerWrappedTensor {
+                storage_key,
+                store,
+                wrapped_tensor,
+                shape,
+                unpadded_shape,
+            }) => {
+                let guard = wrapped_tensor.read().expect("Lock should not be poisoned");
+                let wrapped_tensor = guard
+                    .as_ref()
+                    .map(|wrapped_tensor| wrapped_tensor.dequantize(scaling));
+                TensorHandle::WrappedTensor(InnerWrappedTensor {
+                    storage_key: storage_key.cast(),
+                    store: store.clone(),
+                    wrapped_tensor: Arc::new(RwLock::new(wrapped_tensor)),
+                    shape: shape.clone(),
+                    unpadded_shape: unpadded_shape.clone(),
+                })
+            }
+            TensorHandle::Tensor(InnerTensor {
+                storage_key,
+                store,
+                tensor,
+                shape,
+                unpadded_shape,
+            }) => {
+                let guard = tensor.read().expect("Lock should not be poisoned");
+                let tensor = guard.as_ref().map(|tensor| tensor.dequantize(scaling));
                 TensorHandle::Tensor(InnerTensor {
                     storage_key: storage_key.cast(),
                     store: store.clone(),
@@ -722,7 +764,7 @@ where
     fn try_from(value: TensorHandle<T>) -> anyhow::Result<Self> {
         match value {
             TensorHandle::WrappedTensor(InnerWrappedTensor { wrapped_tensor, .. }) => {
-                let guard = wrapped_tensor.read().expect("Lock should not be poisioned");
+                let guard = wrapped_tensor.read().expect("Lock should not be poisoned");
                 guard
                     .as_ref()
                     .map(Tensor::try_from)
@@ -731,7 +773,7 @@ where
             }
             TensorHandle::Tensor(InnerTensor { tensor, .. }) => tensor
                 .write()
-                .expect("Lock should not be poisioned")
+                .expect("Lock should not be poisoned")
                 .take()
                 .context("TensorHandle::Tensor is dry"),
         }
@@ -749,7 +791,7 @@ where
             TensorHandle::WrappedTensor(InnerWrappedTensor { wrapped_tensor, .. }) => {
                 wrapped_tensor
                     .read()
-                    .expect("Lock should not be poisioned")
+                    .expect("Lock should not be poisoned")
                     .as_ref()
                     .map(Tensor::try_from)
                     .context("TensorHandle::WrappedTensor is dry")
@@ -757,7 +799,7 @@ where
             }
             TensorHandle::Tensor(InnerTensor { tensor, .. }) => tensor
                 .read()
-                .expect("Lock should not be poisioned")
+                .expect("Lock should not be poisoned")
                 .clone()
                 .context("TensorHandle::Tensor is dry"),
         }
@@ -775,14 +817,14 @@ where
             TensorHandle::WrappedTensor(InnerWrappedTensor { wrapped_tensor, .. }) => {
                 wrapped_tensor
                     .read()
-                    .expect("Lock should not be poisioned")
+                    .expect("Lock should not be poisoned")
                     .as_ref()
                     .map(|wrapped_tensor| wrapped_tensor.get_data())
                     .context("TensorHandle::WrappedTensor is dry")
             }
             TensorHandle::Tensor(InnerTensor { tensor, .. }) => tensor
                 .read()
-                .expect("Lock should not be poisioned")
+                .expect("Lock should not be poisoned")
                 .as_ref()
                 .map(|tensor| tensor.data.clone())
                 .context("TensorHandle::Tensor is dry"),
@@ -804,7 +846,7 @@ where
                 ..
             }) => wrapped_tensor
                 .read()
-                .expect("Lock should not be poisioned")
+                .expect("Lock should not be poisoned")
                 .as_ref()
                 .map(|wrapped_tensor| {
                     let tensor = Tensor::try_from(wrapped_tensor)?;
@@ -818,7 +860,7 @@ where
                 ..
             }) => tensor
                 .read()
-                .expect("Lock should not be poisioned")
+                .expect("Lock should not be poisoned")
                 .as_ref()
                 .map(|tensor| Ok(KeyedTensor::new(storage_key.cast(), tensor.clone())))
                 .context("TensorHandle::Tensor is dry")

@@ -27,7 +27,7 @@ use serde_json as json;
 
 use crate::{
     Shape, Tensor,
-    layers::transformer::rmsnorm::RMSNorm,
+    layers::transformer::normalisation::rmsnorm::RMSNorm,
     parser::{ModelNameProvider, llm::LLMConfig},
     tensor::KeyedTensor,
 };

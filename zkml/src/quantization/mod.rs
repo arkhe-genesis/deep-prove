@@ -3,9 +3,10 @@ mod metadata;
 mod strategy;
 use derive_more::From;
 use ff_ext::{ExtensionField, SmallField};
+use multilinear_extensions::util::ceil_log2;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::LazyLock};
-use tracing::warn;
+use tracing::trace;
 
 use crate::{
     Element,
@@ -13,10 +14,14 @@ use crate::{
     tensor::{Tensor, TensorSlice, is_close},
     to_field,
 };
+
+pub mod llm_quant;
+
 pub use metadata::ModelMetadata;
 pub use strategy::{
     AbsoluteMax, InferenceObserver, InferenceTracker, InferenceTrackingMode, ScalingStrategy,
     ScalingStrategyKind,
+    llm::{LLMInferenceObserver, get_default_prompt},
 };
 
 // Get BIT_LEN from environment variable or use default value
@@ -24,7 +29,7 @@ pub static BIT_LEN: LazyLock<usize> = LazyLock::new(|| {
     env::var("ZKML_BIT_LEN")
         .ok()
         .and_then(|val| val.parse::<usize>().ok())
-        .unwrap_or(8) // Default value if env var is not set or invalid
+        .unwrap_or(12) // Default value if env var is not set or invalid
 });
 
 /// symmetric quantization range
@@ -39,7 +44,7 @@ pub const QUANTIZATION_RANGE: std::ops::RangeInclusive<f32> = MIN_FLOAT..=MAX_FL
 /// Symmetric quantization scaling
 /// go from float [-a;a] to int [-2^BIT_LEN;2^BIT_LEN]
 /// S = (a - (-a)) / (2^{BIT_LEN-1}- (-2^{BIT_LEN-1})) = 2a / 2^BIT_LEN
-#[derive(Debug, Clone, From, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, From, Copy, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct ScalingFactor {
     min: f32,
     max: f32,
@@ -115,6 +120,12 @@ impl ScalingFactor {
     pub fn domain(&self) -> (Element, Element) {
         self.quantized_domain
     }
+
+    pub fn bit_size(&self) -> usize {
+        let (min, max) = self.domain();
+        ceil_log2(max.abs().max(min.abs()) as usize)
+    }
+
     /// M = S1 * S2 / S3
     pub fn m(&self, s2: &Self, s3: &Self) -> f32 {
         self.scale() * s2.scale() / s3.scale()
@@ -132,7 +143,7 @@ impl ScalingFactor {
     pub fn quantize(&self, value: &f32) -> Element {
         let scaled = (*value / self.scale()).round_ties_even() as Element;
         if scaled < self.quantized_domain.0 || scaled > self.quantized_domain.1 {
-            warn!(
+            trace!(
                 "Quantized value {} from {} is out of range [{}, {}]",
                 scaled, value, self.quantized_domain.0, self.quantized_domain.1
             );
@@ -173,9 +184,26 @@ pub fn split_scale_into_multiplier(s: f32) -> (i32, f32) {
     (shift as i32, m)
 }
 
-pub fn bias_scaling_matmul(input: &ScalingFactor, model: &ScalingFactor) -> ScalingFactor {
-    let min_quantized = -(1 << (2 * (*BIT_LEN) - 1)) + 1;
-    let max_quantized = (1 << (2 * (*BIT_LEN) - 1)) - 1;
+/// Returns the scaling factors for the main tensor and for the bias tensor. These are the "model" scaling factors, or
+/// S2 in the formula S1 * S2 / S3.
+pub fn model_scaling_factor_from_tensor_and_bias(
+    input: &ScalingFactor,
+    main_max_abs: f32,
+    intermediate_bit_size: usize,
+) -> (ScalingFactor, ScalingFactor) {
+    let main_sf = ScalingFactor::from_absolute_max(main_max_abs, None);
+    let bias_sf = bias_scaling(input, &main_sf, intermediate_bit_size);
+
+    (main_sf, bias_sf)
+}
+
+pub fn bias_scaling(
+    input: &ScalingFactor,
+    model: &ScalingFactor,
+    intermediate_bit_size: usize,
+) -> ScalingFactor {
+    let min_quantized = -1 << intermediate_bit_size;
+    let max_quantized = (1 << intermediate_bit_size) - 1;
     ScalingFactor::from_scale(
         input.scale() * model.scale(),
         Some((min_quantized, max_quantized)),

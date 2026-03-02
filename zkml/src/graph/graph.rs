@@ -960,6 +960,12 @@ impl<N, I, O, W> Graph<N, I, O, W> {
             edges: new_edges,
         })
     }
+
+    pub fn successors(&self, node_id: NodeId) -> Vec<NodeId> {
+        self.neighbors(node_id, Direction::Outgoing)
+            .map(|(_, edge)| edge.target())
+            .collect()
+    }
 }
 
 impl<N, I, O, W> Graph<N, I, O, W>

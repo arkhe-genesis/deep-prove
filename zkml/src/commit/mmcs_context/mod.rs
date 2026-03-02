@@ -1,13 +1,17 @@
 //! Module containing the logic to commit to instance and witness polynomials for a model using a MMCS
 use crate::{
-    Claim, VectorTranscript, commit::compute_betas_eval, graph::NodeId, lookup::context::TableType,
+    Claim, VectorTranscript, commit::compute_betas_eval, graph::NodeId, lookup::table::Table,
     tensor::CommitmentId,
 };
 use anyhow::{Context, Result, anyhow};
 use either::Either;
 use ff_ext::ExtensionField;
 use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{Expression, mle::MultilinearExtension, util::transpose};
+use multilinear_extensions::{
+    Expression,
+    mle::{IntoMLE, MultilinearExtension},
+    util::transpose,
+};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -119,7 +123,7 @@ where
     pub fn new(
         witness_poly_size: usize,
         polys: HashMap<CommitmentId, MultilinearExtension<E>>,
-        lookup_ctx: &[&TableType],
+        lookup_ctx: &[&Table],
         max_node_id: NodeId,
     ) -> Result<GlobalCommitmentContext<E, PCS>> {
         // Find the maximum size so we can generate params
@@ -147,7 +151,7 @@ where
 
         // First we take all the model polys and sort them by the number of variables they have.
         // Then we do the same for any table commitments but here we set all of them to have `table_node_id`.
-        let table_commitments_check = lookup_ctx.iter().any(|tt| tt.has_committed_claims());
+        let table_commitments_check = lookup_ctx.iter().any(|table| table.commit_output_column());
         let (model_commitment, model_comms_map, dummy_model_claims) = if !polys.is_empty()
             || table_commitments_check
         {
@@ -155,10 +159,13 @@ where
             let (map, dummy_model_claims) = polys
                 .into_iter()
                 .map(|(poly_id, poly)| (poly.num_vars(), (poly_id, poly)))
-                .chain(lookup_ctx.iter().filter_map(|table_type| {
-                    table_type
-                        .committed_columns()
-                        .map(|mle| (mle.num_vars(), (table_poly_id(table_type.name()), mle)))
+                .chain(lookup_ctx.iter().filter_map(|table| {
+                    if table.commit_output_column() {
+                        let mle = table.committed_columns::<E>().into_mle();
+                        Some((mle.num_vars(), (table_poly_id(table.name()), mle)))
+                    } else {
+                        None
+                    }
                 }))
                 .fold(
                     (BTreeMap::new(), HashMap::new()),

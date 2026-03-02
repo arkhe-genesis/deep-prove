@@ -19,7 +19,8 @@ use zkml::{
         ModelLoader, ModelNameProvider,
         gguf::RawGGUF,
         llm::{
-            LLMConfig, LLMTokenizer, Token,
+            LLMTokenizer, Token,
+            metadata::LLMMetadata,
             models::{
                 gemma3::Gemma3,
                 gpt2::{GPT2, is_gpt2_model},
@@ -272,8 +273,8 @@ fn build_driver_from_names<DataFormat: Display>(
 where
     GPT2: TokenizerLoader<DataFormat>,
     Gemma3: TokenizerLoader<DataFormat>,
-    GPT2: ModelLoader<DataFormat, ModelConfig = LLMConfig>,
-    Gemma3: ModelLoader<DataFormat, ModelConfig = LLMConfig>,
+    GPT2: ModelLoader<DataFormat, Metadata = LLMMetadata>,
+    Gemma3: ModelLoader<DataFormat, Metadata = LLMMetadata>,
 {
     let loader = detect_llm(&model_names)?;
     match loader {

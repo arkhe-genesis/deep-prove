@@ -343,6 +343,11 @@ impl<R: Read + Seek + Send + 'static> TensorLoader<R> {
     pub fn sliding_window_key(&self, model_name: &str) -> String {
         format!("{model_name}.attention.sliding_window")
     }
+
+    /// Returns the intermediate size inside the feed-forward layer.
+    pub fn feed_forward_intermediate_size_key(&self, model_name: &str) -> String {
+        format!("{model_name}.feed_forward_length")
+    }
 }
 
 impl TensorLoader<BufReader<File>> {

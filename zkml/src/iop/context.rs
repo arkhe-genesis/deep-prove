@@ -7,7 +7,7 @@ use crate::{
         Layer, LayerCtx,
         provable::{OpInfo, ProveInfo},
     },
-    lookup::context::{LookupContext, TableType},
+    lookup::{context::LookupContext, table::Table},
     model::{Model, ModelCtx},
     tensor::CommitmentId,
     to_base,
@@ -96,7 +96,7 @@ impl Model<Element> {
 
         // TODO: refactor that management of polys
         let mut model_polys = HashMap::<CommitmentId, MultilinearExtension<E>>::new();
-        let mut tables = BTreeMap::<TableType, Vec<NodeId>>::new();
+        let mut tables = BTreeMap::<Table, Vec<NodeId>>::new();
         // The shape register is filled along the traversal of the graph.
         let mut shapes: HashMap<NodeOutput, Shape> = HashMap::new();
         debug!("Context : layer info generation ...");
@@ -115,11 +115,10 @@ impl Model<Element> {
                         .collect();
                     let layer_ctx =
                         compute_layer_ctx::<E>(&mut ctx_aux, &mut model_polys, id, layer)?;
-                    if let Some(lookup_ctx) = layer_ctx.lookup_context() {
-                        lookup_ctx
-                            .tables
-                            .iter()
-                            .for_each(|table_type| tables.entry(*table_type).or_default().push(id));
+                    if let Some(layer_tables) = layer_ctx.lookup_tables() {
+                        layer_tables
+                            .into_iter()
+                            .for_each(|table_type| tables.entry(table_type).or_default().push(id));
                     }
                     // NOTE: `ctx.last_output_shape` **will** have been modified
                     // by `compute_layer_ctx`, so these shapes are not the one
@@ -152,12 +151,12 @@ impl Model<Element> {
             })
         })?;
         // Check to see if we use a lookup table larger than any of the individual polynomials
-        tables.keys().for_each(|table_type| {
+        tables.keys().for_each(|table| {
             let inner_metrics = Metrics::new();
-            let multiplicity_vars = table_type.multiplicity_poly_vars();
+            let multiplicity_vars = table.table_bit_size();
             max_poly_len = max_poly_len.max(1 << multiplicity_vars);
             debug!(
-                "{} table type: {table_type:?}, max_poly_len: {max_poly_len}",
+                "{} table type: {table:?}, max_poly_len: {max_poly_len}",
                 inner_metrics.to_span()
             );
         });

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use anyhow::{Result, anyhow};
 use ceno_p3::field::FieldAlgebra;
 use either::Either;
 use ff_ext::ExtensionField;
@@ -16,13 +17,71 @@ use multilinear_extensions::{
 use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
 use transcript::Transcript;
 
-use crate::{Claim, commit::compute_betas_eval};
+use crate::{Claim, commit::compute_betas_eval, lookup::logup_gkr::circuit::MLEsAndExpressions};
 
 use super::{
-    circuit::{LogUpCircuit, construct_final_round_logup_expressions, construct_logup_expressions},
-    error::LogUpError,
+    circuit::LogUpCircuit,
     structs::{LogUpBatchProof, LogUpInput, ProofType},
 };
+
+struct PreppedLayerProvingInfo<'a, E: ExtensionField> {
+    witness_mles_flat: Vec<MultilinearExtension<'a, E>>,
+    eq_mles: Vec<MultilinearExtension<'a, E>>,
+    sumcheck_expressions: Vec<Expression<E>>,
+    claim_expression: Expression<E>,
+}
+
+impl<E: ExtensionField> PreppedLayerProvingInfo<'_, E> {
+    pub fn new() -> Self {
+        Self {
+            witness_mles_flat: vec![],
+            eq_mles: vec![],
+            sumcheck_expressions: vec![],
+            claim_expression: Expression::ZERO,
+        }
+    }
+
+    pub fn compute_current_claim(
+        &self,
+        wit_evals: &[E],
+        alpha: E,
+        lambda: E,
+        batching_challenge: E,
+    ) -> Result<E> {
+        let claim = eval_by_expr_with_instance(
+            &[],
+            wit_evals,
+            &[],
+            &[],
+            &[alpha, lambda, batching_challenge],
+            &self.claim_expression,
+        )
+        .right();
+        claim.ok_or(anyhow!(
+            "Couldn't compute current claim in LogUp proving: claim value was not in the extension field"
+        ))
+    }
+
+    pub fn full_sumcheck_expression(&self) -> Expression<E> {
+        let witness_offset = self.witness_mles_flat.len() as u16;
+        self.sumcheck_expressions
+            .iter()
+            .enumerate()
+            .fold(Expression::ZERO, |acc, (i, expr)| {
+                acc + expr.clone() * Expression::WitIn(witness_offset + i as u16)
+            })
+    }
+
+    pub fn either_mles(
+        &self,
+    ) -> Vec<Either<&'_ MultilinearExtension<'_, E>, &'_ mut MultilinearExtension<'_, E>>> {
+        self.witness_mles_flat
+            .iter()
+            .chain(self.eq_mles.iter())
+            .map(Either::Left)
+            .collect()
+    }
+}
 
 /// Function that proves multiple LogUp instances of the same type, regardless of size and table type.
 /// `input` - A list of [`LogUpInput`] that are all the same variant
@@ -34,13 +93,13 @@ use super::{
 /// To handle instances of differeing size we require that the values in `input` are ordered in a decreasing number of variables. Then
 /// the largest instances begin proving in the first round with smaller instances being "rolled in" at the correct point so that every instance
 /// finishes proving in the very last round.
-pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
+pub fn new_batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
     input: &[LogUpInput<E>],
     transcript: &mut T,
-) -> Result<LogUpBatchProof<E>, LogUpError> {
-    let first_input = input.first().ok_or(LogUpError::ParameterError(
-        "No inputs provided for LogUp".to_string(),
-    ))?;
+) -> Result<LogUpBatchProof<E>> {
+    let first_input = input
+        .first()
+        .ok_or(anyhow!("No inputs provided for LogUp"))?;
     let first_proof_type = match first_input {
         LogUpInput::Lookup { .. } => ProofType::Lookup,
         LogUpInput::Table { .. } => ProofType::Table,
@@ -57,16 +116,14 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
             if acc == f {
                 Ok(acc)
             } else {
-                Err(LogUpError::ParameterError(
-                    "Not all proof types matched".to_string(),
-                ))
+                Err(anyhow!("Not all proof types matched"))
             }
         })?;
 
     // Work out how many instances we are dealing with and make the individual circuits
     let circuits = input
         .iter()
-        .flat_map(|l| l.make_circuits())
+        .flat_map(|l| l.make_new_circuits())
         .collect::<Vec<LogUpCircuit<E>>>();
     let num_instances = circuits.len();
 
@@ -77,9 +134,7 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
             let first_vars = window[0].num_vars();
             let second_vars = window[1].num_vars();
             if first_vars < second_vars {
-                Err(LogUpError::ParameterError(
-                    "Circuits were not in decreasing size order".to_string(),
-                ))
+                Err(anyhow!("Circuits were not in decreasing size order"))
             } else {
                 total_layers = std::cmp::max(total_layers, first_vars);
                 Ok(())
@@ -99,11 +154,6 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
         .iter()
         .map(|c| (c.num_vars(), c.outputs()))
         .into_group_map();
-
-    // Build the expressions that will be used throughout, `sumcheck_layers_expr` is the `Expression` used in the sumcheck,
-    // `claim_layers_exprs` are the `Expression`s used to link the layers together.
-    let (sumcheck_layer_exprs, claim_layer_exprs) =
-        construct_logup_expressions(&unique_layer_size, &output_evals, total_layers);
 
     // Extract all the circuit outputs
     let circuit_outputs = circuits
@@ -157,111 +207,83 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
                 evals.to_vec()
             }
         } else {
-            let new_evals =
-                output_evals
-                    .get(&remaining_layers)
-                    .ok_or(LogUpError::ParameterError(
-                        "No previous evals and no evals for this number of variables".to_string(),
-                    ))?;
+            let new_evals = output_evals.get(&remaining_layers).ok_or(anyhow!(
+                "Proving failed: No previous evals and no evals for this number of variables"
+            ))?;
             new_evals.iter().flatten().copied().collect::<Vec<E>>()
         };
         // The Expressions are grouped by the size of the circuit they refer to, so we need to work out how many of the
         // circuits are running in this round, this is just all the entries of `unique_layer_size` that are larger than `remaining_layers`.
-        let num_expressions = unique_layer_size
-            .iter()
-            .filter_map(|&size| {
-                if size >= remaining_layers {
-                    Some(1)
-                } else {
-                    None
-                }
-            })
-            .sum::<usize>();
-        // Calculate the current claim
-        current_claim = claim_layer_exprs
-            .iter()
-            .take(num_expressions)
-            .map(|c_expr| {
-                eval_by_expr_with_instance(
-                    &[],
-                    &wit_evals,
-                    &[],
-                    &[],
-                    &[alpha, lambda, batching_challenge],
-                    c_expr,
-                )
-                .right()
-            })
-            .try_fold(E::ZERO, |acc, opt_eval| opt_eval.map(|inner| acc + inner))
-            .ok_or(LogUpError::ParameterError(
-                "Couldn't sum claim expressions".to_string(),
-            ))?;
-
-        // Append the current claim to the transcript
-        transcript.append_field_element_ext(&current_claim);
-
-        let sumcheck_exprs = &sumcheck_layer_exprs[..num_expressions];
 
         // Then add all the terms to the sumcheck virtual polynomial
         let num_threads = optimal_sumcheck_threads(current_layer_vars);
         // `current_vars_count` is used so that we can construct all the different sized EQ polynomials as the sumcheck prover
         // does not allow products to include MLEs with differeing numbers of variables.
-        let mut current_vars_counts = BTreeSet::<usize>::new();
-        let mles = unique_layer_size
-            .iter()
-            .rev()
-            .filter_map(|&size| {
+        let mut layer_count = 0usize;
+        let mut witness_offset = 0u16;
+        let point_length = sumcheck_point.len();
+        let proving_info = unique_layer_size.iter().rev().fold(
+            PreppedLayerProvingInfo::new(),
+            |mut acc, &size| {
                 if size >= remaining_layers {
+                    // This multiplier is needed to scale the claim expressions from each layer size correctly.
+                    // This is because smaller instances have fewer layers and so their claims need to be scaled
+                    // by 1 << (total_layers - size) to line up with the largest instances.
+                    let claim_expr_multiplier = Expression::Constant(Either::Right(
+                        E::from_canonical_u64(1 << (total_layers - size)),
+                    ));
                     let layer_iter = iters_by_var_count.get_mut(&size).unwrap();
-                    let polys_vec = layer_iter
-                        .iter_mut()
-                        .flat_map(|iter| {
-                            let layer = iter.next().unwrap();
-                            current_vars_counts.insert(layer.num_vars());
-                            layer.new_get_mles()
-                        })
-                        .collect::<Vec<MultilinearExtension<E>>>();
-                    Some(polys_vec)
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect::<Vec<MultilinearExtension<E>>>();
+                    let mut sumcheck_expr = Expression::ZERO;
+                    let mut current_var_count: usize = 0;
 
-        let either_mles = mles.iter().map(Either::Left).collect::<Vec<Either<_, _>>>();
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new_with_mles(
+                    layer_iter.iter_mut().for_each(|iter| {
+                        let layer = iter.next().unwrap();
+                        current_var_count = layer.num_vars();
+                        let mles_and_expressions =
+                            layer.layer_proving_info(layer_count, witness_offset);
+                        layer_count += 1;
+                        witness_offset += mles_and_expressions.num_witnesses();
+                        let MLEsAndExpressions {
+                            mles,
+                            sumcheck_expression,
+                            claim_expression,
+                        } = mles_and_expressions;
+                        // Append the MLEs to the proving info
+                        acc.witness_mles_flat.extend(mles);
+                        // Add this layer's sumcheck expression and claim expression
+                        sumcheck_expr = sumcheck_expr.clone() + sumcheck_expression;
+                        acc.claim_expression = acc.claim_expression.clone()
+                            + claim_expr_multiplier.clone() * claim_expression;
+                    });
+                    // Now compute the EQ polynomial for this layer size and add it to the proving info
+                    let eq_poly =
+                        compute_betas_eval(&sumcheck_point[point_length - current_var_count..])
+                            .into_mle();
+                    acc.eq_mles.push(eq_poly);
+                    acc.sumcheck_expressions.push(sumcheck_expr);
+                }
+                acc
+            },
+        );
+
+        // Calculate the current claim
+        current_claim =
+            proving_info.compute_current_claim(&wit_evals, alpha, lambda, batching_challenge)?;
+
+        // Append the current claim to the transcript
+        transcript.append_field_element_ext(&current_claim);
+
+        let either_mles = proving_info.either_mles();
+        let full_sumcheck_expr = proving_info.full_sumcheck_expression();
+        let expr_builder = VirtualPolynomialsBuilder::<E>::new_with_mles(
             num_threads,
             current_layer_vars,
             either_mles,
         );
-        let point_length = sumcheck_point.len();
-        let layer_eq_polys = current_vars_counts
-            .iter()
-            .rev()
-            .map(|&vars| compute_betas_eval(&sumcheck_point[point_length - vars..]).into_mle())
-            .collect::<Vec<MultilinearExtension<E>>>();
 
         // If we are proving lookups, rather than tables, and its the final round then we have to use a different sumcheck expression
-        let virtual_poly = if proof_type == ProofType::Lookup && current_layer_vars == total_layers
-        {
-            // If its the final layer and its a lookup proof then the expression changes
-            let sumcheck_exprs =
-                construct_final_round_logup_expressions(&unique_layer_size, &output_evals);
-            let layer_exprs = sumcheck_exprs
-                .iter()
-                .zip(layer_eq_polys.iter())
-                .map(|(sc, poly)| sc.clone() * expr_builder.lift(Either::Left(poly)))
-                .collect::<Vec<Expression<E>>>();
-            expr_builder.to_virtual_polys(&layer_exprs, &[alpha, lambda])
-        } else {
-            let layer_exprs = sumcheck_exprs
-                .iter()
-                .zip(layer_eq_polys.iter())
-                .map(|(sc, poly)| sc.clone() * expr_builder.lift(Either::Left(poly)))
-                .collect::<Vec<Expression<E>>>();
-            expr_builder.to_virtual_polys(&layer_exprs, &[alpha, lambda])
-        };
+        let virtual_poly = expr_builder
+            .to_virtual_polys(std::slice::from_ref(&full_sumcheck_expr), &[alpha, lambda]);
 
         let (proof, state) = IOPProverState::<E>::prove(virtual_poly, transcript);
 
@@ -269,7 +291,7 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
         sumcheck_point = state.collect_raw_challenges();
 
         // Extract all the evaluations apart from the EQ polys
-        let evals = state.get_mle_flatten_final_evaluations()[..mles.len()].to_vec();
+        let evals = state.get_mle_flatten_final_evaluations()[..witness_offset as usize].to_vec();
 
         // Squeeze the challenges to combine everything into a single sumcheck
         batching_challenge = transcript
@@ -297,19 +319,34 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
     // also the multiplicity polynomial in the table case. These will be used by the verifier to check the final sumcheck proofs claim.
     // Then each of these claims should be verified either by another layer proof or via commitment opening proof.
     let point_length = sumcheck_point.len();
-    let output_claims = input
-        .iter()
-        .flat_map(|li| {
-            li.base_mles()
-                .iter()
-                .map(|mle| {
-                    let num_vars = mle.num_vars();
-                    let eval = mle.evaluate(&sumcheck_point[point_length - num_vars..]);
-                    Claim::<E>::new(sumcheck_point[point_length - num_vars..].to_vec(), eval)
-                })
-                .collect::<Vec<Claim<E>>>()
-        })
-        .collect::<Vec<Claim<E>>>();
+    let mut skip = 0usize;
+    let final_round_eval_ref = round_evaluations.last().ok_or(anyhow!(
+        "Proving failed: No round evaluations found".to_string(),
+    ))?;
+    let (output_claims, num_denominator_columns_per_instance) =
+        circuits
+            .iter()
+            .try_fold((vec![], vec![]), |(mut acc, mut column_count), circuit| {
+                let first_layer = circuit
+                    .layers()
+                    .first()
+                    .ok_or(anyhow!("Proving failed: No layers in circuit"))?;
+                // We add one here because the final layer includes the output layer which has one more variable than the number of layers
+                let num_vars = circuit.num_vars() + 1;
+                let final_round_evals = first_layer.final_eval_count();
+                let circuit_final_evals = &final_round_eval_ref[skip..skip + final_round_evals];
+                skip += final_round_evals;
+                let evals =
+                    first_layer.combine_final_evals(circuit_final_evals, batching_challenge)?;
+                for eval in evals {
+                    acc.push(Claim::<E>::new(
+                        sumcheck_point[point_length - num_vars..].to_vec(),
+                        eval,
+                    ));
+                }
+                column_count.push(first_layer.denominator_column_count());
+                Result::<(Vec<Claim<E>>, Vec<usize>)>::Ok((acc, column_count))
+            })?;
 
     Ok(LogUpBatchProof::<E> {
         sumcheck_proofs,
@@ -321,5 +358,6 @@ pub fn batch_multiple_sizes_prove<E: ExtensionField, T: Transcript<E>>(
             .iter()
             .map(|c| c.num_vars())
             .collect::<Vec<usize>>(),
+        num_denominator_columns_per_instance,
     })
 }

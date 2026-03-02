@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use itertools::Itertools;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tenstore::GenStore;
@@ -15,6 +16,7 @@ use zkml::{
         llm::{
             HFTokenizer, Token,
             models::{
+                LLMModelLoader,
                 gemma3::Gemma3,
                 gpt2::{GPT2, is_gpt2_model},
             },
@@ -22,7 +24,7 @@ use zkml::{
         },
         safe::RawSafeTensors,
     },
-    quantization::Dequantize,
+    quantization::{Dequantize, llm_quant::FPTransformModel},
 };
 
 /// Section separator for debug output
@@ -42,14 +44,22 @@ struct Args {
     /// Number of tokens to generate autoregressively (0 = no generation, just return input logits)
     #[arg(short, long, default_value = "0")]
     num_tokens: usize,
+
+    /// Size of each sample to run, if provided with 0 will run a single sample over the whole input
+    #[arg(short, long, default_value = "0")]
+    sample_size: usize,
+
+    /// The (flat) tokens to use as input instead of text (overrides --text)
+    #[arg(long, value_delimiter = ',')]
+    tokens: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Serialize)]
 struct LogitsOutput {
     /// Logits from float mode inference [seq_len * vocab_size], row-major
-    logits_float: Vec<f32>,
+    logits_float: Vec<Vec<f32>>,
     /// Logits from integer/provable mode inference [seq_len_int * vocab_size], row-major
-    logits_int: Vec<f32>,
+    logits_int: Vec<Vec<f32>>,
     /// Sequence length (float mode)
     seq_len: usize,
     /// Sequence length (int mode, potentially padded)
@@ -65,15 +75,31 @@ struct LogitsData {
 }
 
 fn write_logits_to_json(
-    logits_float: &[f32],
-    logits_int: &[f32],
-    seq_len: usize,
-    seq_len_int: usize,
+    logits_float: &[LogitsData],
+    logits_int: &[LogitsData],
     vocab_size: usize,
 ) -> Result<()> {
+    let seq_len = logits_float
+        .first()
+        .context("No float logits data found")?
+        .seq_len;
+    let seq_len_int = logits_int
+        .first()
+        .context("No int logits data found")?
+        .seq_len;
+
+    let logits_float = logits_float
+        .iter()
+        .map(|ld| ld.data.clone())
+        .collect::<Vec<Vec<f32>>>();
+    let logits_int = logits_int
+        .iter()
+        .map(|ld| ld.data.clone())
+        .collect::<Vec<Vec<f32>>>();
+
     let output = LogitsOutput {
-        logits_float: logits_float.to_vec(),
-        logits_int: logits_int.to_vec(),
+        logits_float,
+        logits_int,
         seq_len,
         seq_len_int,
         vocab_size,
@@ -205,6 +231,169 @@ where
     })
 }
 
+fn run_multi_sample_generation<N, ExtractFn>(
+    driver: &Driver<N>,
+    tokenizer: &HFTokenizer,
+    token_samples: &[&[Token]],
+    mode_name: &str,
+    extract_fn: ExtractFn,
+) -> Result<Vec<LogitsData>>
+where
+    N: zkml::tensor::TensorTypeParam,
+    ExtractFn: Fn(&[N], zkml::graph::NodeId) -> Result<Vec<f32>>,
+    Layer<N>: Evaluate<N>,
+{
+    // First check all the tokens have the same length
+    let all_equal_len = token_samples.iter().map(|t| t.len()).all_equal();
+    anyhow::ensure!(
+        all_equal_len,
+        "All token sequences must have the same length to run multiple samples in mode {mode_name}"
+    );
+    let mut store = GenStore::default();
+
+    let mut logits_data = Vec::<LogitsData>::with_capacity(token_samples.len());
+    for tokens in token_samples {
+        let tensor_inputs = driver.tokens_to_tensor(tokens)?;
+        let trace: Trace<N> = driver.run_elements(tensor_inputs, &mut store)?;
+        let logits_step = extract_logits_from_trace(driver, &trace, &extract_fn)?;
+
+        let input_text = tokenizer.detokenize(tokens);
+        eprintln!("{} input: {}", mode_name, input_text);
+
+        let output_tokens = trace
+            .outputs()
+            .last()
+            .unwrap()
+            .tensor()
+            .unwrap()
+            .data()
+            .iter()
+            .skip(tokens.len())
+            .map(|t| Token::from(zkml::Number::to_usize(t)))
+            .collect::<Vec<_>>();
+        let output = tokenizer.detokenize(&output_tokens);
+        eprintln!("{} output: {}", mode_name, output);
+        logits_data.push(logits_step);
+    }
+
+    Ok(logits_data)
+}
+
+fn internal_generate_logits<M>(format: RawSafeTensors, args: &Args) -> Result<()>
+where
+    M: LLMModelLoader<RawSafeTensors>
+        + FPTransformModel
+        + TokenizerLoader<RawSafeTensors>
+        + Clone
+        + Default,
+{
+    let model_type = M::default();
+    let tokenizer = model_type.load_tokenizer(&format)?;
+    let user_tokens = if let Some(tokens) = &args.tokens {
+        eprintln!("Using provided tokens!");
+        tokens
+            .iter()
+            .map(|&t| Token::from(t))
+            .collect::<Vec<Token>>()
+    } else {
+        tokenizer.tokenize(&args.text)
+    };
+    eprintln!("First 10 tokens: {:?}", &user_tokens[..10]);
+    let max_context = if args.sample_size != 0 {
+        args.num_tokens + args.sample_size
+    } else {
+        args.num_tokens + user_tokens.len()
+    };
+    let driver =
+        Driver::load_from_model(model_type.clone(), &format, None)?.with_max_context(max_context);
+    if args.sample_size != 0 {
+        let chunked_tokens = user_tokens
+            .chunks_exact(args.sample_size + 1)
+            .map(|chunk| &chunk[..args.sample_size])
+            .collect::<Vec<&[Token]>>();
+        // Run float mode
+        eprintln!(
+            "\n{} Running Float Mode {}",
+            SECTION_SEPARATOR, SECTION_SEPARATOR
+        );
+        let logits_float = run_multi_sample_generation::<_, _>(
+            &driver,
+            &tokenizer,
+            &chunked_tokens,
+            "Float",
+            |data, _node_id| Ok(data.to_vec()),
+        )?;
+        // Reset cache and convert to provable mode
+        eprintln!(
+            "\n{} Running Integer/Provable Mode {}",
+            SECTION_SEPARATOR, SECTION_SEPARATOR
+        );
+        driver.model.reset();
+
+        let (driver_int, metadata) = driver.into_provable_llm_with_transform::<M>(&tokenizer)?;
+
+        // Run provable mode
+        let logits_int = run_multi_sample_generation::<_, _>(
+            &driver_int,
+            &tokenizer,
+            &chunked_tokens,
+            "Integer",
+            |data, node_id| {
+                let scaling_factors = metadata.layer_input_scaling_factor(node_id);
+                let scaling_factor = scaling_factors
+                    .first()
+                    .context("Failed to get scaling factor for logits layer")?;
+                Ok(data.dequantize(scaling_factor))
+            },
+        )?;
+
+        write_logits_to_json(&logits_float, &logits_int, driver_int.vocab_size())?;
+    } else {
+        let max_context = args.num_tokens + user_tokens.len();
+
+        // Run float mode
+        eprintln!(
+            "\n{} Running Float Mode {}",
+            SECTION_SEPARATOR, SECTION_SEPARATOR
+        );
+        let logits_float = run_generation::<_, _>(
+            &driver,
+            &tokenizer,
+            &user_tokens,
+            "Float",
+            |data, _node_id| Ok(data.to_vec()),
+        )?;
+        // Reset cache and convert to provable mode
+        eprintln!(
+            "\n{} Running Integer/Provable Mode {}",
+            SECTION_SEPARATOR, SECTION_SEPARATOR
+        );
+        driver.model.reset();
+
+        let (driver_int, metadata) = driver.into_provable_llm_with_transform::<M>(&tokenizer)?;
+
+        let driver_int = driver_int.with_max_context(max_context);
+
+        // Run provable mode
+        let logits_int = run_generation::<_, _>(
+            &driver_int,
+            &tokenizer,
+            &user_tokens,
+            "Integer",
+            |data, node_id| {
+                let scaling_factors = metadata.layer_input_scaling_factor(node_id);
+                let scaling_factor = scaling_factors
+                    .first()
+                    .context("Failed to get scaling factor for logits layer")?;
+                Ok(data.dequantize(scaling_factor))
+            },
+        )?;
+
+        write_logits_to_json(&[logits_float], &[logits_int], driver_int.vocab_size())?;
+    };
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -224,71 +413,13 @@ fn main() -> Result<()> {
 
     eprintln!("is_gpt2 {is_gpt2}");
 
-    // Load model, tokenizer, and tokenize input based on detected model type
-    let (driver, tokenizer, user_tokens): (Driver<f32>, HFTokenizer, _) = if is_gpt2 {
-        let gpt2 = GPT2::new();
-        let tokenizer = gpt2.load_tokenizer(&format)?;
-        let user_tokens = tokenizer.tokenize(&args.text);
-        let driver =
-            Driver::load_from_model(gpt2, &format, Some(args.num_tokens + user_tokens.len()))?;
-        (driver, tokenizer, user_tokens)
+    if is_gpt2 {
+        internal_generate_logits::<GPT2>(format, &args)?;
     } else if is_gemma3 {
-        let gemma3 = Gemma3::new();
-        let tokenizer = gemma3.load_tokenizer(&format)?;
-        let user_tokens = tokenizer.tokenize(&args.text);
-        let driver =
-            Driver::load_from_model(gemma3, &format, Some(args.num_tokens + user_tokens.len()))?;
-        (driver, tokenizer, user_tokens)
+        internal_generate_logits::<Gemma3>(format, &args)?;
     } else {
-        bail!(
-            "Unsupported model type. Detected names: {:?}. \
-            Supported models: GPT-2, Gemma3",
-            model_names
-        );
-    };
-
-    // Run float mode
-    eprintln!(
-        "\n{} Running Float Mode {}",
-        SECTION_SEPARATOR, SECTION_SEPARATOR
-    );
-    let logits_float = run_generation::<_, _>(
-        &driver,
-        &tokenizer,
-        &user_tokens,
-        "Float",
-        |data, _node_id| Ok(data.to_vec()),
-    )?;
-    // Reset cache and convert to provable mode
-    eprintln!(
-        "\n{} Running Integer/Provable Mode {}",
-        SECTION_SEPARATOR, SECTION_SEPARATOR
-    );
-    driver.model.reset();
-    let (driver_int, metadata) = driver.into_provable_llm(None)?;
-
-    // Run provable mode
-    let logits_int = run_generation::<_, _>(
-        &driver_int,
-        &tokenizer,
-        &user_tokens,
-        "Integer",
-        |data, node_id| {
-            let scaling_factors = metadata.layer_input_scaling_factor(node_id);
-            let scaling_factor = scaling_factors
-                .first()
-                .context("Failed to get scaling factor for logits layer")?;
-            Ok(data.dequantize(scaling_factor))
-        },
-    )?;
-
-    write_logits_to_json(
-        &logits_float.data,
-        &logits_int.data,
-        logits_float.seq_len,
-        logits_int.seq_len,
-        driver_int.vocab_size(),
-    )?;
+        bail!("Unsupported model type. Only GPT-2 and Gemma3 models are supported.");
+    }
 
     Ok(())
 }

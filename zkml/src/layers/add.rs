@@ -7,12 +7,14 @@ use crate::{
     },
     layers::{
         LayerCtx, LayerProof,
+        activation::lookup_data::ActivationLookupData,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
             VerifiableCtx,
         },
         requant::{FIXED_POINT_SCALE, Requant},
     },
+    lookup::table::Table,
     model::Step,
     padding::{PaddingMode, ShapeInfo},
     quantization::{self, ToField},
@@ -229,6 +231,7 @@ pub struct AddQuantInfo {
     right_multiplier: Element,
     right_shift: usize,
     intermediate_bit_size: usize,
+    pub(crate) output_scaling: ScalingFactor,
 }
 
 impl AddQuantInfo {
@@ -308,8 +311,11 @@ impl AddQuantInfo {
         // Now we need to make sure we can actually perform the requantisation, if not we sacrifice some accuracy to make it possible
         let max_multiplier = std::cmp::max(left_multiplier, right_multiplier);
         let max_mult_bit_size = ceil_log2(max_multiplier as usize);
+        let lhs_input_bit_size = left_scaling.bit_size();
+        let rhs_input_bit_size = right_scaling.bit_size();
+        let max_input_bit_size = std::cmp::max(lhs_input_bit_size, rhs_input_bit_size);
+        let mut total_bit_size = max_mult_bit_size + max_input_bit_size + 2; // +1 for the addition of left and right and an additional + 1 for the sign
 
-        let mut total_bit_size = max_mult_bit_size + *quantization::BIT_LEN + 1; // +1 for the addition of left and right
         while total_bit_size >= 63 {
             total_bit_size -= 1;
             final_right_shift -= 1;
@@ -322,6 +328,7 @@ impl AddQuantInfo {
             right_multiplier,
             right_shift: final_right_shift,
             intermediate_bit_size: total_bit_size,
+            output_scaling: *output_scaling,
         }
     }
     /// The value to scalar multiply the left input by
@@ -368,12 +375,31 @@ impl Add<f32> {
 /// Function used to instantiate a new [`Requant`] from the [`AddQuantInfo`] calculated during quantization of the Add layer.
 /// This [`Requant`] will perform just the right shift part of the fixed point multiplication.
 pub fn requant_from_add(add_quant_info: AddQuantInfo) -> Requant {
+    let output_bit_size = add_quant_info.output_scaling.bit_size() + 1;
+    // We work out how many value chunks for this requantisation operation here, it must be a multiple of the requantisation BIT_LEN
+    let value_chunks = output_bit_size / *quantization::BIT_LEN;
+
+    assert!(
+        output_bit_size.is_multiple_of(*quantization::BIT_LEN),
+        "Output bit size after requantisation must be a multiple of {}, got {}",
+        *quantization::BIT_LEN,
+        output_bit_size
+    );
+
+    let activation_lookup_data = ActivationLookupData::new(
+        add_quant_info.right_shift(),
+        1,
+        // We subtract FIXED_POINT_SCALE here because the ActivationLookupData will add this back on when calculating the max bit size
+        add_quant_info.intermediate_bit_size() - FIXED_POINT_SCALE,
+        0,
+        Table::new_requantise(),
+        false,
+        value_chunks,
+    );
     Requant {
-        right_shift: add_quant_info.right_shift(),
-        fixed_point_multiplier: 1,
-        fp_scale: 0,
-        multiplier: 1.0f32,
-        intermediate_bit_size: add_quant_info.intermediate_bit_size(),
+        output_scaling: add_quant_info.output_scaling,
+        table: Table::new_requantise(),
+        activation_lookup_data,
     }
 }
 
@@ -532,14 +558,15 @@ mod test {
         let add = Add::<f32>::new();
         let t1 = Tensor::<f32>::random(&vec![2, 2].into());
         let t2 = Tensor::<f32>::random(&vec![2, 2].into());
-        let s1 = ScalingFactor::from_tensor(&t1, None);
+        let domain: (Element, Element) = (*quantization::MIN, *quantization::MAX);
+        let s1 = ScalingFactor::from_tensor(&t1, Some(domain));
         let s2 = ScalingFactor::from_tensor(&t2, None);
         let qt1 = t1.quantize(&s1); // x1_q = round(x1 / s1)
         let qt2 = t2.quantize(&s2);
         let dequant_t1 = qt1.dequantize(&s1);
         let dequant_t2 = qt2.dequantize(&s2);
         let t3 = dequant_t1.add(&dequant_t2);
-        let s3 = ScalingFactor::from_tensor(&t3, None);
+        let s3 = ScalingFactor::from_tensor(&t3, Some(domain));
 
         let qadd = add.quantize(&[s1, s2], s3).unwrap().quantized_op;
         let qadd_result = qadd
@@ -548,6 +575,7 @@ mod test {
 
         let quant_info = qadd.quant_info.as_ref().unwrap();
 
+        let domain = quant_info.output_scaling.domain();
         let computed_result = Tensor::<f32>::new(
             qadd_result.outputs()[0].shape().to_vec().into(),
             qadd_result.outputs()[0]
@@ -556,10 +584,10 @@ mod test {
                 .map(|x| {
                     let unclamped = *x >> quant_info.right_shift();
 
-                    if unclamped >= *quantization::MAX {
-                        *quantization::MAX as f32 * s3.scale()
-                    } else if unclamped <= *quantization::MIN {
-                        *quantization::MIN as f32 * s3.scale()
+                    if unclamped >= domain.1 {
+                        domain.1 as f32 * s3.scale()
+                    } else if unclamped <= domain.0 {
+                        domain.0 as f32 * s3.scale()
                     } else {
                         unclamped as f32 * s3.scale()
                     }
@@ -623,6 +651,7 @@ mod test {
                 right_multiplier,
                 right_shift: 1,
                 intermediate_bit_size: 13,
+                output_scaling: ScalingFactor::default(),
             };
 
             let mut add = Add::<Element>::new();

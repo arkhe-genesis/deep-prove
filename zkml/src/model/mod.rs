@@ -6,11 +6,16 @@ use crate::{
     iop::prover::{ModelLayers, ModelLayersRef},
     layers::{
         Layer, NodeOut,
-        activation::ActivationHandle,
         convolution::ConvFFTHandle,
         provable::{Evaluate, OpInfo, ProvingHandle, TrackedDataId},
         requant::Requant,
-        transformer::{layernorm::LayerNormHandle, logits::ArgmaxHandle, softmax::SoftmaxHandle},
+        transformer::{
+            logits::ArgmaxHandle,
+            normalisation::{
+                layernorm::evaluate::LayerNormHandle, rmsnorm::evaluate::RMSNormHandle,
+            },
+            softmax::SoftmaxHandle,
+        },
     },
     padding::PaddingMode,
     quantization::InferenceTracker,
@@ -34,15 +39,15 @@ pub mod transform;
 pub use context::{ContextGraph, ModelCtx};
 pub use trace::{Step, Trace};
 
-type RunResult<N> = anyhow::Result<RunOutput<N>>;
+pub(crate) type RunResult<N> = anyhow::Result<RunOutput<N>>;
 
 pub struct RunOutput<N>
 where
     N: TensorTypeParam,
 {
-    outputs: Vec<TensorHandle<N>>,
-    proving_data: ProvingHandle,
-    tracked_data: HashMap<TrackedDataId, WrappedTensor<N>>,
+    pub(crate) outputs: Vec<TensorHandle<N>>,
+    pub(crate) proving_data: ProvingHandle,
+    pub(crate) tracked_data: HashMap<TrackedDataId, WrappedTensor<N>>,
 }
 
 /// Utility to convert model's input tensors to handles.
@@ -101,7 +106,7 @@ pub trait ToStorageKey<N> {
 
 /// Input data for a layer runner.
 #[derive(Debug)]
-struct RunInput<N>
+pub(crate) struct RunInput<N>
 where
     N: TensorTypeParam,
 {
@@ -311,10 +316,17 @@ where
                             }
                             ProvingHandle::LayerNorm(layer_norm_handle) => {
                                 ProvingHandle::LayerNorm(LayerNormHandle {
-                                    lookup_output: layer_norm_handle
-                                        .lookup_output
+                                    mean: layer_norm_handle.mean.tensor_variant()?,
+                                    std_dev: layer_norm_handle.std_dev.tensor_variant()?,
+                                    lookup_verifier: layer_norm_handle.lookup_verifier,
+                                })
+                            }
+                            ProvingHandle::RMSNorm(rms_norm_handle) => {
+                                ProvingHandle::RMSNorm(RMSNormHandle {
+                                    normalisation: rms_norm_handle
+                                        .normalisation
                                         .tensor_variant()?,
-                                    full_value: layer_norm_handle.full_value.tensor_variant()?,
+                                    lookup_verifier: rms_norm_handle.lookup_verifier,
                                 })
                             }
                             ProvingHandle::ArgMax(argmax_handle) => {
@@ -324,13 +336,6 @@ where
                                         .into_iter()
                                         .map(|handle| handle.tensor_variant())
                                         .collect::<Result<_, _>>()?,
-                                })
-                            }
-                            ProvingHandle::Activation(activation_handle) => {
-                                ProvingHandle::Activation(ActivationHandle {
-                                    activation_output: activation_handle
-                                        .activation_output
-                                        .tensor_variant()?,
                                 })
                             }
                             ProvingHandle::None => ProvingHandle::None,
@@ -591,16 +596,16 @@ where
                 self.send_element(&softmax_handle.shift_handle)?;
             }
             ProvingHandle::LayerNorm(layer_norm_handle) => {
-                self.send_element(&layer_norm_handle.lookup_output)?;
-                self.send_element(&layer_norm_handle.full_value)?;
+                self.send_element(&layer_norm_handle.mean)?;
+                self.send_element(&layer_norm_handle.std_dev)?;
+            }
+            ProvingHandle::RMSNorm(rms_norm_handle) => {
+                self.send_element(&rms_norm_handle.normalisation)?;
             }
             ProvingHandle::ArgMax(argmax_handle) => {
                 for handle in &argmax_handle.max_values {
                     self.send_element(handle)?;
                 }
-            }
-            ProvingHandle::Activation(activation_handle) => {
-                self.send_element(&activation_handle.activation_output)?;
             }
             ProvingHandle::None => (),
         };
@@ -810,10 +815,13 @@ where
                 ProvingHandle::Softmax(softmax_handle)
             }
             ProvingHandle::LayerNorm(mut layer_norm_handle) => {
-                layer_norm_handle.lookup_output =
-                    layer_norm_handle.lookup_output.into_dry_tensor()?;
-                layer_norm_handle.full_value = layer_norm_handle.full_value.into_dry_tensor()?;
+                layer_norm_handle.mean = layer_norm_handle.mean.into_dry_tensor()?;
+                layer_norm_handle.std_dev = layer_norm_handle.std_dev.into_dry_tensor()?;
                 ProvingHandle::LayerNorm(layer_norm_handle)
+            }
+            ProvingHandle::RMSNorm(mut rms_norm_handle) => {
+                rms_norm_handle.normalisation = rms_norm_handle.normalisation.into_dry_tensor()?;
+                ProvingHandle::RMSNorm(rms_norm_handle)
             }
             ProvingHandle::ArgMax(argmax_handle) => {
                 let mut new_handles = Vec::with_capacity(argmax_handle.max_values.len());
@@ -823,11 +831,6 @@ where
                 ProvingHandle::ArgMax(ArgmaxHandle {
                     max_values: new_handles,
                 })
-            }
-            ProvingHandle::Activation(mut activation_handle) => {
-                activation_handle.activation_output =
-                    activation_handle.activation_output.into_dry_tensor()?;
-                ProvingHandle::Activation(activation_handle)
             }
             ProvingHandle::None => ProvingHandle::None,
         };
@@ -1626,34 +1629,13 @@ impl<'a> From<&'a Model<Element>> for ModelLayers {
     }
 }
 
-/// Trait used to define an operation, or sequence of operations that can be added to a [`Model`].
-pub trait LayerInsertion {
-    /// Adds the layer to the provided model, connecting it to the previous node if provided.
-    /// Returns the [`NodeId`] of the last layer added.
-    fn add_to_model(
-        self,
-        model: &mut Model<f32>,
-        previous_node_id: Option<NodeId>,
-    ) -> anyhow::Result<NodeId>;
-}
-
-impl Model<f32> {
-    pub fn insert_layer<L: LayerInsertion>(
-        &mut self,
-        layer: L,
-        previous_node_id: Option<NodeId>,
-    ) -> anyhow::Result<NodeId> {
-        layer.add_to_model(self, previous_node_id)
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test {
     use std::ops::Deref;
 
     use super::Model;
     use crate::{
-        Element, Prover, ScalingFactor, ScalingStrategy, Shape,
+        Element, Prover, ScalingStrategy, Shape,
         graph::NodeOutput,
         init_test_logging, init_test_logging_default,
         layers::{
@@ -1664,14 +1646,13 @@ pub(crate) mod test {
             flatten::Flatten,
             pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
             provable::{OpInfo, evaluate_layer},
-            requant::Requant,
         },
         measure::{self, Measure},
         padding::{PaddingMode, pad_model},
         quantization::{InferenceObserver, Quantize},
         rng_from_env_or_random,
         tensor::{KeyedTensor, Tensor, TensorHandle, TensorTypeParam},
-        testing::{Pcs, random_vector},
+        testing::Pcs,
         verify,
     };
     use anyhow::{Ok, Result};
@@ -1979,7 +1960,6 @@ pub(crate) mod test {
     }
 
     type T = BasicTranscript<GoldilocksExt2>;
-    type N = Element;
 
     fn build_test_model<N: TensorTypeParam, const INPUT_SIZE: usize>() -> Model<N> {
         let input_shape: Shape = vec![INPUT_SIZE].into();
@@ -2028,15 +2008,20 @@ pub(crate) mod test {
     #[test]
     fn test_model_inference() {
         const INPUT_SIZE: usize = 45;
-        let model = build_test_model::<N, INPUT_SIZE>();
-        let input_shape = model.input_shapes()[0].clone();
+        let float_model = build_test_model::<f32, INPUT_SIZE>();
+        let input_shape = float_model.input_shapes()[0].clone();
+        let float_input = Tensor::<f32>::random(&input_shape);
+        let (model, input_tensor) = quantize_model(
+            float_model,
+            vec![float_input],
+            None,
+            &mut GenStore::default(),
+        )
+        .unwrap();
 
-        let input = random_vector(input_shape.iter().product());
-        let input_tensor = Tensor::new(input_shape, input).unwrap();
-        let trace = model
-            .run(vec![input_tensor], &mut Default::default())
-            .unwrap();
-        assert_eq!(trace.steps.len(), 3);
+        let trace = model.run(input_tensor, &mut Default::default()).unwrap();
+        // 5 steps: 2 dense layers, 1 relu layer, 2 requant layers
+        assert_eq!(trace.steps.len(), 5);
     }
 
     #[test]
@@ -2108,7 +2093,8 @@ pub(crate) mod test {
         float_inputs: Vec<Tensor<f32>>,
         store: &mut GenStore,
     ) -> anyhow::Result<Vec<TensorHandle<Element>>> {
-        let (quantized_model, quantized_inputs) = quantize_model(model, float_inputs, None, store)?;
+        let (quantized_model, quantized_inputs) =
+            quantize_model(model, float_inputs.clone(), Some(float_inputs), store)?;
         prove_quantized_model(quantized_model, quantized_inputs, store)
     }
 
@@ -2130,69 +2116,6 @@ pub(crate) mod test {
         const INPUT_SIZE: usize = 57;
         let model = build_test_model::<f32, INPUT_SIZE>();
         prove_model(model, &mut Default::default()).unwrap();
-    }
-
-    /// 2 relus connected. First relu receives two inputs and pass that to the second relu
-    /// This test checks that when inserting a requant layer in between, the inputs and output edges
-    /// are still correct.
-    /// Relu is easy since in inference, it can support many inputs.
-    /// Graph wise:
-    ///      A
-    ///     / \\  <-- double inputs for C
-    ///    B   C
-    /// should become:
-    ///       A
-    ///     /  \\
-    ///    R1  R2  <-- distinct requant layers !
-    ///    /    \\
-    ///   B      C
-    #[test]
-    fn test_model_insert_requant() {
-        init_test_logging_default();
-        const FIRST_INPUT_SIZE: usize = 27;
-        const SECOND_INPUT_SIZE: usize = 49;
-        let input_shapes = vec![
-            vec![FIRST_INPUT_SIZE].into(),
-            vec![SECOND_INPUT_SIZE].into(),
-        ];
-        let mut model =
-            Model::<Element>::new_from_input_shapes(input_shapes.clone(), PaddingMode::NoPadding);
-        let relu1 = model
-            .graph
-            .add_inner(Layer::Activation(Activation::new_relu()))
-            .unwrap();
-        model.connect_model_inputs([0, 1], relu1).unwrap();
-
-        // here we take the first two outputs of relu1
-        let relu2 = model
-            .graph
-            .add_inner(Layer::Activation(Activation::new_relu()))
-            .unwrap();
-        model.add_edge(relu1, relu2, vec![(0, 0), (1, 1)]).unwrap();
-        // here we only want to take the first output of relu1
-        let relu3 = model
-            .graph
-            .add_inner(Layer::Activation(Activation::new_relu()))
-            .unwrap();
-        model.add_edge(relu1, relu3, vec![(0, 0)]).unwrap();
-
-        let input_tensors = vec![
-            Tensor::random(&input_shapes[0]),
-            Tensor::random(&input_shapes[1]),
-        ];
-        let test_sf = ScalingFactor::from_scale(1.0, None);
-        // 2 requants, one for each outgoing output wire (one for relu2 and one for relu3)
-        let requants = vec![Requant::from_scaling_factors(test_sf, test_sf, test_sf, 10); 2];
-        let requants_ids = model.add_requant_layer(requants, relu1).unwrap();
-        assert_eq!(requants_ids.len(), 2);
-
-        let output_node_ids = (0..3)
-            .map(|i| model.graph.add_output(i).unwrap())
-            .collect::<Vec<_>>();
-        model.add_edge(relu2, output_node_ids[0], (0, 0)).unwrap();
-        model.add_edge(relu2, output_node_ids[1], (1, 0)).unwrap();
-        model.add_edge(relu3, output_node_ids[2], (0, 0)).unwrap();
-        model.run(input_tensors, &mut Default::default()).unwrap();
     }
 
     #[test]

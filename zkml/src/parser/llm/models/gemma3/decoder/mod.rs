@@ -1,18 +1,20 @@
 //! Gemma3 model decoder implementation.
 
+use std::marker::PhantomData;
+
 use crate::{
     graph::NodeId,
     layers::{
-        Layer,
-        activation::{ActivationLayer, GELU},
-        add::Add,
-        transformer::rmsnorm::RMSNorm,
+        Layer, activation::ActivationLayer, add::Add, transformer::normalisation::rmsnorm::RMSNorm,
     },
-    model::{LayerInsertion, Model},
+    model::Model,
     parser::{
-        Load,
+        LayerInsertion, Load,
         gguf::FileTensorLoader as GGUFLoader,
-        llm::{config::LLMStructure, transformer::feed_forward::FeedForwardNetwork},
+        llm::{
+            config::LLMStructure, metadata::TransformerMetadata,
+            transformer::feed_forward::FeedForwardNetwork,
+        },
         safe::{ConfigJSON, FileTensorLoader as SafeLoader},
     },
 };
@@ -33,11 +35,12 @@ pub struct Gemma3Decoder {
 }
 
 impl LayerInsertion for Gemma3Decoder {
+    type Metadata = TransformerMetadata;
     fn add_to_model(
         self,
         model: &mut Model<f32>,
         previous_node_id: Option<NodeId>,
-    ) -> Result<NodeId> {
+    ) -> Result<(NodeId, Self::Metadata)> {
         let Gemma3Decoder {
             input_rmsnorm,
             attention_mechanism,
@@ -50,7 +53,7 @@ impl LayerInsertion for Gemma3Decoder {
         let post_input_norm_id =
             model.add_consecutive_layer(Layer::RMSNorm(input_rmsnorm), previous_node_id)?;
 
-        let post_attention_id =
+        let (post_attention_id, attention_md) =
             attention_mechanism.add_to_model(model, Some(post_input_norm_id))?;
 
         let post_attention_norm_id = model.add_consecutive_layer(
@@ -71,7 +74,7 @@ impl LayerInsertion for Gemma3Decoder {
             .add_inner(Layer::RMSNorm(pre_ffn_rmsnorm))?;
         model.add_edge(add_id, pre_ffn_norm_id, (0, 0))?;
 
-        let post_ffn_id = feed_forward.add_to_model(model, Some(pre_ffn_norm_id))?;
+        let (post_ffn_id, ffn_md) = feed_forward.add_to_model(model, Some(pre_ffn_norm_id))?;
 
         let post_ffn_norm_id =
             model.add_consecutive_layer(Layer::RMSNorm(post_ffn_rmsnorm), Some(post_ffn_id))?;
@@ -79,7 +82,12 @@ impl LayerInsertion for Gemma3Decoder {
         let final_add_id = model.graph_mut().add_inner(Layer::Add(Add::new()))?;
         model.add_edge(add_id, final_add_id, (0, 0))?;
         model.add_edge(post_ffn_norm_id, final_add_id, (0, 1))?;
-        Ok(final_add_id)
+        let md = TransformerMetadata {
+            norm_id: post_input_norm_id,
+            transformer: attention_md,
+            ffn: ffn_md,
+        };
+        Ok((final_add_id, md))
     }
 }
 
@@ -145,7 +153,7 @@ impl Load<GGUFLoader> for Gemma3Decoder {
                 up_bias: None,
                 down,
                 down_bias: None,
-                activation: ActivationLayer::Gelu(GELU::new()),
+                activation: ActivationLayer::Gelu(None, PhantomData),
             }
         };
 
@@ -224,7 +232,7 @@ impl Load<SafeLoader> for Gemma3Decoder {
                 up_bias: None,
                 down,
                 down_bias: None,
-                activation: ActivationLayer::Gelu(GELU::new()),
+                activation: ActivationLayer::Gelu(None, PhantomData),
             }
         };
         let mut post_ffn_rmsnorm = RMSNorm::from_safe(

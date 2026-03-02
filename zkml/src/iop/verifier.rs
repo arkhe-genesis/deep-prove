@@ -6,6 +6,7 @@ use crate::{
         compute_claim,
         context::ShapeStep,
     },
+    lookup::logup_gkr::verifier::new_verify_logup_proof_multiple_sizes,
     measure,
 };
 
@@ -18,7 +19,7 @@ use crate::{
         LayerCtx, LayerProof,
         provable::{OpInfo, VerifiableCtx},
     },
-    lookup::{context::LookupContext, logup_gkr::verifier::verify_logup_proof_multiple_sizes},
+    lookup::context::LookupContext,
     tensor::{CommitmentId, Tensor},
 };
 use anyhow::{Context as _, anyhow, ensure};
@@ -73,6 +74,7 @@ where
     pub(crate) commit_verifier: CommitmentVerifier<E, PCS>,
     pub(crate) transcript: &'a mut T,
     pub(crate) challenge_storage: ChallengeStorage<E>,
+    pub(crate) numerators_and_denominators: HashMap<String, (E, E)>,
 }
 
 impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>
@@ -85,6 +87,7 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
             commit_verifier,
             transcript,
             challenge_storage: ChallengeStorage::<E>::default(),
+            numerators_and_denominators: HashMap::new(),
         }
     }
 
@@ -114,9 +117,6 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
         let lookup_ctx = chunk.chunk_lookup_ctx(&ctx.lookup);
 
         // Instantiate everything and append relevant info to the transcript
-        let mut numerators = Vec::<E>::new();
-        let mut denominators = Vec::<E>::new();
-
         // iterate over the step proofs in inference order
         for (node_id, _) in chunk.subgraph.forward_inners() {
             let layer_ctx = ctx
@@ -136,17 +136,10 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
                 .steps
                 .get(&node_id)
                 .ok_or(anyhow!("Proof for node {node_id} not found"))?;
-            if let Some((num, denom)) = node_proof.get_lookup_data() {
-                numerators.extend(num.into_iter());
-                denominators.extend(denom.into_iter());
-            }
             layer_ctx.write_proof_to_transcript(node_proof, self.transcript)?;
         }
 
         if let Some(table_proof) = &proof.table_proof {
-            let (nums, denoms) = table_proof.lookup.fractional_outputs();
-            numerators.extend(nums);
-            denominators.extend(denoms);
             table_proof.write_commitment(self.transcript)?;
         }
 
@@ -394,7 +387,26 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
         })?;
 
         // ===== Verify the lookup table proofs =====
+
         if let Some(proof) = &proof.table_proof {
+            let TableProof { lookup, .. } = proof;
+            let (proof_nums, proof_dens) = lookup.fractional_outputs();
+            itertools::izip!(lookup_ctx.iter(), proof_nums, proof_dens).try_for_each(
+                |(table, num, denom)| {
+                    ensure!(
+                        denom != E::ZERO,
+                        "Denominator was zero for lookup table {}",
+                        table.name()
+                    );
+                    let (table_num, table_denom) = self
+                        .numerators_and_denominators
+                        .entry(table.name())
+                        .or_insert((E::ZERO, E::ONE));
+                    *table_num = num * *table_denom + *table_num * denom;
+                    *table_denom *= denom;
+                    Ok(())
+                },
+            )?;
             verify_table::<_, _, _>(
                 proof,
                 &lookup_ctx,
@@ -411,22 +423,13 @@ impl<'a, E: ExtensionField, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>
             .verify(&ctx.commitment_ctx, proof.commit, self.transcript)?;
 
         // ===== Verify that the accumulated numerator is zero and accumulated denominator is non-zero =====
-        let num_len = numerators.len();
-        let (final_num, final_denom) = numerators.into_iter().zip(denominators).fold(
-            (E::ZERO, E::ONE),
-            |(acc_num, acc_denom), (num, denom)| {
-                (acc_num * denom + num * acc_denom, acc_denom * denom)
-            },
-        );
-
-        ensure!(
-            final_num == E::ZERO,
-            "Final numerator was non-zero, got: {final_num:?} - numerator.len(): {num_len}"
-        );
-        ensure!(
-            final_denom != E::ZERO,
-            "Final denominator was zero, lookup arguments are invalid"
-        );
+        for (table_name, (num, _)) in self.numerators_and_denominators.iter() {
+            // We don't have to check the denominator here because they are checked as they are added to the HashMap
+            ensure!(
+                *num == E::ZERO,
+                "Final numerator was non-zero for lookup table {table_name}, got: {num:?}",
+            );
+        }
 
         Ok(())
     }
@@ -577,19 +580,18 @@ where
         multiplicity_commit,
         lookup,
     } = proof;
-    let batch_claim = verify_logup_proof_multiple_sizes(lookup, t)?;
+    let instances = lookup_ctx.create_logup_verifier_instances(challenge_storage)?;
+    let batch_claim = new_verify_logup_proof_multiple_sizes(lookup, &instances, t)?;
 
     let poly_evals = batch_claim.poly_evals();
     let point = batch_claim.point();
     let point_len = point.len();
-    let alpha = batch_claim.alpha();
-    let lambda = batch_claim.lambda();
 
-    let (mult_claims, _, calc_claim, _) = lookup_ctx.iter().try_fold(
-        (vec![], 0, E::ZERO, E::ONE),
-        |(mut acc, skip, eval_acc, chal_acc), tt| {
+    let (mult_claims, _) = lookup_ctx
+        .iter()
+        .try_fold((vec![], 0), |(mut acc, skip), tt| {
             let take = tt.num_columns() + 1;
-            let nv = tt.multiplicity_poly_vars();
+            let nv = tt.table_bit_size();
             let evals = poly_evals
                 .iter()
                 .skip(skip)
@@ -597,12 +599,9 @@ where
                 .copied()
                 .collect::<Vec<E>>();
             let mult_eval = evals[0];
-            let current_point = point[point_len - nv..].to_vec();
-            let mut column_evals = tt.evaluate_table_columns(&current_point)?;
 
             acc.push((point[point_len - nv..].to_vec(), mult_eval));
-            if tt.has_committed_claims() {
-                column_evals.push(evals[take - 1]);
+            if tt.commit_output_column() {
                 witness_verifier.add_table_claim(
                     chunk_id.0.into(),
                     tt,
@@ -610,23 +609,8 @@ where
                 );
             }
 
-            let (constant_challenge, csc) = challenge_storage
-                .get_challenges_by_name(&tt.name())
-                .ok_or(anyhow!("No challenges for table type {}", tt.name()))?;
-            let column_eval = column_evals
-                .into_iter()
-                .fold((constant_challenge, E::ONE), |(acc, csc_acc), e| {
-                    (acc + csc_acc * e, csc_acc * csc)
-                })
-                .0;
-            Result::<(_, _, _, _), anyhow::Error>::Ok((
-                acc,
-                skip + take,
-                eval_acc + chal_acc * (mult_eval + lambda * column_eval),
-                chal_acc * alpha,
-            ))
-        },
-    )?;
+            Result::<(_, _), anyhow::Error>::Ok((acc, skip + take))
+        })?;
 
     let grouped = mult_claims
         .into_iter()
@@ -636,13 +620,6 @@ where
         .collect::<Vec<(Point<E>, Vec<E>)>>();
 
     witness_verifier.add_witness_claim(table_node_id, multiplicity_commit.clone(), grouped);
-
-    ensure!(
-        calc_claim == batch_claim.claim(),
-        "Table Proof was incorrect, calculated claim: {:?} was not equal to claim from LogUp proof {:?}",
-        calc_claim,
-        batch_claim.claim()
-    );
 
     Ok(())
 }

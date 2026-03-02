@@ -136,15 +136,6 @@ impl<T> Tensor<T> {
 
 impl<T> Tensor<T>
 where
-    T: Number,
-{
-    pub fn random(shape: &Shape) -> Self {
-        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
-    }
-}
-
-impl<T> Tensor<T>
-where
     T: std::ops::Add<Output = T> + Copy + Send + Sync,
 {
     /// Element-wise addition
@@ -428,17 +419,54 @@ where
     }
 }
 
-impl<T> Tensor<T>
-where
-    T: Number,
-{
+impl<T: Number> Tensor<T> {
     /// Instantiate a new tensor with `shape` initialised to `default`.
     pub(crate) fn zeros(shape: Shape) -> Self {
         Self::initialised(shape, T::zero())
     }
 
-    /// Find the maximum absolute value.
-    pub(crate) fn max_abs(&self) -> T {
+    /// Creates a new [Tensor] with `shape` initialised to `T::unit`.
+    ///
+    /// ```rust
+    /// # use zkml::{Tensor, Shape, Element};
+    /// let shape = Shape::new(vec![2, 2]);
+    /// let tensor = Tensor::<Element>::one(shape);
+    /// assert_eq!(tensor.data().as_slice(), [1, 1, 1, 1]);
+    /// ```
+    pub fn one(shape: Shape) -> Self {
+        Tensor {
+            data: vec![T::unit(); shape.numel()],
+            shape: shape.clone(),
+            unpadded_shape: shape,
+        }
+    }
+
+    /// Returns the largest value in the [Tensor].
+    ///
+    /// ```rust
+    /// # use zkml::{Tensor, Shape, Element};
+    /// let tensor = Tensor::<Element>::new(Shape::new(vec![4, 2]), vec![3, 1, 0, 11, 7, 11, 9, 2]).unwrap();
+    /// assert_eq!(tensor.max(), 11);
+    /// ```
+    pub fn max(&self) -> T {
+        self.data.par_iter().cloned().reduce(
+            || T::MIN,
+            |acc, value| match acc.compare(&value) {
+                std::cmp::Ordering::Less => value,
+                _ => acc,
+            },
+        )
+    }
+
+    /// Returns the the largest absolute element in the [Tensor].
+    ///
+    /// ```rust
+    /// # use zkml::{Tensor, Shape, Element};
+    /// let tensor = Tensor::<Element>::new(Shape::new(vec![7]), vec![3, 1, 0, -11, 7, 9,
+    /// 2]).unwrap();
+    /// assert_eq!(tensor.max_abs(), 11);
+    /// ```
+    pub fn max_abs(&self) -> T {
         self.data
             .par_iter()
             .cloned()
@@ -531,6 +559,52 @@ where
         stride: usize,
     ) -> Result<Tensor<T>> {
         convolution::conv2d(self, kernels, bias, stride)
+    }
+
+    /// Converts this [Tensor] to f32.
+    pub fn to_f32(&self) -> anyhow::Result<Tensor<f32>> {
+        Ok(Tensor {
+            data: self
+                .data
+                .iter()
+                .map(Number::to_f32)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
+        })
+    }
+
+    /// Creates a diagonal matrix of given size with the given value on the diagonal.
+    pub fn diagonal(size: usize, value: T) -> Tensor<T> {
+        let mut data = vec![T::default(); size * size];
+        for i in 0..size {
+            data[i * size + i] = value;
+        }
+        Tensor {
+            data,
+            shape: vec![size, size].into(),
+            unpadded_shape: vec![size, size].into(),
+        }
+    }
+
+    pub fn min_value(&self) -> T {
+        self.data.iter().fold(T::MAX, |min, x| min.cmp_min(x))
+    }
+
+    pub fn try_map<F: Fn(&T) -> anyhow::Result<T>>(&self, f: F) -> anyhow::Result<Self> {
+        Ok(Self {
+            data: self
+                .data
+                .iter()
+                .map(f)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
+        })
+    }
+
+    pub fn random(shape: &Shape) -> Self {
+        Self::random_seed(shape, Some(crate::seed_from_env_or_rng()))
     }
 
     /// Creates a random matrix with a given number of rows and cols.

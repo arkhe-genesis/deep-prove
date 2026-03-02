@@ -1,7 +1,7 @@
 use crate::{
     layers::{
         Layer,
-        transformer::{layernorm::LayerNorm, rmsnorm::RMSNorm},
+        transformer::normalisation::{layernorm::LayerNorm, rmsnorm::RMSNorm},
     },
     parser::{gguf, llm::LLMConfig, safe},
     tensor::TensorTypeParam,

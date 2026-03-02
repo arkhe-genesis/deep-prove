@@ -24,6 +24,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Generator, List, NamedTuple, Tuple
 
+
 # Disable tokenizers parallelism to avoid fork warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -32,7 +33,7 @@ import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2LMHeadModel
 from torchmetrics.text import Perplexity, ROUGEScore
 
 # Path configuration - script is in zkml/assets/scripts/accuracy_evaluation/
@@ -61,6 +62,8 @@ class EvaluationMetrics:
     cosine_similarity: float
     perplexity_baseline: float
     perplexity_test: float
+    perplexity_last_token_base_line: float
+    perplexity_last_token: float
     agreement: float
     rouge1_f1: float = 0.0  # ROUGE-1 F1 score (unigram overlap)
     rouge2_f1: float = 0.0  # ROUGE-2 F1 score (bigram overlap)
@@ -99,6 +102,8 @@ def compute_average_metrics(
         cosine_similarity=np.mean([m.cosine_similarity for m in metrics_list]),
         perplexity_baseline=np.mean([m.perplexity_baseline for m in metrics_list]),
         perplexity_test=np.mean([m.perplexity_test for m in metrics_list]),
+        perplexity_last_token=np.mean([m.perplexity_last_token for m in metrics_list]),
+        perplexity_last_token_base_line=np.mean([m.perplexity_last_token_base_line for m in metrics_list]),
         agreement=np.mean([m.agreement for m in metrics_list]),
         rouge1_f1=np.mean([m.rouge1_f1 for m in metrics_list]),
         rouge2_f1=np.mean([m.rouge2_f1 for m in metrics_list]),
@@ -109,6 +114,8 @@ def compute_average_metrics(
         cosine_similarity=np.max([m.cosine_similarity for m in metrics_list]),
         perplexity_baseline=np.max([m.perplexity_baseline for m in metrics_list]),
         perplexity_test=np.max([m.perplexity_test for m in metrics_list]),
+        perplexity_last_token=np.max([m.perplexity_last_token for m in metrics_list]),
+        perplexity_last_token_base_line=np.max([m.perplexity_last_token_base_line for m in metrics_list]),
         agreement=np.max([m.agreement for m in metrics_list]),
         rouge1_f1=np.max([m.rouge1_f1 for m in metrics_list]),
         rouge2_f1=np.max([m.rouge2_f1 for m in metrics_list]),
@@ -205,12 +212,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of tokens to generate autoregressively (0 = no generation, just compare logits)",
     )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=1,
+        help="Number of samples to evaluate (only for single sample mode)",
+    )
     return parser.parse_args()
 
 
 def get_wikitext_sample(
     tokenizer: AutoTokenizer, max_tokens: int = 512
-) -> Tuple[str, List[int]]:
+) -> Tuple[str, List[int], int]:
     """Load a sample from WikiText-103 test set."""
     print("Loading WikiText-103 dataset...")
     dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
@@ -221,13 +234,44 @@ def get_wikitext_sample(
         if len(text) > MIN_SAMPLE_LENGTH:
             # Tokenize and truncate
             tokens = tokenizer.encode(text)
+            final_token = tokens[-1]
             if len(tokens) > max_tokens:
+                final_token = tokens[max_tokens]
                 tokens = tokens[:max_tokens]
             text = tokenizer.decode(tokens)
             print(f"✓ Loaded WikiText-103 sample ({len(tokens)} tokens)")
-            return text, tokens
+            return text, tokens, final_token
 
     raise ValueError("No suitable WikiText-103 sample found")
+
+def get_wikitext2_samples(tokenizer: AutoTokenizer, max_tokens: int = 512, max_docs=100) -> List[Tuple[str, List[int], int]]:
+    """Load samples from WikiText-2 test set."""
+    print("Loading WikiText-2 dataset...")
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+
+    samples = []
+    for doc in dataset["text"]:
+        full_text = tokenizer.eos_token + doc
+        tokens = tokenizer(full_text, return_tensors="pt").input_ids
+        print(f"tokens shape, no indexing: {tokens.shape}")
+        tokens = tokens[0].numpy()
+        print(f"tokens shape, after indexing: {tokens.shape}")
+        if len(tokens) < max_tokens:
+            continue
+        total_sequences = (len(tokens) - 1) // max_tokens
+        for start_idx in range(total_sequences):
+            input_ids = tokens[start_idx * max_tokens : (start_idx + 1) * max_tokens]
+            final_token = tokens[(start_idx + 1) * max_tokens]
+            text = tokenizer.decode(input_ids)
+            samples.append((text, input_ids.tolist(), final_token))
+            if len(samples) >= max_docs:
+               break
+        
+        if len(samples) >= max_docs:
+               break
+    
+    print(f"✓ Loaded {len(samples)} WikiText-2 samples")
+    return samples
 
 
 def get_wikitext_full_test(
@@ -286,9 +330,53 @@ def get_wikitext_full_test(
 
     yield from islice(window_generator(), windows_to_generate)
 
+# https://github.com/huggingface/notebooks/blob/main/examples/language_modeling.ipynb
+def group_texts(examples,block_size=128):
+    # Concatenate all texts.
+    concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+    total_length = len(concatenated_examples[list(examples.keys())[0]])
+    # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+    total_length = (total_length // block_size) * block_size
+    # Split by chunks of max_len.
+    result = {
+        k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+        for k, t in concatenated_examples.items()
+    }
+    result["labels"] = result["input_ids"].copy()
+    return result
+
+
+
+def load_wikitext(tokenizer, block_size=128):
+    print("Loading WikiText-2...")
+    data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    data = data.shuffle()
+    # data = test_data.shuffle()
+    max_tokens = sum([len(t) for t in data["text"]])
+    len_tokens = { }
+    for doc in data["text"]:
+        if len(doc) not in len_tokens:
+            len_tokens[len(doc)] = 0
+        len_tokens[len(doc)] += 1
+    
+    ordered_len_tokens = sorted(len_tokens.items(), key=lambda x: x[0],reverse=True)
+    print(f"Sizes: {ordered_len_tokens[:10]}")
+    data_len = len(data["text"])
+    print(f"Evaluation on {data_len} docs (max {max_tokens} tokens)")
+     # => sizes {ordered_len_tokens}")
+    
+    # tokenize everything 
+    tokenized_text = data.map(lambda x: tokenizer(x["text"]),batched=True,num_proc=4,remove_columns=["text"])
+    tokenized_text = tokenized_text.map(lambda x: group_texts(x,block_size), batched=True, batch_size=1000,num_proc=4)
+
+    tokenized_len = len(tokenized_text["input_ids"])
+    print(f"TOKENIZED TEXT -> number of chunks: {tokenized_len}")
+    return tokenized_text["input_ids"]
+
 
 def run_baseline_model(
-    model_name: str, text: str, tokenizer: AutoTokenizer, num_generate: int = 0
+    model_name: str, text: str, tokenizer: AutoTokenizer, num_generate: int = 0, tokens: torch.Tensor = None
 ) -> ModelOutput:
     """
     Run HuggingFace baseline model and return all logits.
@@ -308,8 +396,8 @@ def run_baseline_model(
     model = AutoModelForCausalLM.from_pretrained(model_name)
     model.eval()
 
-    input_ids = tokenizer.encode(text, return_tensors="pt")
-    print(f"Input tokens: {input_ids.shape[1]}")
+    input_ids = tokens if tokens is not None else tokenizer.encode(text, return_tensors="pt")
+    print(f"Input tokens: {input_ids.shape}")
 
     if num_generate > 0:
         print(f"Generating {num_generate} tokens autoregressively...")
@@ -356,11 +444,14 @@ def run_baseline_model(
         with torch.no_grad():
             outputs = model(input_ids)
             logits = outputs.logits  # Shape: [batch, seq_len, vocab_size]
-
+        logits_np = logits.cpu().numpy()
+        final_ids = input_ids
+        generated_text = tokenizer.decode(final_ids.flatten())
         # Remove batch dimension and convert to numpy
-        logits_np = logits.squeeze(0).cpu().numpy()  # Shape: [seq_len, vocab_size]
-        final_ids = input_ids.squeeze(0)
-        generated_text = tokenizer.decode(final_ids)
+        if input_ids.shape[0] == 1:
+            logits_np = logits.squeeze(0).cpu().numpy()  # Shape: [seq_len, vocab_size]
+            final_ids = input_ids.squeeze(0)
+            generated_text = tokenizer.decode(final_ids)
 
     print(f"Logits shape: {logits_np.shape}")
     print(
@@ -377,10 +468,11 @@ def run_baseline_model(
         generated_text=generated_text,
         generated_only_text=gen_only,
     )
+        
 
 
 def run_rust_model(
-    model_path: Path, text: str, num_generate: int = 0
+    model_path: Path, text: str, num_generate: int = 0, sample_size: int = 0
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run Rust ZKML model and load both float and int logits from stdout.
@@ -409,6 +501,9 @@ def run_rust_model(
 
     if num_generate > 0:
         cmd.append(f"--num-tokens={num_generate}")
+    
+    if sample_size > 0:
+        cmd.append(f"--sample-size={sample_size}")
 
     print(f"Executing: {' '.join(cmd)}")
     print(f"Working directory: {ZKML_ROOT}")
@@ -440,12 +535,12 @@ def run_rust_model(
         seq_len_int = output_data["seq_len_int"]
 
         # Reshape to their respective dimensions
-        logits_float = logits_float_flat.reshape(seq_len, vocab_size)
+        logits_float = logits_float_flat.reshape(logits_float_flat.shape[0], seq_len, vocab_size)
 
         # Integer mode may have padded BOTH seq_len and vocab_size
         # Calculate the actual padded vocab size from the array
-        padded_vocab_size = len(logits_int_flat) // seq_len_int
-        logits_int_padded = logits_int_flat.reshape(seq_len_int, padded_vocab_size)
+        padded_vocab_size = logits_int_flat.shape[1] // seq_len_int
+        logits_int_padded = logits_int_flat.reshape(logits_int_flat.shape[0], seq_len_int, padded_vocab_size)
 
         # Unpad int logits to match float/baseline shape
         # Int mode may have padded seq_len (e.g., 7 -> 8) and vocab_size (e.g., 50257 -> 65536)
@@ -453,7 +548,7 @@ def run_rust_model(
             print(
                 f"  Unpadding int mode from ({seq_len_int}, {padded_vocab_size}) to ({seq_len}, {vocab_size})"
             )
-            logits_int = logits_int_padded[:seq_len, :vocab_size]
+            logits_int = logits_int_padded[:, :seq_len, :vocab_size]
         else:
             logits_int = logits_int_padded
     except (json.JSONDecodeError, KeyError) as e:
@@ -519,6 +614,32 @@ def compute_generated_text_from_logits(
 
     return generated_text
 
+def compute_full_text_from_logits(
+    logits: np.ndarray,
+    tokenizer: AutoTokenizer,
+) -> str:
+    """
+    Compute generated text from logits using argmax.
+
+    Args:
+        logits: Logits array [seq_len, vocab_size] where logits[i] predicts token at position i+1
+        tokenizer: HuggingFace tokenizer
+        num_input_tokens: Number of input tokens (including BOS if present)
+        num_generated_tokens: Number of tokens that were generated
+
+    Returns:
+        Generated text (decoded from argmax of logits)
+    """
+    
+
+    # Get token IDs using argmax
+    generated_token_ids = np.argmax(logits, axis=1).tolist()
+
+    # Decode to text
+    generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=False)
+
+    return generated_text
+
 
 def has_invalid_values(arr: np.ndarray) -> bool:
     """Check if array contains NaN or Inf values."""
@@ -574,6 +695,31 @@ def compute_perplexity(logits: np.ndarray, target_ids: torch.Tensor) -> float:
     # We use logits[:-1] to predict targets[1:] (standard language modeling)
     # This skips the first position (no context) and the last logit (no target)
     perplexity = metric(logits_torch[:, :-1, :], target_ids_batch[:, 1:])
+
+    return perplexity.item()
+
+def compute_perplexity_last_token(logits: np.ndarray, target_id: int) -> float:
+    """
+    Compute perplexity given logits and target token IDs using torchmetrics.
+
+    Args:
+        logits: Logits array [seq_len, vocab_size]
+        target_ids: Target token IDs [seq_len]
+
+    Returns:
+        Perplexity value
+    """
+    # Convert to torch and add batch dimension
+    logits_torch = torch.from_numpy(logits).unsqueeze(0)  # [1, seq_len, vocab_size]
+    target_id_batch = torch.tensor([[target_id]])  # [1, 1]
+
+    # Initialize perplexity metric (no ignore_index needed - we have no padding)
+    metric = Perplexity()
+
+    # Compute perplexity
+    # We use logits[:-1] to predict targets[1:] (standard language modeling)
+    # This skips the first position (no context) and the last logit (no target)
+    perplexity = metric(logits_torch[:, -2:-1, :], target_id_batch[:, :])
 
     return perplexity.item()
 
@@ -633,6 +779,7 @@ def compute_all_metrics(
     baseline_logits: np.ndarray,
     rust_logits: np.ndarray,
     input_ids: torch.Tensor,
+    final_token: int = None,
     skip_first: bool = True,
     baseline_text: str = "",
     rust_text: str = "",
@@ -655,13 +802,16 @@ def compute_all_metrics(
     rouge1_f1, rouge2_f1, rougeL_f1 = 0.0, 0.0, 0.0
     if baseline_text and rust_text:
         rouge1_f1, rouge2_f1, rougeL_f1 = compute_rouge_scores(baseline_text, rust_text)
-
+    if final_token is None:
+        final_token = input_ids[-1].item()
     return EvaluationMetrics(
         cosine_similarity=compute_cosine_similarity(
             baseline_logits, rust_logits, skip_first
         ),
         perplexity_baseline=compute_perplexity(baseline_logits, input_ids),
         perplexity_test=compute_perplexity(rust_logits, input_ids),
+        perplexity_last_token_base_line=compute_perplexity_last_token(baseline_logits, final_token),
+        perplexity_last_token=compute_perplexity_last_token(rust_logits, final_token),
         agreement=compute_next_token_agreement(
             baseline_logits, rust_logits, skip_first
         ),
@@ -833,6 +983,8 @@ def print_evaluation_results(
         print(
             f"Perplexity (test): {metrics.perplexity_test:.4f} (mean) / {max_metrics.perplexity_test:.4f} (max)"
         )
+        print(f"Perplexity (last token baseline): {metrics.perplexity_last_token_base_line:.4f} (mean) / {max_metrics.perplexity_last_token_base_line:.4f} (max)")
+        print(f"Perplexity (last token test): {metrics.perplexity_last_token:.4f} (mean) / {max_metrics.perplexity_last_token:.4f} (max)")
         print(
             f"Perplexity Δ: {metrics.perplexity_delta_pct:+.4f}% (mean) / {max_metrics.perplexity_delta_pct:+.4f}% (max)"
         )
@@ -852,6 +1004,8 @@ def print_evaluation_results(
         print(f"Cosine similarity: {metrics.cosine_similarity:.6f}")
         print(f"Perplexity (baseline): {metrics.perplexity_baseline:.4f}")
         print(f"Perplexity (test): {metrics.perplexity_test:.4f}")
+        print(f"Perplexity (last token baseline): {metrics.perplexity_last_token_base_line:.4f}")
+        print(f"Perplexity (last token test): {metrics.perplexity_last_token:.4f}")
         print(f"Perplexity Δ: {metrics.perplexity_delta_pct:+.4f}%")
         print(f"Next-token match: {metrics.agreement * 100:.2f}%")
         print(f"ROUGE-1 F1: {metrics.rouge1_f1:.4f}")
@@ -1088,6 +1242,8 @@ def run_full_test_set_evaluation(
         logits_float, logits_int = run_rust_model(
             model_path, text, args.generate_tokens
         )
+        logits_float = logits_float[0]
+        logits_int = logits_int[0]
 
         # Always compute generated text from logits using argmax for all modes
         # This ensures ROUGE metrics compare argmax predictions across all models
@@ -1201,13 +1357,14 @@ def run_single_sample_evaluation(
             text = tokenizer.decode(tokens)
         print(f"Using custom text ({len(tokens)} tokens)")
     elif args.dataset_sample == "wikitext":
-        text, tokens = get_wikitext_sample(tokenizer, max_tokens=args.max_tokens)
+        text, tokens, final_token = get_wikitext_sample(tokenizer, max_tokens=args.max_tokens)
     else:
         print("✗ Must provide --text or use --dataset-sample wikitext", file=sys.stderr)
         sys.exit(1)
 
     print(f"\nEvaluation text preview: {text[:100]}...")
     print(f"Total tokens: {len(tokens)}")
+
 
     # Run baseline model
     model_output = run_baseline_model(
@@ -1216,6 +1373,8 @@ def run_single_sample_evaluation(
 
     # Run Rust model - get both float and int logits
     logits_float, logits_int = run_rust_model(model_path, text, args.generate_tokens)
+    logits_float = logits_float[0]
+    logits_int = logits_int[0]
 
     # Always compute generated text from logits using argmax for all modes
     # This ensures ROUGE metrics compare argmax predictions across all models
@@ -1225,6 +1384,8 @@ def run_single_sample_evaluation(
     num_input_tokens = total_tokens - args.generate_tokens
 
     baseline_generated_from_logits = ""
+    generated_text_float = ""
+    generated_text_int = ""
     if args.generate_tokens > 0:
         # Compute baseline generated text from baseline logits using argmax
         baseline_generated_from_logits = compute_generated_text_from_logits(
@@ -1238,6 +1399,14 @@ def run_single_sample_evaluation(
         generated_text_int = compute_generated_text_from_logits(
             logits_int, tokenizer, num_input_tokens, args.generate_tokens
         )
+
+    #Print the full text 
+    full_text_float = compute_full_text_from_logits(logits_float, tokenizer)
+    full_text_int = compute_full_text_from_logits(logits_int, tokenizer)
+    print_section_header("FULL GENERATED TEXT (FLOAT MODE)")
+    print(full_text_float)
+    print_section_header("FULL GENERATED TEXT (INT MODE)")
+    print(full_text_int)
 
     # Verify shapes match
     if model_output.logits.shape != logits_float.shape:
@@ -1268,6 +1437,7 @@ def run_single_sample_evaluation(
         model_output.logits,
         logits_float,
         model_output.input_ids,
+        final_token,
         skip_first=True,
         baseline_text=baseline_generated_from_logits,
         rust_text=generated_text_float,
@@ -1278,6 +1448,7 @@ def run_single_sample_evaluation(
         model_output.logits,
         logits_int,
         model_output.input_ids,
+        final_token,
         skip_first=True,
         baseline_text=baseline_generated_from_logits,
         rust_text=generated_text_int,
@@ -1303,6 +1474,157 @@ def run_single_sample_evaluation(
         generated_text_int,
         text,
     )
+
+
+def run_comparison_sample_evaluations(
+    model_path: Path, tokenizer: AutoTokenizer, args: argparse.Namespace
+) -> Tuple[
+    EvaluationMetrics,
+    EvaluationMetrics,
+    EvaluationMetrics,
+    EvaluationMetrics,
+]:
+    """
+    Run evaluation on multiple text samples of a fixed length.
+
+    Returns:
+        Tuple of (metrics_float, max_metrics_float, metrics_int, max_metrics_int,
+                  smoke_tests_float, smoke_tests_int,
+                  generated_text_baseline, generated_text_float, generated_text_int, input_text)
+    """
+    # Get evaluation text
+    sample = load_wikitext(tokenizer, block_size=args.max_tokens)
+    full_text = tokenizer.decode(sample)
+    samples = get_wikitext2_samples(
+        tokenizer, max_tokens=args.max_tokens, max_docs=args.samples
+    )
+    all_metrics_float = []
+    all_metrics_int = []
+    all_metrics_zkgpt = []
+
+    for i, (text, tokens, final_token) in enumerate(samples, start=1):
+        print_section_header(f"SAMPLE {i} EVALUATION (Length: {len(tokens)} tokens)")
+        print(f"\nEvaluation text preview: {text[:100]}...")
+    
+        # Run baseline model
+        model_output = run_baseline_model(
+             str(model_path), text, tokenizer, 0
+         )
+
+        # Run Rust model - get both float and int logits
+        logits_float, logits_int = run_rust_model(model_path, text, 0)
+        logits_float = logits_float[:-1]
+        logits_int = logits_int[:-1]
+        
+
+        # Always compute generated text from logits using argmax for all modes
+        # This ensures ROUGE metrics compare argmax predictions across all models
+        # Note: model_output.input_ids contains the FULL sequence (input + generated), not just input
+        # Calculate the original input token count from the total sequence length
+        total_tokens = len(model_output.input_ids)
+        num_input_tokens = total_tokens - args.generate_tokens
+
+        baseline_generated_from_logits = ""
+        
+        if args.generate_tokens > 0:
+            # Compute baseline generated text from baseline logits using argmax
+            baseline_generated_from_logits = compute_generated_text_from_logits(
+                model_output.logits, tokenizer, 1, 31
+            )   
+            # Compute ZKML float generated text from float logits using argmax
+            generated_text_float = compute_generated_text_from_logits(
+                logits_float, tokenizer, 1, 31
+            )
+            # Compute ZKML int generated text from int logits using argmax
+            generated_text_int = compute_generated_text_from_logits(
+                logits_int, tokenizer, 1, 31
+            )
+            
+
+            # Verify shapes match
+        if model_output.logits.shape != logits_float.shape:
+            print(f"\n✗ Float mode shape mismatch!", file=sys.stderr)
+            print(f"  Baseline: {model_output.logits.shape}", file=sys.stderr)
+            print(f"  Float: {logits_float.shape}", file=sys.stderr)
+            sys.exit(1)
+        if model_output.logits.shape != logits_int.shape:
+            print(f"\n✗ Int mode shape mismatch!", file=sys.stderr)
+            print(f"  Baseline: {model_output.logits.shape}", file=sys.stderr)
+            print(f"  Int: {logits_int.shape}", file=sys.stderr)
+            sys.exit(1)
+
+        
+
+        # Compute metrics
+        print_section_header(f"Computing Evaluation Metrics Sample {i}")
+
+        # Float mode metrics
+        metrics_float = compute_all_metrics(
+            model_output.logits,
+            logits_float,
+            model_output.input_ids,
+            final_token,
+            skip_first=True,
+            baseline_text=baseline_generated_from_logits,
+            rust_text=generated_text_float,
+        )
+
+        # Int mode metrics
+        metrics_int = compute_all_metrics(
+            model_output.logits,
+            logits_int,
+            model_output.input_ids,
+            final_token,
+            skip_first=True,
+            baseline_text=baseline_generated_from_logits,
+            rust_text=generated_text_int,
+        )
+
+        
+        all_metrics_float.append(metrics_float)
+        all_metrics_int.append(metrics_int)
+        
+
+        if i % 10 == 0:
+            print(f"  Processed {i} samples...")
+            # Compute average and max metrics
+            tmp_avg_metrics_float, tmp_max_metrics_float = compute_average_metrics(all_metrics_float)
+            tmp_avg_metrics_int, tmp_max_metrics_int = compute_average_metrics(all_metrics_int)
+            print_section_header(f"INTERIM RESULTS AFTER {i} SAMPLES")
+            print_evaluation_results(
+                tmp_avg_metrics_float, tmp_max_metrics_float, num_windows=len(all_metrics_float)
+            )
+            print_evaluation_results(
+                tmp_avg_metrics_int, tmp_max_metrics_int, num_windows=len(all_metrics_int)
+            )
+            
+
+
+    # Compute average and max metrics
+    avg_metrics_float, max_metrics_float = compute_average_metrics(all_metrics_float)
+    avg_metrics_int, max_metrics_int = compute_average_metrics(all_metrics_int)
+    
+
+    # Print results
+    print_section_header("FLOAT MODE (Full Test Set)")
+    print_evaluation_results(
+        avg_metrics_float, max_metrics_float, num_windows=len(all_metrics_float)
+    )
+
+    print_section_header("INTEGER MODE (Full Test Set)")
+    print_evaluation_results(
+        avg_metrics_int, max_metrics_int, num_windows=len(all_metrics_int)
+    )
+
+    
+
+    return (
+        avg_metrics_float,
+        max_metrics_float,
+        avg_metrics_int,
+        max_metrics_int,
+    )
+
 
 
 def main():
@@ -1359,6 +1681,9 @@ def main():
             else:
                 print_section_header("MARKDOWN OUTPUT")
                 print(markdown_output)
+    elif args.samples > 1:
+        _ = run_comparison_sample_evaluations(model_path, tokenizer, args)
+        
     else:
         (
             metrics_float,

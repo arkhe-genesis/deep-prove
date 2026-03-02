@@ -70,6 +70,7 @@ libc = "0.2.180"
 libm = "0.2.15"
 mpcs = { workspace = true }
 multilinear_extensions = { workspace = true, features = ["parallel"] }
+ndarray = { version = "0.16.1" }
 num_cpus = "1.17.0"
 p3-field = { workspace = true }
 p3-goldilocks = { workspace = true }
@@ -113,7 +114,6 @@ blake3 = { version = "1", features = ["mmap"] }
 criterion = { "version" = "0.6", features = ["html_reports"] }
 divan = { version = "0.1.21" }
 memmap2 = { workspace = true }
-ndarray = { version = "0.16.1" }
 proptest = { version = "1.7.0" }
 rand = { version = "0.9.2", features = ["std", "std_rng"] }
 rstest = { version = "0.25.0" }

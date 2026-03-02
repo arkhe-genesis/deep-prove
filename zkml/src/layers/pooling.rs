@@ -7,14 +7,16 @@ use crate::{
     backend::Maxpool2dConfig,
     commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
-    iop::{context::ShapeStep, verifier::Verifier},
+    iop::{ChallengeStorage, context::ShapeStep, verifier::Verifier},
     layers::{ContextAux, LayerProof, convolution::check_cnn_input},
     lookup::{
-        context::{LayerLookupContext, LookupWitnessGen, TableType},
+        context::LookupWitnessGen,
         logup_gkr::{
-            prover::batch_multiple_sizes_prove as logup_batch_prove, structs::LogUpBatchProof,
-            verifier::verify_logup_proof_multiple_sizes,
+            prover::new_batch_multiple_sizes_prove as logup_batch_prove,
+            structs::{LogUpBatchProof, LogUpInput, LogUpVerifierInstance, ProofType},
+            verifier::new_verify_logup_proof_multiple_sizes,
         },
+        table::Table,
     },
     model::Step,
     number::Number,
@@ -37,7 +39,7 @@ use multilinear_extensions::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -59,7 +61,12 @@ pub enum Pooling {
 pub struct PoolingCtx {
     pub poolinfo: Maxpool2D,
     pub node_id: NodeId,
-    pub lookup_ctx: LayerLookupContext,
+}
+
+impl PoolingCtx {
+    pub fn lookup_tables(&self) -> Vec<Table> {
+        vec![Table::new_shift_check()]
+    }
 }
 
 /// Contains proof material related to one step of the inference
@@ -207,11 +214,9 @@ impl ProveInfo for Pooling {
                         acc.max(shapes.next_power_of_two().product())
                     });
 
-                let lookup_ctx = LayerLookupContext::new(vec![TableType::Range], vec![4]);
                 LayerCtx::Pooling(PoolingCtx {
                     poolinfo: *info,
                     node_id: id,
-                    lookup_ctx,
                 })
             }
         };
@@ -303,8 +308,12 @@ where
         let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm])?;
 
         let mut gen_w = LookupWitnessGen::<E, PCS>::default();
-        gen_w.insert_logup_witness(id, layer_commitment);
-        gen_w.insert_element_count(TableType::Range, element_count);
+        gen_w.insert_layer_witness_data(
+            id,
+            layer_commitment,
+            vec![Table::new_shift_check()],
+            vec![element_count],
+        );
 
         Ok(gen_w)
     }
@@ -420,17 +429,20 @@ impl Pooling {
             "Maxpool needs 3D inputs, got {}",
             input.shape().rank(),
         );
-        let output_shapes = self.output_shapes(&[input.shape().clone()], PaddingMode::Padding)?;
+        let output_shapes =
+            self.output_shapes(std::slice::from_ref(input.shape()), PaddingMode::Padding)?;
         let num_vars = Self::num_vars_for_outputs(output_shapes.as_slice())?;
         // Should only be one prover_info for this step
         let layer_commitment = prover.lookup_witness(id)?;
-        let logup_inputs = info
-            .lookup_ctx
-            .create_logup_inputs::<PCS, E>(layer_commitment, &prover.challenge_storage)?;
+
         let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
         let commitment = PCS::get_pure_commitment(layer_commitment);
 
-        let logup_proof = logup_batch_prove(&logup_inputs, prover.transcript)?;
+        let logup_inputs = self.create_logup_inputs::<E>(
+            &layer_polys[..layer_polys.len() - 1],
+            &prover.challenge_storage,
+        )?;
+        let logup_proof = logup_batch_prove(&[logup_inputs], prover.transcript)?;
 
         // Run the Zerocheck that checks enforces that output does contain the maximum value for the kernel
         let num_threads = optimal_sumcheck_threads(num_vars);
@@ -494,7 +506,7 @@ impl Pooling {
         // Now we must do the samething accumulating evals for the input poly as we fix variables on the input poly.
         // The point length is 2 longer because for now we only support MaxPool2D.
 
-        let padded_input_shape = input.shape();
+        let padded_input_shape = input.shape().next_power_of_two();
         let padded_input_row_length_log = ceil_log2(padded_input_shape[2]);
         // We can batch all of the claims for the input poly with 00, 10, 01, 11 fixed into one with random challenges
         let [r1, r2] = [prover
@@ -518,9 +530,8 @@ impl Pooling {
         let zc_in_claim = izip!(
             multiplicands.iter(),
             sumcheck_state
-                .get_mle_final_evaluations()
+                .get_mle_flatten_final_evaluations()
                 .iter()
-                .flatten()
                 .take(kernel_size),
         )
         .fold(E::ZERO, |zc_acc, (m, zc)| zc_acc + *m * (output_eval - *zc));
@@ -540,14 +551,7 @@ impl Pooling {
 
         // We don't need the last eval of the the sumcheck state as it is the beta poly
 
-        let zerocheck_evals = [
-            &sumcheck_state
-                .get_mle_flatten_final_evaluations()
-                .into_iter()
-                .collect::<Vec<_>>()[..kernel_size],
-            &[output_eval],
-        ]
-        .concat();
+        let zerocheck_evals = sumcheck_evals[..kernel_size + 1].to_vec();
         // Push the step proof to the list
         prover.push_proof(
             id,
@@ -560,6 +564,32 @@ impl Pooling {
             }),
         );
         Ok(next_claim)
+    }
+
+    fn create_logup_inputs<E: ExtensionField>(
+        &self,
+        polys: &[Arc<MultilinearExtension<E>>],
+        challenge_storage: &ChallengeStorage<E>,
+    ) -> anyhow::Result<LogUpInput<E>> {
+        let table = Table::new_shift_check();
+        let (constant_challenge, column_sep_challenge) = challenge_storage
+            .get_challenges_by_name(&table.name())
+            .ok_or(anyhow::anyhow!(
+                "No challenges found for lookup table {} during MaxPool2D proving",
+                table.name()
+            ))?;
+        let column_evals = polys
+            .iter()
+            .map(|p| p.get_base_field_vec().to_vec())
+            .collect::<Vec<Vec<E::BaseField>>>();
+
+        LogUpInput::new_lookup(
+            column_evals,
+            constant_challenge,
+            column_sep_challenge,
+            table.num_columns(),
+        )
+        .map_err(|e| anyhow::anyhow!("Error creating LogUpInput for MaxPool2D: {:?}", e))
     }
 }
 
@@ -578,10 +608,46 @@ impl PoolingCtx {
         E: ExtensionField,
     {
         // 1. Verify the lookup proof
-        let batch_claim = verify_logup_proof_multiple_sizes(&proof.lookup, verifier.transcript)?;
+        let full_vars = ceil_log2(shape_step.padded_output_shape[0].numel());
+        let table = Table::new_shift_check();
+        let (constant_challenge, column_sep_challenge) = verifier
+            .challenge_storage
+            .get_challenges_by_name(&table.name())
+            .ok_or(anyhow::anyhow!(
+                "No challenges found for lookup table {} during MaxPool2D verifying",
+                table.name()
+            ))?;
+        let logup_instance = LogUpVerifierInstance::<E>::new(
+            constant_challenge,
+            column_sep_challenge,
+            table.num_columns(),
+            ProofType::Lookup,
+            full_vars - 1,
+        );
 
-        self.lookup_ctx
-            .verify_logup_batch_claim(&batch_claim, &verifier.challenge_storage)?;
+        let logup_instances = vec![logup_instance; 4];
+
+        // Add the fractional outputs to the verifier's numerator and denominator storage
+        let (numerators, denominators) = proof.lookup.fractional_outputs();
+        let (shift_num, shift_denom) = verifier
+            .numerators_and_denominators
+            .entry(table.name())
+            .or_insert((E::ZERO, E::ONE));
+
+        for (num, denom) in numerators.into_iter().zip(denominators) {
+            ensure!(
+                denom != E::ZERO,
+                "Denominator in pooling lookup proof fractional output cannot be zero"
+            );
+            *shift_num = num * *shift_denom + *shift_num * denom;
+            *shift_denom *= denom;
+        }
+
+        let batch_claim = new_verify_logup_proof_multiple_sizes(
+            &proof.lookup,
+            &logup_instances,
+            verifier.transcript,
+        )?;
 
         let poly_evals = batch_claim.poly_evals();
         // 2. Verify the sumcheck proof

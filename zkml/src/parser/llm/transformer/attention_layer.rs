@@ -10,11 +10,17 @@ use crate::{
             softmax::Softmax,
         },
     },
-    model::{LayerInsertion, Model},
+    model::Model,
+    parser::{LayerInsertion, llm::metadata::AttentionMetadata},
     tensor::TensorHandle,
 };
 
 use anyhow::{Result, ensure};
+
+pub(crate) const ATTENTION_QKV_EINSUM_NAME: &str = "attention_qkv_einsum";
+pub(crate) const ATTENTION_QK_EINSUM_NAME: &str = "attention_qk_einsum";
+pub(crate) const ATTENTION_VALUE_EINSUM_NAME: &str = "attention_value_einsum";
+pub(crate) const ATTENTION_OUTPUT_EINSUM_NAME: &str = "attention_output_einsum";
 
 /// Struct holding the information needed to attach [ConcatenationCache][crate::layers::transformer::ConcatenationCache] to an attention mechanisms QKV projection layer.
 #[derive(Debug, Clone)]
@@ -140,7 +146,7 @@ pub trait AttentionMechanism {
         self,
         model: &mut Model<f32>,
         previous_node_id: Option<NodeId>,
-    ) -> Result<NodeId>
+    ) -> Result<(NodeId, AttentionMetadata)>
     where
         Self: Sized,
     {
@@ -158,13 +164,18 @@ pub trait AttentionMechanism {
 
         // Extract the tensors from the attention mechanism
         let (weights, biases) = self.qkv_tensors();
-        let qkv_einsum = Self::build_qkv_einsum(qkv_equation, weights, biases)?;
-        let query_key_einsum =
-            Self::build_query_key_attention_einsum(query_key_equation)?.disable_requantisation();
-        let attention_value_einsum = Self::build_attention_value_einsum(attention_value_equation)?;
+        let qkv_einsum = Self::build_qkv_einsum(qkv_equation, weights, biases)?
+            .with_name(ATTENTION_QKV_EINSUM_NAME.to_owned());
+        let query_key_einsum = Self::build_query_key_attention_einsum(query_key_equation)?
+            .no_requant()
+            .with_name(ATTENTION_QK_EINSUM_NAME.to_owned());
+        let attention_value_einsum = Self::build_attention_value_einsum(attention_value_equation)?
+            .with_name(ATTENTION_VALUE_EINSUM_NAME.to_owned());
         let (out_weight, out_bias) = self.out_tensors();
         let output_einsum =
-            Self::build_output_einsum(output_equation, vec![out_weight], vec![out_bias])?;
+            Self::build_output_einsum(output_equation, vec![out_weight], vec![out_bias])?
+                .no_requant()
+                .with_name(ATTENTION_OUTPUT_EINSUM_NAME.to_owned());
         // We also get the attention span
         let attention_span = self.attention_span();
         // We insert the query key EinSum into the model (but don't wire it up yet)
@@ -176,7 +187,7 @@ pub trait AttentionMechanism {
         // We insert any custom logic specific to the attention mechanism
         self.insert_custom_logic(model, qkv_einsum_id, query_key_id)?;
         // We insert the attention mask layer and the softmax layer
-        let softmax_id = match attention_span {
+        let (mask_id, softmax_id) = match attention_span {
             AttentionSpan::Full => {
                 let mask_id = model.add_consecutive_layer(
                     Layer::AttentionMask(
@@ -186,13 +197,16 @@ pub trait AttentionMechanism {
                 )?;
                 // We insert the Softmax layer
 
-                model.add_consecutive_layer(
-                    Layer::Softmax(
-                        Softmax::<f32>::new(max_context_length.next_power_of_two())
-                            .with_scale(1.0f32 / (head_dim as f32).sqrt()),
-                    ),
-                    Some(mask_id),
-                )?
+                (
+                    mask_id,
+                    model.add_consecutive_layer(
+                        Layer::Softmax(
+                            Softmax::<f32>::new(max_context_length)
+                                .with_scale(1.0f32 / (head_dim as f32).sqrt()),
+                        ),
+                        Some(mask_id),
+                    )?,
+                )
             }
             AttentionSpan::Local(effective_context_length) => {
                 // Insert the attention mask layer with local span
@@ -206,13 +220,16 @@ pub trait AttentionMechanism {
                     .min(max_context_length)
                     .next_power_of_two();
                 // Now in the Softmax layer we know we only have at most effective_context_length non-zero entries (after applying exp)
-                model.add_consecutive_layer(
-                    Layer::Softmax(
-                        Softmax::<f32>::new(effective_context_length)
-                            .with_scale(1.0f32 / (head_dim as f32).sqrt()),
-                    ),
-                    Some(mask_id),
-                )?
+                (
+                    mask_id,
+                    model.add_consecutive_layer(
+                        Layer::Softmax(
+                            Softmax::<f32>::new(effective_context_length)
+                                .with_scale(1.0f32 / (head_dim as f32).sqrt()),
+                        ),
+                        Some(mask_id),
+                    )?,
+                )
             }
         };
 
@@ -224,7 +241,17 @@ pub trait AttentionMechanism {
         model.add_edge(softmax_id, attention_value_id, (0, 0))?;
         model.add_edge(qkv_einsum_id, attention_value_id, (2, 1))?;
 
-        model.add_consecutive_layer(Layer::EinSum(output_einsum), Some(attention_value_id))
+        let final_proj_id =
+            model.add_consecutive_layer(Layer::EinSum(output_einsum), Some(attention_value_id))?;
+        let transformer_graph_id = AttentionMetadata {
+            qkv_id: qkv_einsum_id,
+            qkt_id: query_key_id,
+            mask_id,
+            softmax_id,
+            residual_id: attention_value_id,
+            final_proj_id,
+        };
+        Ok((final_proj_id, transformer_graph_id))
     }
 }
 
@@ -320,11 +347,12 @@ fn form_gqa_einsum_equations(uses_qkv_bias: bool, uses_out_bias: bool) -> [Strin
 }
 
 impl<A: AttentionMechanism> LayerInsertion for A {
+    type Metadata = AttentionMetadata;
     fn add_to_model(
         self,
         model: &mut Model<f32>,
         previous_node_id: Option<NodeId>,
-    ) -> Result<NodeId> {
+    ) -> Result<(NodeId, Self::Metadata)> {
         self.write_to_model(model, previous_node_id)
     }
 }

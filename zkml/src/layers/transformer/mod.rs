@@ -8,10 +8,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod attention_mask;
 pub mod embeddings;
-pub mod layernorm;
 pub mod logits;
+pub mod normalisation;
 pub mod positional;
-pub mod rmsnorm;
 pub mod softmax;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

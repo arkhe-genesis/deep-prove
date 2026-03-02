@@ -90,7 +90,10 @@ pub enum RopeLayout {
 impl RopeLayout {
     /// Splits the input tensor according to the layout strategy.
     /// Returns a wrapped tensor with the appropriate shape.
-    fn split_input<T: TensorTypeParam>(&self, input: WrappedTensor<T>) -> WrappedTensor<T> {
+    pub(crate) fn split_input<T: TensorTypeParam>(
+        &self,
+        input: WrappedTensor<T>,
+    ) -> WrappedTensor<T> {
         let input_shape = input.shape();
         match self {
             RopeLayout::Adjacent => {
@@ -818,7 +821,7 @@ impl Rope<f32> {
         // Therefore, we can use the multiplier `input_scaling*matrix_scale/output_scaling` to requantize
         let multiplier = input_scaling.m(&matrix_scale, output_scaling);
         let output_bit_size = 2 * *quantization::BIT_LEN + 1; // +1 because we are adding 2 products of items with `quantization::BIT_LEN` bits
-        let requant = Requant::from_multiplier(multiplier, output_bit_size);
+        let requant = Requant::from_multiplier(multiplier, output_bit_size, *output_scaling);
 
         let concatenation_cache = self.concatenation_cache.map(|cache| {
             let mut cache = cache.lock().unwrap();
@@ -870,34 +873,32 @@ impl Rope<Element> {
         // of the polynomial being committed is halved
 
         let matrix_to_evals = match self.layout {
-            RopeLayout::Adjacent => |matrix: &TensorHandle<Element>| {
-                Ok(matrix
-                    .wrapped_tensor()?
-                    .get_data()
-                    .chunks(2)
-                    .map(|chunk| chunk[0])
-                    .collect_vec())
+            RopeLayout::Adjacent => |matrix: &Tensor<Element>| {
+                matrix.data().chunks(2).map(|chunk| chunk[0]).collect_vec()
             },
-            RopeLayout::RotateHalf => |matrix: &TensorHandle<Element>| {
+            RopeLayout::RotateHalf => |matrix: &Tensor<Element>| {
                 let rows = matrix.shape().dim(-1);
                 let half_rows = rows / 2;
-                Ok(matrix
-                    .wrapped_tensor()?
-                    .get_data()
+                matrix
+                    .data()
                     .chunks(rows)
                     .flat_map(|chunk| chunk[..half_rows].to_vec())
-                    .collect::<Vec<Element>>())
+                    .collect::<Vec<Element>>()
             },
         };
+        let wrapped_cosine_matrix = self.cosine_matrix.wrapped_tensor()?.clone();
+        let cosine_matrix = Tensor::try_from(&wrapped_cosine_matrix)?;
+        let wrapped_sine_matrix = self.sine_matrix.wrapped_tensor()?.clone();
+        let sine_matrix = Tensor::try_from(&wrapped_sine_matrix)?;
         aux.model_polys = Some(
             [
                 (
                     CommitmentId::from(self.cosine_matrix.storage_key()),
-                    matrix_to_evals(&self.cosine_matrix)?,
+                    matrix_to_evals(cosine_matrix.as_ref()),
                 ),
                 (
                     CommitmentId::from(self.sine_matrix.storage_key()),
-                    matrix_to_evals(&self.sine_matrix)?,
+                    matrix_to_evals(sine_matrix.as_ref()),
                 ),
             ]
             .into_iter()
@@ -1228,6 +1229,7 @@ mod tests {
 
         // pad the model
         let padded_model = pad_model(quantized_model)?;
+        padded_model.reset();
 
         let padded_inputs = padded_model.prepare_inputs(inputs)?;
 

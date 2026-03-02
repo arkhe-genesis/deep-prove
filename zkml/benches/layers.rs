@@ -499,8 +499,12 @@ mod norm_layer {
 
     use tenstore::{GenStore, StorageKey};
     use zkml::{
-        Element, ScalingFactor, Shape, Tensor,
-        layers::{provable::Evaluate, transformer::layernorm::LayerNorm},
+        ScalingFactor, Shape, Tensor,
+        layers::{
+            provable::{Evaluate, QuantizeOutput},
+            transformer::normalisation::layernorm::LayerNorm,
+        },
+        quantization::Quantize,
         tensor::{TensorHandle, WrappedTensor},
     };
 
@@ -539,18 +543,36 @@ mod norm_layer {
         );
         let layer = LayerNorm::<f32>::new(gamma, beta, EPS).unwrap();
 
-        let input = Tensor::<Element>::random(&Shape::new(vec![dim0, dim1]));
+        let input = Tensor::<f32>::random(&Shape::new(vec![dim0, dim1]));
 
         let input_scaling = ScalingFactor::from_tensor(&input, None);
-        let input = WrappedTensor::try_from(input).unwrap();
-        let (layer, _, _) = layer.quantise(input_scaling, input_scaling).unwrap();
+        let quantised_input = input.quantize(&input_scaling);
+        let input = WrappedTensor::try_from(&input).unwrap();
+        let normalising_data = WrappedTensor::<f32>::normalising_factors(input.clone(), EPS)
+            .unwrap()
+            .get_data();
+
+        let normalising_max = normalising_data.iter().copied().reduce(f32::max).unwrap();
+        let normalising_min = normalising_data.iter().copied().reduce(f32::min).unwrap();
+        let std_dev_scaling = ScalingFactor::from_span(normalising_min, normalising_max, None);
+        let QuantizeOutput {
+            quantized_op: layer,
+            ..
+        } = layer
+            .quantise(input_scaling, std_dev_scaling, input_scaling)
+            .unwrap();
 
         // warm up
-        let out = layer.evaluate(&[&input]).expect("Norm should succeed");
+        let quantised_input = WrappedTensor::try_from(&quantised_input).unwrap();
+        let out = layer
+            .evaluate(&[&quantised_input])
+            .expect("Norm should succeed");
         let _ = get_results(out);
 
         bencher.bench(|| {
-            let out = layer.evaluate(&[&input]).expect("Norm should succeed");
+            let out = layer
+                .evaluate(&[&quantised_input])
+                .expect("Norm should succeed");
             get_results(out)
         });
     }
@@ -839,7 +861,6 @@ mod softmax_layer {
     use zkml::{
         Element, ScalingFactor, Shape, Tensor,
         layers::{provable::Evaluate, transformer::softmax::Softmax},
-        quantization,
         tensor::WrappedTensor,
     };
 
@@ -854,7 +875,7 @@ mod softmax_layer {
         let input_scaling = ScalingFactor::from_tensor(&input, None);
         let input = WrappedTensor::try_from(input).unwrap();
         let layer = Softmax::<f32>::new(size)
-            .quantise(input_scaling, *quantization::BIT_LEN)
+            .quantise(input_scaling)
             .expect("Softmax quantise should succeed");
 
         // warm up
@@ -889,7 +910,7 @@ mod softmax_layer {
 #[divan::bench_group]
 mod requant_layer {
     use zkml::{
-        Element, Shape,
+        Element, ScalingFactor, Shape,
         layers::{provable::Evaluate, requant::Requant},
         tensor::WrappedTensor,
     };
@@ -901,7 +922,7 @@ mod requant_layer {
         let size = 1 << args.pow2;
         let input = WrappedTensor::<Element>::random(&Shape::new(vec![size]));
 
-        let layer = Requant::from_multiplier(2.0, 8);
+        let layer = Requant::from_multiplier(2.0, 8, ScalingFactor::default());
 
         // warm up
         let out = layer.evaluate(&[&input]).expect("Requant should succeed");

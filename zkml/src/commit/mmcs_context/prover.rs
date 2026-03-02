@@ -7,7 +7,7 @@ use crate::{
         mmcs_context::{ModelClaims, build_sumcheck_expression, table_poly_id},
     },
     graph::NodeId,
-    lookup::context::TableType,
+    lookup::table::Table,
     tensor::CommitmentId,
 };
 use anyhow::{Result, anyhow};
@@ -129,10 +129,10 @@ where
         });
     }
 
-    pub fn add_table_claim(&mut self, table_id: NodeId, table_type: &TableType, claim: Claim<E>) {
+    pub fn add_table_claim(&mut self, table_id: NodeId, table: &Table, claim: Claim<E>) {
         assert!(
             self.model_claims
-                .entry(table_poly_id(table_type.name()))
+                .entry(table_poly_id(table.name()))
                 .or_default()
                 .insert(table_id, claim)
                 .is_none()

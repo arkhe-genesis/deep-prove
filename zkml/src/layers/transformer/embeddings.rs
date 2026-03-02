@@ -31,7 +31,7 @@ use crate::{
     model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     parser::{gguf, json},
-    quantization::Quantize,
+    quantization::{self, Quantize},
     tensor::{CommitmentId, TensorHandle, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -340,8 +340,20 @@ impl QuantizeOp for Embeddings<f32> {
             vocab_size,
         } = self;
 
-        let max_abs = mat.max_abs()?;
-        let scale_factor = ScalingFactor::from_absolute_max(max_abs, None);
+        // We pick the domain size to be the largest multiple of quantization::BIT_LEN that is less than or equal to 24.
+        let mut multiple = 1usize;
+        while (multiple + 1) * *quantization::BIT_LEN <= 24 {
+            multiple += 1;
+        }
+        let multiple_bit_size = multiple * *quantization::BIT_LEN;
+
+        let shift = multiple_bit_size - 1;
+        let embeddings_domain_min: Element = -1 << shift;
+        let embeddings_domain_max: Element = (1 << shift) - 1;
+        let scale_factor = ScalingFactor::from_absolute_max(
+            mat.max_abs()?,
+            Some((embeddings_domain_min, embeddings_domain_max)),
+        );
         let quantised_mat = mat.quantize(&scale_factor);
         let qemb = Embeddings {
             mat: quantised_mat,
@@ -631,7 +643,10 @@ mod tests {
     use crate::{
         Element, Number,
         layers::Layer,
-        model::{Model, test::prove_model_with},
+        model::{
+            Model,
+            test::{prove_quantized_model, quantize_model},
+        },
         quantization::{Quantize, ToField},
         rng_from_env_or_random,
     };
@@ -680,7 +695,23 @@ mod tests {
             .unwrap();
         model.automatic_output_labelling().unwrap();
         model.describe();
-        prove_model_with(model, vec![input], &mut GenStore::default())?;
+
+        let mut store = GenStore::default();
+        let (quantized_model, _) = quantize_model(
+            model,
+            vec![input.clone()],
+            Some(vec![input.clone()]),
+            &mut store,
+        )?;
+
+        let quantised_input_data = input
+            .data()
+            .iter()
+            .map(|val| *val as Element)
+            .collect::<Vec<Element>>();
+        let quantised_input = Tensor::new(input.shape().clone(), quantised_input_data)?;
+
+        prove_quantized_model(quantized_model, vec![quantised_input], &mut store)?;
 
         Ok(())
     }

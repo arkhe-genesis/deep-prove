@@ -1,6 +1,6 @@
 use crate::parser::{
     Load,
-    llm::{HFTokenizer, models::LLMModelLoader, tokenizer::TokenizerLoader},
+    llm::{HFTokenizer, LLMMetadata, models::LLMModelLoader, tokenizer::TokenizerLoader},
 };
 use anyhow::Context;
 
@@ -12,7 +12,7 @@ use crate::{
         ModelLoader,
         gguf::RawGGUF,
         llm::{
-            LLMConfig, LLMModel,
+            LLMConfig, LLMIR,
             config::{AttentionConfig, AttentionHeadType, LLMStructure},
             transformer::{Norm, NormType},
         },
@@ -25,7 +25,7 @@ use decoder::Gemma3Decoder;
 
 /// Loader for the Gemma3 family of models.
 /// For more information about Gemma3, see https://ai.google.dev/gemma/docs/core
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Copy)]
 pub struct Gemma3 {
     /// Current hack to avoid committing to huge rope
     max_ctx_length: Option<usize>,
@@ -44,7 +44,7 @@ impl Gemma3 {
         self
     }
 
-    fn scale_embeddings(llm_config: &LLMConfig, llm_model: &mut LLMModel<Gemma3Decoder>) {
+    fn scale_embeddings(llm_config: &LLMConfig, llm_model: &mut LLMIR<Gemma3Decoder>) {
         let normalizer_factor = (llm_config.hidden_size as f32).sqrt();
         let mat = &llm_model.embeddings.mat;
 
@@ -94,7 +94,7 @@ impl TokenizerLoader<RawSafeTensors> for Gemma3 {
 
 impl<DataFormat> LLMModelLoader<DataFormat> for Gemma3
 where
-    Gemma3: ModelLoader<DataFormat, ModelConfig = LLMConfig>,
+    Gemma3: ModelLoader<DataFormat, Metadata = LLMMetadata>,
 {
     fn with_max_context_length(self, max_ctx_length: usize) -> Self
     where
@@ -105,13 +105,13 @@ where
 }
 
 impl ModelLoader<RawGGUF> for Gemma3 {
-    type ModelConfig = LLMConfig;
+    type Metadata = LLMMetadata;
 
     fn model_name(&self) -> String {
         GEMMA3_NAME.to_string()
     }
 
-    fn parse(&self, raw: &RawGGUF) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
+    fn parse(&self, raw: &RawGGUF) -> anyhow::Result<(Model<f32>, Self::Metadata)> {
         let loader = raw.loader()?;
         let config = LLMConfig::from_gguf(&loader, "gemma3", self.max_ctx_length)?;
 
@@ -138,32 +138,35 @@ impl ModelLoader<RawGGUF> for Gemma3 {
             attention_config: AttentionConfig { span, head },
         };
 
-        let mut model = LLMModel::<Gemma3Decoder>::from_loader(&loader, &structure)?;
+        let mut model = LLMIR::<Gemma3Decoder>::from_loader(&loader, &structure)?;
         // Gemma3 we have to rescale the embedding matrix
         Self::scale_embeddings(&config, &mut model);
         Self::scale_norm(&mut model.final_norm);
         // even though the llm runtime doesn't care about the model input shape, which is designed for "static" input shapes, we still
         // need to provide one.
         let init_user_shape = Shape::from(vec![1]);
-        let model = model.into_provable_model(init_user_shape)?;
-        Ok((model, config))
+        let (model, md) = model.into_model(config, init_user_shape)?;
+        Ok((model, md))
     }
 }
 
 impl ModelLoader<RawSafeTensors> for Gemma3 {
-    type ModelConfig = LLMConfig;
+    type Metadata = LLMMetadata;
 
     fn model_name(&self) -> String {
         GEMMA3_NAME.to_string()
     }
 
-    fn parse(&self, raw: &RawSafeTensors) -> anyhow::Result<(Model<f32>, Self::ModelConfig)> {
+    fn parse(&self, raw: &RawSafeTensors) -> anyhow::Result<(Model<f32>, Self::Metadata)> {
         // Read HF config.json
         let cfg = raw.read_config_json()?;
         let hidden_size = cfg
             .get::<usize, _>("hidden_size")
             .context("hidden_size not found")?;
         let embedding_size = hidden_size;
+        let intermediate_size = cfg
+            .get::<usize, _>("intermediate_size")
+            .context("intermediate_size not found")?;
         let num_heads = cfg
             .get::<usize, _>("num_attention_heads")
             .context("num_attention_heads not found")?;
@@ -190,6 +193,7 @@ impl ModelLoader<RawSafeTensors> for Gemma3 {
         let llm_config = LLMConfig {
             model_name: "gemma3".to_string(),
             embedding_size,
+            intermediate_size,
             hidden_size,
             num_heads,
             head_size,
@@ -235,13 +239,12 @@ impl ModelLoader<RawSafeTensors> for Gemma3 {
         };
 
         let loader = safe::FileTensorLoader::from_path(raw.model_path())?;
-        let mut llm_model = LLMModel::<Gemma3Decoder>::from_loader(&loader, &(structure, cfg))?;
+        let mut llm_ir = LLMIR::<Gemma3Decoder>::from_loader(&loader, &(structure, cfg))?;
         // Gemma3 we have to rescale the embedding matrix
-        Self::scale_embeddings(&llm_config, &mut llm_model);
-        Self::scale_norm(&mut llm_model.final_norm);
+        Self::scale_embeddings(&llm_config, &mut llm_ir);
+        Self::scale_norm(&mut llm_ir.final_norm);
         let init_user_shape = Shape::from(vec![1]);
-        let model = llm_model.into_provable_model(init_user_shape)?;
-        Ok((model, llm_config))
+        llm_ir.into_model(llm_config, init_user_shape)
     }
 }
 
@@ -450,7 +453,8 @@ pub mod tests {
     fn test_gguf_gemma3_load_model() -> anyhow::Result<()> {
         let model_path = file_cache::from_cache(GEMMA3_Q8)?;
         let mygguf = RawGGUF::new(model_path);
-        let (model, config) = Gemma3::new().parse(&mygguf)?;
+        let (model, md) = Gemma3::new().parse(&mygguf)?;
+        let config = md.config;
         assert_eq!(config.num_heads, 4);
         assert_eq!(config.num_block, 18);
         assert_eq!(config.embedding_size, 640);
@@ -1118,7 +1122,8 @@ pub mod safe_tests {
     #[test]
     fn test_safe_gemma3_load_model() -> anyhow::Result<()> {
         let raw = RawSafeTensors::from_hugging_face_cached(GEMMA3_SAFE_MODEL)?;
-        let (model, config) = Gemma3::new().with_max_context(2048).parse(&raw)?;
+        let (model, md) = Gemma3::new().with_max_context(2048).parse(&raw)?;
+        let config = md.config;
         assert_eq!(config.num_heads, 4);
         assert_eq!(config.num_block, 18);
         assert_eq!(config.embedding_size, 640);

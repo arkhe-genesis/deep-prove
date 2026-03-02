@@ -6,15 +6,15 @@ use serde::{Deserialize, Serialize};
 use crate::{
     NextPowerOfTwo, Number,
     backend::{Backend, Conv2dConfig, Maxpool2dConfig, zkml_conv2d_i, zkml_max_pool2d_i},
-    quantization::{Quantize, ScalingFactor},
+    quantization::{Dequantize, Quantize, ScalingFactor},
 };
 use anyhow::{Context, Result, bail, ensure};
 use burn::{
     module::Param,
     nn::{LayerNormConfig, RmsNormConfig},
     tensor::{
-        AsIndex, BasicOps, BroadcastArgs, DimIter as BDimIter, Numeric, Slice, SliceArg,
-        Tensor as BTensor, TensorData, activation, ops::ConvOptions, s,
+        AsIndex, BasicOps, DimIter as BDimIter, Numeric, Slice, SliceArg, Tensor as BTensor,
+        TensorData, activation, ops::ConvOptions, s,
     },
 };
 
@@ -474,6 +474,11 @@ where
         }
     }
 
+    /// Applies element wise absolute value operation.
+    pub fn abs(self) -> Self {
+        delegate!(self, abs)
+    }
+
     /// Transpose the tensor.
     ///
     /// For a 2D tensor, this is the standard matrix transpose. For `D > 2`, the transpose is
@@ -572,6 +577,12 @@ where
     #[allow(clippy::should_implement_trait)]
     pub(crate) fn sub(self, other: Self) -> Result<Self> {
         delegate_binop!(self, sub, other)
+    }
+
+    /// Applies element wise negation operation.
+    #[allow(clippy::should_implement_trait)]
+    pub(crate) fn neg(self) -> Self {
+        delegate!(self, neg)
     }
 
     /// Applies element wise multiplication operation.
@@ -702,16 +713,6 @@ where
         delegate!(self, clamp, min, max)
     }
 
-    /// Clamp element wise over a minimum value.
-    pub(crate) fn clamp_min(self, min: T) -> Self {
-        delegate!(self, clamp_min, min)
-    }
-
-    /// Clamp element wise over a maximum value.
-    pub(crate) fn clamp_max(self, max: T) -> Self {
-        delegate!(self, clamp_max, max)
-    }
-
     /// Aggregate all elements along the given dimension or axis in the tensor with the sum operation.
     pub(crate) fn sum_dim(self, dim: isize) -> Self {
         delegate!(self, sum_dim, dim)
@@ -756,7 +757,7 @@ where
     }
 
     ///  Find the maximum value along the given dimension.
-    pub(crate) fn max_dim_with_indices(self, dim: usize) -> (Self, WrappedTensor<Element>) {
+    pub fn max_dim_with_indices(self, dim: isize) -> (Self, WrappedTensor<Element>) {
         // XXX: fix unpadded shapes
         match self {
             WrappedTensor::Rank1 {
@@ -835,6 +836,20 @@ where
 
         let tensor = delegate_plain!(self, unsqueeze, (2),);
         WrappedTensor::Rank2 {
+            tensor,
+            unpadded_shape,
+        }
+    }
+
+    /// Unsqueeze the current tensor. Create new leading dimensions to fit 2 dimensions.
+    pub(crate) fn unsqueeze_dim_3(self) -> Self {
+        let mut unpadded_shape = self.unpadded_shape().clone();
+        while unpadded_shape.len() != 3 {
+            unpadded_shape.dims.insert(0, 1);
+        }
+
+        let tensor = delegate_plain!(self, unsqueeze, (3),);
+        WrappedTensor::Rank3 {
             tensor,
             unpadded_shape,
         }
@@ -1124,36 +1139,6 @@ where
         }
     }
 
-    /// Broadcast the tensor to the given shape.
-    pub(crate) fn expand<const D: usize, S: Clone + BroadcastArgs<D, D>>(
-        self,
-        shape: S,
-    ) -> Result<Self> {
-        let unpadded_shape = shape.clone().into_shape(self.unpadded_shape());
-        let shape = shape.into_shape(&self.shape());
-
-        let out = match shape.num_dims() {
-            1 => WrappedTensor::Rank1 {
-                tensor: delegate_plain!(self, expand, (1, _), shape),
-                unpadded_shape,
-            },
-            2 => WrappedTensor::Rank2 {
-                tensor: delegate_plain!(self, expand, (2, _), shape),
-                unpadded_shape,
-            },
-            3 => WrappedTensor::Rank3 {
-                tensor: delegate_plain!(self, expand, (3, _), shape),
-                unpadded_shape,
-            },
-            4 => WrappedTensor::Rank4 {
-                tensor: delegate_plain!(self, expand, (4, _), shape),
-                unpadded_shape,
-            },
-            _ => bail!("Unexpected tensor rank: {}.", shape.num_dims()),
-        };
-        Ok(out)
-    }
-
     /// Copies the sub-slice `shape` from this tensor.
     ///
     /// Returns a new [Tensor] with shape `shape` initialised from `self`.
@@ -1173,7 +1158,47 @@ where
         self.reduce_to_shape(&unpadded_shape)
     }
 
-    pub(crate) fn mask_fill(
+    /// Update the given tensor with the value where the mask is true.
+    pub fn mask_fill_4d(
+        self,
+        mask: BTensor<Backend, 4, burn::tensor::Bool>,
+        value: T,
+    ) -> Result<Self> {
+        let input_rank = self.rank();
+        let Self::Rank4 {
+            tensor,
+            unpadded_shape,
+        } = self
+        else {
+            bail!("Unexpected input rank: {input_rank}, expected 4.")
+        };
+        Ok(WrappedTensor::Rank4 {
+            tensor: tensor.mask_fill(mask, value),
+            unpadded_shape,
+        })
+    }
+
+    /// Update the given tensor with the value where the mask is true.
+    pub fn mask_fill_3d(
+        self,
+        mask: BTensor<Backend, 3, burn::tensor::Bool>,
+        value: T,
+    ) -> Result<Self> {
+        let input_rank = self.rank();
+        let Self::Rank3 {
+            tensor,
+            unpadded_shape,
+        } = self
+        else {
+            bail!("Unexpected input rank: {input_rank}, expected 3.")
+        };
+        Ok(WrappedTensor::Rank3 {
+            tensor: tensor.mask_fill(mask, value),
+            unpadded_shape,
+        })
+    }
+
+    pub fn mask_fill(
         self,
         mask: BTensor<Backend, 2, burn::tensor::Bool>,
         value: T,
@@ -1483,6 +1508,50 @@ where
         }
     }
 
+    pub fn lower_equal_elem<const D: usize>(
+        self,
+        elem: T,
+    ) -> Result<BTensor<Backend, D, burn::tensor::Bool>> {
+        anyhow::ensure!(
+            self.rank() == D,
+            "Unexpected tensor rank: {}, expected {}",
+            self.rank(),
+            D
+        );
+        let shape = self.shape();
+        match D {
+            1 => {
+                let Self::Rank1 { tensor, .. } = self else {
+                    unreachable!()
+                };
+                let result = tensor.lower_equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            2 => {
+                let Self::Rank2 { tensor, .. } = self else {
+                    unreachable!()
+                };
+                let result = tensor.lower_equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            3 => {
+                let Self::Rank3 { tensor, .. } = self else {
+                    unreachable!()
+                };
+                let result = tensor.lower_equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            4 => {
+                let Self::Rank4 { tensor, .. } = self else {
+                    unreachable!()
+                };
+                let result = tensor.lower_equal_elem(elem);
+                Ok(result.reshape::<D, _>(shape))
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Utility to make tests more readable
     #[cfg(test)]
     pub(crate) fn to_native(&self) -> Tensor<T> {
@@ -1621,14 +1690,9 @@ impl WrappedTensor<f32> {
         gamma: Self,
         beta: Self,
     ) -> Result<Self> {
-        let input_rank = self.rank();
-        let Self::Rank2 {
-            tensor: input,
-            unpadded_shape,
-        } = self
-        else {
-            bail!("Unexpected input rank: {input_rank}, expected 2.")
-        };
+        // NOTE: simply use the burn tensor API for now as we want to move towards using more burn features
+        // instead of re-implementing everything ourselves.
+        // copy implementation https://docs.rs/burn-core/0.17.0/src/burn_core/nn/norm/layer.rs.html#67
         let gamma_rank = gamma.rank();
         let Self::Rank1 { tensor: gamma, .. } = gamma else {
             bail!("Unexpected gamma rank: {gamma_rank}, expected 1.")
@@ -1642,11 +1706,98 @@ impl WrappedTensor<f32> {
         let mut norm = config.init(&device);
         norm.gamma = Param::from_tensor(gamma);
         norm.beta = Some(Param::from_tensor(beta));
-        let output = norm.forward(input);
-        Ok(Self::Rank2 {
-            tensor: output,
-            unpadded_shape,
-        })
+
+        match self {
+            WrappedTensor::Rank1 {
+                tensor,
+                unpadded_shape,
+            } => {
+                let output = norm.forward(tensor);
+                Ok(WrappedTensor::Rank1 {
+                    tensor: output,
+                    unpadded_shape,
+                })
+            }
+            WrappedTensor::Rank2 {
+                tensor,
+                unpadded_shape,
+            } => {
+                let output = norm.forward(tensor);
+                Ok(WrappedTensor::Rank2 {
+                    tensor: output,
+                    unpadded_shape,
+                })
+            }
+            WrappedTensor::Rank3 {
+                tensor,
+                unpadded_shape,
+            } => {
+                let output = norm.forward(tensor);
+                Ok(WrappedTensor::Rank3 {
+                    tensor: output,
+                    unpadded_shape,
+                })
+            }
+            WrappedTensor::Rank4 {
+                tensor,
+                unpadded_shape,
+            } => {
+                let output = norm.forward(tensor);
+                Ok(WrappedTensor::Rank4 {
+                    tensor: output,
+                    unpadded_shape,
+                })
+            }
+        }
+    }
+
+    pub fn normalising_factors(input: Self, epsilon: f32) -> Result<Self> {
+        match input {
+            Self::Rank1 {
+                tensor: input,
+                unpadded_shape: shape,
+            } => {
+                let (var, mean) = input.clone().var_mean_bias(0);
+                let normalised = input.sub(mean).div(var.add_scalar(epsilon).sqrt());
+                Ok(Self::Rank1 {
+                    tensor: normalised,
+                    unpadded_shape: shape,
+                })
+            }
+            Self::Rank2 {
+                tensor: input,
+                unpadded_shape: shape,
+            } => {
+                let (var, mean) = input.clone().var_mean_bias(1);
+                let normalised = input.sub(mean).div(var.add_scalar(epsilon).sqrt());
+                Ok(Self::Rank2 {
+                    tensor: normalised,
+                    unpadded_shape: shape,
+                })
+            }
+            Self::Rank3 {
+                tensor: input,
+                unpadded_shape: shape,
+            } => {
+                let (var, mean) = input.clone().var_mean_bias(2);
+                let normalised = input.sub(mean).div(var.add_scalar(epsilon).sqrt());
+                Ok(Self::Rank3 {
+                    tensor: normalised,
+                    unpadded_shape: shape,
+                })
+            }
+            Self::Rank4 {
+                tensor: input,
+                unpadded_shape: shape,
+            } => {
+                let (var, mean) = input.clone().var_mean_bias(3);
+                let normalised = input.sub(mean).div(var.add_scalar(epsilon).sqrt());
+                Ok(Self::Rank4 {
+                    tensor: normalised,
+                    unpadded_shape: shape,
+                })
+            }
+        }
     }
 
     pub(crate) fn softmax(self, dim: usize) -> Result<Self> {
@@ -1750,17 +1901,17 @@ impl WrappedTensor<f32> {
             }
         }
     }
+
+    /// Squares the tensor element-wise.
+    pub fn square(self) -> Self {
+        delegate!(self, square)
+    }
 }
 
 impl WrappedTensor<Element> {
     /// Applies the bitwise right shift operation with the scalar.
     pub(crate) fn bitwise_right_shift_scalar(self, other: Element) -> Self {
         delegate!(self, bitwise_right_shift_scalar, other)
-    }
-
-    /// Applies the bitwise left shift operation with the scalar.
-    pub(crate) fn bitwise_left_shift_scalar(self, other: Element) -> Self {
-        delegate!(self, bitwise_left_shift_scalar, other)
     }
 
     /// Convert the element tensor into a float tensor.
@@ -1818,6 +1969,13 @@ impl Quantize for WrappedTensor<f32> {
             .round()
             .int()
             .clamp(min, max)
+    }
+}
+
+impl Dequantize for WrappedTensor<Element> {
+    type Output = WrappedTensor<f32>;
+    fn dequantize(&self, scaling: &ScalingFactor) -> Self::Output {
+        self.clone().float().mul_scalar(scaling.scale())
     }
 }
 
@@ -2047,6 +2205,15 @@ impl TensorTypeParam for Element {
     }
 }
 
+impl<T> AsRef<WrappedTensor<T>> for WrappedTensor<T>
+where
+    T: TensorTypeParam,
+{
+    fn as_ref(&self) -> &WrappedTensor<T> {
+        self
+    }
+}
+
 impl<T> TryFrom<&Tensor<T>> for WrappedTensor<T>
 where
     T: TensorTypeParam,
@@ -2099,8 +2266,9 @@ where
 
     fn try_from(tensor: &WrappedTensor<T>) -> Result<Self, Self::Error> {
         let shape = tensor.shape().into();
+        let unpadded_shape = tensor.unpadded_shape().into();
         let data = tensor.get_data();
-        Tensor::<T>::new(shape, data)
+        Tensor::<T>::new_with_unpadded_shape(shape, unpadded_shape, data)
     }
 }
 
@@ -2211,6 +2379,51 @@ where
         WrappedTensor::Rank4 {
             tensor,
             unpadded_shape,
+        }
+    }
+}
+
+impl<T> TryFrom<TensorData> for WrappedTensor<T>
+where
+    T: TensorTypeParam,
+{
+    type Error = anyhow::Error;
+
+    fn try_from(data: TensorData) -> Result<Self, Self::Error> {
+        match data.shape.len() {
+            1 => {
+                let tensor = BTensor::from_data(data, &Default::default());
+                let unpadded_shape = tensor.shape().clone();
+                Ok(WrappedTensor::Rank1 {
+                    tensor,
+                    unpadded_shape,
+                })
+            }
+            2 => {
+                let tensor = BTensor::from_data(data, &Default::default());
+                let unpadded_shape = tensor.shape().clone();
+                Ok(WrappedTensor::Rank2 {
+                    tensor,
+                    unpadded_shape,
+                })
+            }
+            3 => {
+                let tensor = BTensor::from_data(data, &Default::default());
+                let unpadded_shape = tensor.shape().clone();
+                Ok(WrappedTensor::Rank3 {
+                    tensor,
+                    unpadded_shape,
+                })
+            }
+            4 => {
+                let tensor = BTensor::from_data(data, &Default::default());
+                let unpadded_shape = tensor.shape().clone();
+                Ok(WrappedTensor::Rank4 {
+                    tensor,
+                    unpadded_shape,
+                })
+            }
+            _ => bail!("Unexpected tensor rank: {}", data.shape.len()),
         }
     }
 }

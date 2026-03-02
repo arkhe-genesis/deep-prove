@@ -14,7 +14,10 @@ use zkml::{
     parser::{
         file_cache,
         gguf::RawGGUF,
-        llm::models::{gemma3::Gemma3, gpt2::GPT2},
+        llm::{
+            models::{gemma3::Gemma3, gpt2::GPT2},
+            tokenizer::TokenizerLoader,
+        },
         safe::RawSafeTensors,
     },
 };
@@ -96,6 +99,10 @@ struct LLMArgs {
     /// Profile distributed execution
     #[arg(long, default_value_t = false)]
     distributed: bool,
+
+    /// Use improved accuracy model quantisation and transforms
+    #[arg(long, default_value_t = false)]
+    accuracy: bool,
 }
 
 const HEADER_MODEL: &str = "model_name";
@@ -157,19 +164,36 @@ fn main() -> anyhow::Result<()> {
             .join(", ")
     );
 
-    let driver = if let Some(gguf) = args.gguf {
+    let (driver, tokeniser) = if let Some(gguf) = args.gguf {
         let model_path = file_cache::from_cache(&gguf)?;
         match args.model {
             Model::GPT2 => {
-                Driver::load_from_model(GPT2::new(), &RawGGUF::new(model_path), Some(max_context))?
+                let model_type = GPT2::new();
+                let raw_gguf = RawGGUF::new(model_path);
+                (
+                    Driver::load_from_model(model_type, &raw_gguf, Some(max_context))?,
+                    model_type.load_tokenizer(&raw_gguf)?,
+                )
             }
             _ => bail!("Model {:?} not supported for gguf", args.model),
         }
     } else if let Some(hf) = args.hf {
         let safe = RawSafeTensors::from_hugging_face_cached(&hf)?;
         match args.model {
-            Model::GPT2 => Driver::load_from_model(GPT2::new(), &safe, Some(max_context))?,
-            Model::Gemma3 => Driver::load_from_model(Gemma3::new(), &safe, Some(max_context))?,
+            Model::GPT2 => {
+                let model_type = GPT2::new();
+                (
+                    Driver::load_from_model(model_type, &safe, Some(max_context))?,
+                    model_type.load_tokenizer(&safe)?,
+                )
+            }
+            Model::Gemma3 => {
+                let model_type = Gemma3::new();
+                (
+                    Driver::load_from_model(model_type, &safe, Some(max_context))?,
+                    model_type.load_tokenizer(&safe)?,
+                )
+            }
         }
     } else {
         bail!("Either gguf or hf must be provided");
@@ -178,8 +202,18 @@ fn main() -> anyhow::Result<()> {
     let mut premeasure = Measure::new()
         .with(HEADER_MODEL, &args.model.to_string())
         .with(HEADER_NUM_THREADS, &num_threads.to_string());
-    let (mut driver, _metadata) =
-        premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?;
+    let (mut driver, _metadata) = if !args.accuracy {
+        premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?
+    } else {
+        match args.model {
+            Model::GPT2 => premeasure.r(HEADER_MODEL_QUANT, || {
+                driver.into_provable_llm_with_transform::<GPT2>(&tokeniser)
+            })?,
+            Model::Gemma3 => premeasure.r(HEADER_MODEL_QUANT, || {
+                driver.into_provable_llm_with_transform::<Gemma3>(&tokeniser)
+            })?,
+        }
+    };
     let (prover_ctx, mut verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
         premeasure.r(HEADER_CONTEXT_GENERATION, || driver.context())?;
 
@@ -220,6 +254,7 @@ fn main() -> anyhow::Result<()> {
 
         let proof_size = rmp_serde::to_vec(&proof)?.len();
         measure::set(HEADER_PROOF_SIZE, proof_size);
+
         verifier_ctx = verifier_ctx.with_max_context(max_ctx);
         verifier_ctx
             .verify(proof, user_tokens, io)

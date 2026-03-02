@@ -3,32 +3,13 @@
 use crate::{
     ScalingFactor,
     layers::{provable::QuantizeOutput, requant::Requant},
-    quantization::{self, Quantize, bias_scaling_matmul},
+    quantization::{self, Quantize, bias_scaling, model_scaling_factor_from_tensor_and_bias},
 };
 
 use super::*;
 
 use itertools::izip;
 use multilinear_extensions::util::ceil_log2;
-
-/// Returns the scaling factors for the main tensor and for the bias tensor. These are the "model" scaling factors, or
-/// S2 in the formula S1 * S2 / S3.
-pub fn model_scaling_factor_from_tensor_and_bias(
-    input: &ScalingFactor,
-    main: &TensorHandle<f32>,
-    bias: Option<&TensorHandle<f32>>,
-) -> anyhow::Result<(ScalingFactor, ScalingFactor)> {
-    let max_weight = main.max_abs()?;
-    let max_value = if let Some(bias) = bias {
-        let max_bias = bias.max_abs()?;
-        max_weight.max(max_bias)
-    } else {
-        max_weight
-    };
-    let main_sf = ScalingFactor::from_absolute_max(max_value, None);
-    let bias_sf = bias_scaling_matmul(input, &main_sf);
-    Ok((main_sf, bias_sf))
-}
 
 impl EinSum<f32> {
     pub(crate) fn quantise(
@@ -76,16 +57,15 @@ impl EinSum<f32> {
         // Calculates the amount of bits the contraction will add to the output values
         let contracted_size = self.mapping.axes_sizes(&full_shapes)?[AxisType::Contracted];
         let contraction_bits = ceil_log2(contracted_size);
-        let (lhs_min, lhs_max) = lhs_input_scaling.domain();
-        let lhs_bit_size = ceil_log2(lhs_max.abs().max(lhs_min.abs()) as usize);
+        let lhs_bit_size = lhs_input_scaling.bit_size();
 
         // Now we can iterate through the rhs (that are either constant tensors or inputs) and calculate the requant info for each
-        let (requants, quant_weights, quant_biases, output_scalings) = izip!(
+        let (requants, quant_weights, quant_biases, output_scaling_factors) = izip!(
             self.constant_tensors.iter(),
             self.biases.iter(),
             output_scaling_factors.iter()
         )
-        .fold(
+        .try_fold(
             (vec![], vec![], vec![], vec![]),
             |(mut requants, mut weight, mut bias, mut output_scalings),
              (weight_opt, bias_opt, output_scaling)| {
@@ -95,13 +75,13 @@ impl EinSum<f32> {
                     lhs_bit_size + *quantization::BIT_LEN + contraction_bits
                 };
                 if let Some(weight_tensor) = weight_opt {
-                    // In this case we have to calculate the scaling factor for the RHS
+                    let weight_max_abs = weight_tensor.max_abs()?;
+
                     let (weight_scaling, bias_scaling) = model_scaling_factor_from_tensor_and_bias(
                         &lhs_input_scaling,
-                        weight_tensor,
-                        bias_opt.as_ref(),
-                    )
-                    .unwrap();
+                        weight_max_abs,
+                        intermediate_bit_size - 1,
+                    );
                     let quantized_weight = weight_tensor.quantize(&weight_scaling);
                     let quantized_bias = bias_opt.as_ref().map(|bias| bias.quantize(&bias_scaling));
                     // If `self.requantise` is set to `true` we include a requantisation step after evaluation
@@ -136,24 +116,27 @@ impl EinSum<f32> {
                     let rhs_input_scaling = *input_scalings_iter
                         .next()
                         .expect("Missing input scaling factor for einsum input tensor");
-                    let (rhs_min, rhs_max) = rhs_input_scaling.domain();
-                    let rhs_bit_size = ceil_log2(rhs_max.abs().max(rhs_min.abs()) as usize);
+
+                    let rhs_bit_size = rhs_input_scaling.bit_size();
                     let intermediate_bit_size = if bias_opt.is_some() {
-                        lhs_bit_size + rhs_bit_size + contraction_bits + 1 // If we have a bias we need an extra bit for the addition
+                        lhs_bit_size + rhs_bit_size + contraction_bits + 2 // If we have a bias we need an extra bit for the addition
                     } else {
-                        lhs_bit_size + rhs_bit_size + contraction_bits
+                        lhs_bit_size + rhs_bit_size + contraction_bits + 1
                     };
-                    let bias_scaling = bias_scaling_matmul(&lhs_input_scaling, &rhs_input_scaling);
+                    let bias_scaling = bias_scaling(
+                        &lhs_input_scaling,
+                        &rhs_input_scaling,
+                        intermediate_bit_size - 1,
+                    );
                     let quantized_bias = bias_opt.as_ref().map(|bias| bias.quantize(&bias_scaling));
                     // If `self.requantise` is set to `true` we include a requantisation step after evaluation
-                    if self.requantise() {
+                    if self.requantise {
                         let requant = Requant::from_scaling_factors(
                             lhs_input_scaling,
                             rhs_input_scaling,
                             *output_scaling,
                             intermediate_bit_size,
                         );
-
                         requants.push(requant);
                         output_scalings.push(*output_scaling);
                     } else {
@@ -170,13 +153,17 @@ impl EinSum<f32> {
                         );
                         output_scalings.push(updated_scaling);
                     }
-
                     weight.push(None);
                     bias.push(quantized_bias);
                 }
-                (requants, weight, bias, output_scalings)
+                Result::<(
+                    Vec<Requant>,
+                    Vec<Option<TensorHandle<Element>>>,
+                    Vec<Option<TensorHandle<Element>>>,
+                    Vec<ScalingFactor>,
+                )>::Ok((requants, weight, bias, output_scalings))
             },
-        );
+        )?;
 
         let caches = self
             .caches
@@ -197,6 +184,7 @@ impl EinSum<f32> {
 
         let quantized_op = EinSum {
             equation: self.equation,
+            name: self.name,
             mapping: self.mapping,
             evaluation_info: self.evaluation_info,
             constant_tensors: quant_weights,
@@ -209,9 +197,9 @@ impl EinSum<f32> {
         };
 
         if !requants.is_empty() {
-            QuantizeOutput::new(quantized_op, output_scalings).with_requants(requants)
+            QuantizeOutput::new(quantized_op, output_scaling_factors).with_requants(requants)
         } else {
-            Ok(QuantizeOutput::new(quantized_op, output_scalings))
+            Ok(QuantizeOutput::new(quantized_op, output_scaling_factors))
         }
     }
 }
