@@ -224,7 +224,7 @@ fn main() -> anyhow::Result<()> {
         measure::set(HEADER_MAX_CONTEXT, max_ctx.to_string());
         measure::set(HEADER_MIN_USER_LEN, user_prompt.to_string());
 
-        driver = driver.with_max_context(max_ctx);
+        driver.with_max_context(max_ctx);
         let user_tokens = driver.random_sequence(user_prompt);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
         let trace = measure::r(HEADER_INFERENCE_TIME, || {

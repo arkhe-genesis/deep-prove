@@ -279,10 +279,14 @@ where
     N: TensorTypeParam,
     Layer<N>: Evaluate<N>,
 {
-    /// Sets the `max_context` window for this drivef.
-    pub fn with_max_context(mut self, max_context: usize) -> Self {
+    /// Returns the current `max_context` window, if set.
+    pub fn max_context(&self) -> Option<usize> {
+        self.max_context
+    }
+
+    /// Sets the `max_context` window for this driver.
+    pub fn with_max_context(&mut self, max_context: usize) {
         self.max_context = Some(max_context);
-        self
     }
 
     /// Returns a sequence of `len` random tokens.
@@ -396,6 +400,9 @@ where
         HandleLifetimeRunner<I, N>: LayerRunner<N, ()>,
         I: LayerRunner<N, RunInput<N>>,
     {
+        // Reset the model
+        self.model.reset();
+
         let input_data = input_tensor.data().to_vec();
         let num_input_tokens = input_data.len();
 
@@ -618,7 +625,7 @@ where
             );
         }
 
-        // Reset the model, so it can be reused.
+        // Reset the model so it can be reused.
         self.model.reset();
 
         Ok(trace)

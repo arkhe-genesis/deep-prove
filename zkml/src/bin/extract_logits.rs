@@ -304,8 +304,8 @@ where
     } else {
         args.num_tokens + user_tokens.len()
     };
-    let driver =
-        Driver::load_from_model(model_type.clone(), &format, None)?.with_max_context(max_context);
+    let mut driver = Driver::load_from_model(model_type.clone(), &format, None)?;
+    driver.with_max_context(max_context);
     if args.sample_size != 0 {
         let chunked_tokens = user_tokens
             .chunks_exact(args.sample_size + 1)
@@ -370,9 +370,9 @@ where
         );
         driver.model.reset();
 
-        let (driver_int, metadata) = driver.into_provable_llm_with_transform::<M>(&tokenizer)?;
-
-        let driver_int = driver_int.with_max_context(max_context);
+        let (mut driver_int, metadata) =
+            driver.into_provable_llm_with_transform::<M>(&tokenizer)?;
+        driver_int.with_max_context(max_context);
 
         // Run provable mode
         let logits_int = run_generation::<_, _>(

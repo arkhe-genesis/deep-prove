@@ -68,6 +68,21 @@ impl InferenceEngine {
         }
     }
 
+    /// Returns the LLM Driver's max_context, if this is an LLM engine.
+    pub fn llm_max_context(&self) -> Option<usize> {
+        match self {
+            InferenceEngine::LLM(driver) => driver.max_context(),
+            InferenceEngine::Generic(_) => None,
+        }
+    }
+
+    /// Update the max_context window for LLM inference.
+    pub fn set_llm_max_context(&mut self, max_context: usize) {
+        if let InferenceEngine::LLM(driver) = self {
+            driver.with_max_context(max_context);
+        }
+    }
+
     /// Necessary to return the raw model when doing the proving - as proving is the same
     /// for both generic and LLM models
     pub fn model(&self) -> &Model<Element> {
@@ -133,6 +148,11 @@ where
     /// Get a reference to the inference engine.
     pub fn engine(&self) -> &InferenceEngine {
         &self.engine
+    }
+
+    /// Update the LLM max_context window on the underlying inference engine.
+    pub fn set_llm_max_context(&mut self, max_context: usize) {
+        self.engine.set_llm_max_context(max_context);
     }
 
     /// Build the full execution graph context from `SerializableGraphCtx`,

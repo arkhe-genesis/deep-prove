@@ -147,6 +147,9 @@ pub struct AggregationJob {
     pub aggregation_partition: Option<String>,
     /// User input tokens for verification (LLM).
     pub user_tokens: Option<Vec<usize>>,
+    /// Max context window for LLMs.
+    #[serde(default)]
+    pub max_context: Option<usize>,
 }
 
 /// Runtime data for aggregation proving constructed from [`AggregationJob`]
@@ -156,12 +159,15 @@ pub struct AggregationPayload {
     pub expected_chunks: usize,
     pub chunk_proofs: Vec<String>,
     pub serialized_verifier_ctx: String,
+    pub graph_ctx_key: String,
     /// Resolved context bytes
     pub ctx: ChunkContext,
     /// Partition data for running the aggregation step.
     pub aggregation_partition: String,
     /// User input tokens for verification (LLM).
     pub user_tokens: Option<Vec<usize>>,
+    /// Max context window for LLMs.
+    pub max_context: Option<usize>,
 }
 
 impl AggregationPayload {
@@ -176,9 +182,11 @@ impl AggregationPayload {
             expected_chunks: job.expected_chunks,
             chunk_proofs: job.chunk_proofs,
             serialized_verifier_ctx: job.serialized_verifier_ctx,
+            graph_ctx_key: job.graph_ctx_key,
             ctx,
             aggregation_partition,
             user_tokens: job.user_tokens,
+            max_context: job.max_context,
         }
     }
 }

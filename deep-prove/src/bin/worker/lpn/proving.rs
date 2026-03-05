@@ -1,5 +1,5 @@
 use super::ModelFetcher;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use deep_prove::middleware::{llm, v1, v2};
 use ff_ext::GoldilocksExt2;
@@ -10,7 +10,7 @@ use tracing::{Instrument, info, info_span, warn};
 use transcript::BasicTranscript;
 use zkml::{
     graph::{
-        executor::ThreadPoolExecutor,
+        executor::SequentialExecutor,
         partition::{Partition, PartitionScheduler},
     },
     iop::{context::VerifierContext, prover_graph::ProverGraphIO},
@@ -44,9 +44,10 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
     let ctx_bytes = chunk.ctx.as_bytes();
 
     info!(
-        "run_chunk_partition: starting chunk {} (is_llm={}, ctx_bytes len={}, partition len={})",
+        "run_chunk_partition: starting chunk {} (is_llm={}, requested_max_context={:?}, ctx_bytes len={}, partition len={})",
         chunk.chunk_id,
         chunk.is_llm(),
+        chunk.max_context,
         ctx_bytes.len(),
         chunk.partition.len(),
     );
@@ -55,6 +56,27 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
         let _guard = info_span!("deserialize_ctx", bytes = ctx_bytes.len()).entered();
         rmp_serde::from_slice(ctx_bytes).context("failed to deserialize SerializableGraphCtx")?
     };
+
+    // explicitly check consistency to avoid failures later which are harder to debug.
+    if chunk.is_llm() {
+        let requested_max_context = chunk.max_context.ok_or_else(|| {
+            anyhow!(
+                "missing max_context for LLM chunk {} (plan_id={})",
+                chunk.chunk_id,
+                chunk.plan_id
+            )
+        })?;
+        let graph_ctx_max_context = ctx.engine().llm_max_context();
+
+        ensure!(
+            graph_ctx_max_context == Some(requested_max_context),
+            "LLM max_context mismatch for chunk {} (plan_id={}): requested={}, graph_ctx={:?}",
+            chunk.chunk_id,
+            chunk.plan_id,
+            requested_max_context,
+            graph_ctx_max_context,
+        );
+    }
 
     let mut partitions: Vec<ChunkPartition> = {
         let _guard = info_span!("deserialize_partitions").entered();
@@ -79,11 +101,11 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
         partitions.retain(|p| !p.child_partition.is_empty());
     }
 
-    // Create the partition scheduler with ThreadPoolExecutor for parallel execution
+    // Create the partition scheduler with SequentialExecutor.
     let mut scheduler = {
         let _guard = info_span!("build_scheduler", num_partitions = partitions.len()).entered();
         let tenstore_for_ctx = tenstore.clone();
-        PartitionScheduler::<_, _, ThreadPoolExecutor>::new(
+        PartitionScheduler::<_, _, SequentialExecutor>::new(
             partitions,
             ctx.to_full_ctx(tenstore_for_ctx),
             (),
@@ -226,7 +248,12 @@ pub(super) async fn process_job(
     match job.payload {
         // Handle aggregation jobs
         v2::JobPayload::Aggregation(ref agg_job) => {
-            let span = info_span!("process_aggregation", plan_id = %agg_job.plan_id);
+            let span = info_span!(
+                "process_aggregation",
+                plan_id = %agg_job.plan_id,
+                graph_ctx_key = %agg_job.graph_ctx_key,
+                llm_max_context = ?agg_job.max_context
+            );
 
             async {
                 // Decode and process chunk outputs to extract ChunkProofs and ModelIO
@@ -287,7 +314,6 @@ pub(super) async fn process_job(
                     ctx,
                     aggregation_partition.clone(),
                 );
-
                 let tenstore_for_agg = tenstore.with_run_id(&agg.plan_id);
 
                 let chunk_payload = {
@@ -341,11 +367,15 @@ pub(super) async fn process_job(
                         is_source: false,
                         dependency_outputs,
                         user_tokens: agg.user_tokens.clone(),
-                        max_context: None,
+                        max_context: agg.max_context,
                     }
                 };
 
-                let result = run_chunk_partition(chunk_payload, tenstore_for_agg)?;
+                let result = tokio::task::spawn_blocking(move || {
+                    run_chunk_partition(chunk_payload, tenstore_for_agg)
+                })
+                .await
+                .context("aggregation partition task panicked")??;
 
                 let _guard = info_span!("serialize_aggregated_proof").entered();
 
@@ -415,7 +445,13 @@ pub(super) async fn process_job(
 
         // Handle chunk jobs
         v2::JobPayload::Chunk(job) => {
-            let span = info_span!("process_chunk", plan_id = %job.plan_id, chunk_id = job.chunk_id);
+            let span = info_span!(
+                "process_chunk",
+                plan_id = %job.plan_id,
+                chunk_id = job.chunk_id,
+                graph_ctx_key = %job.graph_ctx_key,
+                llm_max_context = ?job.max_context
+            );
 
             async {
                 let ctx = resolve_context(
@@ -431,7 +467,9 @@ pub(super) async fn process_job(
                 // Set run_id from plan_id so all chunks share the same tensor store namespace
                 let tenstore_for_chunk = tenstore.with_run_id(&chunk.plan_id);
 
-                run_chunk_partition(chunk, tenstore_for_chunk)
+                tokio::task::spawn_blocking(move || run_chunk_partition(chunk, tenstore_for_chunk))
+                    .await
+                    .context("chunk partition task panicked")?
             }
             .instrument(span)
             .await
