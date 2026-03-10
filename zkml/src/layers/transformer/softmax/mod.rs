@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_softmax_proving() {
-        let dim_size = 5;
+        let dim_size = 520;
         let input_shape = vec![3, dim_size, dim_size];
 
         let mut model =

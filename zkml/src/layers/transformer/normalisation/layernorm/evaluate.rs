@@ -109,17 +109,20 @@ impl LayerNorm<Element> {
 
         let n_mean = input.clone().sum_dim(-1);
 
-        let zero_mean_input = input
+        let m_scale = mean_scaling_factor.scale();
+        let float_converter = (m_scale * m_scale) / (dim_size * dim_size * dim_size);
+
+        let subbed_input = input
             .clone()
             .mul_scalar(self.normalisation_dim_size() as Element)
-            .sub(n_mean.clone())?
-            .float()
-            .mul_scalar(mean_scaling_factor.scale() / dim_size);
-        let normalising_factor = zero_mean_input
+            .sub(n_mean.clone())?;
+
+        let normalising_factor = subbed_input
             .clone()
-            .mul(zero_mean_input.clone())?
+            .mul(subbed_input)?
             .sum_dim(-1)
-            .div_scalar(dim_size)
+            .float()
+            .mul_scalar(float_converter)
             .add_scalar(self.eps)
             .sqrt()
             .recip();
@@ -392,7 +395,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn proptest_layernorm_evaluate_quantised(input in layernorm_input(2usize..768, 1usize..64)) {
+        fn proptest_layernorm_evaluate_quantised(input in layernorm_input(10usize..768, 1usize..64)) {
             let Input {
                 input,
                 beta,

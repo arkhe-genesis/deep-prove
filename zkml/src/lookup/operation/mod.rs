@@ -423,6 +423,35 @@ pub(crate) mod lookup_test_utils {
         }
     }
 
+    /// Utility function used in debugging to compute the unpadded lookup witness output.
+    #[allow(dead_code)]
+    pub(crate) fn compute_unpadded_witness_output<L>(
+        lookup_op: &L,
+        unpadded_shape: &Shape,
+        witness: &LookupOpWitness,
+        table: &Table,
+    ) -> Result<Tensor<Element>>
+    where
+        L: LookupOp,
+    {
+        let chunking_info = lookup_op.chunking_info(table)?;
+        let mut full_output_chunks = Vec::<Element>::new();
+
+        for output_chunk in witness.chunked_outputs.iter() {
+            full_output_chunks.extend(chunking_info.combine_outputs(output_chunk));
+        }
+
+        let rank = unpadded_shape.rank();
+        let (non_padded, padded) = unpadded_shape.split_at(rank.saturating_sub(2));
+        let tmp_shape = non_padded
+            .iter()
+            .copied()
+            .chain(padded.iter().map(|d| d.next_power_of_two()))
+            .collect::<Shape>();
+
+        Tensor::new(tmp_shape, full_output_chunks)?.reduce_to_shape(unpadded_shape)
+    }
+
     /// Utility function used in debugging to compare the lookup witness output with the layer evaluate output.
     #[allow(dead_code)]
     pub(crate) fn compare_output_and_witness<L>(
@@ -435,23 +464,9 @@ pub(crate) mod lookup_test_utils {
     where
         L: LookupOp,
     {
-        let chunking_info = lookup_op.chunking_info(table)?;
-        let mut full_output_chunks = Vec::<Element>::new();
-
-        for output_chunk in witness.chunked_outputs.iter() {
-            full_output_chunks.extend(chunking_info.combine_outputs(output_chunk));
-        }
-
         let unpadded_shape = output.unpadded_shape();
-        let rank = unpadded_shape.rank();
-        let (non_padded, padded) = unpadded_shape.split_at(rank.saturating_sub(2));
-        let tmp_shape = non_padded
-            .iter()
-            .copied()
-            .chain(padded.iter().map(|d| d.next_power_of_two()))
-            .collect::<Shape>();
         let witness_output_tensor =
-            Tensor::new(tmp_shape, full_output_chunks)?.reduce_to_shape(unpadded_shape)?;
+            compute_unpadded_witness_output(lookup_op, unpadded_shape, witness, table)?;
 
         let multi_cartesian = unpadded_shape
             .iter()
