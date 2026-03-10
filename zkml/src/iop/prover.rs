@@ -216,7 +216,7 @@ where
             let table_node_id = self.ctx.commitment_ctx.table_node_id();
             let multiplicity_witness = self
                 .lookup_witness(table_node_id)
-                .context("No mutliplicity commitment found during table proving")?;
+                .context("No multiplicity commitment found during table proving")?;
             let logup_inputs = lookup_ctx
                 .create_logup_inputs::<PCS, E>(multiplicity_witness, &self.challenge_storage)?;
             let multiplicity_commit = PCS::get_pure_commitment(multiplicity_witness);
@@ -642,11 +642,9 @@ where
                     output_edge.ports().len()
                 );
                 let source_port = &output_edge.ports()[0].source_port;
-                let output_tensor ={
-                    let output_tensor_guard = trace_step.output_tensor_at(
-                        **source_port,
-                    )?;
-                    output_tensor_guard.to_field()
+                let output_tensor: Tensor<E> = {
+                    let tensor = trace_step.output_tensor_at(**source_port)?;
+                    tensor.to_field().pad_next_power_of_two()
                 };
                 ensure!(
                     outputs.insert(output_id, output_tensor).is_none(),
@@ -681,11 +679,12 @@ where
                 edge.ports().iter().try_for_each(|port| {
                     let source_port = NodeOutput::new(*source_node_id, port.source_port);
                     if let std::collections::btree_map::Entry::Vacant(e) = claims_map.entry(source_port) {
-                         // compute new claim and insert in cache
-                         let output_tensor = trace_step.output_tensor_at(
+                         // Convert to field first, then pad
+                         let tensor = trace_step.output_tensor_at(
                              port.source_port.into(),
                          )?;
-                         e.insert(output_tensor);
+                         let output_field: Tensor<E> = tensor.to_field().pad_next_power_of_two();
+                         e.insert(output_field);
                     }
                     anyhow::Ok(())
                 })?;
@@ -693,7 +692,7 @@ where
             })?
             .into_iter() // then, we compute the claims for each output
             .map(|(port, tensor)| {
-                let claim = compute_claim(self.transcript, tensor.to_field());
+                let claim = compute_claim(self.transcript, tensor);
                 (port, claim)
         }).collect();
         // each layer generates claims about its inputs. Each claim is indexed by
@@ -711,20 +710,12 @@ where
                         .ok_or(anyhow!("Node {node_id} not found in model"))?;
                     trace!("Proving node with id {node_id}: {:?}", op.describe());
 
-                    // Load all output tensors and convert to target field
+                    // Load all output tensors, convert to field, then pad
                     let handles = section
-                        .node_outputs
-                        .outputs
-                        .iter()
-                        .map(|handle| {
-                            handle
-                                .tensor()
-                                .with_context(|| {
-                                    format!("hydrating tensor {}", handle.storage_key())
-                                })
-                                .map(|tensor_guard| tensor_guard.to_field())
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?;
+                        .output_tensors()?
+                        .into_iter()
+                        .map(|tensor| tensor.to_field().pad_next_power_of_two())
+                        .collect::<Vec<_>>();
 
                     // The claims for this node, i.e. the claims stemming from
                     // the input nodes of the successor nodes connected to this

@@ -138,7 +138,7 @@ where
         Layer<N>: Evaluate<N>;
 }
 
-/// Base layer runnner.
+/// Base layer runner.
 ///
 /// This runner bridges the use of [TensorHandle]s and [WrappedTensor]s used to
 /// run the layers.
@@ -1094,7 +1094,6 @@ where
     ///     `Node::Output(output_id)`, and sample their value on input port 0;
     graph: ModelGraph<N>,
     input_shapes: Vec<Shape>,
-    unpadded_input_shapes: Vec<Shape>,
 }
 
 impl<N> Model<N>
@@ -1116,9 +1115,8 @@ where
         self.graph
     }
 
-    pub fn set_shapes(&mut self, input_shapes: Vec<Shape>, unpadded_input_shapes: Vec<Shape>) {
+    pub fn set_input_shapes(&mut self, input_shapes: Vec<Shape>) {
         self.input_shapes = input_shapes;
-        self.unpadded_input_shapes = unpadded_input_shapes;
     }
 
     /// Returns an iterator over the nodes in the model, in arbitrary order.
@@ -1128,63 +1126,37 @@ where
         self.graph.nodes()
     }
 
-    /// Instantiate a model with the given input shape: the `padding` input specifies whether
-    /// the provided inputs shapes should be padded or not.
+    /// Instantiate a model with the given input shapes (always unpadded).
     ///
     /// A corresponding number of input nodes is automatically generated.
-    pub fn new_from_input_shapes(unpadded_input_shapes: Vec<Shape>, padding: PaddingMode) -> Self {
+    pub fn new_from_input_shapes(input_shapes: Vec<Shape>) -> Self {
         let mut graph = ModelGraph::new();
-        for i in 0..unpadded_input_shapes.len() {
+        for i in 0..input_shapes.len() {
             graph.add_input(i).unwrap();
         }
-
-        let input_shapes = match padding {
-            PaddingMode::NoPadding => unpadded_input_shapes.clone(),
-            PaddingMode::Padding => unpadded_input_shapes.next_power_of_two(),
-        };
 
         Self {
             graph,
             input_shapes,
-            unpadded_input_shapes,
         }
     }
 
-    pub(crate) fn new(
-        unpadded_input_shapes: Vec<Shape>,
-        padding: PaddingMode,
-        nodes: ModelGraph<N>,
-    ) -> Self {
-        let mut model = Self::new_from_input_shapes(unpadded_input_shapes, padding);
+    pub(crate) fn new(input_shapes: Vec<Shape>, nodes: ModelGraph<N>) -> Self {
+        let mut model = Self::new_from_input_shapes(input_shapes);
         model.graph = nodes;
 
         model
     }
 
-    /// Instantiate a model from the set of nodes and the input shapes.
-    /// `actual_input_shapes` correspond to the expected shape of the input
-    /// tensors for the model; therefore, `actual_input_shapes` can be the same
-    /// as `unpadded_input_shapes` if the input tensors of the model are
-    /// not expected to be padded
-    pub fn new_from_shapes(
-        unpadded_input_shapes: Vec<Shape>,
-        actual_input_shapes: Vec<Shape>,
-        nodes: ModelGraph<N>,
-    ) -> Self {
+    /// Instantiate a model from the set of nodes and the input shapes (always unpadded).
+    pub fn new_from_shapes(input_shapes: Vec<Shape>, nodes: ModelGraph<N>) -> Self {
         Self {
-            unpadded_input_shapes,
-            input_shapes: actual_input_shapes,
+            input_shapes,
             graph: nodes,
         }
     }
 
-    /// Get the shapes of the input tensors, not padded
-    pub(crate) fn unpadded_input_shapes(&self) -> Vec<Shape> {
-        self.unpadded_input_shapes.clone()
-    }
-
-    /// Get the actual input shapes, which could be padded or unpadded
-    /// depending on how the model was instantiated
+    /// Get the input shapes (always unpadded)
     pub fn input_shapes(&self) -> Vec<Shape> {
         self.input_shapes.clone()
     }
@@ -1252,10 +1224,10 @@ where
     /// Textual description of the model
     pub fn describe(&self) {
         info!("Model description:");
-        info!("Unpadded input shapes: {:?}", self.unpadded_input_shapes);
+        info!("Input shapes: {:?}", self.input_shapes);
         info!(
             "Padded input shapes: {:?}",
-            self.unpadded_input_shapes.next_power_of_two(),
+            self.input_shapes.next_power_of_two(),
         );
 
         for (id, layer) in self.graph.forward_inners() {
@@ -1300,7 +1272,7 @@ where
     pub fn load_input_flat(&self, input: Vec<Vec<N>>) -> Result<Vec<Tensor<N>>> {
         let input_tensor: Result<Vec<_>> = input
             .into_iter()
-            .zip(self.unpadded_input_shapes())
+            .zip(self.input_shapes())
             .map(|(inp, shape)| Tensor::new(shape, inp))
             .collect();
         self.prepare_inputs(input_tensor?)
@@ -1686,7 +1658,6 @@ pub(crate) mod test {
             let mut last_row: usize = rng.gen_range(3..15);
             let mut model = Model::<f32>::new_from_input_shapes(
                 vec![vec![last_row].into()],
-                PaddingMode::NoPadding,
             );
 
             let mut last_node_id = None;
@@ -1757,7 +1728,6 @@ pub(crate) mod test {
 
             let mut model = Model::<f32>::new_from_input_shapes(
                 vec![input_shape.clone()],
-                PaddingMode::NoPadding,
             );
 
             let info = Maxpool2D::default();
@@ -1809,7 +1779,7 @@ pub(crate) mod test {
         let bias1 = KeyedTensor::new("conv_bias", Tensor::random(&vec![shape1[0]].into()));
 
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::Padding);
+            Model::new_from_input_shapes(vec![input_shape.clone()]);
         let conv_layer = model
             .add_consecutive_layer(
                 Layer::Convolution(
@@ -1833,9 +1803,9 @@ pub(crate) mod test {
         // we can just do model.prepare_input(&input).
         // Here is not possible since we didnt run through the onnx loader
         let input = Tensor::random(&input_shape);
-        let inputs_padded = model.prepare_inputs(vec![input]).unwrap();
+        let inputs = model.prepare_inputs(vec![input]).unwrap();
 
-        let _ = model.run(inputs_padded, &mut Default::default()).unwrap();
+        let _ = model.run(inputs, &mut Default::default()).unwrap();
     }
 
     #[test]
@@ -1860,7 +1830,7 @@ pub(crate) mod test {
             .clone();
 
         let mut model =
-            Model::<Element>::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
+            Model::<Element>::new_from_input_shapes(vec![input_shape]);
         let first_id = model
             .add_consecutive_layer(Layer::EinSum(dense1.clone()), None)
             .unwrap();
@@ -1916,7 +1886,7 @@ pub(crate) mod test {
         );
         let input_shape = vec![k_x, n_x, n_x].into();
 
-        let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::Padding);
+        let mut model = Model::new_from_input_shapes(vec![input_shape]);
         let input = Tensor::random(&model.input_shapes()[0]);
         let bias = KeyedTensor::new("conv_bias", Tensor::random(&vec![conv1.dim(0)].into()));
         let conv_layer = Convolution::new(conv1.clone(), bias.clone())
@@ -1964,7 +1934,7 @@ pub(crate) mod test {
     fn build_test_model<N: TensorTypeParam, const INPUT_SIZE: usize>() -> Model<N> {
         let input_shape: Shape = vec![INPUT_SIZE].into();
         let mut model =
-            Model::<N>::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
+            Model::<N>::new_from_input_shapes(vec![input_shape.clone()]);
         // add input dense layer
         // generate random dense matrix
         let ncols = input_shape[0];
@@ -1975,7 +1945,7 @@ pub(crate) mod test {
         );
 
         let dense_out_shape = &dense
-            .output_shapes(&model.unpadded_input_shapes(), PaddingMode::NoPadding)
+            .output_shapes(&model.input_shapes(), PaddingMode::NoPadding)
             .unwrap()[0];
         let input_node = model
             .add_consecutive_layer(
@@ -2127,7 +2097,7 @@ pub(crate) mod test {
             vec![FIRST_INPUT_SIZE].into(),
             vec![SECOND_INPUT_SIZE].into(),
         ];
-        let mut model = Model::<f32>::new_from_input_shapes(input_shapes, PaddingMode::NoPadding);
+        let mut model = Model::<f32>::new_from_input_shapes(input_shapes);
         // add first dense layer
         // generate random dense matrix
         let ncols = FIRST_INPUT_SIZE;
@@ -2138,7 +2108,7 @@ pub(crate) mod test {
         );
         let first_dense_out_shape = &dense
             .output_shapes(
-                &[model.unpadded_input_shapes()[0].clone()],
+                &[model.input_shapes()[0].clone()],
                 PaddingMode::NoPadding,
             )
             .unwrap()[0];
@@ -2157,7 +2127,7 @@ pub(crate) mod test {
         );
         let second_dense_out_shape = &dense
             .output_shapes(
-                &[model.unpadded_input_shapes()[1].clone()],
+                &[model.input_shapes()[1].clone()],
                 PaddingMode::NoPadding,
             )
             .unwrap()[0];
@@ -2218,7 +2188,7 @@ pub(crate) mod test {
     fn test_model_with_multiple_inputs() {
         let input_shapes = vec![vec![6, 9].into(), vec![9, 13].into(), vec![11, 9].into()];
 
-        let mut model = Model::new_from_input_shapes(input_shapes, PaddingMode::NoPadding);
+        let mut model = Model::new_from_input_shapes(input_shapes);
 
         // Add an input MatMul layer multiplying second with third input
         let first_input_node = model
@@ -2261,7 +2231,7 @@ pub(crate) mod test {
     fn test_model_with_multiple_output_edges() {
         let input_shapes = vec![vec![7, 11].into(), vec![11, 13].into()];
 
-        let mut model = Model::new_from_input_shapes(input_shapes, PaddingMode::NoPadding);
+        let mut model = Model::new_from_input_shapes(input_shapes);
 
         let matmul1 = model
             .graph
@@ -2330,7 +2300,7 @@ pub(crate) mod test {
             GenStore::new_empty(),
             Tensor::random(&bias_shape),
         );
-        let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
+        let mut model = Model::new_from_input_shapes(vec![input_shape]);
         let first_layer_id = model
             .add_consecutive_layer(
                 Layer::EinSum(

@@ -34,7 +34,7 @@ use rayon::{
     prelude::*,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, mem, ops::Deref};
+use std::{collections::HashMap, mem};
 use sumcheck::{
     structs::{IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -525,7 +525,7 @@ impl<T> Convolution<T> {
 
     pub(crate) fn output_shape(&self, input_shape: &Shape, padding_mode: PaddingMode) -> Shape {
         match padding_mode {
-            // unpadded shape is the shape found in onxx file for example
+            // unpadded shape is the shape found in onnx file for example
             PaddingMode::NoPadding => conv2d_shape(input_shape, &self.filter.original_shape),
             PaddingMode::Padding => padded_conv2d_shape(input_shape, self.filter.pre_fft_shape()),
         }
@@ -1273,10 +1273,6 @@ impl Evaluate<Element> for Convolution<Element> {
             input
         };
 
-        // The output is expected to be padded to the fft shape
-        let n_x = input.dim(1)?.next_power_of_two();
-        let fft_shape = Shape::new(vec![tensor.dim(0), n_x, n_x]);
-
         let kernels = WrappedTensor::try_from(&kernels)?;
         let bias = WrappedTensor::try_from(&bias)?;
         let input = input.unsqueeze_dim(0)?;
@@ -1286,17 +1282,15 @@ impl Evaluate<Element> for Convolution<Element> {
         let conv_output = input.conv2d(kernels, bias, config)?;
 
         let conv_output = conv_output.squeeze(0)?;
-        // conv2d always return a 4D tensor
-        let padded = {
-            let mut native = Tensor::try_from(conv_output)?;
-            native.pad_to_shape(fft_shape)?;
-            WrappedTensor::try_from(native)?
-        };
+
+        // Return the real (unpadded) conv output. The FFT padding to fft_shape
+        // is deferred to the prove layer, keeping evaluate fully unpadded.
+        let output = WrappedTensor::try_from(Tensor::try_from(conv_output)?)?;
 
         let proving_data = ProvingData::Convolution(ConvFFTData {
             input: inputs[0].clone(),
         });
-        let layer_out = LayerOut::from_vec(vec![padded]).with_proving_data(proving_data);
+        let layer_out = LayerOut::from_vec(vec![output]).with_proving_data(proving_data);
         Ok(layer_out)
     }
 }
@@ -1480,11 +1474,22 @@ where
         step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
-        let output_tensor = step_data.output_tensor_at(0)?;
-
+        // The FFT protocol requires the output padded to fft_shape. Since evaluate
+        // now stores the real unpadded output, we compute fft_shape and pad here.
         let fft_data = step_data.node_outputs.try_convdata().unwrap();
         let fft_data = fft_data.handle.tensor()?;
-        let (_, conv_data) = self.fft(fft_data.deref())?;
+        let n_x = fft_data.dim(1).next_power_of_two();
+        let (fft_tensor, _) = self.filter.as_fft_tensor();
+        let fft_shape = Shape::new(vec![fft_tensor.dim(0), n_x, n_x]);
+
+        let output_unpadded = step_data.output_tensor_at(0)?;
+        let mut output_tensor = (*output_unpadded).clone();
+        output_tensor.pad_to_shape(fft_shape)?;
+
+        // The conv input must be explicitly padded before computing the FFT — the
+        // filter is stored padded by prepare_for_fft in pad_node.
+        let padded_fft_data = fft_data.pad_next_power_of_two();
+        let (_, conv_data) = self.fft(&padded_fft_data)?;
 
         let claim =
             self.prove_convolution_step(prover, last_claims[0], &output_tensor, &conv_data, id)?;

@@ -562,7 +562,7 @@ pub struct LogUpBatchProof<E: ExtensionField> {
     pub sumcheck_proofs: Vec<IOPProof<E>>,
     /// The evaluations of the polynomials at each layer
     pub round_evaluations: Vec<Vec<E>>,
-    /// Claims about the individual column evals from the last round (so before they are meged using the column challenges)
+    /// Claims about the individual column evals from the last round (so before they are merged using the column challenges)
     pub output_claims: Vec<Claim<E>>,
     /// The outputs of the circuit
     pub circuit_outputs: Vec<Vec<E>>,

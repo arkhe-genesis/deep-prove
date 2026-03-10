@@ -53,10 +53,7 @@ pub mod verify;
 pub const SOFTMAX_LAYER: &str = "SFTM";
 
 fn default_shift_cache<N: TensorTypeParam>() -> Arc<Mutex<ConcatenationCache<N>>> {
-    Arc::new(Mutex::new(ConcatenationCache::new_dynamic(
-        -2,
-        PaddingMode::NoPadding,
-    )))
+    Arc::new(Mutex::new(ConcatenationCache::new_dynamic(-2)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,10 +209,7 @@ impl<N: TensorTypeParam> Softmax<N> {
             scalar: N::unit(),
             max_size: context_length,
             quant_info: None,
-            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<N>::new_dynamic(
-                -2,
-                PaddingMode::NoPadding,
-            ))),
+            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<N>::new_dynamic(-2))),
         }
     }
 
@@ -224,10 +218,7 @@ impl<N: TensorTypeParam> Softmax<N> {
             scalar: scale,
             max_size: max_context_size,
             quant_info: None,
-            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<N>::new_dynamic(
-                -2,
-                PaddingMode::NoPadding,
-            ))),
+            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<N>::new_dynamic(-2))),
         }
     }
 
@@ -506,7 +497,6 @@ mod tests {
         Tensor,
         layers::{Layer, transformer::attention_mask::AttentionMask},
         model::{Model, test::prove_model},
-        padding::PaddingMode,
         quantization::Quantize,
     };
 
@@ -632,7 +622,7 @@ mod tests {
         let input_shape = vec![3, dim_size, dim_size];
 
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![input_shape.into()]);
 
         let mask = AttentionMask::<f32>::new(f32::NEG_INFINITY);
         let softmax = Softmax::<f32>::new_with_scale(1.0f32 / 64.0f32.sqrt(), 1024);

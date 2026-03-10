@@ -56,7 +56,7 @@ pub struct TaskMonitor<R> {
     /// Associate a name with each id.
     ///
     /// Note: ids are not unique and can be reused. The vector contains the names in creation order,
-    /// and are poped to handle id reuse.
+    /// and are popped to handle id reuse.
     id_to_name: HashMap<task::Id, Vec<Cow<'static, str>>>,
 }
 
@@ -74,9 +74,9 @@ impl<R: 'static + Send> TaskMonitor<R> {
     ///
     /// This utility will:
     ///
-    /// - Spawns the `future` inside a [task::JoinSet]. The lifecyle of the future is managed as follows:
+    /// - Spawns the `future` inside a [task::JoinSet]. The lifecycle of the future is managed as follows:
     ///     - [TaskMonitor::join_next] returns the task [Result], if it finish execution with normal control flow.
-    ///     - Otheriwse, `join_next` returns an [Err] in case the task panics or is aborted.
+    ///     - Otherwise, `join_next` returns an [Err] in case the task panics or is aborted.
     ///     - Once dropped, the [TaskMonitor] aborts all unfished tasks it owns.
     /// - Create a [tokio_metrics::TaskMonitor] to collect metrics and export it with
     ///   [metrics::Counter].

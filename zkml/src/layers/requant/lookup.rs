@@ -13,12 +13,7 @@ impl Requant {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     {
         let lookup_data = self.activation_lookup_data;
-        let unpadded_input = if input.shape() == input.unpadded_shape() {
-            input.clone()
-        } else {
-            input.reduce_to_shape(input.unpadded_shape())?
-        };
-        let lookup_witness = lookup_data.get_lookup_witness(unpadded_input)?;
+        let lookup_witness = lookup_data.get_lookup_witness(input.clone())?;
         let element_counts = lookup_witness.get_counts(&lookup_data.table);
 
         let input_evals = lookup_witness.input_mle_evals::<E>(lookup_data.table.num_columns());

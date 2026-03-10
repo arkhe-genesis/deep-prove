@@ -65,10 +65,10 @@ impl LookupContext {
         PCS: PolynomialCommitmentScheme<E>,
     {
         // First we retrieve the multiplicity polynomials
-        let mulitplicity_polys =
+        let multiplicity_polys =
             PCS::get_arc_mle_witness_from_commitment(multiplicities_commitment);
         self.iter()
-            .zip(mulitplicity_polys.iter())
+            .zip(multiplicity_polys.iter())
             .map(|(table, m_poly)| {
                 let multiplicities = m_poly.get_base_field_vec().to_vec();
                 let column_evals = table.get_table_columns::<E>();

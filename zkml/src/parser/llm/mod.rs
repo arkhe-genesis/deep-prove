@@ -27,7 +27,6 @@ use crate::{
     },
     model::Model,
     number::Number,
-    padding::PaddingMode,
     parser::{
         LayerInsertion, Load,
         llm::{config::LLMStructure, transformer::Norm},
@@ -137,7 +136,7 @@ impl<T: LayerInsertion<Metadata = TransformerMetadata>> LLMIR<T> {
         user_input_shape: Shape,
     ) -> anyhow::Result<(Model<f32>, LLMMetadata)> {
         let mut model =
-            Model::new_from_input_shapes(vec![user_input_shape], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![user_input_shape]);
 
         let embeddings_id =
             model.add_consecutive_layer(Layer::Embeddings(self.embeddings), None)?;

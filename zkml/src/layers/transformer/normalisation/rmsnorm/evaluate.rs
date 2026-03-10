@@ -89,7 +89,7 @@ impl RMSNorm<Element> {
             "Exactly one input must be provided to RMSnorm. got {}",
             inputs.len(),
         );
-        let input = inputs[0].clone().reduce_to_unpadded_shape()?;
+        let input = inputs[0].clone();
         let shape = input.shape();
         // Ensure we have the quantisation scaling factors
         let (input_scaling_factor, normalisation_scaling_factor) = self
@@ -158,10 +158,7 @@ impl RMSNorm<Element> {
         // Get the alpha
         let output = match self.alpha.as_ref() {
             Some(keyed_alpha) => {
-                let alpha_tensor = keyed_alpha
-                    .wrapped_tensor()?
-                    .clone()
-                    .reduce_to_unpadded_shape()?;
+                let alpha_tensor = keyed_alpha.wrapped_tensor()?.clone();
                 let expanded_alpha = match shape.rank() {
                     1 => alpha_tensor,
                     2 => alpha_tensor.unsqueeze_dim_2(),
@@ -179,12 +176,7 @@ impl RMSNorm<Element> {
             None => tmp_output,
         };
 
-        if inputs[0].is_padded() {
-            let output = output.pad_next_power_of_two();
-            Ok(LayerOut::from_tensor(output).with_proving_data(ProvingData::RMSNorm(proving_data)))
-        } else {
-            Ok(LayerOut::from_tensor(output).with_proving_data(ProvingData::RMSNorm(proving_data)))
-        }
+        Ok(LayerOut::from_tensor(output).with_proving_data(ProvingData::RMSNorm(proving_data)))
     }
 }
 

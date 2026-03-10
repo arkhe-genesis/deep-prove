@@ -141,23 +141,14 @@ impl Softmax<Element> {
         ))?;
         let table = &quant_info.lut;
         let input = step.input_tensor_at(0)?;
-        let unpadded_input_shape = input.unpadded_shape();
+        let input_shape = input.shape().clone();
 
-        let witness_gen_input = if input.shape() == unpadded_input_shape {
-            let prepped = WrappedTensor::try_from(input.as_ref())?
-                .mul_scalar(quant_info.fixed_point_multiplier())
-                .sub(shift_tensor.clone())?;
-            Tensor::try_from(&prepped)?
-        } else {
-            let input = input.reduce_to_shape(unpadded_input_shape)?;
-            let prepped = WrappedTensor::try_from(input.as_ref())?
-                .mul_scalar(quant_info.fixed_point_multiplier())
-                .sub(shift_tensor.clone())?;
-            Tensor::try_from(&prepped)?
-        };
-
-        let rank = unpadded_input_shape.rank();
-        let number_of_chunks = unpadded_input_shape[..rank.saturating_sub(2)]
+        let prepped = WrappedTensor::try_from(input.as_ref())?
+            .mul_scalar(quant_info.fixed_point_multiplier())
+            .sub(shift_tensor.clone())?;
+        let witness_gen_input = Tensor::try_from(&prepped)?;
+        let rank = input_shape.rank();
+        let number_of_chunks = input_shape[..rank.saturating_sub(2)]
             .iter()
             .product::<usize>();
 
@@ -196,11 +187,7 @@ impl Softmax<Element> {
         );
 
         // Make the commitments to the shift tensor
-        let unpadded_dim_size = if rank >= 2 {
-            unpadded_input_shape[rank - 2]
-        } else {
-            1
-        };
+        let unpadded_dim_size = if rank >= 2 { input_shape[rank - 2] } else { 1 };
 
         let shift_evals = shift_tensor
             .get_data()

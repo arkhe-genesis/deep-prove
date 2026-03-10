@@ -18,7 +18,6 @@ pub mod softmax;
 pub struct ConcatenationCache<N: TensorTypeParam> {
     cached_tensor: Option<WrappedTensor<N>>,
     caching_info: CachingInfo,
-    padding_mode: PaddingMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Copy)]
@@ -74,21 +73,19 @@ impl CachingInfo {
 }
 
 impl<N: TensorTypeParam> ConcatenationCache<N> {
-    pub fn new(rank: usize, concatenation_dim: usize, padding_mode: PaddingMode) -> Self {
+    pub fn new(rank: usize, concatenation_dim: usize) -> Self {
         let caching_info = CachingInfo::new_static(rank, concatenation_dim);
         Self {
             cached_tensor: None,
             caching_info,
-            padding_mode,
         }
     }
 
-    pub fn new_dynamic(concatenation_dim: isize, padding_mode: PaddingMode) -> Self {
+    pub fn new_dynamic(concatenation_dim: isize) -> Self {
         let caching_info = CachingInfo::new_dynamic(concatenation_dim);
         Self {
             cached_tensor: None,
             caching_info,
-            padding_mode,
         }
     }
 
@@ -107,15 +104,8 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
         &mut self,
         new_tensor: WrappedTensor<N>,
     ) -> anyhow::Result<WrappedTensor<N>> {
-        let reduced = if let PaddingMode::NoPadding = self.padding_mode {
-            new_tensor
-        } else {
-            let unpadded_shape = new_tensor.unpadded_shape().clone();
-            new_tensor.reduce_to_shape(&unpadded_shape)?
-        };
-
         // We retrieve the concatenation dim here to enforce that the tensor to be cached is valid.
-        let rank = reduced.rank();
+        let rank = new_tensor.rank();
         let concatenation_dim = self.get_concatenation_dim(rank)?;
 
         let output = if self.is_initialized() {
@@ -124,18 +114,15 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
 
             // Unwrap is safe because we are initialised
             let cached_tensor = placeholder.unwrap();
-            let catted = WrappedTensor::cat(vec![cached_tensor, reduced], concatenation_dim)?;
+            let catted = WrappedTensor::cat(vec![cached_tensor, new_tensor], concatenation_dim)?;
             self.cached_tensor = Some(catted.clone());
             catted
         } else {
-            self.cached_tensor = Some(reduced.clone());
-            reduced
+            self.cached_tensor = Some(new_tensor.clone());
+            new_tensor
         };
 
-        match self.padding_mode {
-            PaddingMode::NoPadding => Ok(output),
-            PaddingMode::Padding => Ok(output.pad_next_power_of_two()),
-        }
+        Ok(output)
     }
 
     /// Given a [`Shape`], returns the next shape after concatenation.
@@ -152,23 +139,9 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
     }
 
     pub fn get_cached(&self) -> anyhow::Result<WrappedTensor<N>> {
-        if let PaddingMode::NoPadding = self.padding_mode {
-            self.cached_tensor
-                .clone()
-                .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))
-        } else {
-            let inner = self
-                .cached_tensor
-                .clone()
-                .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))?;
-            Ok(inner.pad_next_power_of_two())
-        }
-    }
-
-    pub fn set_padding_mode(&mut self, padding_mode: PaddingMode) {
-        // We reset the cache when we change the padding mode
-        self.reset();
-        self.padding_mode = padding_mode;
+        self.cached_tensor
+            .clone()
+            .ok_or(anyhow::anyhow!("ConcatenationCache is not initialized"))
     }
 
     pub fn current_sequence_length(&self) -> usize {

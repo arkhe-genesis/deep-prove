@@ -91,8 +91,6 @@ where
     pub biases: Vec<Option<TensorHandle<T>>>,
     /// This vector holds the unpadded bias tensor shapes, if any.
     pub bias_unpadded_shapes: Vec<Option<Shape>>,
-    /// Tells us if we are running padded or unpadded
-    pub(crate) padded: bool,
     /// used if the outputs of the einsum need to be cached
     pub caches: Vec<Option<Arc<Mutex<ConcatenationCache<T>>>>>,
     /// Flag to indicate if a requantisation step should be inserted after this layer
@@ -217,7 +215,6 @@ where
             constant_unpadded_shapes,
             biases,
             bias_unpadded_shapes,
-            padded: false,
             caches: vec![None; output_count],
             requantise: true,
         })
@@ -246,11 +243,6 @@ where
         );
 
         let output_ranks = self.mapping.output_ranks();
-        let padding_mode = if self.padded {
-            PaddingMode::Padding
-        } else {
-            PaddingMode::NoPadding
-        };
 
         self.caches = concatenation_dims
             .into_iter()
@@ -266,7 +258,6 @@ where
                     Ok(Some(Arc::new(Mutex::new(ConcatenationCache::new(
                         output_rank,
                         concat_dim,
-                        padding_mode,
                     )))))
                 } else {
                     Ok(None)
@@ -454,7 +445,7 @@ where
         step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
-        let inputs = step_data.input_tensors()?;
+        let inputs = step_data.padded_input_tensors()?;
 
         let EinSumProofInfo {
             claims,
@@ -640,7 +631,6 @@ mod tests {
         let runtime_stack = 4;
         let mut model = Model::new_from_input_shapes(
             vec![vec![max_stack, a, b].into()],
-            PaddingMode::NoPadding,
         );
         let weight = TensorHandle::from_tensor(
             StorageKey::from("weight"),
@@ -666,11 +656,7 @@ mod tests {
             quantize_model(model, float_inputs, None, &mut store)?;
         let mut padded_model = pad_model(quantized_model)?;
 
-        padded_model.set_shapes(
-            quantized_inputs
-                .iter()
-                .map(|t| t.shape().next_power_of_two())
-                .collect(),
+        padded_model.set_input_shapes(
             quantized_inputs.iter().map(|t| t.shape().clone()).collect(),
         );
         let input_tensors = padded_model
@@ -697,7 +683,6 @@ mod tests {
         let second_input_shape = vec![d, b];
         let mut model = Model::new_from_input_shapes(
             vec![first_input_shape.into(), second_input_shape.into()],
-            PaddingMode::NoPadding,
         );
         let bias = Tensor::<f32>::random(&vec![d].into());
         let keyed_bias =
@@ -724,7 +709,6 @@ mod tests {
 
         let mut model = Model::new_from_input_shapes(
             vec![input_shape_left, input_shape_right],
-            PaddingMode::NoPadding,
         );
         let einsum =
             EinSum::new("A(ijk)@B(ikl)->C(ijl)".to_string(), vec![None], vec![None]).unwrap();
@@ -737,10 +721,7 @@ mod tests {
         let outputs = prove_model(model, &mut GenStore::default()).unwrap();
 
         // check output shape
-        assert_eq!(
-            *outputs[0].shape(),
-            Shape::new(vec![5, 14, 18]).next_power_of_two()
-        );
+        assert_eq!(*outputs[0].shape(), Shape::new(vec![5, 14, 18]));
     }
 
     #[test]
@@ -751,7 +732,6 @@ mod tests {
 
         let mut model = Model::new_from_input_shapes(
             vec![input_shape_left, input_shape_right],
-            PaddingMode::NoPadding,
         );
         let bias = TensorHandle::from_tensor(
             StorageKey::new("qkv_bias.q"),
@@ -773,10 +753,7 @@ mod tests {
         let outputs = prove_model(model, &mut GenStore::default()).unwrap();
 
         // check output shape
-        assert_eq!(
-            *outputs[0].shape(),
-            Shape::new(vec![5, 14, 18]).next_power_of_two()
-        );
+        assert_eq!(*outputs[0].shape(), Shape::new(vec![5, 14, 18]));
     }
 
     #[test]
@@ -825,7 +802,7 @@ mod tests {
         )
         .unwrap();
         let mut model =
-            Model::<f32>::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
+            Model::<f32>::new_from_input_shapes(vec![input_shape]);
 
         let _einsum_node_id = model
             .add_consecutive_layer(Layer::EinSum(einsum_layer), None)

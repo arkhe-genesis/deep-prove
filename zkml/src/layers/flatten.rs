@@ -1,11 +1,11 @@
 use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProveInfo};
 use crate::{
-    NextPowerOfTwo, Shape,
+    Element, NextPowerOfTwo, Shape,
     graph::NodeId,
     iop::context::ContextAux,
     layers::LayerCtx,
     padding::{PaddingMode, ShapeInfo, reshape},
-    tensor::{TensorTypeParam, WrappedTensor},
+    tensor::WrappedTensor,
 };
 use anyhow::{Result, ensure};
 use ff_ext::ExtensionField;
@@ -62,17 +62,34 @@ impl OpInfo for Flatten {
     }
 }
 
-impl<T> Evaluate<T> for Flatten
-where
-    T: TensorTypeParam,
-{
-    fn evaluate(&self, inputs: &[&WrappedTensor<T>]) -> Result<LayerOut<T>> {
+impl Evaluate<f32> for Flatten {
+    fn evaluate(&self, inputs: &[&WrappedTensor<f32>]) -> Result<LayerOut<f32>> {
         ensure!(
             inputs.len() == 1,
             "Found more than 1 input when evaluating reshape layer"
         );
         let input = inputs[0];
         let out = input.clone().flatten_1d();
+        Ok(LayerOut::from_vec(vec![out]))
+    }
+}
+
+impl Evaluate<Element> for Flatten {
+    /// EXCEPTION to the "run unpadded" rule: Flatten must pad its input before
+    /// flattening because the 1D layout depends on padded (power-of-two) dimensions.
+    /// Without padding first, the flat index mapping would be inconsistent between
+    /// inference and proving.
+    fn evaluate(&self, inputs: &[&WrappedTensor<Element>]) -> Result<LayerOut<Element>> {
+        ensure!(
+            inputs.len() == 1,
+            "Found more than 1 input when evaluating reshape layer"
+        );
+        let input = inputs[0];
+        let padded = input.clone().pad_next_power_of_two();
+        let mut out = padded.flatten_1d();
+        // Set unpadded_shape = shape so downstream layers treat this as "unpadded"
+        let shape = out.shape().clone();
+        out.set_unpadded_shape(shape);
         Ok(LayerOut::from_vec(vec![out]))
     }
 }
@@ -104,7 +121,7 @@ mod tests {
     use proptest::prelude::*;
     use std::ops::Range;
 
-    use crate::{Element, Shape, Tensor};
+    use crate::{Element, Shape, Tensor, tensor::TensorTypeParam};
 
     use super::*;
 
@@ -121,7 +138,8 @@ mod tests {
 
         #[test]
         fn test_flatten_with_element(input in any_input::<Element>(1..5, 1..8)) {
-            let expected = input.to_flatten();
+            // Element evaluate pads-then-flattens
+            let expected = input.pad_next_power_of_two().to_flatten();
 
             let layer = Flatten(false);
             let computed = layer.evaluate(&[&input.as_wrapped()]).expect("flatten evaluation must be successful");

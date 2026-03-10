@@ -433,18 +433,12 @@ where
         // Initialise the full tokens with the input data, generated tokens will be appended.
         let mut full_sentence = input_data;
 
-        let mut input_handles = if let PaddingMode::NoPadding = self.padding_mode {
-            info!(
-                "LLM: running model with initial unpadded shape: {:?}",
-                input_tensor.shape(),
-            );
-            tensor_to_handles(&[input_tensor], &self.model.graph, store)?
-        } else {
-            let unpadded_shape = input_tensor.shape().clone();
-            let padded = input_tensor.pad_next_power_of_two();
-            info!("LLM: running model with initial padded shape: {unpadded_shape:?}");
-            tensor_to_handles(&[padded], &self.model.graph, store)?
-        };
+        // Inference always runs on unpadded tensors. Padding is only needed at the proving layer.
+        info!(
+            "LLM: running model with initial shape: {:?}",
+            input_tensor.shape(),
+        );
+        let mut input_handles = tensor_to_handles(&[input_tensor], &self.model.graph, store)?;
 
         // This thread waits for the results
         let (tx, rx) = mpsc::sync_channel::<WrappedTensor<N>>(10);
@@ -533,13 +527,8 @@ where
             .map_err(|err| anyhow!("Results thread panicked. err: {err:?}"))?
             .context("Fetch tensor results failed")?;
         full_sentence.extend(generated_tokens);
-        let mut tensor = Tensor::new(Shape::new(vec![full_sentence.len()]), full_sentence.clone())?;
-
-        // Pad the input to the expected shape of the model
-        let target_padded_shape = vec![max_window.next_power_of_two()].into();
-        if let PaddingMode::Padding = self.padding_mode {
-            tensor.pad_to_shape(target_padded_shape)?
-        };
+        // Inference always runs on unpadded tensors. Padding is handled at the proving layer.
+        let tensor = Tensor::new(Shape::new(vec![full_sentence.len()]), full_sentence.clone())?;
 
         // Reset the model and its caches, otherwise a single token is
         // generated.
@@ -959,7 +948,6 @@ mod test {
         let model_path = file_cache::from_cache(PRUNED_GPT2)?;
         println!("model path: {:?}", model_path);
 
-        // let model_path = "assets/scripts/llms/toy_gpt2.gguf";
         let raw = RawGGUF::new(model_path.clone());
         let (driver, _metadata) =
             Driver::load_from_model(GPT2::new(), &raw, Some(10))?.into_provable_llm(None)?;

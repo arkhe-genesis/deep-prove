@@ -471,8 +471,12 @@ where
     where
         T: Transcript<E>,
     {
-        let (output_claims, proof) =
-            self.prove_step(node_id, last_claims, &step_data.input_tensors()?, prover)?;
+        let (output_claims, proof) = self.prove_step(
+            node_id,
+            last_claims,
+            &step_data.padded_input_tensors()?,
+            prover,
+        )?;
 
         prover.push_proof(node_id, LayerProof::Add(proof));
         Ok(output_claims)
@@ -613,7 +617,6 @@ mod test {
         for _ in 0..25 {
             let mut model = Model::new_from_input_shapes(
                 vec![input_shape.clone(), input_shape.clone()],
-                PaddingMode::NoPadding,
             );
 
             let add = Add::new();

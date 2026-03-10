@@ -481,8 +481,8 @@ where
             "Expected 1 input tensor for Logits layer, found {}",
             step_data.node_inputs.len()
         );
-        let input = step_data.input_tensor_at(0)?;
-        let outputs = step_data.output_tensors()?;
+        let input = step_data.padded_input_tensor_at(0)?;
+        let outputs = step_data.padded_output_tensors()?;
         // We need the final dim size to build the less than polynomial
         let unpadded_dim_size = *input.unpadded_shape().last().ok_or(anyhow::anyhow!(
             "Input shape must have at least one dimension"
@@ -653,8 +653,7 @@ where
             step_data.node_inputs.len()
         );
 
-        let inputs = step_data.input_tensors()?;
-        let input = &inputs[0];
+        let input = step_data.padded_input_tensor_at(0)?;
 
         ensure!(
             matches!(self, Logits::Argmax(Some(_))),
@@ -673,17 +672,18 @@ where
 
         let max_values = &argmax_data.max_values[0];
 
-        let input_shape = input.shape();
-        // For rank>2 inputs we flattened all leading dimensions when computing argmax which is enforced here
-        let expected_rows: usize = (0..input_shape.rank() - 1)
-            .map(|d| input_shape.dim(d))
+        // max_values was computed during unpadded inference, so use unpadded shape for the row count check
+        let unpadded_input_shape = input.unpadded_shape();
+        let expected_rows: usize = unpadded_input_shape
+            .iter()
+            .take(unpadded_input_shape.rank() - 1)
             .product();
         ensure!(
             max_values.shape()[0] == expected_rows,
             "Incompatible shapes between max values tensor (rows={}) and flattened input rows (expected_rows={}) for input shape {:?}",
             max_values.shape()[0],
             expected_rows,
-            input.shape(),
+            input.unpadded_shape(),
         );
 
         let unpadded_dim_size = *input.unpadded_shape().last().ok_or(anyhow::anyhow!(
@@ -691,7 +691,13 @@ where
         ))?;
 
         let max_values_guard = max_values.tensor()?;
-        let merged_diff = input
+        let padded_input_shape = input.shape();
+        let padded_rows: usize = padded_input_shape
+            .iter()
+            .take(padded_input_shape.rank() - 1)
+            .product();
+        let padded_cols = padded_input_shape.dim(padded_input_shape.rank() - 1);
+        let mut merged_diff = input
             .slice_last_dim()
             .zip(max_values_guard.data())
             .flat_map(|(row, row_max)| {
@@ -708,6 +714,8 @@ where
                     .collect::<Vec<Element>>()
             })
             .collect::<Vec<Element>>();
+        // Extend with zeros for padded rows (padded input is zero, max is zero, diff is zero)
+        merged_diff.resize(padded_rows * padded_cols, 0);
         // split merged diff in chunks
         let mut element_count = HashMap::new();
         let chunks = (0..self.range_check_chunks())
@@ -1095,7 +1103,7 @@ mod test {
         let seq_len = 13;
         let vocab_size = 17;
         let input_shape = Shape::new(vec![seq_len, vocab_size]);
-        let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
+        let mut model = Model::new_from_input_shapes(vec![input_shape]);
 
         let _ = model
             .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), None)
@@ -1112,7 +1120,7 @@ mod test {
         let vocab_size = 17;
         let input_shape = Shape::new(vec![seq_len, vocab_size]);
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![input_shape.clone()]);
 
         let _ = model
             .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), None)
@@ -1147,7 +1155,7 @@ mod test {
             .disable_requantisation(),
         );
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![input_shape.clone()]);
         let einsum_id = model.add_consecutive_layer(einsum, None).unwrap();
         let _ = model
             .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), Some(einsum_id))

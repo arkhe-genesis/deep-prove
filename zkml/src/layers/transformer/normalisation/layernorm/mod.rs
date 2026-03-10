@@ -503,11 +503,9 @@ impl PadOp for LayerNorm<Element> {
     {
         // LayerNorm does not need any special padding handling so
         // we just pad the keyed tensors
-        let padded_gamma = self.gamma.pad_next_power_of_two();
-        let padded_beta = self.beta.pad_next_power_of_two();
         Ok(Self {
-            gamma: padded_gamma,
-            beta: padded_beta,
+            gamma: self.gamma,
+            beta: self.beta,
             eps: self.eps,
             normalisation_dim_size: self.normalisation_dim_size,
             mean_scaling_factor: self.mean_scaling_factor,
@@ -637,7 +635,6 @@ mod tests {
 
             let mut model = Model::new_from_input_shapes(
                 vec![random_input.shape().clone()],
-                PaddingMode::NoPadding,
             );
 
             let dense_id = model

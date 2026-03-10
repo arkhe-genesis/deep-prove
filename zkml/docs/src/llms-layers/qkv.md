@@ -20,19 +20,19 @@ Since an LLM processes all the input tokens simultaneously, the computation of `
 
 In particular:
 - The `s` vectors $x_i \in \mathbb{R}^m$, each representing one of the `s` input tokens being processed, are concatenated in a matrix $X \in \mathbb{R}^{s \times e}$, where the $i$-th row of $X$ is equal to $X_i$
-- Define the unitary vector as $\mathbb{1}_s = 1^s$. Given the bias vectors $B_q \in \mathbb{R}^h$, $B_k \in \mathbb{R}^h$ and $B_v \in \mathbb{R}^h$, define the *bias matrices* $B_q^s \in \mathbb{R}^{s \times h}= \mathbb{1}_s*B_q^T$, $B_k^s \in \mathbb{R}^{s \times h}= \mathbb{1}_s*B_k^T$ and $B_v^s \in \mathbb{R}^{s \times h}= \mathbb{1}_s*B_v^T$; in other words, each of the $s$ rows in a bias matrix is equal to the corresponding bias vector 
+- Define the unitary vector as $\mathbb{1}_s = 1^s$. Given the bias vectors $B_q \in \mathbb{R}^h$, $B_k \in \mathbb{R}^h$ and $B_v \in \mathbb{R}^h$, define the *bias matrices* $B_q^s \in \mathbb{R}^{s \times h}= \mathbb{1}_s*B_q^T$, $B_k^s \in \mathbb{R}^{s \times h}= \mathbb{1}_s*B_k^T$ and $B_v^s \in \mathbb{R}^{s \times h}= \mathbb{1}_s*B_v^T$; in other words, each of the $s$ rows in a bias matrix is equal to the corresponding bias vector
 - The output matrices $Q \in \mathbb{R}^{s \times h}$, $K \in \mathbb{R}^{s \times h}$ and $V \in \mathbb{R}^{s \times h}$ are computed as:
 
     - $Q = XW_q + B_q^s$
     - $K = XW_k + B_k^s$
     - $V = XW_v + B_v^s$
 
-    the $i$-th row of these matrices corresponds, respectively, to the query, key and value vectors of the $i$-th input token 
+    the $i$-th row of these matrices corresponds, respectively, to the query, key and value vectors of the $i$-th input token
 
 The QKV layer is basically computing these three matrices `Q`, `K` and `V` from the matrix `X` representing the input tokens
 
 ## Proving the Layer
-Proving the three matrix multiplications to compute `Q`, `K` and `V` can be done with a single *batched* sum-check. 
+Proving the three matrix multiplications to compute `Q`, `K` and `V` can be done with a single *batched* sum-check.
 
 The prover starts from the following 3 claims about the MLEs of the output matrices of the layer:
 
@@ -40,7 +40,7 @@ The prover starts from the following 3 claims about the MLEs of the output matri
 - Claim $y_K$ about the MLE of matrix `K`, computed at the random point $r_K \in \mathbb{F}^{\log(s)+\log(h)}$; consider $r_K$ to be split in 2 sub-points $r_K^r \in \mathbb{F}^{\log(s)}$, $r_K^c \in \mathbb{F}^{\log(h)}$, which are built from the coordinates of $r_K$ referring to the rows and columns variables, respectively, of the MLE of `K`
 - Claim $y_V$ about the MLE of matrix `V`, computed at the random point $r_V \in \mathbb{F}^{\log(s)+\log(h)}$; consider $r_V$ to be split in 2 sub-points $r_V^r \in \mathbb{F}^{\log(s)}$, $r_V^c \in \mathbb{F}^{\log(h)}$, which are built from the coordinates of $r_V$ referring to the rows and columns variables, respectively, of the MLE of `V`
 
-Furthermore, the prover has computed the MLEs of the weight matrices $W_q$, $W_k$ and $W_v$ and the MLEs of the bias vectors $B_q$, $B_k$ and $B_v$, which were committed to in a setup phase. 
+Furthermore, the prover has computed the MLEs of the weight matrices $W_q$, $W_k$ and $W_v$ and the MLEs of the bias vectors $B_q$, $B_k$ and $B_v$, which were committed to in a setup phase.
 
 Given the 3 claims $y_Q$, $y_K,$ and $y_V$, the prover computes also the claims $y_{B_q} = B_q(r_Q^c)$, $y_{B_k} = B_k(r_K^c)$ and $y_{B_v} = B_v(r_V^c)$, and claims $\widetilde{y_Q} = y_Q - B_q(r_Q^c)$, $\widetilde{y_K} = y_K - B_k(r_K^c)$, $\widetilde{y_V} = y_V - B_V(r_V^c)$.
 
@@ -53,7 +53,7 @@ Given the 3 claims $y'_Q$, $y'_K$, $y'_V$, the verifier samples random challenge
 
 Where $X$ is the MLE of the input matrix `X`. At the end of the sum-check protocol, for a random $r \in \mathbb{F}^{\log(e)}$ the following claims are produced:
 
-- 3 claims $X(r_Q^r, r)$, $X(r_K^r, r)$, $X(r_V^r, r)$, which can be accumulated in a single claim for the MLE polynomial $X$, using the [same poly technique](https://github.com/Lagrange-Labs/deep-prove/blob/c2752df53be1b4b6832e452b6cbca17e3543556b/docs/src/commitments.md#accumulation-for-same-polynomial). 
+- 3 claims $X(r_Q^r, r)$, $X(r_K^r, r)$, $X(r_V^r, r)$, which can be accumulated in a single claim for the MLE polynomial $X$, using the [same poly technique](https://github.com/Lagrange-Labs/deep-prove/blob/c2752df53be1b4b6832e452b6cbca17e3543556b/docs/src/commitments.md#accumulation-for-same-polynomial).
 - 3 Claims $y_{W_Q} = W_Q(r, r_Q^c)$, $y_{W_K} = W_K(r, r_K^c)$, $y_{W_V} = W_V(r, r_V^c)$, which will be bound to the corresponding weight polynomial through an opening proof of the polynomial commitment scheme, as described in the next section.
 
 ### Polynomial Commitment Operations
@@ -65,9 +65,9 @@ Then, when proving the inference for a given input matrix $X$, the prover needs 
 - The claims $y_{B_q}$, $y_{B_k}$, $y_{B_v}$ about the MLEs of the bias vectors $B_q$, $B_k$ and $B_v$, respectively
 
 ## Proving Passes over Output Tokens
-In a LLM like GPT2, the inference is an iterative process: the same layers are evaluated multiple times, producing each time an output token. In all iterations except the first one, the input matrix $X_i$ of the QKV layer is the row-wise concatenation of the input matrix $X_{i-1}$ employed in the previous iteration and the vector $x$ representing the output token of the previous iteration. Therefore, also the `Q`, `K` and `V` matrices computed by the QKV layer are a concatenation of the corresponding matrices computed in the previous iteration and the vectors `q`, `k` and `v` computed for the new input row `x`. 
+In a LLM like GPT2, the inference is an iterative process: the same layers are evaluated multiple times, producing each time an output token. In all iterations except the first one, the input matrix $X_i$ of the QKV layer is the row-wise concatenation of the input matrix $X_{i-1}$ employed in the previous iteration and the vector $x$ representing the output token of the previous iteration. Therefore, also the `Q`, `K` and `V` matrices computed by the QKV layer are a concatenation of the corresponding matrices computed in the previous iteration and the vectors `q`, `k` and `v` computed for the new input row `x`.
 
-To avoid the cost of a full matrix multiplication in each iteration after the first one, it is thus possible to compute only the vectors `q`, `k` and `v` from the input row `x`, and then concatenate each vector with the corresponding matrices produced by the QKV layer in the previous iteration. 
+To avoid the cost of a full matrix multiplication in each iteration after the first one, it is thus possible to compute only the vectors `q`, `k` and `v` from the input row `x`, and then concatenate each vector with the corresponding matrices produced by the QKV layer in the previous iteration.
 
 Most importantly, concatenation is not necessary at all for the matrix Q computed by the QKV layer: instead, the layer just needs to output the vector `q` computed for the new input row `x`.
 
@@ -75,12 +75,12 @@ Therefore, the QKV layer in sub-sequent forward passes has the following input/o
 
 - Input vector $x \in \mathbb{R}^e$ for the new token
 - Output vector $q \in \mathbb{R}^h$
-- Output matrices $K \in \mathbb{R}^{s \times h}$, $V \in \mathbb{R}^{s \times h}$ 
+- Output matrices $K \in \mathbb{R}^{s \times h}$, $V \in \mathbb{R}^{s \times h}$
 
 ### Proving
 When proving QKV layers, we employ output matrices $K$ and $V$ with a fixed number of rows across all iterations. More specifically, the output matrices, rather than having the actual shape $[\mathtt{seq\_len}, \mathtt{hidden\_size}]$, where $\mathtt{seq\_len}$ increases at each iteration depending on the number of tokens processed so far, have always shape $l \times h$, where $l$ is the *context-length* of the model, that is the maximum number of tokens that can be processed. The padded matrices are built from the actual output matrices by padding with $l - \mathtt{seq\_len}$ rows filled with 0s. In the following, for the sake of conciseness of the formulas, we will use $s$ in place of $\mathtt{seq\_len}$. Wlog, in the following we assume that both $l$ and $h$ are powers of 2; otherwise, all the input/output tensors can be padded with 0 to reach the next power of 2.
 
-This simplifies the MLEs employed to prove the correct concatenation of the vector $k$ and $v$ computed for the input $x$ with the matrices $K_{prev}$ and $V_{prev}$ produced as outputs in the previous iteration. 
+This simplifies the MLEs employed to prove the correct concatenation of the vector $k$ and $v$ computed for the input $x$ with the matrices $K_{prev}$ and $V_{prev}$ produced as outputs in the previous iteration.
 
 The concatenation over the padded matrix $K \in \mathbb{R}^{l \times h}$ (and similarly for $V \in \mathbb{R}^{l \times h}$) is defined as follows.
 
@@ -90,7 +90,7 @@ The concatenation over the padded matrix $K \in \mathbb{R}^{l \times h}$ (and si
 Proving the QKV layer is therefore done in 2 steps:
 
 1. The computation of vectors `q`, `k` and `v` from the new input row `x` is proven
-2. The construction of the output matrices $K \in \mathbb{R}^{l \times h}$ and $V \in \mathbb{R}^{l \times h}$ by proving concatenation of vectors $k \in \mathbb{R}^h$ and $v \in \mathbb{R}^h$ with the corresponding matrices $K_{prev} \in \mathbb{R}^{l \times h}$ and $V_{prev} \in \mathbb{R}^{l \times h}$ computed in the previous iteration. 
+2. The construction of the output matrices $K \in \mathbb{R}^{l \times h}$ and $V \in \mathbb{R}^{l \times h}$ by proving concatenation of vectors $k \in \mathbb{R}^h$ and $v \in \mathbb{R}^h$ with the corresponding matrices $K_{prev} \in \mathbb{R}^{l \times h}$ and $V_{prev} \in \mathbb{R}^{l \times h}$ computed in the previous iteration.
 
 Since proving currently proceeds in reverse order w.r.t. inference, we start by describing how to prove step 2.
 
@@ -109,7 +109,7 @@ Then, we need to bind the MLE of $\widetilde{M_{prev}}$ to the original input ma
 The computation of $\widetilde{m}$ from $m$ can be proven as follows. Define the pad vector $P \in \mathbb{F}^{l}$ as the vector where $P[s] = 1$ and all other entries are 0. Then the matrix $\widetilde{m}$ can be computed from $m$ and $P$ as:
 $$
 \widetilde{M}[i, j] = P[i]*m[j]
-$$ 
+$$
 We can prove this relation via sum-check protocol[^note]. Given the claim $y_{\widetilde{M}} = \widetilde{m}(r)$, for a random point $r \in \mathbb{F}^{\log(l*h)}$, the prover proves the following relationship via sum-check:
 \begin{equation}
 y_{\widetilde{M}} = \sum_{x \in \{0, 1\}^{\log(l)}} \sum_{y \in \{0, 1\}^{\log(h)}} \beta(x||y, r) * P(x) * m(y)
@@ -118,10 +118,10 @@ y_{\widetilde{M}} = \sum_{x \in \{0, 1\}^{\log(l)}} \sum_{y \in \{0, 1\}^{\log(h
 The sum-check proof will produce the following claims for a random point $r_s \in \mathbb{F}^{\log(l*h)} = (r_l \in \mathbb{F}^{\log(l)}, r_h \in \mathbb{F}^{\log{h}})$:
 
 - Claim $\beta(r_s, r)$, which can be verified efficiency by the verifier
-- Claim $P(r_l)$, which can be verified efficiently by the verifier as well: indeed, given that P has only one non-zero entry (i.e., $P[s] = 1$), its MLE is simply $P(x) = \beta(x, \mathtt{BitDecompose}(s))$, where $\mathtt{BitDecompose}(s)$ is the sequence of $\log(l)$ bits representing $s$; therefore, $P(r_l) = \beta(r_l, s)$. 
+- Claim $P(r_l)$, which can be verified efficiently by the verifier as well: indeed, given that P has only one non-zero entry (i.e., $P[s] = 1$), its MLE is simply $P(x) = \beta(x, \mathtt{BitDecompose}(s))$, where $\mathtt{BitDecompose}(s)$ is the sequence of $\log(l)$ bits representing $s$; therefore, $P(r_l) = \beta(r_l, s)$.
 - Claim $m(r_h)$, which is the claim about the input vector $m$ produced by the proving sub-protocol
 
-We could also get a claim for the MLE $M_{prev}$ from $\widetilde{M_{prev}}$ with a similar sum-check, but we don't show it here because it won't be necessary when using this sub-protocol to prove concatenation in the QKV layer. 
+We could also get a claim for the MLE $M_{prev}$ from $\widetilde{M_{prev}}$ with a similar sum-check, but we don't show it here because it won't be necessary when using this sub-protocol to prove concatenation in the QKV layer.
 
 #### Concatenation in QKV Layer
 We now show how to use the concatenation sub-protocol to prove the concatenation of matrices $K_{prev} \in \mathbb{R}^{l \times h}$ and $V_{prev} \in \mathbb{R}^{l \times h}$, computed in the previous iteration, with the vectors $k \in \mathbb{R}^h$ and $v \in \mathbb{R}^h$, respectively, computed in the current iteration for the new token $x$.
@@ -152,10 +152,10 @@ The sum-check proof will produce the following claims for a random point $r \in 
 - Claims $k(r_h)$, $v(r_h)$, which correspond to the claims about the input vector $k$ and $v$ produced by the proving protocol. These claims can then be employed to prove the computation of the $k$, $v$ vectors from the input $x$ of the QKV layer, as shown next.
 
 #### Prove Computation of New Vectors
-To prove the computation of $q$, $k$ and $v$ vector for the new processed input token $x$, we use a simplied variant of the sum-check employed in the general QKV layer, described in Equation (1). The proving starts from 3 claims $y_q$, $y_k$ and $y_v$: the first one is coming directly from the output claims of the QKV layer, and it is computed over a random point $r_q \in \mathbb{F}^{\log(h)}$; the latter claims correspond to the claims $y_k$ and $y_v$ employed to prove concatenation in the same layer, and so they are evaluated over the same point $r_h \in \mathbb{F}^{\log{h}}$. 
+To prove the computation of $q$, $k$ and $v$ vector for the new processed input token $x$, we use a simplified variant of the sum-check employed in the general QKV layer, described in Equation (1). The proving starts from 3 claims $y_q$, $y_k$ and $y_v$: the first one is coming directly from the output claims of the QKV layer, and it is computed over a random point $r_q \in \mathbb{F}^{\log(h)}$; the latter claims correspond to the claims $y_k$ and $y_v$ employed to prove concatenation in the same layer, and so they are evaluated over the same point $r_h \in \mathbb{F}^{\log{h}}$.
 
 Given random challenges $\lambda_1$, $\lambda_2$ provided by the verifier, the prover computes the claims $B_q(r_q)$, $B_k(r)$, $B_v(r)$ and generates a sum-check proof for the following relationship:
-$$ 
+$$
 \footnotesize
 y_q - B_q(r_q) + \lambda_1 (y_k - B_k(r))  + \lambda_2 (y_v - B_v(r)) = \sum_{z \in \{0,1\}^{\log(e)}} X(z)*(W_Q(z, r_q) + \lambda_1 W_K(z, r_h) + \lambda_2 W_V(z,r_h))
 $$

@@ -10,7 +10,7 @@ There are two "types" of commitment used in Deep Prove. The first are *Model Com
 
 The large number of non-linear operations present in most neural networks leads to having to open many different commitments at many different points. To improve efficiency we make use of batch opening in this scenario. The batch opening protocol used is the one described in Section 3.8 of the [Hyperplonk paper](https://eprint.iacr.org/2022/1355.pdf).
 
-We make use of two additional optimistaions. The first is that if a multilinear polynomial has 7 or fewer variables it is more efficient to send the polynomial directly than to supply an opening proof. The second is that we make use of sumcheck to reduce multiple claims about a single polynomial  to one claim, this way in the batch opening protocol each polynomial is opened at a single point.
+We make use of two additional optimisations. The first is that if a multilinear polynomial has 7 or fewer variables it is more efficient to send the polynomial directly than to supply an opening proof. The second is that we make use of sumcheck to reduce multiple claims about a single polynomial  to one claim, this way in the batch opening protocol each polynomial is opened at a single point.
 
 ## Prover Flow
 

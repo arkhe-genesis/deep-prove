@@ -37,10 +37,7 @@ use multilinear_extensions::{
     mle::IntoMLE, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    ops::Deref,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use sumcheck::{
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
@@ -423,7 +420,6 @@ impl<N: TensorTypeParam> Rope<N> {
         let concat_cache = Arc::new(Mutex::new(ConcatenationCache::new(
             input_rank,
             concatenation_dim,
-            PaddingMode::NoPadding,
         )));
         Ok(Self {
             concatenation_cache: Some(concat_cache),
@@ -489,13 +485,12 @@ impl<N: TensorTypeParam> Rope<N> {
         T: Transcript<E>,
         PCS: PolynomialCommitmentScheme<E> + Send + Sync,
     {
-        let input = &step_data.node_inputs[0];
-        let input = input.tensor()?;
+        let input = step_data.padded_input_tensor_at(0)?;
         let input_shape = input.shape().clone();
         let unpadded_input_shape = input.unpadded_shape().clone();
 
-        let cosine_matrix = Tensor::try_from(&self.cosine_matrix)?;
-        let sine_matrix = Tensor::try_from(&self.sine_matrix)?;
+        let cosine_matrix = Tensor::try_from(&self.cosine_matrix)?.pad_next_power_of_two();
+        let sine_matrix = Tensor::try_from(&self.sine_matrix)?.pad_next_power_of_two();
 
         let cosine_matrix_slice = TensorSlice::from(&cosine_matrix);
         let sine_matrix_slice = TensorSlice::from(&sine_matrix);
@@ -528,7 +523,7 @@ impl<N: TensorTypeParam> Rope<N> {
         // the relationship `output = eq_poly * input * sub_cos_matrix + permuted_eq_poly * input * sub_sin_matrix`
 
         // compute MLEs of the tensors involved in the sum-check
-        let input_mle = input.deref().to_field_mle();
+        let input_mle = input.to_field_mle();
         let sub_cos_mle = sub_cos_matrix.into_mle();
         let sub_sin_mle = sub_sin_matrix.into_mle();
         ensure!(
@@ -674,12 +669,7 @@ where
             input.shape().rank(),
         );
 
-        let is_padded = input.is_padded();
-        let input = if is_padded {
-            input.clone().reduce_to_unpadded_shape()?
-        } else {
-            input.clone()
-        };
+        let input = input.clone();
 
         let input_shape = input.shape();
         let feature_size = input_shape.dims[input_shape.rank() - 1];
@@ -688,14 +678,7 @@ where
         let cosine_matrix = self.cosine_matrix.wrapped_tensor()?;
         let sine_matrix = self.sine_matrix.wrapped_tensor()?;
 
-        let (cosine_matrix, sine_matrix) = if is_padded {
-            (
-                cosine_matrix.clone().reduce_to_unpadded_shape()?,
-                sine_matrix.clone().reduce_to_unpadded_shape()?,
-            )
-        } else {
-            (cosine_matrix.clone(), sine_matrix.clone())
-        };
+        let (cosine_matrix, sine_matrix) = (cosine_matrix.clone(), sine_matrix.clone());
 
         let past_length = positional_cache.lock().unwrap().seq_len;
         let cosine_slice_bt = cosine_matrix.slice([
@@ -734,8 +717,6 @@ where
 
             let cached = cache.concatenate(output)?;
             Ok(LayerOut::from_tensor(cached))
-        } else if is_padded {
-            Ok(LayerOut::from_tensor(output.pad_next_power_of_two()))
         } else {
             Ok(LayerOut::from_tensor(output))
         }
@@ -830,7 +811,6 @@ impl Rope<f32> {
             Arc::new(Mutex::new(ConcatenationCache::<Element>::new(
                 rank,
                 concatenation_dim,
-                PaddingMode::NoPadding,
             )))
         });
 
@@ -847,17 +827,10 @@ impl Rope<f32> {
 }
 
 impl PadOp for Rope<Element> {
-    fn pad_node(mut self, _si: &mut crate::padding::ShapeInfo) -> Result<Self>
+    fn pad_node(self, _si: &mut crate::padding::ShapeInfo) -> Result<Self>
     where
         Self: Sized,
     {
-        self.cosine_matrix = self.cosine_matrix.pad_next_power_of_two();
-        self.sine_matrix = self.sine_matrix.pad_next_power_of_two();
-        if let Some(cache) = &self.concatenation_cache {
-            let mut cache = cache.lock().unwrap();
-            cache.set_padding_mode(PaddingMode::Padding);
-        }
-
         Ok(self)
     }
 }
@@ -887,9 +860,9 @@ impl Rope<Element> {
             },
         };
         let wrapped_cosine_matrix = self.cosine_matrix.wrapped_tensor()?.clone();
-        let cosine_matrix = Tensor::try_from(&wrapped_cosine_matrix)?;
+        let cosine_matrix = Tensor::try_from(&wrapped_cosine_matrix)?.pad_next_power_of_two();
         let wrapped_sine_matrix = self.sine_matrix.wrapped_tensor()?.clone();
-        let sine_matrix = Tensor::try_from(&wrapped_sine_matrix)?;
+        let sine_matrix = Tensor::try_from(&wrapped_sine_matrix)?.pad_next_power_of_two();
         aux.model_polys = Some(
             [
                 (
@@ -905,7 +878,7 @@ impl Rope<Element> {
             .collect(),
         );
 
-        let num_vars = self.cosine_matrix.shape().num_vars().into_iter().sum();
+        let num_vars = cosine_matrix.shape().num_vars().into_iter().sum();
         let ctx = RopeCtx {
             unpadded_shape: self.unpadded_shape.clone(),
             node_id: id,
@@ -1102,7 +1075,6 @@ mod tests {
             },
         },
         model::{Model, test::prove_model},
-        padding::PaddingMode,
         quantization::{AbsoluteMax, Quantize},
         rng_from_env_or_random,
         tensor::{TensorTypeParam, is_close_with_tolerance},
@@ -1151,7 +1123,7 @@ mod tests {
         let input_shape = vec![extra_dim, seq_len, embedding_size];
 
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![input_shape.into()]);
 
         // build angles for rotational matrix
         assert!(embedding_size.is_power_of_two());
@@ -1194,7 +1166,7 @@ mod tests {
         let context_length = 27;
 
         let input_shape = vec![num_heads, seq_len, hidden_size].into();
-        let mut model = Model::new_from_input_shapes(vec![input_shape], PaddingMode::NoPadding);
+        let mut model = Model::new_from_input_shapes(vec![input_shape]);
 
         // build angles for rotational matrix
         assert!(hidden_size.is_multiple_of(2));
@@ -1373,7 +1345,7 @@ mod tests {
             prop_assume!(seq_len >= 2);
 
             let input_shape = vec![seq_len, embedding_size];
-            let mut model = Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
+            let mut model = Model::new_from_input_shapes(vec![input_shape.into()]);
 
             model.add_consecutive_layer(Layer::Positional(Positional::new_rope(angles, "rope_angles".to_string().into(), context_length, layout).expect("rope")), None).expect("rope layer");
             model.automatic_output_labelling().expect("route output");

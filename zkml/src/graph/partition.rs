@@ -632,7 +632,7 @@ where
         // second element is the associated mapping original_graph_index => new_partition_index
         let mut map = BTreeMap::<C, Vec<ExecGraph<N, C>>>::new();
 
-        // We start itearting from the input nodes of the original graph, so we
+        // We start iterating from the input nodes of the original graph, so we
         // create the partitions "in order", starting from the lower partitions
         // to the higher ones as this is the order of the execution of the
         // graph.

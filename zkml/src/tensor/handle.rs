@@ -484,28 +484,6 @@ where
         }
     }
 
-    /// Loads the transformed version of this tensor with type [S].
-    ///
-    /// If the transformed version does not yet exist, apply `f` over `self`,
-    /// save it to store and returns a copy.
-    pub(crate) fn hydrated_cast<S, F>(&self, f: F) -> anyhow::Result<Tensor<S>>
-    where
-        S: Serialize + for<'a> Deserialize<'a>,
-        F: Fn(&T) -> S,
-    {
-        self.store()
-            .cast_and_fetch(self.storage_key(), |xs| {
-                xs.iter().map(&f).collect::<Vec<S>>()
-            })
-            .map(|bytes| {
-                Tensor::new_with_unpadded_shape(
-                    self.shape().clone(),
-                    self.unpadded_shape().clone(),
-                    bytes.1,
-                )
-            })?
-    }
-
     /// Pads the tensor to the next power-of-two.
     pub(crate) fn pad_next_power_of_two(&self) -> Self {
         match self {

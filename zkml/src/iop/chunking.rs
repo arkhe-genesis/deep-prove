@@ -14,14 +14,14 @@ use transcript::Transcript;
 use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 use crate::{
-    Claim, Element, InitTranscript,
+    Claim, Element, InitTranscript, Tensor,
     commit::mmcs_context::CommitmentProverCtx,
     graph::{Direction, Edge, EdgeId, Graph, Node, NodeId, NodeInput, NodeOutput, PortId},
     iop::prover::ModelLayersRef,
     layers::LayerCtx,
     lookup::context::LookupContext,
     model::{Model, ModelCtx, Trace},
-    to_base,
+    quantization::ToField,
 };
 
 /// Default unique chunk identifier.
@@ -338,11 +338,23 @@ impl ModelChunk {
                 "Node {node_id} not found in trace for chunk {chunk_id}"
             ))?;
             edge.ports().iter().try_for_each(|port| {
-                let tensor = match group_type {
-                    GroupType::Incoming => step_data.input_tensor_at(port.target_port.into())?,
-                    GroupType::Outgoing => step_data.output_tensor_at(port.source_port.into())?,
+                // Convert to field first, then pad
+                let tensor: Tensor<Element> = match group_type {
+                    GroupType::Incoming => {
+                        step_data.input_tensor_at(port.target_port.into())?.clone()
+                    }
+                    GroupType::Outgoing => {
+                        step_data.output_tensor_at(port.source_port.into())?.clone()
+                    }
                 };
-                let matrix_values = transpose(vec![to_base::<E, _>(tensor.data())]);
+                let padded_field: Tensor<E> = tensor.to_field().pad_next_power_of_two();
+                let matrix_values = transpose(vec![
+                    padded_field
+                        .data()
+                        .iter()
+                        .map(|e| e.as_bases()[0])
+                        .collect(),
+                ]);
                 let rmm = RowMajorMatrix::new_by_inner_matrix(
                     ceno_p3::matrix::dense::DenseMatrix::new(matrix_values.concat(), 1),
                     InstancePaddingStrategy::Default,

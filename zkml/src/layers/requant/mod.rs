@@ -1,4 +1,4 @@
-//! Module containign code for performing proving friendly requantisation. This is done via a [fixed point multiplication](https://en.wikipedia.org/wiki/Fixed-point_arithmetic#Binary_fixed-point_multiplication) and use of lookup arguments.
+//! Module containing code for performing proving friendly requantisation. This is done via a [fixed point multiplication](https://en.wikipedia.org/wiki/Fixed-point_arithmetic#Binary_fixed-point_multiplication) and use of lookup arguments.
 use super::{
     LayerCtx,
     provable::{Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
@@ -20,7 +20,7 @@ use crate::{
     quantization,
     tensor::WrappedTensor,
 };
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Result, anyhow, ensure};
 use ceno_p3::field::FieldAlgebra;
 use ff_ext::ExtensionField;
 
@@ -222,21 +222,18 @@ where
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
-        let outputs = step_data.output_tensors()?;
         ensure!(
             step_data.node_inputs.len() == 1,
             "Found more than 1 input in inference step of requant layer"
         );
         ensure!(
-            outputs.len() == 1,
+            step_data.outputs().len() == 1,
             "Found more than 1 output in inference step of requant layer"
         );
 
-        let input = &step_data.node_inputs[0]
-            .tensor()
-            .context("hydrating tensor")?;
+        let input = step_data.input_tensor_at(0)?;
 
-        self.lookup_witness(id, ctx, input)
+        self.lookup_witness(id, ctx, &input)
     }
 }
 
@@ -444,7 +441,6 @@ mod tests {
 
             let mut model = Model::new_from_input_shapes(
                 vec![random_input.shape().clone()],
-                PaddingMode::NoPadding,
             );
 
             let _ = model

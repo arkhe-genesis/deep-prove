@@ -104,7 +104,7 @@ impl ScalingStrategy for LLMInferenceObserver {
     ) -> Result<(Model<Element>, ModelMetadata)> {
         let mut tracker = LLMInferenceTracker::new(self.llm_metadata.clone());
 
-        let unpadded_input_shapes = model.unpadded_input_shapes();
+        let unpadded_input_shapes = model.input_shapes();
         let context_length = unpadded_input_shapes[0].numel();
         let representative_input_tokens = self.make_representative_input(context_length);
         let input_tensor = Tensor::<f32>::new(

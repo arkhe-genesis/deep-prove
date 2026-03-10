@@ -27,36 +27,23 @@ impl RMSNorm<Element> {
             .to_proving_data()?;
 
         let input = step.input_tensor_at(0)?;
-        let unpadded_input_shape = input.unpadded_shape();
+        let input_shape = input.shape().clone();
         let (_, normalisation_scaling_factor) = self.get_quantisation_scaling_factors().ok_or(
             anyhow!("Quantisation scaling factors not found for RMSNorm lookup witness generation"),
         )?;
         let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 1);
 
-        let (unpadded_input, output) = if input.shape() == unpadded_input_shape {
-            let wrapped_input = WrappedTensor::try_from(input.as_ref())?;
-            let lookup_output = rmsnorm_data.apply(wrapped_input.clone(), &table)?;
-            let scaled = wrapped_input.mul(rmsnorm_data.normalisation.clone())?;
-            (
-                Tensor::try_from(&scaled)?,
-                Tensor::try_from(&lookup_output)?,
-            )
-        } else {
-            let input = input.reduce_to_shape(unpadded_input_shape)?;
-            let wrapped_input = WrappedTensor::try_from(input)?;
-            let lookup_output = rmsnorm_data.apply(wrapped_input.clone(), &table)?;
-            let scaled = wrapped_input.mul(rmsnorm_data.normalisation.clone())?;
-            (
-                Tensor::try_from(&scaled)?,
-                Tensor::try_from(&lookup_output)?,
-            )
-        };
-        let rank = unpadded_input_shape.rank();
-        let number_of_chunks = unpadded_input_shape[..rank.saturating_sub(2)]
+        let wrapped_input = WrappedTensor::try_from(input.as_ref())?;
+        let lookup_output = rmsnorm_data.apply(wrapped_input.clone(), &table)?;
+        let scaled = wrapped_input.mul(rmsnorm_data.normalisation.clone())?;
+        let scaled_input = Tensor::try_from(&scaled)?;
+        let output = Tensor::try_from(&lookup_output)?;
+        let rank = input_shape.rank();
+        let number_of_chunks = input_shape[..rank.saturating_sub(2)]
             .iter()
             .product::<usize>();
 
-        let lookup_witness = rmsnorm_data.generate_witness(unpadded_input, &table)?;
+        let lookup_witness = rmsnorm_data.generate_witness(scaled_input, &table)?;
 
         let mut element_counts = lookup_witness.get_counts(&table);
         let variant = rmsnorm_data.variant();
@@ -90,8 +77,8 @@ impl RMSNorm<Element> {
         );
 
         // Make the commitments to the multipliers
-        let unpadded_dim_size = if rank >= 2 {
-            unpadded_input_shape[rank - 2]
+        let dim_size = if rank >= 2 {
+            input_shape[rank - 2]
         } else {
             1
         };
@@ -99,11 +86,11 @@ impl RMSNorm<Element> {
         let normalisation_evals = rmsnorm_data
             .normalisation
             .get_data()
-            .chunks(unpadded_dim_size)
+            .chunks(dim_size)
             .map(|chunk| {
                 let evals = chunk.iter().copied().chain(std::iter::repeat_n(
                     0,
-                    unpadded_dim_size.next_power_of_two() - chunk.len(),
+                    dim_size.next_power_of_two() - chunk.len(),
                 ));
                 to_base::<E, _>(evals)
             })

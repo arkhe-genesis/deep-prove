@@ -46,7 +46,7 @@ impl LayerNorm<Element> {
         let weight_tensor = Some(gamma.as_ref());
 
         // Reconstruct the lookup output here
-        let input = step_data.input_tensor_at(0)?;
+        let input = step_data.padded_input_tensor_at(0)?;
         let unpadded_input_shape = input.unpadded_shape();
 
         // Here we subtract the bias contribution from the last claim
@@ -58,7 +58,7 @@ impl LayerNorm<Element> {
             .collect::<Vec<usize>>();
         let bias_lt_eval =
             unpadded_input_shape.broadcasting_evaluation(&dim_points, &unbroadcast_shape)?;
-        let wrapped_beta = self.beta.wrapped_tensor()?;
+        let wrapped_beta = self.beta.wrapped_tensor()?.clone().pad_next_power_of_two();
         let beta_mle: MultilinearExtension<E> =
             to_base::<E, _>(wrapped_beta.get_data().iter()).into_mle();
         let beta_point = dim_points

@@ -12,15 +12,8 @@ where
     /// Apply the mask to an input, this method requires the input has rank between 2 and 4, and that the final two dims are either equal
     /// or the second to last dim is 1.
     pub(crate) fn evaluate_internal(&self, input: &WrappedTensor<T>) -> Result<WrappedTensor<T>> {
-        // Reduce the input to its unpadded shape
-        let current_shape = input.shape();
         let unpadded_shape = input.unpadded_shape();
-        let is_padded = current_shape.as_slice() != unpadded_shape.as_slice();
-        let input = if is_padded {
-            input.clone().reduce_to_unpadded_shape()?
-        } else {
-            input.clone()
-        };
+        let input = input.clone();
 
         let seq_len = input.dim(-1)?;
         // // input of shape [..., num_heads, q_len, seq_len]
@@ -34,11 +27,7 @@ where
             false => non_caching_case_mask(self.span, seq_len),
         };
         let unpadded_output = input.mask_fill(mask, self.negative_infinity)?;
-        if is_padded {
-            Ok(unpadded_output.pad_next_power_of_two())
-        } else {
-            Ok(unpadded_output)
-        }
+        Ok(unpadded_output)
     }
 }
 

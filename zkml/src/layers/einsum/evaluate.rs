@@ -30,11 +30,7 @@ where
         inputs: &[&WrappedTensor<N>],
     ) -> Result<Vec<WrappedTensor<N>>> {
         // Prepare the input tensors, applying permutations and reshaping as needed
-        let mut unpadded_inputs_iter = inputs
-            .iter()
-            .map(|&wrapped| wrapped.clone().reduce_to_unpadded_shape())
-            .collect::<Result<Vec<WrappedTensor<N>>>>()?
-            .into_iter();
+        let mut unpadded_inputs_iter = inputs.iter().map(|&wrapped| wrapped.clone());
 
         // The LHS is never a constant tensor, so we take it from the inputs
         let lhs_input = unpadded_inputs_iter
@@ -48,11 +44,7 @@ where
         for constant in &self.constant_tensors {
             let next = if let Some(const_tensor) = constant {
                 let tensor = const_tensor.wrapped_tensor()?;
-                if self.padded {
-                    tensor.clone().reduce_to_unpadded_shape()?
-                } else {
-                    tensor.clone()
-                }
+                tensor.clone()
             } else {
                 unpadded_inputs_iter
                     .next()
@@ -177,14 +169,7 @@ where
                 };
                 // Add the bias if provided
                 let with_bias = if let Some(bias_tensor) = bias {
-                    let unpadded_bias = if self.padded {
-                        bias_tensor
-                            .wrapped_tensor()?
-                            .clone()
-                            .reduce_to_unpadded_shape()?
-                    } else {
-                        bias_tensor.wrapped_tensor()?.clone()
-                    };
+                    let unpadded_bias = bias_tensor.wrapped_tensor()?.clone();
                     permuted.add(unpadded_bias)?
                 } else {
                     permuted
@@ -195,11 +180,7 @@ where
                         let mut cache = cache.lock().unwrap();
                         cache.concatenate(with_bias)
                     }
-                    None => Ok(if self.padded {
-                        with_bias.pad_next_power_of_two()
-                    } else {
-                        with_bias
-                    }),
+                    None => Ok(with_bias),
                 }
             },
         )

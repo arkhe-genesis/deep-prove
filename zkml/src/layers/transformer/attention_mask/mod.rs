@@ -318,7 +318,7 @@ where
         step_data: &Step<Element>,
         prover: &mut Prover<'c, 'd, E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
-        let inputs = step_data.input_tensors()?;
+        let inputs = step_data.padded_input_tensors()?;
         let unpadded_seq_len = *inputs[0].unpadded_shape().last().ok_or(anyhow::anyhow!(
             "Input shape must have at least one dimension"
         ))?;
@@ -481,7 +481,6 @@ mod tests {
 
         let mut model = Model::new_from_input_shapes(
             vec![input_shape_left, input_shape_right],
-            PaddingMode::NoPadding,
         );
 
         let id = model

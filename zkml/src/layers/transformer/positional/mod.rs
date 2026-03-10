@@ -861,7 +861,7 @@ mod tests {
     use tenstore::GenStore;
 
     use crate::{
-        Element, NextPowerOfTwo, Tensor,
+        Element, Tensor,
         layers::{
             provable::PadOp,
             transformer::positional::{Positional, PositionalVariant},
@@ -892,20 +892,17 @@ mod tests {
             unreachable!()
         };
 
-        let padded_shape = padded_pos.positional.shape();
+        // After pad_node, positional matrix is stored unpadded
+        let stored_shape = padded_pos.positional.shape();
         assert_eq!(padded_pos.unpadded_shape, *positional_matrix.shape());
-        assert_eq!(*padded_shape, positional_matrix.shape().next_power_of_two());
+        assert_eq!(*stored_shape, *positional_matrix.shape());
 
-        // check that padded positional matrix has the same data of original matrix
-        let padded_tensor = Tensor::try_from(padded_pos.positional.clone()).unwrap();
+        // check that stored positional matrix has the same data as original matrix
+        let stored_tensor = Tensor::try_from(padded_pos.positional.clone()).unwrap();
         let tensor = Tensor::try_from(positional_matrix).unwrap();
-        for i in 0..padded_shape[0] {
-            for j in 0..padded_shape[1] {
-                if i < padded_pos.unpadded_shape[0] && j < padded_pos.unpadded_shape[1] {
-                    assert_eq!(padded_tensor.get_2d(i, j), tensor.get_2d(i, j));
-                } else {
-                    assert_eq!(padded_tensor.get_2d(i, j), 0);
-                }
+        for i in 0..stored_shape[0] {
+            for j in 0..stored_shape[1] {
+                assert_eq!(stored_tensor.get_2d(i, j), tensor.get_2d(i, j));
             }
         }
     }

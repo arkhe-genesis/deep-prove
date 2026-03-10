@@ -98,7 +98,7 @@ impl LayerNorm<Element> {
             inputs.len(),
         );
 
-        let input = inputs[0].clone().reduce_to_unpadded_shape()?;
+        let input = inputs[0].clone();
         let shape = input.shape();
         // Ensure we have the quantisation scaling factors
         let (mean_scaling_factor, intermediate_scaling_factor) = self
@@ -179,16 +179,8 @@ impl LayerNorm<Element> {
         );
 
         // Get the gamma and beta tensors
-        let gamma = self
-            .gamma
-            .wrapped_tensor()?
-            .clone()
-            .reduce_to_unpadded_shape()?;
-        let beta = self
-            .beta
-            .wrapped_tensor()?
-            .clone()
-            .reduce_to_unpadded_shape()?;
+        let gamma = self.gamma.wrapped_tensor()?.clone();
+        let beta = self.beta.wrapped_tensor()?.clone();
         let (gamma, beta) = match shape.rank() {
             1 => (gamma, beta),
             2 => (gamma.unsqueeze_dim_2(), beta.unsqueeze_dim_2()),
@@ -206,14 +198,7 @@ impl LayerNorm<Element> {
 
         let output = proving_data.apply(input, &table)?.mul(gamma)?.add(beta)?;
 
-        if inputs[0].is_padded() {
-            let output = output.pad_next_power_of_two();
-            Ok(LayerOut::from_tensor(output)
-                .with_proving_data(ProvingData::LayerNorm(proving_data)))
-        } else {
-            Ok(LayerOut::from_tensor(output)
-                .with_proving_data(ProvingData::LayerNorm(proving_data)))
-        }
+        Ok(LayerOut::from_tensor(output).with_proving_data(ProvingData::LayerNorm(proving_data)))
     }
 }
 

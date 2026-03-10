@@ -250,7 +250,7 @@ where
         step_data: &Step<Element>,
         prover: &mut Prover<E, T, PCS>,
     ) -> Result<Vec<Claim<E>>> {
-        let input_tensors = step_data.input_tensors()?;
+        let input_tensors = step_data.padded_input_tensors()?;
 
         Ok(vec![self.prove_pooling(
             prover,
@@ -267,8 +267,8 @@ where
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
-        let input_tensors = step_data.input_tensors()?;
-        let output_tensors = step_data.output_tensors()?;
+        let input_tensors = step_data.padded_input_tensors()?;
+        let output_tensors = step_data.padded_output_tensors()?;
 
         ensure!(
             input_tensors.len() == 1,

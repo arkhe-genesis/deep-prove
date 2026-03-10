@@ -77,7 +77,7 @@ impl EinSum<Element> {
             .map(|tensor_opt| {
                 tensor_opt
                     .as_ref()
-                    .map(|tensor| Ok(Tensor::try_from(tensor)?.to_field()))
+                    .map(|tensor| Ok(Tensor::try_from(tensor)?.pad_next_power_of_two().to_field()))
                     .transpose()
             })
             .collect::<Result<Vec<Option<Tensor<E>>>>>()?;
@@ -200,7 +200,10 @@ impl EinSum<Element> {
             .filter_map(|(output_id, (bias_opt, split_point))| {
                 if let Some(bias) = bias_opt.as_ref() {
                     let key = CommitmentId::from(bias.storage_key());
-                    let bias_field: Tensor<E> = Tensor::try_from(bias).unwrap().to_field();
+                    let bias_field: Tensor<E> = Tensor::try_from(bias)
+                        .unwrap()
+                        .pad_next_power_of_two()
+                        .to_field();
                     let bias_poly = bias_field.to_mle();
                     let bias_point = self
                         .mapping

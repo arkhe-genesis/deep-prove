@@ -142,20 +142,10 @@ mod tests {
 
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
         let mut store = GenStore::default();
-        let transformed_trace = if let crate::padding::PaddingMode::Padding = driver.padding_mode {
-            let padded = input_tensor.pad_next_power_of_two();
-            driver.run(vec![padded], &mut store)?
-        } else {
-            driver.run(vec![input_tensor.clone()], &mut store)?
-        };
+        // Inference always runs on unpadded tensors.
+        let transformed_trace = driver.run(vec![input_tensor.clone()], &mut store)?;
 
-        let original_trace =
-            if let crate::padding::PaddingMode::Padding = original_driver.padding_mode {
-                let padded = input_tensor.pad_next_power_of_two();
-                original_driver.run(vec![padded], &mut store)?
-            } else {
-                original_driver.run(vec![input_tensor.clone()], &mut store)?
-            };
+        let original_trace = original_driver.run(vec![input_tensor.clone()], &mut store)?;
 
         let logits_id = driver.md.logits;
 
@@ -210,12 +200,8 @@ mod tests {
 
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
         let mut store = GenStore::default();
-        let trace = if let crate::padding::PaddingMode::Padding = driver.padding_mode {
-            let padded = input_tensor.pad_next_power_of_two();
-            driver.run(vec![padded], &mut store)?
-        } else {
-            driver.run(vec![input_tensor.clone()], &mut store)?
-        };
+        // Inference always runs on unpadded tensors.
+        let trace = driver.run(vec![input_tensor.clone()], &mut store)?;
         driver.model.reset();
 
         // Rewrite the model by applying our transformation rule
@@ -225,12 +211,8 @@ mod tests {
         // Now we generate the post-transformation trace and extract the logits step data
         let mut store = GenStore::default();
         let input_tensor = new_driver.tokens_to_tensor(&user_tokens)?;
-        let new_trace = if let crate::padding::PaddingMode::Padding = new_driver.padding_mode {
-            let padded = input_tensor.pad_next_power_of_two();
-            new_driver.run(vec![padded], &mut store)?
-        } else {
-            new_driver.run(vec![input_tensor], &mut store)?
-        };
+        // Inference always runs on unpadded tensors.
+        let new_trace = new_driver.run(vec![input_tensor], &mut store)?;
 
         // Compare the pre and post transformation data
         // check embeddings output

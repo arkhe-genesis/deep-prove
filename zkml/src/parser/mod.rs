@@ -112,7 +112,7 @@ pub fn to_quantized<S: ScalingStrategy>(
     if let Some(input_shapes) = pipeline_config.input_shapes.take() {
         // NOTE: currently no difference between padded and unpadded input shapes as it's
         // mostly used for LLM and this notion of padded/unpadded should disappear soon
-        model.set_shapes(input_shapes.clone(), input_shapes);
+        model.set_input_shapes(input_shapes);
     }
 
     let mut default_store = GenStore::default();

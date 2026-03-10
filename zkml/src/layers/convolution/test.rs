@@ -237,23 +237,18 @@ fn convolution_test_simple_element() {
 
     let expected = input.conv2d(&kernels, &bias, 1).unwrap();
     // Remove the leading dimension, the fft only supports 3d tensors.
-    let mut conv2d_result = expected.squeeze(0).unwrap();
+    let conv2d_result = expected.squeeze(0).unwrap();
 
     let conv = Convolution::new(kernels, bias)
         .unwrap()
         .prepared_for_fft(input.shape())
         .unwrap();
     let result = conv.evaluate(&[&input.as_wrapped()]).unwrap();
-    let fft_result = result.outputs()[0];
+    let fft_result = result.outputs()[0].to_native();
 
-    check_tensor_consistency(&conv2d_result, &fft_result.to_native());
-
-    // Pad the conv2d result to match the fft padded shape with the extra values set to 0.
-    conv2d_result
-        .pad_to_shape(Shape::from(fft_result.shape()))
-        .unwrap();
-
-    assert_eq!(conv2d_result.data(), &fft_result.get_data());
+    // Evaluate now returns unpadded output — shapes should match directly.
+    assert_eq!(conv2d_result.shape(), fft_result.shape());
+    assert_eq!(conv2d_result.data(), fft_result.data());
 }
 
 #[test]
@@ -270,23 +265,18 @@ fn convolution_test_random_element() {
 
     let expected = input.conv2d(&kernels, &bias, 1).unwrap();
     // Remove the leading dimension, the fft only supports 3d tensors.
-    let mut conv2d_result = expected.squeeze(0).unwrap();
+    let conv2d_result = expected.squeeze(0).unwrap();
 
     let conv = Convolution::new(kernels, bias)
         .unwrap()
         .prepared_for_fft(input.shape())
         .unwrap();
     let result = conv.evaluate(&[&input.as_wrapped()]).unwrap();
-    let fft_result = result.outputs()[0];
+    let fft_result = result.outputs()[0].to_native();
 
-    check_tensor_consistency(&conv2d_result, &fft_result.to_native());
-
-    // Pad the conv2d result to match the fft padded shape with the extra values set to 0.
-    conv2d_result
-        .pad_to_shape(Shape::from(fft_result.shape()))
-        .unwrap();
-
-    assert_eq!(conv2d_result.data(), &fft_result.get_data());
+    // Evaluate now returns unpadded output — shapes should match directly.
+    assert_eq!(conv2d_result.shape(), fft_result.shape());
+    assert_eq!(conv2d_result.data(), fft_result.data());
 }
 
 struct Input<T> {
@@ -412,9 +402,11 @@ proptest! {
         .prepared_for_fft(input.input.shape()).unwrap();
         let fft_result = conv.evaluate(&[&input.input.as_wrapped()]).unwrap();
 
-        // Remove the leading dimension, the fft only supports 3d tensors.
+        // Evaluate returns unpadded output — shapes should match directly.
         let conv2d_result = conv2d_result.squeeze(0).unwrap();
-        check_tensor_consistency(&conv2d_result, &fft_result.outputs()[0].to_native());
+        let fft_output = fft_result.outputs()[0].to_native();
+        prop_assert_eq!(conv2d_result.shape(), fft_output.shape());
+        prop_assert_eq!(conv2d_result.data(), fft_output.data());
     }
 
     #[test]
@@ -425,9 +417,11 @@ proptest! {
         .prepared_for_fft(input.input.shape()).unwrap();
         let fft_result = conv.evaluate(&[&input.input.as_wrapped()]).unwrap();
 
-        // Remove the leading dimension, the fft only supports 3d tensors.
+        // Evaluate returns unpadded output — shapes should match directly.
         let conv2d_result = conv2d_result.squeeze(0).unwrap();
-        check_tensor_consistency(&conv2d_result, &fft_result.outputs()[0].to_native());
+        let fft_output = fft_result.outputs()[0].to_native();
+        prop_assert_eq!(conv2d_result.shape(), fft_output.shape());
+        prop_assert_eq!(conv2d_result.data(), fft_output.data());
     }
 
     #[test]

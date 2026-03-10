@@ -8,7 +8,7 @@ use crate::{
         pooling::{MAXPOOL2D_KERNEL_SIZE, Maxpool2D, Pooling},
     },
     model::Model,
-    padding::{PaddingMode, pad_model},
+    padding::pad_model,
     quantization::{AbsoluteMax, ModelMetadata},
     tensor::KeyedTensor,
 };
@@ -177,7 +177,7 @@ fn from_inference_model(model: InferenceModel) -> Result<Model<f32>> {
     }
 
     let mut pmodel =
-        Model::new_from_input_shapes(vec![model_input_shape.clone()], PaddingMode::NoPadding);
+        Model::new_from_input_shapes(vec![model_input_shape.clone()]);
     let mut it = inference_order[1..].iter().peekable();
 
     let mut input_mapping = HashMap::new();
@@ -908,7 +908,7 @@ mod tests {
         info!("CREAting random tensor input");
         let (model, md) = result.unwrap();
         let inputs = model
-            .unpadded_input_shapes()
+            .input_shapes()
             .into_iter()
             .enumerate()
             .map(|(i, shape)| {
@@ -950,7 +950,7 @@ mod tests {
         // let model = pad_model(model).unwrap();
         model.describe();
         let native_input = model
-            .unpadded_input_shapes()
+            .input_shapes()
             .into_iter()
             .enumerate()
             .map(|(i, shape)| {

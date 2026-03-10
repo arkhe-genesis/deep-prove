@@ -481,11 +481,9 @@ impl PadOp for RMSNorm<Element> {
     where
         Self: Sized,
     {
-        // LayerNorm does not need any special padding handling so
-        // we just pad the keyed tensors
-        let padded_alpha = self.alpha.map(|alpha| alpha.pad_next_power_of_two());
+        // RMSNorm does not need any special padding handling
         Ok(Self {
-            alpha: padded_alpha,
+            alpha: self.alpha,
             eps: self.eps,
             normalisation_dim_size: self.normalisation_dim_size,
             input_scaling_factor: self.input_scaling_factor,
@@ -617,7 +615,6 @@ mod tests {
 
             let mut model = Model::new_from_input_shapes(
                 vec![random_input.shape().clone()],
-                PaddingMode::NoPadding,
             );
 
             let dense_id = model

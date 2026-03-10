@@ -26,6 +26,8 @@ jobs:
         with:
           token: ${{secrets.GITHUB_TOKEN}}
           use-katex: true
+      - name: Install rsync
+        run: sudo apt-get update && sudo apt-get install -y rsync
       - name: Build Book
         run: |
           cd zkml/docs

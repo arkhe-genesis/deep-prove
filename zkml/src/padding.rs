@@ -110,7 +110,7 @@ impl ShapeData {
 pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
     let input_si = ShapeInfo {
         shapes: model
-            .unpadded_input_shapes()
+            .input_shapes()
             .into_iter()
             .map(|unpadded_shape| ShapeData {
                 input_shape_padded: unpadded_shape.next_power_of_two(),
@@ -119,7 +119,7 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
             })
             .collect(),
     };
-    let unpadded_input_shapes = model.unpadded_input_shapes();
+    let unpadded_input_shapes = model.input_shapes();
     debug!(
         "Padding model with {} inputs: shapes {:?}",
         unpadded_input_shapes.len(),
@@ -164,7 +164,7 @@ pub fn pad_model(mut model: Model<Element>) -> Result<Model<Element>> {
                 })
             })?;
 
-    model = Model::<Element>::new(unpadded_input_shapes, PaddingMode::Padding, padded_graph);
+    model = Model::<Element>::new(unpadded_input_shapes, padded_graph);
     debug!("Padded model with {} layers", model.graph().node_count());
     Ok(model)
 }
@@ -253,15 +253,9 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             ..
         } = einsum;
 
-        let padded_constant_tensors = constant_tensors
-            .into_iter()
-            .map(|opt| opt.map(|tensor| tensor.pad_next_power_of_two()))
-            .collect::<Vec<_>>();
+        let padded_constant_tensors = constant_tensors;
 
-        let padded_biases = biases
-            .into_iter()
-            .map(|opt| opt.map(|tensor| tensor.pad_next_power_of_two()))
-            .collect::<Vec<_>>();
+        let padded_biases = biases;
 
         // Currently we do not support garbage padding for einsum outputs, this is because we are in the process
         // of removing garbage padding from the library, so we do not want to add it here.
@@ -275,16 +269,6 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             })
             .collect();
 
-        let padded_caches = caches
-            .into_iter()
-            .map(|cache| {
-                cache.inspect(|c| {
-                    let mut c_lock = c.lock().unwrap();
-                    c_lock.set_padding_mode(PaddingMode::Padding);
-                })
-            })
-            .collect();
-
         Ok(EinSum {
             equation,
             name,
@@ -294,8 +278,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             constant_unpadded_shapes,
             biases: padded_biases,
             bias_unpadded_shapes,
-            padded: true,
-            caches: padded_caches,
+            caches,
             requantise,
         })
     } else {
@@ -308,9 +291,7 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
         );
         let mut matrix = einsum.constant_tensors[0].clone().unwrap();
 
-        let matrix_shape = matrix.shape().clone();
-        let nrows = matrix_shape.nrows();
-        sd.input_shape_og = vec![nrows].into();
+        let nrows = matrix.shape().nrows_2d();
         if let Some(ref bias) = einsum.biases[0] {
             let wrapped = bias.wrapped_tensor()?;
             ensure!(
@@ -320,33 +301,16 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
                 nrows,
             );
         }
+        // ncols must match the exact flatten output size (from shape tracking)
+        let ncols = sd.input_shape_padded.product();
         ensure!(
-            sd.input_shape_padded.is_power_of_two(),
-            "Input shape for dense is not padded"
+            matrix.shape().ncols_2d() <= ncols,
+            "EinSum layer matrix has more columns ({}) than previous layer output size ({}). \
+             Cannot shrink without losing information.",
+            matrix.shape().ncols_2d(),
+            ncols,
         );
-        if sd.input_shape_padded.rank() != 1 {
-            sd.input_shape_padded = vec![sd.input_shape_padded.product()].into();
-            sd.input_shape_og = vec![sd.input_shape_og.product()].into();
-        }
-        let mut new_cols = matrix.shape().ncols_2d();
-        if matrix.shape().ncols_2d() != sd.input_shape_padded.dim(0) {
-            if matrix.shape().ncols_2d() < sd.input_shape_padded.dim(0) {
-                new_cols = sd.input_shape_padded.dim(0);
-            } else {
-                // If we have too many columns, we can't shrink without losing information
-                anyhow::bail!(
-                    "EinSum layer matrix has more columns ({}) than previous layer output size ({}).
-                            Cannot shrink without losing information.",
-                    matrix.shape().ncols_2d(),
-                    sd.input_shape_padded.dim(0)
-                );
-            }
-        }
-        // The reason to pad to a minimum of 4 is that any subsequent activation function will
-        // be needing at least input shape of total size 4 due to usage of lookups.
-        // current logup gkr implementation requires at least 2 variables for poly.
-        let ncols = pad_minimum(new_cols);
-        let nrows = pad_minimum(matrix.shape().nrows_2d());
+        let nrows = matrix.shape().nrows_2d();
 
         if let Some(garbage_pad) = sd.ignore_garbage_pad.as_ref() {
             garbage_pad
@@ -357,6 +321,10 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             let reshaped = wrapped.reshape(Shape::new(vec![nrows, ncols]).into())?;
             matrix.set_wrapped_tensor(reshaped)?;
         }
+
+        // Update shape tracking: output shape is [nrows]
+        sd.input_shape_og = vec![nrows].into();
+        sd.input_shape_padded = vec![nrows.next_power_of_two()].into();
 
         let bias = einsum.biases[0].clone().map(|mut handle| {
             let wrapped = handle.take_wrapped_tensor().unwrap();
@@ -390,14 +358,8 @@ pub(crate) fn pad_einsum(einsum: EinSum<Element>, si: &mut ShapeInfo) -> Result<
             constant_unpadded_shapes,
             biases: vec![bias],
             bias_unpadded_shapes,
-            padded: true,
             caches,
             requantise,
         })
     }
-}
-
-fn pad_minimum(dim: usize) -> usize {
-    let r = dim.next_power_of_two();
-    if r < 4 { 4 } else { r }
 }

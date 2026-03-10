@@ -83,10 +83,7 @@ impl Softmax<f32> {
             scalar: 1,
             max_size: self.max_size,
             quant_info: Some(quant_info),
-            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<Element>::new_dynamic(
-                -2,
-                PaddingMode::NoPadding,
-            ))),
+            shift_cache: Arc::new(Mutex::new(ConcatenationCache::<Element>::new_dynamic(-2))),
         })
     }
 

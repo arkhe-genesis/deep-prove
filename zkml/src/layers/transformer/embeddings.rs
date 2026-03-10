@@ -220,21 +220,10 @@ impl Evaluate<Element> for Embeddings<Element> {
 
         let weights = self.mat.wrapped_tensor()?;
 
-        let indices = if input.is_padded() {
-            input.clone().reduce_to_unpadded_shape()?
-        } else {
-            input.clone()
-        };
-
-        let res = weights.clone().select(0, indices)?;
-
-        let out = if input.is_padded() {
-            res.pad_next_power_of_two()
-        } else {
-            res
-        };
-
-        Ok(LayerOut::from_tensor(out))
+        weights
+            .clone()
+            .select(0, input.clone())
+            .map(LayerOut::from_tensor)
     }
 }
 
@@ -264,7 +253,7 @@ impl PadOp for Embeddings<Element> {
             ignore_garbage_pad: None,
         }];
 
-        let padded_emb = self.mat.pad_next_power_of_two();
+        let padded_emb = self.mat;
 
         Ok(Self {
             mat: padded_emb,
@@ -392,7 +381,7 @@ where
             "embeddings only support 1 last claim"
         );
         let last_claim = last_claims[0];
-        let input_tensors = step_data.input_tensors()?;
+        let input_tensors = step_data.padded_input_tensors()?;
         let input = &input_tensors[0];
         let unpadded_length = input.unpadded_shape().numel();
 
@@ -421,7 +410,7 @@ where
 
         let reduced_one_hot = Tensor::new(vec![1, vocab_size].into(), reduced_one_hot)?;
 
-        let embedding_matrix = Tensor::try_from(&self.mat)?;
+        let embedding_matrix = Tensor::try_from(&self.mat)?.pad_next_power_of_two();
 
         ensure!(
             vocab_size == embedding_matrix.nrows_2d()?,
@@ -682,7 +671,7 @@ mod tests {
         let input_shape = Shape::from(vec![seq_len]);
         let input = Tensor::new(input_shape.clone(), indices.clone()).unwrap();
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![input_shape.clone()]);
 
         let embeddings_value = Tensor::random(&Shape::new(vec![vocab_size, emb_size]));
         let embeddings = Embeddings::new(TensorHandle::from_tensor(

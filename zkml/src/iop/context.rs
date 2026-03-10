@@ -1,5 +1,5 @@
 use crate::{
-    Element, Shape,
+    Element, NextPowerOfTwo, Shape,
     commit::mmcs_context::{CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext},
     graph::{Node, NodeId, NodeInput, NodeOutput, order_by_in_port},
     iop::chunking::{ChunkingStrategy, ModelChunk},
@@ -185,7 +185,13 @@ impl Model<Element> {
     where
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
     {
-        let input_shapes = self.input_shapes();
+        // NOTE: here we pad the tensor because trace is unpadded - both the layer and this logic pad the tensor
+        // - could be later optimized to only pad once if necessary
+        let input_shapes: Vec<Shape> = self
+            .input_shapes()
+            .into_iter()
+            .map(|s| s.next_power_of_two())
+            .collect();
         let span = info_span!("zkml_generate_contexts", inputs = input_shapes.len());
         let _guard = span.enter();
         let (step_info, commitment_ctx, lookup) = self.build_global_context_data(&input_shapes)?;

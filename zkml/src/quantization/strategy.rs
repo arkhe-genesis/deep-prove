@@ -109,7 +109,7 @@ impl ScalingStrategy for InferenceObserver {
         let tracking_mode = InferenceTrackingMode::MinMax;
         let mut tracker = InferenceTracker::new(tracking_mode);
 
-        let unpadded_input_shapes = model.unpadded_input_shapes();
+        let unpadded_input_shapes = model.input_shapes();
         let input_samples: Vec<Vec<Tensor<f32>>> = if self.input_samples.is_empty() {
             warn!("No representative inputs provided, generating random ones");
             (0..10)
@@ -431,7 +431,6 @@ fn quantize_model<S: ScalingStrategy>(
     input_scaling: Vec<ScalingFactor>,
 ) -> anyhow::Result<(Model<Element>, ModelMetadata)> {
     let input_shapes = model.input_shapes();
-    let input_not_padded_shapes = model.unpadded_input_shapes();
     let mut md = MetadataBuilder::new();
     let mut requant_layers = vec![];
     let mut transforms = vec![];
@@ -517,7 +516,7 @@ fn quantize_model<S: ScalingStrategy>(
                     md.insert_layer_scalings(node_id, vec![input_scaling[i]], vec![]);
                     shape_map.insert(
                         NodeOutput::new(node_id, 0),
-                        input_not_padded_shapes[i].clone(),
+                        input_shapes[i].clone(),
                     );
                     Node::Input(i)
                 }
@@ -531,7 +530,7 @@ fn quantize_model<S: ScalingStrategy>(
                 }
             })
         })?;
-    let mut model = Model::new_from_shapes(input_not_padded_shapes, input_shapes, quantized_graph);
+    let mut model = Model::new_from_shapes(input_shapes, quantized_graph);
 
     // add scaling factor to `md` for requant layers: the scaling factors of
     // the inputs correspond to the scaling factors of the outputs of the

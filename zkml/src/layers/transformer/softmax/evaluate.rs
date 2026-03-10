@@ -26,12 +26,7 @@ impl Softmax<Element> {
             "Attempted to evaluate quantised Softmax with no QuantisedSoftmaxData present"
         ))?;
 
-        // Reduce the input to its unpadded shape if necessary
-        let input = if inputs[0].is_padded() {
-            inputs[0].clone().reduce_to_unpadded_shape()?
-        } else {
-            inputs[0].clone()
-        };
+        let input = inputs[0].clone();
 
         let shift_tensor = self.calculate_shift_data(&input)?;
         let input = input
@@ -39,19 +34,11 @@ impl Softmax<Element> {
             .sub(shift_tensor.clone())?;
         let output_tensor = quant_info.apply(input, &quant_info.lut)?;
 
-        if inputs[0].is_padded() {
-            Ok(LayerOut {
-                outputs: vec![output_tensor.pad_next_power_of_two()],
-                proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
-                tracked_layer_data: Default::default(),
-            })
-        } else {
-            Ok(LayerOut {
-                outputs: vec![output_tensor],
-                proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
-                tracked_layer_data: Default::default(),
-            })
-        }
+        Ok(LayerOut {
+            outputs: vec![output_tensor],
+            proving_data: ProvingData::Softmax(SoftmaxData { shift_tensor }),
+            tracked_layer_data: Default::default(),
+        })
     }
 
     /// Method that given a quantised input [`Tensor`] calculates the `shift` we apply along each dim and returns the unpadded tensor as the result.

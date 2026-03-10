@@ -141,13 +141,21 @@ where
         let inputs = self
             .input
             .iter()
-            .map(|handle| handle.hydrated_cast(|x| x.to_field()))
+            .map(|handle| {
+                let tensor_guard = handle.tensor()?;
+                let padded = (*tensor_guard).pad_next_power_of_two();
+                Ok(padded.to_field())
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         let outputs = self
             .output
             .iter()
-            .map(|handle| handle.hydrated_cast(|x| x.to_field()))
+            .map(|handle| {
+                let tensor_guard = handle.tensor()?;
+                let padded = (*tensor_guard).pad_next_power_of_two();
+                Ok(padded.to_field())
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(IO::new(inputs, outputs))
     }
@@ -233,6 +241,7 @@ where
     }
 
     /// Hydrate all the input tensors of the node corresponding to this step.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn input_tensors(&self) -> anyhow::Result<Vec<Tensor<D>>> {
         self.node_inputs
             .iter()
@@ -264,6 +273,36 @@ where
     ) -> anyhow::Result<MappedRwLockReadGuard<'_, Tensor<D>>> {
         self.node_outputs.outputs[i].tensor()
     }
+
+    /// Hydrate all the input tensors of the node, padding each to the next power of two.
+    pub(crate) fn padded_input_tensors(&self) -> anyhow::Result<Vec<Tensor<D>>> {
+        self.node_inputs
+            .iter()
+            .map(|handle| {
+                let tensor = handle.tensor()?;
+                Ok(tensor.pad_next_power_of_two())
+            })
+            .collect()
+    }
+
+    /// Hydrate one of the input tensors of the node, padding it to the next power of two.
+    pub(crate) fn padded_input_tensor_at(&self, i: usize) -> anyhow::Result<Tensor<D>> {
+        let tensor = self.node_inputs[i].tensor()?;
+        Ok(tensor.pad_next_power_of_two())
+    }
+
+    /// Hydrate all the output tensors of the node, padding each to the next power of two.
+    pub(crate) fn padded_output_tensors(&self) -> anyhow::Result<Vec<Tensor<D>>> {
+        self.node_outputs
+            .outputs
+            .iter()
+            .map(|handle| {
+                let tensor = handle.tensor()?;
+                Ok(tensor.pad_next_power_of_two())
+            })
+            .collect()
+    }
+
 }
 
 impl Step<Element> {

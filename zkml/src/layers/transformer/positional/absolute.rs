@@ -1,5 +1,5 @@
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    Claim, Element, NextPowerOfTwo, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
     commit::{compute_betas_eval, identity_eval},
     eval_zeroifier_mle,
     graph::NodeId,
@@ -81,8 +81,10 @@ where
 
 impl<N: TensorTypeParam> Absolute<N> {
     fn num_vars(&self) -> usize {
-        let num_vars = self.positional.shape().num_vars_2d();
-        num_vars.0 + num_vars.1
+        let padded_shape = self.positional.shape().next_power_of_two();
+        let nrows = padded_shape.nrows_2d();
+        let ncols = padded_shape.ncols_2d();
+        nrows.ilog2() as usize + ncols.ilog2() as usize
     }
 
     pub(super) fn new(matrix: TensorHandle<N>) -> anyhow::Result<Self> {
@@ -109,8 +111,6 @@ where
     {
         let past_length = positional_cache.lock().unwrap().seq_len;
 
-        let is_padded = input.is_padded();
-
         let start = past_length;
         let end = start + input.unpadded_shape().dims[0];
         let sliced = self
@@ -119,11 +119,7 @@ where
             .clone()
             .slice_2d(start, end);
 
-        let sub_bt = if is_padded {
-            sliced.pad_next_power_of_two()
-        } else {
-            sliced
-        };
+        let sub_bt = sliced;
 
         positional_cache
             .lock()
@@ -202,11 +198,11 @@ impl Absolute<f32> {
 }
 
 impl PadOp for Absolute<Element> {
-    fn pad_node(mut self, _shape_info: &mut ShapeInfo) -> anyhow::Result<Self>
+    fn pad_node(self, _shape_info: &mut ShapeInfo) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
-        self.positional = self.positional.pad_next_power_of_two();
+        // positional matrix is stored unpadded
         Ok(self)
     }
 }
@@ -262,11 +258,11 @@ impl Absolute<Element> {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
         PCS::ProverParam: Send + Sync,
     {
-        let input = &step_data.input_tensors()?[0];
+        let input = &step_data.padded_input_tensors()?[0];
 
         // derive sub-matrix to be added to input.
         // TODO: place it in proving data
-        let tensor = Tensor::try_from(&self.positional)?;
+        let tensor = Tensor::try_from(&self.positional)?.pad_next_power_of_two();
         let matrix_slice = TensorSlice::from(&tensor);
 
         let masked_sub_pos = matrix_slice
@@ -495,14 +491,14 @@ mod tests {
     use tenstore::{GenStore, StorageKey};
 
     use crate::{
-        Element, NextPowerOfTwo, Tensor,
+        Element, Tensor,
         layers::{
             Layer,
             provable::{Evaluate, PadOp},
             transformer::positional::{Positional, PositionalCache, absolute::Absolute},
         },
         model::{Model, test::prove_model},
-        padding::{PaddingMode, ShapeData, ShapeInfo},
+        padding::{ShapeData, ShapeInfo},
         quantization::{AbsoluteMax, Quantize, ScalingFactor},
         tensor::{
             KeyedTensor, TensorHandle, TensorSlice, TensorTypeParam, is_close_with_tolerance,
@@ -521,7 +517,7 @@ mod tests {
         let input_shape = vec![seq_len, embedding_size];
 
         let mut model =
-            Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
+            Model::new_from_input_shapes(vec![input_shape.into()]);
 
         let matrix_shape = vec![context_length, embedding_size];
         let positional_matrix = TensorHandle::from_tensor(
@@ -656,18 +652,15 @@ mod tests {
             let mut si = ShapeInfo::from(vec![ShapeData::new(vec![seq_len, embedding_size].into())].as_slice());
             let padded_layer = PadOp::pad_node(layer, &mut si).expect("pad_node should succeed");
 
-            let padded_shape = padded_layer.positional.shape();
+            // After pad_node, positional matrix is stored unpadded
+            let stored_shape = padded_layer.positional.shape();
             prop_assert_eq!(&padded_layer.unpadded_shape, positional_matrix.shape());
-            prop_assert_eq!(padded_shape, &positional_matrix.shape().next_power_of_two());
+            prop_assert_eq!(stored_shape, positional_matrix.shape());
 
             let tensor = Tensor::try_from(padded_layer.positional.clone()).unwrap();
-            for i in 0..padded_shape[0] {
-                for j in 0..padded_shape[1] {
-                    if i < padded_layer.unpadded_shape[0] && j < padded_layer.unpadded_shape[1] {
-                        prop_assert_eq!(tensor.get_2d(i, j), positional_matrix.get_2d(i, j));
-                    } else {
-                        prop_assert_eq!(tensor.get_2d(i, j), 0);
-                    }
+            for i in 0..stored_shape[0] {
+                for j in 0..stored_shape[1] {
+                    prop_assert_eq!(tensor.get_2d(i, j), positional_matrix.get_2d(i, j));
                 }
             }
         }
@@ -678,7 +671,7 @@ mod tests {
             prop_assume!(seq_len >= 2 && embedding_size >= 2);
 
             let input_shape = vec![seq_len, embedding_size];
-            let mut model = Model::new_from_input_shapes(vec![input_shape.into()], PaddingMode::NoPadding);
+            let mut model = Model::new_from_input_shapes(vec![input_shape.into()]);
 
             let positional = Layer::Positional(Positional::new_absolute(positional_matrix.into()).unwrap());
             model

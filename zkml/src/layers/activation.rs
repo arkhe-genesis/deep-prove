@@ -31,7 +31,7 @@ use mpcs::PolynomialCommitmentScheme;
 use multilinear_extensions::util::transpose;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, marker::PhantomData, ops::Deref};
+use std::{collections::HashMap, marker::PhantomData};
 use sumcheck::structs::IOPProof;
 
 use transcript::Transcript;
@@ -286,12 +286,7 @@ impl ActivationLayer<Element> {
         PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
     {
         let lookup_data = self.get_lookup_data();
-        let unpadded_input = if activation_input.shape() == activation_input.unpadded_shape() {
-            activation_input.clone()
-        } else {
-            activation_input.reduce_to_shape(activation_input.unpadded_shape())?
-        };
-        let lookup_witness = lookup_data.get_lookup_witness(unpadded_input)?;
+        let lookup_witness = lookup_data.get_lookup_witness(activation_input.clone())?;
 
         let element_counts = lookup_witness.get_counts(&lookup_data.table);
 
@@ -537,11 +532,12 @@ where
         ctx: &ProverContext<E, PCS>,
         step_data: &Step<Element>,
     ) -> Result<LookupWitnessGen<E, PCS>> {
-        let outputs = step_data.output_tensors()?;
         ensure!(
-            outputs.len() == 1,
+            step_data.outputs().len() == 1,
             "Found more than 1 output tensor in inference step of activation layer"
         );
+
+        let input = step_data.input_tensor_at(0)?;
 
         match self {
             Activation::Plain(activation_layer) => {
@@ -549,14 +545,14 @@ where
                     step_data.node_inputs.len() == 1,
                     "Found more than 1 input tensor in inference step of activation layer"
                 );
-                activation_layer.lookup_witness(id, ctx, step_data.input_tensor_at(0)?.deref())
+                activation_layer.lookup_witness(id, ctx, &input)
             }
             Activation::GLU(activation_layer) => {
                 ensure!(
                     step_data.node_inputs.len() == 2,
                     "Found more than 2 input tensor in inference step of activation layer"
                 );
-                activation_layer.lookup_witness(id, ctx, step_data.input_tensor_at(0)?.deref())
+                activation_layer.lookup_witness(id, ctx, &input)
             }
         }
     }
@@ -800,7 +796,6 @@ mod test {
 
             let mut model = Model::new_from_input_shapes(
                 vec![random_input.shape().clone()],
-                PaddingMode::NoPadding,
             );
 
             let dense_id = model
@@ -825,7 +820,6 @@ mod test {
             let input_shape = vec![7, 94].into();
             let mut model = Model::new_from_input_shapes(
                 vec![input_shape; 2], // 2 inputs in case of GLU variant
-                PaddingMode::NoPadding,
             );
             model.add_consecutive_layer(Activation::new_geglu().into(), None)?;
             model.automatic_output_labelling()?;

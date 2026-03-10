@@ -176,7 +176,6 @@ impl EinSum<f32> {
                     Arc::new(Mutex::new(ConcatenationCache::<Element>::new(
                         rank,
                         concatenation_dim,
-                        PaddingMode::NoPadding,
                     )))
                 })
             })
@@ -191,7 +190,6 @@ impl EinSum<f32> {
             constant_unpadded_shapes: self.constant_unpadded_shapes,
             biases: quant_biases,
             bias_unpadded_shapes: self.bias_unpadded_shapes,
-            padded: self.padded,
             caches,
             requantise: self.requantise,
         };
