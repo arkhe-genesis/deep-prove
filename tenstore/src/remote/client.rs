@@ -333,6 +333,12 @@ where
         Result<anyhow::Result<()>, tokio::task::JoinError>,
         Cow<'static, str>,
     )> {
+        // If no tasks, pend forever to avoid busy-looping in the select!
+        // The other select branches will handle new commands/prefetches.
+        if monitor.is_empty() {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
         // Timeout to avoid dead-locks from tasks spawning more tasks
         if let Ok(result) = timeout(Duration::from_millis(50), monitor.join_next()).await {
             return result;

@@ -67,6 +67,11 @@ impl<R> TaskMonitor<R> {
             id_to_name: Default::default(),
         }
     }
+
+    /// Returns true if there are no tasks being monitored
+    pub fn is_empty(&self) -> bool {
+        self.join_set.is_empty()
+    }
 }
 
 impl<R: 'static + Send> TaskMonitor<R> {
