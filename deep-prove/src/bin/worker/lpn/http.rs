@@ -13,6 +13,9 @@ const ATTEMPTS: u32 = 5;
 const MIN_WAIT_MS: u64 = 1000;
 const MAX_WAIT_MS: u64 = 100000;
 
+/// How long to wait when a GW-linked error occured before polling again.
+const IDLE_POLL_INTERVAL_MS: u64 = 5000;
+
 pub fn retry_operation<F, T, E: std::fmt::Debug>(func: F, log: impl Fn() -> String) -> Result<T, E>
 where
     F: Fn() -> Result<T, E>,
@@ -231,6 +234,7 @@ pub async fn run(args: crate::RunMode, tenstore: GenStore) -> anyhow::Result<()>
             Ok(body) => body,
             Err(e) => {
                 error!("failed to fetch job from gateway: {e:?}");
+                std::thread::sleep(std::time::Duration::from_millis(IDLE_POLL_INTERVAL_MS));
                 continue;
             }
         };
@@ -255,6 +259,7 @@ pub async fn run(args: crate::RunMode, tenstore: GenStore) -> anyhow::Result<()>
                 } else {
                     error!("could not extract job_id from malformed response to report error");
                 }
+                std::thread::sleep(std::time::Duration::from_millis(IDLE_POLL_INTERVAL_MS));
                 continue;
             }
         };
