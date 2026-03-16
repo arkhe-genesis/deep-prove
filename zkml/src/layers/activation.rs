@@ -794,9 +794,7 @@ mod test {
             .unwrap()
             .no_requant();
 
-            let mut model = Model::new_from_input_shapes(
-                vec![random_input.shape().clone()],
-            );
+            let mut model = Model::new_from_input_shapes(vec![random_input.shape().clone()]);
 
             let dense_id = model
                 .add_consecutive_layer(Layer::EinSum(dense), None)

@@ -670,8 +670,7 @@ mod tests {
             .collect::<Vec<_>>();
         let input_shape = Shape::from(vec![seq_len]);
         let input = Tensor::new(input_shape.clone(), indices.clone()).unwrap();
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()]);
+        let mut model = Model::new_from_input_shapes(vec![input_shape.clone()]);
 
         let embeddings_value = Tensor::random(&Shape::new(vec![vocab_size, emb_size]));
         let embeddings = Embeddings::new(TensorHandle::from_tensor(

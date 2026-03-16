@@ -48,7 +48,7 @@ jobs:
     name: Tests
     needs: changes
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
-    runs-on: ['arc-runner-ccx53']
+    runs-on: ['arc-runner-cpx42']
     steps:
       - name: Setup sccache
         uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main
@@ -115,7 +115,7 @@ jobs:
   linting:
     needs: changes
     if: ${{ needs.changes.outputs.zkml_src != '[]' }}
-    runs-on: ['arc-runner-ccx63']
+    runs-on: ['arc-runner-ccx23']
     steps:
       - name: Setup sccache
         uses: Lagrange-Labs/github-workflows/.github/actions/setup-sccache@main

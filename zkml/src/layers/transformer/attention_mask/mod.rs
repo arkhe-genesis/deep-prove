@@ -479,9 +479,7 @@ mod tests {
             .slice(..rank - 2)
             .extend(&Shape::new(vec![10, seq_len]));
 
-        let mut model = Model::new_from_input_shapes(
-            vec![input_shape_left, input_shape_right],
-        );
+        let mut model = Model::new_from_input_shapes(vec![input_shape_left, input_shape_right]);
 
         let id = model
             .add_consecutive_layer(Layer::EinSum(einsum), None)

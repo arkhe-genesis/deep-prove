@@ -615,9 +615,8 @@ mod test {
     fn test_add_proving_no_operand() {
         let input_shape = Shape::from(vec![2, 2]);
         for _ in 0..25 {
-            let mut model = Model::new_from_input_shapes(
-                vec![input_shape.clone(), input_shape.clone()],
-            );
+            let mut model =
+                Model::new_from_input_shapes(vec![input_shape.clone(), input_shape.clone()]);
 
             let add = Add::new();
             let _ = model.add_consecutive_layer(Layer::Add(add), None).unwrap();

@@ -516,8 +516,7 @@ mod tests {
     ) {
         let input_shape = vec![seq_len, embedding_size];
 
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.into()]);
+        let mut model = Model::new_from_input_shapes(vec![input_shape.into()]);
 
         let matrix_shape = vec![context_length, embedding_size];
         let positional_matrix = TensorHandle::from_tensor(

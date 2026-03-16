@@ -629,9 +629,7 @@ mod tests {
         let [a, b, c] = [3, 16, 32];
         let max_stack = 8;
         let runtime_stack = 4;
-        let mut model = Model::new_from_input_shapes(
-            vec![vec![max_stack, a, b].into()],
-        );
+        let mut model = Model::new_from_input_shapes(vec![vec![max_stack, a, b].into()]);
         let weight = TensorHandle::from_tensor(
             StorageKey::from("weight"),
             GenStore::new_empty(),
@@ -656,9 +654,7 @@ mod tests {
             quantize_model(model, float_inputs, None, &mut store)?;
         let mut padded_model = pad_model(quantized_model)?;
 
-        padded_model.set_input_shapes(
-            quantized_inputs.iter().map(|t| t.shape().clone()).collect(),
-        );
+        padded_model.set_input_shapes(quantized_inputs.iter().map(|t| t.shape().clone()).collect());
         let input_tensors = padded_model
             .prepare_inputs(quantized_inputs.clone())
             .unwrap();
@@ -681,9 +677,8 @@ mod tests {
         let first_input_shape = vec![a, b];
         // since we transpose B
         let second_input_shape = vec![d, b];
-        let mut model = Model::new_from_input_shapes(
-            vec![first_input_shape.into(), second_input_shape.into()],
-        );
+        let mut model =
+            Model::new_from_input_shapes(vec![first_input_shape.into(), second_input_shape.into()]);
         let bias = Tensor::<f32>::random(&vec![d].into());
         let keyed_bias =
             TensorHandle::from_tensor(StorageKey::from("bias1"), GenStore::new_empty(), bias);
@@ -707,9 +702,7 @@ mod tests {
         let input_shape_left = vec![5, 14, 27].into();
         let input_shape_right = vec![5, 27, 18].into();
 
-        let mut model = Model::new_from_input_shapes(
-            vec![input_shape_left, input_shape_right],
-        );
+        let mut model = Model::new_from_input_shapes(vec![input_shape_left, input_shape_right]);
         let einsum =
             EinSum::new("A(ijk)@B(ikl)->C(ijl)".to_string(), vec![None], vec![None]).unwrap();
 
@@ -730,9 +723,7 @@ mod tests {
         let input_shape_left = vec![5, 14, 27].into();
         let input_shape_right = vec![5, 27, 18].into();
 
-        let mut model = Model::new_from_input_shapes(
-            vec![input_shape_left, input_shape_right],
-        );
+        let mut model = Model::new_from_input_shapes(vec![input_shape_left, input_shape_right]);
         let bias = TensorHandle::from_tensor(
             StorageKey::new("qkv_bias.q"),
             GenStore::new_empty(),
@@ -801,8 +792,7 @@ mod tests {
             vec![Some(q_bias), Some(k_bias), Some(v_bias)],
         )
         .unwrap();
-        let mut model =
-            Model::<f32>::new_from_input_shapes(vec![input_shape]);
+        let mut model = Model::<f32>::new_from_input_shapes(vec![input_shape]);
 
         let _einsum_node_id = model
             .add_consecutive_layer(Layer::EinSum(einsum_layer), None)

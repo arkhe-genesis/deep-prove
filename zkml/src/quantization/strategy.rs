@@ -514,10 +514,7 @@ fn quantize_model<S: ScalingStrategy>(
                 // types left & right
                 Node::Input(i) => {
                     md.insert_layer_scalings(node_id, vec![input_scaling[i]], vec![]);
-                    shape_map.insert(
-                        NodeOutput::new(node_id, 0),
-                        input_shapes[i].clone(),
-                    );
+                    shape_map.insert(NodeOutput::new(node_id, 0), input_shapes[i].clone());
                     Node::Input(i)
                 }
                 Node::Output(o) => {

@@ -1656,9 +1656,7 @@ pub(crate) mod test {
             rng: &mut R,
         ) -> Result<(Self, Vec<Tensor<Element>>)> {
             let mut last_row: usize = rng.gen_range(3..15);
-            let mut model = Model::<f32>::new_from_input_shapes(
-                vec![vec![last_row].into()],
-            );
+            let mut model = Model::<f32>::new_from_input_shapes(vec![vec![last_row].into()]);
 
             let mut last_node_id = None;
             for selector in 0..num_dense_layers {
@@ -1726,9 +1724,7 @@ pub(crate) mod test {
                 })
                 .collect::<Shape>();
 
-            let mut model = Model::<f32>::new_from_input_shapes(
-                vec![input_shape.clone()],
-            );
+            let mut model = Model::<f32>::new_from_input_shapes(vec![input_shape.clone()]);
 
             let info = Maxpool2D::default();
             let mut last_node_id = None;
@@ -1778,8 +1774,7 @@ pub(crate) mod test {
         let filter = KeyedTensor::new("conv_filter", Tensor::random(&shape1));
         let bias1 = KeyedTensor::new("conv_bias", Tensor::random(&vec![shape1[0]].into()));
 
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()]);
+        let mut model = Model::new_from_input_shapes(vec![input_shape.clone()]);
         let conv_layer = model
             .add_consecutive_layer(
                 Layer::Convolution(
@@ -1829,8 +1824,7 @@ pub(crate) mod test {
             .outputs()[0]
             .clone();
 
-        let mut model =
-            Model::<Element>::new_from_input_shapes(vec![input_shape]);
+        let mut model = Model::<Element>::new_from_input_shapes(vec![input_shape]);
         let first_id = model
             .add_consecutive_layer(Layer::EinSum(dense1.clone()), None)
             .unwrap();
@@ -1933,8 +1927,7 @@ pub(crate) mod test {
 
     fn build_test_model<N: TensorTypeParam, const INPUT_SIZE: usize>() -> Model<N> {
         let input_shape: Shape = vec![INPUT_SIZE].into();
-        let mut model =
-            Model::<N>::new_from_input_shapes(vec![input_shape.clone()]);
+        let mut model = Model::<N>::new_from_input_shapes(vec![input_shape.clone()]);
         // add input dense layer
         // generate random dense matrix
         let ncols = input_shape[0];
@@ -2107,10 +2100,7 @@ pub(crate) mod test {
             Some("dense_1".to_string().into()),
         );
         let first_dense_out_shape = &dense
-            .output_shapes(
-                &[model.input_shapes()[0].clone()],
-                PaddingMode::NoPadding,
-            )
+            .output_shapes(&[model.input_shapes()[0].clone()], PaddingMode::NoPadding)
             .unwrap()[0];
         let first_input_dense = model.graph.add_inner(Layer::EinSum(dense)).unwrap();
         // set that it will consume the first input
@@ -2126,10 +2116,7 @@ pub(crate) mod test {
             Some("dense_2".to_string().into()),
         );
         let second_dense_out_shape = &dense
-            .output_shapes(
-                &[model.input_shapes()[1].clone()],
-                PaddingMode::NoPadding,
-            )
+            .output_shapes(&[model.input_shapes()[1].clone()], PaddingMode::NoPadding)
             .unwrap()[0];
         let second_input_dense = model.graph.add_inner(Layer::EinSum(dense)).unwrap();
         model

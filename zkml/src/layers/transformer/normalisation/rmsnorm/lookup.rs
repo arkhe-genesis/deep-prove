@@ -77,11 +77,7 @@ impl RMSNorm<Element> {
         );
 
         // Make the commitments to the multipliers
-        let dim_size = if rank >= 2 {
-            input_shape[rank - 2]
-        } else {
-            1
-        };
+        let dim_size = if rank >= 2 { input_shape[rank - 2] } else { 1 };
 
         let normalisation_evals = rmsnorm_data
             .normalisation

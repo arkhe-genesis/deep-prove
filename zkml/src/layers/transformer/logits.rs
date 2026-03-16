@@ -1119,8 +1119,7 @@ mod test {
         let seq_len = 13;
         let vocab_size = 17;
         let input_shape = Shape::new(vec![seq_len, vocab_size]);
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()]);
+        let mut model = Model::new_from_input_shapes(vec![input_shape.clone()]);
 
         let _ = model
             .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), None)
@@ -1154,8 +1153,7 @@ mod test {
             .unwrap()
             .disable_requantisation(),
         );
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.clone()]);
+        let mut model = Model::new_from_input_shapes(vec![input_shape.clone()]);
         let einsum_id = model.add_consecutive_layer(einsum, None).unwrap();
         let _ = model
             .add_consecutive_layer(Layer::Logits(Logits::Argmax(None)), Some(einsum_id))

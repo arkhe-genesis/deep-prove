@@ -176,8 +176,7 @@ fn from_inference_model(model: InferenceModel) -> Result<Model<f32>> {
         model_input_shape.remove(0);
     }
 
-    let mut pmodel =
-        Model::new_from_input_shapes(vec![model_input_shape.clone()]);
+    let mut pmodel = Model::new_from_input_shapes(vec![model_input_shape.clone()]);
     let mut it = inference_order[1..].iter().peekable();
 
     let mut input_mapping = HashMap::new();

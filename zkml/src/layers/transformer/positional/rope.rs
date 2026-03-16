@@ -1122,8 +1122,7 @@ mod tests {
         let extra_dim = 6;
         let input_shape = vec![extra_dim, seq_len, embedding_size];
 
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.into()]);
+        let mut model = Model::new_from_input_shapes(vec![input_shape.into()]);
 
         // build angles for rotational matrix
         assert!(embedding_size.is_power_of_two());

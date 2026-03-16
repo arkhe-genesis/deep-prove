@@ -621,8 +621,7 @@ mod tests {
         let dim_size = 520;
         let input_shape = vec![3, dim_size, dim_size];
 
-        let mut model =
-            Model::new_from_input_shapes(vec![input_shape.into()]);
+        let mut model = Model::new_from_input_shapes(vec![input_shape.into()]);
 
         let mask = AttentionMask::<f32>::new(f32::NEG_INFINITY);
         let softmax = Softmax::<f32>::new_with_scale(1.0f32 / 64.0f32.sqrt(), 1024);

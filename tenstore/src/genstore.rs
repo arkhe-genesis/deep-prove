@@ -1,4 +1,5 @@
 use crate::{StorageKey, StoreError, local::DiskStore, remote::RemoteStore};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -171,6 +172,18 @@ impl GenStore {
         let mut new_store = self.clone();
         new_store.run_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, id.as_bytes());
         new_store
+    }
+
+    /// Execute `f` with a clean store, that is discarded on completion.
+    pub fn in_new_run<F: FnOnce(&mut Self) -> anyhow::Result<()>>(
+        &self,
+        f: F,
+    ) -> anyhow::Result<()> {
+        let mut store = self.start_new_run();
+        // No early exit on error, so that `clean_up` is always called.
+        let r = f(&mut store);
+        store.clean_up().context("cleaning up store")?;
+        r
     }
 }
 

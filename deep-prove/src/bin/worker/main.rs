@@ -150,31 +150,33 @@ async fn run_model_v1<S: Store>(
             // Ensure per-input runs don't reuse cached layer state or tensor-store pages
             // to avoid cross-input contamination when proving multiple inputs in a row.
             model.reset();
-            let mut run_store = tenstore.start_new_run();
-            let input_tensors = model
-                .load_input_flat(vec![input])
-                .context("loading flat inputs")?;
+            tenstore.in_new_run(|run_store| {
+                let input_tensors = model
+                    .load_input_flat(vec![input])
+                    .context("loading flat inputs")?;
 
-            let trace = model
-                .run(input_tensors, &mut run_store)
-                .context(format!("Running inference for input {}", i + 1))?;
-            let output_handles = trace.outputs();
-            let outputs = output_handles
-                .iter()
-                .map(|handle| handle.tensor().map(|t| t.clone()))
-                .collect::<Result<_, _>>()?;
-            let io = trace.to_verifier_io().context("generating verifier IOs")?;
-            let proof = Prover::<_, T, _>::prove(&prover_ctx, trace, &model)
-                .with_context(|| "unable to generate proof for {i}th input")?;
+                let trace = model
+                    .run(input_tensors, run_store)
+                    .context(format!("Running inference for input {}", i + 1))?;
+                let output_handles = trace.outputs();
+                let outputs = output_handles
+                    .iter()
+                    .map(|handle| handle.tensor().map(|t| t.clone()))
+                    .collect::<Result<_, _>>()?;
+                let io = trace.to_verifier_io().context("generating verifier IOs")?;
+                let proof = Prover::<_, T, _>::prove(&prover_ctx, trace, &model)
+                    .with_context(|| "unable to generate proof for {i}th input")?;
 
-            proofs.push(v1::Output {
-                outputs,
-                proof: Provable {
-                    proof,
-                    io,
-                    ctx: verifier_ctx.clone(),
-                },
-            });
+                proofs.push(v1::Output {
+                    outputs,
+                    proof: Provable {
+                        proof,
+                        io,
+                        ctx: verifier_ctx.clone(),
+                    },
+                });
+                Ok(())
+            })?;
         }
         Ok(proofs)
     })
