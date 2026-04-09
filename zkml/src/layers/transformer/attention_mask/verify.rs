@@ -165,7 +165,7 @@ impl AttentionMask<Element> {
 
         let num_col_vars = column_point.len();
         // compute the evaluation for the padding polynomial, i.e., the polynomial P[i,j] = 1 iff j >= seq_len - window
-        let pad_col_bits = to_bit_sequence_le(seq_len - window - 1, num_col_vars)
+        let pad_col_bits = to_bit_sequence_le(seq_len - window, num_col_vars)
             .map(|b| E::from_canonical_usize(b))
             .collect_vec();
         let padded_eval = E::ONE - eval_zeroifier_mle(column_point, &pad_col_bits);
@@ -194,7 +194,7 @@ impl AttentionMask<Element> {
         let upper_eval = eval_zeroifier_mle(row_point, &sumcheck_point);
 
         // evaluation for the shift matrix MLE
-        let shift_eval = eval_shift_matrix(&sumcheck_point, column_point, window);
+        let shift_eval = eval_shift_matrix(&sumcheck_point, column_point, window - 1);
 
         let calc_eval = upper_eval * shift_eval;
         ensure!(

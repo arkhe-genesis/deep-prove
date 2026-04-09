@@ -115,6 +115,11 @@ mod tests {
     }
 
     #[test]
+    fn gemma3_inference() -> anyhow::Result<()> {
+        transformed_model_inference_helper::<Gemma3>(GEMMA3_SAFE_MODEL)
+    }
+
+    #[test]
     #[ignore = "Used for comparison of float and quantised model outputs, not a test of the proving system itself"]
     fn compare_float_gemma3() -> anyhow::Result<()> {
         compare_float_models_helper::<Gemma3>(GEMMA3_SAFE_MODEL)
@@ -538,6 +543,37 @@ mod tests {
                 &dequant_fp.data()[0..10]
             );
         }
+        Ok(())
+    }
+
+    fn transformed_model_inference_helper<
+        M: FPTransformModel
+            + Default
+            + TokenizerLoader<RawSafeTensors>
+            + Clone
+            + LLMModelLoader<RawSafeTensors>,
+    >(
+        model_path: &str,
+    ) -> anyhow::Result<()> {
+        init_test_logging("debug");
+        const MAX_CONTEXT: usize = 64;
+        // First we load the model
+        let raw_safe = RawSafeTensors::from_hugging_face_cached(model_path)?;
+        let model_type = M::default();
+
+        // Make a tester input for the model so we can compare the pre and post transformation outputs
+        let tokenizer = model_type.load_tokenizer(&raw_safe)?;
+
+        // Generate or load the prover & verifier contexts
+        let (driver, _) =
+            Driver::load_from_model(model_type.clone(), &raw_safe, Some(MAX_CONTEXT))?
+                .into_provable_llm_with_transform::<M>(&tokenizer)?;
+
+        let user_tokens = driver.random_sequence(MAX_CONTEXT - 2);
+        let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
+        let mut store = GenStore::default();
+
+        let _ = driver.run_elements(input_tensor, &mut store)?;
         Ok(())
     }
 

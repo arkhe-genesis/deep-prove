@@ -50,19 +50,22 @@ fn caching_case_mask(span: AttentionSpan, seq_len: usize) -> BTensor<Backend, 2,
 }
 
 /// Makes a rank 2 mask for the non-caching case (so a square matrix).
-fn non_caching_case_mask(span: AttentionSpan, seq_len: usize) -> BTensor<Backend, 2, Bool> {
+pub(crate) fn non_caching_case_mask(
+    span: AttentionSpan,
+    seq_len: usize,
+) -> BTensor<Backend, 2, Bool> {
     let plain_mask =
         BTensor::<Backend, 2, Bool>::tril_mask([seq_len, seq_len], 0, &Default::default());
     match span {
         AttentionSpan::Full => plain_mask,
         AttentionSpan::Local(n) => {
             // If the sliding window is bigger than seq_len-1, it means the local span covers the whole matrix so we just return the plain mask
-            if n >= seq_len - 1 {
+            if n >= seq_len {
                 plain_mask
             } else {
                 let extra_mask = BTensor::<Backend, 2, Bool>::triu_mask(
                     [seq_len, seq_len],
-                    -(n as i64),
+                    1 - (n as i64),
                     &Default::default(),
                 );
                 plain_mask.bool_or(extra_mask)

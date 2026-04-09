@@ -156,8 +156,8 @@ impl AttentionMask<Element> {
             let seq_len = 1 << num_col_vars;
             let mut shift_fixed_evals = vec![E::ZERO; seq_len];
             #[allow(clippy::needless_range_loop)]
-            for row in n..seq_len {
-                let col = row - n;
+            for row in n - 1..seq_len {
+                let col = row + 1 - n;
                 shift_fixed_evals[row] += beta_vec[col];
             }
             let fixed_shift_mle = shift_fixed_evals.into_mle();
@@ -235,7 +235,7 @@ impl AttentionMask<Element> {
                 return vec![zeroifier_mle];
             }
             let local_mask_mle = bool_mle_from_fn(Box::new(|token, other| {
-                if token <= other + *n {
+                if token < other + *n {
                     E::BaseField::ONE
                 } else {
                     E::BaseField::ZERO
@@ -376,12 +376,20 @@ impl<E: ExtensionField> MaskProvingData<E> {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::ensure;
     use ff_ext::GoldilocksExt2;
     use multilinear_extensions::mle::MultilinearExtension;
-    use p3_field::FieldAlgebra;
+    use p3_field::{FieldAlgebra, FieldExtensionAlgebra};
 
     use crate::{
-        layers::transformer::attention_mask::prove::{fix_lower_mle_columns, fix_lower_mle_rows},
+        Element, Shape, Tensor,
+        layers::transformer::attention_mask::{
+            AttentionMask, AttentionSpan,
+            evaluate::non_caching_case_mask,
+            prove::{fix_lower_mle_columns, fix_lower_mle_rows},
+        },
+        quantization::ToElement,
+        tensor::WrappedTensor,
         testing::random_field_vector,
     };
 
@@ -461,6 +469,62 @@ mod tests {
         assert_eq!(
             fixed_upper_mle.evaluations(),
             custom_fixed_upper_mle.evaluations(),
+        );
+
+        Ok(())
+    }
+
+    const SEQ_LENS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
+
+    #[test]
+    fn test_mask_polys_vs_mask() -> anyhow::Result<()> {
+        for seq_len in SEQ_LENS {
+            test_mask_polys_vs_mask_helper(seq_len)?;
+        }
+        Ok(())
+    }
+
+    fn test_mask_polys_vs_mask_helper(seq_len: usize) -> anyhow::Result<()> {
+        let local_span = seq_len / 2;
+        let span = AttentionSpan::Local(local_span);
+        let mask_layer = AttentionMask::<Element>::new(Element::MIN).with_span(span)?;
+
+        let test_tensor = Tensor::<Element>::new(
+            Shape::new(vec![seq_len, seq_len]),
+            vec![1; seq_len * seq_len],
+        )?;
+        let wrapped_tensor = WrappedTensor::try_from(test_tensor)?;
+        // non_caching_case_mask returns true where a position is masked out (set to -inf)
+        // false = attended position = the element-wise product of the two mask polys should be 1
+        let bool_mask = non_caching_case_mask(span, seq_len);
+        let masked_tensor = wrapped_tensor.mask_fill(bool_mask, 0)?.to_native();
+
+        // make_mask_polys returns [lower_tri_mle, offset_mle] for Local(n < seq_len)
+        let mask_polys = mask_layer.make_mask_polys::<E>(seq_len);
+        assert_eq!(
+            mask_polys.len(),
+            2,
+            "Expected two mask polynomials for Local(512) with seq_len=1024"
+        );
+
+        let combined_poly_data = mask_polys[0]
+            .get_base_field_vec()
+            .iter()
+            .zip(mask_polys[1].get_base_field_vec().iter())
+            .map(|(&a, &b)| {
+                let a = E::from_base(a).to_element();
+                let b = E::from_base(b).to_element();
+                a * b
+            })
+            .collect::<Vec<Element>>();
+
+        let poly_tensor =
+            Tensor::<Element>::new(Shape::new(vec![seq_len, seq_len]), combined_poly_data)?;
+
+        // Check equality between the two tensors
+        ensure!(
+            masked_tensor == poly_tensor,
+            "Mask tensor and poly tensor not equal for sequence length: {seq_len}, local span: {local_span}"
         );
 
         Ok(())
