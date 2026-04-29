@@ -15,7 +15,8 @@ use zkml::{
         file_cache,
         gguf::RawGGUF,
         llm::{
-            models::{gemma3::Gemma3, gpt2::GPT2},
+            HFTokenizer,
+            models::{gemma3::Gemma3, gpt2::GPT2, llama2::Llama2},
             tokenizer::TokenizerLoader,
         },
         safe::RawSafeTensors,
@@ -27,9 +28,11 @@ type F = GoldilocksExt2;
 type Pcs<E> = Basefold<E, BasefoldRSParams>;
 
 #[derive(Clone, Debug, ValueEnum)]
+#[clap(rename_all = "lower")]
 enum Model {
     GPT2,
     Gemma3,
+    Llama2,
 }
 
 impl std::fmt::Display for Model {
@@ -37,6 +40,7 @@ impl std::fmt::Display for Model {
         match self {
             Model::GPT2 => write!(f, "gpt2"),
             Model::Gemma3 => write!(f, "gemma3"),
+            Model::Llama2 => write!(f, "llama2"),
         }
     }
 }
@@ -164,40 +168,7 @@ fn main() -> anyhow::Result<()> {
             .join(", ")
     );
 
-    let (driver, tokeniser) = if let Some(gguf) = args.gguf {
-        let model_path = file_cache::from_cache(&gguf)?;
-        match args.model {
-            Model::GPT2 => {
-                let model_type = GPT2::new();
-                let raw_gguf = RawGGUF::new(model_path);
-                (
-                    Driver::load_from_model(model_type, &raw_gguf, Some(max_context))?,
-                    model_type.load_tokenizer(&raw_gguf)?,
-                )
-            }
-            _ => bail!("Model {:?} not supported for gguf", args.model),
-        }
-    } else if let Some(hf) = args.hf {
-        let safe = RawSafeTensors::from_hugging_face_cached(&hf)?;
-        match args.model {
-            Model::GPT2 => {
-                let model_type = GPT2::new();
-                (
-                    Driver::load_from_model(model_type, &safe, Some(max_context))?,
-                    model_type.load_tokenizer(&safe)?,
-                )
-            }
-            Model::Gemma3 => {
-                let model_type = Gemma3::new();
-                (
-                    Driver::load_from_model(model_type, &safe, Some(max_context))?,
-                    model_type.load_tokenizer(&safe)?,
-                )
-            }
-        }
-    } else {
-        bail!("Either gguf or hf must be provided");
-    };
+    let (driver, tokeniser) = parse_model(&args, max_context)?;
 
     let mut premeasure = Measure::new()
         .with(HEADER_MODEL, &args.model.to_string())
@@ -212,6 +183,7 @@ fn main() -> anyhow::Result<()> {
             Model::Gemma3 => premeasure.r(HEADER_MODEL_QUANT, || {
                 driver.into_provable_llm_with_transform::<Gemma3>(&tokeniser)
             })?,
+            Model::Llama2 => premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?,
         }
     };
     let (prover_ctx, mut verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
@@ -292,6 +264,50 @@ fn peak_rss_bytes() -> u64 {
         {
             r.ru_maxrss as u64
         }
+    }
+}
+
+fn parse_model(args: &LLMArgs, max_context: usize) -> anyhow::Result<(Driver<f32>, HFTokenizer)> {
+    if let Some(ref gguf) = args.gguf {
+        let model_path = file_cache::from_cache(gguf)?;
+        match args.model {
+            Model::GPT2 => {
+                let model_type = GPT2::new();
+                let raw_gguf = RawGGUF::new(model_path);
+                Ok((
+                    Driver::load_from_model(model_type, &raw_gguf, Some(max_context))?,
+                    model_type.load_tokenizer(&raw_gguf)?,
+                ))
+            }
+            _ => bail!("Model {:?} not supported for gguf", args.model),
+        }
+    } else if let Some(ref hf) = args.hf {
+        let safe = RawSafeTensors::from_hugging_face_cached(hf)?;
+        match args.model {
+            Model::GPT2 => {
+                let model_type = GPT2::new();
+                Ok((
+                    Driver::load_from_model(model_type, &safe, Some(max_context))?,
+                    model_type.load_tokenizer(&safe)?,
+                ))
+            }
+            Model::Gemma3 => {
+                let model_type = Gemma3::new();
+                Ok((
+                    Driver::load_from_model(model_type, &safe, Some(max_context))?,
+                    model_type.load_tokenizer(&safe)?,
+                ))
+            }
+            Model::Llama2 => {
+                let model_type = Llama2::new();
+                Ok((
+                    Driver::load_from_model(model_type, &safe, Some(max_context))?,
+                    model_type.load_tokenizer(&safe)?,
+                ))
+            }
+        }
+    } else {
+        bail!("Either gguf or hf must be provided");
     }
 }
 

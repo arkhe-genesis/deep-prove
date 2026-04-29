@@ -38,6 +38,7 @@ impl RMSNorm<Element> {
         let scaled = wrapped_input.mul(rmsnorm_data.normalisation.clone())?;
         let scaled_input = Tensor::try_from(&scaled)?;
         let output = Tensor::try_from(&lookup_output)?;
+
         let rank = input_shape.rank();
         let number_of_chunks = input_shape[..rank.saturating_sub(2)]
             .iter()

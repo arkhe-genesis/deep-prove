@@ -177,7 +177,7 @@ impl Load<GGUFLoader> for Gemma3Attention {
             (
                 vec![embedding_size, num_groups, heads_per_group, head_size],
                 vec![embedding_size, num_groups, head_size],
-                vec![heads_per_group, num_groups, head_size, embedding_size],
+                vec![num_groups, heads_per_group, head_size, embedding_size],
             )
         };
         let wq = loader
@@ -289,7 +289,7 @@ impl Load<SafeLoader> for Gemma3Attention {
             (
                 vec![embedding_size, num_groups, heads_per_group, head_size],
                 vec![embedding_size, num_groups, head_size],
-                vec![heads_per_group, num_groups, head_size, embedding_size],
+                vec![num_groups, heads_per_group, head_size, embedding_size],
             )
         };
         let wq = loader

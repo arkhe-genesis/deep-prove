@@ -23,7 +23,7 @@ impl LookupVariant {
             } => {
                 // This offset is used to ensure the range check performed constrains that the values are within the specified error bound.
                 // The largest diff possible is twice the error bound, so we offset al the values so the lie in the final (2 * error_bound) values of the range check table.
-                let offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * error_bound);
+                let offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * error_bound);
                 let norm_sum_const = normalised_sum_value + error_bound;
 
                 let all_lookups = unpadded_output
@@ -56,9 +56,10 @@ impl LookupVariant {
                 };
                 // This offset is used to ensure the range check performed constrains that the values are within the specified error bound.
                 // The largest diff possible is twice the error bound, so we offset al the values so the lie in the final (2 * error_bound) values of the range check table.
-                let sum_offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * sum_error_bound);
+                let sum_offset: Element =
+                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * sum_error_bound);
                 let sumsq_offset: Element =
-                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * magnitude_error_bound);
+                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * magnitude_error_bound);
 
                 // Since the value we are checking can be either side of the specified value we add the error bound to it as an offset,
                 // This was if we are on the lower limit the value becomes 0, and the upper limit becomes 2 * error_bound.
@@ -126,7 +127,7 @@ impl LookupVariant {
             } => {
                 // This offset is used to ensure the range check performed constrains that the values are within the specified error bound.
                 // The largest diff possible is twice the error bound, so we offset all the values so they lie in the final (2 * error_bound) values of the range check table.
-                let offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * error_bound);
+                let offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * error_bound);
                 let norm_sum_const = normalised_sum_value + error_bound;
                 let column_evals = output_chunks
                     .map(|chunk| {
@@ -162,9 +163,10 @@ impl LookupVariant {
 
                 // This offset is used to ensure the range check performed constrains that the values are within the specified error bound.
                 // The largest diff possible is twice the error bound, so we offset all the values so they lie in the final (2 * error_bound) values of the range check table.
-                let sum_offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * sum_error_bound);
+                let sum_offset: Element =
+                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * sum_error_bound);
                 let sumsq_offset: Element =
-                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * magnitude_error_bound);
+                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * magnitude_error_bound);
 
                 let norm_sum_const = norm_sum + sum_error_bound;
                 let normalised_magnitude_const = normalised_magnitude_value + magnitude_error_bound;

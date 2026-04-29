@@ -1,0 +1,662 @@
+use crate::parser::{
+    Load,
+    llm::{HFTokenizer, LLMMetadata, models::LLMModelLoader, tokenizer::TokenizerLoader},
+};
+use anyhow::Context;
+
+use crate::{
+    Shape,
+    layers::transformer::attention_mask::AttentionSpan,
+    model::Model,
+    parser::{
+        ModelLoader,
+        llm::{
+            LLMConfig, LLMIR,
+            config::{AttentionConfig, AttentionHeadType, LLMStructure},
+            transformer::NormType,
+        },
+        safe::{self, RawSafeTensors},
+    },
+};
+
+pub mod decoder;
+use decoder::Llama2Decoder;
+
+/// Loader for the Llama2 model.
+#[derive(Clone, Debug, Default, Copy)]
+pub struct Llama2 {
+    /// Maximum context length for RoPE precomputation.
+    /// If None, uses the model's default from config.json.
+    max_ctx_length: Option<usize>,
+}
+
+pub const LLAMA2_NAME: &str = "llama2";
+impl Llama2 {
+    pub fn new() -> Self {
+        Llama2 {
+            max_ctx_length: None,
+        }
+    }
+
+    /// Set a custom maximum context length to limit RoPE matrix size.
+    pub fn with_max_ctx_length(mut self, length: usize) -> Self {
+        self.max_ctx_length = Some(length);
+        self
+    }
+}
+pub fn is_llama2_model(names: &[String]) -> bool {
+    names
+        .iter()
+        .any(|name| name.to_lowercase().contains("llama"))
+}
+
+impl TokenizerLoader<RawSafeTensors> for Llama2 {
+    fn load_tokenizer(&self, raw: &RawSafeTensors) -> anyhow::Result<HFTokenizer> {
+        let tokenizer = HFTokenizer::from_tokenizer_json_path(raw.tokenizer_path())?;
+        Ok(tokenizer)
+    }
+}
+
+impl<DataFormat> LLMModelLoader<DataFormat> for Llama2
+where
+    Llama2: ModelLoader<DataFormat, Metadata = LLMMetadata>,
+{
+    fn with_max_context_length(self, max_ctx_length: usize) -> Self
+    where
+        Self: Sized,
+    {
+        Llama2 {
+            max_ctx_length: Some(max_ctx_length),
+        }
+    }
+}
+
+impl ModelLoader<RawSafeTensors> for Llama2 {
+    type Metadata = LLMMetadata;
+
+    fn model_name(&self) -> String {
+        LLAMA2_NAME.to_string()
+    }
+
+    fn parse(&self, raw: &RawSafeTensors) -> anyhow::Result<(Model<f32>, Self::Metadata)> {
+        // Read HF config.json
+        let cfg = raw.read_config_json()?;
+        let hidden_size = cfg
+            .get::<usize, _>("hidden_size")
+            .context("hidden_size not found")?;
+        let embedding_size = hidden_size;
+        let num_heads = cfg
+            .get::<usize, _>("num_attention_heads")
+            .context("num_attention_heads not found")?;
+        // head_dim may not be present in config.json, compute from hidden_size / num_heads
+        let head_size = cfg
+            .get::<usize, _>("head_dim")
+            .unwrap_or(hidden_size / num_heads);
+        let num_block = cfg
+            .get::<usize, _>("num_hidden_layers")
+            .context("num_hidden_layers not found")?;
+        let config_context_length = cfg
+            .get::<usize, _>("max_position_embeddings")
+            .context("max_position_embeddings not found")?;
+        // Use custom max_ctx_length if set (to limit RoPE matrix size), otherwise use config value
+        let context_length = self.max_ctx_length.unwrap_or(config_context_length);
+        let norm_epsilon = cfg
+            .get::<f32, _>("rms_norm_eps")
+            .context("rms_norm_eps not found")?;
+        let vocab_size = cfg
+            .get::<usize, _>("vocab_size")
+            .context("vocab_size not found")?;
+        let eos_token = cfg
+            .get::<u64, _>("eos_token_id")
+            .context("eos_token_id not found")?
+            .into();
+        let intermediate_size = cfg
+            .get::<usize, _>("intermediate_size")
+            .context("intermediate_size not found")?;
+
+        let llm_config = LLMConfig {
+            model_name: "llama2".to_string(),
+            embedding_size,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            head_size,
+            num_block,
+            context_length,
+            norm_epsilon,
+            vocab_size,
+            eos_token,
+        };
+
+        // Structure: Llama2 uses RMSNorm + RoPE and no final projection
+        let num_groups = cfg
+            .get::<usize, _>("num_key_value_heads")
+            .context("num_key_value_heads not found")?;
+        let structure = LLMStructure {
+            generic: llm_config.clone(),
+            norm_type: NormType::RMSNorm,
+            global_positional: None,
+            attention_config: AttentionConfig {
+                span: (1..=num_block).map(|_| AttentionSpan::Full).collect(),
+                head: AttentionHeadType::GQA(num_groups),
+            },
+        };
+
+        let loader = safe::FileTensorLoader::from_path(raw.model_path())?;
+        let llm_model = LLMIR::<Llama2Decoder>::from_loader(&loader, &(structure, cfg))?;
+        let init_user_shape = Shape::from(vec![1]);
+        llm_model.into_model(llm_config, init_user_shape)
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::{fs::File, io::BufReader};
+
+    use serde::{Deserialize, Serialize};
+    use tenstore::GenStore;
+
+    use crate::{Tensor, layers::Layer, parser::llm::LLMTokenizer};
+
+    use super::*;
+
+    pub const LLAMA2_SAFE_MODEL: &str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
+
+    #[test]
+    fn test_safe_llama2_load_tokenizer() -> anyhow::Result<()> {
+        let raw = RawSafeTensors::from_hugging_face_cached(LLAMA2_SAFE_MODEL)?;
+        let tokenizer = Llama2::new().load_tokenizer(&raw)?;
+        let tokens = tokenizer.tokenize("Hello, world!");
+        let s = tokenizer.detokenize(&tokens);
+        assert_eq!(s, "Hello, world!");
+        Ok(())
+    }
+
+    #[test]
+    fn test_safe_llama2_load_model() -> anyhow::Result<()> {
+        let raw = RawSafeTensors::from_hugging_face_cached(LLAMA2_SAFE_MODEL)?;
+        let (model, metadata) = Llama2::new().parse(&raw)?;
+        let config = &metadata.config;
+        assert_eq!(config.num_heads, 32);
+        assert_eq!(config.num_block, 22);
+        assert_eq!(config.embedding_size, 2048);
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.context_length, 2048);
+        assert_eq!(config.norm_epsilon, 1e-5);
+        assert_eq!(config.vocab_size, 32000);
+        let input = Tensor::new(vec![1].into(), vec![1_f32])?;
+        model.run_float(vec![input], &mut GenStore::default())?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_safe_llama2_logits() -> anyhow::Result<()> {
+        use crate::tensor::is_close_with_tolerance;
+
+        // Use relaxed tolerance for floating point comparison (1e-4 relative, 1e-5 absolute)
+        let is_close = |a: &[f32], b: &[f32]| is_close_with_tolerance(a, b, 1e-5, 1e-4);
+
+        let raw = RawSafeTensors::from_hugging_face_cached(LLAMA2_SAFE_MODEL)?;
+        let (model, _metadata) = Llama2::new().parse(&raw)?;
+
+        // Load the json file that was generated by the python script
+        let logits_path = "assets/scripts/llms/llama2_logits.json";
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Llama2Trace {
+            input_token: Vec<u32>,
+            input_text: String,
+            embeddings: Vec<Vec<f32>>,        // [seq_len, hidden_size]
+            q_proj_0: Vec<f32>, // flattened [heads_per_group, num_groups, seq, head_dim]
+            k_proj_0: Vec<f32>, // flattened [num_groups, seq, head_dim]
+            v_proj_0: Vec<f32>, // flattened [num_groups, seq, head_dim]
+            q_rope_0: Vec<f32>, // flattened [heads_per_group, num_groups, seq, head_dim]
+            k_rope_0: Vec<f32>, // flattened [num_groups, seq, head_dim]
+            attn_softmax_0: Vec<f32>, // flattened [heads_per_group, num_groups, seq, seq]
+            attn_value_0: Vec<f32>, // [heads_per_group, num_groups, seq, head_dim] - softmax @ V
+            attn_output_0: Vec<f32>, // [seq, hidden_size] - after o_proj
+            after_first_residual_0: Vec<f32>, // [seq, hidden_size] - embeddings + attn_output
+            final_proj_output: Vec<f32>, // [vocab_size] - last token logits
+            logits: Vec<f32>,
+        }
+
+        let traces: Vec<Llama2Trace> =
+            serde_json::from_reader(BufReader::new(File::open(logits_path)?))?;
+
+        // Just process the first trace
+        let trace_data = &traces[0];
+        let input_shape = Shape::from(vec![trace_data.input_token.len()]);
+        let input = Tensor::new(
+            input_shape.clone(),
+            trace_data.input_token.iter().map(|x| *x as f32).collect(),
+        )?;
+
+        let mut store = GenStore::default();
+        let trace = model.run(vec![input], &mut store)?;
+
+        // Find the embeddings layer output (should be first inner node after input)
+        let embedding_node_id = model
+            .graph()
+            .inner_nodes()
+            .find(|(_, layer)| matches!(layer, Layer::Embeddings(_)))
+            .map(|(id, _)| id)
+            .ok_or(anyhow::anyhow!("No embeddings layer found"))?;
+
+        let rust_embeddings = trace
+            .get_step(&embedding_node_id)
+            .ok_or(anyhow::anyhow!("Failed to get embeddings step"))?
+            .output_tensors()?[0]
+            .clone();
+
+        // Flatten Python embeddings for comparison
+        let python_embeddings: Vec<f32> = trace_data.embeddings.iter().flatten().copied().collect();
+        let rust_emb_data = rust_embeddings.data();
+
+        println!("Rust embeddings shape: {:?}", rust_embeddings.shape());
+        println!(
+            "Python embeddings: {} x {} = {} values",
+            trace_data.embeddings.len(),
+            trace_data.embeddings[0].len(),
+            python_embeddings.len()
+        );
+        println!("Rust embeddings: {} values", rust_emb_data.len());
+
+        // Compare embeddings
+        if !is_close(rust_emb_data, &python_embeddings) {
+            let max_diff = rust_emb_data
+                .iter()
+                .zip(python_embeddings.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let avg_diff = rust_emb_data
+                .iter()
+                .zip(python_embeddings.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+                / rust_emb_data.len() as f32;
+            panic!(
+                "Embeddings not close! max_diff: {:.6}, avg_diff: {:.6}, \
+                 rust_first_5: {:?}, python_first_5: {:?}",
+                max_diff,
+                avg_diff,
+                &rust_emb_data[..5.min(rust_emb_data.len())],
+                &python_embeddings[..5.min(python_embeddings.len())]
+            );
+        }
+
+        // Find the first EinSum layer (QKV projection in first decoder block)
+        let first_einsum_id = model
+            .graph()
+            .inner_nodes()
+            .find(|(_, layer)| matches!(layer, Layer::EinSum(_)))
+            .map(|(id, _)| id)
+            .ok_or(anyhow::anyhow!("No EinSum layer found"))?;
+
+        let qkv_step = trace
+            .get_step(&first_einsum_id)
+            .ok_or(anyhow::anyhow!("Failed to get QKV EinSum step"))?;
+
+        let qkv_outputs = qkv_step.output_tensors()?;
+        println!("QKV EinSum has {} outputs", qkv_outputs.len());
+        for (i, out) in qkv_outputs.iter().enumerate() {
+            println!("  Output {}: shape {:?}", i, out.shape());
+        }
+
+        // Compare Q projection (output 0)
+        let rust_q = &qkv_outputs[0];
+        let python_q = &trace_data.q_proj_0;
+        println!(
+            "Rust Q shape: {:?}, Python Q: {} values",
+            rust_q.shape(),
+            python_q.len()
+        );
+
+        if !is_close(rust_q.data(), python_q) {
+            let max_diff = rust_q
+                .data()
+                .iter()
+                .zip(python_q.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            panic!(
+                "Q projection not close! max_diff: {:.6}, \
+                 rust_first_5: {:?}, python_first_5: {:?}",
+                max_diff,
+                &rust_q.data()[..5.min(rust_q.data().len())],
+                &python_q[..5.min(python_q.len())]
+            );
+        }
+
+        // Compare K projection (output 1)
+        let rust_k = &qkv_outputs[1];
+        let python_k = &trace_data.k_proj_0;
+        println!(
+            "Rust K shape: {:?}, Python K: {} values",
+            rust_k.shape(),
+            python_k.len()
+        );
+
+        if !is_close(rust_k.data(), python_k) {
+            let max_diff = rust_k
+                .data()
+                .iter()
+                .zip(python_k.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            panic!(
+                "K projection not close! max_diff: {:.6}, \
+                 rust_first_5: {:?}, python_first_5: {:?}",
+                max_diff,
+                &rust_k.data()[..5.min(rust_k.data().len())],
+                &python_k[..5.min(python_k.len())]
+            );
+        }
+
+        // Compare V projection (output 2)
+        let rust_v = &qkv_outputs[2];
+        let python_v = &trace_data.v_proj_0;
+        println!(
+            "Rust V shape: {:?}, Python V: {} values",
+            rust_v.shape(),
+            python_v.len()
+        );
+
+        if !is_close(rust_v.data(), python_v) {
+            let max_diff = rust_v
+                .data()
+                .iter()
+                .zip(python_v.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            panic!(
+                "V projection not close! max_diff: {:.6}, \
+                 rust_first_5: {:?}, python_first_5: {:?}",
+                max_diff,
+                &rust_v.data()[..5.min(rust_v.data().len())],
+                &python_v[..5.min(python_v.len())]
+            );
+        }
+
+        // Find the Positional (RoPE) layers - there should be two after the QKV einsum (one for Q, one for K)
+        let positional_nodes: Vec<_> = model
+            .graph()
+            .inner_nodes()
+            .filter(|(_, layer)| matches!(layer, Layer::Positional(_)))
+            .map(|(id, _)| id)
+            .collect();
+        println!("Found {} Positional (RoPE) layers", positional_nodes.len());
+
+        // First positional is Q RoPE, second is K RoPE
+        if positional_nodes.len() >= 2 {
+            let q_rope_id = positional_nodes[0];
+            let k_rope_id = positional_nodes[1];
+
+            let rust_q_rope = trace
+                .get_step(&q_rope_id)
+                .ok_or(anyhow::anyhow!("Failed to get Q RoPE step"))?
+                .output_tensors()?[0]
+                .clone();
+
+            let rust_k_rope = trace
+                .get_step(&k_rope_id)
+                .ok_or(anyhow::anyhow!("Failed to get K RoPE step"))?
+                .output_tensors()?[0]
+                .clone();
+
+            let python_q_rope = &trace_data.q_rope_0;
+            let python_k_rope = &trace_data.k_rope_0;
+
+            println!(
+                "Rust Q RoPE shape: {:?}, Python Q RoPE: {} values",
+                rust_q_rope.shape(),
+                python_q_rope.len()
+            );
+            println!(
+                "Rust K RoPE shape: {:?}, Python K RoPE: {} values",
+                rust_k_rope.shape(),
+                python_k_rope.len()
+            );
+
+            if !is_close(rust_q_rope.data(), python_q_rope) {
+                let max_diff = rust_q_rope
+                    .data()
+                    .iter()
+                    .zip(python_q_rope.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                panic!(
+                    "Q RoPE not close! max_diff: {:.6}, \
+                     rust_first_5: {:?}, python_first_5: {:?}",
+                    max_diff,
+                    &rust_q_rope.data()[..5.min(rust_q_rope.data().len())],
+                    &python_q_rope[..5.min(python_q_rope.len())]
+                );
+            }
+
+            if !is_close(rust_k_rope.data(), python_k_rope) {
+                let max_diff = rust_k_rope
+                    .data()
+                    .iter()
+                    .zip(python_k_rope.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                panic!(
+                    "K RoPE not close! max_diff: {:.6}, \
+                     rust_first_5: {:?}, python_first_5: {:?}",
+                    max_diff,
+                    &rust_k_rope.data()[..5.min(rust_k_rope.data().len())],
+                    &python_k_rope[..5.min(python_k_rope.len())]
+                );
+            }
+        }
+
+        // Find the Softmax layer output
+        let softmax_node_id = model
+            .graph()
+            .inner_nodes()
+            .find(|(_, layer)| matches!(layer, Layer::Softmax(_)))
+            .map(|(id, _)| id)
+            .ok_or(anyhow::anyhow!("No Softmax layer found"))?;
+
+        let rust_softmax = trace
+            .get_step(&softmax_node_id)
+            .ok_or(anyhow::anyhow!("Failed to get Softmax step"))?
+            .output_tensors()?[0]
+            .clone();
+
+        let python_softmax = &trace_data.attn_softmax_0;
+        println!(
+            "Rust Softmax shape: {:?}, Python Softmax: {} values",
+            rust_softmax.shape(),
+            python_softmax.len()
+        );
+
+        if !is_close(rust_softmax.data(), python_softmax) {
+            let max_diff = rust_softmax
+                .data()
+                .iter()
+                .zip(python_softmax.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            panic!(
+                "Softmax not close! max_diff: {:.6}, \
+                 rust_first_10: {:?}, python_first_10: {:?}",
+                max_diff,
+                &rust_softmax.data()[..10.min(rust_softmax.data().len())],
+                &python_softmax[..10.min(python_softmax.len())]
+            );
+        }
+
+        // Find EinSum layers
+        let einsum_nodes: Vec<_> = model
+            .graph()
+            .inner_nodes()
+            .filter(|(_, layer)| matches!(layer, Layer::EinSum(_)))
+            .collect();
+        println!("Found {} EinSum layers total", einsum_nodes.len());
+
+        // Print shapes of first few EinSums to find the right one
+        for (i, (id, _)) in einsum_nodes.iter().take(5).enumerate() {
+            if let Some(step) = trace.get_step(id)
+                && let Ok(outs) = step.output_tensors()
+            {
+                println!(
+                    "  EinSum {}: outputs {:?}",
+                    i,
+                    outs.iter()
+                        .map(|t| format!("{:?}", t.shape()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        // Check attention output first (EinSum 3 with shape [10, 2048])
+        let hidden_size = 2048;
+        let seq_len = trace_data.input_token.len();
+
+        let out_proj_id = einsum_nodes
+            .iter()
+            .find(|(id, _)| {
+                if let Some(step) = trace.get_step(id)
+                    && let Ok(outs) = step.output_tensors()
+                    && outs.len() == 1
+                {
+                    let shape = outs[0].shape();
+                    return shape.len() == 2 && shape[0] == seq_len && shape[1] == hidden_size;
+                }
+                false
+            })
+            .map(|(id, _)| id);
+
+        if let Some(out_proj_id) = out_proj_id {
+            let rust_attn_out = trace
+                .get_step(out_proj_id)
+                .ok_or(anyhow::anyhow!("Failed to get attn output step"))?
+                .output_tensors()?[0]
+                .clone();
+
+            let python_attn_out = &trace_data.attn_output_0;
+            println!(
+                "Rust attn_output shape: {:?}, Python attn_output: {} values",
+                rust_attn_out.shape(),
+                python_attn_out.len()
+            );
+
+            if !is_close(rust_attn_out.data(), python_attn_out) {
+                let max_diff = rust_attn_out
+                    .data()
+                    .iter()
+                    .zip(python_attn_out.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                panic!(
+                    "Attn output not close! max_diff: {:.6}, \
+                     rust_first_5: {:?}, python_first_5: {:?}",
+                    max_diff,
+                    &rust_attn_out.data()[..5.min(rust_attn_out.data().len())],
+                    &python_attn_out[..5.min(python_attn_out.len())]
+                );
+            }
+        } else {
+            println!(
+                "WARNING: Could not find output projection EinSum with shape [{}, {}]",
+                seq_len, hidden_size
+            );
+        }
+
+        // Find the first Add layer (residual after attention)
+        let add_nodes: Vec<_> = model
+            .graph()
+            .inner_nodes()
+            .filter(|(_, layer)| matches!(layer, Layer::Add(_)))
+            .map(|(id, _)| id)
+            .collect();
+        println!("Found {} Add layers total", add_nodes.len());
+
+        if !add_nodes.is_empty() {
+            let first_add_id = add_nodes[0];
+            let rust_first_residual = trace
+                .get_step(&first_add_id)
+                .ok_or(anyhow::anyhow!("Failed to get first Add step"))?
+                .output_tensors()?[0]
+                .clone();
+
+            let python_first_residual = &trace_data.after_first_residual_0;
+            println!(
+                "Rust first residual shape: {:?}, Python: {} values",
+                rust_first_residual.shape(),
+                python_first_residual.len()
+            );
+
+            if !is_close(rust_first_residual.data(), python_first_residual) {
+                let max_diff = rust_first_residual
+                    .data()
+                    .iter()
+                    .zip(python_first_residual.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                panic!(
+                    "First residual not close! max_diff: {:.6}, \
+                     rust_first_5: {:?}, python_first_5: {:?}",
+                    max_diff,
+                    &rust_first_residual.data()[..5.min(rust_first_residual.data().len())],
+                    &python_first_residual[..5.min(python_first_residual.len())]
+                );
+            }
+        }
+
+        // Find the final projection (last EinSum before Argmax)
+        // The final projection is the second-to-last inner node (before Argmax)
+        let (argmax_layer_id, _) = model.graph().inner_nodes().last().unwrap();
+
+        let rust_final_proj = trace
+            .get_step(&argmax_layer_id)
+            .ok_or(anyhow::anyhow!("Failed to get final proj step"))?
+            .input_tensors()?[0]
+            .clone();
+
+        let python_final_proj = &trace_data.final_proj_output;
+
+        // Get the last token's logits from Rust (skip to last seq position)
+        let vocab_size = python_final_proj.len();
+        let total_logits = rust_final_proj.data().len();
+        let skip = total_logits - vocab_size;
+        let rust_last_token_logits = &rust_final_proj.data()[skip..];
+
+        println!(
+            "Rust final_proj shape: {:?}, total values: {}",
+            rust_final_proj.shape(),
+            total_logits
+        );
+        println!(
+            "Python final_proj: {} values (last token only)",
+            python_final_proj.len()
+        );
+        println!("Comparing last {} values from Rust", vocab_size);
+
+        // Use relaxed tolerance for final logits - errors accumulate through 22 layers
+        let is_close_final = |a: &[f32], b: &[f32]| is_close_with_tolerance(a, b, 1e-4, 1e-3);
+        if !is_close_final(rust_last_token_logits, python_final_proj) {
+            let max_diff = rust_last_token_logits
+                .iter()
+                .zip(python_final_proj.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let avg_diff = rust_last_token_logits
+                .iter()
+                .zip(python_final_proj.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+                / vocab_size as f32;
+            panic!(
+                "Final proj not close! max_diff: {:.6}, avg_diff: {:.6}, \
+                 rust_first_5: {:?}, python_first_5: {:?}",
+                max_diff,
+                avg_diff,
+                &rust_last_token_logits[..5.min(rust_last_token_logits.len())],
+                &python_final_proj[..5.min(python_final_proj.len())]
+            );
+        }
+
+        Ok(())
+    }
+}

@@ -189,6 +189,82 @@ mod tests {
         })
     }
 
+    /// Regression test: softmax row sums must stay within the ShiftCheckTable error
+    /// bound at context 128 across different input distributions. The tightest case
+    /// (near-zero values) previously had only 5 units of margin, causing
+    /// "Final numerator was non-zero for ShiftCheckTable" failures on Llama2.
+    #[test]
+    fn test_softmax_row_sums_within_error_bound_at_128() {
+        use crate::lookup::{
+            operation::{LookupOp, variant::LookupVariant},
+            table::SHIFT_CHECK_TABLE_BIT_SIZE,
+        };
+
+        let test_cases: Vec<(&str, Vec<f32>)> = vec![
+            ("uniform", vec![0.001f32; 128 * 128]),
+            ("random", {
+                let mut rng = 42u64;
+                (0..128 * 128)
+                    .map(|_| {
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        ((rng >> 33) as f32 / (1u64 << 31) as f32) * 8.0 - 4.0
+                    })
+                    .collect()
+            }),
+        ];
+
+        let n = 128;
+
+        for (name, flat_floats) in &test_cases {
+            let float_matrix = Tensor::new(vec![1, n, n].into(), flat_floats.clone()).unwrap();
+            let scaling = ScalingFactor::from_tensor(&float_matrix, None);
+            if scaling.scale() <= 0.0 {
+                continue;
+            }
+
+            let quant_matrix = float_matrix.quantize(&scaling);
+            let softmax = Softmax::<f32>::new(n).quantise(scaling).unwrap();
+            let quant_info = softmax.quant_info().unwrap();
+            let neg_inf = quant_info.quantised_negative_infinity();
+            if quant_matrix.data().contains(&neg_inf) {
+                continue;
+            }
+
+            let mask = BTensor::<Backend, 2, Bool>::tril_mask([n, n], 0, &Default::default());
+            let causal = WrappedTensor::try_from(quant_matrix)
+                .unwrap()
+                .mask_fill(mask, neg_inf)
+                .unwrap();
+
+            let result = softmax.evaluate_internal(&[&causal]).unwrap();
+            let output_data: Vec<Element> = result.outputs[0].to_data().to_vec().unwrap();
+
+            let (normalised_sum_value, error_bound) = match quant_info.variant() {
+                LookupVariant::Softmax {
+                    normalised_sum_value,
+                    error_bound,
+                } => (normalised_sum_value, error_bound),
+                _ => panic!("Expected Softmax variant"),
+            };
+
+            let table_max: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1;
+            let offset: Element = table_max - (2 * error_bound);
+
+            for row in 0..n {
+                let row_sum: Element = output_data[row * n..(row + 1) * n].iter().sum();
+                let lookup_val = offset + normalised_sum_value + error_bound - row_sum;
+                assert!(
+                    (0..=table_max).contains(&lookup_val),
+                    "{name}: row {row} overflow: sum={row_sum} expected={normalised_sum_value} \
+                     deviation={} error_bound={error_bound}",
+                    (row_sum - normalised_sum_value).abs()
+                );
+            }
+        }
+    }
+
     proptest! {
         /// Checks that [`Softmax::calculate_shift_data_new`] produces the same integer
         /// shift when processing a full `[heads, n, n]` causally-masked attention matrix all

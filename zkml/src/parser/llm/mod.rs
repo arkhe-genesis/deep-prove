@@ -10,6 +10,7 @@ pub use crate::parser::{
     json::{self, FileTensorLoader as JSONLoader},
     safe::{ConfigJSON, FileTensorLoader as SafeLoader},
 };
+use anyhow::Context;
 pub use config::LLMConfig;
 use serde::{Deserialize, Serialize};
 use tenstore::StorageKey;
@@ -237,6 +238,14 @@ where
     }
 }
 
+pub const FINAL_PROJ_KEYS: &[&str] = &[
+    "lm_head.weight",
+    "output.weight",
+    "output_projection.weight",
+    "decoder.lm_head.weight",
+    "model.lm_head.weight",
+];
+
 impl<T> Load<SafeLoader> for LLMIR<T>
 where
     T: Load<SafeLoader, Config = (LLMStructure, ConfigJSON)> + LayerInsertion,
@@ -266,16 +275,31 @@ where
             &structure.generic,
         )?;
         // Now we work out the final projection
+        // Check for separate lm_head (tie_word_embeddings=false) or use embeddings (tied)
+        let proj_weights = match config.get::<bool, _>("tie_word_embeddings") {
+            Some(true) => embeddings.mat.clone(),
+            Some(false) => {
+                // lm_head.weight is already [vocab_size, hidden_size], no transpose needed
+                let maybe_tensor = FINAL_PROJ_KEYS
+                    .iter()
+                    .find_map(|k| loader.get_tensor(k).ok());
+                maybe_tensor
+                    .context("unable to find lm_head weight")?
+                    .into()
+            }
+            None => embeddings.mat.clone(),
+        };
+
         // there may or may not be a bias
         let input_terms = "X(se)@WE(ve)";
-        let proj_bias = loader.get_tensor("output.bias").ok();
+        let proj_bias = loader.get_tensor("lm_head.bias").ok();
         let output_terms = if proj_bias.is_some() {
             "O(sv)+BIAS(v)"
         } else {
             "O(sv)"
         };
         let equation = format!("{input_terms}->{output_terms}");
-        let mut proj_weights = KeyedTensor::try_from(&embeddings.mat)?;
+        let mut proj_weights = KeyedTensor::try_from(&proj_weights)?;
         // We need to modify the key to avoid conflicts between the embeddings matrix and the final projection
         // the embeddings matrix is scaled _after_ parsing the model, but the final projection is *not* scaled
         // so in effect, these are two different tensors and thus need to be represented by two different keys

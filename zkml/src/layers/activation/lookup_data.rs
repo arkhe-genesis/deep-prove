@@ -71,6 +71,18 @@ impl ActivationLookupData {
                     0,
                 )
             }
+            ActivationLayer::Silu(..) => {
+                let table = Table::new_silu(
+                    table_input_scaling.scale().recip(),
+                    table_output_scaling.scale().recip(),
+                    table_input_scaling.bit_size() + 1,
+                );
+                (
+                    input_scaling.scale() / table_input_scaling.scale(),
+                    table,
+                    0,
+                )
+            }
         };
 
         let intermediate_bit_size = input_scaling.bit_size() + 1;

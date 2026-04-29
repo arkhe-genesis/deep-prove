@@ -398,18 +398,21 @@ where
             #[cfg(test)]
             {
                 let mut total_not_in_table = 0;
-                for key in table_lookup_data.keys() {
+                let mut bad_values = Vec::new();
+                for (key, count) in table_lookup_data.iter() {
                     let check = table_column.contains(key);
                     if !check {
                         total_not_in_table += 1;
+                        bad_values.push((*key, *count));
                     }
                 }
                 if total_not_in_table > 0 {
                     println!(
-                        "For table {}, total lookup values: {}, not in table: {}",
+                        "For table {}, total lookup values: {}, not in table: {}, bad values (value, count): {:?}",
                         table.name(),
                         table_lookup_data.len(),
-                        total_not_in_table
+                        total_not_in_table,
+                        bad_values
                     );
                 }
             }

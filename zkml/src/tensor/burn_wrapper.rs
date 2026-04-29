@@ -1625,6 +1625,41 @@ impl WrappedTensor<f32> {
         }
     }
 
+    /// Applies the Sigmoid Linear Unit (SiLU) function, also known as swish.
+    /// SiLU is defined as `x * sigmoid(x)`.
+    pub(crate) fn silu(self) -> Self {
+        match self {
+            WrappedTensor::Rank1 {
+                tensor,
+                unpadded_shape,
+            } => WrappedTensor::Rank1 {
+                tensor: burn::tensor::activation::silu(tensor),
+                unpadded_shape,
+            },
+            WrappedTensor::Rank2 {
+                tensor,
+                unpadded_shape,
+            } => WrappedTensor::Rank2 {
+                tensor: burn::tensor::activation::silu(tensor),
+                unpadded_shape,
+            },
+            WrappedTensor::Rank3 {
+                tensor,
+                unpadded_shape,
+            } => WrappedTensor::Rank3 {
+                tensor: burn::tensor::activation::silu(tensor),
+                unpadded_shape,
+            },
+            WrappedTensor::Rank4 {
+                tensor,
+                unpadded_shape,
+            } => WrappedTensor::Rank4 {
+                tensor: burn::tensor::activation::silu(tensor),
+                unpadded_shape,
+            },
+        }
+    }
+
     pub(crate) fn conv2d(
         self,
         weight: Self,

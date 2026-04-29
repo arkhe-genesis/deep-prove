@@ -41,7 +41,7 @@ impl LookupVariant {
                     evals.len() == 1,
                     "Expected single eval for softmax normalisation"
                 );
-                let offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * error_bound);
+                let offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * error_bound);
                 let offset_field: E = offset.to_field();
                 let norm_sum_const: E = (*normalised_sum_value + error_bound).to_field();
 
@@ -60,11 +60,12 @@ impl LookupVariant {
                     None => (0, 0),
                 };
 
-                let sum_offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * sum_error_bound);
+                let sum_offset: Element =
+                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * sum_error_bound);
                 let sum_offset_field: E = sum_offset.to_field();
 
                 let sumsq_offset: Element =
-                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - (2 * magnitude_error_bound);
+                    (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * magnitude_error_bound);
                 let sumsq_offset_field: E = sumsq_offset.to_field();
                 let norm_sum_const: E = (norm_sum + sum_error_bound).to_field();
                 let norm_magnitude_const: E =

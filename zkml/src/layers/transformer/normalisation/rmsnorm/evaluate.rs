@@ -96,33 +96,71 @@ impl RMSNorm<Element> {
             .get_quantisation_scaling_factors()
             .context("Quantisation scaling factors not found for RMSNorm evaluation")?;
 
-        let dim_size = self.normalisation_dim_size() as f32;
+        let squared = input.clone().mul(input.clone())?;
+        let summed = squared.sum_dim(-1);
 
-        let normalising_factor = input
-            .clone()
-            .mul(input.clone())?
-            .sum_dim(-1)
-            .float()
-            .mul_scalar(input_scaling_factor.scale() * input_scaling_factor.scale() / dim_size)
-            .add_scalar(self.eps)
-            .sqrt()
-            .recip();
+        // ── Why we don't use epsilon in the quantised path ─────────────────────
+        //
+        // Standard (float) RMSNorm computes:
+        //   output = input / sqrt(mean(input²) + eps)
+        //
+        // The ZK prover verifies each row satisfies:
+        //   sum(output²) ≈ normalised_sum_sq  (within ± error_bound)
+        // If the check value lands outside ShiftCheckTable's [0, 65535] range,
+        // the prover fails with "Final numerator was non-zero".
+        //
+        // Problem: epsilon in sqrt(mean_sq + eps) inflates the denominator,
+        // which shrinks the normalising factor, which shrinks the outputs,
+        // which makes sum(output²) too small, which overflows the check table.
+        // This is especially severe for rows with small input magnitudes where
+        // eps is significant relative to mean(input²) (e.g. Llama2 RMSNorm).
+        //
+        // Fix: don't use epsilon here at all. Its only purpose in float
+        // RMSNorm is to prevent division by zero, which we handle explicitly
+        // via the `input_sumsq != 0` branch below. Instead, compute the
+        // normalising factor directly from the target output sum-of-squares:
+        //
+        //   nws = sqrt(normalised_sum_sq / input_sumsq)
+        //
+        // This guarantees sum(output²) ≈ normalised_sum_sq (targeting the
+        // center of the valid range to leave margin for fixed-point rounding).
+        //
+        // Note on zero-input rows:
+        //   If input_sumsq == 0 we set nws = 0 to avoid log2(0) = -inf in
+        //   the fract/shift decomposition below. Output will be all zeros.
+        //   In practice zero rows don't occur (quantisation spreads values).
+        // ───────────────────────────────────────────────────────────────────────
 
-        let rescaling_factor =
-            input_scaling_factor.scale() * normalisation_scaling_factor.scale().recip();
+        let input_sumsq_data: Vec<Element> = summed.get_data();
+        let multiplier_shape = summed.shape();
 
-        let norm_with_scale = normalising_factor.mul_scalar(rescaling_factor);
-        let norm_with_scale_shape = norm_with_scale.shape();
+        // Normalisation check parameters (same formula used by the prover/verifier
+        // in variant/proving.rs and variant/verifying.rs).
+        let normalised_sum_sq = (self.normalisation_dim_size() as f32
+            / (normalisation_scaling_factor.scale() * normalisation_scaling_factor.scale()))
+        .round_ties_even() as Element;
+        let error_bound = (self.normalisation_dim_size() as f32
+            * (2.0f32 * normalisation_scaling_factor.scale().recip() + 1.0f32))
+            .round_ties_even() as Element;
+
+        let target_sumsq = normalised_sum_sq as f32;
         let mut cache = self.cache.lock().unwrap();
-        let (mut fract_data, shift_data) = norm_with_scale.get_data().iter().map(|x| {
-            let log_x = x.log2();
-            let fract_mul = (2.0f32.powf(log_x.fract()) * (1u64 << FIXED_POINT_SCALE) as f32).round_ties_even() as Element;
-            let shift_amount = log_x.trunc() as Element - FIXED_POINT_SCALE as Element;
-            if shift_amount < 0 {
-                cache.update(shift_amount.abs());
-                (fract_mul, shift_amount.abs())
+        let (mut fract_data, shift_data) = input_sumsq_data.iter().map(|&input_sumsq| {
+            if input_sumsq != 0 {
+                let nws = (target_sumsq / input_sumsq as f32).sqrt();
+                let log_x = nws.log2();
+                let fract_mul = (2.0f32.powf(log_x.fract()) * (1u64 << FIXED_POINT_SCALE) as f32).round_ties_even() as Element;
+                let shift_amount = log_x.trunc() as Element - FIXED_POINT_SCALE as Element;
+                if shift_amount < 0 {
+                    cache.update(shift_amount.abs());
+                    (fract_mul, shift_amount.abs())
+                } else {
+                    panic!("RMSNorm normalising factor fract part calculation produced invalid shift amount {}", shift_amount);
+                }
             } else {
-                panic!("RMSNorm normalising factor fract part calculation produced invalid shift amount {}", shift_amount);
+                // Zero row: use a dummy shift value, the fract_mul will be zeroed
+                cache.update(FIXED_POINT_SCALE as Element + 1);
+                (0i64, FIXED_POINT_SCALE as Element + 1)
             }
         }).unzip::<Element, Element, Vec<Element>, Vec<Element>>();
 
@@ -133,15 +171,8 @@ impl RMSNorm<Element> {
             *mul_val <<= shift_diff;
         }
 
-        let mult_tensor_data = TensorData::new(fract_data, norm_with_scale_shape);
+        let mult_tensor_data = TensorData::new(fract_data, multiplier_shape);
         let mult = WrappedTensor::try_from(mult_tensor_data)?;
-
-        let normalised_sum_sq = (self.normalisation_dim_size() as f32
-            / (normalisation_scaling_factor.scale() * normalisation_scaling_factor.scale()))
-        .round_ties_even() as Element;
-        let error_bound = (self.normalisation_dim_size() as f32
-            * (2.0f32 * normalisation_scaling_factor.scale().recip() + 1.0f32))
-            .round_ties_even() as Element;
 
         let proving_data = RMSNormProvingData::new(
             mult,
@@ -308,6 +339,95 @@ mod tests {
                 let input = Tensor::any(Shape::new(shape));
                 input.prop_map(|input| Input { input })
             })
+    }
+
+    /// Regression test for the epsilon-bias bug (see comment in evaluate_quantised_internal).
+    /// Creates input where Row 0 has ~100x smaller values than other rows, which makes
+    /// epsilon significant for Row 0's mean(input²). Without the norm_with_scale clamp,
+    /// Row 0's output sumsq falls below the normalisation check range and overflows
+    /// ShiftCheckTable, causing "Final numerator was non-zero" during proving.
+    #[test]
+    fn test_quantised_heterogeneous_magnitudes() {
+        let dim = 640;
+        let num_rows = 5;
+
+        // Create input where Row 0 has ~10x smaller values than other rows
+        let mut data = Vec::with_capacity(num_rows * dim);
+        for row in 0..num_rows {
+            let scale = if row == 0 { 0.01 } else { 1.0 };
+            for j in 0..dim {
+                // Deterministic pseudo-random-ish values
+                let val = ((row * dim + j) as f32 * 0.618034 % 2.0 - 1.0) * scale;
+                data.push(val);
+            }
+        }
+
+        let input = Tensor::new(Shape::new(vec![num_rows, dim]), data).unwrap();
+        let input_shape = input.shape();
+        let layer = RMSNorm::new(None, 1e-5, Some(input_shape.dim(-1))).unwrap();
+
+        let wrapped_input = WrappedTensor::try_from(&input).unwrap();
+        let LayerOut { outputs, .. } = layer.evaluate_float_internal(&[&wrapped_input]).unwrap();
+
+        let input_scaling = ScalingFactor::from_tensor(&input, None);
+        let output_native = outputs[0].to_native();
+        let output_scaling = ScalingFactor::from_tensor(&output_native, None);
+
+        let minimum_normalising_scale = 2.0
+            / ((1u64 << (SHIFT_CHECK_TABLE_BIT_SIZE - 1)) as f32
+                / layer.normalisation_dim_size as f32
+                - 1.0);
+
+        let mut normalisation_bits = *quantization::BIT_LEN;
+        let norm_max = (layer.normalisation_dim_size() as f32).sqrt();
+        let norm_min = -norm_max;
+
+        let mut test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
+        while test_scale < minimum_normalising_scale && normalisation_bits > 1 {
+            normalisation_bits -= 1;
+            test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
+        }
+
+        let norm_quant_min: Element = -1 << (normalisation_bits - 1);
+        let norm_quant_max: Element = (1 << (normalisation_bits - 1)) - 1;
+        let normalisation_scaling_factor = ScalingFactor::from_parts(
+            norm_max,
+            norm_min,
+            test_scale,
+            (norm_quant_min, norm_quant_max),
+        );
+
+        let QuantizeOutput { quantized_op, .. } = layer
+            .quantise(input_scaling, normalisation_scaling_factor, output_scaling)
+            .unwrap();
+
+        let quantised_input = input.quantize(&input_scaling);
+        let wrapped_quantised_input = WrappedTensor::try_from(&quantised_input).unwrap();
+
+        let quantised_layer_out = quantized_op
+            .evaluate_quantised_internal(&[&wrapped_quantised_input])
+            .unwrap();
+
+        let quantised_output = quantised_layer_out.outputs();
+        let RMSNormProvingData {
+            normalisation: _,
+            lookup_verifier,
+        } = quantised_layer_out.try_rmsnorm_data().unwrap();
+
+        let normalised_sumsq = lookup_verifier.normalisation_sum_sq;
+        let error_bound = lookup_verifier.error_bound;
+
+        let dim_size = quantized_op.normalisation_dim_size();
+        for (row, output_chunk) in quantised_output[0].get_data().chunks(dim_size).enumerate() {
+            let square_sum = output_chunk.iter().map(|x| x * x).sum::<Element>();
+            let diff = (normalised_sumsq - square_sum).abs();
+            assert!(
+                diff <= error_bound || square_sum == 0,
+                "Row {}: Norm not within range bound, got square sum {square_sum} expected to be within {error_bound} of {normalised_sumsq} or equal 0, was actually {diff}, out by {}",
+                row,
+                diff - error_bound,
+            );
+        }
     }
 
     proptest! {

@@ -11,6 +11,7 @@ pub enum TableType {
     Exp,
     GeLU,
     ReLU,
+    SiLU,
     Requantise,
     ShiftCheck,
     SignedZeroCheck,
@@ -23,6 +24,7 @@ impl Display for TableType {
             TableType::Exp => "ExpTable",
             TableType::GeLU => "GeLUTable",
             TableType::ReLU => "ReLUTable",
+            TableType::SiLU => "SiLUTable",
             TableType::Requantise => "RequantiseTable",
             TableType::ShiftCheck => "ShiftCheckTable",
             TableType::SignedZeroCheck => "SignedZeroCheckTable",
@@ -110,6 +112,20 @@ impl TableType {
                     (gelu_result * output_sf).round_ties_even() as Element
                 }
             }
+            TableType::SiLU => {
+                if input < input_min {
+                    (silu_float(&(input_min as f32 / input_sf)) * output_sf).round_ties_even()
+                        as Element
+                } else if input > input_max {
+                    (silu_float(&(input_max as f32 / input_sf)) * output_sf).round_ties_even()
+                        as Element
+                } else {
+                    let input_float = (input as f32) / input_sf;
+                    let silu_result = silu_float(&input_float);
+
+                    (silu_result * output_sf).round_ties_even() as Element
+                }
+            }
             TableType::ReLU => input.clamp(0, input_max),
             TableType::Requantise => input.clamp(input_min, input_max),
             TableType::ShiftCheck => {
@@ -141,6 +157,7 @@ impl TableType {
     pub fn generate_challenge<E: ExtensionField, T: Transcript<E>>(&self, transcript: &mut T) -> E {
         match self {
             TableType::GeLU => transcript.sample_and_append_challenge(b"GeLU").elements,
+            TableType::SiLU => transcript.sample_and_append_challenge(b"SiLU").elements,
             TableType::ReLU => transcript.sample_and_append_challenge(b"ReLU").elements,
             TableType::Requantise => {
                 transcript
@@ -180,4 +197,11 @@ pub(crate) fn gelu_float(x: &f32) -> f32 {
     // error function from `libm::erf`
     let inner_term = libm::erf((x / 2.0_f32.sqrt()) as f64) as f32;
     0.5 * x * (1.0 + inner_term)
+}
+
+/// Compute the SiLU (Sigmoid Linear Unit), also known as swish.
+/// SiLU is defined as `x * sigmoid(x)`.
+pub(crate) fn silu_float(x: &f32) -> f32 {
+    let sigmoid = 1.0 / (1.0 + (-(*x as f64)).exp());
+    *x * sigmoid as f32
 }

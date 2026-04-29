@@ -148,6 +148,7 @@ impl Table {
             TableType::Exp
             | TableType::ReLU
             | TableType::GeLU
+            | TableType::SiLU
             | TableType::Requantise
             | TableType::ShiftCheck
             | TableType::SignedZeroCheck => self
@@ -172,6 +173,7 @@ impl Table {
             TableType::Exp
             | TableType::ReLU
             | TableType::GeLU
+            | TableType::SiLU
             | TableType::Requantise
             | TableType::ShiftCheck
             | TableType::SignedZeroCheck => self
@@ -331,6 +333,16 @@ impl Table {
     pub fn new_gelu(input_sf: f32, output_sf: f32, table_bit_size: usize) -> Self {
         Self::new(
             TableType::GeLU,
+            input_sf.to_bits(),
+            output_sf.to_bits(),
+            table_bit_size,
+        )
+    }
+
+    /// Creates a new [`Table`] instance for a SiLU operation.
+    pub fn new_silu(input_sf: f32, output_sf: f32, table_bit_size: usize) -> Self {
+        Self::new(
+            TableType::SiLU,
             input_sf.to_bits(),
             output_sf.to_bits(),
             table_bit_size,

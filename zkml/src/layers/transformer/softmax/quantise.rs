@@ -163,7 +163,13 @@ impl Softmax<f32> {
         let val_too_large_error = (table_max_value as f32 / input_sf).exp();
         let other_error_part = table_rounding.max(val_too_large_error);
 
-        let other_relative_error = first_part + max_context_size * other_error_part;
+        // The per-element error accounts for exp output rounding (±0.5) plus a
+        // contribution from right-shift truncation (±1 in the table input, which
+        // perturbs the output by up to 1 additional unit). Using 1/output_sf
+        // instead of 1/(2*output_sf) provides the necessary margin.
+        let per_element_error = (1.0 / output_sf as f32).max(other_error_part);
+
+        let other_relative_error = first_part + max_context_size * per_element_error;
 
         let relative_error = relative_sum_error.max(other_relative_error);
         SoftmaxErrorData {

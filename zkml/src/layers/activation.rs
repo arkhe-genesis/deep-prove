@@ -60,6 +60,7 @@ pub enum Activation<N> {
 pub enum ActivationLayer<N> {
     Relu(Option<ActivationLookupData>, PhantomData<N>),
     Gelu(Option<ActivationLookupData>, PhantomData<N>),
+    Silu(Option<ActivationLookupData>, PhantomData<N>),
 }
 
 impl<N> ActivationLayer<N> {
@@ -67,6 +68,7 @@ impl<N> ActivationLayer<N> {
         match self {
             ActivationLayer::Relu(_, _) => "RELU_IN".to_string(),
             ActivationLayer::Gelu(_, _) => "GELU_IN".to_string(),
+            ActivationLayer::Silu(_, _) => "SILU_IN".to_string(),
         }
     }
 
@@ -74,6 +76,7 @@ impl<N> ActivationLayer<N> {
         match self {
             ActivationLayer::Relu(_, _) => "RELU_OUT".to_string(),
             ActivationLayer::Gelu(_, _) => "GELU_OUT".to_string(),
+            ActivationLayer::Silu(_, _) => "SILU_OUT".to_string(),
         }
     }
 }
@@ -129,6 +132,16 @@ impl<N> Activation<N> {
         Self::Plain(ActivationLayer::<N>::Gelu(None, PhantomData))
     }
 
+    /// Returns a new sigmoid linear unit activation.
+    pub fn new_silu() -> Self {
+        Self::Plain(ActivationLayer::<N>::Silu(None, PhantomData))
+    }
+
+    /// Returns a Gated SiLU (SwiGLU).
+    pub fn new_swiglu() -> Self {
+        Self::GLU(ActivationLayer::<N>::Silu(None, PhantomData))
+    }
+
     /// Instantiate a new Activation layer configured to be used in a GLU.
     pub fn new_for_glu(activation_type: ActivationLayer<N>) -> Self {
         Self::GLU(activation_type)
@@ -179,6 +192,10 @@ impl ActivationLayer<f32> {
                 .iter()
                 .map(|input| WrappedTensor::gelu((*input).clone()))
                 .collect::<Vec<_>>()),
+            ActivationLayer::Silu(..) => Ok(inputs
+                .iter()
+                .map(|input| WrappedTensor::silu((*input).clone()))
+                .collect::<Vec<_>>()),
         }
     }
 
@@ -217,6 +234,10 @@ impl ActivationLayer<f32> {
                 ActivationLayer::<Element>::Gelu(Some(activation_lookup_data), PhantomData),
                 vec![table_output_scaling],
             )),
+            ActivationLayer::Silu(..) => Ok(QuantizeOutput::new(
+                ActivationLayer::<Element>::Silu(Some(activation_lookup_data), PhantomData),
+                vec![table_output_scaling],
+            )),
         }
     }
 }
@@ -224,17 +245,21 @@ impl ActivationLayer<f32> {
 impl ActivationLayer<Element> {
     fn get_lookup_data(&self) -> &ActivationLookupData {
         match self {
-            ActivationLayer::Relu(Some(data), ..) | ActivationLayer::Gelu(Some(data), ..) => data,
+            ActivationLayer::Relu(Some(data), ..)
+            | ActivationLayer::Gelu(Some(data), ..)
+            | ActivationLayer::Silu(Some(data), ..) => data,
             _ => panic!("Activation layer lookup data not initialized"),
         }
     }
 
     fn set_glu_flag(&mut self, is_glu: bool) {
         match self {
-            ActivationLayer::Relu(Some(data), ..) | ActivationLayer::Gelu(Some(data), ..) => {
+            ActivationLayer::Relu(Some(data), ..)
+            | ActivationLayer::Gelu(Some(data), ..)
+            | ActivationLayer::Silu(Some(data), ..) => {
                 data.set_glu(is_glu);
             }
-            _ => unreachable!("ActivaitonLayer Element lookup data not initialized"),
+            _ => unreachable!("ActivationLayer Element lookup data not initialized"),
         }
     }
 
@@ -338,6 +363,7 @@ impl<N> OpInfo for Activation<N> {
         match self.activation_type() {
             ActivationLayer::Relu(..) => "ReLU".to_string(),
             ActivationLayer::Gelu(..) => "GeLU".to_string(),
+            ActivationLayer::Silu(..) => "SiLU".to_string(),
         }
     }
 
@@ -703,12 +729,12 @@ impl ActivationCtx {
 #[cfg(test)]
 mod test {
     use ark_std::rand::Rng;
-    use burn::tensor::activation::gelu;
+    use burn::tensor::activation::{gelu, silu};
     use proptest::prelude::*;
 
     use crate::{
         layers::{EinSum, Layer},
-        lookup::table::gelu_float,
+        lookup::table::{gelu_float, silu_float},
         model::{Model, test::prove_model},
         rng_from_env_or_random,
         tensor::{IntoBTensor, KeyedTensor},
@@ -826,6 +852,26 @@ mod test {
         Ok(())
     }
 
+    #[test]
+    fn test_activation_silu_proving() -> anyhow::Result<()> {
+        let input_shape = vec![3, 100].into();
+        let mut model = Model::new_from_input_shapes(vec![input_shape]);
+        model.add_consecutive_layer(Layer::Activation(Activation::new_silu()), None)?;
+        model.automatic_output_labelling()?;
+        prove_model(model, &mut Default::default()).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn test_glu_silu_activation_proving() -> anyhow::Result<()> {
+        let input_shape = vec![7, 94].into();
+        let mut model = Model::new_from_input_shapes(vec![input_shape; 2]);
+        model.add_consecutive_layer(Layer::Activation(Activation::new_swiglu()), None)?;
+        model.automatic_output_labelling()?;
+        prove_model(model, &mut Default::default()).unwrap();
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn gelu_kernel_test(size in 1usize..1024) {
@@ -838,6 +884,30 @@ mod test {
 
             let data = tensor.data();
             let data = data.iter().map(gelu_float).collect::<Vec<_>>();
+            let result = Tensor::new(shape, data).unwrap();
+
+            resultb.data().iter().zip(result.data().iter()).try_for_each(|(left, right)| {
+                prop_assert!(
+                    (left - right).abs() < 1e-3,
+                    "Actual: {left}, Expected: {right}",
+                );
+                Ok(())
+            })?;
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn silu_kernel_test(size in 1usize..1024) {
+            let shape = Shape::new(vec![size]);
+            let tensor = Tensor::<f32>::random(&shape);
+
+            let btensor = tensor.clone().to_btensor::<1>();
+            let data = silu(btensor).to_data().into_vec().expect("Failed to compute SiLU");
+            let resultb = Tensor::<f32>::new(shape.clone(), data).unwrap();
+
+            let data = tensor.data();
+            let data = data.iter().map(silu_float).collect::<Vec<_>>();
             let result = Tensor::new(shape, data).unwrap();
 
             resultb.data().iter().zip(result.data().iter()).try_for_each(|(left, right)| {

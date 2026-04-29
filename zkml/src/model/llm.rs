@@ -1133,4 +1133,69 @@ mod test {
     fn test_prove_llm_gemma3() -> anyhow::Result<()> {
         test_generic_prove_llm_gemma3::<false>()
     }
+
+    // ---- Llama2 (SafeTensors) ----
+
+    fn test_generic_prove_llm_llama2<const DISTRIBUTE_PROVE: bool>() -> anyhow::Result<()> {
+        use crate::parser::llm::models::llama2::{Llama2, tests::LLAMA2_SAFE_MODEL};
+
+        init_test_logging("debug");
+        const MAX_CONTEXT: usize = 10;
+
+        let raw = RawSafeTensors::from_hugging_face_cached(LLAMA2_SAFE_MODEL)?;
+        let (driver, _metadata) = Driver::load_from_model(Llama2::new(), &raw, Some(MAX_CONTEXT))?
+            .into_provable_llm(None)?;
+
+        let (prover_ctx, verifier_ctx) = driver
+            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+            .with_max_context(MAX_CONTEXT);
+
+        driver.model.describe();
+
+        // Generate the trace
+        let mut store = GenStore::default();
+        let sentence = "The sky is";
+        let tokenizer = Llama2::new().load_tokenizer(&raw)?;
+        let user_tokens = tokenizer.tokenize(sentence);
+        let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
+        let trace = driver.run_elements(input_tensor, &mut store)?;
+
+        // Prove the trace
+        let num_provers = if DISTRIBUTE_PROVE {
+            Some(rng_from_env_or_random().gen_range(1..6))
+        } else {
+            Some(1)
+        };
+        let io = trace.to_verifier_io()?;
+        let proof = driver.chunked_prove_default_executor(
+            &prover_ctx,
+            trace,
+            num_provers,
+            LLMChunkingStrategy,
+        )?;
+
+        // Serialize the proof
+        let proof_bytes =
+            bincode::serde::encode_to_vec(&proof, bincode::config::standard()).unwrap();
+        info!(
+            "Proof size: {}",
+            humansize::format_size(proof_bytes.len(), humansize::BINARY)
+        );
+
+        // Verify the proof
+        verifier_ctx.verify(proof, user_tokens, io)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Test requires large machine to run"]
+    fn test_distribute_prove_llm_llama2() -> anyhow::Result<()> {
+        test_generic_prove_llm_llama2::<true>()
+    }
+
+    #[test]
+    #[ignore = "Test requires large machine to run"]
+    fn test_prove_llm_llama2() -> anyhow::Result<()> {
+        test_generic_prove_llm_llama2::<false>()
+    }
 }

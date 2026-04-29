@@ -437,8 +437,9 @@ impl ProveInfo for Softmax<Element> {
                 });
             let shape = &aux.last_output_shape[0];
             ensure!(
-                shape.rank() == 2 || shape.rank() == 3,
-                "Softmax only supports 2D or 3D tensors"
+                shape.rank() >= 2,
+                "Softmax requires at least 2D tensors, got rank {}",
+                shape.rank()
             );
 
             // There are no common commitments for this layer
@@ -620,6 +621,31 @@ mod tests {
     fn test_softmax_proving() {
         let dim_size = 520;
         let input_shape = vec![3, dim_size, dim_size];
+
+        let mut model = Model::new_from_input_shapes(vec![input_shape.into()]);
+
+        let mask = AttentionMask::<f32>::new(f32::NEG_INFINITY);
+        let softmax = Softmax::<f32>::new_with_scale(1.0f32 / 64.0f32.sqrt(), 1024);
+
+        let mask_id = model
+            .add_consecutive_layer(Layer::AttentionMask(mask), None)
+            .unwrap();
+        let _ = model
+            .add_consecutive_layer(Layer::Softmax(softmax), Some(mask_id))
+            .unwrap();
+
+        model.automatic_output_labelling().unwrap();
+        model.describe();
+        prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    #[test]
+    fn test_softmax_proving_4d() {
+        // 4D input simulating GQA attention: [heads_per_group, num_groups, seq, seq]
+        let groups = 4;
+        let heads_per_group = 8;
+        let seq_len = 10;
+        let input_shape = vec![heads_per_group, groups, seq_len, seq_len];
 
         let mut model = Model::new_from_input_shapes(vec![input_shape.into()]);
 

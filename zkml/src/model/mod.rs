@@ -1092,7 +1092,7 @@ where
     ///
     ///   - model global outputs are represented by their own
     ///     `Node::Output(output_id)`, and sample their value on input port 0;
-    graph: ModelGraph<N>,
+    pub(crate) graph: ModelGraph<N>,
     input_shapes: Vec<Shape>,
 }
 
