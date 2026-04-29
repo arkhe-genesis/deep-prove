@@ -15,7 +15,7 @@ mod local;
 mod remote;
 
 /// Identifier for storage data.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct StorageKey<T> {
     /// User defined `ID`.
     id: String,

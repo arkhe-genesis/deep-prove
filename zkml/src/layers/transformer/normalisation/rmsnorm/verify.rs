@@ -16,10 +16,10 @@ pub(crate) struct RMSNormLookupVerifier {
 }
 
 impl RMSNormLookupVerifier {
-    fn new<E, PCS>(ctx: &RMSNormCtx, proof: &RMSNormProof<E, PCS>) -> Self
+    fn new<F, PCS>(ctx: &RMSNormCtx, proof: &RMSNormProof<F, PCS>) -> Self
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme,
     {
         let intermediate_bit_size = ctx.input_scaling.bit_size() + 1;
         let normalisation_sum_sq = (ctx.normalisation_dim_size as f32
@@ -111,35 +111,35 @@ impl LookupOp for RMSNormLookupVerifier {
 }
 
 impl RMSNormCtx {
-    pub(crate) fn verify_internal<E, PCS, T>(
+    pub(crate) fn verify_internal<F, PCS, T>(
         &self,
-        proof: &RMSNormProof<E, PCS>,
+        proof: &RMSNormProof<F, PCS>,
         id: NodeId,
-        verifier: &mut Verifier<E, T, PCS>,
-        last_claim: &Claim<E>,
+        verifier: &mut Verifier<F, T, PCS>,
+        last_claim: &Claim<F>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>>
+    ) -> Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-        T: Transcript<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme<Field = F>,
+        T: Transcript,
     {
         // First we make the lookup verifier context
         let lookup_op = RMSNormLookupVerifier::new(self, proof);
         let RMSNormProof {
             logup_proof,
-            commitment,
+            commitments,
             io_proof,
             io_evaluations,
             alpha_evaluation,
             ..
         } = proof;
 
-        let generic_lookup_proof = GenericLookupProof::<E, PCS> {
+        let generic_lookup_proof = GenericLookupProof::<F, PCS> {
             logup_proof: logup_proof.clone(),
             sumcheck_proof: io_proof.clone(),
             evaluations: io_evaluations.clone(),
-            commitment: commitment.clone(),
+            commitments: commitments.clone(),
             weight_evaluation: *alpha_evaluation,
             shift_evaluations: None,
         };
@@ -165,7 +165,7 @@ impl RMSNormCtx {
                 // Add the weight commitment claim to the verifier
                 let claims_map = HashMap::from([(
                     alpha_key.clone(),
-                    Claim::<E>::new(weight_eval_point, alpha_eval),
+                    Claim::<F>::new(weight_eval_point, alpha_eval),
                 )]);
                 verifier.add_common_claims(id, claims_map);
             }

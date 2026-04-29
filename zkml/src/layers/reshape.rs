@@ -6,13 +6,15 @@ use crate::{
     iop::context::ContextAux,
     layers::{
         LayerCtx,
-        provable::{Evaluate, LayerOut, OpInfo, PadOp, ProveInfo, QuantizeOp, QuantizeOutput},
+        provable::{
+            Evaluate, LayerOut, OpInfo, PadOp, ProveInfo, QuantizeOp, QuantizeOutput, Splittable,
+        },
     },
     padding::{PaddingMode, pad_reshape_layer},
     tensor::{TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, ensure};
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
@@ -200,6 +202,8 @@ impl OpInfo for Reshape {
     }
 }
 
+impl Splittable for ReshapeCtx {}
+
 impl<N> Evaluate<N> for Reshape
 where
     N: TensorTypeParam,
@@ -242,11 +246,10 @@ fn range_end<R: RangeBounds<usize>>(range: &R) -> Option<usize> {
 }
 
 impl ProveInfo for Reshape {
-    fn step_info<E: ExtensionField>(
+    fn step_info<F: PrimeField>(
         &self,
-        _id: NodeId,
         mut aux: ContextAux,
-    ) -> anyhow::Result<(super::LayerCtx<E>, ContextAux)> {
+    ) -> anyhow::Result<(super::LayerCtx<F>, ContextAux)> {
         aux.last_output_shape = self.output_shapes(&aux.last_output_shape, PaddingMode::Padding)?;
 
         Ok((LayerCtx::Reshape(ReshapeCtx(self.clone())), aux))

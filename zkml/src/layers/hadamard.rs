@@ -5,25 +5,26 @@
 //! convolution.
 
 use anyhow::{Result, ensure};
-use either::Either;
-use ff_ext::ExtensionField;
-use multilinear_extensions::{
-    Expression, mle::IntoMLE, virtual_poly::VPAuxInfo, virtual_polys::VirtualPolynomialsBuilder,
-};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
+use ark_ff::PrimeField;
+use dp_crypto::{
+    Expression, IntoMLE,
+    arkyper::transcript::Transcript,
+    poly::eq::evals,
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
+    virtual_poly::VPAuxInfo,
+    virtual_polys::VirtualPolynomialsBuilder,
 };
-use transcript::Transcript;
+use either::Either;
+use serde::{Deserialize, Serialize};
 
-use crate::{Claim, Element, Tensor, commit::compute_betas_eval};
+use crate::{Claim, Element, Tensor};
 
-pub struct HadamardCtx<F: ExtensionField> {
+pub struct HadamardCtx<F: PrimeField> {
     sumcheck_aux: VPAuxInfo<F>,
 }
 
-impl<F: ExtensionField> HadamardCtx<F> {
+impl<F: PrimeField> HadamardCtx<F> {
     pub fn new(v1: &Tensor<Element>, v2: &Tensor<Element>) -> Self {
         assert_eq!(v1.shape(), v2.shape());
         let num_vars = if v1.data().len().is_power_of_two() {
@@ -50,14 +51,19 @@ impl<F: ExtensionField> HadamardCtx<F> {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct HadamardProof<E: ExtensionField> {
-    sumcheck: IOPProof<E>,
-    individual_claim: Vec<E>,
-    point: Vec<E>,
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct HadamardProof<F: PrimeField> {
+    sumcheck: IOPProof<F>,
+    #[serde(with = "dp_crypto::serialization")]
+    individual_claim: Vec<F>,
+    #[serde(with = "dp_crypto::serialization")]
+    point: Vec<F>,
 }
 
-impl<F: ExtensionField> HadamardProof<F> {
+impl<F: PrimeField> HadamardProof<F> {
     #[allow(unused)]
     pub fn random_point(&self) -> &[F] {
         &self.point
@@ -84,7 +90,7 @@ impl<F: ExtensionField> HadamardProof<F> {
 // . - v2 clearing garbage tensor. the verifier can evaluate v2 and eq easily
 //   - the v1 claim is now passed to the previous layer (we prove in reverse)
 #[allow(unused)]
-pub fn prove<F: ExtensionField, T: Transcript<F>>(
+pub fn prove<F: PrimeField, T: Transcript>(
     transcript: &mut T,
     output_claim: &Claim<F>,
     v1: &Tensor<Element>,
@@ -94,7 +100,7 @@ pub fn prove<F: ExtensionField, T: Transcript<F>>(
     assert_eq!(output_claim.point.len(), v2.data().len().ilog2() as usize);
     assert!(v1.shape().iter().all(|x| x.is_power_of_two()));
     assert!(v2.shape().iter().all(|x| x.is_power_of_two()));
-    let beta_poly = compute_betas_eval(&output_claim.point).into_mle();
+    let beta_poly = evals(&output_claim.point).into_mle();
     let v1_mle = v1.to_field_mle::<F>();
     let v2_mle = v2.to_field_mle::<F>();
     let num_vars = beta_poly.num_vars();
@@ -102,7 +108,7 @@ pub fn prove<F: ExtensionField, T: Transcript<F>>(
     let mut expr_builder = VirtualPolynomialsBuilder::<F>::new(num_threads, num_vars);
     let expr = [&v1_mle, &v2_mle, &beta_poly]
         .iter()
-        .fold(Expression::Constant(Either::Right(F::ONE)), |acc, p| {
+        .fold(Expression::Constant(F::ONE), |acc, p| {
             acc * expr_builder.lift(Either::Left(p))
         });
     let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
@@ -125,7 +131,7 @@ pub fn prove<F: ExtensionField, T: Transcript<F>>(
 }
 
 #[allow(unused)]
-pub fn verify<F: ExtensionField, T: Transcript<F>>(
+pub fn verify<F: PrimeField, T: Transcript>(
     ctx: &HadamardCtx<F>,
     transcript: &mut T,
     proof: &HadamardProof<F>,
@@ -138,9 +144,9 @@ pub fn verify<F: ExtensionField, T: Transcript<F>>(
         &ctx.sumcheck_aux,
         transcript,
     );
-    // TODO: closed formula for beta evaluation
-    let beta = compute_betas_eval(&output_claim.point).into_mle();
-    let beta_eval = beta.evaluate(&proof.point);
+    // !ToDo!: closed formula for beta evaluation
+    let beta = evals(&output_claim.point).into_mle();
+    let beta_eval = beta.evaluate(&proof.point)?;
     // [v1,v2,beta]
     ensure!(
         expected_v2_eval == proof.v2_eval(),
@@ -158,10 +164,11 @@ pub fn verify<F: ExtensionField, T: Transcript<F>>(
 
 #[cfg(test)]
 mod test {
-    use ff_ext::GoldilocksExt2;
 
     use super::*;
     use crate::{default_transcript, testing::random_field_vector};
+
+    type F = ark_bn254::Fr;
 
     #[test]
     fn test_hadamard_proving() {
@@ -171,8 +178,8 @@ mod test {
         let v2 = Tensor::random(&vec![n].into()).pad_next_power_of_two();
         let r = random_field_vector(n.next_power_of_two().ilog2() as usize);
         let expected_output = v1.mul(&v2);
-        let output_mle = expected_output.to_field_mle::<GoldilocksExt2>();
-        let output_eval = output_mle.evaluate(&r);
+        let output_mle = expected_output.to_field_mle::<F>();
+        let output_eval = output_mle.evaluate(&r).unwrap();
         let output_claim = Claim::new(r, output_eval);
         let proof = prove(
             &mut transcript,
@@ -184,8 +191,9 @@ mod test {
         let ctx = HadamardCtx::new(&v1, &v2);
         // NOTE: find closed formula to evaluate it efficiently OR use PCS
         let v2_eval = v2
-            .to_field_mle::<GoldilocksExt2>()
-            .evaluate(proof.random_point());
+            .to_field_mle::<F>()
+            .evaluate(proof.random_point())
+            .unwrap();
         // NOTE: this has to be done by the component integrating the hadamard logic
         // normally by verifying this input claim via another sumcheck.
         let input_claim = verify(
@@ -196,9 +204,7 @@ mod test {
             v2_eval,
         )
         .unwrap();
-        let expected_v1_eval = v1
-            .to_field_mle::<GoldilocksExt2>()
-            .evaluate(&input_claim.point);
+        let expected_v1_eval = v1.to_field_mle::<F>().evaluate(&input_claim.point).unwrap();
         assert_eq!(expected_v1_eval, input_claim.eval);
     }
 }

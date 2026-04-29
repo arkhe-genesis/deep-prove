@@ -2,7 +2,7 @@
 #![allow(clippy::print_stdout)]
 use std::path::PathBuf;
 use zkml::{
-    Element, IO, Proof, ProverContext, Tensor,
+    Element, IO, Proof, ProverContext, Shape, Tensor,
     iop::chunking::LLMChunkingStrategy,
     model::{
         exec_graph::InferenceEngine,
@@ -38,6 +38,7 @@ fn full_model_path(gguf_path: &str) -> PathBuf {
 struct GPT2Runner {
     gguf_path: String,
     user_input: Vec<Token>,
+    chunk_strategy: Option<LLMChunkingStrategy>,
     vk: Option<LLMVerifierContext<F, Pcs>>,
 }
 
@@ -49,6 +50,7 @@ impl GPT2Runner {
         Ok(Self {
             gguf_path: model_path.to_str().unwrap().to_string(),
             user_input: user_tokens,
+            chunk_strategy: None,
             vk: None,
         })
     }
@@ -58,7 +60,11 @@ impl GraphRuner for GPT2Runner {
     type ChunkingStrategy = LLMChunkingStrategy;
     fn setup(
         &mut self,
-    ) -> anyhow::Result<(ProverContext<F, Pcs>, InferenceEngine, Vec<Tensor<Element>>)> {
+    ) -> anyhow::Result<(
+        ProverContext<'static, F, Pcs>,
+        InferenceEngine,
+        Vec<Tensor<Element>>,
+    )> {
         let (driver, _metadata) =
             Driver::load_from_model(GPT2::new(), &RawGGUF::new(self.gguf_path.clone()), Some(10))?
                 .into_provable_llm(None)?;
@@ -70,12 +76,13 @@ impl GraphRuner for GPT2Runner {
                 .collect::<Vec<_>>(),
         )?;
         let (prover_ctx, verifier_ctx) = driver.context::<F, Pcs>()?;
+        self.chunk_strategy = Some(driver.chunking_strategy(&input_tensor, &prover_ctx)?);
         self.vk = Some(verifier_ctx);
         Ok((prover_ctx, InferenceEngine::LLM(driver), vec![input_tensor]))
     }
 
-    fn chunk_strategy(&self) -> Self::ChunkingStrategy {
-        LLMChunkingStrategy
+    fn chunk_strategy(&self, _unpadded_input_shapes: Vec<Shape>) -> Self::ChunkingStrategy {
+        self.chunk_strategy.clone().expect("Call setup first")
     }
 
     fn verify_proof(&self, proof: Proof<F, Pcs>, io: IO<F>) -> anyhow::Result<()> {

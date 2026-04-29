@@ -71,6 +71,25 @@ impl ShapeInfo {
             .map(|sd| sd.input_shape_padded.clone())
             .collect()
     }
+
+    pub fn update_shapes<L: OpInfo>(&mut self, layer: &L) -> anyhow::Result<()> {
+        let unpadded_output_shapes =
+            layer.output_shapes(&self.unpadded_input_shapes(), PaddingMode::NoPadding)?;
+        let padded_output_shapes =
+            layer.output_shapes(&self.padded_input_shapes(), PaddingMode::Padding)?;
+        self.shapes
+            .resize(unpadded_output_shapes.len(), Default::default());
+        for ((sd, unpadded_shape), shape) in self
+            .shapes
+            .iter_mut()
+            .zip(unpadded_output_shapes)
+            .zip(padded_output_shapes)
+        {
+            sd.input_shape_padded = shape;
+            sd.input_shape_og = unpadded_shape;
+        }
+        Ok(())
+    }
 }
 
 impl From<&[ShapeData]> for ShapeInfo {
@@ -81,7 +100,7 @@ impl From<&[ShapeData]> for ShapeInfo {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ShapeData {
     pub(crate) input_shape_padded: Shape,
     pub(crate) ignore_garbage_pad: Option<GarbagePad>,

@@ -1,11 +1,9 @@
 use crate::quantization::{self, MAX_FLOAT, MIN_FLOAT};
 use anyhow::ensure;
 use ark_std::rand::Rng;
-use ceno_p3::field::FieldAlgebra;
-use ff_ext::GoldilocksExt2;
 use std::cmp::{Ordering, PartialEq};
 
-use crate::{Element, quantization::ToField};
+use crate::Element;
 
 pub trait Number:
     Copy
@@ -150,45 +148,84 @@ impl Number for f32 {
     }
 }
 
-impl Number for GoldilocksExt2 {
-    const MIN: GoldilocksExt2 = GoldilocksExt2::ZERO;
-    const MAX: GoldilocksExt2 = GoldilocksExt2::ZERO;
-    fn unit() -> Self {
-        GoldilocksExt2::ONE
-    }
-    fn zero() -> Self {
-        GoldilocksExt2::ZERO
-    }
-    fn random<R: Rng>(rng: &mut R) -> Self {
-        Element::random(rng).to_field()
-    }
-    fn absolute_value(&self) -> Self {
-        *self
-    }
-    fn compare(&self, other: &Self) -> Ordering {
-        self.cmp(other)
-    }
+#[cfg(test)]
+macro_rules! impl_number {
+    ($field:ident) => {
+        impl Number for $field {
+            const MIN: $field = $field::ZERO;
 
-    fn is_negative(&self) -> bool {
-        panic!("GoldilocksExt2: is_negative is meaningless");
-    }
+            const MAX: $field = $field::ZERO;
 
-    fn to_f32(&self) -> anyhow::Result<f32> {
-        unreachable!("Called to_f32 for Goldilocks")
-    }
-    fn from_f32(_: f32) -> anyhow::Result<Self> {
-        unreachable!("Called from_f32 for Goldilocks")
-    }
-    fn to_usize(&self) -> usize {
-        unreachable!("Called to_usize for Goldilocks")
-    }
-    fn from_usize(_: usize) -> Self {
-        unreachable!("Called from_usize for Goldilocks")
-    }
+            fn unit() -> Self {
+                $field::ONE
+            }
 
+            fn zero() -> Self {
+                $field::ZERO
+            }
+
+            fn random<R: Rng>(rng: &mut R) -> Self {
+                $field::rand(rng)
+            }
+
+            fn absolute_value(&self) -> Self {
+                *self
+            }
+
+            fn compare(&self, other: &Self) -> Ordering {
+                self.cmp(other)
+            }
+
+            fn is_negative(&self) -> bool {
+                *self >= $field::from($field::MODULUS_MINUS_ONE_DIV_TWO)
+            }
+
+            fn to_f32(&self) -> anyhow::Result<f32> {
+                unreachable!("Cannot convert field element to f32")
+            }
+
+            fn from_f32(_: f32) -> anyhow::Result<Self> {
+                unreachable!("Cannot convert f32 to field element")
+            }
+
+            fn to_usize(&self) -> usize {
+                let usize_max = $field::from(usize::MAX as u64);
+                assert!(
+                    *self <= usize_max,
+                    "Canno convert to usize a field element bigger than `usize::MAX`"
+                );
+                let bigint = self.clone().into_bigint();
+                let limb = bigint
+                    .as_ref()
+                    .iter()
+                    .filter(|limb| **limb != 0)
+                    .exactly_one()
+                    .expect("More than 1 u64 limb found for field element");
+                *limb as usize
+            }
+
+            fn from_usize(u: usize) -> Self {
+                $field::from(u as u64)
+            }
+
+            #[cfg(test)]
+            fn any() -> impl proptest::prelude::Strategy<Value = Self> {
+                use proptest::prelude::Strategy;
+
+                use crate::quantization::ToField;
+                Element::any().prop_map(|el| el.to_field())
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use ark_ff::{AdditiveGroup, Field, PrimeField, UniformRand};
+    use itertools::Itertools;
+
+    type F = ark_bn254::Fr;
     #[cfg(test)]
-    fn any() -> impl proptest::prelude::Strategy<Value = Self> {
-        use proptest::prelude::Strategy;
-        Element::any().prop_map(|el| el.to_field())
-    }
+    impl_number!(F);
 }

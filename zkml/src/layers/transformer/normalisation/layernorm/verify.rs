@@ -18,10 +18,10 @@ pub(crate) struct LayerNormLookupVerifier {
 }
 
 impl LayerNormLookupVerifier {
-    fn new<E, PCS>(ctx: &LayerNormCtx, proof: &LayerNormProof<E, PCS>) -> Self
+    fn new<F, PCS>(ctx: &LayerNormCtx, proof: &LayerNormProof<F, PCS>) -> Self
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme,
     {
         let intermediate_bit_size = ctx.mean_scaling.bit_size() + 1;
         let normalisation_sumsq = (ctx.normalisation_dim_size as f32
@@ -118,24 +118,24 @@ impl LookupOp for LayerNormLookupVerifier {
 }
 
 impl LayerNormCtx {
-    pub(crate) fn verify_internal<E, PCS, T>(
+    pub(crate) fn verify_internal<F, PCS, T>(
         &self,
-        proof: &LayerNormProof<E, PCS>,
+        proof: &LayerNormProof<F, PCS>,
         id: NodeId,
-        verifier: &mut Verifier<E, T, PCS>,
-        last_claim: &Claim<E>,
+        verifier: &mut Verifier<F, T, PCS>,
+        last_claim: &Claim<F>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>>
+    ) -> Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-        T: Transcript<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme<Field = F>,
+        T: Transcript,
     {
         // First we make the lookup verifier context
         let lookup_op = LayerNormLookupVerifier::new(self, proof);
         let LayerNormProof {
             logup_proof,
-            commitment,
+            commitments,
             io_proof,
             io_evaluations,
             gamma_eval,
@@ -164,11 +164,11 @@ impl LayerNormCtx {
         let mut last_claim = last_claim.clone();
         last_claim.eval -= *beta_eval * bias_lt_eval;
 
-        let generic_lookup_proof = GenericLookupProof::<E, PCS> {
+        let generic_lookup_proof = GenericLookupProof::<F, PCS> {
             logup_proof: logup_proof.clone(),
             sumcheck_proof: io_proof.clone(),
             evaluations: io_evaluations.clone(),
-            commitment: commitment.clone(),
+            commitments: commitments.clone(),
             weight_evaluation: Some(*gamma_eval),
             shift_evaluations: Some(mean_evals.clone()),
         };
@@ -194,11 +194,11 @@ impl LayerNormCtx {
         let claims_map = HashMap::from([
             (
                 self.gamma_key.clone(),
-                Claim::<E>::new(gamma_point, *gamma_eval),
+                Claim::<F>::new(gamma_point, *gamma_eval),
             ),
             (
                 self.beta_key.clone(),
-                Claim::<E>::new(beta_point, *beta_eval),
+                Claim::<F>::new(beta_point, *beta_eval),
             ),
         ]);
 

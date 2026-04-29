@@ -72,11 +72,13 @@ use tracing::trace;
 
 pub static MEASURE: Mutex<Option<Measure>> = Mutex::new(None);
 
+pub(crate) const LAYER_WISE_MEASURE_PREFIX: &str = "layer_wise_";
+
 pub fn set_global(metrics: Measure) {
     *MEASURE.lock().unwrap() = Some(metrics);
 }
 
-fn r_and_accumulate<R, F: FnOnce() -> R, A: Fn(u128, u128) -> u128>(
+pub(crate) fn r_and_accumulate<R, F: FnOnce() -> R, A: Fn(u128, u128) -> u128>(
     key: &str,
     f: F,
     acc_fn: Option<A>,
@@ -171,6 +173,7 @@ pub fn accumulate_key<T: ToString + FromStr<Err: Display>, F: Fn(T, T) -> T>(
 #[derive(Debug, Clone)]
 pub struct Measure {
     data: BTreeMap<String, String>,
+    skip_layerwise_measures: bool,
 }
 
 impl Measure {
@@ -178,7 +181,13 @@ impl Measure {
     pub fn new() -> Self {
         Self {
             data: BTreeMap::new(),
+            skip_layerwise_measures: true,
         }
+    }
+
+    pub fn enable_layerwise_measures(mut self) -> Self {
+        self.skip_layerwise_measures = false;
+        self
     }
     /// Set a static value for a key.
     pub fn with(mut self, key: &str, value: &str) -> Self {
@@ -250,19 +259,28 @@ impl Measure {
         // are the same
         let write_header = file.metadata().unwrap().len() == 0;
         let mut writer = csv::Writer::from_writer(file);
+        let keys = self
+            .data
+            .keys()
+            .filter(|k| !self.skip_layerwise_measures || !k.starts_with(LAYER_WISE_MEASURE_PREFIX))
+            .collect::<Vec<&String>>();
         if write_header {
-            writer.write_record(self.data.keys().collect::<Vec<&String>>())?;
+            writer.write_record(&keys)?;
         } else {
             let mut reader = std::io::BufReader::new(File::open(fname).unwrap()).lines();
             let header_line = reader.next().unwrap()?;
             let header = header_line.split(",").collect::<Vec<&str>>();
             ensure!(
-                header == self.data.keys().collect::<Vec<&String>>(),
-                "Header mismatch in {fname}"
+                header == keys,
+                "Header mismatch in {fname}: found {header:?}, expected {:?}",
+                keys
             );
         }
         // iterate over all columns in order and write the values
-        writer.write_record(self.data.values().map(|v| v.to_string()))?;
+        writer.write_record(
+            keys.into_iter()
+                .map(|k| self.data.get(k).unwrap().to_string()),
+        )?;
         writer.flush()?;
         Ok(())
     }

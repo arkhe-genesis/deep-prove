@@ -7,31 +7,32 @@ use crate::lookup::operation::{
 use super::*;
 
 impl SoftmaxCtx {
-    pub(crate) fn verify_internal<E, PCS, T>(
+    pub(crate) fn verify_internal<F, PCS, T>(
         &self,
-        proof: &SoftmaxProof<E, PCS>,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        proof: &SoftmaxProof<F, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>>
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-        T: transcript::Transcript<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme,
+        T: Transcript,
     {
         let SoftmaxProof {
             logup_proof,
-            commitment,
+            commitments,
             sumcheck_proof,
             evaluations,
             shift_evaluations,
         } = proof;
 
-        let generic_lookup_proof = GenericLookupProof::<E, PCS> {
+        let generic_lookup_proof = GenericLookupProof::<F, PCS> {
             logup_proof: logup_proof.clone(),
             sumcheck_proof: sumcheck_proof.clone(),
             evaluations: evaluations.clone(),
-            commitment: commitment.clone(),
+            commitments: commitments.clone(),
             weight_evaluation: None,
             shift_evaluations: Some(shift_evaluations.clone()),
         };
@@ -45,7 +46,7 @@ impl SoftmaxCtx {
             &table,
             &generic_lookup_proof,
             verifier,
-            self.node_id,
+            node_id,
         )?;
 
         Ok(input_claims)

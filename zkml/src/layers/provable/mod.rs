@@ -2,7 +2,8 @@ use super::{
     LayerCtx, LayerProof, flatten::Flatten, requant::Requant, transformer::softmax::SoftmaxData,
 };
 use crate::{
-    Claim, Element, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    Claim, Element, InitTranscript, Prover, ProverContext, ScalingFactor, ScalingStrategy, Shape,
+    Tensor,
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -22,17 +23,17 @@ use crate::{
     lookup::context::LookupWitnessGen,
     model::{trace::Step, transform::ModelTransform},
     padding::{PaddingMode, ShapeInfo},
-    tensor::{TensorTypeParam, WrappedTensor},
+    quantization::ToField,
+    tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, bail, ensure};
+use ark_ff::PrimeField;
 use derive_more::{From, Into};
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::mle::IntoMLE;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashMap, fmt::Debug};
+use dp_crypto::arkyper::{CommitmentScheme, transcript::Transcript};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fmt::Debug, ops::Deref};
 use tenstore::{GenStore, StorageKey};
-use transcript::Transcript;
 
 /// Extra data returned by layers needed for proving.
 ///
@@ -90,6 +91,67 @@ impl ProvingHandle {
             }
             ProvingData::None => ProvingHandle::None,
         }
+    }
+
+    pub(crate) fn split_proving_data(&self, num_chunks: usize) -> anyhow::Result<Vec<Self>> {
+        match self {
+            ProvingHandle::None => Ok(vec![ProvingHandle::None; num_chunks]),
+            ProvingHandle::ArgMax(handle) => handle
+                .split_tensors(num_chunks)
+                .map(|new_handles| new_handles.into_iter().map(ProvingHandle::ArgMax).collect()),
+            _ => todo!(),
+        }
+    }
+
+    pub(crate) fn handles(&self) -> impl Iterator<Item = &TensorHandle<Element>> {
+        match self {
+            ProvingHandle::Convolution(conv_ffthandle) => vec![&conv_ffthandle.handle],
+            ProvingHandle::Softmax(softmax_handle) => vec![&softmax_handle.shift_handle],
+            ProvingHandle::LayerNorm(layer_norm_handle) => {
+                vec![&layer_norm_handle.mean, &layer_norm_handle.std_dev]
+            }
+            ProvingHandle::RMSNorm(rmsnorm_handle) => vec![&rmsnorm_handle.normalisation],
+            ProvingHandle::ArgMax(argmax_handle) => argmax_handle.max_values.iter().collect_vec(),
+            ProvingHandle::None => vec![],
+        }
+        .into_iter()
+    }
+
+    pub(crate) fn try_into_map<
+        F: FnMut(TensorHandle<Element>) -> anyhow::Result<TensorHandle<Element>>,
+    >(
+        self,
+        mut f: F,
+    ) -> anyhow::Result<Self> {
+        Ok(match self {
+            ProvingHandle::Convolution(mut conv_ffthandle) => {
+                conv_ffthandle.handle = f(conv_ffthandle.handle)?;
+                ProvingHandle::Convolution(conv_ffthandle)
+            }
+            ProvingHandle::Softmax(mut softmax_handle) => {
+                softmax_handle.shift_handle = f(softmax_handle.shift_handle)?;
+                ProvingHandle::Softmax(softmax_handle)
+            }
+            ProvingHandle::LayerNorm(mut layer_norm_handle) => {
+                layer_norm_handle.mean = f(layer_norm_handle.mean)?;
+                layer_norm_handle.std_dev = f(layer_norm_handle.std_dev)?;
+                ProvingHandle::LayerNorm(layer_norm_handle)
+            }
+            ProvingHandle::ArgMax(argmax_handle) => {
+                let mut new_handles = Vec::with_capacity(argmax_handle.max_values.len());
+                for handle in argmax_handle.max_values {
+                    new_handles.push(f(handle)?);
+                }
+                ProvingHandle::ArgMax(ArgmaxHandle {
+                    max_values: new_handles,
+                })
+            }
+            ProvingHandle::None => ProvingHandle::None,
+            ProvingHandle::RMSNorm(mut rmsnorm_handle) => {
+                rmsnorm_handle.normalisation = f(rmsnorm_handle.normalisation)?;
+                ProvingHandle::RMSNorm(rmsnorm_handle)
+            }
+        })
     }
 
     pub(crate) fn attach_store(&mut self, store: GenStore) {
@@ -250,7 +312,7 @@ pub trait Evaluate<T: TensorTypeParam> {
 
 /// Helper method employed to call `Evaluate::evaluate` when there are no `unpadded_input_shapes`
 /// or when the `E` type cannot be inferred automatically by the compiler
-pub fn evaluate_layer<E: ExtensionField, T: TensorTypeParam, O: Evaluate<T>>(
+pub fn evaluate_layer<T: TensorTypeParam, O: Evaluate<T>>(
     layer: &O,
     inputs: &[&WrappedTensor<T>],
 ) -> Result<LayerOut<T>> {
@@ -259,11 +321,7 @@ pub fn evaluate_layer<E: ExtensionField, T: TensorTypeParam, O: Evaluate<T>>(
 
 pub trait ProveInfo {
     /// Compute the proving context for the operation
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)>;
+    fn step_info<F: PrimeField>(&self, aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)>;
 }
 
 /// Output of `QuantizeOp` method over a layer
@@ -362,24 +420,22 @@ pub trait PadOp {
     }
 }
 
-pub trait ProvableOp<E, PCS>: OpInfo + PadOp + ProveInfo
+pub trait ProvableOp<F, PCS>: OpInfo + PadOp + ProveInfo
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    type Ctx: VerifiableCtx<E, PCS>;
+    type Ctx: VerifiableCtx<F, PCS>;
 
     /// Produces a proof of correct execution for this operation.
-    fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
+    fn prove<'a, 'b, 'c, 'd, T: Transcript + InitTranscript>(
         &'a self,
         _node_id: NodeId,
         _ctx: &'b Self::Ctx,
-        _last_claims: Vec<&Claim<E>>,
+        _last_claims: Vec<&Claim<F>>,
         _step_data: &Step<Element>,
-        _prover: &mut Prover<'c, 'd, E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        _prover: &mut Prover<'c, 'd, F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
         ensure!(
             !self.is_provable(),
@@ -392,38 +448,67 @@ where
     fn gen_lookup_witness(
         &self,
         _id: NodeId,
-        _ctx: &ProverContext<E, PCS>,
+        _ctx: &ProverContext<F, PCS>,
         _step_data: &Step<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'_, F>> {
         Ok(Default::default())
     }
 }
 
-pub trait VerifiableCtx<E, PCS>: Debug + OpInfo
+pub trait Splittable {
+    /// This method returns the ideal number of chunks to be used to split the
+    /// proving logic, if `self.splittable` returns true.
+    /// If the layer is not splittable, this method should return `None`,
+    /// since chunking is not applicable    
+    fn ideal_num_chunks(&self, _input_shapes: &[Shape]) -> Option<usize> {
+        None // by default, NO SPLIT
+    }
+
+    // whether the layer can be horizontally split
+    fn is_splittable(&self) -> bool {
+        false
+    }
+}
+pub trait VerifiableCtx<F, PCS>: Debug + OpInfo
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
     type Proof: Sized;
 
     /// Verify proof for the given operation
-    fn verify<T: Transcript<E>>(
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>>;
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>>;
+
+    /// Variant of `verify` employed to verify a chunk when the layer inputs are split into multiple chunks
+    fn verify_chunk<T: Transcript>(
+        &self,
+        proof: &Self::Proof,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
+        shape_step: &ShapeStep,
+        node_id: NodeId,
+        _chunk_number: usize,
+    ) -> Result<Vec<Claim<F>>> {
+        // as a default implementation, this is the same as `verify`
+        self.verify(proof, last_claims, verifier, shape_step, node_id)
+    }
 
     /// Verify the claim about the input of the model. Sometimes
     /// the input needs to be processed in a certain way before being evaluated.
     /// For example, Embeddings use one hot encoding of the input before
     /// running the matmul protocol.
     /// By default, it simply evaluates the input against the input claim.
-    fn verify_input_claim<A: AsRef<Tensor<E>>>(
+    fn verify_input_claim<D: Deref<Target = F> + ToField<F>, A: AsRef<Tensor<D>>>(
         &self,
         inputs: &[A],
-        claims: &[&Claim<E>],
+        claims: &[&Claim<F>],
     ) -> anyhow::Result<()> {
         ensure!(
             inputs.len() == claims.len(),
@@ -432,10 +517,9 @@ where
         for (i, (input, claim)) in inputs.iter().zip(claims).enumerate() {
             let computed = input
                 .as_ref()
-                .data()
-                .to_vec()
+                .to_field()
                 .into_mle()
-                .evaluate(&claim.point);
+                .evaluate(&claim.point)?;
             ensure!(
                 computed == claim.eval,
                 "input claim {:?} is incorrect, computed: {:?}, given: {:?}",
@@ -448,38 +532,39 @@ where
     }
 
     /// Writes the associated type [`Self::Proof`] to the transcript if it contains any [`PCS::Commitment`].
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,
     ) -> anyhow::Result<()>;
 }
 
-pub(crate) fn verify_input_claim<E, PCS, V, A>(
+pub(crate) fn verify_input_claim<F, PCS, V, D, A>(
     ctx: &V,
     inputs: &[A],
-    claims: &[&Claim<E>],
+    claims: &[&Claim<F>],
 ) -> anyhow::Result<()>
 where
-    V: VerifiableCtx<E, PCS>,
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-    A: AsRef<Tensor<E>>,
+    V: VerifiableCtx<F, PCS>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
+    D: Deref<Target = F> + ToField<F>,
+    A: AsRef<Tensor<D>>,
 {
-    <V as VerifiableCtx<E, PCS>>::verify_input_claim(ctx, inputs, claims)
+    <V as VerifiableCtx<F, PCS>>::verify_input_claim(ctx, inputs, claims)
 }
 
 pub(crate) fn write_proof_to_transcript<
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-    T: Transcript<E>,
-    V: VerifiableCtx<E, PCS>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
+    T: Transcript,
+    V: VerifiableCtx<F, PCS>,
 >(
     ctx: &V,
-    proof: &<V as VerifiableCtx<E, PCS>>::Proof,
+    proof: &<V as VerifiableCtx<F, PCS>>::Proof,
     transcript: &mut T,
 ) -> anyhow::Result<()> {
-    <V as VerifiableCtx<E, PCS>>::write_proof_to_transcript(ctx, proof, transcript)
+    <V as VerifiableCtx<F, PCS>>::write_proof_to_transcript(ctx, proof, transcript)
 }
 
 #[derive(Clone, Debug)]
@@ -507,18 +592,19 @@ impl<'a, O: OpInfo> OpInfo for NonProvableVerifierCtx<'a, O> {
     }
 }
 
-impl<'a, O: OpInfo + Debug, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-    VerifiableCtx<E, PCS> for NonProvableVerifierCtx<'a, O>
+impl<'a, O: OpInfo + Debug, F: PrimeField, PCS: CommitmentScheme> VerifiableCtx<F, PCS>
+    for NonProvableVerifierCtx<'a, O>
 {
     type Proof = ();
 
-    fn verify<T: Transcript<E>>(
+    fn verify<T: Transcript>(
         &self,
         _proof: &Self::Proof,
-        _last_claims: &[&Claim<E>],
-        _verifier: &mut Verifier<E, T, PCS>,
+        _last_claims: &[&Claim<F>],
+        _verifier: &mut Verifier<F, T, PCS>,
         _shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
+        _node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
         // Default implementation, to avoid having to implement this method in case `is_provable` is false
         ensure!(
             !self.is_provable(),
@@ -527,7 +613,7 @@ impl<'a, O: OpInfo + Debug, E: ExtensionField, PCS: PolynomialCommitmentScheme<E
         Ok(vec![Claim::default()])
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         _proof: &Self::Proof,
         _transcript: &mut T,
@@ -537,7 +623,7 @@ impl<'a, O: OpInfo + Debug, E: ExtensionField, PCS: PolynomialCommitmentScheme<E
     }
 }
 
-impl<E: ExtensionField> OpInfo for LayerCtx<E> {
+impl<F: PrimeField> OpInfo for LayerCtx<F> {
     fn output_shapes(
         &self,
         input_shapes: &[Shape],
@@ -565,6 +651,8 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
                 attention_mask_ctx.output_shapes(input_shapes, padding_mode)
             }
             LayerCtx::EinSum(einsum_ctx) => einsum_ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::Split(split_ctx) => split_ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::Recombination(rec_ctx) => rec_ctx.output_shapes(input_shapes, padding_mode),
         }
     }
 
@@ -587,6 +675,8 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
                 attention_mask_ctx.num_outputs(num_inputs)
             }
             LayerCtx::EinSum(einsum_ctx) => einsum_ctx.num_outputs(num_inputs),
+            LayerCtx::Split(split_ctx) => split_ctx.num_outputs(num_inputs),
+            LayerCtx::Recombination(rec_ctx) => rec_ctx.num_outputs(num_inputs),
         }
     }
 
@@ -607,6 +697,8 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Flatten => Flatten(true).describe(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.describe(),
             LayerCtx::EinSum(einsum_ctx) => einsum_ctx.describe(),
+            LayerCtx::Split(split_ctx) => split_ctx.describe(),
+            LayerCtx::Recombination(rec_ctx) => rec_ctx.describe(),
         }
     }
 
@@ -627,62 +719,71 @@ impl<E: ExtensionField> OpInfo for LayerCtx<E> {
             LayerCtx::Flatten => Flatten(true).is_provable(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.is_provable(),
             LayerCtx::EinSum(einsum_ctx) => einsum_ctx.is_provable(),
+            LayerCtx::Split(split_ctx) => split_ctx.is_provable(),
+            LayerCtx::Recombination(rec_ctx) => rec_ctx.is_provable(),
         }
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS> for LayerCtx<E> {
-    type Proof = LayerProof<E, PCS>;
+impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for LayerCtx<F> {
+    type Proof = LayerProof<F, PCS>;
 
-    fn verify<T: Transcript<E>>(
+    fn verify<T: Transcript>(
         &self,
-        proof: &LayerProof<E, PCS>,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        proof: &LayerProof<F, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
         match (self, proof) {
             (LayerCtx::Convolution(conv_ctx), LayerProof::Convolution(proof)) => {
-                conv_ctx.verify(proof, last_claims, verifier, shape_step)
+                conv_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Embeddings(ctx), LayerProof::Embeddings(proof)) => {
-                ctx.verify(proof, last_claims, verifier, shape_step)
+                ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Positional(pos_ctx), LayerProof::Positional(proof)) => {
-                pos_ctx.verify(proof, last_claims, verifier, shape_step)
+                pos_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Add(ctx), LayerProof::Add(proof)) => {
-                ctx.verify(proof, last_claims, verifier, shape_step)
+                ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Logits(ctx), LayerProof::Logits(proof)) => {
-                ctx.verify(proof, last_claims, verifier, shape_step)
+                ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Activation(activation_ctx), LayerProof::Activation(proof)) => {
-                activation_ctx.verify(proof, last_claims, verifier, shape_step)
+                activation_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::LayerNorm(layernorm_ctx), LayerProof::LayerNorm(proof)) => {
-                layernorm_ctx.verify(proof, last_claims, verifier, shape_step)
+                layernorm_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::RMSNorm(rmsnorm_ctx), LayerProof::RMSNorm(proof)) => {
-                rmsnorm_ctx.verify(proof, last_claims, verifier, shape_step)
+                rmsnorm_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Requant(requant_ctx), LayerProof::Requant(proof)) => {
-                requant_ctx.verify(proof, last_claims, verifier, shape_step)
+                requant_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Pooling(pooling_ctx), LayerProof::Pooling(proof)) => {
-                pooling_ctx.verify(proof, last_claims, verifier, shape_step)
+                pooling_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Softmax(softmax_ctx), LayerProof::Softmax(proof)) => {
-                softmax_ctx.verify(proof, last_claims, verifier, shape_step)
+                softmax_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Flatten, _) | (LayerCtx::Reshape(_), _) => {
                 unreachable!("Trying to verify a non-provable layer")
             }
             (LayerCtx::AttentionMask(attention_mask_ctx), LayerProof::AttentionMask(proof)) => {
-                attention_mask_ctx.verify(proof, last_claims, verifier, shape_step)
+                attention_mask_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::EinSum(einsum_ctx), LayerProof::EinSum(proof)) => {
-                einsum_ctx.verify(proof, last_claims, verifier, shape_step)
+                einsum_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
+            }
+            (LayerCtx::Split(split_ctx), LayerProof::SplitLayer(proof)) => {
+                split_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
+            }
+            (LayerCtx::Recombination(rec_ctx), LayerProof::Recombination(proof)) => {
+                rec_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             _ => bail!(
                 "Incompatible layer {} and proof {} found",
@@ -692,90 +793,253 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
         }
     }
 
-    fn verify_input_claim<A: AsRef<Tensor<E>>>(
+    fn verify_chunk<T: Transcript>(
+        &self,
+        proof: &LayerProof<F, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
+        shape_step: &ShapeStep,
+        node_id: NodeId,
+        chunk_number: usize,
+    ) -> Result<Vec<Claim<F>>> {
+        match (self, proof) {
+            (LayerCtx::Convolution(conv_ctx), LayerProof::Convolution(proof)) => conv_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::Embeddings(ctx), LayerProof::Embeddings(proof)) => ctx.verify_chunk(
+                proof,
+                last_claims,
+                verifier,
+                shape_step,
+                node_id,
+                chunk_number,
+            ),
+            (LayerCtx::Positional(pos_ctx), LayerProof::Positional(proof)) => pos_ctx.verify_chunk(
+                proof,
+                last_claims,
+                verifier,
+                shape_step,
+                node_id,
+                chunk_number,
+            ),
+            (LayerCtx::Add(ctx), LayerProof::Add(proof)) => ctx.verify_chunk(
+                proof,
+                last_claims,
+                verifier,
+                shape_step,
+                node_id,
+                chunk_number,
+            ),
+            (LayerCtx::Logits(ctx), LayerProof::Logits(proof)) => ctx.verify_chunk(
+                proof,
+                last_claims,
+                verifier,
+                shape_step,
+                node_id,
+                chunk_number,
+            ),
+            (LayerCtx::Activation(activation_ctx), LayerProof::Activation(proof)) => activation_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::LayerNorm(layernorm_ctx), LayerProof::LayerNorm(proof)) => layernorm_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::RMSNorm(rmsnorm_ctx), LayerProof::RMSNorm(proof)) => rmsnorm_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::Requant(requant_ctx), LayerProof::Requant(proof)) => requant_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::Pooling(pooling_ctx), LayerProof::Pooling(proof)) => pooling_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::Softmax(softmax_ctx), LayerProof::Softmax(proof)) => softmax_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::Flatten, _) | (LayerCtx::Reshape(_), _) => {
+                unreachable!("Trying to verify a non-provable layer")
+            }
+            (LayerCtx::AttentionMask(attention_mask_ctx), LayerProof::AttentionMask(proof)) => {
+                attention_mask_ctx.verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                )
+            }
+            (LayerCtx::EinSum(einsum_ctx), LayerProof::EinSum(proof)) => einsum_ctx.verify_chunk(
+                proof,
+                last_claims,
+                verifier,
+                shape_step,
+                node_id,
+                chunk_number,
+            ),
+            (LayerCtx::Split(split_ctx), LayerProof::SplitLayer(proof)) => split_ctx.verify_chunk(
+                proof,
+                last_claims,
+                verifier,
+                shape_step,
+                node_id,
+                chunk_number,
+            ),
+            (LayerCtx::Recombination(rec_ctx), LayerProof::Recombination(proof)) => rec_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            _ => bail!(
+                "Incompatible layer {} and proof {} found",
+                self.describe(),
+                proof.variant_name()
+            ),
+        }
+    }
+
+    fn verify_input_claim<D: Deref<Target = F> + ToField<F>, A: AsRef<Tensor<D>>>(
         &self,
         inputs: &[A],
-        claims: &[&Claim<E>],
+        claims: &[&Claim<F>],
     ) -> anyhow::Result<()> {
         match self {
             LayerCtx::Convolution(conv_ctx) => {
-                verify_input_claim::<E, PCS, _, _>(conv_ctx, inputs, claims)
+                verify_input_claim::<F, PCS, _, _, _>(conv_ctx, inputs, claims)
             }
 
             LayerCtx::Activation(activation_ctx) => {
-                verify_input_claim::<E, PCS, _, A>(activation_ctx, inputs, claims)
+                verify_input_claim::<F, PCS, _, _, _>(activation_ctx, inputs, claims)
             }
-            LayerCtx::LayerNorm(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
-            LayerCtx::RMSNorm(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
-            LayerCtx::Softmax(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
-            LayerCtx::Logits(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
-            LayerCtx::Embeddings(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
-            LayerCtx::Add(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
-            LayerCtx::Positional(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
+            LayerCtx::LayerNorm(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::RMSNorm(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::Softmax(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::Logits(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::Embeddings(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::Add(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::Positional(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
             LayerCtx::Reshape(ctx) => {
-                verify_input_claim::<E, PCS, _, _>(&NonProvableVerifierCtx(ctx), inputs, claims)
+                verify_input_claim::<F, PCS, _, _, _>(&NonProvableVerifierCtx(ctx), inputs, claims)
             }
             LayerCtx::Requant(requant_ctx) => {
-                verify_input_claim::<E, PCS, _, _>(requant_ctx, inputs, claims)
+                verify_input_claim::<F, PCS, _, _, _>(requant_ctx, inputs, claims)
             }
             LayerCtx::Pooling(pooling_ctx) => {
-                verify_input_claim::<E, PCS, _, _>(pooling_ctx, inputs, claims)
+                verify_input_claim::<F, PCS, _, _, _>(pooling_ctx, inputs, claims)
             }
-            LayerCtx::Flatten => verify_input_claim::<E, PCS, _, _>(
+            LayerCtx::Flatten => verify_input_claim::<F, PCS, _, _, _>(
                 &NonProvableVerifierCtx(&Flatten(true)),
                 inputs,
                 claims,
             ),
-            LayerCtx::AttentionMask(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
-            LayerCtx::EinSum(ctx) => verify_input_claim::<E, PCS, _, _>(ctx, inputs, claims),
+            LayerCtx::AttentionMask(ctx) => {
+                verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims)
+            }
+            LayerCtx::EinSum(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::Split(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::Recombination(ctx) => {
+                verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims)
+            }
         }
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,
     ) -> anyhow::Result<()> {
         match (self, proof) {
             (LayerCtx::Convolution(ctx), LayerProof::Convolution(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
 
             (LayerCtx::Activation(ctx), LayerProof::Activation(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::LayerNorm(ctx), LayerProof::LayerNorm(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::RMSNorm(ctx), LayerProof::RMSNorm(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Softmax(ctx), LayerProof::Softmax(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Logits(ctx), LayerProof::Logits(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Embeddings(ctx), LayerProof::Embeddings(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Add(ctx), LayerProof::Add(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Positional(ctx), LayerProof::Positional(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Requant(ctx), LayerProof::Requant(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Pooling(ctx), LayerProof::Pooling(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::AttentionMask(ctx), LayerProof::AttentionMask(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::EinSum(ctx), LayerProof::EinSum(p)) => {
-                write_proof_to_transcript::<E, PCS, _, _>(ctx, p, transcript)
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Split(ctx), LayerProof::SplitLayer(p)) => {
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::Recombination(ctx), LayerProof::Recombination(p)) => {
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Flatten, _) => Ok(()),
             (LayerCtx::Reshape(_), _) => Ok(()),

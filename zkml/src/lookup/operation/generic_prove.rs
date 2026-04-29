@@ -9,43 +9,49 @@ use crate::{
         variant::verifying::evaluate_dim_lt_poly,
     },
     model::Step,
-    to_base,
+    poly_commit::verifier::VerifierCommitment,
 };
 
-use mpcs::PolynomialCommitmentScheme;
-use serde::{Serialize, de::DeserializeOwned};
+use dp_crypto::{
+    IntoMLE,
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    poly::dense::DensePolynomial,
+    structs::IOPProof,
+    util::ceil_log2,
+};
+use itertools::Itertools;
 
 use super::*;
 
 #[derive(Debug, Clone)]
-pub struct GenericLookupProof<E, PCS>
+pub struct GenericLookupProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    pub logup_proof: LogUpBatchProof<E>,
-    pub sumcheck_proof: IOPProof<E>,
-    pub evaluations: Vec<E>,
-    pub weight_evaluation: Option<E>,
-    pub shift_evaluations: Option<Vec<E>>,
-    pub commitment: PCS::Commitment,
+    pub logup_proof: LogUpBatchProof<F>,
+    pub sumcheck_proof: IOPProof<F>,
+    pub evaluations: Vec<F>,
+    pub weight_evaluation: Option<F>,
+    pub shift_evaluations: Option<Vec<F>>,
+    pub commitments: Vec<VerifierCommitment<PCS>>,
 }
 
-pub struct LookupProverResult<E, PCS>
+pub struct LookupProverResult<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    pub generic_proof: GenericLookupProof<E, PCS>,
-    pub input_claims: Vec<Claim<E>>,
-    pub weight_evaluation_point: Option<Vec<E>>,
+    pub generic_proof: GenericLookupProof<F, PCS>,
+    pub input_claims: Vec<Claim<F>>,
+    pub weight_evaluation_point: Option<Vec<F>>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupProverResult<E, PCS> {
+impl<F: PrimeField, PCS: CommitmentScheme> LookupProverResult<F, PCS> {
     pub fn new(
-        generic_proof: GenericLookupProof<E, PCS>,
-        input_claims: Vec<Claim<E>>,
-        weight_evaluation_point: Option<Vec<E>>,
+        generic_proof: GenericLookupProof<F, PCS>,
+        input_claims: Vec<Claim<F>>,
+        weight_evaluation_point: Option<Vec<F>>,
     ) -> Self {
         Self {
             generic_proof,
@@ -57,28 +63,33 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupProverResult<E
 /// Generic function to prove a lookup operation for any implementor of [`LookupOp`]. This function handles the generation of the LogUp proof and the linking sumcheck proof, as well as the necessary evaluations and claims.
 /// It takes in the lookup operation, the last claim, the current step, the table, an optional weight tensor (if this is a normalisation variant), the prover, and the node id for which we are proving.
 /// It returns a [`LookupProverResult`] containing the generated proof and any relevant evaluation points.
-pub fn prove_lookup_op<L, E, T, PCS>(
+pub fn prove_lookup_op<L, F, T, PCS>(
     lookup_op: &L,
-    last_claim: &Claim<E>,
+    last_claim: &Claim<F>,
     step: &Step<Element>,
     table: &Table,
     weight_tensor: Option<&Tensor<Element>>,
-    prover: &mut Prover<E, T, PCS>,
+    prover: &mut Prover<F, T, PCS>,
     node_id: NodeId,
-) -> Result<LookupProverResult<E, PCS>>
+) -> Result<LookupProverResult<F, PCS>>
 where
     L: LookupOp,
-    E: ExtensionField,
-    T: Transcript<E>,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    T: Transcript,
+    PCS: CommitmentScheme<Field = F>,
 {
     // First we get the layer commitment and extract it into parts
     let layer_commitment = prover.lookup_witness(node_id)?;
 
-    let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
-    let commit = PCS::get_pure_commitment(layer_commitment);
+    let (layer_polys, commitments): (Vec<_>, Vec<_>) = layer_commitment
+        .iter()
+        .map(|committed_poly| {
+            (
+                committed_poly.polynomial.clone(),
+                VerifierCommitment::from(committed_poly),
+            )
+        })
+        .unzip();
 
     let variant = lookup_op.variant();
     let unpadded_input_shape = step.inputs()[0].unpadded_shape();
@@ -99,10 +110,10 @@ where
     // Generate the LogUp proof
     // First we have to sort and pair off the MLEs for the LogUp proof.
     let logup_inputs = if !variant.requires_output() {
-        input_config.create_logup_inputs::<E>(lookup_polys, None, &prover.challenge_storage)?
+        input_config.create_logup_inputs::<F>(lookup_polys, None, &prover.challenge_storage)?
     } else if weight_tensor.is_none() {
         let output = step.output_tensor_at(0)?;
-        input_config.create_logup_inputs::<E>(
+        input_config.create_logup_inputs::<F>(
             lookup_polys,
             Some(output.as_ref()),
             &prover.challenge_storage,
@@ -112,7 +123,7 @@ where
         let wrapped_input = WrappedTensor::try_from(input.as_ref())?.reduce_to_unpadded_shape()?;
         let lookup_output = lookup_op.apply(wrapped_input, table)?;
         let output = Tensor::try_from(&lookup_output)?;
-        input_config.create_logup_inputs::<E>(
+        input_config.create_logup_inputs::<F>(
             lookup_polys,
             Some(&output),
             &prover.challenge_storage,
@@ -130,7 +141,7 @@ where
                 .iter()
                 .skip(number_of_chunks * lookup_inputs_per_chunk)
                 .map(|p| p.as_view())
-                .collect::<Vec<MultilinearExtension<E>>>(),
+                .collect::<Vec<DensePolynomial<F>>>(),
             None,
         ),
         LookupVariant::GLU => {
@@ -144,7 +155,7 @@ where
                     .skip(number_of_chunks * lookup_inputs_per_chunk)
                     .map(|p| p.as_view())
                     .chain(extra_sumcheck_mles)
-                    .collect::<Vec<MultilinearExtension<E>>>(),
+                    .collect::<Vec<DensePolynomial<F>>>(),
                 None,
             )
         }
@@ -154,7 +165,7 @@ where
                 .iter()
                 .skip(number_of_chunks * lookup_inputs_per_chunk)
                 .map(|p| p.as_view())
-                .collect::<Vec<MultilinearExtension<E>>>(),
+                .collect::<Vec<DensePolynomial<F>>>(),
             Some(others),
         ),
         LookupVariant::Normalisation {
@@ -172,20 +183,20 @@ where
             let expanded_normaliser_mles = normaliser_mles
                 .iter()
                 .map(|m| {
-                    m.get_base_field_vec()
+                    m.evals_ref()
                         .iter()
                         .flat_map(|v| std::iter::repeat_n(*v, padded_final_dim))
-                        .collect::<Vec<E::BaseField>>()
+                        .collect::<Vec<F>>()
                         .into_mle()
                 })
-                .collect::<Vec<MultilinearExtension<E>>>();
+                .collect::<Vec<DensePolynomial<F>>>();
             let mles = lookup_polys
                 .iter()
                 .skip(number_of_chunks * lookup_inputs_per_chunk)
                 .map(|p| p.as_view())
                 .chain(extra_sumcheck_mles)
                 .chain(expanded_normaliser_mles)
-                .collect::<Vec<MultilinearExtension<E>>>();
+                .collect::<Vec<DensePolynomial<F>>>();
             if normalised_sum_value.is_some() {
                 (mles, Some(shift_mles))
             } else {
@@ -197,7 +208,7 @@ where
     // Make the expanded weight tensor MLE if it is provided (this is multiplied element wise with the lookup output).
     let weight_mle = weight_tensor.map(|weight| {
         let padded_weight = weight.pad_next_power_of_two().into_data();
-        let weight_field = to_base::<E, _>(padded_weight);
+        let weight_field = padded_weight.to_field();
         let second_last_dim = if rank >= 2 {
             unpadded_input_shape.dim(-2).next_power_of_two()
         } else {
@@ -227,21 +238,23 @@ where
         .output_claims()
         .iter()
         .map(|c| c.evaluation())
-        .collect::<Vec<E>>();
+        .collect::<Vec<F>>();
     let final_dim_vars = ceil_log2(unpadded_input_shape.dim(-1));
 
     let shift_point = logup_proof.point()[final_dim_vars..].to_vec();
-    let shift_evals = shift_mles.map(|s_mles| {
-        let lt_eval = evaluate_dim_lt_poly(
-            &logup_proof.point()[..final_dim_vars],
-            unpadded_input_shape.dim(-1),
-        )
-        .unwrap();
-        s_mles
-            .iter()
-            .map(|m| m.evaluate(&shift_point) * lt_eval)
-            .collect::<Vec<E>>()
-    });
+    let shift_evals = shift_mles
+        .map(|s_mles| {
+            let lt_eval = evaluate_dim_lt_poly(
+                &logup_proof.point()[..final_dim_vars],
+                unpadded_input_shape.dim(-1),
+            )
+            .unwrap();
+            s_mles
+                .iter()
+                .map(|m| m.evaluate(&shift_point).map(|eval| eval * lt_eval))
+                .collect::<anyhow::Result<Vec<F>>>()
+        })
+        .transpose()?;
 
     // Construct the witness commitment claims
     let LookupEvaluations {
@@ -256,10 +269,15 @@ where
         &shift_evals,
     )?;
 
-    let first_commitments = (logup_proof.point().to_vec(), input_commitment_evals);
-    let second_commitments = (sumcheck_point.clone(), output_commitment_evals);
-
-    let mut commitment_claims = vec![first_commitments, second_commitments];
+    let mut commitment_claims = input_commitment_evals
+        .into_iter()
+        .map(|eval| Claim::new(logup_proof.point().to_vec(), eval))
+        .chain(
+            output_commitment_evals
+                .into_iter()
+                .map(|eval| Claim::new(sumcheck_point.clone(), eval)),
+        )
+        .collect_vec();
 
     // Construct the input claims to be passed to the next layer.
     let input_claims = variant.produce_input_claims(
@@ -275,31 +293,36 @@ where
         // In this case we don't need to deal with rounding constants and the fixed point multiplier
         // because the input evaluation comes directly from the Sumcheck (since we had to prove that the values in the lookup
         // are the elementwise product of the input tensor and a witness specific tensor of normalising values).
-        commitment_claims.push((
-            sumcheck_point[final_dim_vars..].to_vec(),
-            normalisation_commitment_evals,
-        ));
+        for eval in normalisation_commitment_evals {
+            commitment_claims.push(Claim::new(sumcheck_point[final_dim_vars..].to_vec(), eval))
+        }
     }
 
     // Process the shift evaluations if they are present, we need to divide them by the evaluation of the dim_lt polynomial at the logup point to get the correct shift evaluations to be used in the next layer, and we also add them as claims for the witness commitment.
-    let shift_evals = if let Some(shift_evals) = shift_evals.as_ref() {
-        let inverse_lt_eval = evaluate_dim_lt_poly(
-            &logup_proof.point()[..final_dim_vars],
-            unpadded_input_shape.dim(-1),
-        )?
-        .inverse();
-        let shift_evals = shift_evals
-            .iter()
-            .map(|e| *e * inverse_lt_eval)
-            .collect::<Vec<E>>();
-        commitment_claims.push((shift_point, shift_evals.clone()));
-        Some(shift_evals)
-    } else {
-        None
-    };
+    let shift_evals = shift_evals
+        .as_ref()
+        .map(|shift_evals| {
+            let inverse_lt_eval = evaluate_dim_lt_poly(
+                &logup_proof.point()[..final_dim_vars],
+                unpadded_input_shape.dim(-1),
+            )?
+            .inverse()
+            .ok_or(anyhow!("Tried to invert dim lt poly eval"))?;
+            anyhow::Ok(
+                shift_evals
+                    .iter()
+                    .map(|e| {
+                        let eval = *e * inverse_lt_eval;
+                        commitment_claims.push(Claim::new(shift_point.clone(), eval));
+                        eval
+                    })
+                    .collect(),
+            )
+        })
+        .transpose()?;
 
     // Add the witness claims to the prover.
-    prover.add_witness_claim(node_id, commitment_claims);
+    prover.add_witness_claim_per_poly(node_id, commitment_claims);
 
     // Make the generic lookup proof to be returned to the caller.
     let generic_proof = GenericLookupProof {
@@ -308,7 +331,7 @@ where
         evaluations,
         weight_evaluation: weight_eval,
         shift_evaluations: shift_evals,
-        commitment: commit,
+        commitments,
     };
     // make the weight tensor evaluation point if a weight tensor was provided.
     let weight_point = weight_eval.map(|_| sumcheck_point[..final_dim_vars].to_vec());

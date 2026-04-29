@@ -163,8 +163,7 @@ async fn run_model_v1<S: Store>(
                     .iter()
                     .map(|handle| handle.tensor().map(|t| t.clone()))
                     .collect::<Result<_, _>>()?;
-                let io = trace.to_verifier_io().context("generating verifier IOs")?;
-                let proof = Prover::<_, T, _>::prove(&prover_ctx, trace, &model)
+                let (proof, io) = Prover::<_, T, _>::prove(&prover_ctx, trace, &model)
                     .with_context(|| "unable to generate proof for {i}th input")?;
 
                 proofs.push(v1::Output {

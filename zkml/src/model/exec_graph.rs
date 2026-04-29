@@ -1,12 +1,11 @@
 use std::{collections::HashMap, fmt::Debug, ops::Deref};
 
 use anyhow::{anyhow, bail, ensure};
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
+use dp_crypto::arkyper::{CommitmentScheme, transcript::Transcript};
 use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use tenstore::GenStore;
-use transcript::Transcript;
 
 use crate::{
     Element, IO, InitTranscript, Proof, Prover, ProverContext, Tensor,
@@ -18,25 +17,20 @@ use crate::{
         chunking::ChunkingStrategy,
         prover_graph::{LocalProverCtx, ProverGraphIO, ProverGraphNode},
     },
-    model::{Model, Trace, llm::Driver},
+    model::{Model, Trace, llm::Driver, trace::SplittedNodesInfo},
     quantization::ModelMetadata,
 };
 
 /// Context for the execution graph used for distributed proving
-pub struct ExecGraphCtx<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    pub(crate) serializable_ctx: SerializableGraphCtx<E, PCS>,
+pub struct ExecGraphCtx<F: PrimeField, PCS: CommitmentScheme> {
+    pub(crate) serializable_ctx: SerializableGraphCtx<F, PCS>,
     pub(crate) store: GenStore,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> AsRef<SerializableGraphCtx<E, PCS>>
-    for ExecGraphCtx<E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
+impl<F: PrimeField, PCS: CommitmentScheme> AsRef<SerializableGraphCtx<F, PCS>>
+    for ExecGraphCtx<F, PCS>
 {
-    fn as_ref(&self) -> &SerializableGraphCtx<E, PCS> {
+    fn as_ref(&self) -> &SerializableGraphCtx<F, PCS> {
         &self.serializable_ctx
     }
 }
@@ -54,16 +48,19 @@ impl InferenceEngine {
         &self,
         mut input: Vec<Tensor<Element>>,
         store: &mut GenStore,
+        split_node_info: &SplittedNodesInfo,
     ) -> anyhow::Result<Trace<Element>> {
         match self {
-            InferenceEngine::Generic(model) => model.run(input, store),
+            InferenceEngine::Generic(model) => {
+                model.run_with_split_nodes_info(input, store, Some(split_node_info))
+            }
             InferenceEngine::LLM(driver) => {
                 ensure!(
                     input.len() == 1,
                     "LLM inference only supports one sequence of tokens - batch inference is not supported"
                 );
                 let input = input.pop().expect("size validated above");
-                driver.run_elements(input, store)
+                driver.run_elements_with_split_info(input, store, Some(split_node_info))
             }
         }
     }
@@ -97,12 +94,12 @@ impl InferenceEngine {
 /// Once deserialized, this structure can be converted to the full `ExecGraphCtx` to
 /// be used to run the execution graph
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct SerializableGraphCtx<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    pub(crate) ctx: ProverContext<E, PCS>,
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct SerializableGraphCtx<F: PrimeField, PCS: CommitmentScheme> {
+    pub(crate) ctx: ProverContext<'static, F, PCS>,
     pub(crate) engine: InferenceEngine,
     /// Model metadata for input/output scaling. Required for input quantization.
     /// This field is optional for backward compatibility with existing serialized data.
@@ -110,11 +107,8 @@ where
     pub(crate) metadata: Option<ModelMetadata>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SerializableGraphCtx<E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    pub fn new(ctx: ProverContext<E, PCS>, engine: InferenceEngine) -> Self {
+impl<F: PrimeField, PCS: CommitmentScheme> SerializableGraphCtx<F, PCS> {
+    pub fn new(ctx: ProverContext<'static, F, PCS>, engine: InferenceEngine) -> Self {
         Self {
             ctx,
             engine,
@@ -126,7 +120,7 @@ where
     /// The metadata is required when the context will be cached and reused for
     /// different inputs.
     pub fn new_with_metadata(
-        ctx: ProverContext<E, PCS>,
+        ctx: ProverContext<'static, F, PCS>,
         engine: InferenceEngine,
         metadata: ModelMetadata,
     ) -> Self {
@@ -157,7 +151,7 @@ where
 
     /// Build the full execution graph context from `SerializableGraphCtx`,
     /// attaching the given `GenStore`.
-    pub fn to_full_ctx(self, store: GenStore) -> ExecGraphCtx<E, PCS> {
+    pub fn to_full_ctx(self, store: GenStore) -> ExecGraphCtx<F, PCS> {
         ExecGraphCtx {
             serializable_ctx: self,
             store,
@@ -165,11 +159,8 @@ where
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Deref for ExecGraphCtx<E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    type Target = SerializableGraphCtx<E, PCS>;
+impl<F: PrimeField, PCS: CommitmentScheme> Deref for ExecGraphCtx<F, PCS> {
+    type Target = SerializableGraphCtx<F, PCS>;
 
     fn deref(&self) -> &Self::Target {
         &self.serializable_ctx
@@ -185,15 +176,18 @@ pub struct InferenceIO {
 
 /// Input/output data for nodes of the execution graph used for distributed proving
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 #[allow(clippy::large_enum_variant)]
-pub enum ExecGraphIO<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+pub enum ExecGraphIO<F: PrimeField, PCS: CommitmentScheme> {
     // Input for inference task
     InferenceInput(InferenceIO),
     // Input for prover graph nodes
-    Prover(ProverGraphIO<E, PCS>),
+    Prover(ProverGraphIO<F, PCS>),
     // Model IO output to be provided to the verifier
-    ModelIO(IO<E>),
+    ModelIO(IO<F>),
 }
 
 /// A serializable intermediate output for GW mediated distributed execution.
@@ -203,20 +197,23 @@ pub enum ExecGraphIO<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
 /// It is used for storing intermediate outputs in the GW DB and passing
 /// them between workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct SerializablePartitionOutput<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct SerializablePartitionOutput<F: PrimeField, PCS: CommitmentScheme> {
     /// The color/chunk_id of the partition that produced this output
     pub from: usize,
     /// The color/chunk_id of the partition that should receive this output.
     /// `None` indicates this is a final output of the entire computation.
     pub to: Option<usize>,
     /// The actual output data produced by the partition
-    pub output: ExecGraphIO<E, PCS>,
+    pub output: ExecGraphIO<F, PCS>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SerializablePartitionOutput<E, PCS> {
+impl<F: PrimeField, PCS: CommitmentScheme> SerializablePartitionOutput<F, PCS> {
     /// Create a new serializable partition output
-    pub fn new(from: usize, to: Option<usize>, output: ExecGraphIO<E, PCS>) -> Self {
+    pub fn new(from: usize, to: Option<usize>, output: ExecGraphIO<F, PCS>) -> Self {
         Self { from, to, output }
     }
 
@@ -226,7 +223,7 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SerializablePartitio
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ExecGraphIO<E, PCS> {
+impl<F: PrimeField, PCS: CommitmentScheme> ExecGraphIO<F, PCS> {
     /// Attach the store to the trace instances found in `ChunkProverII`.
     /// This method is needed when the IO needs to be serialized/deserialized (e.g.,
     /// in a distrbiuted setting), as the store cannot be serialized.
@@ -243,46 +240,43 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ExecGraphIO<E, PCS> 
 
 /// Node of the execution graph used for distributed proving
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub enum ExecGraphNode<'a, 'b, E: ExtensionField, T, PCS: PolynomialCommitmentScheme<E>>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
-{
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub enum ExecGraphNode<'a, 'b, F: PrimeField, T, PCS: CommitmentScheme> {
     /// Task for inference of the model
-    Inference,
-    Prover(ProverGraphNode<'a, 'b, E, T, PCS>),
+    Inference(SplittedNodesInfo),
+    Prover(ProverGraphNode<'a, 'b, F, T, PCS>),
 }
 
-impl<'a, 'b, E: ExtensionField, T, PCS: PolynomialCommitmentScheme<E>> Debug
-    for ExecGraphNode<'a, 'b, E, T, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
-{
+impl<'a, 'b, F: PrimeField, T, PCS: CommitmentScheme> Debug for ExecGraphNode<'a, 'b, F, T, PCS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecGraphNode::Inference => write!(f, "ExecGraphNode::Inference"),
+            ExecGraphNode::Inference(split_info) => {
+                write!(f, "ExecGraphNode::Inference({split_info:?})")
+            }
             ExecGraphNode::Prover(node) => write!(f, "ExecGraphNode::Prover({:?})", node),
         }
     }
 }
 
-impl<'a, 'b, E, T, PCS> ExecNode for ExecGraphNode<'a, 'b, E, T, PCS>
+impl<'a, 'b, F, T, PCS> ExecNode for ExecGraphNode<'a, 'b, F, T, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
-    T: Transcript<E> + InitTranscript,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F> + 'static,
+    T: Transcript + InitTranscript,
 {
-    type IO = ExecGraphIO<E, PCS>;
+    type IO = ExecGraphIO<F, PCS>;
 
-    type Context = ExecGraphCtx<E, PCS>;
+    type Context = ExecGraphCtx<F, PCS>;
 
     fn describe(&self) -> String {
         match self {
-            ExecGraphNode::Inference => "Inference".into(),
+            ExecGraphNode::Inference(split_info) => format!(
+                "Inference, number of splitted nodes: {}",
+                split_info.splitted_nodes.inner_nodes.len()
+            ),
             ExecGraphNode::Prover(generic_exec_graph_node) => {
                 format!("Prover node({})", generic_exec_graph_node.describe())
             }
@@ -295,7 +289,7 @@ where
             .iter_mut()
             .for_each(|inp| inp.attach_store(ctx.store.clone()));
         match self {
-            ExecGraphNode::Inference => {
+            ExecGraphNode::Inference(split_info) => {
                 ensure!(
                     inputs.len() == 1,
                     "Expected 1 input for inference node in distributed graph, found {}",
@@ -304,8 +298,10 @@ where
                 let ExecGraphIO::InferenceInput(mut input) = inputs.pop().unwrap() else {
                     bail!("Expected tensors as input for inference task")
                 };
-                let trace = ctx.engine.run(input.input_tensors, &mut input.store)?;
-                let io: IO<E> = trace.to_verifier_io()?;
+                let trace = ctx
+                    .engine
+                    .run(input.input_tensors, &mut input.store, split_info)?;
+                let io: IO<F> = trace.to_verifier_io()?;
                 Ok(vec![
                     ExecGraphIO::Prover(ProverGraphIO::ProverSplitInput(trace)),
                     ExecGraphIO::ModelIO(io),
@@ -336,28 +332,26 @@ where
     }
 }
 
-pub type ExecGraph<'a, 'b, E, T, PCS> =
-    crate::graph::scheduler::ExecGraph<ExecGraphNode<'a, 'b, E, T, PCS>, usize>;
+pub type ExecGraph<'a, 'b, F, T, PCS> =
+    crate::graph::scheduler::ExecGraph<ExecGraphNode<'a, 'b, F, T, PCS>, usize>;
 
-pub fn build_execution_graph<E, T, PCS, S>(
-    ctx: &ExecGraphCtx<E, PCS>,
+pub fn build_execution_graph<F, T, PCS, S>(
+    ctx: &ExecGraphCtx<F, PCS>,
     num_chunks: Option<usize>,
     chunking_strategy: S,
-) -> anyhow::Result<ExecGraph<'_, '_, E, T, PCS>>
+) -> anyhow::Result<ExecGraph<'_, '_, F, T, PCS>>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F> + 'static,
     S: ChunkingStrategy,
-    T: Transcript<E> + InitTranscript,
+    T: Transcript + InitTranscript,
 {
-    let chunks = ctx.ctx.split_in_chunks(num_chunks, chunking_strategy)?;
+    let (chunks, split_info) = ctx.ctx.split_in_chunks(num_chunks, chunking_strategy)?;
     // The full execution graph is obtained by pre-pending the node related to inference task
     // to the prover execution graph. The inference node produces the full trace, which is the
     // input needed by the prover graph
-    let mut prover_graph: ExecGraph<E, T, PCS> =
-        Prover::<E, T, PCS>::build_execution_graph(chunks)?
+    let mut prover_graph: ExecGraph<F, T, PCS> =
+        Prover::<F, T, PCS>::build_execution_graph(chunks)?
             // we need to convert prover graph nodes to `ExecGraphNode`
             .try_into_map_forward(|_node_id, node, _feeds| {
                 let inner_node = node
@@ -386,23 +380,21 @@ where
         .expect("All nodes in execution graph must be Inner nodes")
         .color();
     let inference_node_id =
-        prover_graph.add_inner(ExecGraphNode::Inference.colored(*source_node_color))?;
+        prover_graph.add_inner(ExecGraphNode::Inference(split_info).colored(*source_node_color))?;
     // link inference node id with source node of prover graph
     prover_graph.add_consecutive_edge(inference_node_id, source_node, None)?;
     Ok(prover_graph)
 }
 
-pub fn graph_inputs<E, T, PCS>(
+pub fn graph_inputs<F, T, PCS>(
     input_tensors: Vec<Tensor<Element>>,
     store: GenStore,
-    exec_graph: &ExecGraph<E, T, PCS>,
-) -> anyhow::Result<HashMap<NodeInput, ExecGraphIO<E, PCS>>>
+    exec_graph: &ExecGraph<F, T, PCS>,
+) -> anyhow::Result<HashMap<NodeInput, ExecGraphIO<F, PCS>>>
 where
-    E: ExtensionField,
-    T: Transcript<E> + InitTranscript,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    T: Transcript + InitTranscript,
+    PCS: CommitmentScheme<Field = F> + 'static,
 {
     let source_node = exec_graph.source_nodes().exactly_one().map_err(|e| {
         anyhow!(
@@ -420,16 +412,12 @@ where
     .into())
 }
 
-pub type ProofWithIO<E, PCS> = (Proof<E, PCS>, IO<E>);
+pub type ProofWithIO<F, PCS> = (Proof<F, PCS>, IO<F>);
 
 /// Utility method to extract the `ProofWithIO` from the outputs produced by the execution graph
-pub fn extract_graph_outputs<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
-    outputs: impl IntoIterator<Item = ExecGraphIO<E, PCS>>,
-) -> anyhow::Result<ProofWithIO<E, PCS>>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
-{
+pub fn extract_graph_outputs<F: PrimeField, PCS: CommitmentScheme>(
+    outputs: impl IntoIterator<Item = ExecGraphIO<F, PCS>>,
+) -> anyhow::Result<ProofWithIO<F, PCS>> {
     let (proof_opt, io_opt) =
         outputs
             .into_iter()
@@ -447,12 +435,11 @@ where
 mod tests {
     use anyhow::Context;
     use crossbeam_channel::unbounded;
-    use ff_ext::GoldilocksExt2;
+    use dp_crypto::arkyper::transcript::blake3::Blake3Transcript;
     use rayon::scope;
     use serde::{Serialize, de::DeserializeOwned};
     use std::collections::{BTreeMap, HashMap};
     use tenstore::GenStore;
-    use transcript::BasicTranscript;
 
     use crate::{
         graph::{
@@ -472,8 +459,8 @@ mod tests {
         verify,
     };
 
-    type F = GoldilocksExt2;
-    type T = BasicTranscript<F>;
+    type F = ark_bn254::Fr;
+    type T = Blake3Transcript;
 
     /// Utility trait to convert a serializable type `T` to bytes
     /// independently from the given serializer being employed (e.g., bincode, serde_json)
@@ -592,7 +579,7 @@ mod tests {
     fn test_exec_graph_data_serialization() -> anyhow::Result<()> {
         let (model, input) = Model::random(6)?;
         let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<F, Pcs<F>>()
+            .generate_contexts::<F, Pcs>()
             .expect("unable to generate contexts");
         let store: GenStore = Default::default();
         let num_chunks = Some(3);
@@ -606,12 +593,17 @@ mod tests {
         let graph = build_execution_graph::<_, T, _, _>(
             &ctx,
             num_chunks,
-            DefaultChunkingStrategy::default(),
+            DefaultChunkingStrategy::new(
+                input
+                    .iter()
+                    .map(|inp| inp.unpadded_shape().clone())
+                    .collect(),
+            ),
         )?;
         let inputs = graph_inputs(input, store.clone(), &graph)?;
 
         let serialized_ctx = BincodeSerializer.try_to_bytes(ctx.as_ref())?;
-        let deserialized_ctx: SerializableGraphCtx<F, Pcs<F>> =
+        let deserialized_ctx: SerializableGraphCtx<F, Pcs> =
             BincodeSerializer.try_from_bytes(&serialized_ctx)?;
 
         let ctx = deserialized_ctx.to_full_ctx(store.clone());

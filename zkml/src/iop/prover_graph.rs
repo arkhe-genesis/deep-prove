@@ -5,11 +5,10 @@ use crate::{
     model::{Model, Trace},
 };
 use anyhow::{bail, ensure};
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use ark_ff::PrimeField;
+use dp_crypto::arkyper::{CommitmentScheme, transcript::Transcript};
+use serde::{Deserialize, Serialize};
 use tenstore::GenStore;
-use transcript::Transcript;
 
 use crate::{
     Element, InitTranscript, Prover, ProverContext,
@@ -22,34 +21,46 @@ use crate::{
 
 // A node in the execution graph of chunks whose job is to prove a chunk.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SplitNode<'a, 'b, E, T, PCS> {
+pub struct SplitNode<'a, 'b, F, T, PCS> {
     chunks: Vec<ModelChunk>,
-    _phantom: PhantomData<(E, T, PCS, &'a (), &'b ())>,
+    dry_trace: bool,
+    _phantom: PhantomData<(F, T, PCS, &'a (), &'b ())>,
 }
 
-impl<'a, 'b, E, T, PCS> SplitNode<'a, 'b, E, T, PCS> {
+impl<'a, 'b, F: PrimeField, T, PCS> SplitNode<'a, 'b, F, T, PCS> {
     pub(crate) fn new(chunks: Vec<ModelChunk>) -> Self {
         Self {
             chunks,
+            dry_trace: true,
             _phantom: Default::default(),
+        }
+    }
+
+    pub(crate) fn disable_dry_trace(self) -> Self {
+        Self {
+            dry_trace: false,
+            ..self
         }
     }
 }
 
 /// Nodes in the execution graph for the chunk prover
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 #[allow(clippy::large_enum_variant)]
-pub enum ProverGraphNode<'a, 'b, E: ExtensionField, T, PCS> {
+pub enum ProverGraphNode<'a, 'b, F, T, PCS> {
     // Executor for the task of splitting the trace in multiple chunks and setting up the distributed proving
-    ProverSplit(SplitNode<'a, 'b, E, T, PCS>),
+    ProverSplit(SplitNode<'a, 'b, F, T, PCS>),
     // Executor for the task of proving each chunk
     ChunkProver(usize),
     // Final node to just collect the proofs and return a single coherent proof
     Final,
 }
 
-impl<'a, 'b, E: ExtensionField, T, PCS> std::fmt::Debug for ProverGraphNode<'a, 'b, E, T, PCS> {
+impl<'a, 'b, F: PrimeField, T, PCS> std::fmt::Debug for ProverGraphNode<'a, 'b, F, T, PCS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProverGraphNode::ProverSplit(split_node) => {
@@ -62,29 +73,36 @@ impl<'a, 'b, E: ExtensionField, T, PCS> std::fmt::Debug for ProverGraphNode<'a, 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ChunkProverInput<E: ExtensionField> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct ChunkProverInput<F: PrimeField> {
     chunk: ModelChunk,
     trace: Trace<Element>,
-    challenge: E,
+    #[serde(with = "dp_crypto::serialization")]
+    challenge: F,
 }
 
 /// Input/Output data for the nodes of the chunk prover execution graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 #[allow(clippy::large_enum_variant)]
-pub enum ProverGraphIO<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+pub enum ProverGraphIO<F: PrimeField, PCS: CommitmentScheme> {
     // Input for the prover split task
     ProverSplitInput(Trace<Element>),
     // Input for the task of proving a single chunk
-    ChunkProveInput(ChunkProverInput<E>),
+    ChunkProveInput(ChunkProverInput<F>),
     // Output data produced for a given chunk,
-    ChunkProof(ChunkProof<E, PCS>),
+    ChunkProof(ChunkProof<F, PCS>),
     // Final proof to be outputted by the final node
-    FinalProof(Proof<E, PCS>),
+    FinalProof(Proof<F, PCS>),
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProverGraphIO<E, PCS> {
+impl<F: PrimeField, PCS: CommitmentScheme> ProverGraphIO<F, PCS> {
     /// Attach the store to the trace instances found in `ChunkProverII`.
     /// This method is needed when the IO needs to be serialized/deserialized (e.g.,
     /// in a distrbiuted setting), as the store cannot be serialized.
@@ -103,34 +121,26 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProverGraphIO<E, PCS
 }
 
 /// Global context for each chunk prover
-pub struct LocalProverCtx<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    pub(crate) ctx: &'a ProverContext<E, PCS>,
+pub struct LocalProverCtx<'a, 'b, F: PrimeField, PCS: CommitmentScheme> {
+    pub(crate) ctx: &'a ProverContext<'a, F, PCS>,
     pub(crate) model: &'b Model<Element>,
 }
 
-impl<'a, 'b, E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LocalProverCtx<'a, 'b, E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    pub fn new(ctx: &'a ProverContext<E, PCS>, model: &'b Model<Element>) -> Self {
+impl<'a, 'b, F: PrimeField, PCS: CommitmentScheme> LocalProverCtx<'a, 'b, F, PCS> {
+    pub fn new(ctx: &'a ProverContext<F, PCS>, model: &'b Model<Element>) -> Self {
         Self { ctx, model }
     }
 }
 
-impl<'a, 'b, E, T, PCS> ExecNode for ProverGraphNode<'a, 'b, E, T, PCS>
+impl<'a, 'b, F, T, PCS> ExecNode for ProverGraphNode<'a, 'b, F, T, PCS>
 where
-    E: ExtensionField,
-    T: Transcript<E> + InitTranscript,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'static,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    T: Transcript + InitTranscript,
+    PCS: CommitmentScheme<Field = F> + 'static,
 {
-    type IO = ProverGraphIO<E, PCS>;
+    type IO = ProverGraphIO<F, PCS>;
 
-    type Context = LocalProverCtx<'a, 'b, E, PCS>;
+    type Context = LocalProverCtx<'a, 'b, F, PCS>;
 
     fn describe(&self) -> String {
         match self {
@@ -156,18 +166,22 @@ where
                     bail!("Expected input for chunk prover executor")
                 };
                 measure::r("chunk_split", || {
-                    let mut transcript = Prover::<E, T, PCS>::initialise_transcript(ctx.ctx)?;
+                    let mut transcript = Prover::<F, T, PCS>::initialise_transcript(ctx.ctx)?;
                     // squeeze the common challenge to initialize the transcript for each cbunk
-                    let challenge = transcript.read_challenge();
+                    let challenge: F = transcript.challenge_scalar();
                     split_node
                         .chunks
                         .iter()
                         .map(|chunk| {
                             let chunk_trace = chunk.chunk_trace(&full_trace)?;
+                            if split_node.dry_trace {
+                                // dry tensor handles in the trace
+                                chunk_trace.dry_handles()
+                            }
                             Ok(ProverGraphIO::ChunkProveInput(ChunkProverInput {
                                 chunk: chunk.clone(),
                                 trace: chunk_trace,
-                                challenge: challenge.elements,
+                                challenge,
                             }))
                         })
                         .collect()

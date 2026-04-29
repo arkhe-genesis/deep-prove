@@ -3,29 +3,28 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, anyhow};
-use ceno_p3::field::FieldAlgebra;
-use either::Either;
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
+use dp_crypto::{
+    Expression, arkyper::transcript::Transcript, structs::IOPVerifierState,
+    utils::eval_by_expr_with_instance,
+};
 use itertools::Itertools;
-use multilinear_extensions::{Expression, utils::eval_by_expr_with_instance};
-use sumcheck::structs::IOPVerifierState;
-use transcript::Transcript;
 
 use crate::{
     Claim,
-    commit::identity_eval,
     lookup::logup_gkr::structs::{InstanceExpressions, LogUpVerifierInstance},
+    poly_commit::identity_eval,
 };
 
 use super::structs::{LogUpBatchProof, LogUpBatchVerifierClaim};
 
-struct PreppedLayerVerifyingInfo<E: ExtensionField> {
-    eq_points: Vec<Vec<E>>,
-    sumcheck_expressions: Vec<Expression<E>>,
-    claim_expression: Expression<E>,
+struct PreppedLayerVerifyingInfo<F: PrimeField> {
+    eq_points: Vec<Vec<F>>,
+    sumcheck_expressions: Vec<Expression<F>>,
+    claim_expression: Expression<F>,
 }
 
-impl<E: ExtensionField> PreppedLayerVerifyingInfo<E> {
+impl<F: PrimeField> PreppedLayerVerifyingInfo<F> {
     pub fn new() -> Self {
         Self {
             eq_points: vec![],
@@ -36,11 +35,11 @@ impl<E: ExtensionField> PreppedLayerVerifyingInfo<E> {
 
     pub fn compute_current_claim(
         &self,
-        wit_evals: &[E],
-        alpha: E,
-        lambda: E,
-        batching_challenge: E,
-    ) -> Result<E> {
+        wit_evals: &[F],
+        alpha: F,
+        lambda: F,
+        batching_challenge: F,
+    ) -> F {
         eval_by_expr_with_instance(
             &[],
             wit_evals,
@@ -49,11 +48,9 @@ impl<E: ExtensionField> PreppedLayerVerifyingInfo<E> {
             &[alpha, lambda, batching_challenge],
             &self.claim_expression,
         )
-        .right()
-        .ok_or(anyhow!("Couldn't compute current claim"))
     }
 
-    pub fn full_sumcheck_expression(&self, witness_offset: u16) -> Expression<E> {
+    pub fn full_sumcheck_expression(&self, witness_offset: u16) -> Expression<F> {
         self.sumcheck_expressions
             .iter()
             .enumerate()
@@ -62,7 +59,7 @@ impl<E: ExtensionField> PreppedLayerVerifyingInfo<E> {
             })
     }
 
-    pub fn eq_evaluations(&self, current_point: &[E]) -> Vec<E> {
+    pub fn eq_evaluations(&self, current_point: &[F]) -> Vec<F> {
         let current_point_len = current_point.len();
         self.eq_points
             .iter()
@@ -77,17 +74,17 @@ impl<E: ExtensionField> PreppedLayerVerifyingInfo<E> {
 }
 
 /// Function to verify a [`LogUpBatchProof`] that has been produced by [`super::prover::batch_multiple_sizes_prove`].
-pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>>(
-    proof: &LogUpBatchProof<E>,
-    instances: &[LogUpVerifierInstance<E>],
+pub fn new_verify_logup_proof_multiple_sizes<F: PrimeField, T: Transcript>(
+    proof: &LogUpBatchProof<F>,
+    instances: &[LogUpVerifierInstance<F>],
     transcript: &mut T,
-) -> Result<LogUpBatchVerifierClaim<E>> {
+) -> Result<LogUpBatchVerifierClaim<F>> {
     // Append the number of instances along with their output evals to the transcript and then squeeze our first alpha and lambda
     let num_instances = instances.len();
-    transcript.append_field_element(&E::BaseField::from_canonical_u64(num_instances as u64));
+    transcript.append_scalars(&[F::from(num_instances as u64)]);
     proof.append_to_transcript(transcript);
     // Extract the numerators and denominators
-    let (numerators, denominators): (Vec<E>, Vec<E>) = proof.fractional_outputs();
+    let (numerators, denominators): (Vec<F>, Vec<F>) = proof.fractional_outputs();
 
     // Make the maps that store initial evaluations of each circuit by the size of the circuit
     let output_evals = instances
@@ -103,20 +100,14 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
     let total_layers = proof.sumcheck_proofs.len();
 
     // Squeeze the first challenges
-    let mut batching_challenge = transcript
-        .sample_and_append_challenge(b"initial_batching")
-        .elements;
-    let mut alpha = transcript
-        .sample_and_append_challenge(b"initial_alpha")
-        .elements;
-    let mut lambda = transcript
-        .sample_and_append_challenge(b"initial_lambda")
-        .elements;
+    let mut batching_challenge = transcript.append_and_sample(b"initial_batching");
+    let mut alpha = transcript.append_and_sample(b"initial_alpha");
+    let mut lambda = transcript.append_and_sample(b"initial_lambda");
 
-    let mut current_claim: E;
+    let mut current_claim: F;
 
     // The initial sumcheck point is just the batching challenge
-    let mut sumcheck_point: Vec<E> = vec![batching_challenge];
+    let mut sumcheck_point: Vec<F> = vec![batching_challenge];
 
     for (i, (sumcheck_proof, round_evaluations)) in proof.proofs_and_evals().enumerate() {
         let remaining_layers = total_layers - i;
@@ -129,7 +120,7 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
                     .iter()
                     .chain(new_evals.iter().flatten())
                     .copied()
-                    .collect::<Vec<E>>()
+                    .collect::<Vec<F>>()
             } else {
                 proof.round_evaluations[i - 1].to_vec()
             }
@@ -137,7 +128,7 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
             let new_evals = output_evals.get(&remaining_layers).ok_or(anyhow!(
                 "No previous evals and no evals for this number of variables: {remaining_layers}"
             ))?;
-            new_evals.iter().flatten().copied().collect::<Vec<E>>()
+            new_evals.iter().flatten().copied().collect::<Vec<F>>()
         };
         // The Expressions are grouped by the size of the circuit they refer to, so we need to work out how many of the
         // circuits are running in this round, this is just all the entries of `unique_layer_size` that are larger than `remaining_layers`.
@@ -151,9 +142,8 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
                     // This multiplier is needed to scale the claim expressions from each layer size correctly.
                     // This is because smaller instances have fewer layers and so their claims need to be scaled
                     // by 1 << (total_layers - size) to line up with the largest instances.
-                    let claim_expr_multiplier = Expression::Constant(Either::Right(
-                        E::from_canonical_u64(1 << (total_layers - size)),
-                    ));
+                    let claim_expr_multiplier =
+                        Expression::Constant(F::from(1u64 << (total_layers - size)));
 
                     let mut sumcheck_expr = Expression::ZERO;
                     let current_var_count: usize = size + 1 - remaining_layers;
@@ -187,35 +177,29 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
         );
         // Compute the current_claim
         current_claim =
-            verifying_info.compute_current_claim(&wit_evals, alpha, lambda, batching_challenge)?;
+            verifying_info.compute_current_claim(&wit_evals, alpha, lambda, batching_challenge);
 
         // Append the current claim to the transcript
-        transcript.append_field_element_ext(&current_claim);
+        transcript.append_scalars(&[current_claim]);
 
         // Run this rounds sumcheck verification
         let current_num_vars = i + 1;
         let aux_info = crate::util::from_mle_list_dimensions(&[vec![current_num_vars; 3]]);
         let sumcheck_subclaim =
-            IOPVerifierState::<E>::verify(current_claim, sumcheck_proof, &aux_info, transcript);
+            IOPVerifierState::<F>::verify(current_claim, sumcheck_proof, &aux_info, transcript);
 
-        let current_point = sumcheck_subclaim
-            .point
-            .iter()
-            .map(|c| c.elements)
-            .collect::<Vec<E>>();
+        let current_point = &sumcheck_subclaim.point;
 
-        batching_challenge = transcript
-            .sample_and_append_challenge(b"logup_batching")
-            .elements;
+        batching_challenge = transcript.append_and_sample(b"logup_batching");
 
         let full_sumcheck_expression = verifying_info.full_sumcheck_expression(witness_offset);
-        let eq_evaluations = verifying_info.eq_evaluations(&current_point);
+        let eq_evaluations = verifying_info.eq_evaluations(current_point);
 
         let full_evaluations = round_evaluations
             .iter()
             .copied()
             .chain(eq_evaluations)
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
         let calc_sumcheck_eval = eval_by_expr_with_instance(
             &[],
@@ -224,20 +208,12 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
             &[],
             &[alpha, lambda],
             &full_sumcheck_expression,
-        )
-        .right()
-        .ok_or(anyhow!(
-            "Verifier did not get extension field element when evaluating sumcheck claim"
-        ))?;
+        );
 
         if (i + 1) != total_layers {
             // Squeeze the challenges to combine everything into a single sumcheck
-            alpha = transcript
-                .sample_and_append_challenge(b"logup_alpha")
-                .elements;
-            lambda = transcript
-                .sample_and_append_challenge(b"logup_lambda")
-                .elements;
+            alpha = transcript.append_and_sample(b"logup_alpha");
+            lambda = transcript.append_and_sample(b"logup_lambda");
         }
 
         if calc_sumcheck_eval != sumcheck_subclaim.expected_evaluation {
@@ -249,7 +225,7 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
             ));
         }
 
-        sumcheck_point = current_point;
+        sumcheck_point = current_point.clone();
         sumcheck_point.push(batching_challenge);
     }
 
@@ -263,17 +239,17 @@ pub fn new_verify_logup_proof_multiple_sizes<E: ExtensionField, T: Transcript<E>
         skip += instance.num_final_round_evals();
         let eval = instance.final_claim(evals_slice, batching_challenge, &sumcheck_point)?;
         acc.extend(eval);
-        Result::<Vec<Claim<E>>>::Ok(acc)
+        Result::<Vec<Claim<F>>>::Ok(acc)
     })?;
-    Ok(LogUpBatchVerifierClaim::<E>::new(
-        E::ZERO,
+    Ok(LogUpBatchVerifierClaim::<F>::new(
+        F::ZERO,
         output_claims,
         sumcheck_point,
         proof
             .output_claims()
             .iter()
             .map(|c| c.eval)
-            .collect::<Vec<E>>(),
+            .collect::<Vec<F>>(),
         numerators,
         denominators,
     ))

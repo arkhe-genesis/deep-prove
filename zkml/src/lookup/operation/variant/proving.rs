@@ -1,6 +1,11 @@
 //! Methods and functionality called by the prover during lookup variant operations.
 
-use crate::commit::compute_betas_eval;
+use dp_crypto::{
+    IntoMLE,
+    poly::{dense::DensePolynomial, eq::evals},
+};
+
+use crate::to_field;
 
 use super::*;
 
@@ -104,13 +109,13 @@ impl LookupVariant {
     }
 
     /// Method that computes the extra lookup inputs needed for normalisation variants.
-    pub fn compute_extra_lookup_inputs<E: ExtensionField>(
+    pub fn compute_extra_lookup_inputs<F: PrimeField>(
         &self,
         number_of_chunks: usize,
         output: &Tensor<Element>,
-        constant_challenge: E,
-        column_sep_challenge: E,
-    ) -> Result<Vec<LogUpInput<E>>> {
+        constant_challenge: F,
+        column_sep_challenge: F,
+    ) -> Result<Vec<LogUpInput<F>>> {
         // Check that we have been supplied with output tensor in this case
         let unpadded_shape = output.unpadded_shape();
         let chunk_size = unpadded_shape.numel() / number_of_chunks;
@@ -138,10 +143,10 @@ impl LookupVariant {
                             .chunks(dim_size)
                             .map(|row| offset + norm_sum_const - row.iter().sum::<Element>())
                             .chain(std::iter::repeat_n(offset, diff));
-                        to_base::<E, _>(chunk_evals)
+                        to_field::<_, F, _>(chunk_evals)
                     })
-                    .collect::<Vec<Vec<E::BaseField>>>();
-                let normalisation_input = LogUpInput::<E>::new_lookup(
+                    .collect::<Vec<Vec<F>>>();
+                let normalisation_input = LogUpInput::<F>::new_lookup(
                     column_evals,
                     constant_challenge,
                     column_sep_challenge,
@@ -190,14 +195,11 @@ impl LookupVariant {
                                 })
                                 .chain(std::iter::repeat_n((sum_offset, sumsq_offset), diff))
                                 .unzip();
-                        (
-                            to_base::<E, _>(sum_chunk_evals),
-                            to_base::<E, _>(sumsq_chunk_evals),
-                        )
+                        (sum_chunk_evals.to_field(), sumsq_chunk_evals.to_field())
                     })
-                    .unzip::<Vec<E::BaseField>, Vec<E::BaseField>, Vec<Vec<E::BaseField>>, Vec<Vec<E::BaseField>>>();
+                    .unzip::<Vec<F>, Vec<F>, Vec<Vec<F>>, Vec<Vec<F>>>();
 
-                let sumsq_normalisation_input = LogUpInput::<E>::new_lookup(
+                let sumsq_normalisation_input = LogUpInput::<F>::new_lookup(
                     sumsq_column_evals,
                     constant_challenge,
                     column_sep_challenge,
@@ -207,7 +209,7 @@ impl LookupVariant {
                 if normalised_sum_value.is_none() {
                     Ok(vec![sumsq_normalisation_input])
                 } else {
-                    let sum_normalisation_input = LogUpInput::<E>::new_lookup(
+                    let sum_normalisation_input = LogUpInput::<F>::new_lookup(
                         sum_column_evals,
                         constant_challenge,
                         column_sep_challenge,
@@ -220,24 +222,27 @@ impl LookupVariant {
         }
     }
 
-    pub(crate) fn build_eq_polys<E: ExtensionField>(
+    pub(crate) fn build_eq_polys<F: PrimeField>(
         &self,
-        last_claim_point: &[E],
-        logup_point: &[E],
+        last_claim_point: &[F],
+        logup_point: &[F],
         final_dim_vars: usize,
-    ) -> Vec<MultilinearExtension<'_, E>> {
-        let output_eq_evals = compute_betas_eval(last_claim_point);
-        let logup_eq_evals = compute_betas_eval(logup_point);
+    ) -> Vec<DensePolynomial<'_, F>> {
+        let output_eq_evals = evals(last_claim_point);
+        let logup_eq_evals = evals(logup_point);
 
         match self {
             LookupVariant::Standard | LookupVariant::GLU => {
                 vec![output_eq_evals.into_mle(), logup_eq_evals.into_mle()]
             }
             LookupVariant::Softmax { .. } | LookupVariant::Normalisation { .. } => {
-                let normalisation_point = std::iter::repeat_n(E::TWO.inverse(), final_dim_vars)
-                    .chain(logup_point[final_dim_vars..].iter().cloned())
-                    .collect::<Vec<E>>();
-                let normalisation_eq_evals = compute_betas_eval(&normalisation_point);
+                let normalisation_point = std::iter::repeat_n(
+                    F::from(2).inverse().expect("Cannot fail when inverting 2"),
+                    final_dim_vars,
+                )
+                .chain(logup_point[final_dim_vars..].iter().cloned())
+                .collect::<Vec<F>>();
+                let normalisation_eq_evals = evals(&normalisation_point);
                 vec![
                     output_eq_evals.into_mle(),
                     logup_eq_evals.into_mle(),

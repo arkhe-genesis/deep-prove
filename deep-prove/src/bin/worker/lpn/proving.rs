@@ -1,13 +1,10 @@
 use super::ModelFetcher;
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::{Engine, prelude::BASE64_STANDARD};
-use deep_prove::middleware::{llm, v1, v2};
-use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams};
+use deep_prove::middleware::{self, llm, v1, v2};
 use std::{collections::HashMap, sync::Arc};
 use tenstore::GenStore;
 use tracing::{Instrument, info, info_span, warn};
-use transcript::BasicTranscript;
 use zkml::{
     graph::{
         executor::SequentialExecutor,
@@ -23,9 +20,9 @@ use zkml::{
     parser::llm::Token,
 };
 
-type F = GoldilocksExt2;
-type Pcs = Basefold<F, BasefoldRSParams>;
-type T = BasicTranscript<F>;
+type F = middleware::v2::F;
+type Pcs = middleware::v2::Pcs;
+type T = middleware::v2::T;
 type ChunkPartition<'a, 'b> = Partition<ExecGraphNode<'a, 'b, F, T, Pcs>, usize>;
 
 /// Execute a chunk job using chunk-based proving with GW mediated coordination.

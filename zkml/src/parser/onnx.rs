@@ -853,7 +853,7 @@ fn tdim_to_usize(tdim: &TDim) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
     use anyhow::Ok;
-    use ff_ext::GoldilocksExt2;
+    use dp_crypto::arkyper::transcript::blake3::Blake3Transcript;
     use tenstore::GenStore;
 
     use crate::{
@@ -863,12 +863,11 @@ mod tests {
         verify,
     };
     use tracing::info;
-    use transcript::BasicTranscript;
 
-    type F = GoldilocksExt2;
-    type T = BasicTranscript<F>;
+    type F = ark_bn254::Fr;
+    type T = Blake3Transcript;
 
-    type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs<F>>;
+    type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs>;
 
     #[test]
     fn test_load_mlp() {
@@ -924,14 +923,13 @@ mod tests {
 
         info!("GENERATING CONTEXT...");
         let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<F, Pcs<F>>()
+            .generate_contexts::<F, Pcs>()
             .expect("Unable to generate contexts");
 
         info!("GENERATING CONTEXT DONE...");
-        let io = trace.to_verifier_io().unwrap();
 
         info!("GENERATING Proof...");
-        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        let (proof, io) = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
         info!("GENERATING Proof DONE...");
         verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
@@ -960,11 +958,10 @@ mod tests {
         let trace = model.run(inputs, &mut GenStore::default()).unwrap();
 
         let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<F, Pcs<F>>()
+            .generate_contexts::<F, Pcs>()
             .expect("Unable to generate contexts");
 
-        let io = trace.to_verifier_io().unwrap();
-        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        let (proof, io) = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
         verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
     }
 

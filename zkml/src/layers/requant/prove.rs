@@ -10,18 +10,16 @@ impl Requant {
     #[timed::timed_instrument(name = "Prover::prove_requant")]
     /// Method that proves requantisation was performed correctly. It does this by running any required lookups and then linking the `last_claim` to the
     /// `input` via a series of Sumchecks.
-    pub(crate) fn prove_step<E, T: Transcript<E>, PCS>(
+    pub(crate) fn prove_step<F, T: Transcript, PCS>(
         &self,
-        prover: &mut Prover<E, T, PCS>,
-        last_claim: &Claim<E>,
+        prover: &mut Prover<F, T, PCS>,
+        last_claim: &Claim<F>,
         step: &Step<Element>,
         id: NodeId,
-    ) -> anyhow::Result<Vec<Claim<E>>>
+    ) -> anyhow::Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        F: PrimeField,
+        PCS: CommitmentScheme<Field = F>,
     {
         let lookup_op = &self.activation_lookup_data;
 
@@ -43,7 +41,7 @@ impl Requant {
             logup_proof,
             sumcheck_proof,
             evaluations,
-            commitment,
+            commitments,
             ..
         } = generic_proof;
 
@@ -51,7 +49,7 @@ impl Requant {
             io_accumulation: sumcheck_proof,
             io_eval: evaluations,
             logup_proof,
-            commitment,
+            commitments,
         };
 
         // Add the proof to the prover

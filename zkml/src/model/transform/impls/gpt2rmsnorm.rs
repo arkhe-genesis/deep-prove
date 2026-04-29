@@ -402,9 +402,9 @@ mod tests {
 
     use crate::{
         init_test_logging,
-        model::llm::Driver,
+        model::llm::{Driver, WithMaxContext},
         parser::{
-            file_cache,
+            default_pipeline_config, file_cache,
             gguf::RawGGUF,
             llm::{
                 LLMTokenizer,
@@ -413,9 +413,12 @@ mod tests {
             },
         },
         tensor::is_close_with_tolerance,
+        testing::Pcs,
     };
 
     use super::*;
+
+    type F = ark_bn254::Fr;
 
     #[test]
     fn test_gpt2_replace() -> anyhow::Result<()> {
@@ -478,6 +481,32 @@ mod tests {
                 &post_data[..10],
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_gpt2_replace_proving() -> Result<()> {
+        init_test_logging("debug");
+        let max_context = 10;
+        // First we load up a GPT-2 model
+        let model_path = file_cache::from_cache(GPT2_Q8_0)?;
+        let gguf = RawGGUF::new(model_path);
+        let driver = Driver::load_from_model(GPT2::new(), &gguf, Some(max_context))?;
+        // Make a tester input for the model so we can compare the pre and post transformation outputs
+        let sentence = "The sky is";
+        let tokenizer = GPT2::new().load_tokenizer(&gguf)?;
+        let user_tokens = tokenizer.tokenize(sentence);
+
+        // Rewrite the model by applying our transformation rule
+        let conf = default_pipeline_config().with_float_rules(vec![Box::new(GPT2RMSNorm)]);
+
+        let (driver, _metadata) = driver.into_provable_llm(Some(conf))?;
+        let input_tensors = driver.tokens_to_tensor(&user_tokens)?;
+        let trace = driver.run_elements(input_tensors, &mut GenStore::default())?;
+
+        let (prover_ctx, verifier_ctx) = driver.context::<F, Pcs>()?.with_max_context(max_context);
+        let (proof, io) = driver.prove(&prover_ctx, trace)?;
+        verifier_ctx.verify(proof, user_tokens, io)?;
         Ok(())
     }
 }

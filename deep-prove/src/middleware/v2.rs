@@ -1,21 +1,21 @@
-use ff_ext::GoldilocksExt2;
+use ark_bn254::Bn254;
+use dp_crypto::arkyper::{HyperKZG, transcript::blake3::Blake3Transcript};
 use memmap2::Mmap;
-use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
-use transcript::BasicTranscript;
 use zkml::{IO, Proof as ZkmlProof, inputs::Input, iop::context::VerifierContext, verify};
 
 /// The extension field the proving system is based on.
-pub type E = GoldilocksExt2;
-pub type T = BasicTranscript<E>;
+pub type F = ark_bn254::Fr;
+pub type T = Blake3Transcript;
+pub type Pcs = HyperKZG<Bn254>;
 
 /// A wrapper for a proof and its ancillaries, required by the verifying process.
 #[derive(Serialize, Deserialize)]
 pub struct Provable {
-    pub proof: ZkmlProof<E, Basefold<E, BasefoldRSParams>>,
-    pub io: IO<E>,
-    pub ctx: VerifierContext<E, Basefold<E, BasefoldRSParams>>,
+    pub proof: ZkmlProof<F, Pcs>,
+    pub io: IO<F>,
+    pub ctx: VerifierContext<F, Pcs>,
 }
 impl Provable {
     pub fn verify(self) -> anyhow::Result<()> {

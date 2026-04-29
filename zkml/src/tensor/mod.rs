@@ -5,16 +5,15 @@ pub use burn_wrapper::{
 };
 
 use crate::{
-    NextPowerOfTwo, ScalingFactor,
+    NextPowerOfTwo, ScalingFactor, SerializableField,
     layers::convolution,
     number::Number,
-    quantization::{Dequantize, Quantize},
+    quantization::{Dequantize, Quantize, ToElement},
     shape::Shape,
 };
 use anyhow::{Result, bail, ensure};
-use ceno_p3::field::Field;
-use ff_ext::{ExtensionField, GoldilocksExt2};
-use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
+use ark_ff::PrimeField;
+use dp_crypto::{IntoMLE, poly::dense::DensePolynomial};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
     IntoParallelRefMutIterator, ParallelIterator,
@@ -233,7 +232,7 @@ impl<T> Tensor<T> {
     }
 
     /// Returns a reference to the tensor's original unpadded [Shape].
-    pub(crate) fn unpadded_shape(&self) -> &Shape {
+    pub fn unpadded_shape(&self) -> &Shape {
         &self.unpadded_shape
     }
 
@@ -300,7 +299,7 @@ impl<T> AsRef<Tensor<T>> for Tensor<T> {
 }
 
 impl Tensor<Element> {
-    /// Converts this [Tensor<Element>] into [MultilinearExtension].
+    /// Converts this [Tensor<Element>] into [DensePolynomial].
     ///
     /// This will convert the element into an extension field and convert that
     /// into a multilinear extension.
@@ -310,11 +309,11 @@ impl Tensor<Element> {
     /// # Panics
     ///
     /// If the input is not a 2D tensor or if either dimension is not a power of two.
-    pub(crate) fn to_2d_mle<F: ExtensionField>(&self) -> Result<MultilinearExtension<'static, F>> {
+    pub(crate) fn to_2d_mle<F: PrimeField>(&self) -> Result<DensePolynomial<'static, F>> {
         Tensor::<F>::from(self).into_mle_2d()
     }
 
-    /// Converts this [Tensor<Element>] into a [MultilinearExtension].
+    /// Converts this [Tensor<Element>] into a [DensePolynomial].
     ///
     /// This will convert the element into an extension field and convert that
     /// into a multilinear extension.
@@ -326,23 +325,23 @@ impl Tensor<Element> {
     /// # Panics
     ///
     /// If the number of elements in the Tensor is not a power of two.
-    pub(crate) fn to_field_mle<F: ExtensionField>(&self) -> MultilinearExtension<'static, F> {
+    pub(crate) fn to_field_mle<F: PrimeField>(&self) -> DensePolynomial<'static, F> {
         Tensor::<F>::from(self).into_mle()
     }
 }
 
 impl<F> Tensor<F>
 where
-    F: ExtensionField,
+    F: PrimeField,
 {
-    /// Clone this [Tensor] and convert into a [MultilinearExtension].
+    /// Clone this [Tensor] and convert into a [DensePolynomial].
     ///
     /// see [Tensor::into_mle_2d].
-    pub(crate) fn to_mle_2d(&self) -> Result<MultilinearExtension<'static, F>> {
+    pub(crate) fn to_mle_2d(&self) -> Result<DensePolynomial<'static, F>> {
         self.clone().into_mle_2d()
     }
 
-    /// Consumes this [Tensor] into a [MultilinearExtension].
+    /// Consumes this [Tensor] into a [DensePolynomial].
     ///
     /// The [Tensor] must be in evaluation form.
     ///
@@ -350,7 +349,7 @@ where
     ///
     /// - If the tensor is not 2D.
     /// - If either dimension is not a power-of-two.
-    pub(crate) fn into_mle_2d(self) -> Result<MultilinearExtension<'static, F>> {
+    pub(crate) fn into_mle_2d(self) -> Result<DensePolynomial<'static, F>> {
         ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
         ensure!(
             self.nrows_2d()?.is_power_of_two(),
@@ -362,23 +361,32 @@ where
             "number of columns {} is not a power of two",
             self.ncols_2d()?
         );
-        // N variable to address 2^N rows and M variables to address 2^M columns
-        let num_vars = self.nrows_2d()?.ilog2() + self.ncols_2d()?.ilog2();
-        Ok(MultilinearExtension::from_evaluations_ext_vec(
-            num_vars as usize,
-            self.data,
-        ))
+        Ok(DensePolynomial::new(self.data))
+    }
+}
+
+impl<F: PrimeField> From<Tensor<F>> for Tensor<SerializableField<F>> {
+    fn from(value: Tensor<F>) -> Self {
+        Tensor {
+            data: value
+                .data
+                .into_iter()
+                .map(|x| SerializableField(x))
+                .collect(),
+            shape: value.shape,
+            unpadded_shape: value.unpadded_shape,
+        }
     }
 }
 
 impl<F> Tensor<F>
 where
-    F: Field,
+    F: PrimeField,
 {
-    /// Clone this [Tensor] and convert into a [MultilinearExtension].
+    /// Clone this [Tensor] and convert into a [DensePolynomial].
     ///
     /// see [Tensor::into_mle].
-    pub(crate) fn to_mle<E: ExtensionField>(&self) -> MultilinearExtension<'_, E> {
+    pub(crate) fn to_mle(&self) -> DensePolynomial<'static, F> {
         self.data.clone().into_mle()
     }
 
@@ -389,14 +397,25 @@ where
     /// # Panics
     ///
     /// - If the number of elements in the tensor is not a power of two.
-    pub(crate) fn into_mle<E: ExtensionField>(self) -> MultilinearExtension<'static, E> {
+    pub(crate) fn into_mle(self) -> DensePolynomial<'static, F> {
         self.data.into_mle()
+    }
+}
+
+impl<F: ToElement> Tensor<F> {
+    pub(crate) fn to_element(&self) -> Tensor<Element> {
+        let data = self.data.iter().map(ToElement::to_element).collect();
+        Tensor {
+            data,
+            shape: self.shape.clone(),
+            unpadded_shape: self.unpadded_shape.clone(),
+        }
     }
 }
 
 impl<F> From<&Tensor<Element>> for Tensor<F>
 where
-    F: ExtensionField,
+    F: PrimeField,
 {
     fn from(value: &Tensor<Element>) -> Self {
         value.to_field()
@@ -691,19 +710,7 @@ where
     }
 }
 
-impl PartialEq for Tensor<Element> {
-    fn eq(&self, other: &Self) -> bool {
-        self.shape == other.shape && self.data == other.data
-    }
-}
-
-impl PartialEq for Tensor<f32> {
-    fn eq(&self, other: &Self) -> bool {
-        self.shape == other.shape && self.data == other.data
-    }
-}
-
-impl PartialEq for Tensor<GoldilocksExt2> {
+impl<T: PartialEq> PartialEq for Tensor<T> {
     fn eq(&self, other: &Self) -> bool {
         self.shape == other.shape && self.data == other.data
     }
@@ -978,19 +985,6 @@ where
     }
 }
 
-impl<T> Tensor<T>
-where
-    T: Default,
-{
-    pub(crate) fn map_data<O, F: Fn(&T) -> O>(&self, f: F) -> Tensor<O> {
-        Tensor {
-            data: self.data.iter().map(f).collect(),
-            shape: self.shape.clone(),
-            unpadded_shape: self.unpadded_shape.clone(),
-        }
-    }
-}
-
 /// Determines whether two slices of `f32` values are element-wise close within
 /// the specified absolute (`atol`) and relative (`rtol`) tolerances.
 ///
@@ -1019,10 +1013,11 @@ mod test {
     use std::cmp::Ordering;
 
     use ark_std::rand::Rng;
-    use ff_ext::{FieldFrom, GoldilocksExt2};
     use itertools::Itertools;
     use ndarray::{Array, Ix2, Order};
     use rayon::slice::{ParallelSlice, ParallelSliceMut};
+
+    type F = ark_bn254::Fr;
 
     use crate::{
         rng_from_env_or_random, testing::random_field_vector, to_bit_sequence_le, to_field,
@@ -1619,30 +1614,30 @@ mod test {
 
         /// Returns the boolean iterator indicating the given row in the right endianness to be
         /// evaluated by an MLE
-        pub(crate) fn row_to_boolean_2d<F: ExtensionField>(
+        pub(crate) fn row_to_boolean_2d<F: PrimeField>(
             &self,
             row: usize,
         ) -> Result<impl Iterator<Item = F>> {
             ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
             let (nvars_rows, _) = self.shape().num_vars_2d();
-            Ok(to_bit_sequence_le(row, nvars_rows).map(|b| F::from_canonical_u64(b as u64)))
+            Ok(to_bit_sequence_le(row, nvars_rows).map(|b| F::from(b as u64)))
         }
 
         /// Returns the boolean iterator indicating the given row in the right endianness to be
         /// evaluated by an MLE
-        pub(crate) fn col_to_boolean_2d<F: ExtensionField>(
+        pub(crate) fn col_to_boolean_2d<F: PrimeField>(
             &self,
             col: usize,
         ) -> Result<impl Iterator<Item = F>> {
             ensure!(self.shape.is_matrix(), "Tensor is not a matrix");
             let (_, nvars_col) = self.shape().num_vars_2d();
-            Ok(to_bit_sequence_le(col, nvars_col).map(|b| F::from_canonical_u64(b as u64)))
+            Ok(to_bit_sequence_le(col, nvars_col).map(|b| F::from(b as u64)))
         }
 
         /// From a given row and a given column, return the vector of field elements in the right
         /// format to evaluate the MLE.
         /// little endian so we need to read cols before rows
-        pub(crate) fn position_to_boolean_2d<F: ExtensionField>(
+        pub(crate) fn position_to_boolean_2d<F: PrimeField>(
             &self,
             row: usize,
             col: usize,
@@ -1868,7 +1863,7 @@ mod test {
             self.data[i * self.shape()[1] + j]
         }
 
-        pub fn random_eval_point(&self) -> Vec<E> {
+        pub fn random_eval_point(&self) -> Vec<F> {
             let mut rng = rng_from_env_or_random();
             let r = rng.gen_range(0..self.nrows_2d().unwrap());
             let c = rng.gen_range(0..self.ncols_2d().unwrap());
@@ -1881,14 +1876,14 @@ mod test {
         let mat = Tensor::random(&vec![3, 5].into());
         let shape = mat.shape();
         let mat = mat.pad_next_power_of_two();
-        let mut mle = mat.to_2d_mle::<E>().unwrap();
+        let mut mle = mat.to_2d_mle::<F>().unwrap();
         let mut rng = rng_from_env_or_random();
         let (chosen_row, chosen_col) = (rng.gen_range(0..shape[0]), rng.gen_range(0..shape[1]));
         let elem = mat.get_2d(chosen_row, chosen_col);
-        let elem_field: E = elem.to_field();
+        let elem_field: F = elem.to_field();
         println!("(x,y) = ({chosen_row},{chosen_col}) ==> {elem:?}");
         let inputs = mat.position_to_boolean_2d(chosen_row, chosen_col).unwrap();
-        let output = mle.evaluate(&inputs);
+        let output = mle.evaluate(&inputs).unwrap();
         assert_eq!(elem_field, output);
 
         // now try to address one at a time, and starting by the row, which is the opposite order
@@ -1896,7 +1891,7 @@ mod test {
         let row_input = mat.row_to_boolean_2d(chosen_row).unwrap();
         mle.fix_high_variables_in_place(&row_input.collect_vec());
         let col_input = mat.col_to_boolean_2d(chosen_col).unwrap();
-        let output = mle.evaluate(&col_input.collect_vec());
+        let output = mle.evaluate(&col_input.collect_vec()).unwrap();
         assert_eq!(elem_field, output);
     }
 
@@ -1918,8 +1913,6 @@ mod test {
         );
     }
 
-    type E = GoldilocksExt2;
-
     #[test]
     fn test_tensor_ext_ops() {
         let matrix_a_data = [1 as Element, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -1928,11 +1921,11 @@ mod test {
         let vector_a_data = [10 as Element, 20, 30];
         let vector_b_data = [140 as Element, 320, 500];
 
-        let matrix_a_data: Vec<E> = to_field(matrix_a_data);
-        let matrix_b_data: Vec<E> = to_field(matrix_b_data);
-        let matrix_c_data: Vec<E> = to_field(matrix_c_data);
-        let vector_a_data: Vec<E> = to_field(vector_a_data);
-        let vector_b_data: Vec<E> = to_field(vector_b_data);
+        let matrix_a_data: Vec<F> = to_field(matrix_a_data);
+        let matrix_b_data: Vec<F> = to_field(matrix_b_data);
+        let matrix_c_data: Vec<F> = to_field(matrix_c_data);
+        let vector_a_data: Vec<F> = to_field(vector_a_data);
+        let vector_b_data: Vec<F> = to_field(vector_b_data);
         let matrix = Tensor::new(vec![3usize, 3].into(), matrix_a_data.clone()).unwrap();
         let vector = Tensor::new(vec![3usize].into(), vector_a_data).unwrap();
         let vector_expected = Tensor::new(vec![3usize].into(), vector_b_data).unwrap();
@@ -2452,11 +2445,11 @@ mod test {
             })
     }
 
-    fn eval_mle<F: ExtensionField + FieldFrom<u64>>(point: &[F]) -> F {
+    fn eval_mle<F: PrimeField>(point: &[F]) -> F {
         let x_i = &point[..point.len() / 2];
         let y_i = &point[point.len() / 2..];
-        x_i.iter().zip(y_i).fold(F::from_v(1), |acc, (&x, &y)| {
-            acc * (F::from_v(1) - x - y + F::from_v(2) * x * y) + (F::from_v(1) - x) * y
+        x_i.iter().zip(y_i).fold(F::from(1), |acc, (&x, &y)| {
+            acc * (F::from(1) - x - y + F::from(2) * x * y) + (F::from(1) - x) * y
         })
     }
 
@@ -2500,7 +2493,7 @@ mod test {
         assert_eq!(zeroifier.get_2d(1, 1), Element::from(1));
         assert_eq!(zeroifier.get_2d(1, 2), Element::from(0));
 
-        let mle = zeroifier.to_2d_mle::<GoldilocksExt2>().unwrap();
+        let mle = zeroifier.to_2d_mle::<F>().unwrap();
 
         for i in 0..num_columns {
             for j in 0..num_columns {
@@ -2517,10 +2510,10 @@ mod test {
                     .into_iter()
                     .rev()
                     .chain(x_i.into_iter().rev())
-                    .map(|bit| GoldilocksExt2::from_v(bit as u64))
+                    .map(|bit| F::from(bit as u64))
                     .collect_vec();
-                let eval = mle.evaluate(&point);
-                assert_eq!(eval, GoldilocksExt2::from_v(cmp as u64));
+                let eval = mle.evaluate(&point).unwrap();
+                assert_eq!(eval, F::from(cmp as u64));
                 let quick_eval = eval_mle(&point);
                 assert_eq!(eval, quick_eval);
             }
@@ -2528,8 +2521,8 @@ mod test {
 
         // test over random points
         for _ in 0..10 {
-            let point = random_field_vector::<GoldilocksExt2>(NUM_BITS * 2);
-            assert_eq!(mle.evaluate(&point), eval_mle(&point),);
+            let point = random_field_vector::<F>(NUM_BITS * 2);
+            assert_eq!(mle.evaluate(&point).unwrap(), eval_mle(&point),);
         }
     }
 

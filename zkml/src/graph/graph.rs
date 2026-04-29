@@ -97,7 +97,7 @@ impl<L> Node<L, (), ()> {
 /// Enum employed to specify whether a port of a node refers to an input or output edge.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, derive_more::Display)]
 #[repr(u8)]
-enum PortType {
+pub(crate) enum PortType {
     #[display("Input")]
     Input,
     #[display("Output")]

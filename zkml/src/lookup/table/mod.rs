@@ -2,14 +2,14 @@
 
 use crate::{
     Element, Shape, Tensor, lookup::context::COLUMN_SEPARATOR, quantization::ToField,
-    tensor::WrappedTensor, to_base,
+    tensor::WrappedTensor, to_field,
 };
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
+use dp_crypto::{arkyper::transcript::Transcript, poly::dense::DensePolynomial};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
-use transcript::Transcript;
 
 use anyhow::{Result, anyhow};
 
@@ -218,30 +218,34 @@ impl Table {
     }
 
     /// Returns the table columns as elements of the specified extension field's basefield.
-    pub fn get_table_columns<E: ExtensionField>(&self) -> Vec<Vec<E::BaseField>> {
+    pub fn get_table_columns<F: PrimeField>(&self) -> Vec<Vec<F>> {
         match self.num_columns() {
             1 => {
-                vec![to_base::<E, _>(
+                vec![to_field::<_, F, _>(
                     self.min_input_value()..=self.max_input_value(),
                 )]
             }
             2 => {
                 let inputs = self.min_input_value()..=self.max_input_value();
                 let outputs = inputs.clone().map(|inp| self.lookup(inp).unwrap());
-                vec![to_base::<E, _>(inputs), to_base::<E, _>(outputs)]
+                vec![to_field::<_, F, _>(inputs), to_field::<_, F, _>(outputs)]
             }
             _ => unreachable!("No table has more than 2 columns"),
         }
     }
 
     /// Returns the committed table columns
-    pub fn committed_columns<E: ExtensionField>(&self) -> Vec<E::BaseField> {
+    pub fn committed_columns<'a, F: PrimeField>(&self) -> Option<DensePolynomial<'a, F>> {
         if self.operation.commit_output_column() {
             let inputs = self.min_input_value()..=self.max_input_value();
-            let outputs = inputs.clone().map(|inp| self.lookup(inp).unwrap());
-            to_base::<E, _>(outputs)
+            Some(DensePolynomial::new(
+                inputs
+                    .clone()
+                    .map(|inp| F::from(self.lookup(inp).unwrap()))
+                    .collect(),
+            ))
         } else {
-            vec![]
+            None
         }
     }
 
@@ -266,7 +270,7 @@ impl Table {
 
     /// Called by the verifier to evaluate _some_ columns itself. If the verifier can't verify the table
     /// efficiently, then it is done by regular PCS.
-    pub fn evaluate_table_columns<E: ExtensionField>(&self, point: &[E]) -> Result<Vec<E>> {
+    pub fn evaluate_table_columns<F: PrimeField>(&self, point: &[F]) -> Result<Vec<F>> {
         if point.len() != self.table_bit_size() {
             return Err(anyhow!(
                 "Point was not the correct size to produce a table evaluation, point size: {}, expected: {}",
@@ -276,33 +280,38 @@ impl Table {
         }
         match self.operation {
             TableType::ReLU => {
-                let min_input_field: E = self.min_input_value().to_field();
+                let min_input_field: F = self.min_input_value().to_field();
 
-                let first_column = point.iter().enumerate().fold(E::ZERO, |acc, (index, p)| {
-                    acc + *p * E::from_canonical_u64(1u64 << index)
-                }) + min_input_field;
+                let first_column = point
+                    .iter()
+                    .enumerate()
+                    .fold(F::ZERO, |acc, (index, p)| acc + *p * F::from(1u64 << index))
+                    + min_input_field;
 
-                let second_column = point.iter().enumerate().take(point.len() - 1).fold(
-                    E::ZERO,
-                    |acc, (index, p)| {
-                        acc + *p * E::from_canonical_u64(1u64 << index) * point[point.len() - 1]
-                    },
-                );
+                let second_column = point
+                    .iter()
+                    .enumerate()
+                    .take(point.len() - 1)
+                    .fold(F::ZERO, |acc, (index, p)| {
+                        acc + *p * F::from(1u64 << index) * point[point.len() - 1]
+                    });
                 Ok(vec![first_column, second_column])
             }
             _ => {
-                let min_input_field: E = self.min_input_value().to_field();
+                let min_input_field: F = self.min_input_value().to_field();
 
                 Ok(vec![
-                    point.iter().enumerate().fold(E::ZERO, |acc, (index, p)| {
-                        acc + *p * E::from_canonical_u64(1u64 << index)
-                    }) + min_input_field,
+                    point
+                        .iter()
+                        .enumerate()
+                        .fold(F::ZERO, |acc, (index, p)| acc + *p * F::from(1u64 << index))
+                        + min_input_field,
                 ])
             }
         }
     }
 
-    pub fn generate_challenge<E: ExtensionField, T: Transcript<E>>(&self, transcript: &mut T) -> E {
+    pub fn generate_challenge<F: PrimeField, T: Transcript>(&self, transcript: &mut T) -> F {
         self.operation.generate_challenge(transcript)
     }
 }

@@ -5,9 +5,9 @@ use super::{
     },
 };
 use crate::{
-    Claim, Element, NextPowerOfTwo, Prover, ScalingStrategy, Shape, VectorTranscript,
+    Claim, Element, InitTranscript, NextPowerOfTwo, Prover, ScalingStrategy, Shape,
+    VectorTranscript,
     backend::Conv2dConfig,
-    commit::{compute_betas_eval, identity_eval},
     fft::fft,
     graph::NodeId,
     iop::{context::ContextAux, prover::BatchFFTProof},
@@ -15,33 +15,33 @@ use crate::{
     model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo},
+    poly_commit::identity_eval,
     quantization::{self, BIT_LEN, Quantize, ScalingFactor, ToElement, ToField},
     shape::filter_size,
     tensor::{CommitmentId, KeyedTensor, Tensor, TensorHandle, TensorTypeParam, WrappedTensor},
     util::from_mle_list_dimensions,
 };
 use anyhow::{Context, Result, ensure};
+use ark_ff::PrimeField;
 use burn::tensor::ops::ConvOptions;
 use core::f32;
-use either::Either;
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    Expression, mle::IntoMLE, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
+use dp_crypto::{
+    Expression, IntoMLE,
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    poly::eq::evals,
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::{ceil_log2, optimal_sumcheck_threads},
+    virtual_polys::VirtualPolynomialsBuilder,
 };
+use either::Either;
 use rayon::{
     iter::{IntoParallelIterator, ParallelIterator},
     prelude::*,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, mem};
-use sumcheck::{
-    structs::{IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
 use tenstore::StorageKey;
 use tracing::{info, warn};
-use transcript::Transcript;
 
 /// The short name used to identify the convolution layer
 pub const CONVOLUTION_LAYER: &str = "CONV";
@@ -55,9 +55,9 @@ mod test;
 pub(crate) use proof::{ConvCtx, ConvProof};
 
 #[derive(Debug, Default, Clone)]
-pub struct ConvData<E>
+pub struct ConvData<F>
 where
-    E: Clone + ExtensionField,
+    F: PrimeField,
 {
     /// Convolution input data.
     ///
@@ -65,25 +65,25 @@ where
     /// field elements, before padding or FFT.
     ///
     /// Used for debugging purposes
-    pub real_input: Vec<E>,
+    pub real_input: Vec<F>,
 
     /// The input chunked and reversed
-    pub input: Vec<Vec<E>>,
+    pub input: Vec<Vec<F>>,
 
     /// The input after applying the FFT transformation.
     ///
     /// Same as `FFT(input)`.
-    pub input_fft: Vec<Vec<E>>,
+    pub input_fft: Vec<Vec<F>>,
 
     /// The result of the convolution in the frequency domain.
     ///
     /// Same as `FFT(input) * FFT(filter)`.
-    pub prod: Vec<Vec<E>>,
+    pub prod: Vec<Vec<F>>,
 
     /// The result of the convolution in its original domain.
     ///
     /// Same as `iFFT(FFT(input) * FFT(filter))`.
-    pub output: Vec<Vec<E>>,
+    pub output: Vec<Vec<F>>,
 
     /// The result converted to `Element`.
     ///
@@ -91,16 +91,16 @@ where
     pub output_as_element: Vec<Element>,
 }
 
-impl<E> ConvData<E>
+impl<F> ConvData<F>
 where
-    E: Copy + ExtensionField,
+    F: PrimeField,
 {
     pub fn new(
-        real_input: Vec<E>,
-        input: Vec<Vec<E>>,
-        input_fft: Vec<Vec<E>>,
-        prod: Vec<Vec<E>>,
-        output: Vec<Vec<E>>,
+        real_input: Vec<F>,
+        input: Vec<Vec<F>>,
+        input_fft: Vec<Vec<F>>,
+        prod: Vec<Vec<F>>,
+        output: Vec<Vec<F>>,
         n_x: usize,
     ) -> Self {
         let n_x_squared = n_x * n_x;
@@ -319,7 +319,7 @@ impl Filter<Element> {
     /// Convolution algorithm using FFTs. When invoking this algorithm the
     /// prover generates all witness/intermediate evaluations needed to generate
     /// a convolution proof of `self` applied over `input` with `bias`.
-    fn fft_conv<F: ExtensionField>(
+    fn fft_conv<F: PrimeField>(
         &self,
         input: &Tensor<Element>,
         bias: &Tensor<Element>,
@@ -330,19 +330,19 @@ impl Filter<Element> {
         /// Usually vec and n are powers of 2
         ///
         /// Output: [[F[0][0],…,F[0][n_w],0,…,0],[F[1][0],…,F[1][n_w],0,…,0],…]
-        fn index_w<E: ExtensionField>(
+        fn index_w<F: PrimeField>(
             w: &[Element],
             n_real: usize,
             n: usize,
             output_len: usize,
-        ) -> impl ParallelIterator<Item = E> + use<'_, E> {
+        ) -> impl ParallelIterator<Item = F> + use<'_, F> {
             (0..output_len).into_par_iter().map(move |idx| {
                 let i = idx / n;
                 let j = idx % n;
                 if i < n_real && j < n_real {
                     w[i * n_real + j].to_field()
                 } else {
-                    E::ZERO
+                    F::ZERO
                 }
             })
         }
@@ -558,9 +558,8 @@ impl<T> Convolution<T> {
     }
 
     /// Returns this layers [ConvCtx].
-    pub(crate) fn conv_context(&self, node_id: NodeId) -> ConvCtx {
+    pub(crate) fn conv_context(&self) -> ConvCtx {
         ConvCtx {
-            node_id,
             kw: self.kw(),
             kx: self.kx(),
             nw: self.filter.as_fft_tensor().0.dim(2),
@@ -669,10 +668,10 @@ impl Convolution<Element> {
     /// Compute the convolution using FFT.
     ///
     /// See: https://en.wikipedia.org/wiki/Convolution_theorem
-    fn fft<E: ExtensionField>(
+    fn fft<F: PrimeField>(
         &self,
         input: &Tensor<Element>,
-    ) -> Result<(Tensor<Element>, ConvData<E>)> {
+    ) -> Result<(Tensor<Element>, ConvData<F>)> {
         let (conv_output, proving_data) = self.filter.fft_conv(input, &self.bias)?;
 
         let unpadded_output_shape =
@@ -696,28 +695,22 @@ impl Convolution<Element> {
         2 * (*quantization::BIT_LEN - 1) + ceil_log2(shape[1] * shape[2] * shape[3] + 1)
     }
 
-    fn prove_batch_fft_weights<
-        E,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    >(
+    fn prove_batch_fft_weights<F, T: Transcript, PCS: CommitmentScheme<Field = F>>(
         &self,
-        prover: &mut Prover<E, T, PCS>,
-        r: Vec<E>,
-    ) -> BatchFFTWeightsProof<E>
+        prover: &mut Prover<F, T, PCS>,
+        r: Vec<F>,
+    ) -> anyhow::Result<BatchFFTWeightsProof<F>>
     where
-        E: ExtensionField,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        F: PrimeField,
     {
         let (tensor, pre_fft_shape) = self.filter.as_fft_tensor();
 
         let padded_rows = 2 * self.fft_filter_size();
-        let mut w1_reduced: Vec<E> = vec![E::ZERO; self.pre_fft_filter_size()];
+        let mut w1_reduced: Vec<F> = vec![F::ZERO; self.pre_fft_filter_size()];
 
         // Partition r in (r1,r2)
-        let mut r1 = vec![E::ZERO; padded_rows.ilog2() as usize];
-        let mut r2 = vec![E::ZERO; r.len() - padded_rows.ilog2() as usize];
+        let mut r1 = vec![F::ZERO; padded_rows.ilog2() as usize];
+        let mut r2 = vec![F::ZERO; r.len() - padded_rows.ilog2() as usize];
         let r1_len = r1.len();
         r1.copy_from_slice(&r[..r1_len]);
 
@@ -726,17 +719,17 @@ impl Convolution<Element> {
         }
 
         // compute W(r1,i)
-        let mut w_red: Vec<E> = vec![E::ZERO; padded_rows];
-        let mut f_middle: Vec<Vec<E>> = vec![Vec::new(); r1.len() - 1];
-        let beta = compute_betas_eval(&r2);
-        Prover::<E, T, PCS>::phi_g_init(
+        let mut w_red: Vec<F> = vec![F::ZERO; padded_rows];
+        let mut f_middle: Vec<Vec<F>> = vec![Vec::new(); r1.len() - 1];
+        let beta = evals(&r2);
+        Prover::<F, T, PCS>::phi_g_init(
             &mut w_red,
             &mut f_middle,
             r1.clone(),
-            E::ONE,
+            F::ONE,
             padded_rows.ilog2() as usize,
             false,
-        );
+        )?;
 
         // compute X(i,r2)
         let filter_size = filter_size(pre_fft_shape);
@@ -744,7 +737,7 @@ impl Convolution<Element> {
             (0..tensor.dim(1)).for_each(|j| {
                 (0..filter_size).for_each(|k| {
                     let index = i * filter_size * tensor.dim(1) + j * filter_size + k;
-                    let v: E = tensor[index].to_field();
+                    let v: F = tensor[index].to_field();
                     w1_reduced[k] += beta[i * tensor.dim(1) + j] * v;
                 });
             });
@@ -752,35 +745,35 @@ impl Convolution<Element> {
 
         let partial_evals = w1_reduced.clone();
         w1_reduced =
-            index_wf(&w1_reduced, pre_fft_shape[2], tensor.dim(2), padded_rows).collect::<Vec<E>>();
+            index_wf(&w1_reduced, pre_fft_shape[2], tensor.dim(2), padded_rows).collect::<Vec<F>>();
         let f_m = w1_reduced.into_mle();
 
         // Construct the virtual polynomial and run the sumcheck prover
         let f_red = w_red.into_mle();
         let num_vars = f_red.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<F>::new(num_threads, num_vars);
         let expr = [&f_m, &f_red]
             .into_iter()
-            .fold(Expression::Constant(Either::Right(E::ONE)), |acc, p| {
+            .fold(Expression::Constant(F::ONE), |acc, p| {
                 acc * expr_builder.lift(Either::Left(p))
             });
         let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
-        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let (proof, state) = IOPProverState::<F>::prove(virtual_poly, prover.transcript);
 
         let claims = state.get_mle_flatten_final_evaluations();
 
         let out_point = state.collect_raw_challenges();
         let (matrix_proofs, matrix_claims, matrix_evaluation_points) =
-            prover.delegate_matrix_evaluation(&mut f_middle, &r1, out_point.clone(), false);
-        BatchFFTWeightsProof {
+            prover.delegate_matrix_evaluation(&mut f_middle, &r1, out_point.clone(), false)?;
+        Ok(BatchFFTWeightsProof {
             proof,
             claims,
             partial_evals,
             point: out_point,
             matrix_evaluation: (matrix_proofs, matrix_claims),
             matrix_evaluation_points,
-        }
+        })
     }
 
     // Prove convolution of a CNN network. This is a convolution between in a 3D matrix X of dimension k_x * n_x * n_x
@@ -788,22 +781,20 @@ impl Convolution<Element> {
     // We want to batch prove the following: Y[i] = iFFT(sum_{j \in [n_x]}(FFT(X[j]) o FFT(W[i][j])).
     #[allow(clippy::too_many_arguments)]
     #[timed::timed_instrument(name = "Prover::prove_convolution_step")]
-    fn prove_convolution_step<E, T: Transcript<E>, PCS>(
+    fn prove_convolution_step<F, T: Transcript + Clone, PCS>(
         &self,
-        prover: &mut Prover<E, T, PCS>,
+        prover: &mut Prover<F, T, PCS>,
         // last random claim made
-        last_claim: &Claim<E>,
+        last_claim: &Claim<F>,
         // Struct containing all necessary information
         // to generate a convolution proof
         output: &Tensor<Element>,
-        proving_data: &ConvData<E>,
+        proving_data: &ConvData<F>,
         id: NodeId,
-    ) -> anyhow::Result<Claim<E>>
+    ) -> anyhow::Result<Claim<F>>
     where
-        E: ExtensionField,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        F: PrimeField,
+        PCS: CommitmentScheme<Field = F>,
     {
         let (tensor, pre_fft_shape) = self.filter.as_fft_tensor();
         // First part is proving the clearing of the garbage has been done
@@ -836,7 +827,7 @@ impl Convolution<Element> {
             info!("PROVE: unpadded_output_shape: {unpadded_output_shape:?}");
             info!("PROVE: output.shape(): {:?}", output.shape());
             let cleared_out = conv_after_bias.to_flatten().mul(&clearing_tensor);
-            let fielded: Tensor<E> = cleared_out.to_field();
+            let fielded: Tensor<F> = cleared_out.to_field();
             fielded.data() == output.to_field().data()
         });
         let clearing_proof = hadamard::prove(
@@ -863,23 +854,23 @@ impl Convolution<Element> {
             ((filter.fft_filter_size() * filter.kw()).ilog2()),
             last_claim.point.len()
         );
-        let mut r = vec![E::ZERO; last_claim.point.len() + 1];
-        let mut bias_point = vec![E::ZERO; filter.kw().ilog2() as usize];
+        let mut r = vec![F::ZERO; last_claim.point.len() + 1];
+        let mut bias_point = vec![F::ZERO; filter.kw().ilog2() as usize];
         for (i, item) in r
             .iter_mut()
             .enumerate()
             .take(filter.fft_filter_size().ilog2() as usize)
         {
-            *item = E::ONE - last_claim.point[i];
+            *item = F::ONE - last_claim.point[i];
         }
         for i in 0..(filter.kw().ilog2() as usize) {
             r[i + (filter.fft_filter_size().ilog2() as usize) + 1] =
                 last_claim.point[i + (filter.fft_filter_size().ilog2() as usize)];
             bias_point[i] = last_claim.point[i + (filter.fft_filter_size().ilog2() as usize)];
         }
-        let mut bias_eval = E::ZERO;
+        let mut bias_eval = F::ZERO;
         if !bias_point.is_empty() {
-            bias_eval = filter.bias.to_field_mle().evaluate(&bias_point);
+            bias_eval = filter.bias.to_field_mle().evaluate(&bias_point)?;
         } else if filter.bias.data().len() == 1 {
             bias_eval = filter.bias.to_field()[0];
         }
@@ -892,7 +883,7 @@ impl Convolution<Element> {
                 .flatten()
                 .collect::<Vec<_>>()
                 .into_mle()
-                .evaluate(&r);
+                .evaluate(&r)?;
             debug_assert_eq!(last_claim.eval - bias_eval, y, "Error in Conv 1");
             last_claim.eval - bias_eval == y
         });
@@ -916,7 +907,7 @@ impl Convolution<Element> {
                 (self.fft_filter_size().ilog2() as usize) + 1,
                 (self.fft_filter_size().ilog2() as usize) + 1,
             ]]);
-            IOPVerifierState::<E>::verify(
+            IOPVerifierState::<F>::verify(
                 last_claim.eval - bias_eval,
                 &ifft_proof.clone(),
                 &fft_aux,
@@ -933,7 +924,7 @@ impl Convolution<Element> {
         // For this let r1 be the last log(k_w) elements of r and r2 the first log(n_x^2) elements
         // Compute the arrays beta1,beta2 such that beta1[i] = beta(i,r1) and beta2[i] = beta(i,r2)
 
-        let mut r_ifft: Vec<E> = ifft_proof_point.clone();
+        let mut r_ifft: Vec<F> = ifft_proof_point.clone();
         for item in r.iter().skip(proving_data.output[0].len().ilog2() as usize) {
             r_ifft.push(*item);
         }
@@ -946,7 +937,7 @@ impl Convolution<Element> {
                 .flatten()
                 .collect::<Vec<_>>()
                 .into_mle()
-                .evaluate(&r_ifft);
+                .evaluate(&r_ifft)?;
             let eval2 = ifft_claim[0];
             debug_assert_eq!(
                 proving_data
@@ -956,7 +947,7 @@ impl Convolution<Element> {
                     .flatten()
                     .collect::<Vec<_>>()
                     .into_mle()
-                    .evaluate(&r_ifft),
+                    .evaluate(&r_ifft)?,
                 ifft_claim[0],
                 "Error in Conv 1"
             );
@@ -965,8 +956,8 @@ impl Convolution<Element> {
 
         let r1 = &r_ifft[(proving_data.output[0].len().ilog2() as usize)..];
         let r2 = &r_ifft[..(proving_data.output[0].len().ilog2() as usize)];
-        let beta1 = compute_betas_eval(r1);
-        let beta2 = compute_betas_eval(r2);
+        let beta1 = evals(r1);
+        let beta2 = evals(r2);
         // Given beta1,beta2 observe that :
         // \sum_{i \in [k_w]} beta1[i]prod[i] = \sum_{i \in [k_w]}sum_{j \in [k_x]} x[j] o w[i][j] =
         // = sum_{j \in [k_x]}x[j]o(\sum_{i \in [k_w]}(beta[i]*w[i][j])). We let w_reduced[j] = \sum_{i \in [k_w]}(beta[i]*w[i][j])
@@ -979,7 +970,7 @@ impl Convolution<Element> {
         // This is a cubic sumcheck where v1 = [x[0][0],...,x[k_x][n_x^2]], v2 = [w_reduced[0][0],...,w_reduced[k_x][n_x^2]]
         // and v3 = [beta2,..(k_x times)..,beta2]. So, first initialize v3 and then invoke the cubic sumceck.
         let og_filter_size = self.pre_fft_filter_size();
-        let mut aggregated_filter = vec![vec![E::ZERO; og_filter_size]; tensor.dim(1)];
+        let mut aggregated_filter = vec![vec![F::ZERO; og_filter_size]; tensor.dim(1)];
         // Compute aggregated_filter using iterators
         // TO DO: PARALLELIZE
         (0..tensor.dim(1)).try_for_each(|i| -> Result<()> {
@@ -989,7 +980,7 @@ impl Convolution<Element> {
                     .enumerate()
                     .for_each(|(k, v)| {
                         let index = j * tensor.dim(1) * og_filter_size + i * og_filter_size + k;
-                        let v_field: E = tensor[index].to_field();
+                        let v_field: F = tensor[index].to_field();
                         *v += beta1[j] * v_field;
                     });
             });
@@ -1000,7 +991,7 @@ impl Convolution<Element> {
                 tensor.dim(2),
                 2 * self.fft_filter_size(),
             )
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
             fft(&mut aggregated_filter[i], false)?;
 
@@ -1011,7 +1002,7 @@ impl Convolution<Element> {
         let f1 = aggregated_filter
             .into_iter()
             .flatten()
-            .collect::<Vec<E>>()
+            .collect::<Vec<F>>()
             .into_mle();
 
         let f2 = proving_data
@@ -1024,14 +1015,14 @@ impl Convolution<Element> {
         let f3 = beta_acc.into_mle();
         let num_vars = f1.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<F>::new(num_threads, num_vars);
         let expr = [&f1, &f2, &f3]
             .into_iter()
-            .fold(Expression::Constant(Either::Right(E::ONE)), |acc, p| {
+            .fold(Expression::Constant(F::ONE), |acc, p| {
                 acc * expr_builder.lift(Either::Left(p))
             });
         let virtual_poly = expr_builder.to_virtual_polys(&[expr], &[]);
-        let (hadamard_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let (hadamard_proof, state) = IOPProverState::<F>::prove(virtual_poly, prover.transcript);
 
         let hadamard_claims = state.get_mle_flatten_final_evaluations();
         let hadamard_point = state.collect_raw_challenges();
@@ -1045,7 +1036,7 @@ impl Convolution<Element> {
             point: fft_point,
             matrix_eval: fft_del_proof,
             delegation_points: fft_delegation_points,
-        } = prover.prove_batch_fft(hadamard_point.clone(), &mut proving_data.input.clone());
+        } = prover.prove_batch_fft(hadamard_point.clone(), &mut proving_data.input.clone())?;
 
         let BatchFFTWeightsProof {
             proof: fft_proof_weights,
@@ -1054,25 +1045,27 @@ impl Convolution<Element> {
             partial_evals,
             matrix_evaluation: fft_weights_del_proof,
             matrix_evaluation_points: fft_delegation_weights_points,
-        } = self.prove_batch_fft_weights(prover, point.clone());
+        } = self.prove_batch_fft_weights(prover, point.clone())?;
 
-        let weights_rand: Vec<E> = prover
+        let weights_rand: Vec<F> = prover
             .transcript
             .read_challenges((self.pre_fft_filter_size()).ilog2() as usize);
         debug_assert!({
             let mut weights_point = fft_weight_point.clone();
             let mut v_weights = weights_point.pop().unwrap();
-            v_weights = (E::ONE - v_weights).inverse();
+            v_weights = (F::ONE - v_weights)
+                .inverse()
+                .expect("Tried to invert zero when proving convolution step");
 
             let mut r = [
                 weights_rand.clone(),
                 point[(2 * self.fft_filter_size()).ilog2() as usize..].to_vec(),
             ]
             .concat();
-            let field_data: Vec<E> = tensor.data().to_field();
-            let y = field_data.into_mle().evaluate(&r);
+            let field_data: Vec<F> = tensor.data().to_field();
+            let y = field_data.into_mle().evaluate(&r)?;
             ensure!(
-                y == partial_evals.clone().into_mle().evaluate(&weights_rand),
+                y == partial_evals.clone().into_mle().evaluate(&weights_rand)?,
                 "Error in fft_weights eval"
             );
             let mut indexes = vec![0_usize; self.pre_fft_filter_size()];
@@ -1087,7 +1080,7 @@ impl Convolution<Element> {
                 .map(|i| identity_eval(&r, &to_bits(indexes[i], r.len())))
                 .collect::<Vec<_>>();
 
-            let y: E = betas
+            let y: F = betas
                 .iter()
                 .zip(partial_evals.iter())
                 .map(|(&beta, &eval)| beta * eval)
@@ -1107,7 +1100,7 @@ impl Convolution<Element> {
                 point[(2 * self.fft_filter_size()).ilog2() as usize..].to_vec(),
             ]
             .concat(),
-            partial_evals.clone().into_mle().evaluate(&weights_rand),
+            partial_evals.clone().into_mle().evaluate(&weights_rand)?,
         );
 
         // Add common polynomial commitment claims to the commitment prover
@@ -1150,7 +1143,9 @@ impl Convolution<Element> {
         );
         let mut input_point = fft_point.clone();
         let mut v = input_point.pop().unwrap();
-        v = (E::ONE - v).inverse();
+        v = (F::ONE - v)
+            .inverse()
+            .expect("Trying to invert zero when proving convolution step");
         debug_assert!({
             let mut p = [
                 input_point.clone(),
@@ -1162,24 +1157,24 @@ impl Convolution<Element> {
                 .clone()
                 .into_iter()
                 .flat_map(|v| v.into_iter())
-                .collect::<Vec<E>>()
+                .collect::<Vec<F>>()
                 .into_mle()
-                .evaluate(&p);
+                .evaluate(&p)?;
             ensure!(y == fft_claim[0] * v, "Error in input eval CONV PROVER");
             for element in p
                 .iter_mut()
                 .take((filter.fft_filter_size().ilog2()) as usize)
             {
-                *element = E::ONE - *element;
+                *element = F::ONE - *element;
             }
             ensure!(
-                proving_data.real_input.clone().into_mle().evaluate(&p) == fft_claim[0] * v,
+                proving_data.real_input.clone().into_mle().evaluate(&p)? == fft_claim[0] * v,
                 "Error in real input eval CONV PROVER"
             );
-            proving_data.real_input.clone().into_mle().evaluate(&p) == fft_claim[0] * v
+            proving_data.real_input.clone().into_mle().evaluate(&p)? == fft_claim[0] * v
         });
         for ip in &mut input_point {
-            *ip = E::ONE - *ip;
+            *ip = F::ONE - *ip;
         }
         let final_claim = Claim {
             point: [
@@ -1295,21 +1290,17 @@ impl Evaluate<Element> for Convolution<Element> {
     }
 }
 
-struct BatchFFTWeightsProof<E: ExtensionField> {
-    proof: sumcheck::structs::IOPProof<E>,
-    claims: Vec<E>,
-    point: Vec<E>,
-    partial_evals: Vec<E>,
-    matrix_evaluation: (Vec<sumcheck::structs::IOPProof<E>>, Vec<Vec<E>>),
-    matrix_evaluation_points: Vec<Vec<E>>,
+struct BatchFFTWeightsProof<F: PrimeField> {
+    proof: IOPProof<F>,
+    claims: Vec<F>,
+    point: Vec<F>,
+    partial_evals: Vec<F>,
+    matrix_evaluation: (Vec<IOPProof<F>>, Vec<Vec<F>>),
+    matrix_evaluation_points: Vec<Vec<F>>,
 }
 
 impl ProveInfo for Convolution<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         let (tensor, _) = self.filter.as_fft_tensor();
 
         let mut filter_shape = tensor.shape().clone();
@@ -1318,7 +1309,7 @@ impl ProveInfo for Convolution<Element> {
             .iter_mut()
             .for_each(|shape| *shape = tensor.shape().clone());
 
-        let conv_info = LayerCtx::Convolution(self.conv_context(id));
+        let conv_info = LayerCtx::Convolution(self.conv_context());
         let filter_poly = tensor.pad_next_power_of_two().into_data();
         let bias_poly = self.bias.tensor().pad_next_power_of_two().into_data();
         aux.model_polys = {
@@ -1457,23 +1448,21 @@ pub fn check_cnn_input(input_shape: &Shape) -> Result<()> {
     Ok(())
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for Convolution<Element>
+impl<F, PCS> ProvableOp<F, PCS> for Convolution<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = proof::ConvCtx;
 
-    fn prove<T: Transcript<E>>(
+    fn prove<T: Transcript + InitTranscript>(
         &self,
         id: NodeId,
         _ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         // The FFT protocol requires the output padded to fft_shape. Since evaluate
         // now stores the real unpadded output, we compute fft_shape and pad here.
         let fft_data = step_data.node_outputs.try_convdata().unwrap();
@@ -1498,10 +1487,10 @@ where
     }
 }
 
-fn to_bits<E: ExtensionField>(mut num: usize, bitlen: usize) -> Vec<E> {
-    let mut bits = vec![E::ZERO; bitlen];
+fn to_bits<F: PrimeField>(mut num: usize, bitlen: usize) -> Vec<F> {
+    let mut bits = vec![F::ZERO; bitlen];
     for bit in bits.iter_mut().take(bitlen) {
-        *bit = E::from_canonical_u64((num & 1) as u64);
+        *bit = F::from((num & 1) as u64);
         num >>= 1;
     }
     bits
@@ -1601,19 +1590,19 @@ fn new_clearing_tensor(og_shape: &Shape, padded_shape: &Shape) -> Result<Tensor<
 /// We use this function so that filter is amenable to FFT based conv2d
 /// Usually vec and n are powers of 2
 /// Output: [[F[0][0],…,F[0][n_w],0,…,0],[F[1][0],…,F[1][n_w],0,…,0],…]
-fn index_wf<E: ExtensionField>(
-    w: &[E],
+fn index_wf<F: PrimeField>(
+    w: &[F],
     n_real: usize,
     n: usize,
     output_len: usize,
-) -> impl ParallelIterator<Item = E> + use<'_, E> {
+) -> impl ParallelIterator<Item = F> + use<'_, F> {
     (0..output_len).into_par_iter().map(move |idx| {
         let i = idx / n;
         let j = idx % n;
         if i < n_real && j < n_real {
             w[i * n_real + j]
         } else {
-            E::ZERO
+            F::ZERO
         }
     })
 }

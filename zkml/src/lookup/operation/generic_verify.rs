@@ -1,5 +1,9 @@
 //! Module contiaing code for generic verification of lookup operations.
-use mpcs::PolynomialCommitmentScheme;
+use dp_crypto::{
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    util::ceil_log2,
+};
+use itertools::Itertools;
 
 use crate::{
     graph::NodeId,
@@ -9,18 +13,19 @@ use crate::{
         inputs::{LookupEvaluations, proving::LookupSumcheckProof},
         variant::verifying::evaluate_dim_lt_poly,
     },
+    poly_commit::verifier::VerifierClaim,
 };
 
 use super::*;
 
 #[derive(Debug, Clone)]
-pub struct LookupVerifyResult<E: ExtensionField> {
-    pub input_claims: Vec<Claim<E>>,
-    pub weight_evaluation_point: Option<Vec<E>>,
+pub struct LookupVerifyResult<F: PrimeField> {
+    pub input_claims: Vec<Claim<F>>,
+    pub weight_evaluation_point: Option<Vec<F>>,
 }
 
-impl<E: ExtensionField> LookupVerifyResult<E> {
-    pub fn new(input_claims: Vec<Claim<E>>, weight_evaluation_point: Option<Vec<E>>) -> Self {
+impl<F: PrimeField> LookupVerifyResult<F> {
+    pub fn new(input_claims: Vec<Claim<F>>, weight_evaluation_point: Option<Vec<F>>) -> Self {
         Self {
             input_claims,
             weight_evaluation_point,
@@ -29,20 +34,20 @@ impl<E: ExtensionField> LookupVerifyResult<E> {
 }
 
 /// Method to verify a lookup operation that has been proven by [`prove_lookup_op`](super::proving::prove_lookup_op). This method verifies the lookup proof, constructs the claims for the input witnesses and adds the commitment claims to the verifier for later use in the generic batch verification of the polynomial commitment scheme.
-pub fn verify_lookup_op<L, E, T, PCS>(
+pub fn verify_lookup_op<L, F, T, PCS>(
     lookup_op: &L,
-    last_claim: &Claim<E>,
+    last_claim: &Claim<F>,
     shape_step: &ShapeStep,
     table: &Table,
-    proof: &GenericLookupProof<E, PCS>,
-    verifier: &mut Verifier<E, T, PCS>,
+    proof: &GenericLookupProof<F, PCS>,
+    verifier: &mut Verifier<F, T, PCS>,
     node_id: NodeId,
-) -> Result<LookupVerifyResult<E>>
+) -> Result<LookupVerifyResult<F>>
 where
     L: LookupOp,
-    E: ExtensionField,
-    T: Transcript<E>,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    T: Transcript,
+    PCS: CommitmentScheme,
 {
     let unpadded_input_shape = &shape_step.unpadded_input_shape[0];
     let GenericLookupProof {
@@ -51,19 +56,19 @@ where
         evaluations,
         weight_evaluation,
         shift_evaluations,
-        commitment,
+        commitments,
         ..
     } = proof;
     // 1. Verify the lookup proof
     let chunking_info = lookup_op.chunking_info(table)?;
     let input_config = lookup_op.input_config(chunking_info, unpadded_input_shape);
     // Add the fractional outputs to the verifier's numerator and denominator storage
-    input_config.sort_fractional_outputs::<E, T, PCS>(verifier, logup_proof)?;
+    input_config.sort_fractional_outputs::<F, T, PCS>(verifier, logup_proof)?;
 
     // Verify the actual logup proof.
     // Build the verifier instances for the LogUp proof
     let logup_instances =
-        input_config.create_logup_verifier_instances::<E>(&verifier.challenge_storage)?;
+        input_config.create_logup_verifier_instances::<F>(&verifier.challenge_storage)?;
 
     // Now Verify the LogUp proof
     let logup_claim =
@@ -86,7 +91,7 @@ where
         let final_dim = unpadded_input_shape.dim(-1);
         let final_dim_vars = ceil_log2(final_dim);
         let lt_eval = evaluate_dim_lt_poly(&logup_claim.point()[..final_dim_vars], final_dim)?;
-        let rescaled = evals.iter().map(|e| *e * lt_eval).collect::<Vec<E>>();
+        let rescaled = evals.iter().map(|e| *e * lt_eval).collect::<Vec<F>>();
         Some(rescaled)
     } else {
         None
@@ -105,7 +110,7 @@ where
         .output_claims()
         .iter()
         .map(|c| c.evaluation())
-        .collect::<Vec<E>>();
+        .collect::<Vec<F>>();
 
     // 3. Construct the claims for the input witnesses and the evaluations for the commitment claims and add them to the verifier.
     let LookupEvaluations {
@@ -120,10 +125,15 @@ where
         &shift_evals,
     )?;
 
-    let first_commitments = (logup_proof.point().to_vec(), input_commitment_evals);
-    let second_commitments = (sumcheck_point.clone(), output_commitment_evals);
-
-    let mut commitment_claims = vec![first_commitments, second_commitments];
+    let mut commitment_claims = input_commitment_evals
+        .into_iter()
+        .map(|input_eval| Claim::new(logup_proof.point().to_vec(), input_eval))
+        .chain(
+            output_commitment_evals
+                .into_iter()
+                .map(|out_eval| Claim::new(sumcheck_point.clone(), out_eval)),
+        )
+        .collect_vec();
 
     let final_dim_vars = ceil_log2(shape_step.unpadded_input_shape[0].dim(-1));
 
@@ -141,20 +151,26 @@ where
         // In this case we don't need to deal with rounding constants and the fixed point multiplier
         // because the input evaluation comes directly from the Sumcheck (since we had to prove that the values in the lookup
         // are the elementwise product of the input tensor and a witness specific tensor of normalising values).
-        commitment_claims.push((
-            sumcheck_point[final_dim_vars..].to_vec(),
-            normalisation_commitment_evals,
-        ));
+        for eval in normalisation_commitment_evals {
+            commitment_claims.push(Claim::new(sumcheck_point[final_dim_vars..].to_vec(), eval))
+        }
     }
 
     if let Some(shift_evals) = shift_evaluations {
-        let shift_point = logup_claim.point()[final_dim_vars..].to_vec();
-        commitment_claims.push((shift_point, shift_evals.clone()));
+        let shift_point = &logup_claim.point()[final_dim_vars..];
+        for &eval in shift_evals {
+            commitment_claims.push(Claim::new(shift_point.to_vec(), eval))
+        }
     }
 
-    verifier
-        .commit_verifier
-        .add_witness_claim(node_id, commitment.clone(), commitment_claims);
+    verifier.commit_verifier.add_witness_claim(
+        node_id,
+        commitment_claims
+            .into_iter()
+            .zip_eq(commitments)
+            .map(|(claim, comm)| VerifierClaim::from((comm.clone(), claim)))
+            .collect(),
+    );
 
     let weight_point = weight_evaluation.map(|_| sumcheck_point[..final_dim_vars].to_vec());
 

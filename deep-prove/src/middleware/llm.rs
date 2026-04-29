@@ -1,5 +1,3 @@
-use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
 use zkml::{
     IO, Proof as ZkmlProof,
@@ -7,8 +5,8 @@ use zkml::{
     parser::llm::Token,
 };
 
-pub type F = GoldilocksExt2;
-pub type Pcs = Basefold<F, BasefoldRSParams>;
+pub type F = super::v1::F;
+pub type Pcs = super::v1::Pcs;
 
 /// Informational payload persisted with the proof; `llm_response` is for logging only.
 #[derive(Serialize, Deserialize)]

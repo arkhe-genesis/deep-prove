@@ -17,6 +17,7 @@ in
   packages = [
     # General dev.
     pkgs.git pkgs.git-lfs pkgs.openssl pkgs.cmake pkgs.git-cliff
+    pkgs.cudatoolkit
 
     # Rust crates build deps
     pkgs.openssl pkgs.llvmPackages.libclang.lib pkgs.protobuf
@@ -28,25 +29,13 @@ in
     # Python dependencies
     pkgs.zlib
     pkgs.openblas
-    pkgs.python3Packages.datasets
-    pkgs.python3Packages.gguf
-    pkgs.python3Packages.huggingface-hub
-    pkgs.python3Packages.matplotlib
-    pkgs.python3Packages.nltk
-    pkgs.python3Packages.numpy
-    pkgs.python3Packages.onnx
-    pkgs.python3Packages.pandas
-    pkgs.python3Packages.psutil
-    pkgs.python3Packages.scikit-learn
-    pkgs.python3Packages.tabulate
-    pkgs.python3Packages.tqdm
-    pkgs.python3Packages.transformers
-  ];
+  ] ++ (if pkgs.stdenv.isLinux then [ pkgs.linuxPackages.nvidia_x11 ] else []);
 
   env = {
     OPENSSL_DEV = pkgs.openssl.dev;
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-    LD_LIBRARY_PATH = "${pkgs.zlib}/lib:${pkgs.openblas}/lib:${pkgs.stdenv.cc.cc.lib}/lib";
+    LD_LIBRARY_PATH = "${pkgs.zlib}/lib:${pkgs.openblas}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
+                      + (if pkgs.stdenv.isLinux then " ${pkgs.linuxPackages.nvidia_x11}/lib" else "");
     # Point NLTK to pre-installed data in nix store
     NLTK_DATA = "${nltk-data}";
     OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318";

@@ -1,5 +1,6 @@
 use crate::{
     Claim, Element, NextPowerOfTwo, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
+    VectorTranscript,
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -10,7 +11,7 @@ use crate::{
         add::Add,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
-            VerifiableCtx,
+            Splittable, VerifiableCtx,
         },
         transformer::positional::{
             absolute::{Absolute, AbsoluteCtx, AbsoluteProof},
@@ -30,16 +31,15 @@ use crate::{
     tensor::{CommitmentId, TensorHandle, TensorSlice, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Ok, Result, bail, ensure};
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
+use dp_crypto::arkyper::{CommitmentScheme, transcript::Transcript};
 use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
-use transcript::Transcript;
 
 pub(crate) mod absolute;
 pub(crate) mod rope;
@@ -55,11 +55,14 @@ pub enum PositionalCtx {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub enum PositionalProof<E: ExtensionField> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub enum PositionalProof<F: PrimeField> {
     // Proofs for all the inputs of the positional encoding layer
-    Absolute(AbsoluteProof<E>),
-    Rope(RopeProof<E>),
+    Absolute(AbsoluteProof<F>),
+    Rope(RopeProof<F>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,22 +244,20 @@ impl<N: TensorTypeParam> Positional<N> {
     // for proving. It requires as input also the claim related to the output polynomial and
     // the claim about the sub-matrix of positional matrix being actually added to the
     // input polynomial
-    fn sample_random_coordinates<E: ExtensionField, T: Transcript<E>>(
+    fn sample_random_coordinates<F: PrimeField, T: Transcript>(
         num_coordinates: usize,
         t: &mut T,
-        output_claim: &Claim<E>,
-        sub_matrix_claim: &Claim<E>,
-    ) -> Vec<E> {
+        output_claim: &Claim<F>,
+        sub_matrix_claim: &Claim<F>,
+    ) -> Vec<F> {
         // first, we add `output_claim` and `sub_pos_claim` to the transcript
-        t.append_field_element_exts(&output_claim.point);
-        t.append_field_element_ext(&output_claim.eval);
-        t.append_field_element_exts(&sub_matrix_claim.point);
-        t.append_field_element_ext(&sub_matrix_claim.eval);
+        t.append_scalars(&output_claim.point);
+        t.append_scalars(&[output_claim.eval]);
+        t.append_scalars(&sub_matrix_claim.point);
+        t.append_scalars(&[sub_matrix_claim.eval]);
 
         // then, we get `num_coordinates` challenges
-        (0..num_coordinates)
-            .map(|_| t.read_challenge().elements)
-            .collect()
+        t.read_challenges(num_coordinates)
     }
 
     // Compute a claim about the positional encoding matrix at point `evaluation_point`.
@@ -267,11 +268,11 @@ impl<N: TensorTypeParam> Positional<N> {
     // Note that the sub-matrices the evaluations are referred to corresponds to a partition
     // of the positional encoding matrix, that is their concatenation yields the positional
     // encoding matrix itself
-    fn compute_positional_matrix_claim<E: ExtensionField>(
-        evaluation_point: Vec<E>,
-        sub_pos_eval: E,
-        sub_matrix_evals: &[E],
-    ) -> Claim<E> {
+    fn compute_positional_matrix_claim<F: PrimeField>(
+        evaluation_point: Vec<F>,
+        sub_pos_eval: F,
+        sub_matrix_evals: &[F],
+    ) -> Claim<F> {
         // compute the slice of the evaluation point to be used to compute the claim
         let eval_point = {
             let diff_vars = sub_matrix_evals.len();
@@ -282,7 +283,7 @@ impl<N: TensorTypeParam> Positional<N> {
             .iter()
             .zip(eval_point)
             .fold(sub_pos_eval, |eval, (&sub_eval, &coordinate)| {
-                eval * (E::ONE - coordinate) + sub_eval * coordinate
+                eval * (F::ONE - coordinate) + sub_eval * coordinate
             });
         Claim::new(evaluation_point, positional_matrix_eval)
     }
@@ -291,16 +292,16 @@ impl<N: TensorTypeParam> Positional<N> {
     /// `sub_matrix_claim` on the sub-matrix given by the first `input_num_rows` of positional matrix;
     /// it returns the claim for the positional matrix and the list of evaluations for the sub-matrices
     /// employed to build the claim, which have to be included in the proof
-    fn bind_sub_claim_to_positional_matrix<'a, E: ExtensionField, T: Transcript<E>>(
-        sub_matrix_claim: Claim<E>,
-        output_claim: &Claim<E>,
+    fn bind_sub_claim_to_positional_matrix<'a, F: PrimeField, T: Transcript>(
+        sub_matrix_claim: Claim<F>,
+        output_claim: &Claim<F>,
         matrix_slice: &TensorSlice<'a, N>,
         positional_matrix: &Tensor<N>,
         input_num_rows: usize,
         transcript: &mut T,
-    ) -> anyhow::Result<(Vec<E>, Claim<E>)>
+    ) -> anyhow::Result<(Vec<F>, Claim<F>)>
     where
-        N: ToField<E>,
+        N: ToField<F>,
     {
         // first, we compute the number of variables that we need to fill to get to the `positional_matrix`
         // polynomial
@@ -351,7 +352,7 @@ impl<N: TensorTypeParam> Positional<N> {
                     sub_matrices[i]
                         .to_field()
                         .to_mle_2d()?
-                        .evaluate(&evaluation_point[..sub_pos_vars + i]),
+                        .evaluate(&evaluation_point[..sub_pos_vars + i])?,
                 ))
             })
             .collect::<anyhow::Result<BTreeMap<_, _>>>()?
@@ -446,18 +447,17 @@ impl<N: TensorTypeParam> OpInfo for Positional<N> {
 }
 
 impl ProveInfo for Positional<Element> {
-    fn step_info<E: ExtensionField>(
+    fn step_info<F: PrimeField>(
         &self,
-        id: NodeId,
         aux: ContextAux,
-    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+    ) -> anyhow::Result<(LayerCtx<F>, ContextAux)> {
         let (ctx, aux) = match &self.variant {
             PositionalVariant::Absolute(absolute) => {
-                let (ctx, aux) = absolute.step_info::<E>(id, aux)?;
+                let (ctx, aux) = absolute.step_info::<F>(aux)?;
                 (PositionalCtx::Absolute(ctx), aux)
             }
             PositionalVariant::Rope(rope) => {
-                let (ctx, aux) = rope.step_info(id, aux)?;
+                let (ctx, aux) = rope.step_info(aux)?;
                 (PositionalCtx::Rope(ctx), aux)
             }
         };
@@ -671,22 +671,20 @@ impl Positional<f32> {
     }
 }
 
-impl<E: ExtensionField, PCS> ProvableOp<E, PCS> for Positional<Element>
+impl<F: PrimeField, PCS> ProvableOp<F, PCS> for Positional<Element>
 where
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = PositionalCtx;
 
-    fn prove<T: Transcript<E>>(
+    fn prove<T: Transcript>(
         &self,
         node_id: NodeId,
         _ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        prover: &mut Prover<F, T, PCS>,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         ensure!(
             last_claims.len() == 1,
             "Expected 1 output claim for positional layer, found {}",
@@ -740,6 +738,8 @@ impl OpInfo for PositionalCtx {
     }
 }
 
+impl Splittable for PositionalCtx {}
+
 impl PositionalCtx {
     fn unpadded_shape(&self) -> &Shape {
         match self {
@@ -749,13 +749,13 @@ impl PositionalCtx {
     }
     /// Compute the claim for a full positional matrix from a claim `sub_claim` about a sub matrix
     /// and the evaluations for other sub-matrices provided as input.
-    fn build_positional_matrix_claim<E: ExtensionField, T: Transcript<E>>(
-        sub_claim: Claim<E>,
-        output_claim: &Claim<E>,
+    fn build_positional_matrix_claim<F: PrimeField, T: Transcript>(
+        sub_claim: Claim<F>,
+        output_claim: &Claim<F>,
         num_vars_full_matrix: usize,
         transcript: &mut T,
-        sub_matrix_evals: &[E],
-    ) -> anyhow::Result<Claim<E>> {
+        sub_matrix_evals: &[F],
+    ) -> anyhow::Result<Claim<F>> {
         // first, we compute the number of variables that we need to fill to get to the `positional_matrix`
         // polynomial
         let sub_pos_vars = sub_claim.point.len();
@@ -789,18 +789,17 @@ impl PositionalCtx {
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS>
-    for PositionalCtx
-{
-    type Proof = PositionalProof<E>;
+impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for PositionalCtx {
+    type Proof = PositionalProof<F>;
 
-    fn verify<T: Transcript<E>>(
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         let num_outputs = last_claims.len();
 
         ensure!(
@@ -837,16 +836,16 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
 
         match (self, proof) {
             (PositionalCtx::Absolute(absolute_ctx), PositionalProof::Absolute(proof)) => {
-                absolute_ctx.verify(proof, verifier, output_claim, shape_step)
+                absolute_ctx.verify(proof, verifier, output_claim, shape_step, node_id)
             }
             (PositionalCtx::Rope(rope_ctx), PositionalProof::Rope(proof)) => {
-                rope_ctx.verify(proof, output_claim, verifier, shape_step)
+                rope_ctx.verify(proof, output_claim, verifier, shape_step, node_id)
             }
             _ => bail!("Incompatible ctx and proof types found for positional layer"),
         }
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         _proof: &Self::Proof,
         _transcript: &mut T,

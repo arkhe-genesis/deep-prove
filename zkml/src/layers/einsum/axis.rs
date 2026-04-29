@@ -2,14 +2,15 @@
 
 use std::{collections::HashSet, ops::Index, sync::OnceLock};
 
-use crate::{
-    Claim, Shape, Tensor, commit::compute_betas_eval, eval_zeroifier_mle, to_bit_sequence_le,
-};
+use crate::{Claim, Shape, Tensor, eval_zeroifier_mle, to_bit_sequence_le};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
+use dp_crypto::{
+    poly::{dense::DensePolynomial, eq::evals},
+    util::ceil_log2,
+};
 use itertools::{Itertools, izip};
-use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
 use serde::{Deserialize, Serialize};
 
 use rayon::prelude::*;
@@ -474,12 +475,12 @@ impl AxesMapping {
 
     /// Given the LHS [`Tensor`], the RHS [Tensors][`Tensor`] and the claim points for each output tensor, this method returns the MLES
     /// with all variables fixed except those corresponding to the contraction axes.
-    pub fn fix_axes<'a, E: ExtensionField>(
+    pub fn fix_axes<'a, F: PrimeField>(
         &self,
-        claim_points: &[Vec<&'a [E]>],
-        full_inputs: &[Tensor<E>],
+        claim_points: &[Vec<&'a [F]>],
+        full_inputs: &[Tensor<F>],
         unpadded_shapes: &[Shape],
-    ) -> Result<FixedPolys<'a, E>> {
+    ) -> Result<FixedPolys<'a, F>> {
         ensure!(
             full_inputs.len() == self.input_count,
             "Mismatched number of input tensors, expected {}, got {}",
@@ -492,7 +493,7 @@ impl AxesMapping {
             self.input_count,
             unpadded_shapes.len()
         );
-        let fixed_axes = self.sort_variables_to_axes::<E>(claim_points)?;
+        let fixed_axes = self.sort_variables_to_axes::<F>(claim_points)?;
 
         // We now fix the variables in the input tensors according to the fixed axes
         fixed_axes.into_fixed_polys(full_inputs, unpadded_shapes)
@@ -651,14 +652,14 @@ impl AxesMapping {
     /// - `output_shape`: The shape of the output tensor, used to compute less than checks for broadcasted axes.
     ///
     /// Returns a tuple of the broadcasted evaluation for the bias tensor and the corresponding claim on the unbroadcasted tensor.
-    pub(crate) fn compute_bias_evaluation<E: ExtensionField>(
+    pub(crate) fn compute_bias_evaluation<F: PrimeField>(
         &self,
         output_id: usize,
         bias_id: usize,
-        claim_point: &[&[E]],
-        bias_eval: E,
+        claim_point: &[&[F]],
+        bias_eval: F,
         output_shape: &Shape,
-    ) -> Result<(E, Claim<E>)> {
+    ) -> Result<(F, Claim<F>)> {
         let (eval, claim_slices) =
             self.axes()
                 .fold((bias_eval, vec![]), |(eval, mut acc), axis| {
@@ -668,8 +669,8 @@ impl AxesMapping {
                             let claim_slice = claim_point[output_pos];
                             let dim_size = output_shape[output_pos];
                             let dim_size_bits = to_bit_sequence_le(dim_size - 1, claim_slice.len())
-                                .map(E::from_canonical_usize)
-                                .collect::<Vec<E>>();
+                                .map(|b| F::from(b as u64))
+                                .collect::<Vec<F>>();
                             (eval * eval_zeroifier_mle(claim_slice, &dim_size_bits), acc)
                         }
                         (Dimension::Present(output_pos), Dimension::Present(bias_pos)) => {
@@ -692,16 +693,16 @@ impl AxesMapping {
         let point = claim_slices
             .into_iter()
             .rev()
-            .try_fold(Vec::<E>::new(), |mut acc, opt| {
+            .try_fold(Vec::<F>::new(), |mut acc, opt| {
                 let unwrapped = opt.ok_or(anyhow!(
                     "Bias tensor {} does not have all its axes present in output tensor {}",
                     bias_id,
                     output_id
                 ))?;
                 acc.extend_from_slice(unwrapped);
-                Result::<Vec<E>>::Ok(acc)
+                Result::<Vec<F>>::Ok(acc)
             })?;
-        Ok((eval, Claim::<E>::new(point, bias_eval)))
+        Ok((eval, Claim::<F>::new(point, bias_eval)))
     }
 
     /// Sorts the axes in the mapping based on their first occurrence in the input tensors.
@@ -1001,25 +1002,25 @@ impl<T> FixedAxis<T> {
 /// If the variant is [`FixedAxis::Stacked`], then the axis is not fixed and instead the total number of MLEs produced is equal to the unpadded stacking axes size.
 ///
 /// The fixes are given in the order of the axes in the inputs corresponding [`Shape`] without any permutation applied.
-pub struct FixedAxesMapping<'a, E> {
+pub struct FixedAxesMapping<'a, F> {
     /// This is the points to fix each of the corresponding LHS axes at for each output tensor.
     /// The outer [`Vec`] corresponds to which output tensor, the inner [`Vec`] corresponds to which axis in the LHS tensor.
-    pub(crate) lhs_fixes: Vec<Vec<FixedAxis<&'a [E]>>>,
+    pub(crate) lhs_fixes: Vec<Vec<FixedAxis<&'a [F]>>>,
     /// This is the points to fix each of the corresponding RHS axes at for each output tensor.
     /// The outer [`Vec`] corresponds to which RHS tensor, the inner [`Vec`] corresponds to which axis in that tensor.
-    pub(crate) rhs_fixes: Vec<Vec<FixedAxis<&'a [E]>>>,
+    pub(crate) rhs_fixes: Vec<Vec<FixedAxis<&'a [F]>>>,
 }
 
-type FixedPolysResult<E> = (Vec<Vec<MultilinearExtension<'static, E>>>, Vec<Vec<E>>);
+type FixedPolysResult<F> = (Vec<Vec<DensePolynomial<'static, F>>>, Vec<Vec<F>>);
 
-impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
+impl<'a, F: PrimeField> FixedAxesMapping<'a, F> {
     /// Returns the LHS tensors after being fixed for each fix point and split along the stacking axes.
     /// That is if there are `s` stacking axes, the returned [`Vec`] will have length `s`.
     pub fn lhs_fixes(
         &self,
-        lhs: &Tensor<E>,
+        lhs: &Tensor<F>,
         unpadded_shape: &Shape,
-    ) -> Result<FixedPolysResult<E>> {
+    ) -> Result<FixedPolysResult<F>> {
         // Transform the stacking/fixing points into eq_poly evals.
         let lhs_evals = self
             .lhs_fixes
@@ -1028,12 +1029,10 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                 fixes
                     .iter()
                     .zip(unpadded_shape.iter())
-                    .map(|(dim_point, size)| {
-                        dim_point.map(|point| compute_betas_eval(point)[..*size].to_vec())
-                    })
-                    .collect::<Vec<FixedAxis<Vec<E>>>>()
+                    .map(|(dim_point, size)| dim_point.map(|point| evals(point)[..*size].to_vec()))
+                    .collect::<Vec<FixedAxis<Vec<F>>>>()
             })
-            .collect::<Vec<Vec<FixedAxis<Vec<E>>>>>();
+            .collect::<Vec<Vec<FixedAxis<Vec<F>>>>>();
 
         // Work out the stacking coefficients for the LHS
         // these can be thought of as the coefficients of the unpadded heads of the LHS tensor.
@@ -1044,7 +1043,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
         let stacking_coeffs = lhs_evals
             .iter()
             .map(|fixed_axes| {
-                fixed_axes.iter().rev().fold(vec![E::ONE], |acc, axis| {
+                fixed_axes.iter().rev().fold(vec![F::ONE], |acc, axis| {
                     if let FixedAxis::Stacked(beta_evals) = axis {
                         beta_evals
                             .iter()
@@ -1052,7 +1051,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                                 acc.par_iter()
                                     .with_min_len(64)
                                     .map(|&a| a * b)
-                                    .collect::<Vec<E>>()
+                                    .collect::<Vec<F>>()
                             })
                             .collect()
                     } else {
@@ -1060,7 +1059,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                     }
                 })
             })
-            .collect::<Vec<Vec<E>>>();
+            .collect::<Vec<Vec<F>>>();
         // Now we can construct the multilinear extensions that have been fixed along the correct axes.
         let lhs_mles = lhs_evals
             .into_iter()
@@ -1071,22 +1070,22 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
     }
 
     /// Returns only the stacking coefficients, used by the verifier.
-    pub fn stacking_coefficients(&self, unpadded_shape: &Shape) -> Vec<Vec<E>> {
+    pub fn stacking_coefficients(&self, unpadded_shape: &Shape) -> Vec<Vec<F>> {
         self.lhs_fixes
             .iter()
             .map(|fixed_axes| {
                 fixed_axes.iter().zip(unpadded_shape.iter()).rev().fold(
-                    vec![E::ONE],
+                    vec![F::ONE],
                     |acc, (axis, size)| {
                         if let FixedAxis::Stacked(point) = axis {
-                            compute_betas_eval(point)[..*size]
+                            evals(point)[..*size]
                                 .to_vec()
                                 .iter()
                                 .flat_map(|&b| {
                                     acc.par_iter()
                                         .with_min_len(64)
                                         .map(|&a| a * b)
-                                        .collect::<Vec<E>>()
+                                        .collect::<Vec<F>>()
                                 })
                                 .collect()
                         } else {
@@ -1095,16 +1094,16 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                     },
                 )
             })
-            .collect::<Vec<Vec<E>>>()
+            .collect::<Vec<Vec<F>>>()
     }
 
     /// Returns the RHS tensors after being fixed for each fix point and split along the stacking axes.
     /// That is if there are `r` RHS tensors and the stacking axis are of size `s`, the returned [`Vec`] will have length `r` and each inner [`Vec`] will have length `s`.
     pub fn rhs_fixes(
         &self,
-        rhs: &[Tensor<E>],
+        rhs: &[Tensor<F>],
         unpadded_shapes: &[Shape],
-    ) -> Result<Vec<Vec<MultilinearExtension<'static, E>>>> {
+    ) -> Result<Vec<Vec<DensePolynomial<'static, F>>>> {
         ensure!(
             rhs.len() == self.rhs_fixes.len(),
             "Mismatched number of RHS tensors, expected {}, got {}",
@@ -1126,12 +1125,10 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                 fixes
                     .iter()
                     .zip(unpadded_shape.iter())
-                    .map(|(dim_point, size)| {
-                        dim_point.map(|point| compute_betas_eval(point)[..*size].to_vec())
-                    })
-                    .collect::<Vec<FixedAxis<Vec<E>>>>()
+                    .map(|(dim_point, size)| dim_point.map(|point| evals(point)[..*size].to_vec()))
+                    .collect::<Vec<FixedAxis<Vec<F>>>>()
             })
-            .collect::<Vec<Vec<FixedAxis<Vec<E>>>>>();
+            .collect::<Vec<Vec<FixedAxis<Vec<F>>>>>();
 
         // Now we can construct the multilinear extensions that have been fixed along the correct axes.
         izip!(rhs_evals, rhs, unpadded_shapes)
@@ -1143,10 +1140,10 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
 
     /// Method that constructs the multilinear extensions from a tensor after fixing the correct axes.
     fn mles_from_tensor(
-        fixed_axes: Vec<FixedAxis<Vec<E>>>,
-        tensor: &Tensor<E>,
+        fixed_axes: Vec<FixedAxis<Vec<F>>>,
+        tensor: &Tensor<F>,
         unpadded_shape: &Shape,
-    ) -> Result<Vec<MultilinearExtension<'static, E>>> {
+    ) -> Result<Vec<DensePolynomial<'static, F>>> {
         // First we reduce the tensor to the unpadded shape
         let unpadded_data = tensor.reduce_to_shape(unpadded_shape)?.into_data();
 
@@ -1193,7 +1190,7 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
                                                     .map(|(v, b)| *v * *b)
                                                     .sum()
                                             })
-                                            .collect::<Vec<E>>()
+                                            .collect::<Vec<F>>()
                                     })
                                     .collect();
                             }
@@ -1225,12 +1222,11 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
         Ok(evaluations
             .chunks(contraction_size)
             .map(|eval_chunk| {
-                MultilinearExtension::<E>::from_evaluations_ext_vec(
-                    num_vars,
+                DensePolynomial::new(
                     eval_chunk
                         .iter()
                         .copied()
-                        .chain(std::iter::repeat_n(E::ZERO, diff))
+                        .chain(std::iter::repeat_n(F::ZERO, diff))
                         .collect(),
                 )
             })
@@ -1239,11 +1235,10 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
 
     fn into_fixed_polys<'b>(
         self,
-        tensors: &[Tensor<E>],
+        tensors: &[Tensor<F>],
         unpadded_shapes: &[Shape],
-    ) -> Result<FixedPolys<'b, E>>
+    ) -> Result<FixedPolys<'b, F>>
     where
-        E: ExtensionField,
         'a: 'b,
     {
         let (lhs, stacking_coeffs) = self.lhs_fixes(&tensors[0], &unpadded_shapes[0])?;
@@ -1264,32 +1259,36 @@ impl<'a, E: ExtensionField> FixedAxesMapping<'a, E> {
 }
 
 /// Struct used to reduce type complexity when returning fixed polynomials from [`AxesMapping::fix_axes`]
-pub struct FixedPolys<'a, E: ExtensionField> {
+pub struct FixedPolys<'a, F: PrimeField> {
     /// The length of the outer [`Vec`] is equal to the total number of batched operations being performed.
     /// The the length of the inner [`Vec`] is equal to the total stacking dimension size of the LHS tensor.
-    pub(crate) lhs: Vec<Vec<MultilinearExtension<'static, E>>>,
+    pub(crate) lhs: Vec<Vec<DensePolynomial<'static, F>>>,
     /// The length of the outer [`Vec`] is equal to the number of RHS tensors.
     /// The length of the inner [`Vec`] is equal to the total stacking dimension size of mapping.
-    pub(crate) rhs: Vec<Vec<MultilinearExtension<'static, E>>>,
+    pub(crate) rhs: Vec<Vec<DensePolynomial<'static, F>>>,
     /// The points used to fix the axes in the above lhs tensors. The outer vec should have the same length as the outer vec in `lhs`.
     /// The inner vec should have the same length as the number of axes in the LHS tensor.
-    pub(crate) lhs_points: Vec<Vec<FixedAxis<&'a [E]>>>,
+    pub(crate) lhs_points: Vec<Vec<FixedAxis<&'a [F]>>>,
     /// The points used to fix the axes in the above rhs tensors. The outer vec should have the same length as the outer vec in `rhs`.
     /// The inner vec should have the same length as the number of axes in the corresponding RHS tensor.
-    pub(crate) rhs_points: Vec<Vec<FixedAxis<&'a [E]>>>,
+    pub(crate) rhs_points: Vec<Vec<FixedAxis<&'a [F]>>>,
     /// These are the stacking coefficients for the mapping, they correspond to eq poly evals for the stacking axes.
-    pub(crate) stacking_coeffs: Vec<Vec<E>>,
+    pub(crate) stacking_coeffs: Vec<Vec<F>>,
 }
 
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
     use ark_std::rand::Rng;
-    use ff_ext::{FromUniformBytes, GoldilocksExt2 as F};
 
-    use crate::{Element, NextPowerOfTwo, quantization::ToField, rng_from_env_or_random};
+    use crate::{
+        Element, NextPowerOfTwo, quantization::ToField, rng_from_env_or_random,
+        testing::random_field_vector,
+    };
 
     use super::*;
+
+    type F = ark_bn254::Fr;
 
     #[test]
     fn test_invalid_axes_mapping() {
@@ -1546,9 +1545,7 @@ mod tests {
             let total_variables = ceil_log2(padded_output_shape.numel());
 
             // Make a random evaluation point for the bias tensor
-            let point = (0..total_variables)
-                .map(|_| F::random(&mut rng))
-                .collect::<Vec<F>>();
+            let point = random_field_vector(total_variables);
 
             let bias_tensor = Tensor::<Element>::random(&Shape::new(vec![i, l]));
             // Make the unpadded broadcasted bias tensor
@@ -1566,7 +1563,7 @@ mod tests {
                 broadcasted_bias.pad_next_power_of_two().to_field();
 
             let broadcasted_mle = broadcasted_bias_field.to_mle();
-            let broadcasted_eval = broadcasted_mle.evaluate(&point);
+            let broadcasted_eval = broadcasted_mle.evaluate(&point).unwrap();
 
             let split_point = padded_output_shape.split_point(&point).unwrap();
 
@@ -1575,7 +1572,7 @@ mod tests {
                 .bias_evaluation_point(output_id, bias_id, &split_point)
                 .unwrap();
             let bias_mle = bias_field.to_mle();
-            let bias_eval = bias_mle.evaluate(&bias_point);
+            let bias_eval = bias_mle.evaluate(&bias_point).unwrap();
 
             let computed_broadcasted_eval = axes_mapping
                 .compute_bias_evaluation(

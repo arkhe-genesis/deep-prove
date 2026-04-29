@@ -1,14 +1,20 @@
 //! Code for proving an attention mask layer
-
 use anyhow::anyhow;
-use multilinear_extensions::mle::IntoMLE;
+
+use dp_crypto::{
+    IntoMLE,
+    poly::{dense::DensePolynomial, eq::evals},
+    structs::IOPProverState,
+    util::{ceil_log2, optimal_sumcheck_threads},
+    virtual_polys::VirtualPolynomialsBuilder,
+};
 
 use super::*;
 
-fn fix_mle_rec<E: ExtensionField, const FIX_ROW: bool>(
-    evals: &mut Vec<E>,
-    point: &[E],
-    acc: E,
+fn fix_mle_rec<F: PrimeField, const FIX_ROW: bool>(
+    evals: &mut Vec<F>,
+    point: &[F],
+    acc: F,
     eval_index: usize,
     num_bits: usize,
 ) {
@@ -20,18 +26,16 @@ fn fix_mle_rec<E: ExtensionField, const FIX_ROW: bool>(
     let c = point[num_bits];
     let update_acc = |new_bit| {
         if FIX_ROW {
-            acc * (E::ONE - new_bit - c + E::from_canonical_u64(2) * new_bit * c)
-                + (E::ONE - new_bit) * c
+            acc * (F::ONE - new_bit - c + F::from(2) * new_bit * c) + (F::ONE - new_bit) * c
         } else {
-            acc * (E::ONE - c - new_bit + E::from_canonical_u64(2) * c * new_bit)
-                + (E::ONE - c) * new_bit
+            acc * (F::ONE - c - new_bit + F::from(2) * c * new_bit) + (F::ONE - c) * new_bit
         }
     };
-    fix_mle_rec::<_, FIX_ROW>(evals, point, update_acc(E::ZERO), eval_index, num_bits + 1);
+    fix_mle_rec::<_, FIX_ROW>(evals, point, update_acc(F::ZERO), eval_index, num_bits + 1);
     fix_mle_rec::<_, FIX_ROW>(
         evals,
         point,
-        update_acc(E::ONE),
+        update_acc(F::ONE),
         eval_index | (1 << num_bits),
         num_bits + 1,
     );
@@ -39,33 +43,31 @@ fn fix_mle_rec<E: ExtensionField, const FIX_ROW: bool>(
 
 /// Optimized algorithm to fix the row variables of the MLE for the lower triangular matrix L
 #[cfg(test)]
-pub(crate) fn fix_lower_mle_rows<E: ExtensionField>(row_point: &[E]) -> Vec<E> {
-    let mut evals = vec![E::ZERO; 1 << row_point.len()];
-    fix_mle_rec::<E, true>(&mut evals, row_point, E::ONE, 0, 0);
+pub(crate) fn fix_lower_mle_rows<F: PrimeField>(row_point: &[F]) -> Vec<F> {
+    let mut evals = vec![F::ZERO; 1 << row_point.len()];
+    fix_mle_rec::<F, true>(&mut evals, row_point, F::ONE, 0, 0);
     evals
 }
 
 /// Optimized algorithm to fix the column variables of the MLE for the lower triangular matrix L
-pub(crate) fn fix_lower_mle_columns<E: ExtensionField>(column_point: &[E]) -> Vec<E> {
-    let mut evals = vec![E::ZERO; 1 << column_point.len()];
-    fix_mle_rec::<E, false>(&mut evals, column_point, E::ONE, 0, 0);
+pub(crate) fn fix_lower_mle_columns<F: PrimeField>(column_point: &[F]) -> Vec<F> {
+    let mut evals = vec![F::ZERO; 1 << column_point.len()];
+    fix_mle_rec::<F, false>(&mut evals, column_point, F::ONE, 0, 0);
     evals
 }
 
 impl AttentionMask<Element> {
-    pub(crate) fn prove_internal<E, PCS, T>(
+    pub(crate) fn prove_internal<F, PCS, T>(
         &self,
         _ctx: &AttentionMaskCtx,
-        mask_proving_data: MaskProvingData<E>,
+        mask_proving_data: MaskProvingData<F>,
         unpadded_seq_len: usize,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> Result<(AttentionMaskProof<E>, Vec<Claim<E>>)>
+        prover: &mut Prover<F, T, PCS>,
+    ) -> Result<(AttentionMaskProof<F>, Vec<Claim<F>>)>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
-        T: Transcript<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme<Field = F>,
+        T: Transcript,
     {
         let MaskProvingData {
             batching_challenges,
@@ -75,15 +77,15 @@ impl AttentionMask<Element> {
             input_shape,
         } = mask_proving_data;
         let num_vars = ceil_log2(eq_evals.len());
-        let eq_poly = MultilinearExtension::from_evaluations_ext_vec(num_vars, eq_evals);
+        let eq_poly = DensePolynomial::new(eq_evals);
         // Since the mask is square the padded seq_len is just 1 << (num_vars >> 1)
         let mask_polys = &self.make_mask_polys(1 << (num_vars >> 1));
         // These polys are used so that the sumcheck only takes into account the portions of the mask poly corresponding to non-padded areas
-        let (row_lt_poly, column_lt_poly) = self.make_row_column_lt_polys::<E>(unpadded_seq_len);
+        let (row_lt_poly, column_lt_poly) = self.make_row_column_lt_polys::<F>(unpadded_seq_len);
 
         let input_polys = input_polys
             .into_iter()
-            .map(|evals| MultilinearExtension::from_evaluations_ext_vec(num_vars, evals))
+            .map(|evals| DensePolynomial::new(evals))
             .collect::<Vec<_>>();
 
         // this flag specifies whether the mask matrix is decomposed or not in 2 matrices
@@ -105,7 +107,7 @@ impl AttentionMask<Element> {
         .collect::<Vec<_>>();
         let num_threads = optimal_sumcheck_threads(num_vars);
         let expr_builder =
-            VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
+            VirtualPolynomialsBuilder::<F>::new_with_mles(num_threads, num_vars, either_mles);
 
         let sumcheck_expression =
             self.build_sumcheck_expression(&input_shape, self.negative_infinity, decomposed_mask);
@@ -113,7 +115,7 @@ impl AttentionMask<Element> {
             &sumcheck_expression[..input_polys.len()],
             &batching_challenges,
         );
-        let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let (sumcheck_proof, state) = IOPProverState::<F>::prove(virtual_poly, prover.transcript);
         let evaluations = state.get_mle_flatten_final_evaluations()[4..].to_vec();
 
         let sumcheck_point = state.collect_raw_challenges();
@@ -123,13 +125,13 @@ impl AttentionMask<Element> {
             .iter()
             .zip(evaluations[decomposed_mask as usize..].iter()) // we need to skip the first evaluation in case of local attention mask,
             // as it refers to the additional mask polynomial
-            .fold(E::ZERO, |acc, (c, e)| acc + (*c) * (*e));
+            .fold(F::ZERO, |acc, (c, e)| acc + (*c) * (*e));
         let full_point = sumcheck_point
             .iter()
             .chain(batching_point.iter())
             .copied()
             .collect::<Vec<_>>();
-        let input_claim = vec![Claim::<E>::new(full_point, combined_eval)];
+        let input_claim = vec![Claim::<F>::new(full_point, combined_eval)];
 
         let local_mask_proof = if decomposed_mask {
             let AttentionSpan::Local(n) = self.span else {
@@ -152,9 +154,9 @@ impl AttentionMask<Element> {
             let fixed_upper_mle = fix_lower_mle_columns(row_point).into_mle();
             // now we need to fix the column variables for MLE of the shift matrix S, relying on its sparse structure
             // precompute the `\beta(i, column_point)` values for all possible columns indexes `i`
-            let beta_vec = compute_betas_eval(column_point);
+            let beta_vec = evals(column_point);
             let seq_len = 1 << num_col_vars;
-            let mut shift_fixed_evals = vec![E::ZERO; seq_len];
+            let mut shift_fixed_evals = vec![F::ZERO; seq_len];
             #[allow(clippy::needless_range_loop)]
             for row in n - 1..seq_len {
                 let col = row + 1 - n;
@@ -167,7 +169,7 @@ impl AttentionMask<Element> {
                 .map(Either::Left)
                 .collect::<Vec<_>>();
             let num_threads = optimal_sumcheck_threads(num_col_vars);
-            let expr_builder = VirtualPolynomialsBuilder::<E>::new_with_mles(
+            let expr_builder = VirtualPolynomialsBuilder::<F>::new_with_mles(
                 num_threads,
                 num_col_vars,
                 either_mles,
@@ -204,12 +206,8 @@ impl AttentionMask<Element> {
     /// since we never want to prove a single token inference with caching enabled.
     /// We always prove the full sequence length, without caching.
     /// However, the evaluation needs to support both cases.
-    fn make_mask_polys<E: ExtensionField>(
-        &self,
-        seq_len: usize,
-    ) -> Vec<MultilinearExtension<'_, E>> {
-        let num_vars = 2 * ceil_log2(seq_len);
-        let bool_mle_from_fn = |evals_fn: Box<dyn Fn(usize, usize) -> E::BaseField>| {
+    fn make_mask_polys<F: PrimeField>(&self, seq_len: usize) -> Vec<DensePolynomial<'_, F>> {
+        let bool_mle_from_fn = |evals_fn: Box<dyn Fn(usize, usize) -> F>| {
             let mut evals = vec![];
             for row in 0..seq_len {
                 for col in 0..seq_len {
@@ -218,29 +216,27 @@ impl AttentionMask<Element> {
                 }
             }
 
-            MultilinearExtension::from_evaluations_vec(num_vars, evals)
+            DensePolynomial::new(evals)
         };
 
-        let zeroifier_mle = bool_mle_from_fn(Box::new(|token, other| {
-            if token >= other {
-                E::BaseField::ONE
-            } else {
-                E::BaseField::ZERO
-            }
-        }));
+        let zeroifier_mle =
+            bool_mle_from_fn(Box::new(
+                |token, other| {
+                    if token >= other { F::ONE } else { F::ZERO }
+                },
+            ));
 
         if let AttentionSpan::Local(n) = &self.span {
             if *n >= seq_len {
                 // the second mask polynomial would be the identity matrix, so no need to compute it
                 return vec![zeroifier_mle];
             }
-            let local_mask_mle = bool_mle_from_fn(Box::new(|token, other| {
-                if token < other + *n {
-                    E::BaseField::ONE
-                } else {
-                    E::BaseField::ZERO
-                }
-            }));
+            let local_mask_mle =
+                bool_mle_from_fn(Box::new(
+                    |token, other| {
+                        if token < other + *n { F::ONE } else { F::ZERO }
+                    },
+                ));
             return vec![zeroifier_mle, local_mask_mle];
         }
 
@@ -248,61 +244,60 @@ impl AttentionMask<Element> {
     }
 
     /// Function to make the row and column less than polynomials for proving purposes
-    fn make_row_column_lt_polys<E: ExtensionField>(
+    fn make_row_column_lt_polys<F: PrimeField>(
         &self,
         unpadded_seq_len: usize,
-    ) -> (MultilinearExtension<'_, E>, MultilinearExtension<'_, E>) {
+    ) -> (DensePolynomial<'_, F>, DensePolynomial<'_, F>) {
         let padded_seq_len = unpadded_seq_len.next_power_of_two();
         // First we make the row less than evaluations
         let row_evals = (0..padded_seq_len)
             .map(|row_index| {
                 if row_index < unpadded_seq_len {
-                    E::BaseField::ONE
+                    F::ONE
                 } else {
-                    E::BaseField::ZERO
+                    F::ZERO
                 }
             })
             .cycle()
             .take(padded_seq_len * padded_seq_len)
-            .collect::<Vec<E::BaseField>>();
+            .collect::<Vec<F>>();
 
         // The column less than evaluations will be `unpadded_seq_len` rows of `padded_seq_len` ones followed by
         // `(padded_seq_len - unpadded_seq_len)` rows of `padded_seq_len` zeros
         let column_ones_count = unpadded_seq_len * padded_seq_len;
         let column_zeros_count = (padded_seq_len - unpadded_seq_len) * padded_seq_len;
-        let column_evals = std::iter::repeat_n(E::BaseField::ONE, column_ones_count)
-            .chain(std::iter::repeat_n(E::BaseField::ZERO, column_zeros_count))
-            .collect::<Vec<E::BaseField>>();
+        let column_evals = std::iter::repeat_n(F::ONE, column_ones_count)
+            .chain(std::iter::repeat_n(F::ZERO, column_zeros_count))
+            .collect::<Vec<F>>();
 
-        let num_vars = 2 * ceil_log2(unpadded_seq_len);
         (
-            MultilinearExtension::from_evaluations_vec(num_vars, row_evals),
-            MultilinearExtension::from_evaluations_vec(num_vars, column_evals),
+            DensePolynomial::new(row_evals),
+            DensePolynomial::new(column_evals),
         )
     }
 }
 
 #[derive(Debug, Clone)]
 /// Struct storing all information to prove the application of an attention mask correctly without having to do proving work on padded parts.
-pub(crate) struct MaskProvingData<E: ExtensionField> {
+pub(crate) struct MaskProvingData<F: PrimeField> {
     /// These values are the evaluations of the eq-poly for the higher dims that aren't from padding
-    batching_challenges: Vec<E>,
+    batching_challenges: Vec<F>,
     /// This is the point used to make the batch challenges
-    batching_point: Vec<E>,
+    batching_point: Vec<F>,
     /// This is evaluations of the eq-poly for each of the rank-2 tensors that the mask is applied to
-    eq_evals: Vec<E>,
+    eq_evals: Vec<F>,
     /// This list of evaluations are the rank-2 tensors forming the input that aren't padding parts
-    input_polys: Vec<Vec<E>>,
+    input_polys: Vec<Vec<F>>,
     input_shape: Shape,
 }
 
-impl<E: ExtensionField> MaskProvingData<E> {
+impl<F: PrimeField> MaskProvingData<F> {
     /// Create a new [`MaskProvingData`]
     pub fn new(
-        batching_challenges: Vec<E>,
-        batching_point: Vec<E>,
-        eq_evals: Vec<E>,
-        input_polys: Vec<Vec<E>>,
+        batching_challenges: Vec<F>,
+        batching_point: Vec<F>,
+        eq_evals: Vec<F>,
+        input_polys: Vec<Vec<F>>,
         input_shape: Shape,
     ) -> Self {
         MaskProvingData {
@@ -314,7 +309,7 @@ impl<E: ExtensionField> MaskProvingData<E> {
         }
     }
 
-    pub fn from_claims_and_input(claim: &Claim<E>, input: &Tensor<E>) -> Result<Self> {
+    pub fn from_claims_and_input(claim: &Claim<F>, input: &Tensor<F>) -> Result<Self> {
         let input_shape = input.shape().clone();
         let unpadded_shape = input.unpadded_shape();
         let rank = input_shape.rank();
@@ -329,10 +324,10 @@ impl<E: ExtensionField> MaskProvingData<E> {
             .chunks(chunk_size)
             .map(|chunk| {
                 let tensor =
-                    Tensor::<E>::new(vec![second_to_last_dim, final_dim].into(), chunk.to_vec())?;
+                    Tensor::<F>::new(vec![second_to_last_dim, final_dim].into(), chunk.to_vec())?;
                 Ok(tensor.pad_next_power_of_two().into_data())
             })
-            .collect::<Result<Vec<Vec<E>>>>()?;
+            .collect::<Result<Vec<Vec<F>>>>()?;
 
         // Split the last claim point into the points corresponding to each dimension
         let dim_points = input_shape.split_point(claim.point())?;
@@ -343,17 +338,17 @@ impl<E: ExtensionField> MaskProvingData<E> {
             .rev()
             .flat_map(|p| *p)
             .copied()
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
         let batching_challenges = dim_points[..rank - 2]
             .iter()
             .zip(unpadded_shape[..rank - 2].iter())
-            .fold(vec![E::ONE], |mut acc, (point_slice, dim)| {
-                let evals = compute_betas_eval(point_slice);
+            .fold(vec![F::ONE], |mut acc, (point_slice, dim)| {
+                let evals = evals(point_slice);
                 acc = acc
                     .into_iter()
-                    .flat_map(|c| evals.iter().take(*dim).map(|e| c * *e).collect::<Vec<E>>())
-                    .collect::<Vec<E>>();
+                    .flat_map(|c| evals.iter().take(*dim).map(|e| c * *e).collect::<Vec<F>>())
+                    .collect::<Vec<F>>();
                 acc
             });
 
@@ -362,12 +357,12 @@ impl<E: ExtensionField> MaskProvingData<E> {
             .rev()
             .flat_map(|p| *p)
             .copied()
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
         Ok(MaskProvingData::new(
             batching_challenges,
             batching_point,
-            compute_betas_eval(&eq_point),
+            evals(&eq_point),
             input_polys,
             input_shape,
         ))
@@ -377,9 +372,8 @@ impl<E: ExtensionField> MaskProvingData<E> {
 #[cfg(test)]
 mod tests {
     use anyhow::ensure;
-    use ff_ext::GoldilocksExt2;
-    use multilinear_extensions::mle::MultilinearExtension;
-    use p3_field::{FieldAlgebra, FieldExtensionAlgebra};
+    use ark_ff::{AdditiveGroup, Field};
+    use dp_crypto::poly::{dense::DensePolynomial, slice::SmartSlice};
 
     use crate::{
         Element, Shape, Tensor,
@@ -393,7 +387,7 @@ mod tests {
         testing::random_field_vector,
     };
 
-    type E = GoldilocksExt2;
+    type F = ark_bn254::Fr;
 
     #[test]
     fn test_fix_lower_mle() -> anyhow::Result<()> {
@@ -404,27 +398,21 @@ mod tests {
         for row in 0..(1 << num_row_vars) {
             for col in 0..(1 << num_col_vars) {
                 if row >= col {
-                    lower_evals.push(E::ONE)
+                    lower_evals.push(F::ONE)
                 } else {
-                    lower_evals.push(E::ZERO)
+                    lower_evals.push(F::ZERO)
                 }
             }
             for col in 0..(1 << num_col_vars) {
                 if row <= col {
-                    upper_evals.push(E::ONE)
+                    upper_evals.push(F::ONE)
                 } else {
-                    upper_evals.push(E::ZERO)
+                    upper_evals.push(F::ZERO)
                 }
             }
         }
-        let lower_mle = MultilinearExtension::<E>::from_evaluations_ext_slice(
-            num_row_vars + num_col_vars,
-            &lower_evals,
-        );
-        let upper_mle = MultilinearExtension::<E>::from_evaluations_ext_slice(
-            num_row_vars + num_col_vars,
-            &upper_evals,
-        );
+        let lower_mle = DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(&lower_evals));
+        let upper_mle = DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(&upper_evals));
 
         let row_point = random_field_vector(num_row_vars);
 
@@ -432,44 +420,32 @@ mod tests {
 
         let fixed_lower_evals = fix_lower_mle_rows(&row_point);
         let custom_fixed_lower_mle =
-            MultilinearExtension::<E>::from_evaluations_ext_slice(num_col_vars, &fixed_lower_evals);
-        assert_eq!(
-            fixed_lower_mle.evaluations(),
-            custom_fixed_lower_mle.evaluations(),
-        );
+            DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(&fixed_lower_evals));
+        assert_eq!(fixed_lower_mle.evals(), custom_fixed_lower_mle.evals(),);
 
         // test fixing columns in lower triangular MLE
         let column_point = random_field_vector(num_col_vars);
-        let fixed_lower_mle = lower_mle.fix_variables(&column_point);
+        let fixed_lower_mle = lower_mle.fix_low_variables(&column_point);
 
         let fixed_lower_evals = fix_lower_mle_columns(&column_point);
         let custom_fixed_lower_mle =
-            MultilinearExtension::<E>::from_evaluations_ext_slice(num_row_vars, &fixed_lower_evals);
-        assert_eq!(
-            fixed_lower_mle.evaluations(),
-            custom_fixed_lower_mle.evaluations(),
-        );
+            DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(&fixed_lower_evals));
+        assert_eq!(fixed_lower_mle.evals(), custom_fixed_lower_mle.evals(),);
 
         // test fixing rows in upper triangular MLE
         let fixed_upper_mle = upper_mle.fix_high_variables(&row_point);
         let fixed_upper_evals = fix_lower_mle_columns(&row_point);
         let custom_fixed_upper_mle =
-            MultilinearExtension::<E>::from_evaluations_ext_slice(num_col_vars, &fixed_upper_evals);
-        assert_eq!(
-            fixed_upper_mle.evaluations(),
-            custom_fixed_upper_mle.evaluations(),
-        );
+            DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(&fixed_upper_evals));
+        assert_eq!(fixed_upper_mle.evals(), custom_fixed_upper_mle.evals(),);
 
         // test fixing columns in upper triangular MLE
-        let fixed_upper_mle = upper_mle.fix_variables(&column_point);
+        let fixed_upper_mle = upper_mle.fix_low_variables(&column_point);
 
         let fixed_upper_evals = fix_lower_mle_rows(&column_point);
         let custom_fixed_upper_mle =
-            MultilinearExtension::<E>::from_evaluations_ext_slice(num_row_vars, &fixed_upper_evals);
-        assert_eq!(
-            fixed_upper_mle.evaluations(),
-            custom_fixed_upper_mle.evaluations(),
-        );
+            DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(&fixed_upper_evals));
+        assert_eq!(fixed_upper_mle.evals(), custom_fixed_upper_mle.evals(),);
 
         Ok(())
     }
@@ -500,7 +476,7 @@ mod tests {
         let masked_tensor = wrapped_tensor.mask_fill(bool_mask, 0)?.to_native();
 
         // make_mask_polys returns [lower_tri_mle, offset_mle] for Local(n < seq_len)
-        let mask_polys = mask_layer.make_mask_polys::<E>(seq_len);
+        let mask_polys = mask_layer.make_mask_polys::<F>(seq_len);
         assert_eq!(
             mask_polys.len(),
             2,
@@ -508,12 +484,12 @@ mod tests {
         );
 
         let combined_poly_data = mask_polys[0]
-            .get_base_field_vec()
+            .evals()
             .iter()
-            .zip(mask_polys[1].get_base_field_vec().iter())
+            .zip(mask_polys[1].evals().iter())
             .map(|(&a, &b)| {
-                let a = E::from_base(a).to_element();
-                let b = E::from_base(b).to_element();
+                let a = a.to_element();
+                let b = b.to_element();
                 a * b
             })
             .collect::<Vec<Element>>();

@@ -39,7 +39,7 @@ mod tests {
         testing::Pcs,
     };
 
-    use ff_ext::GoldilocksExt2;
+    type F = ark_bn254::Fr;
 
     use super::*;
 
@@ -600,21 +600,19 @@ mod tests {
             .into_provable_llm_with_transform::<M>(&tokenizer)?;
 
         driver.model.describe();
-        let (prover_ctx, verifier_ctx) = driver
-            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
-            .with_max_context(MAX_CONTEXT);
+        let (prover_ctx, verifier_ctx) = driver.context::<F, Pcs>()?.with_max_context(MAX_CONTEXT);
 
         let user_tokens = driver.random_sequence(MAX_CONTEXT - 2);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
         let mut store = GenStore::default();
 
         let trace = driver.run_elements(input_tensor, &mut store)?;
-        let io = trace.to_verifier_io()?;
-        let proof = driver.chunked_prove_default_executor(
+        let chunking_strategy = LLMChunkingStrategy::from((&trace, &prover_ctx.model_ctx));
+        let (proof, io) = driver.chunked_prove_default_executor(
             &prover_ctx,
             trace,
             Some(1),
-            LLMChunkingStrategy,
+            chunking_strategy,
         )?;
 
         // Serialize the proof

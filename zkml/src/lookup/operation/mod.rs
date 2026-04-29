@@ -28,17 +28,10 @@ use crate::{
 
 use anyhow::{Result, anyhow, bail, ensure};
 
+use ark_ff::PrimeField;
 use either::Either;
-use ff_ext::ExtensionField;
 
-use multilinear_extensions::{
-    Expression,
-    mle::{IntoMLE, MultilinearExtension},
-    util::ceil_log2,
-};
 use std::{collections::HashMap, sync::Arc};
-use sumcheck::structs::IOPProof;
-use transcript::Transcript;
 
 pub mod decomposer;
 pub mod generic_prove;
@@ -276,31 +269,28 @@ impl LookupOpWitness {
         ]
     }
 
-    pub fn input_mle_evals<E: ExtensionField>(
-        &self,
-        num_value_columns: usize,
-    ) -> Vec<Vec<E::BaseField>> {
+    pub fn input_mle_evals<F: PrimeField>(&self, num_value_columns: usize) -> Vec<Vec<F>> {
         self.chunked_inputs
             .iter()
-            .flat_map(|chunked_input| chunked_input.to_evals::<E>(num_value_columns))
+            .flat_map(|chunked_input| chunked_input.to_evals::<F>(num_value_columns))
             .collect()
     }
 
-    pub fn output_mle_evals<E: ExtensionField>(&self) -> Vec<Vec<E::BaseField>> {
+    pub fn output_mle_evals<F: PrimeField>(&self) -> Vec<Vec<F>> {
         self.chunked_outputs
             .iter()
-            .flat_map(|chunked_output| chunked_output.to_evals::<E>())
+            .flat_map(|chunked_output| chunked_output.to_evals::<F>())
             .collect()
     }
 }
 
 /// Function that given a [`LookupOp`], the unpadded input [`Shape`] and the evaluation point computes
 /// the value that needs to be subtracted from the input [`Claim`] to remove the lookup padding value.
-pub fn compute_lookup_padding_evaluation<E: ExtensionField>(
-    padding_value: E,
+pub fn compute_lookup_padding_evaluation<F: PrimeField>(
+    padding_value: F,
     unpadded_input_shape: &Shape,
-    dim_points: &[&[E]],
-) -> Result<E> {
+    dim_points: &[&[F]],
+) -> Result<F> {
     let rank = unpadded_input_shape.rank();
 
     if unpadded_input_shape
@@ -309,7 +299,7 @@ pub fn compute_lookup_padding_evaluation<E: ExtensionField>(
         .all(|d| d.is_power_of_two())
     {
         // If all dimensions are powers of two then the padding evaluation is just the zero tensor evaluation which is zero
-        return Ok(E::ZERO);
+        return Ok(F::ZERO);
     }
 
     let unbroadcast_shape = unpadded_input_shape
@@ -331,10 +321,10 @@ pub fn compute_lookup_padding_evaluation<E: ExtensionField>(
     };
 
     let last_dim_lt_eval = if last_dim.is_power_of_two() {
-        E::ZERO
+        F::ZERO
     } else {
         let last_dim_lt_eval = evaluate_dim_lt_poly(dim_points[rank - 1], last_dim)?;
-        E::ONE - last_dim_lt_eval
+        F::ONE - last_dim_lt_eval
     };
 
     let final_eval = match second_last_dim {
@@ -343,7 +333,7 @@ pub fn compute_lookup_padding_evaluation<E: ExtensionField>(
         d => {
             let second_last_dim_lt_eval = evaluate_dim_lt_poly(dim_points[rank - 2], d)?;
             leading_lt_eval
-                * (second_last_dim_lt_eval * last_dim_lt_eval + (E::ONE - second_last_dim_lt_eval))
+                * (second_last_dim_lt_eval * last_dim_lt_eval + (F::ONE - second_last_dim_lt_eval))
         }
     } * padding_value;
 
@@ -352,11 +342,12 @@ pub fn compute_lookup_padding_evaluation<E: ExtensionField>(
 
 #[cfg(test)]
 pub(crate) mod lookup_test_utils {
-    use crate::{graph::NodeId, rng_from_env_or_random, to_base};
-    use ark_std::{UniformRand, rand::Rng};
+    use crate::{graph::NodeId, rng_from_env_or_random};
+    use ark_ff::UniformRand;
+    use ark_std::rand::Rng;
     use itertools::{Itertools, izip};
 
-    use ff_ext::GoldilocksExt2 as F;
+    use ark_bn254::Fr as F;
 
     use super::*;
 
@@ -404,9 +395,9 @@ pub(crate) mod lookup_test_utils {
                 .map(|_| F::rand(&mut rng))
                 .collect::<Vec<F>>();
 
-            let input_mle = to_base::<F, _>(input_tensor.data()).into_mle();
+            let input_mle = input_tensor.to_field().into_mle();
 
-            let mle_eval = input_mle.evaluate(&point);
+            let mle_eval = input_mle.evaluate(&point).unwrap();
 
             let dim_points = input_tensor.shape().split_point(&point).unwrap();
             let padding_eval = compute_lookup_padding_evaluation(

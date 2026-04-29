@@ -1,9 +1,9 @@
 //! Module that takes care of (re)quantizing
 mod metadata;
 mod strategy;
+use ark_ff::{BigInteger, PrimeField};
 use derive_more::From;
-use ff_ext::{ExtensionField, SmallField};
-use multilinear_extensions::util::ceil_log2;
+use dp_crypto::util::ceil_log2;
 use serde::{Deserialize, Serialize};
 use std::{env, sync::LazyLock};
 use tracing::trace;
@@ -221,46 +221,52 @@ pub trait ToField<F> {
     fn to_field(&self) -> F;
 }
 
-impl<F: ExtensionField> ToField<F> for Element {
-    fn to_field(&self) -> F {
-        if self.is_negative() {
-            // Doing wrapped arithmetic : p-128 ... p-1 means negative number
-            F::from_canonical_u64(<F::BaseField as SmallField>::MODULUS_U64 - self.unsigned_abs())
-        } else {
-            // for positive and zero, it's just the number
-            F::from_canonical_u64(*self as u64)
-        }
-    }
-}
-
 /// Trait to convert a field element to its base.
 ///
 /// The [From] and [Into] traits can not be used because of the orphan rules, it
 /// is not allowed to implement a foreign trait for a foreign type.
-pub(crate) trait ToElement {
+pub trait ToElement {
     fn to_element(&self) -> Element;
 }
 
-impl<F: ExtensionField> ToElement for F {
+impl<F: PrimeField> ToElement for F {
     fn to_element(&self) -> Element {
-        let e = self.to_canonical_u64_vec()[0];
-        let modulus_half = <F::BaseField as SmallField>::MODULUS_U64 >> 1;
-        // That means he's a positive number
-        if *self == F::ZERO {
-            0
-        // we dont assume any bounds on the field elements, requant might happen at a later stage
-        // so we assume the worst case
-        } else if e <= modulus_half {
-            e as Element
+        let int_f: F::BigInt = (*self).into();
+        let modulus_half = F::MODULUS_MINUS_ONE_DIV_TWO;
+        let is_negative = int_f > modulus_half;
+        let abs = if is_negative {
+            // it's a negative number, so we compute the difference with F::MODULUS
+            let mut abs = F::MODULUS;
+            assert!(
+                !abs.sub_with_borrow(&int_f),
+                "Field element cannot be greater than modulus"
+            );
+            abs
         } else {
-            // That means he's a negative number - so take the diff with the modulus and recenter around 0
-            let diff = <F::BaseField as SmallField>::MODULUS_U64 - e;
-            -(diff as Element)
-        }
+            int_f
+        };
+        // check that `abs` fits in `Element`
+        assert!(
+            abs <= F::BigInt::from(Element::MAX as u64),
+            "Trying to convert to Element a field element grater than Element::MAX: {self}"
+        );
+        let num_bytes = (Element::BITS / 8) as usize;
+        let abs_el = Element::from_le_bytes(
+            abs.to_bytes_le()[0..num_bytes]
+                .try_into()
+                .expect("Cannot fit into Element"),
+        );
+        if is_negative { -abs_el } else { abs_el }
     }
 }
 
-impl<F: ExtensionField, T> ToField<Vec<F>> for [T]
+impl<F: PrimeField> ToField<F> for Element {
+    fn to_field(&self) -> F {
+        F::from(*self)
+    }
+}
+
+impl<F, T> ToField<Vec<F>> for [T]
 where
     T: ToField<F>,
 {
@@ -269,7 +275,7 @@ where
     }
 }
 
-impl<F: ExtensionField, T> ToField<Tensor<F>> for Tensor<T>
+impl<F, T> ToField<Tensor<F>> for Tensor<T>
 where
     T: ToField<F>,
 {
@@ -282,7 +288,7 @@ where
     }
 }
 
-impl<'a, F: ExtensionField, T> ToField<Tensor<F>> for TensorSlice<'a, T>
+impl<'a, F: PrimeField, T> ToField<Tensor<F>> for TensorSlice<'a, T>
 where
     T: ToField<F>,
 {
@@ -421,7 +427,7 @@ mod test {
     use crate::Element;
 
     use super::{MAX, MIN};
-    type F = ff_ext::GoldilocksExt2;
+    type F = ark_bn254::Fr;
 
     #[test]
     fn test_wrapped_arithmetic() {

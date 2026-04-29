@@ -1,9 +1,8 @@
 //! This module contains the [`ChunkingInfo`] struct and its associated methods.
 //! This is used for general chunking of input values for lookup operations.
 
-use crate::{
-    lookup::table::{SHIFT_CHECK_TABLE_BIT_SIZE, TableSign, TableType, ZERO_CHECK_TABLE_BIT_SIZE},
-    to_base,
+use crate::lookup::table::{
+    SHIFT_CHECK_TABLE_BIT_SIZE, TableSign, TableType, ZERO_CHECK_TABLE_BIT_SIZE,
 };
 
 use super::*;
@@ -67,20 +66,20 @@ impl ChunkedInput {
         }
     }
 
-    pub fn to_evals<E: ExtensionField>(&self, num_value_columns: usize) -> Vec<Vec<E::BaseField>> {
+    pub fn to_evals<F: PrimeField>(&self, num_value_columns: usize) -> Vec<Vec<F>> {
         let mut evals = Vec::with_capacity(
             self.shifted_chunks.len() + (num_value_columns - 1) + self.zeroing_chunks.len(),
         );
         for chunk in &self.shifted_chunks {
-            evals.push(to_base::<E, _>(chunk));
+            evals.push(chunk.to_field());
         }
         if num_value_columns != 1 {
             for chunk in &self.value_chunks {
-                evals.push(to_base::<E, _>(chunk));
+                evals.push(chunk.to_field());
             }
         }
         for chunk in &self.zeroing_chunks {
-            evals.push(to_base::<E, _>(chunk));
+            evals.push(chunk.to_field());
         }
         evals
     }
@@ -134,13 +133,13 @@ impl ChunkedOutput {
         }
     }
 
-    pub fn to_evals<E: ExtensionField>(&self) -> Vec<Vec<E::BaseField>> {
+    pub fn to_evals<F: PrimeField>(&self) -> Vec<Vec<F>> {
         let mut evals = Vec::new();
         for chunk in &self.value_chunk_outputs {
-            evals.push(to_base::<E, _>(chunk));
+            evals.push(chunk.to_field());
         }
         for chunk in &self.zeroing_chunk_outputs {
-            evals.push(to_base::<E, _>(chunk));
+            evals.push(chunk.to_field());
         }
         evals
     }
@@ -429,40 +428,42 @@ impl ChunkingInfo {
     }
 
     /// Function to recombine input claims
-    pub fn combine_input_claims<E: ExtensionField>(
+    pub fn combine_input_claims<F: PrimeField>(
         &self,
-        shifted_claims: &[E],
-        value_claims: &[E],
-        zeroing_claims: &[E],
-    ) -> E {
+        shifted_claims: &[F],
+        value_claims: &[F],
+        zeroing_claims: &[F],
+    ) -> F {
         let offset_val =
             shifted_claims
                 .iter()
                 .enumerate()
-                .fold(E::ZERO, |acc, (j, &chunk_claim)| {
+                .fold(F::ZERO, |acc, (j, &chunk_claim)| {
                     let shift_amount = j * SHIFT_CHECK_TABLE_BIT_SIZE;
-                    let shift_value_field = E::from_canonical_u64(1u64 << shift_amount);
+                    let shift_value_field = F::from(1u64 << shift_amount);
                     if j != self.number_of_shifted_chunks - 1
                         || self.right_shift.is_multiple_of(SHIFT_CHECK_TABLE_BIT_SIZE)
                     {
                         acc + (chunk_claim * shift_value_field)
                     } else {
                         let shifted_chunk_multiplier_field =
-                            E::from_canonical_u64(self.shifted_chunk_multiplier as u64);
-                        let inv = shifted_chunk_multiplier_field.inverse();
+                            F::from(self.shifted_chunk_multiplier as u64);
+                        let inv = shifted_chunk_multiplier_field
+                            .inverse()
+                            .expect("Tried to invert 0 when inverting shifted chunk multiplier");
                         acc + ((chunk_claim * inv) * shift_value_field)
                     }
                 });
-        let right_shift_field = E::from_canonical_u64(1u64 << self.right_shift);
-        let value_chunk_offset_field: E = self.value_chunk_offset.to_field();
+        let right_shift_field = F::from(1u64 << self.right_shift);
+        let value_chunk_offset_field: F = self.value_chunk_offset.to_field();
 
         let combined_value =
             value_claims
                 .iter()
                 .enumerate()
-                .fold(E::ZERO, |acc, (j, &value_claim)| {
+                .fold(F::ZERO, |acc, (j, &value_claim)| {
                     let shift_amount = j * self.value_chunk_size;
-                    let shift_value_field = E::from_canonical_u64(1u64 << shift_amount);
+                    let shift_value_field = F::from(1u64 << shift_amount);
                     let reconstructed_value = match self.table.table_sign() {
                         TableSign::Mixed => value_claim + value_chunk_offset_field,
                         TableSign::Positive => value_claim,
@@ -481,15 +482,15 @@ impl ChunkingInfo {
                     let shift_amount = self.value_chunk_size * self.number_of_value_chunks
                         + self.right_shift
                         + j * ZERO_CHECK_TABLE_BIT_SIZE;
-                    let shift_value_field = E::from_canonical_u64(1u64 << shift_amount);
+                    let shift_value_field = F::from(1u64 << shift_amount);
                     if j != self.number_of_zeroing_chunks - 1 || !self.is_signed {
                         acc + (chunk_claim * shift_value_field)
                     } else {
-                        let top_chunk_offset_field: E = self.top_zeroing_chunk_offset.to_field();
+                        let top_chunk_offset_field: F = self.top_zeroing_chunk_offset.to_field();
                         acc + ((chunk_claim + top_chunk_offset_field) * shift_value_field)
                     }
                 });
-        let offset_field: E = self.offset.to_field();
+        let offset_field: F = self.offset.to_field();
         match self.table.table_sign() {
             TableSign::Mixed => full_offset_val - offset_field,
             TableSign::Positive => full_offset_val,
@@ -595,7 +596,7 @@ mod tests {
     use crate::quantization::ToElement;
 
     use super::*;
-    use ff_ext::GoldilocksExt2 as F;
+    use ark_bn254::Fr as F;
     use proptest::prelude::*;
 
     impl ChunkingInfo {
@@ -752,24 +753,24 @@ mod tests {
         )
     }
 
-    type Decomposed<E> = (Vec<Vec<E>>, Vec<Vec<E>>, Vec<Vec<E>>);
+    type Decomposed<F> = (Vec<Vec<F>>, Vec<Vec<F>>, Vec<Vec<F>>);
     impl ChunkedInput {
-        fn to_field<E: ExtensionField>(&self) -> Decomposed<E> {
+        fn to_field<F: PrimeField>(&self) -> Decomposed<F> {
             let shifted = self
                 .shifted_chunks
                 .iter()
-                .map(|chunk| chunk.iter().map(|&v| v.to_field()).collect::<Vec<E>>())
-                .collect::<Vec<Vec<E>>>();
+                .map(|chunk| chunk.iter().map(|&v| v.to_field()).collect::<Vec<F>>())
+                .collect::<Vec<Vec<F>>>();
             let value = self
                 .value_chunks
                 .iter()
-                .map(|chunk| chunk.iter().map(|&v| v.to_field()).collect::<Vec<E>>())
-                .collect::<Vec<Vec<E>>>();
+                .map(|chunk| chunk.iter().map(|&v| v.to_field()).collect::<Vec<F>>())
+                .collect::<Vec<Vec<F>>>();
             let zero = self
                 .zeroing_chunks
                 .iter()
-                .map(|chunk| chunk.iter().map(|&v| v.to_field()).collect::<Vec<E>>())
-                .collect::<Vec<Vec<E>>>();
+                .map(|chunk| chunk.iter().map(|&v| v.to_field()).collect::<Vec<F>>())
+                .collect::<Vec<Vec<F>>>();
             (shifted, value, zero)
         }
     }

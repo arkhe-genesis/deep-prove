@@ -1,16 +1,24 @@
+use std::{fs::File, io::Write};
+
 use anyhow::bail;
+use ark_bn254::Bn254;
 use clap::{ArgGroup, Parser, ValueEnum, builder::ArgPredicate};
-use ff_ext::GoldilocksExt2;
+#[cfg(not(feature = "cuda"))]
+use dp_crypto::arkyper::HyperKZG;
+#[cfg(feature = "cuda")]
+use dp_crypto::arkyper::hyperkzg_gpu::HyperKZGGpu;
 use libc::{RUSAGE_SELF, getrusage, rusage};
-use mpcs::{Basefold, BasefoldRSParams};
 use tenstore::GenStore;
 use timed_core::Output;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use zkml::{
     ProverContext,
     measure::{self, Measure},
-    model::llm::{Driver, LLMVerifierContext, WithMaxContext},
+    model::{
+        exec_graph::InferenceEngine,
+        llm::{Driver, LLMVerifierContext, WithMaxContext},
+    },
     parser::{
         file_cache,
         gguf::RawGGUF,
@@ -23,9 +31,12 @@ use zkml::{
     },
 };
 
-type F = GoldilocksExt2;
+type F = ark_bn254::Fr;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
-type Pcs<E> = Basefold<E, BasefoldRSParams>;
+#[cfg(not(feature = "cuda"))]
+type Pcs = HyperKZG<Bn254>;
+#[cfg(feature = "cuda")]
+type Pcs = HyperKZGGpu<Bn254>;
 
 #[derive(Clone, Debug, ValueEnum)]
 #[clap(rename_all = "lower")]
@@ -90,6 +101,7 @@ struct LLMArgs {
     #[arg(
         long,
         default_value_if("distributed", ArgPredicate::IsPresent, Some("bench_distributed.csv")),
+        default_value_if("measure_layerwise", ArgPredicate::IsPresent, Some("bench_layerwise.csv")),
         default_value = "bench.csv" // Optional: what to use if NOT distributed
     )]
     bench: String,
@@ -107,6 +119,26 @@ struct LLMArgs {
     /// Use improved accuracy model quantisation and transforms
     #[arg(long, default_value_t = false)]
     accuracy: bool,
+
+    /// basename of the param files to use for the prover and verifier.
+    /// e.g. "--params setup" will search for "setup.pk" and "setup.vk" in the current directory.
+    #[arg(long)]
+    load_params: Option<String>,
+
+    /// Basename of the prover and verifier context files to save.
+    /// e.g. "--save_params setup" will save the prover and verifier context to "setup.pk" and "setup.vk" in the current directory.
+    #[arg(long)]
+    save_params: Option<String>,
+
+    #[arg(long)]
+    memory: bool,
+
+    #[arg(long, requires = "distributed")]
+    num_chunks: Option<usize>,
+
+    /// Measure layer-wise metrics
+    #[arg(long, default_value_t = false)]
+    measure_layerwise: bool,
 }
 
 const HEADER_MODEL: &str = "model_name";
@@ -173,6 +205,10 @@ fn main() -> anyhow::Result<()> {
     let mut premeasure = Measure::new()
         .with(HEADER_MODEL, &args.model.to_string())
         .with(HEADER_NUM_THREADS, &num_threads.to_string());
+    if args.measure_layerwise {
+        premeasure = premeasure.enable_layerwise_measures();
+    }
+    info!("Converting model into provable model...");
     let (mut driver, _metadata) = if !args.accuracy {
         premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?
     } else {
@@ -186,8 +222,45 @@ fn main() -> anyhow::Result<()> {
             Model::Llama2 => premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?,
         }
     };
-    let (prover_ctx, mut verifier_ctx): (ProverContext<F, Pcs<F>>, LLMVerifierContext<F, Pcs<F>>) =
-        premeasure.r(HEADER_CONTEXT_GENERATION, || driver.context())?;
+
+    let (prover_ctx, mut verifier_ctx) = if let Some(ref params) = args.load_params {
+        info!("Loading proving contexts from {params}.pk and {params}.vk...");
+        let prover_ctx = bincode::serde::decode_from_slice(
+            &std::fs::read(format!("{params}.pk"))?,
+            bincode::config::standard(),
+        )?
+        .0;
+        let verifier_ctx = bincode::serde::decode_from_slice(
+            &std::fs::read(format!("{params}.vk"))?,
+            bincode::config::standard(),
+        )?
+        .0;
+        // set to 0 since we're not spending any time generating it
+        premeasure.r(HEADER_CONTEXT_GENERATION, || 0);
+        (prover_ctx, verifier_ctx)
+    } else {
+        info!("Generating proving contexts...");
+        let (prover_ctx, verifier_ctx): (ProverContext<F, Pcs>, LLMVerifierContext<F, Pcs>) =
+            premeasure.r(HEADER_CONTEXT_GENERATION, || driver.context())?;
+        (prover_ctx, verifier_ctx)
+    };
+
+    if let Some(ref save_params) = args.save_params {
+        if args.load_params.is_some() {
+            bail!("Cannot save parameters if loading parameters is also specified");
+        }
+        info!("Saving proving contexts to {save_params}.pk and {save_params}.vk...");
+        let mut io = File::create(format!("{save_params}.pk"))?;
+        io.write_all(&bincode::serde::encode_to_vec(
+            &prover_ctx,
+            bincode::config::standard(),
+        )?)?;
+        let mut io = File::create(format!("{save_params}.vk"))?;
+        io.write_all(&bincode::serde::encode_to_vec(
+            &verifier_ctx,
+            bincode::config::standard(),
+        )?)?;
+    }
 
     for (user_prompt, max_ctx) in sequence {
         // make a new measure for each trial, but always keep the initial measurements for each sample
@@ -199,35 +272,72 @@ fn main() -> anyhow::Result<()> {
         driver.with_max_context(max_ctx);
         let user_tokens = driver.random_sequence(user_prompt);
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
-        let trace = measure::r(HEADER_INFERENCE_TIME, || {
-            driver.run_elements(input_tensor, &mut GenStore::default())
-        })?;
-
-        let (proof, io) = if args.distributed {
-            distributed::run_distributed(trace, &driver, &prover_ctx)?
+        let (trace, chunks) = if args.distributed {
+            let (chunks, split_node_info) = prover_ctx.split_in_chunks(
+                args.num_chunks,
+                driver.chunking_strategy(&input_tensor, &prover_ctx)?,
+            )?;
+            let engine = InferenceEngine::LLM(driver);
+            let trace = measure::r(HEADER_INFERENCE_TIME, || {
+                info!("Running inference...");
+                engine.run(
+                    vec![input_tensor],
+                    &mut GenStore::default(),
+                    &split_node_info,
+                )
+            })?;
+            driver = match engine {
+                InferenceEngine::LLM(driver) => driver,
+                _ => bail!("Expected LLM engine"),
+            };
+            (trace, Some(chunks))
         } else {
-            let io = trace.to_verifier_io()?;
+            (
+                measure::r(HEADER_INFERENCE_TIME, || {
+                    info!("Running inference...");
+                    driver.run_elements(input_tensor, &mut GenStore::default())
+                })?,
+                None,
+            )
+        };
+
+        if args.memory {
+            info!(
+                "Running memory profiler - will save into {:?}",
+                std::env::var("FLAMEGRAPH")
+            );
+            utils::track::flame_graph_enable();
+        }
+        let (proof, io) = if args.distributed {
+            info!("Running distributed proving locally...");
+            distributed::run_distributed(trace, &driver, &prover_ctx, chunks.unwrap())?
+        } else {
             let peak_rss = peak_rss_bytes();
-            let proof = driver.prove(&prover_ctx, trace)?;
+            info!("Running proving locally...");
+            let (proof, io) = driver.prove(&prover_ctx, trace)?;
             let new_peak_rss = peak_rss_bytes();
-            if new_peak_rss > peak_rss {
-                // new_peak_rss is the peak memory consumption during proving
-                measure::set(
-                    "prove_full_memory_peak",
-                    (new_peak_rss / 1024 / 1024).to_string(),
+            if new_peak_rss == peak_rss {
+                warn!(
+                    "Cannot reliably measure peak memory consumption during proving, setting upper bound"
                 );
-            } else {
-                // cannot reliably measure peak memory consumption
-                measure::set("prove_full_memory_peak", "NaN".to_string());
             }
+            // new_peak_rss is the peak memory consumption during proving
+            measure::set(
+                "prove_full_memory_peak",
+                (new_peak_rss / 1024 / 1024).to_string(),
+            );
 
             (proof, io)
         };
+        if args.memory {
+            utils::track::flame_graph();
+        }
 
         let proof_size = rmp_serde::to_vec(&proof)?.len();
         measure::set(HEADER_PROOF_SIZE, proof_size);
 
         verifier_ctx = verifier_ctx.with_max_context(max_ctx);
+        info!("Verifying proof...");
         verifier_ctx
             .verify(proof, user_tokens, io)
             .expect("invalid proof");
@@ -316,8 +426,8 @@ mod distributed {
 
     use super::*;
     use anyhow::{anyhow, ensure};
+    use dp_crypto::arkyper::transcript::blake3::Blake3Transcript;
     use tracing::debug;
-    use transcript::BasicTranscript;
 
     use zkml::{
         Element, IO, Proof, Prover,
@@ -327,16 +437,16 @@ mod distributed {
             scheduler::ExecGraph,
         },
         iop::{
-            chunking::LLMChunkingStrategy,
+            chunking::ModelChunk,
             prover_graph::{LocalProverCtx, ProverGraphIO, ProverGraphNode},
         },
         model::Trace,
     };
 
-    pub type T = BasicTranscript<F>;
+    pub type T = Blake3Transcript;
 
     // Type of nodes of the graph to execute
-    pub type Node<'a, 'b> = ProverGraphNode<'a, 'b, F, T, Pcs<F>>;
+    pub type Node<'a, 'b> = ProverGraphNode<'a, 'b, F, T, Pcs>;
 
     // Type of execution graph to be partitioned and executed in the workers
     pub type Graph<'a, 'b> = ExecGraph<Node<'a, 'b>, Color>;
@@ -413,11 +523,11 @@ mod distributed {
     pub(super) fn run_distributed(
         full_trace: Trace<Element>,
         driver: &Driver<Element>,
-        prover_ctx: &ProverContext<F, Pcs<F>>,
-    ) -> anyhow::Result<(Proof<F, Pcs<F>>, IO<F>)> {
+        prover_ctx: &ProverContext<F, Pcs>,
+        chunks: Vec<ModelChunk>,
+    ) -> anyhow::Result<(Proof<F, Pcs>, IO<F>)> {
         let io = full_trace.to_verifier_io()?;
 
-        let chunks = prover_ctx.split_in_chunks(None, LLMChunkingStrategy)?;
         let graph: Graph = Prover::build_execution_graph(chunks)?;
 
         let inputs = Prover::graph_inputs(full_trace, &graph)?;
@@ -448,18 +558,21 @@ mod distributed {
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
 
         let mut final_outputs = Vec::new();
-        let mut max_peak_rss = 0;
+        let peak_rss = peak_rss_bytes();
         while !schedulers.is_empty() {
-            let peak_rss = peak_rss_bytes();
             if let Some(final_output) = run_next_partition(&mut schedulers)? {
                 final_outputs.push(final_output.output)
             };
-            let new_peak_rss = peak_rss_bytes();
-            max_peak_rss = max_peak_rss.max(new_peak_rss - peak_rss);
+        }
+        let new_peak_rss = peak_rss_bytes();
+        if new_peak_rss == peak_rss {
+            warn!(
+                "Cannot reliably measure peak memory consumption during proving, setting upper bound"
+            );
         }
         measure::set(
             "prove_full_memory_peak",
-            (max_peak_rss / 1024 / 1024).to_string(),
+            (new_peak_rss / 1024 / 1024).to_string(),
         );
 
         // Creates channels pairs to communicate with all other nodes

@@ -4,10 +4,10 @@
 use std::{fmt::Display, io::BufWriter, path::PathBuf};
 
 use anyhow::Context;
+use ark_bn254::Bn254;
 use deep_prove::store::MemStore;
-use ff_ext::GoldilocksExt2;
+use dp_crypto::arkyper::HyperKZG;
 use memmap2::Mmap;
-use mpcs::{Basefold, BasefoldRSParams};
 use tempfile::Builder;
 use tenstore::GenStore;
 use tracing::info;
@@ -35,8 +35,8 @@ use zkml::{
 use crate::{ModelFormat, RunMode};
 use deep_prove::middleware::llm::LlmOneShotOutput;
 
-type F = GoldilocksExt2;
-type Pcs = Basefold<F, BasefoldRSParams>;
+type F = ark_bn254::Fr;
+type Pcs = HyperKZG<Bn254>;
 
 /// Run the prover once, directly feeding it the required inputs. The proofs are
 /// written to a file.
@@ -163,8 +163,7 @@ async fn run_one_shot_llm(
 
     let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
     let trace = driver.run_elements(input_tensor, &mut tenstore)?;
-    let io = trace.to_verifier_io()?;
-    let proof = driver.prove(&prover_ctx, trace.clone())?;
+    let (proof, io) = driver.prove(&prover_ctx, trace.clone())?;
     let llm_proof = LLMProof { proof, io };
 
     let final_tokens = trace

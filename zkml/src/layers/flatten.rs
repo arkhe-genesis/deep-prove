@@ -1,14 +1,13 @@
 use super::provable::{Evaluate, LayerOut, OpInfo, PadOp, ProveInfo};
 use crate::{
     Element, NextPowerOfTwo, Shape,
-    graph::NodeId,
     iop::context::ContextAux,
     layers::LayerCtx,
     padding::{PaddingMode, ShapeInfo, reshape},
     tensor::WrappedTensor,
 };
 use anyhow::{Result, ensure};
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 
 /// Short name used to identify the flatten layer
@@ -95,11 +94,7 @@ impl Evaluate<Element> for Flatten {
 }
 
 impl ProveInfo for Flatten {
-    fn step_info<E: ExtensionField>(
-        &self,
-        _id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         aux.last_output_shape
             .iter_mut()
             .for_each(|s| *s = s.next_power_of_two());

@@ -17,6 +17,7 @@ use crate::{
             softmax::SoftmaxHandle,
         },
     },
+    model::trace::{SplittedNodesInfo, TraceSplitterInfo},
     padding::PaddingMode,
     quantization::InferenceTracker,
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
@@ -31,7 +32,7 @@ use std::{
 use tenstore::{GenStore, GenericStore, StorageKey};
 use tracing::{info, info_span, warn};
 
-mod context;
+pub(crate) mod context;
 pub mod exec_graph;
 pub mod llm;
 pub(crate) mod trace;
@@ -48,6 +49,7 @@ where
     pub(crate) outputs: Vec<TensorHandle<N>>,
     pub(crate) proving_data: ProvingHandle,
     pub(crate) tracked_data: HashMap<TrackedDataId, WrappedTensor<N>>,
+    trace_split_info: TraceSplitterInfo<N>,
 }
 
 /// Utility to convert model's input tensors to handles.
@@ -142,11 +144,21 @@ where
 ///
 /// This runner bridges the use of [TensorHandle]s and [WrappedTensor]s used to
 /// run the layers.
-pub struct BaseRunner {
+pub struct BaseRunner<'a> {
     pub store: GenStore,
+    split_nodes_info: Option<&'a SplittedNodesInfo>,
 }
 
-impl<N> LayerRunner<N, RunInput<N>> for BaseRunner
+impl<'a> From<GenStore> for BaseRunner<'a> {
+    fn from(value: GenStore) -> Self {
+        Self {
+            store: value,
+            split_nodes_info: None,
+        }
+    }
+}
+
+impl<'a, N> LayerRunner<N, RunInput<N>> for BaseRunner<'a>
 where
     N: TensorTypeParam,
 {
@@ -210,10 +222,23 @@ where
         let proving_data =
             ProvingHandle::new(storage_key, layer_out.proving_data, self.store.clone());
 
+        let trace_split_info = if let Some(trace_split) = self.split_nodes_info {
+            trace_split.map_handles(
+                node_id,
+                graph,
+                &inputs.input_handles,
+                &outputs,
+                &proving_data,
+            )?
+        } else {
+            Default::default()
+        };
+
         Ok(RunOutput {
             outputs,
             proving_data,
             tracked_data: layer_out.tracked_layer_data,
+            trace_split_info,
         })
     }
 }
@@ -584,31 +609,57 @@ where
     {
         let layer_out = self.inner.run_layer(node_id, graph, layer, inputs)?;
 
-        for handle in &layer_out.outputs {
-            self.send(handle)?;
+        for (original_handle, feed) in layer_out.outputs.iter().zip(graph.outgoing_feeds(node_id)) {
+            let storage_key = original_handle.storage_key().clone();
+            if let Some(new_handles) = layer_out.trace_split_info.output_handles.get(&storage_key) {
+                for (handle, _) in new_handles.iter() {
+                    self.send(handle)?;
+                }
+                // send to the store also the original output handle if there is a recombination layer associated to this layer
+                if layer_out.trace_split_info.recombination_layer.is_some() {
+                    self.send(original_handle)?;
+                }
+                // check if the current output is also an output of the model, so that we can send it to the store.
+                // This is needed since the trace needs to have access to the unchunked outputs as well
+                if graph
+                    .node(feed.target.node_id)
+                    .ok_or(anyhow!(
+                        "Target node {} linked to node {node_id} not found",
+                        feed.target.node_id
+                    ))?
+                    .is_output()
+                {
+                    self.send(original_handle)?;
+                }
+            } else {
+                self.send(original_handle)?;
+            }
         }
 
-        match &layer_out.proving_data {
-            ProvingHandle::Convolution(conv_ffthandle) => {
-                self.send_element(&conv_ffthandle.handle)?;
+        if let Some((_, split_layer_handles)) = &layer_out.trace_split_info.split_layer {
+            for handle in split_layer_handles {
+                self.send(handle)?;
             }
-            ProvingHandle::Softmax(softmax_handle) => {
-                self.send_element(&softmax_handle.shift_handle)?;
+        }
+
+        if layer_out.trace_split_info.new_proving_handles.is_empty() {
+            // the current node has not been split, so we store the original proving handle
+            for handle in layer_out.proving_data.handles() {
+                self.send_element(handle)?
             }
-            ProvingHandle::LayerNorm(layer_norm_handle) => {
-                self.send_element(&layer_norm_handle.mean)?;
-                self.send_element(&layer_norm_handle.std_dev)?;
-            }
-            ProvingHandle::RMSNorm(rms_norm_handle) => {
-                self.send_element(&rms_norm_handle.normalisation)?;
-            }
-            ProvingHandle::ArgMax(argmax_handle) => {
-                for handle in &argmax_handle.max_values {
-                    self.send_element(handle)?;
+        } else {
+            // otherwise, the current node has been split in chunks, so we store the proving handles
+            // for each chunk
+            for proving_handle in layer_out.trace_split_info.new_proving_handles.values() {
+                for handle in proving_handle.handles() {
+                    self.send_element(handle)?
                 }
             }
-            ProvingHandle::None => (),
-        };
+        }
+
+        for handle in layer_out.trace_split_info.model_input_handles.values() {
+            self.send(handle)?;
+        }
 
         Ok(layer_out)
     }
@@ -748,6 +799,7 @@ where
 {
     inner: I,
     trace: Trace<N>,
+    model_output_handles: BTreeMap<usize, TensorHandle<N>>,
 }
 
 impl<I, N> TraceRunner<I, N>
@@ -758,12 +810,31 @@ where
         Self {
             inner,
             trace: Trace::new(input_handles.clone()),
+            model_output_handles: BTreeMap::new(),
         }
     }
 
     /// Consumes this runner and returns its parts.
-    fn into_parts(self) -> (I, Trace<N>) {
-        (self.inner, self.trace)
+    fn into_parts(mut self) -> anyhow::Result<(I, Trace<N>)> {
+        self.build_trace_outputs()?;
+        Ok((self.inner, self.trace))
+    }
+
+    fn build_trace_outputs(&mut self) -> anyhow::Result<()> {
+        ensure!(
+            !self.model_output_handles.is_empty(),
+            "Expected at least one output handle for a model"
+        );
+        ensure!(
+            *self.model_output_handles.keys().min().unwrap() == 0,
+            "Expected first output index to be 0"
+        );
+        ensure!(
+            *self.model_output_handles.keys().max().unwrap() == self.model_output_handles.len() - 1,
+            "Not all output handles have been processed by trace runner"
+        );
+        self.trace.output = self.model_output_handles.values().cloned().collect();
+        Ok(())
     }
 }
 
@@ -793,53 +864,35 @@ where
     {
         let mut layer_out = self.inner.run_layer(node_id, graph, layer, inputs)?;
 
-        let input_handles_dried = inputs
-            .input_handles
-            .iter()
-            .map(|handle| handle.clone().into_dry_tensor())
-            .collect::<Result<_, _>>()?;
-        let output_handles_dried = layer_out
-            .outputs
-            .iter()
-            .map(|handle| handle.clone().into_dry_tensor())
-            .collect::<Result<_, _>>()?;
+        let trace_steps = self.trace.new_steps_for_splitted_nodes(
+            node_id,
+            &inputs.input_handles,
+            &layer_out.outputs,
+            mem::take(&mut layer_out.trace_split_info),
+            mem::replace(&mut layer_out.proving_data, ProvingHandle::None),
+        )?;
+        for (node_id, step) in trace_steps {
+            self.trace.new_step(node_id, step);
+        }
 
-        let proving_data = mem::replace(&mut layer_out.proving_data, ProvingHandle::None);
-        let proving_data = match proving_data {
-            ProvingHandle::Convolution(mut conv_ffthandle) => {
-                conv_ffthandle.handle = conv_ffthandle.handle.into_dry_tensor()?;
-                ProvingHandle::Convolution(conv_ffthandle)
+        // check if there are outputs of this node that are also outputs of the model, so that we can add them
+        // to `self.model_output_handles`
+        for feed in graph.outgoing_feeds(node_id) {
+            let target = graph.node(feed.target.node_id).ok_or(anyhow!(
+                "Target node {} linked to node {node_id}not found",
+                feed.target.node_id
+            ))?;
+            if let Some(output_idx) = target.as_output() {
+                let output_handle = layer_out.outputs[*feed.source.port]
+                    .clone()
+                    .into_dry_tensor()?;
+                let old_output = self.model_output_handles.insert(*output_idx, output_handle);
+                ensure!(
+                    old_output.is_none(),
+                    "Trying to insert twice an output value for the same index {output_idx}",
+                );
             }
-            ProvingHandle::Softmax(mut softmax_handle) => {
-                softmax_handle.shift_handle = softmax_handle.shift_handle.into_dry_tensor()?;
-                ProvingHandle::Softmax(softmax_handle)
-            }
-            ProvingHandle::LayerNorm(mut layer_norm_handle) => {
-                layer_norm_handle.mean = layer_norm_handle.mean.into_dry_tensor()?;
-                layer_norm_handle.std_dev = layer_norm_handle.std_dev.into_dry_tensor()?;
-                ProvingHandle::LayerNorm(layer_norm_handle)
-            }
-            ProvingHandle::RMSNorm(mut rms_norm_handle) => {
-                rms_norm_handle.normalisation = rms_norm_handle.normalisation.into_dry_tensor()?;
-                ProvingHandle::RMSNorm(rms_norm_handle)
-            }
-            ProvingHandle::ArgMax(argmax_handle) => {
-                let mut new_handles = Vec::with_capacity(argmax_handle.max_values.len());
-                for handle in argmax_handle.max_values {
-                    new_handles.push(handle.into_dry_tensor()?);
-                }
-                ProvingHandle::ArgMax(ArgmaxHandle {
-                    max_values: new_handles,
-                })
-            }
-            ProvingHandle::None => ProvingHandle::None,
-        };
-
-        let new_step = Step {
-            node_inputs: input_handles_dried,
-            node_outputs: NodeOut::new(output_handles_dried, proving_data),
-        };
-        self.trace.new_step(node_id, new_step);
+        }
 
         Ok(layer_out)
     }
@@ -1531,8 +1584,12 @@ where
         Ok(())
     }
 
-    /// Performs a single run of the model, returning the produced trace.
-    pub fn run(&self, inputs: Vec<Tensor<N>>, store: &mut GenStore) -> anyhow::Result<Trace<N>>
+    pub(crate) fn run_with_split_nodes_info(
+        &self,
+        inputs: Vec<Tensor<N>>,
+        store: &mut GenStore,
+        split_nodes_info: Option<&SplittedNodesInfo>,
+    ) -> anyhow::Result<Trace<N>>
     where
         Layer<N>: Evaluate<N>,
     {
@@ -1546,6 +1603,7 @@ where
 
         let runner = BaseRunner {
             store: store.clone(),
+            split_nodes_info,
         };
         #[cfg(test)]
         let runner = SanityCheckRunner { inner: runner };
@@ -1558,10 +1616,20 @@ where
         self.run_with_runner(&mut runner, input_handles)?;
 
         let trace_runner = runner.into_inner();
-        let (_store_runner, mut trace) = trace_runner.into_parts();
+        let (_store_runner, mut trace) = trace_runner.into_parts()?;
 
-        trace.output = trace.graph_outputs(&self.graph)?;
+        if let Some(split_info) = split_nodes_info {
+            trace.attach_split_info(split_info);
+        }
         Ok(trace)
+    }
+
+    /// Performs a single run of the model, returning the produced trace.
+    pub fn run(&self, inputs: Vec<Tensor<N>>, store: &mut GenStore) -> anyhow::Result<Trace<N>>
+    where
+        Layer<N>: Evaluate<N>,
+    {
+        self.run_with_split_nodes_info(inputs, store, None)
     }
 }
 
@@ -1575,6 +1643,7 @@ impl Model<f32> {
 
         let runner = BaseRunner {
             store: store.clone(),
+            split_nodes_info: None,
         };
         #[cfg(test)]
         let runner = SanityCheckRunner { inner: runner };
@@ -1603,7 +1672,7 @@ impl<'a> From<&'a Model<Element>> for ModelLayers {
 
 #[cfg(test)]
 pub(crate) mod test {
-    use std::ops::Deref;
+    use std::ops::{Deref, Range};
 
     use super::Model;
     use crate::{
@@ -1630,19 +1699,18 @@ pub(crate) mod test {
     use anyhow::{Ok, Result};
     use ark_std::rand::{Rng, RngCore};
 
-    use ff_ext::GoldilocksExt2;
+    use dp_crypto::arkyper::transcript::blake3::Blake3Transcript;
     use itertools::Itertools;
 
     use tenstore::{GenStore, StorageKey};
-    use transcript::BasicTranscript;
 
-    pub type F = GoldilocksExt2;
+    pub type F = ark_bn254::Fr;
     const SELECTOR_DENSE: usize = 0;
     const SELECTOR_RELU: usize = 1;
     const SELECTOR_POOLING: usize = 2;
     const MOD_SELECTOR: usize = 2;
 
-    pub type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs<F>>;
+    pub type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs>;
 
     impl Model<Element> {
         pub fn random(num_dense_layers: usize) -> Result<(Self, Vec<Tensor<Element>>)> {
@@ -1686,6 +1754,62 @@ pub(crate) mod test {
                         last_node_id,
                     )?);
                     last_row -= MAXPOOL2D_KERNEL_SIZE - 1;
+                } else {
+                    panic!("random selection shouldn't be in that case");
+                }
+            }
+            model.automatic_output_labelling().unwrap();
+            let inputs = model.input_shapes().iter().map(Tensor::random).collect();
+            let (model, inputs) = quantize_model(model, inputs, None, &mut GenStore::default())?;
+            let model = pad_model(model)?;
+            let prepped_inputs = model.prepare_inputs(inputs)?;
+            Ok((model, prepped_inputs))
+        }
+
+        pub fn random_with_matmul(
+            num_linear_layers: usize,
+            dim_size_range: Range<usize>,
+        ) -> Result<(Self, Vec<Tensor<Element>>)> {
+            let mut rng = rng_from_env_or_random();
+            let (nrows, ncols): (usize, usize) = (
+                rng.gen_range(dim_size_range.clone()),
+                rng.gen_range(dim_size_range.clone()),
+            );
+            let mut model = Model::<f32>::new_from_input_shapes(vec![vec![nrows, ncols].into()]);
+            let mut last_col = ncols;
+            let mut last_node_id = None;
+            for selector in 0..num_linear_layers {
+                if selector % MOD_SELECTOR == SELECTOR_DENSE {
+                    // last row becomes new column
+                    let (nrows, ncols): (usize, usize) =
+                        (last_col, rng.gen_range(dim_size_range.clone()));
+                    last_col = ncols;
+                    let weight = KeyedTensor::new(
+                        format!("matmul_{selector}_weight"),
+                        Tensor::random(&vec![nrows, ncols].into()),
+                    );
+
+                    let bias = KeyedTensor::new(
+                        format!("matmul_{selector}_bias"),
+                        Tensor::random(&vec![ncols].into()),
+                    );
+                    let linear_layer = EinSum::<f32>::new_matmul(
+                        None,
+                        Some(weight.into()),
+                        false,
+                        Some(bias.into()),
+                    )?;
+
+                    last_node_id = Some(
+                        model.add_consecutive_layer(Layer::EinSum(linear_layer), last_node_id)?,
+                    );
+                } else if selector % MOD_SELECTOR == SELECTOR_RELU {
+                    last_node_id = Some(model.add_consecutive_layer(
+                        Layer::Activation(Activation::new_relu()),
+                        last_node_id,
+                    )?);
+                    // no need to change the `last_col` since RELU layer keeps the same shape
+                    // of outputs
                 } else {
                     panic!("random selection shouldn't be in that case");
                 }
@@ -1815,11 +1939,11 @@ pub(crate) mod test {
         );
         let input_shape = vec![11usize.next_power_of_two()].into();
         let input = Tensor::<Element>::random(&input_shape).into_wrapped();
-        let output1 = evaluate_layer::<GoldilocksExt2, _, _>(&dense1, &[&input])
+        let output1 = evaluate_layer::<_, _>(&dense1, &[&input])
             .unwrap()
             .outputs()[0]
             .clone();
-        let final_output = evaluate_layer::<GoldilocksExt2, _, _>(&dense2, &[&output1])
+        let final_output = evaluate_layer::<_, _>(&dense2, &[&output1])
             .unwrap()
             .outputs()[0]
             .clone();
@@ -1887,14 +2011,13 @@ pub(crate) mod test {
             .unwrap()
             .prepared_for_fft(&in_dimensions[0].clone().into())
             .unwrap();
-        let conv_layer_id = model
+        let _conv_layer_id = model
             .add_consecutive_layer(Layer::Convolution(conv_layer.clone()), None)
             .unwrap();
 
         assert_eq!(
-            conv_layer.conv_context(conv_layer_id),
+            conv_layer.conv_context(),
             ConvCtx {
-                node_id: conv_layer_id,
                 kw: 16,
                 kx: 2,
                 real_nw: 4,
@@ -1912,18 +2035,16 @@ pub(crate) mod test {
         let mut store = GenStore::default();
         let trace = model.run(vec![input], &mut store).unwrap();
         let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<F, Pcs<F>>()
+            .generate_contexts::<F, Pcs>()
             .expect("Unable to generate contexts");
 
-        let io = trace.to_verifier_io().unwrap();
-
-        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        let (proof, io) = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
 
         verify::<_, T, _>(&verifier_ctx, proof, io).unwrap();
         measure::to_csv("cnn_prover.csv").unwrap();
     }
 
-    type T = BasicTranscript<GoldilocksExt2>;
+    type T = Blake3Transcript;
 
     fn build_test_model<N: TensorTypeParam, const INPUT_SIZE: usize>() -> Model<N> {
         let input_shape: Shape = vec![INPUT_SIZE].into();
@@ -2042,11 +2163,10 @@ pub(crate) mod test {
 
         let trace = model.run(input_tensors, store)?;
         let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<F, Pcs<F>>()
+            .generate_contexts::<F, Pcs>()
             .expect("Unable to generate contexts");
-        let io = trace.to_verifier_io().unwrap();
         let outputs = trace.outputs().to_vec();
-        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        let (proof, io) = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
         verify::<_, T, _>(&verifier_ctx, proof, io)?;
         Ok(outputs)
     }

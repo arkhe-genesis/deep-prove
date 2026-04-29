@@ -1,24 +1,26 @@
 //! Lookup verifying methods.
-
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{utils::eval_by_expr_with_instance, virtual_poly::VPAuxInfo};
-use sumcheck::structs::IOPVerifierState;
+use dp_crypto::{
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    structs::IOPVerifierState,
+    utils::eval_by_expr_with_instance,
+    virtual_poly::VPAuxInfo,
+};
 
 use crate::{
-    commit::identity_eval, iop::verifier::Verifier,
-    lookup::operation::inputs::proving::LookupSumcheckProof,
+    iop::verifier::Verifier, lookup::operation::inputs::proving::LookupSumcheckProof,
+    poly_commit::identity_eval,
 };
 
 use super::*;
 
 impl LookupInputConfig {
     /// Method that computes the verifier instances needed for normalisation variants.
-    pub fn compute_normalisation_lookup_verifier_instances<E: ExtensionField>(
+    pub fn compute_normalisation_lookup_verifier_instances<F: PrimeField>(
         &self,
-        shift_check_constant_challenge: E,
-        shift_check_column_sep: E,
+        shift_check_constant_challenge: F,
+        shift_check_column_sep: F,
         norm_vars: usize,
-    ) -> Vec<LogUpVerifierInstance<E>> {
+    ) -> Vec<LogUpVerifierInstance<F>> {
         // Short circuit if no normalisation is needed
         if matches!(self.variant, LookupVariant::Standard | LookupVariant::GLU) {
             return Vec::new();
@@ -27,7 +29,7 @@ impl LookupInputConfig {
         let shift_table = Table::new_shift_check();
         match self.variant {
             LookupVariant::Softmax { .. } => {
-                vec![LogUpVerifierInstance::<E>::new(
+                vec![LogUpVerifierInstance::<F>::new(
                     shift_check_constant_challenge,
                     shift_check_column_sep,
                     shift_table.num_columns(),
@@ -40,7 +42,7 @@ impl LookupInputConfig {
                 ..
             } => {
                 if normalised_sum_value.is_none() {
-                    vec![LogUpVerifierInstance::<E>::new(
+                    vec![LogUpVerifierInstance::<F>::new(
                         shift_check_constant_challenge,
                         shift_check_column_sep,
                         shift_table.num_columns(),
@@ -49,7 +51,7 @@ impl LookupInputConfig {
                     )]
                 } else {
                     vec![
-                        LogUpVerifierInstance::<E>::new(
+                        LogUpVerifierInstance::<F>::new(
                             shift_check_constant_challenge,
                             shift_check_column_sep,
                             shift_table.num_columns(),
@@ -65,15 +67,15 @@ impl LookupInputConfig {
     }
 
     /// Method that computes the verifier instances needed for normalisation variants.
-    pub fn sort_fractional_outputs<E, T, PCS>(
+    pub fn sort_fractional_outputs<F, T, PCS>(
         &self,
-        verifier: &mut Verifier<E, T, PCS>,
-        logup_proof: &LogUpBatchProof<E>,
+        verifier: &mut Verifier<F, T, PCS>,
+        logup_proof: &LogUpBatchProof<F>,
     ) -> Result<()>
     where
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
+        F: PrimeField,
+        T: Transcript,
+        PCS: CommitmentScheme,
     {
         let chunking_info = self.chunking_info();
         let number_of_chunks = self.number_of_chunks();
@@ -103,13 +105,13 @@ impl LookupInputConfig {
             let (shift_num, shift_denom) = verifier
                 .numerators_and_denominators
                 .entry(shift_check_table.name())
-                .or_insert((E::ZERO, E::ONE));
+                .or_insert((F::ZERO, F::ONE));
             shifted_nums
                 .iter()
                 .zip(shifted_dens.iter())
                 .try_for_each(|(&num, &den)| {
                     ensure!(
-                        den != E::ZERO,
+                        den != F::ZERO,
                         "Denominator was zero in shift check lookup!"
                     );
                     *shift_num = num * *shift_denom + *shift_num * den;
@@ -125,13 +127,13 @@ impl LookupInputConfig {
             let (value_n, value_d) = verifier
                 .numerators_and_denominators
                 .entry(table.name())
-                .or_insert((E::ZERO, E::ONE));
+                .or_insert((F::ZERO, F::ONE));
 
             value_nums
                 .iter()
                 .zip(value_denoms.iter())
                 .try_for_each(|(&num, &den)| {
-                    ensure!(den != E::ZERO, "Denominator was zero in value lookup!");
+                    ensure!(den != F::ZERO, "Denominator was zero in value lookup!");
                     *value_n = num * *value_d + *value_n * den;
                     *value_d *= den;
                     Ok(())
@@ -146,13 +148,13 @@ impl LookupInputConfig {
                     let (signed_zero_num, signed_zero_denom) = verifier
                         .numerators_and_denominators
                         .entry(signed_zero_check.name())
-                        .or_insert((E::ZERO, E::ONE));
+                        .or_insert((F::ZERO, F::ONE));
                     zero_nums
                         .iter()
                         .zip(zero_denoms.iter())
                         .try_for_each(|(&num, &den)| {
                             ensure!(
-                                den != E::ZERO,
+                                den != F::ZERO,
                                 "Denominator was zero in signed zero check lookup!"
                             );
                             *signed_zero_num = num * *signed_zero_denom + *signed_zero_num * den;
@@ -167,12 +169,12 @@ impl LookupInputConfig {
                     let (zero_check_num, zero_check_denom) = verifier
                         .numerators_and_denominators
                         .entry(zero_check_table.name())
-                        .or_insert((E::ZERO, E::ONE));
+                        .or_insert((F::ZERO, F::ONE));
                     zero_nums
                         .iter()
                         .zip(zero_denoms.iter())
                         .try_for_each(|(&num, &den)| {
-                            ensure!(den != E::ZERO, "Denominator was zero in zero check lookup!");
+                            ensure!(den != F::ZERO, "Denominator was zero in zero check lookup!");
                             *zero_check_num = num * *zero_check_denom + *zero_check_num * den;
                             *zero_check_denom *= den;
                             Ok(())
@@ -181,10 +183,10 @@ impl LookupInputConfig {
                     let (signed_zero_num, signed_zero_denom) = verifier
                         .numerators_and_denominators
                         .entry(signed_zero_check.name())
-                        .or_insert((E::ZERO, E::ONE));
+                        .or_insert((F::ZERO, F::ONE));
 
                     ensure!(
-                        signed_denom[0] != E::ZERO,
+                        signed_denom[0] != F::ZERO,
                         "Denominator was zero in signed zero check lookup!"
                     );
                     *signed_zero_num =
@@ -196,12 +198,12 @@ impl LookupInputConfig {
                     let (zero_check_num, zero_check_denom) = verifier
                         .numerators_and_denominators
                         .entry(zero_check_table.name())
-                        .or_insert((E::ZERO, E::ONE));
+                        .or_insert((F::ZERO, F::ONE));
                     zero_nums
                         .iter()
                         .zip(zero_denoms.iter())
                         .try_for_each(|(&num, &den)| {
-                            ensure!(den != E::ZERO, "Denominator was zero in zero check lookup!");
+                            ensure!(den != F::ZERO, "Denominator was zero in zero check lookup!");
                             *zero_check_num = num * *zero_check_denom + *zero_check_num * den;
                             *zero_check_denom *= den;
                             Ok(())
@@ -214,7 +216,7 @@ impl LookupInputConfig {
         let (shift_num, shift_denom) = verifier
             .numerators_and_denominators
             .entry(shift_check_table.name())
-            .or_insert((E::ZERO, E::ONE));
+            .or_insert((F::ZERO, F::ONE));
 
         numerators
             .iter()
@@ -222,7 +224,7 @@ impl LookupInputConfig {
             .skip(number_of_chunks * regular_lookups_per_chunk)
             .try_for_each(|(&num, &den)| {
                 ensure!(
-                    den != E::ZERO,
+                    den != F::ZERO,
                     "Denominator was zero in normalisation shift check lookup!"
                 );
                 *shift_num = num * *shift_denom + *shift_num * den;
@@ -232,27 +234,27 @@ impl LookupInputConfig {
         Ok(())
     }
     /// Method that verifies the sumcheck proof linking the lookup argument to the inputs/outputs of the layer. It takes in the proof, the current claim, the claim for the logup proof and optionally the shift evaluations (if this is a normalisation/softmax variant) and returns the challenges and point used in the sumcheck.
-    pub fn verify_linking_sumcheck<E, T>(
+    pub fn verify_linking_sumcheck<F, T>(
         &self,
-        lookup_sumcheck_proof: &LookupSumcheckProof<E>,
+        lookup_sumcheck_proof: &LookupSumcheckProof<F>,
         transcript: &mut T,
-        last_claim: &Claim<E>,
-        logup_claim: &LogUpBatchVerifierClaim<E>,
-        shift_evals: &Option<Vec<E>>,
-    ) -> Result<(Vec<E>, Vec<E>)>
+        last_claim: &Claim<F>,
+        logup_claim: &LogUpBatchVerifierClaim<F>,
+        shift_evals: &Option<Vec<F>>,
+    ) -> Result<(Vec<F>, Vec<F>)>
     where
-        E: ExtensionField,
-        T: Transcript<E>,
+        F: PrimeField,
+        T: Transcript,
     {
         let chunking_info = self.chunking_info();
         let unpadded_input_shape = self.unpadded_input_shape();
 
         let (output_eq_point, mut batching_challenges) = unpadded_input_shape
-            .compute_eq_point_and_batching_challenges::<E>(last_claim.point())?;
+            .compute_eq_point_and_batching_challenges::<F>(last_claim.point())?;
 
         // Now we squeeze the required challenges from the transcript, we always need the sum challenge so we squeeze that explicitly first.
-        let sum_challenge = transcript.sample_and_append_challenge(b"sum").elements;
-        let other_challenges = self.variant.squeeze_sumcheck_challenges(transcript);
+        let sum_challenge = transcript.append_and_sample(b"sum");
+        let other_challenges: Vec<F> = self.variant.squeeze_sumcheck_challenges(transcript);
 
         batching_challenges.insert(0, sum_challenge);
         batching_challenges.extend(other_challenges);
@@ -267,29 +269,24 @@ impl LookupInputConfig {
             unpadded_input_shape,
         )?;
 
-        let expression = self.build_full_sumcheck_expression::<E>();
+        let expression = self.build_full_sumcheck_expression::<F>();
         let degree = expression.degree();
         let max_num_variables = output_eq_point.len();
-        let aux_info = VPAuxInfo::<E> {
+        let aux_info = VPAuxInfo::<F> {
             max_degree: degree,
             max_num_variables,
             ..Default::default()
         };
-
-        let subclaim = IOPVerifierState::<E>::verify(
+        let subclaim = IOPVerifierState::<F>::verify(
             initial_claim,
             &lookup_sumcheck_proof.sumcheck_proof,
             &aux_info,
             transcript,
         );
-        let sumcheck_point = subclaim
-            .point
-            .iter()
-            .map(|c| c.elements)
-            .collect::<Vec<E>>();
+        let sumcheck_point = &subclaim.point;
 
-        let output_eq_eval = identity_eval(&output_eq_point, &sumcheck_point);
-        let logup_eq_eval = identity_eval(logup_claim.point(), &sumcheck_point);
+        let output_eq_eval = identity_eval(&output_eq_point, sumcheck_point);
+        let logup_eq_eval = identity_eval(logup_claim.point(), sumcheck_point);
 
         let mut all_evals = lookup_sumcheck_proof.evaluations.clone();
         all_evals.push(output_eq_eval);
@@ -300,10 +297,13 @@ impl LookupInputConfig {
             LookupVariant::Normalisation { .. } | LookupVariant::Softmax { .. }
         ) {
             let norm_dim_vars = ceil_log2(unpadded_input_shape.dim(-1));
-            let norm_point = std::iter::repeat_n(E::TWO.inverse(), norm_dim_vars)
-                .chain(logup_claim.point()[norm_dim_vars..].iter().cloned())
-                .collect::<Vec<E>>();
-            let norm_eq_eval = identity_eval(&norm_point, &sumcheck_point);
+            let norm_point = std::iter::repeat_n(
+                F::from(2).inverse().expect("Cannot fail when inverting 2"),
+                norm_dim_vars,
+            )
+            .chain(logup_claim.point()[norm_dim_vars..].iter().cloned())
+            .collect::<Vec<F>>();
+            let norm_eq_eval = identity_eval(&norm_point, sumcheck_point);
             all_evals.push(norm_eq_eval);
         }
 
@@ -318,11 +318,7 @@ impl LookupInputConfig {
             &[],
             &batching_challenges,
             &expression,
-        )
-        .right()
-        .ok_or(anyhow!(
-            "Could not calculate subclaim during lookup sumcheck verification"
-        ))?;
+        );
 
         ensure!(
             calculated_claim == subclaim.expected_evaluation,
@@ -330,6 +326,6 @@ impl LookupInputConfig {
             subclaim.expected_evaluation
         );
 
-        Ok((batching_challenges, sumcheck_point))
+        Ok((batching_challenges, sumcheck_point.clone()))
     }
 }

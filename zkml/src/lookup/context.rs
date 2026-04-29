@@ -1,37 +1,37 @@
 //! File containing code for lookup witness generation.
 use crate::{
     Element,
-    graph::{
-        Graph, NodeId, NodeInput,
-        executor::{Executor, SequentialExecutor},
-        scheduler::{Colored, ExecNode, GraphScheduler},
+    graph::NodeId,
+    iop::{
+        ChallengeStorage,
+        chunking::{BoundaryEdgeType, ChunkIOCommitments, ChunkedNode, ModelChunk},
+        context::ProverContext,
+        prover::ModelLayersRef,
     },
-    iop::{ChallengeStorage, context::ProverContext, prover::ModelLayersRef},
     layers::provable::ProvableOp,
     lookup::{
         logup_gkr::structs::{LogUpInput, LogUpVerifierInstance, ProofType},
         table::Table,
     },
     measure,
+    measure::LAYER_WISE_MEASURE_PREFIX,
     model::Trace,
+    poly_commit::{context::CommittedPolynomial, verifier::VerifierCommitment},
 };
-use anyhow::{Context as CC, anyhow, bail};
-use ceno_p3::field::{Field, FieldAlgebra};
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::util::transpose;
+use anyhow::{Context as CC, anyhow};
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{
+        CommitmentScheme,
+        transcript::{AppendToTranscript, Transcript},
+    },
+    poly::dense::DensePolynomial,
+};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{
-    collections::{BTreeMap, HashMap, btree_map},
-    marker::PhantomData,
-    sync::Arc,
-};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, btree_map};
 use tracing::{debug, warn};
-use transcript::Transcript;
 use utils::Metrics;
-use witness::{InstancePaddingStrategy, RowMajorMatrix};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookupContext {
@@ -55,30 +55,31 @@ impl LookupContext {
         self.tables.is_empty()
     }
 
-    pub fn create_logup_inputs<PCS, E>(
+    pub fn create_logup_inputs<PCS, F>(
         &self,
-        multiplicities_commitment: &PCS::CommitmentWithWitness,
-        challenge_storage: &ChallengeStorage<E>,
-    ) -> anyhow::Result<Vec<LogUpInput<E>>>
+        multiplicities_commitments: &[CommittedPolynomial<F, PCS>],
+        challenge_storage: &ChallengeStorage<F>,
+    ) -> anyhow::Result<Vec<LogUpInput<F>>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme,
     {
         // First we retrieve the multiplicity polynomials
-        let multiplicity_polys =
-            PCS::get_arc_mle_witness_from_commitment(multiplicities_commitment);
+        let multiplicity_polys = multiplicities_commitments
+            .iter()
+            .map(|committed_poly| &committed_poly.polynomial);
         self.iter()
-            .zip(multiplicity_polys.iter())
+            .zip(multiplicity_polys)
             .map(|(table, m_poly)| {
-                let multiplicities = m_poly.get_base_field_vec().to_vec();
-                let column_evals = table.get_table_columns::<E>();
+                let multiplicities = m_poly.evals();
+                let column_evals = table.get_table_columns::<F>();
                 let (constant_challenge, column_separation_challenge) = challenge_storage
                     .get_challenges_by_name(&table.name())
                     .ok_or(anyhow!(
                         "No challenges found for Table {}, cannot generate LogUp input",
                         table.name()
                     ))?;
-                LogUpInput::<E>::new_table(
+                LogUpInput::<F>::new_table(
                     column_evals,
                     multiplicities,
                     constant_challenge,
@@ -86,15 +87,15 @@ impl LookupContext {
                 )
                 .map_err(|e| anyhow!("Table: {}, {e:?}", table.name()))
             })
-            .collect::<anyhow::Result<Vec<LogUpInput<E>>>>()
+            .collect::<anyhow::Result<Vec<LogUpInput<F>>>>()
     }
 
-    pub fn create_logup_verifier_instances<E>(
+    pub fn create_logup_verifier_instances<F>(
         &self,
-        challenge_storage: &ChallengeStorage<E>,
-    ) -> anyhow::Result<Vec<LogUpVerifierInstance<E>>>
+        challenge_storage: &ChallengeStorage<F>,
+    ) -> anyhow::Result<Vec<LogUpVerifierInstance<F>>>
     where
-        E: ExtensionField,
+        F: PrimeField,
     {
         self.iter()
             .map(|table| {
@@ -104,7 +105,7 @@ impl LookupContext {
                         "No challenges found for Table {}, cannot generate LogUp input",
                         table.name()
                     ))?;
-                Ok(LogUpVerifierInstance::<E>::new(
+                Ok(LogUpVerifierInstance::<F>::new(
                     constant_challenge,
                     column_separation_challenge,
                     table.num_columns(),
@@ -112,7 +113,7 @@ impl LookupContext {
                     table.table_bit_size() - 1,
                 ))
             })
-            .collect::<anyhow::Result<Vec<LogUpVerifierInstance<E>>>>()
+            .collect::<anyhow::Result<Vec<LogUpVerifierInstance<F>>>>()
     }
 }
 
@@ -125,56 +126,50 @@ pub(crate) fn count_elements<I: IntoIterator<Item = Element>>(i: I) -> HashMap<E
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct LookupWitnessGen<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    PCS::CommitmentWithWitness: Serialize + for<'a> Deserialize<'a>,
-{
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct LookupWitnessGen<'a, F: PrimeField> {
     /// Contains the count of elements per table type.
     ///
     /// These values are later used to compute the GKR's multiplicities.
     element_count: BTreeMap<Table, HashMap<Element, u64>>,
-    logup_witnesses: HashMap<NodeId, Arc<PCS::CommitmentWithWitness>>,
+    /// Contains the witness polynomials that must be committed. All polynomials are committed at once
+    /// using `batch_commit` method.
+    poly_to_commit: HashMap<NodeId, Vec<DensePolynomial<'a, F>>>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Clone for LookupWitnessGen<E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + for<'a> Deserialize<'a>,
-{
+impl<'a, F: PrimeField> Clone for LookupWitnessGen<'a, F> {
     fn clone(&self) -> Self {
         LookupWitnessGen {
             element_count: self.element_count.clone(),
-            logup_witnesses: self.logup_witnesses.clone(),
+            poly_to_commit: self.poly_to_commit.clone(),
         }
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWitnessGen<E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + for<'a> Deserialize<'a>,
-{
+impl<'a, F: PrimeField> Default for LookupWitnessGen<'a, F> {
     fn default() -> Self {
         LookupWitnessGen {
             element_count: BTreeMap::default(),
-            logup_witnesses: HashMap::default(),
+            poly_to_commit: HashMap::default(),
         }
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LookupWitnessGen<E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + for<'a> Deserialize<'a>,
-{
-    pub fn insert_logup_witness(&mut self, node_id: NodeId, witness: PCS::CommitmentWithWitness) {
-        self.logup_witnesses.insert(node_id, Arc::new(witness));
+impl<'a, F: PrimeField> LookupWitnessGen<'a, F> {
+    pub fn insert_logup_witness(&mut self, node_id: NodeId, witness: Vec<DensePolynomial<'a, F>>) {
+        self.poly_to_commit.insert(node_id, witness);
     }
+
     pub fn insert_element_count(&mut self, table: Table, elements: HashMap<Element, u64>) {
         self.element_count.insert(table, elements);
     }
     pub fn insert_layer_witness_data(
         &mut self,
         node_id: NodeId,
-        witness: PCS::CommitmentWithWitness,
+        witness: Vec<DensePolynomial<'a, F>>,
         tables: Vec<Table>,
         element_counts: Vec<HashMap<Element, u64>>,
     ) {
@@ -203,132 +198,48 @@ where
                 }
             }
         }
-        self.logup_witnesses.extend(other.logup_witnesses);
+        self.poly_to_commit.extend(other.poly_to_commit);
     }
 }
 
 pub(crate) const COLUMN_SEPARATOR: Element = 1 << 32;
 
-/// Action to put inside the graph of tasks. This operation can be serialized over the network.
-#[derive(Debug, Clone)]
-pub(crate) struct GenerateWitness<
-    'a,
-    'b,
-    'c,
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-> {
-    _phantom: PhantomData<(E, PCS)>,
-    _marker: PhantomData<(&'a (), &'b (), &'c ())>,
-}
-
-impl<'a, 'b, 'c, E: ExtensionField, PCS: PolynomialCommitmentScheme<E> + Send + Sync> Default
-    for GenerateWitness<'a, 'b, 'c, E, PCS>
-{
-    fn default() -> Self {
-        Self {
-            _phantom: PhantomData,
-            _marker: PhantomData,
-        }
-    }
-}
-
-pub(crate) struct GenerateWitnessContext<'a, 'b, 'c, E, PCS>
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-{
-    trace: &'a Trace<Element>,
-    ctx: &'b ProverContext<E, PCS>,
-    layers: &'c ModelLayersRef<'c>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub(crate) enum GenerateWitnessIO<E, PCS>
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-    PCS::CommitmentWithWitness: Serialize + for<'a> Deserialize<'a>,
-{
-    Input(NodeId),
-    Output(LookupWitnessGen<E, PCS>),
-}
-
-impl<'a, 'b, 'c, E, PCS> ExecNode for GenerateWitness<'a, 'b, 'c, E, PCS>
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync + 'b,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
-{
-    type IO = GenerateWitnessIO<E, PCS>;
-    type Context = GenerateWitnessContext<'a, 'b, 'c, E, PCS>;
-
-    fn run(&self, ctx: &Self::Context, input: Vec<Self::IO>) -> anyhow::Result<Vec<Self::IO>> {
-        let input = input.first().context("expect only one node_id as input")?;
-        let GenerateWitnessIO::Input(node_id) = input else {
-            bail!("Expected input to be a node_id");
-        };
-
-        let step = ctx
-            .trace
-            .get_step(node_id)
-            .with_context(|| format!("fetching trace for {node_id}"))?;
-        let op = ctx
-            .layers
-            .get(node_id)
-            .ok_or(anyhow!("Node {node_id} not found in model"))?;
-        Ok(vec![
-            op.gen_lookup_witness(*node_id, ctx.ctx, step)
-                .map_err(|e| {
-                    anyhow!(
-                        "Error generating lookup witness for node {node_id:?} with error: {e:?}"
-                    )
-                })
-                .map(|gen_w| GenerateWitnessIO::Output(gen_w))?,
-        ])
-    }
-    fn describe(&self) -> String {
-        "GenerateWitness".to_string()
-    }
-}
-
 #[derive(Debug)]
-pub struct LookupWitness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
-    pub logup_witnesses: HashMap<NodeId, PCS::CommitmentWithWitness>,
-    pub table_witnesses: Option<PCS::CommitmentWithWitness>,
+pub struct LookupWitness<'a, F: PrimeField, PCS: CommitmentScheme> {
+    pub(crate) logup_witnesses: HashMap<NodeId, Vec<CommittedPolynomial<'a, F, PCS>>>,
+    pub(crate) table_witnesses: Option<Vec<CommittedPolynomial<'a, F, PCS>>>,
+    pub(crate) chunk_commitments: ChunkIOCommitments<VerifierCommitment<PCS>>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Default for LookupWitness<E, PCS> {
+impl<'a, F: PrimeField, PCS: CommitmentScheme> Default for LookupWitness<'a, F, PCS> {
     fn default() -> Self {
         LookupWitness {
             logup_witnesses: HashMap::default(),
             table_witnesses: None,
+            chunk_commitments: ChunkIOCommitments::default(),
         }
     }
 }
 
-pub(crate) fn generate_lookup_witness_for_chunk<'a, 'b, 'c, E, T, PCS, N, Ex>(
-    chunk_graph: &Graph<N, usize, usize, ()>,
+pub(crate) fn generate_lookup_witness_for_chunk<'c, F, T, PCS>(
+    chunk: &ModelChunk,
     chunk_lookup_ctx: &LookupContext,
-    chunk_trace: &'a Trace<Element>,
-    ctx: &'b ProverContext<E, PCS>,
+    chunk_trace: &Trace<Element>,
+    ctx: &ProverContext<F, PCS>,
     transcript: &mut T,
     layers: &'c ModelLayersRef<'c>,
-    executor_config: &Ex::Config,
-) -> anyhow::Result<LookupWitness<E, PCS>>
+) -> anyhow::Result<LookupWitness<'c, F, PCS>>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
-    T: Transcript<E>,
-    Ex: Executor<GenerateWitness<'a, 'b, 'c, E, PCS>, usize>,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
+    T: Transcript,
 {
-    // If the lookup context is empty then there are no lookup witnesses to generate so we return default values
-    if chunk_lookup_ctx.is_empty() {
+    // If there are no tables in the lookup context and there are no input/output boundary edges for this chunk,
+    // then there are no lookup witnesses to generate so we return default values
+    if chunk_lookup_ctx.is_empty()
+        && chunk.boundary_edges(BoundaryEdgeType::Incoming).is_empty()
+        && chunk.boundary_edges(BoundaryEdgeType::Outgoing).is_empty()
+    {
         warn!("Lookup witness generation: no tables found, returning empty context TEST?");
         return Ok(LookupWitness::default());
     }
@@ -336,56 +247,67 @@ where
     // Make the witness gen struct that stores relevant table lookup data
     debug!("== Witness poly commitments generation ==");
     let metrics = Metrics::new();
-    let mut witness_gen = LookupWitnessGen::<E, PCS>::default();
 
-    // We create the graph here for showcasing the graph module. The end goal is
-    // that we create the graph at the top level and every functionality of the
-    // prover is appended to that graph
-    //
-    // We also spin up a local executor here, since this is for the first PR to
-    // showcase the graph module as well. The endgoal is that once the full
-    // graph is created, the executor will simply run the graph to completion.
-    // Since we haven't "graphized" the whole prover yet, we limit the scope to
-    // this small function.
-
-    // the colour for now doesn't matter too much since everything is
-    // sequential. later on, the local executor can use a threadpool to run the
-    // graph in parallel with a master thread
-    let max_colour = 2;
-    let mut graph = Graph::new();
-    let inputs = chunk_graph
+    let node_ids = chunk
+        .subgraph
         .forward_inners()
-        .enumerate()
-        .map(|(idx, (node_id, _))| {
-            let node_idx =
-                graph.add_inner(Colored::new(GenerateWitness::default(), idx % max_colour))?;
-            let input = GenerateWitnessIO::Input(node_id);
-            Ok((NodeInput::new(node_idx, 0), input))
+        .map(|(node_id, _)| node_id)
+        .collect::<Vec<_>>();
+    let witness_gens = node_ids
+        .par_iter()
+        .map(|&node_id| {
+            let step = chunk_trace
+                .get_step(&node_id)
+                .with_context(|| format!("fetching trace for {node_id}"))?;
+            let node = chunk
+                .subgraph
+                .node(node_id)
+                .expect("Node must be found")
+                .as_inner()
+                .expect("Must be an inner node");
+            // fetch the layer op depending on the node type
+            match node {
+                ChunkedNode::OriginalNode(_) => {
+                    let node = layers
+                        .get(&node_id)
+                        .ok_or(anyhow!("Node {node_id} not found in model"))?;
+                    measure::r_and_accumulate(
+                        format!(
+                            "{LAYER_WISE_MEASURE_PREFIX}commitment_{}",
+                            node.as_kind_str()
+                        )
+                        .as_str(),
+                        || node.gen_lookup_witness(node_id, ctx, step),
+                        Some(|a, b| a + b),
+                    )?
+                }
+                ChunkedNode::ChunkedLayer(chunked_layer) => {
+                    let node = layers.get(&chunked_layer.original_node_id).ok_or(anyhow!(
+                        "Node {} not found in model",
+                        chunked_layer.original_node_id
+                    ))?;
+                    measure::r_and_accumulate(
+                        format!(
+                            "{LAYER_WISE_MEASURE_PREFIX}commitment_{}",
+                            node.as_kind_str()
+                        )
+                        .as_str(),
+                        || node.gen_lookup_witness(node_id, ctx, step),
+                        Some(|a, b| a + b),
+                    )?
+                }
+                ChunkedNode::SplitLayer(_) => Ok(Default::default()),
+                ChunkedNode::RecombinationLayer(_) => Ok(Default::default()),
+            }
         })
-        .collect::<anyhow::Result<HashMap<NodeInput, GenerateWitnessIO<_, _>>>>()?;
-
-    // here for the moment there is not yet a "parent node" so it's a directed
-    // graph ... but with no edges.
-    let graph_ctx = GenerateWitnessContext {
-        ctx,
-        layers,
-        trace: chunk_trace,
-    };
-    let scheduler = GraphScheduler::<GenerateWitness<E, PCS>, usize>::new(graph);
-    for gen_w in Ex::run(executor_config, scheduler, inputs, &graph_ctx)?.into_values() {
-        let GenerateWitnessIO::Output(gen_w) = gen_w else {
-            return Err(anyhow!("Expected output to be a logup witness"));
-        };
-        witness_gen.consume(gen_w);
-    }
-
-    debug!(
-        "== Witness poly commitments generation metrics {} ==",
-        metrics.to_span()
-    );
-
-    debug!("== Witness table multiplicities commitment generation ==");
-    let metrics = Metrics::new();
+        .collect::<anyhow::Result<Vec<LookupWitnessGen<'_, F>>>>()?;
+    let mut witness_gen =
+        witness_gens
+            .into_iter()
+            .fold(LookupWitnessGen::<F>::default(), |mut acc, gen_w| {
+                acc.consume(gen_w);
+                acc
+            });
 
     // calculate the table multiplicities
     let multiplicities = witness_gen
@@ -431,94 +353,146 @@ where
                     if let Some(lookup_count) = table_lookup_data.get(table_val) {
                         let table_count = *table_column_map.get(table_val).unwrap();
                         let inv = if table_count != 1 {
-                            E::BaseField::from_canonical_u64(table_count).inverse()
+                            F::from(table_count)
+                                .inverse()
+                                .expect("Tried to invert zero when computing table multiplicities")
                         } else {
-                            E::BaseField::ONE
+                            F::ONE
                         };
-                        E::BaseField::from_canonical_u64(*lookup_count) * inv
+                        F::from(*lookup_count) * inv
                     } else {
-                        E::BaseField::ZERO
+                        F::ZERO
                     }
                 })
-                .collect::<Vec<E::BaseField>>();
+                .collect::<Vec<F>>();
 
-            Ok(multiplicities)
+            Ok(DensePolynomial::new(multiplicities))
         })
-        .collect::<anyhow::Result<Vec<Vec<E::BaseField>>>>()?;
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let grouped_by_vars = witness_gen
-        .element_count
-        .keys()
-        .map(|table| (table.table_bit_size(), *table))
-        .into_group_map();
-    let rmms = grouped_by_vars
+    // let's put all polynomials to commit into a single vector and batch commit them
+    // given flattening all polys loose information we must keep that info for later to unflatten them
+    // how many polynomials per node
+    let witness_len = chunk
+        .subgraph
+        .forward_inners()
+        .filter_map(|(node_id, _)| {
+            witness_gen
+                .poly_to_commit
+                .get(&node_id)
+                .map(|v| (node_id, v.len()))
+        })
+        .collect::<BTreeMap<NodeId, usize>>();
+    let all_witness_len = witness_len.values().sum();
+    let multiplicities_len = multiplicities.len();
+    let multiplicities_poly_len = multiplicities
+        .iter()
+        .map(|p| p.len())
+        .collect::<Vec<usize>>();
+    let mut all_polys = chunk
+        .subgraph
+        .forward_inners()
+        .flat_map(|(node_id, _)| {
+            if let Some(polys) = witness_gen.poly_to_commit.get_mut(&node_id) {
+                std::mem::take(polys).into_iter()
+            } else {
+                Vec::new().into_iter()
+            }
+        })
+        .chain(multiplicities)
+        .collect::<Vec<_>>();
+    assert_eq!(all_polys.len(), all_witness_len + multiplicities_len);
+
+    // compute polys for input and outputs of the chunk
+    let (input_poly_ids, input_mles): (Vec<_>, Vec<_>) = chunk
+        .to_be_committed_polys(chunk_trace, BoundaryEdgeType::Incoming)?
         .into_iter()
-        .sorted_by(|a, b| Ord::cmp(&b.0, &a.0))
-        .scan(0, |skip, (nv, list)| {
-            let multiplicities_slice = multiplicities[*skip..*skip + list.len()].to_vec();
-            *skip += list.len();
-            Some((nv, multiplicities_slice))
-        })
-        .fold(vec![], |mut acc, (_, multiplicities_slice)| {
-            let num_tables = multiplicities_slice.len();
-            let transposed = transpose(multiplicities_slice);
+        .unzip();
 
-            let rmm = RowMajorMatrix::new_by_inner_matrix(
-                ceno_p3::matrix::dense::DenseMatrix::new(transposed.concat(), num_tables),
-                InstancePaddingStrategy::Default,
-            );
-            acc.push(rmm);
-            acc
-        });
+    let (output_poly_ids, output_mles): (Vec<_>, Vec<_>) = chunk
+        .to_be_committed_polys(chunk_trace, BoundaryEdgeType::Outgoing)?
+        .into_iter()
+        .unzip();
 
-    let table_witness = ctx.commitment_ctx.batch_commit(rmms)?;
+    all_polys.extend(input_mles);
+    all_polys.extend(output_mles);
+
+    let mut all_commitments = measure::r("witness_commitment", || {
+        ctx.commitment_ctx.batch_commit(all_polys)
+    })?;
+    let mut chunk_boundary_commitments =
+        all_commitments.split_off(all_witness_len + multiplicities_len);
+    assert_eq!(
+        chunk_boundary_commitments.len(),
+        input_poly_ids.len() + output_poly_ids.len()
+    );
+    let multiplicities_commitments = all_commitments.split_off(all_witness_len);
+    assert_eq!(multiplicities_commitments.len(), multiplicities_len);
+    assert_eq!(
+        multiplicities_commitments
+            .iter()
+            .map(|p| p.polynomial.len())
+            .collect::<Vec<usize>>(),
+        multiplicities_poly_len
+    );
+    let mut witness_commitments = all_commitments.into_iter();
+    let mut logup_witness = HashMap::new();
     debug!(
-        "== Witness table multiplicities commitment metrics {} ==",
+        "== Witness poly commitments generation metrics {} ==",
         metrics.to_span()
     );
 
     // Write the witness commitments to the transcript
-    for (node_id, _) in chunk_graph.forward_iter() {
-        if let Some(prover_commit) = witness_gen.logup_witnesses.get(&node_id) {
-            let comm = PCS::get_pure_commitment(prover_commit);
-            PCS::write_commitment(&comm, transcript).map_err(|e| anyhow!("{e:?}"))?;
+    for (node_id, _) in chunk.subgraph.forward_inners() {
+        let Some(len_commit) = witness_len.get(&node_id) else {
+            continue;
+        };
+        let mut node_commits = Vec::with_capacity(*len_commit);
+        for _ in 0..*len_commit {
+            let committed_poly = witness_commitments.next().unwrap();
+            committed_poly.append_to_transcript(transcript);
+            node_commits.push(committed_poly);
         }
+        logup_witness.insert(node_id, node_commits);
     }
 
-    let table_comm = PCS::get_pure_commitment(&table_witness);
-    PCS::write_commitment(&table_comm, transcript).map_err(|e| anyhow!("{e:?}"))?;
+    multiplicities_commitments
+        .iter()
+        .for_each(|committed_poly| committed_poly.append_to_transcript(transcript));
+
+    // build chunk io commitments
+    let output_boundary_comms = chunk_boundary_commitments
+        .split_off(input_poly_ids.len())
+        .into_iter()
+        .zip(output_poly_ids)
+        .map(|(committed_poly, poly_id)| {
+            let comm = VerifierCommitment::from(&committed_poly);
+            logup_witness.insert(poly_id, vec![committed_poly]);
+            (poly_id, comm)
+        })
+        .collect();
+
+    let input_boundary_comms = chunk_boundary_commitments
+        .into_iter()
+        .zip(input_poly_ids)
+        .map(|(committed_poly, poly_id)| {
+            let comm = VerifierCommitment::from(&committed_poly);
+            logup_witness.insert(poly_id, vec![committed_poly]);
+            (poly_id, comm)
+        })
+        .collect();
+
+    let chunk_commitments = ChunkIOCommitments {
+        inputs: input_boundary_comms,
+        outputs: output_boundary_comms,
+    };
+
+    // append chunk io commitments to the transcript
+    chunk_commitments.add_to_transcript(chunk.chunk_id, transcript);
 
     Ok(LookupWitness {
-        logup_witnesses: witness_gen
-            .logup_witnesses
-            .into_iter()
-            .map(|(k, v)| (k, Arc::into_inner(v).unwrap()))
-            .collect(),
-        table_witnesses: Some(table_witness),
-    })
-}
-
-pub fn generate_lookup_witnesses<'a, E, T: Transcript<E>, PCS>(
-    trace: &Trace<Element>,
-    ctx: &ProverContext<E, PCS>,
-    transcript: &mut T,
-    layers: &ModelLayersRef<'a>,
-) -> anyhow::Result<LookupWitness<E, PCS>>
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
-{
-    measure::r("witness_commitment", || {
-        generate_lookup_witness_for_chunk::<_, _, _, _, SequentialExecutor>(
-            &ctx.model_ctx.nodes,
-            &ctx.lookup,
-            trace,
-            ctx,
-            transcript,
-            layers,
-            &(),
-        )
+        logup_witnesses: logup_witness,
+        table_witnesses: Some(multiplicities_commitments),
+        chunk_commitments,
     })
 }

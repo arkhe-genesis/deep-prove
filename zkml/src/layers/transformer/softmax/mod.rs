@@ -10,7 +10,7 @@ use crate::{
         LayerCtx, LayerProof,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, ProvingData, QuantizeOp,
-            QuantizeOutput, VerifiableCtx,
+            QuantizeOutput, Splittable, VerifiableCtx,
         },
         requant::FIXED_POINT_SCALE,
         transformer::ConcatenationCache,
@@ -22,26 +22,27 @@ use crate::{
     },
     model::{Step, transform::impls::softmax_mask::SoftmaxMaskTransform},
     padding::PaddingMode,
+    poly_commit::verifier::VerifierCommitment,
     quantization::{self, ScalingFactor},
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
-    to_base,
 };
 use anyhow::{Result, anyhow, bail, ensure};
-
-use ff_ext::ExtensionField;
-
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::util::{ceil_log2, transpose};
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{
+        CommitmentScheme,
+        transcript::{AppendToTranscript, Transcript},
+    },
+    structs::IOPProof,
+    util::ceil_log2,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fmt::Debug,
     sync::{Arc, Mutex},
 };
-use sumcheck::structs::IOPProof;
 use tenstore::StorageKey;
-use transcript::Transcript;
-use witness::RowMajorMatrix;
 
 pub mod evaluate;
 pub mod lookup;
@@ -112,26 +113,31 @@ impl QuantisedSoftmaxData {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 /// Proof for correct execution of a quantised [`Softmax`] operation.
-pub struct SoftmaxProof<E, PCS>
+pub struct SoftmaxProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
     /// The LogUp proofs for Softmax, they are ordered `exp_lookup`, `range_lookup`, `error_lookup` and then `zero_table_lookup` if it exists
-    pub(crate) logup_proof: LogUpBatchProof<E>,
+    pub(crate) logup_proof: LogUpBatchProof<F>,
     /// Witness commitments for this layer
-    pub(crate) commitment: PCS::Commitment,
+    pub(crate) commitments: Vec<VerifierCommitment<PCS>>,
     /// The sumcheck proof we use to make sure everything is evaluated at the same point.
-    pub(crate) sumcheck_proof: IOPProof<E>,
+    pub(crate) sumcheck_proof: IOPProof<F>,
     /// The claimed evaluations of the polynomials used in the sumcheck proof.
-    pub(crate) evaluations: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) evaluations: Vec<F>,
     /// The shift tensor evaluations
-    pub(crate) shift_evaluations: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) shift_evaluations: Vec<F>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Debug for SoftmaxProof<E, PCS> {
+impl<F: PrimeField, PCS: CommitmentScheme> Debug for SoftmaxProof<F, PCS> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -141,9 +147,12 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> Debug for SoftmaxPro
     }
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> SoftmaxProof<E, PCS> {
-    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
-        PCS::write_commitment(&self.commitment, transcript).map_err(|e| anyhow!("{e:?}"))
+impl<F: PrimeField, PCS: CommitmentScheme> SoftmaxProof<F, PCS> {
+    pub(crate) fn write_commitment<T: Transcript>(&self, transcript: &mut T) -> Result<()> {
+        self.commitments
+            .iter()
+            .for_each(|comm| comm.append_to_transcript(transcript));
+        Ok(())
     }
 }
 
@@ -302,33 +311,31 @@ impl Evaluate<Element> for Softmax<Element> {
 
 impl PadOp for Softmax<Element> {}
 
-impl<E, PCS> ProvableOp<E, PCS> for Softmax<Element>
+impl<F, PCS> ProvableOp<F, PCS> for Softmax<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = SoftmaxCtx;
 
-    fn prove<T: transcript::Transcript<E>>(
+    fn prove<T: Transcript>(
         &self,
         node_id: NodeId,
         _ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut crate::Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut crate::Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         self.prove_internal(node_id, last_claims, step_data, prover)
     }
 
     fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &ProverContext<E, PCS>,
+        _ctx: &ProverContext<F, PCS>,
         step_data: &Step<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
-        self.lookup_witness(id, ctx, step_data)
+    ) -> Result<LookupWitnessGen<'static, F>> {
+        self.lookup_witness(id, step_data)
     }
 }
 
@@ -383,7 +390,6 @@ impl QuantizeOp for Softmax<f32> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SoftmaxCtx {
-    node_id: NodeId,
     /// This is the quantisation data for the [`Softmax`] op
     quant_info: QuantisedSoftmaxData,
 }
@@ -421,11 +427,7 @@ impl OpInfo for SoftmaxCtx {
 }
 
 impl ProveInfo for Softmax<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         if let Some(quant_info) = self.quant_info() {
             // There are no common commitments for this layer
             aux.model_polys = None;
@@ -453,7 +455,6 @@ impl ProveInfo for Softmax<Element> {
             // return the LayerCtx and the updated ContextAux
             Ok((
                 LayerCtx::Softmax(SoftmaxCtx {
-                    node_id: id,
                     quant_info: *quant_info,
                 }),
                 aux,
@@ -464,23 +465,26 @@ impl ProveInfo for Softmax<Element> {
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for SoftmaxCtx
+impl Splittable for SoftmaxCtx {}
+
+impl<F, PCS> VerifiableCtx<F, PCS> for SoftmaxCtx
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    type Proof = SoftmaxProof<E, PCS>;
-    fn verify<T: transcript::Transcript<E>>(
+    type Proof = SoftmaxProof<F, PCS>;
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
-        self.verify_internal(proof, last_claims, verifier, shape_step)
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
+        self.verify_internal(proof, last_claims, verifier, shape_step, node_id)
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,

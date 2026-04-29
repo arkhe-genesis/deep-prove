@@ -1,6 +1,5 @@
 use crate::{
     Claim, Element, NextPowerOfTwo, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
-    commit::{compute_betas_eval, identity_eval},
     eval_zeroifier_mle,
     graph::NodeId,
     iop::{
@@ -17,46 +16,48 @@ use crate::{
     },
     model::Step,
     padding::ShapeInfo,
+    poly_commit::identity_eval,
     quantization::{self, Quantize, ToField},
     tensor::{CommitmentId, TensorHandle, TensorSlice, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
 };
 use anyhow::ensure;
-use either::Either;
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    mle::IntoMLE, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
+use ark_ff::PrimeField;
+use dp_crypto::{
+    IntoMLE,
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    poly::eq::evals,
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::{ceil_log2, optimal_sumcheck_threads},
+    virtual_polys::VirtualPolynomialsBuilder,
 };
-use p3_field::FieldAlgebra;
+use either::Either;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     iter::once,
     sync::{Arc, Mutex},
 };
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-
-use transcript::Transcript;
 
 /// Data structure containing the proof data for the absolute variant of positional encoding layer
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct AbsoluteProof<E: ExtensionField> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct AbsoluteProof<F: PrimeField> {
     /// The sumcheck proof used to check we have used the correct subslice of the positional matrix
-    sumcheck_proof: IOPProof<E>,
+    sumcheck_proof: IOPProof<F>,
     // Evaluations of the sub-matrices required to compute the claim
     // about the positional matrix. Each sub-matrix is identified by
     // an incremental integer that corresponds to an extra variable to be processed
     // to get to the number of variables of the positional matrix.
-    sub_matrix_evals: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    sub_matrix_evals: Vec<F>,
     // Proofs for addition of the slice of the positional matrix with an
     // input tensor
-    add_proof: AddProof<E>,
+    add_proof: AddProof<F>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,7 +65,6 @@ pub struct AbsoluteCtx {
     add_ctx: AddCtx,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
-    node_id: NodeId,
     positional_key: CommitmentId,
 }
 
@@ -208,14 +208,13 @@ impl PadOp for Absolute<Element> {
 }
 
 impl Absolute<Element> {
-    pub(super) fn step_info<E: ExtensionField>(
+    pub(super) fn step_info<F: PrimeField>(
         &self,
-        id: NodeId,
         aux: ContextAux,
     ) -> anyhow::Result<(AbsoluteCtx, ContextAux)> {
-        let (ctx, mut aux) = self.add_layer.step_info(id, aux)?;
+        let (ctx, mut aux) = self.add_layer.step_info(aux)?;
 
-        let LayerCtx::<E>::Add(add_ctx) = ctx else {
+        let LayerCtx::<F>::Add(add_ctx) = ctx else {
             unreachable!()
         };
 
@@ -236,28 +235,19 @@ impl Absolute<Element> {
             add_ctx,
             unpadded_shape: self.unpadded_shape.clone(),
             num_vars_positional_matrix: self.num_vars(),
-            node_id: id,
             positional_key: self.positional.storage_key().into(),
         };
 
         Ok((ctx, aux))
     }
 
-    pub(super) fn prove_step<
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    >(
+    pub(super) fn prove_step<F: PrimeField, T: Transcript, PCS: CommitmentScheme<Field = F>>(
         &self,
         node_id: NodeId,
-        output_claim: &Claim<E>,
+        output_claim: &Claim<F>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> anyhow::Result<Vec<Claim<E>>>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
-    {
+        prover: &mut Prover<F, T, PCS>,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         let input = &step_data.padded_input_tensors()?[0];
 
         // derive sub-matrix to be added to input.
@@ -269,7 +259,7 @@ impl Absolute<Element> {
             .slice_over_first_dim(0, input.unpadded_shape()[0])
             .to_tensor()?
             .pad_next_power_of_two();
-        let sub_pos: Tensor<E> = matrix_slice
+        let sub_pos: Tensor<F> = matrix_slice
             .slice_over_first_dim(0, input.shape()[0])
             .to_tensor()?
             .to_field();
@@ -296,8 +286,8 @@ impl Absolute<Element> {
         // to the the element in the row with index `2` (assuming zero indexing).
         let row_num_vars = ceil_log2(input.shape().dim(-1));
         let row_point = &sub_pos_claim.point()[..row_num_vars];
-        let row_evals = compute_betas_eval(row_point);
-        let column_eq = compute_betas_eval(&sub_pos_claim.point()[row_num_vars..]).into_mle();
+        let row_evals = evals(row_point);
+        let column_eq = evals(&sub_pos_claim.point()[row_num_vars..]).into_mle();
         // All of the rows in the positional matrix are fixed for the Sumcheck
         let fixed_positional = sub_pos
             .data()
@@ -308,25 +298,25 @@ impl Absolute<Element> {
                     .take(input.unpadded_shape().dim(-1))
                     .zip(row_evals.iter())
                     .map(|(v, r)| *v * *r)
-                    .sum::<E>()
+                    .sum::<F>()
             })
-            .collect::<Vec<E>>()
+            .collect::<Vec<F>>()
             .into_mle();
         // This polynomial is 1 for rows less than the input length and 0 otherwise
         let lt_poly = (0..input.shape().dim(0))
             .map(|i| {
                 if i < input.unpadded_shape().dim(0) {
-                    E::BaseField::ONE
+                    F::ONE
                 } else {
-                    E::BaseField::ZERO
+                    F::ZERO
                 }
             })
-            .collect::<Vec<E::BaseField>>()
+            .collect::<Vec<F>>()
             .into_mle();
 
         let num_vars = column_eq.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<F>::new(num_threads, num_vars);
         let fixed_positional_expr = expr_builder.lift(Either::Left(&fixed_positional));
         let lt_expr = expr_builder.lift(Either::Left(&lt_poly));
         let column_eq_expr = expr_builder.lift(Either::Left(&column_eq));
@@ -334,12 +324,12 @@ impl Absolute<Element> {
         let virtual_poly =
             expr_builder.to_virtual_polys(&[fixed_positional_expr * lt_expr * column_eq_expr], &[]);
         // This sumcheck checks that the positional matrix subslice has been correctly formed
-        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let (proof, state) = IOPProverState::<F>::prove(virtual_poly, prover.transcript);
 
         let sumcheck_point = state.collect_raw_challenges();
         let all_evals = state.get_mle_flatten_final_evaluations();
         let sub_matrix_eval = all_evals[0];
-        let sub_pos_claim = Claim::<E>::new(
+        let sub_pos_claim = Claim::<F>::new(
             row_point
                 .iter()
                 .chain(sumcheck_point.iter())
@@ -383,21 +373,18 @@ impl Absolute<Element> {
 }
 
 impl AbsoluteCtx {
-    pub(super) fn verify<
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
-    >(
+    pub(super) fn verify<F: PrimeField, T: Transcript, PCS: CommitmentScheme<Field = F>>(
         &self,
-        proof: &AbsoluteProof<E>,
-        verifier: &mut Verifier<E, T, PCS>,
-        output_claim: &Claim<E>,
+        proof: &AbsoluteProof<F>,
+        verifier: &mut Verifier<F, T, PCS>,
+        output_claim: &Claim<F>,
         shape_step: &ShapeStep,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         // compute shape step for add sub-layer
         let unpadded_input_shapes = vec![shape_step.unpadded_input_shape[0].clone(); 2];
         let padded_input_shapes = vec![shape_step.padded_input_shape[0].clone(); 2];
-        let shape_step = LayerCtx::<E>::Add(self.add_ctx.clone())
+        let shape_step = LayerCtx::<F>::Add(self.add_ctx.clone())
             .shape_step(&unpadded_input_shapes, &padded_input_shapes)?;
 
         let AbsoluteProof {
@@ -405,9 +392,9 @@ impl AbsoluteCtx {
             sub_matrix_evals,
             add_proof,
         } = proof;
-        let mut claims = self
-            .add_ctx
-            .verify(add_proof, &[output_claim], verifier, &shape_step)?;
+        let mut claims =
+            self.add_ctx
+                .verify(add_proof, &[output_claim], verifier, &shape_step, node_id)?;
 
         ensure!(
             claims.len() == 2,
@@ -423,7 +410,7 @@ impl AbsoluteCtx {
         let num_row_vars = ceil_log2(padded_input_shapes[0].dim(-1));
         let num_col_vars = ceil_log2(padded_input_shapes[0].dim(0));
 
-        let subclaim = IOPVerifierState::<E>::verify(
+        let subclaim = IOPVerifierState::<F>::verify(
             sub_pos_claim.evaluation(),
             sumcheck_proof,
             &from_mle_list_dimensions(&[vec![num_col_vars, num_col_vars, num_col_vars]]),
@@ -431,29 +418,27 @@ impl AbsoluteCtx {
         );
 
         // Calculate the sub matrix claim from the subclaim and lt and eq evals
-        let sumcheck_point = subclaim
-            .point
-            .iter()
-            .map(|c| c.elements)
-            .collect::<Vec<E>>();
-        let column_eq_eval = identity_eval(&sub_pos_claim.point()[num_row_vars..], &sumcheck_point);
+        let sumcheck_point = &subclaim.point;
+        let column_eq_eval = identity_eval(&sub_pos_claim.point()[num_row_vars..], sumcheck_point);
 
         let unpadded_seq_len = unpadded_input_shapes[0].dim(0);
         let bits = to_bit_sequence_le(unpadded_seq_len - 1, num_col_vars)
-            .map(E::from_canonical_usize)
-            .collect::<Vec<E>>();
-        let lt_eval = eval_zeroifier_mle(&sumcheck_point, &bits);
+            .map(|b| F::from(b as u64))
+            .collect::<Vec<F>>();
+        let lt_eval = eval_zeroifier_mle(sumcheck_point, &bits);
 
-        let multiplier = (lt_eval * column_eq_eval).inverse();
+        let multiplier = (lt_eval * column_eq_eval)
+            .inverse()
+            .expect("Tried to invert zero in Absolute Positional verifier");
         let sub_pos_eval = subclaim.expected_evaluation * multiplier;
 
-        let sub_pos_claim = Claim::<E>::new(
+        let sub_pos_claim = Claim::<F>::new(
             sub_pos_claim
                 .point()
                 .iter()
                 .take(num_row_vars)
-                .cloned()
                 .chain(sumcheck_point)
+                .cloned()
                 .collect(),
             sub_pos_eval,
         );
@@ -467,7 +452,7 @@ impl AbsoluteCtx {
         )?;
 
         verifier.add_common_claims(
-            self.node_id,
+            node_id,
             [(self.positional_key.clone(), positional_matrix_claim)]
                 .into_iter()
                 .collect(),

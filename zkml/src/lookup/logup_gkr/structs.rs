@@ -6,13 +6,15 @@ use std::{
     ops::{Add, AddAssign, Mul, MulAssign},
 };
 
-use anyhow::{Result, anyhow, ensure};
-use either::Either;
-use ff_ext::ExtensionField;
-use multilinear_extensions::{Expression, mle::MultilinearExtension};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::IOPProof;
-use transcript::Transcript;
+use anyhow::{anyhow, ensure};
+use ark_ff::PrimeField;
+use dp_crypto::{
+    Expression,
+    arkyper::transcript::Transcript,
+    poly::{dense::DensePolynomial, slice::SmartSlice},
+    structs::IOPProof,
+};
+use serde::{Deserialize, Serialize};
 
 use super::circuit::LogUpCircuit;
 use crate::Claim;
@@ -43,7 +45,7 @@ impl<F> Fraction<F> {
     }
 }
 
-impl<F: ExtensionField, T: Borrow<Fraction<F>>> AddAssign<T> for Fraction<F> {
+impl<F: PrimeField, T: Borrow<Fraction<F>>> AddAssign<T> for Fraction<F> {
     fn add_assign(&mut self, rhs: T) {
         let rhs: &Fraction<F> = rhs.borrow();
         let numerator = (self.numerator * rhs.denominator) + (self.denominator * rhs.numerator);
@@ -55,7 +57,7 @@ impl<F: ExtensionField, T: Borrow<Fraction<F>>> AddAssign<T> for Fraction<F> {
     }
 }
 
-impl<F: ExtensionField, T: Borrow<Fraction<F>>> Add<T> for &Fraction<F> {
+impl<F: PrimeField, T: Borrow<Fraction<F>>> Add<T> for &Fraction<F> {
     type Output = Fraction<F>;
 
     fn add(self, rhs: T) -> Self::Output {
@@ -65,7 +67,7 @@ impl<F: ExtensionField, T: Borrow<Fraction<F>>> Add<T> for &Fraction<F> {
     }
 }
 
-impl<F: ExtensionField, T: Borrow<Fraction<F>>> Add<T> for Fraction<F> {
+impl<F: PrimeField, T: Borrow<Fraction<F>>> Add<T> for Fraction<F> {
     type Output = Fraction<F>;
 
     fn add(self, rhs: T) -> Self::Output {
@@ -75,7 +77,7 @@ impl<F: ExtensionField, T: Borrow<Fraction<F>>> Add<T> for Fraction<F> {
     }
 }
 
-impl<F: ExtensionField, T: Borrow<Fraction<F>>> MulAssign<T> for Fraction<F> {
+impl<F: PrimeField, T: Borrow<Fraction<F>>> MulAssign<T> for Fraction<F> {
     fn mul_assign(&mut self, rhs: T) {
         let rhs: &Fraction<F> = rhs.borrow();
         self.numerator *= rhs.numerator;
@@ -83,7 +85,7 @@ impl<F: ExtensionField, T: Borrow<Fraction<F>>> MulAssign<T> for Fraction<F> {
     }
 }
 
-impl<F: ExtensionField, T: Borrow<Fraction<F>>> Mul<T> for &Fraction<F> {
+impl<F: PrimeField, T: Borrow<Fraction<F>>> Mul<T> for &Fraction<F> {
     type Output = Fraction<F>;
 
     fn mul(self, rhs: T) -> Self::Output {
@@ -93,7 +95,7 @@ impl<F: ExtensionField, T: Borrow<Fraction<F>>> Mul<T> for &Fraction<F> {
     }
 }
 
-impl<F: ExtensionField, T: Borrow<Fraction<F>>> Mul<T> for Fraction<F> {
+impl<F: PrimeField, T: Borrow<Fraction<F>>> Mul<T> for Fraction<F> {
     type Output = Fraction<F>;
 
     fn mul(self, rhs: T) -> Self::Output {
@@ -103,19 +105,19 @@ impl<F: ExtensionField, T: Borrow<Fraction<F>>> Mul<T> for Fraction<F> {
     }
 }
 
-impl<F: ExtensionField> Sum for Fraction<F> {
+impl<F: PrimeField> Sum for Fraction<F> {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Fraction<F> {
         iter.fold(Fraction::<F>::ZERO, |acc, term| acc + term)
     }
 }
 
-impl<F: ExtensionField> Product for Fraction<F> {
+impl<F: PrimeField> Product for Fraction<F> {
     fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.fold(Fraction::<F>::ONE, |acc, term| acc * term)
     }
 }
 
-impl<F: ExtensionField> Fraction<F> {
+impl<F: PrimeField> Fraction<F> {
     const ZERO: Fraction<F> = Fraction {
         numerator: F::ZERO,
         denominator: F::ONE,
@@ -135,30 +137,30 @@ impl<F: ExtensionField> Fraction<F> {
 /// Enum defining inputs to LogUp proofs.
 /// We split lookup inputs and table inputs as different optimisations can be made in each case. Additionally it allows us to only do work proportional to the table size in the table proving case
 /// which is useful when multiple different model layers use the same table.
-pub enum LogUpInput<E: ExtensionField> {
+pub enum LogUpInput<F: PrimeField> {
     /// Lookup variant can have multiple instances in one [`LogUpInput::Lookup`], `columns_per_instance` is used to work out how many batches we need to prove.
     Lookup {
-        column_evals: Vec<Vec<E::BaseField>>,
-        constant_challenge: E,
-        column_separation_challenge: E,
+        column_evals: Vec<Vec<F>>,
+        constant_challenge: F,
+        column_separation_challenge: F,
         columns_per_instance: usize,
     },
     /// Input for a Table proof.
     Table {
-        column_evals: Vec<Vec<E::BaseField>>,
-        multiplicities: Vec<E::BaseField>,
-        constant_challenge: E,
-        column_separation_challenge: E,
+        column_evals: Vec<Vec<F>>,
+        multiplicities: Vec<F>,
+        constant_challenge: F,
+        column_separation_challenge: F,
     },
 }
 
-impl<E: ExtensionField> LogUpInput<E> {
+impl<F: PrimeField> LogUpInput<F> {
     pub fn new_lookup(
-        column_evals: Vec<Vec<E::BaseField>>,
-        constant_challenge: E,
-        column_separation_challenge: E,
+        column_evals: Vec<Vec<F>>,
+        constant_challenge: F,
+        column_separation_challenge: F,
         columns_per_instance: usize,
-    ) -> Result<LogUpInput<E>> {
+    ) -> anyhow::Result<LogUpInput<F>> {
         ensure!(
             !column_evals.is_empty(),
             "No column evals were provided for Lookup input"
@@ -188,11 +190,11 @@ impl<E: ExtensionField> LogUpInput<E> {
     }
 
     pub fn new_table(
-        column_evals: Vec<Vec<E::BaseField>>,
-        multiplicities: Vec<E::BaseField>,
-        constant_challenge: E,
-        column_separation_challenge: E,
-    ) -> Result<LogUpInput<E>> {
+        column_evals: Vec<Vec<F>>,
+        multiplicities: Vec<F>,
+        constant_challenge: F,
+        column_separation_challenge: F,
+    ) -> anyhow::Result<LogUpInput<F>> {
         ensure!(
             !column_evals.is_empty(),
             "No column evals were provided for Lookup input"
@@ -228,7 +230,7 @@ impl<E: ExtensionField> LogUpInput<E> {
         })
     }
 
-    pub fn column_evals(&self) -> &[Vec<E::BaseField>] {
+    pub fn column_evals(&self) -> &[Vec<F>] {
         match self {
             LogUpInput::Lookup { column_evals, .. } | LogUpInput::Table { column_evals, .. } => {
                 column_evals
@@ -236,7 +238,7 @@ impl<E: ExtensionField> LogUpInput<E> {
         }
     }
 
-    pub fn make_new_circuits(&self) -> Vec<LogUpCircuit<E>> {
+    pub fn make_new_circuits(&self) -> Vec<LogUpCircuit<F>> {
         match self {
             LogUpInput::Lookup {
                 column_evals,
@@ -246,7 +248,7 @@ impl<E: ExtensionField> LogUpInput<E> {
             } => column_evals
                 .par_chunks(*columns_per_instance)
                 .map(|column_evals| {
-                    LogUpCircuit::<E>::new_lookup_circuit(
+                    LogUpCircuit::<F>::new_lookup_circuit(
                         column_evals,
                         *constant_challenge,
                         *column_separation_challenge,
@@ -259,7 +261,7 @@ impl<E: ExtensionField> LogUpInput<E> {
                 constant_challenge,
                 column_separation_challenge,
             } => {
-                vec![LogUpCircuit::<E>::new_table_circuit(
+                vec![LogUpCircuit::<F>::new_table_circuit(
                     column_evals,
                     multiplicities,
                     *constant_challenge,
@@ -269,13 +271,12 @@ impl<E: ExtensionField> LogUpInput<E> {
         }
     }
 
-    pub fn base_mles(&self) -> Vec<MultilinearExtension<'_, E>> {
+    pub fn base_mles(&self) -> Vec<DensePolynomial<'_, F>> {
         match self {
             LogUpInput::Lookup { column_evals, .. } => column_evals
                 .iter()
                 .map(|evaluations| {
-                    let num_vars = evaluations.len().ilog2() as usize;
-                    MultilinearExtension::<E>::from_evaluations_slice(num_vars, evaluations)
+                    DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(evaluations))
                 })
                 .collect(),
             LogUpInput::Table {
@@ -285,8 +286,7 @@ impl<E: ExtensionField> LogUpInput<E> {
             } => std::iter::once(multiplicities)
                 .chain(column_evals.iter())
                 .map(|evaluations| {
-                    let num_vars = evaluations.len().ilog2() as usize;
-                    MultilinearExtension::<E>::from_evaluations_slice(num_vars, evaluations)
+                    DensePolynomial::new_from_smart_slice(SmartSlice::Borrowed(evaluations))
                 })
                 .collect(),
         }
@@ -318,20 +318,20 @@ pub struct LogUpVerifierInstance<E> {
     num_vars: usize,
 }
 
-pub struct InstanceExpressions<E: ExtensionField> {
-    pub(crate) sumcheck_expression: Expression<E>,
-    pub(crate) claim_expression: Expression<E>,
+pub struct InstanceExpressions<F: PrimeField> {
+    pub(crate) sumcheck_expression: Expression<F>,
+    pub(crate) claim_expression: Expression<F>,
 }
 
-impl<E: ExtensionField> LogUpVerifierInstance<E> {
+impl<F: PrimeField> LogUpVerifierInstance<F> {
     /// Create a new instance of a [`LogUpVerifierInstance`].
     pub fn new(
-        constant_challenge: E,
-        column_separation_challenge: E,
+        constant_challenge: F,
+        column_separation_challenge: F,
         num_columns: usize,
         instance_type: ProofType,
         num_vars: usize,
-    ) -> LogUpVerifierInstance<E> {
+    ) -> LogUpVerifierInstance<F> {
         LogUpVerifierInstance {
             constant_challenge,
             column_separation_challenge,
@@ -342,11 +342,11 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
     }
 
     /// Getter for the constant challenge.
-    pub fn constant_challenge(&self) -> E {
+    pub fn constant_challenge(&self) -> F {
         self.constant_challenge
     }
     /// Getter for the column separation challenge.
-    pub fn column_separation_challenge(&self) -> E {
+    pub fn column_separation_challenge(&self) -> F {
         self.column_separation_challenge
     }
     /// Getter for the number of columns.
@@ -374,10 +374,10 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
     /// It returns the contribution to the claim along with the full evaluations of the polynomials at the final round.
     pub fn final_claim(
         &self,
-        final_round_evals: &[E],
-        batching_challenge: E,
-        sumcheck_point: &[E],
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        final_round_evals: &[F],
+        batching_challenge: F,
+        sumcheck_point: &[F],
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         let point_length = sumcheck_point.len();
         match self.instance_type() {
             ProofType::Lookup => {
@@ -387,13 +387,13 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
                     .zip(high_evals.iter())
                     .map(|(&low, &high)| {
                         let eval = batching_challenge * (high - low) + low;
-                        Claim::<E>::new(
+                        Claim::<F>::new(
                             // self.num_vars() + 1 is subtracted because the final layer of the GKR circuit is over 1 fewer variable than the full column MLEs
                             sumcheck_point[point_length - 1 - self.num_vars()..].to_vec(),
                             eval,
                         )
                     })
-                    .collect::<Vec<Claim<E>>>();
+                    .collect::<Vec<Claim<F>>>();
 
                 Ok(output_claims)
             }
@@ -412,13 +412,13 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
                             .map(|(&low, &high)| batching_challenge * (high - low) + low),
                     )
                     .map(|eval| {
-                        Claim::<E>::new(
+                        Claim::<F>::new(
                             // self.num_vars() + 1 is subtracted because the final layer of the GKR circuit is over 1 fewer variable than the full column MLEs
                             sumcheck_point[point_length - 1 - self.num_vars()..].to_vec(),
                             eval,
                         )
                     })
-                    .collect::<Vec<Claim<E>>>();
+                    .collect::<Vec<Claim<F>>>();
 
                 Ok(output_claims)
             }
@@ -430,18 +430,18 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
         layer_count: &mut usize,
         initial_witness_id: &mut u16,
         is_final_round: bool,
-    ) -> InstanceExpressions<E> {
+    ) -> InstanceExpressions<F> {
         // build the claim expression which is used to link to the previous layer to this one, common to all layer types
         let claim_num_low_id = *layer_count as u16 * 4;
         let claim_num_high_id = claim_num_low_id + 1;
         let claim_denom_low_id = claim_num_high_id + 1;
         let claim_denom_high_id = claim_denom_low_id + 1;
-        let claim_expression = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
-            * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+        let claim_expression = Expression::Challenge(0u16, *layer_count, F::ONE, F::ZERO)
+            * (Expression::Challenge(2, 1, F::ONE, F::ZERO)
                 * (Expression::WitIn(claim_num_high_id) - Expression::WitIn(claim_num_low_id))
                 + Expression::WitIn(claim_num_low_id)
-                + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
-                    * (Expression::Challenge(2, 1, E::ONE, E::ZERO)
+                + Expression::Challenge(1u16, 1, F::ONE, F::ZERO)
+                    * (Expression::Challenge(2, 1, F::ONE, F::ZERO)
                         * (Expression::WitIn(claim_denom_high_id)
                             - Expression::WitIn(claim_denom_low_id))
                         + Expression::WitIn(claim_denom_low_id)));
@@ -453,10 +453,10 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
             let denom_high_id = denom_low_id + 1;
 
             // build the sumcheck expression which is used to prove this layer links to the next one
-            let sumcheck_expr = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
+            let sumcheck_expr = Expression::Challenge(0u16, *layer_count, F::ONE, F::ZERO)
                 * (Expression::WitIn(num_low_id) * Expression::WitIn(denom_high_id)
                     + Expression::WitIn(num_high_id) * Expression::WitIn(denom_low_id)
-                    + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                    + Expression::Challenge(1u16, 1, F::ONE, F::ZERO)
                         * Expression::WitIn(denom_low_id)
                         * Expression::WitIn(denom_high_id));
             // Increment the layer count and witness id for the next call
@@ -472,12 +472,11 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
                     let num_low_id = *initial_witness_id;
                     let num_high_id = num_low_id + 1;
                     // Now we make the denominator expressions
-                    let constant_expr =
-                        Expression::Constant(Either::Right(self.constant_challenge()));
+                    let constant_expr = Expression::Constant(self.constant_challenge());
                     let (denom_low_expr, denom_high_expr, _) = (0..self.num_columns() as u16).fold(
-                        (constant_expr.clone(), constant_expr.clone(), E::ONE),
+                        (constant_expr.clone(), constant_expr.clone(), F::ONE),
                         |(acc_low, acc_high, chal_acc), i| {
-                            let chal_expr = Expression::Constant(Either::Right(chal_acc));
+                            let chal_expr = Expression::Constant(chal_acc);
                             (
                                 acc_low
                                     + chal_expr.clone() * Expression::WitIn(num_high_id + 1 + i),
@@ -492,10 +491,10 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
                     );
 
                     // build the sumcheck expression which is used to prove this layer links to the next one
-                    let sumcheck_expr = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
+                    let sumcheck_expr = Expression::Challenge(0u16, *layer_count, F::ONE, F::ZERO)
                         * (Expression::WitIn(num_low_id) * denom_high_expr.clone()
                             + Expression::WitIn(num_high_id) * denom_low_expr.clone()
-                            + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                            + Expression::Challenge(1u16, 1, F::ONE, F::ZERO)
                                 * denom_low_expr.clone()
                                 * denom_high_expr.clone());
                     // Increment the layer count and witness id for the next call
@@ -508,12 +507,11 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
                 }
                 ProofType::Lookup => {
                     // Now we make the denominator expressions
-                    let constant_expr =
-                        Expression::Constant(Either::Right(self.constant_challenge()));
+                    let constant_expr = Expression::Constant(self.constant_challenge());
                     let (denom_low_expr, denom_high_expr, _) = (0..self.num_columns() as u16).fold(
-                        (constant_expr.clone(), constant_expr.clone(), E::ONE),
+                        (constant_expr.clone(), constant_expr.clone(), F::ONE),
                         |(acc_low, acc_high, chal_acc), i| {
-                            let chal_expr = Expression::Constant(Either::Right(chal_acc));
+                            let chal_expr = Expression::Constant(chal_acc);
                             (
                                 acc_low
                                     + chal_expr.clone()
@@ -530,9 +528,9 @@ impl<E: ExtensionField> LogUpVerifierInstance<E> {
                     // The numerator is all -1 so we can use a constant expression
 
                     // build the sumcheck expression which is used to prove this layer links to the next one
-                    let sumcheck_expr = Expression::Challenge(0u16, *layer_count, E::ONE, E::ZERO)
+                    let sumcheck_expr = Expression::Challenge(0u16, *layer_count, F::ONE, F::ZERO)
                         * (-denom_high_expr.clone() - denom_low_expr.clone()
-                            + Expression::Challenge(1u16, 1, E::ONE, E::ZERO)
+                            + Expression::Challenge(1u16, 1, F::ONE, F::ZERO)
                                 * denom_low_expr.clone()
                                 * denom_high_expr.clone());
                     // Increment the layer count and witness id for the next call
@@ -555,17 +553,22 @@ pub enum ProofType {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 /// Struct used to store all information needed to verify a LogUp GKR argument.
-pub struct LogUpBatchProof<E: ExtensionField> {
+pub struct LogUpBatchProof<F: PrimeField> {
     /// Sumcheck proofs for each round
-    pub sumcheck_proofs: Vec<IOPProof<E>>,
+    pub sumcheck_proofs: Vec<IOPProof<F>>,
+    #[serde(with = "dp_crypto::serialization")]
     /// The evaluations of the polynomials at each layer
-    pub round_evaluations: Vec<Vec<E>>,
+    pub round_evaluations: Vec<Vec<F>>,
     /// Claims about the individual column evals from the last round (so before they are merged using the column challenges)
-    pub output_claims: Vec<Claim<E>>,
+    pub output_claims: Vec<Claim<F>>,
+    #[serde(with = "dp_crypto::serialization")]
     /// The outputs of the circuit
-    pub circuit_outputs: Vec<Vec<E>>,
+    pub circuit_outputs: Vec<Vec<F>>,
     /// Whether this proof wa for lookups or tables
     pub proof_type: ProofType,
     /// How many variables each instance is.
@@ -574,14 +577,14 @@ pub struct LogUpBatchProof<E: ExtensionField> {
     pub num_denominator_columns_per_instance: Vec<usize>,
 }
 
-impl<E: ExtensionField> LogUpBatchProof<E> {
-    pub fn append_to_transcript<T: Transcript<E>>(&self, transcript: &mut T) {
+impl<F: PrimeField> LogUpBatchProof<F> {
+    pub fn append_to_transcript<T: Transcript>(&self, transcript: &mut T) {
         self.circuit_outputs
             .iter()
-            .for_each(|evals| transcript.append_field_element_exts(evals));
+            .for_each(|evals| transcript.append_scalars(evals));
     }
 
-    pub fn fractional_outputs(&self) -> (Vec<E>, Vec<E>) {
+    pub fn fractional_outputs(&self) -> (Vec<F>, Vec<F>) {
         self.circuit_outputs
             .iter()
             .map(|evals| {
@@ -593,17 +596,17 @@ impl<E: ExtensionField> LogUpBatchProof<E> {
             .unzip()
     }
 
-    pub fn proofs_and_evals(&self) -> impl Iterator<Item = (&IOPProof<E>, &Vec<E>)> {
+    pub fn proofs_and_evals(&self) -> impl Iterator<Item = (&IOPProof<F>, &Vec<F>)> {
         self.sumcheck_proofs
             .iter()
             .zip(self.round_evaluations.iter())
     }
 
-    pub fn circuit_outputs(&self) -> &[Vec<E>] {
+    pub fn circuit_outputs(&self) -> &[Vec<F>] {
         &self.circuit_outputs
     }
 
-    pub fn output_claims(&self) -> &[Claim<E>] {
+    pub fn output_claims(&self) -> &[Claim<F>] {
         &self.output_claims
     }
 
@@ -615,38 +618,38 @@ impl<E: ExtensionField> LogUpBatchProof<E> {
         self.num_vars_per_instance.len()
     }
 
-    pub fn final_round_evals(&self) -> Vec<E> {
+    pub fn final_round_evals(&self) -> Vec<F> {
         self.round_evaluations.last().unwrap().clone()
     }
 
-    pub fn point(&self) -> &[E] {
+    pub fn point(&self) -> &[F] {
         self.output_claims[0].point()
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct LogUpBatchVerifierClaim<E: ExtensionField> {
+pub struct LogUpBatchVerifierClaim<F> {
     /// This is the final claim returned by the GKR circuit
-    claim: E,
+    claim: F,
     /// The output claims about the individual polynomials
-    output_claims: Vec<Claim<E>>,
+    output_claims: Vec<Claim<F>>,
     /// The full point for the final claims
-    point: Vec<E>,
+    point: Vec<F>,
     /// All poly evaluations in order
-    poly_evals: Vec<E>,
-    numerators: Vec<E>,
-    denominators: Vec<E>,
+    poly_evals: Vec<F>,
+    numerators: Vec<F>,
+    denominators: Vec<F>,
 }
 
-impl<E: ExtensionField> LogUpBatchVerifierClaim<E> {
+impl<F: PrimeField> LogUpBatchVerifierClaim<F> {
     pub fn new(
-        claim: E,
-        output_claims: Vec<Claim<E>>,
-        point: Vec<E>,
-        poly_evals: Vec<E>,
-        numerators: Vec<E>,
-        denominators: Vec<E>,
-    ) -> LogUpBatchVerifierClaim<E> {
+        claim: F,
+        output_claims: Vec<Claim<F>>,
+        point: Vec<F>,
+        poly_evals: Vec<F>,
+        numerators: Vec<F>,
+        denominators: Vec<F>,
+    ) -> LogUpBatchVerifierClaim<F> {
         LogUpBatchVerifierClaim {
             claim,
             output_claims,
@@ -657,27 +660,27 @@ impl<E: ExtensionField> LogUpBatchVerifierClaim<E> {
         }
     }
 
-    pub fn numerators(&self) -> &[E] {
+    pub fn numerators(&self) -> &[F] {
         &self.numerators
     }
 
-    pub fn denominators(&self) -> &[E] {
+    pub fn denominators(&self) -> &[F] {
         &self.denominators
     }
 
-    pub fn point(&self) -> &[E] {
+    pub fn point(&self) -> &[F] {
         &self.point
     }
 
-    pub fn claim(&self) -> E {
+    pub fn claim(&self) -> F {
         self.claim
     }
 
-    pub fn output_claims(&self) -> &[Claim<E>] {
+    pub fn output_claims(&self) -> &[Claim<F>] {
         &self.output_claims
     }
 
-    pub fn poly_evals(&self) -> &[E] {
+    pub fn poly_evals(&self) -> &[F] {
         &self.poly_evals
     }
 }

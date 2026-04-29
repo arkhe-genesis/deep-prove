@@ -2,16 +2,13 @@
 use super::*;
 use crate::{Element, Tensor, iop::context::ContextAux};
 use anyhow::Result;
-use either::Either;
-use multilinear_extensions::Expression;
 
 impl EinSum<Element> {
     /// Create an [`EinSumContext`] from the current [`EinSum`] layer.
-    pub fn to_context<E: ExtensionField>(
+    pub fn to_context<F: PrimeField>(
         &self,
-        node_id: NodeId,
         mut aux: ContextAux,
-    ) -> Result<(EinSumContext<E>, ContextAux)> {
+    ) -> Result<(EinSumContext<F>, ContextAux)> {
         // Update the output shapes
         let mut inputs_shapes_iter = aux.last_output_shape.iter();
         let lhs_shape = inputs_shapes_iter
@@ -62,7 +59,7 @@ impl EinSum<Element> {
             aux.model_polys = None;
         }
         // Create the sumcheck expression
-        let input_aggregation_expression = self.build_aggregation_expression::<E>();
+        let input_aggregation_expression = self.build_aggregation_expression::<F>();
 
         let constant_keys = self
             .constant_tensors
@@ -83,9 +80,46 @@ impl EinSum<Element> {
             })
             .collect();
 
+        // determine if this EinSum layer is splittable. For now, we only support splitting iff:
+        // - The first dimension of all left inputs is an outer axis
+        // - All the RHS are constant tensors
+        // - The bias, if any, does not involve the outer axis being splitted
+
+        // first, find the axis corresponding to the first dimension of the LHS
+        let first_dim_axis = self.mapping.axes().find(|axis| {
+            if let Dimension::Present(pos) = axis.lhs_input
+                && pos == 0
+            {
+                true
+            } else {
+                false
+            }
+        });
+
+        ensure!(
+            first_dim_axis.is_some(),
+            "First dimension of LHS input is not present in the axis mapping?"
+        );
+
+        let first_dim_axis = first_dim_axis.unwrap();
+        let is_splittable = {
+            // check that this axis is an outer axis
+            if let AxisType::Outer = first_dim_axis.axis_type {
+                // check that this axis does not appear in the bias unpadded shapes
+                let bias_check = first_dim_axis
+                    .biases
+                    .iter()
+                    .all(|bias_axis| matches!(bias_axis, Dimension::Absent));
+                // check that all RHS inputs are constant tensors
+                let rhs_constant_check = self.constant_tensors.iter().all(|t| t.is_some());
+                bias_check && rhs_constant_check
+            } else {
+                false
+            }
+        };
+
         Ok((
             EinSumContext {
-                node_id,
                 equation: self.equation.clone(),
                 mapping: self.mapping.clone(),
                 constant_keys,
@@ -94,12 +128,13 @@ impl EinSum<Element> {
                 bias_unpadded_shapes: self.bias_unpadded_shapes.clone(),
 
                 input_aggregation_expression,
+                is_splittable,
             },
             aux,
         ))
     }
 
-    fn build_aggregation_expression<E: ExtensionField>(&self) -> Option<Expression<E>> {
+    fn build_aggregation_expression<F: PrimeField>(&self) -> Option<Expression<F>> {
         let total_inputs = self.mapping.input_count();
 
         if total_inputs > 2 {
@@ -108,7 +143,7 @@ impl EinSum<Element> {
             let expr = (0..total_inputs - 1).fold(Expression::ZERO, |acc, i| {
                 acc + input_expr.clone()
                     * Expression::WitIn((i + 1) as u16)
-                    * Expression::Challenge(0, i, E::ONE, E::ZERO)
+                    * Expression::Challenge(0, i, F::ONE, F::ZERO)
             });
             Some(expr)
         } else {
@@ -117,11 +152,11 @@ impl EinSum<Element> {
     }
 }
 
-impl<E: ExtensionField> EinSumContext<E> {
+impl<F: PrimeField> EinSumContext<F> {
     /// Build the einsum expression for the sumcheck from the stacking coefficients
     /// We do this on the fly because the stacking coefficients depend on the input shapes
     /// which are only known at proving/verification time.
-    pub(crate) fn build_einsum_expression(&self, stacking_coeffs: &[&[E]]) -> Expression<E> {
+    pub(crate) fn build_einsum_expression(&self, stacking_coeffs: &[&[F]]) -> Expression<F> {
         let total_inputs = self.mapping.input_count();
         let rhs_inputs = total_inputs - 1;
         // the outer length of `stacking_coeffs` should be the number of operations that are being batched in this einsum
@@ -142,16 +177,16 @@ impl<E: ExtensionField> EinSumContext<E> {
                 let offset = i * stack_dim_size;
                 let rhs_offset = rhs_inputs * stack_dim_size + offset;
                 // We need to make the initial term otherwise it complains about a zero product
-                let initial_expr = Expression::Constant(Either::Right(coeffs[0]))
+                let initial_expr = Expression::Constant(coeffs[0])
                     * Expression::WitIn(offset as u16)
                     * Expression::WitIn(rhs_offset as u16);
-                acc + Expression::Challenge(0, i, E::ONE, E::ZERO)
+                acc + Expression::Challenge(0, i, F::ONE, F::ZERO)
                     * coeffs
                         .iter()
                         .enumerate()
                         .skip(1)
                         .fold(initial_expr, |inner_acc, (j, &c)| {
-                            Expression::Constant(Either::Right(c))
+                            Expression::Constant(c)
                                 * Expression::WitIn((j + offset) as u16)
                                 * Expression::WitIn((j + rhs_offset) as u16)
                                 + inner_acc

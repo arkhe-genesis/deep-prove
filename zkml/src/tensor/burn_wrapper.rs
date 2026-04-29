@@ -448,6 +448,72 @@ where
         }
     }
 
+    /// Attempts to split the tensor into a specified number of chunks along a
+    /// given dimension.
+    ///
+    /// May return less chunks than requested if the tensor size is not
+    /// divisible by the number of chunks.
+    pub fn chunk(self, chunks: usize, dim: usize) -> Result<Vec<Self>> {
+        ensure!(
+            dim < self.rank(),
+            "Chunk dimension {dim} out of bounds for tensor of rank {}",
+            self.rank(),
+        );
+
+        let original_shape = self.shape();
+        let original_unpadded = self.unpadded_shape().clone();
+
+        // Every dimension should have at least one non padding element.
+        // XXX: Unclear what exactly should be the rule here, this is a relaxed approach.
+        // let padding = original_shape.dims[dim] - original_unpadded.dims[dim];
+        // ensure!(
+        // padding <= chunks,
+        // "Chunk must not be larger than the padding to include at least one non-padding element",
+        // );
+
+        let mut out: Vec<Self> = match self {
+            WrappedTensor::Rank1 { tensor, .. } => tensor
+                .chunk(chunks, dim)
+                .into_iter()
+                .map(WrappedTensor::from)
+                .collect(),
+            WrappedTensor::Rank2 { tensor, .. } => tensor
+                .chunk(chunks, dim)
+                .into_iter()
+                .map(WrappedTensor::from)
+                .collect(),
+            WrappedTensor::Rank3 { tensor, .. } => tensor
+                .chunk(chunks, dim)
+                .into_iter()
+                .map(WrappedTensor::from)
+                .collect(),
+            WrappedTensor::Rank4 { tensor, .. } => tensor
+                .chunk(chunks, dim)
+                .into_iter()
+                .map(WrappedTensor::from)
+                .collect(),
+        };
+
+        // Fix unpadded shapes
+        if original_shape != original_unpadded {
+            out.iter_mut().fold(0, |num_items_on_dim, chunk| {
+                let dim_size_in_chunk = chunk.shape()[dim];
+                let unpadded_dim_size =
+                    if num_items_on_dim + dim_size_in_chunk > original_unpadded[dim] {
+                        original_unpadded[dim].saturating_sub(num_items_on_dim)
+                    } else {
+                        dim_size_in_chunk
+                    };
+                let mut chunk_shape = original_unpadded.clone();
+                chunk_shape.dims[dim] = unpadded_dim_size;
+                chunk.set_unpadded_shape(chunk_shape);
+                num_items_on_dim + dim_size_in_chunk
+            });
+        }
+
+        Ok(out)
+    }
+
     /// Find the maximum value.
     pub(crate) fn max(self) -> Self {
         let tensor = delegate_plain!(self, max);
@@ -1254,7 +1320,6 @@ where
                 .all(|(curr, new)| curr <= new),
             "Padding must maintain or increase existing dimensions",
         );
-
         match self {
             WrappedTensor::Rank1 {
                 tensor,
@@ -2301,8 +2366,8 @@ where
 
     fn try_from(tensor: &WrappedTensor<T>) -> Result<Self, Self::Error> {
         let shape = tensor.shape().into();
-        let unpadded_shape = tensor.unpadded_shape().into();
         let data = tensor.get_data();
+        let unpadded_shape = tensor.unpadded_shape().into();
         Tensor::<T>::new_with_unpadded_shape(shape, unpadded_shape, data)
     }
 }

@@ -1,8 +1,6 @@
 //! Implementation of various types of attention masks for transformer models.
 use crate::{
-    Claim, Element, Number, ScalingFactor, Shape, Tensor,
-    commit::compute_betas_eval,
-    eval_zeroifier_mle,
+    Claim, Element, Number, ScalingFactor, Shape, Tensor, eval_zeroifier_mle,
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -13,7 +11,7 @@ use crate::{
         LayerCtx, LayerProof,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
-            VerifiableCtx,
+            Splittable, VerifiableCtx,
         },
     },
     model::Step,
@@ -23,26 +21,16 @@ use crate::{
     to_bit_sequence_le,
 };
 use anyhow::{Result, ensure};
+use ark_ff::PrimeField;
 use burn::tensor::Tensor as BTensor;
-use either::Either;
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
+use dp_crypto::{
     Expression,
-    mle::MultilinearExtension,
-    util::ceil_log2,
-    virtual_poly::{VPAuxInfo, eq_eval},
-    virtual_polys::VirtualPolynomialsBuilder,
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    structs::IOPProof,
 };
-use p3_field::FieldAlgebra;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-
-use transcript::Transcript;
+use either::Either;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 pub mod evaluate;
 pub mod prove;
@@ -88,15 +76,19 @@ impl<N: TensorTypeParam> Default for AttentionMask<N> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 /// Mask used in attention so that tokens can only see "previous" values.
-pub struct AttentionMaskProof<E: ExtensionField> {
+pub struct AttentionMaskProof<F: PrimeField> {
     /// The sumcheck proof for correct application of the attention mask
-    sumcheck_proof: IOPProof<E>,
+    sumcheck_proof: IOPProof<F>,
     /// The input evaluations
-    evaluations: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    evaluations: Vec<F>,
     /// Proof for the sumcheck employed to prove claims about the local attention mask
-    local_mask_proof: Option<IOPProof<E>>,
+    local_mask_proof: Option<IOPProof<F>>,
 }
 
 impl<N: TensorTypeParam> AttentionMask<N> {
@@ -120,26 +112,26 @@ impl<N: TensorTypeParam> AttentionMask<N> {
         matches!(&self.span, AttentionSpan::Local(_))
     }
 
-    fn build_sumcheck_expression<E: ExtensionField>(
+    fn build_sumcheck_expression<F: PrimeField>(
         &self,
         input_shape: &Shape,
         negative_inf: Element,
         decomposed_mask: bool,
-    ) -> Vec<Expression<E>> {
+    ) -> Vec<Expression<F>> {
         // If the input shape has rank greater than two we treat it as a batch of 2D images.
         // Since we handle it in this way we make the eq_poly and less than poly the first two witness indices.
-        let eq_expr = Expression::<E>::WitIn(0);
+        let eq_expr = Expression::<F>::WitIn(0);
         let mask_expr = if decomposed_mask {
-            Expression::<E>::WitIn(1) * Expression::<E>::WitIn(4)
+            Expression::<F>::WitIn(1) * Expression::<F>::WitIn(4)
         } else {
-            Expression::<E>::WitIn(1)
+            Expression::<F>::WitIn(1)
         };
         // This expr ensures we only apply the mask to the unpadded portion of each row of the input
-        let row_lt_expr = Expression::<E>::WitIn(2);
+        let row_lt_expr = Expression::<F>::WitIn(2);
         // This expr ensures we only apply the mask to the unpadded portion of each column of the input
-        let column_lt_expr = Expression::<E>::WitIn(3);
+        let column_lt_expr = Expression::<F>::WitIn(3);
         let lt_expr = row_lt_expr * column_lt_expr;
-        let one_minus_mask_expr = Expression::Constant(Either::Right(E::ONE)) - mask_expr.clone();
+        let one_minus_mask_expr = Expression::Constant(F::ONE) - mask_expr.clone();
         // The input offset is 4 since we have eq_poly, mask_poly and two less than polys before the input polys start
         let input_offset: u16 = if decomposed_mask { 5 } else { 4 };
         if input_shape.rank() > 2 {
@@ -150,9 +142,9 @@ impl<N: TensorTypeParam> AttentionMask<N> {
                     // Each term is the same it is just the challenge that changes
                     eq_expr.clone()
                         * lt_expr.clone()
-                        * Expression::Challenge(j, 1, E::ONE, E::ZERO)
+                        * Expression::Challenge(j, 1, F::ONE, F::ZERO)
                         * (mask_expr.clone() * Expression::WitIn(wit_poly_id)
-                            + Expression::Constant(Either::Right(negative_inf.to_field()))
+                            + Expression::Constant(negative_inf.to_field())
                                 * one_minus_mask_expr.clone())
                 })
                 .collect()
@@ -161,8 +153,7 @@ impl<N: TensorTypeParam> AttentionMask<N> {
                 eq_expr
                     * lt_expr
                     * (mask_expr * Expression::WitIn(input_offset)
-                        + Expression::Constant(Either::Right(negative_inf.to_field()))
-                            * one_minus_mask_expr),
+                        + Expression::Constant(negative_inf.to_field()) * one_minus_mask_expr),
             ]
         }
     }
@@ -241,11 +232,7 @@ impl QuantizeOp for AttentionMask<f32> {
 }
 
 impl ProveInfo for AttentionMask<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         // We need the previous output shapes to compute the sumcheck expressions
         let shapes = &aux.last_output_shape;
 
@@ -253,7 +240,7 @@ impl ProveInfo for AttentionMask<Element> {
             shapes.len() == 1,
             "Casual Mask can only be applied to a single input"
         );
-        let layer_ctx = LayerCtx::AttentionMask(AttentionMaskCtx::new(*self, id));
+        let layer_ctx = LayerCtx::AttentionMask(AttentionMaskCtx::new(*self));
 
         // We make sure to update the ContextAux so that it knows there are no model commitments for this layer
         aux.model_polys = None;
@@ -266,15 +253,16 @@ impl ProveInfo for AttentionMask<Element> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttentionMaskCtx {
     pub op: AttentionMask<Element>,
-    pub node_id: NodeId,
 }
 
 impl AttentionMaskCtx {
     /// Create a new [`AttentionMaskCtx`]
-    pub fn new(op: AttentionMask<Element>, node_id: NodeId) -> Self {
-        AttentionMaskCtx { op, node_id }
+    pub fn new(op: AttentionMask<Element>) -> Self {
+        AttentionMaskCtx { op }
     }
 }
+
+impl Splittable for AttentionMaskCtx {}
 
 impl OpInfo for AttentionMaskCtx {
     fn output_shapes(
@@ -301,23 +289,21 @@ impl OpInfo for AttentionMaskCtx {
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for AttentionMask<Element>
+impl<F, PCS> ProvableOp<F, PCS> for AttentionMask<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = AttentionMaskCtx;
 
-    fn prove<'a, 'b, 'c, 'd, T: transcript::Transcript<E>>(
+    fn prove<'a, 'b, 'c, 'd, T: Transcript>(
         &'a self,
         node_id: NodeId,
         ctx: &'b Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<'c, 'd, E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut Prover<'c, 'd, F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         let inputs = step_data.padded_input_tensors()?;
         let unpadded_seq_len = *inputs[0].unpadded_shape().last().ok_or(anyhow::anyhow!(
             "Input shape must have at least one dimension"
@@ -344,20 +330,21 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for AttentionMaskCtx
+impl<F, PCS> VerifiableCtx<F, PCS> for AttentionMaskCtx
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
-    type Proof = AttentionMaskProof<E>;
+    type Proof = AttentionMaskProof<F>;
 
-    fn verify<T: Transcript<E>>(
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
+        _node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
         let input_shapes = &shape_step.padded_input_shape;
         ensure!(
             input_shapes.len() == 1,
@@ -390,7 +377,7 @@ where
         )
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         _proof: &Self::Proof,
         _transcript: &mut T,

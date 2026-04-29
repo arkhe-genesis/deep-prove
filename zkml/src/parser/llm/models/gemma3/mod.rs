@@ -1138,7 +1138,6 @@ pub mod safe_tests {
     }
 
     use crate::{model::llm::WithMaxContext, testing::Pcs};
-    use ff_ext::GoldilocksExt2;
 
     #[test]
     #[ignore = "Large machine to run"]
@@ -1154,14 +1153,15 @@ pub mod safe_tests {
         let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
         let trace = driver.run_elements(input_tensor, &mut GenStore::default())?;
         let (prover_ctx, _verifier_ctx) = driver
-            .context::<GoldilocksExt2, Pcs<GoldilocksExt2>>()?
+            .context::<ark_bn254::Fr, Pcs>()?
             .with_max_context(max_context);
         let num_provers = Some(6);
+        let chunking_strategy = LLMChunkingStrategy::from((&trace, &prover_ctx.model_ctx));
         let _ = driver.chunked_prove_default_executor(
             &prover_ctx,
             trace,
             num_provers,
-            LLMChunkingStrategy,
+            chunking_strategy,
         )?;
         Ok(())
     }

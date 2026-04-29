@@ -1,3 +1,5 @@
+use ark_bn254::Bn254;
+use dp_crypto::arkyper::{HyperKZG, transcript::blake3::Blake3Transcript};
 use std::{fs::File, io::BufReader};
 use tenstore::GenStore;
 use timed_core::Output;
@@ -10,8 +12,6 @@ use zkml::{
 
 use anyhow::{Context as CC, Result, bail, ensure};
 use clap::Parser;
-use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams};
 use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, fmt};
 use zkml::parser::onnx::FloatOnnxLoader;
@@ -21,11 +21,11 @@ use zkml::{Element, Prover, verify};
 
 use rmp_serde::encode::to_vec_named;
 
-type F = GoldilocksExt2;
+type F = ark_bn254::Fr;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
-type Pcs<E> = Basefold<E, BasefoldRSParams>;
+type Pcs = HyperKZG<Bn254>;
 
-type Transcript = transcript::basic::BasicTranscript<F>;
+type Transcript = Blake3Transcript;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -310,7 +310,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     let ctx = if !args.skip_proving {
         Some(
             model
-                .generate_contexts::<F, Pcs<F>>()
+                .generate_contexts::<F, Pcs>()
                 .expect("unable to generate context"),
         )
     } else {
@@ -391,13 +391,9 @@ fn run(args: Args) -> anyhow::Result<()> {
         info!("== Proving ==");
         let metrics = Metrics::new();
 
-        let io = trace.to_verifier_io()?;
-        let proof = Prover::<F, Transcript, Pcs<F>>::prove(
-            &ctx.as_ref().as_ref().unwrap().0,
-            trace,
-            &model,
-        )
-        .expect("unable to generate proof");
+        let (proof, io) =
+            Prover::<F, Transcript, Pcs>::prove(&ctx.as_ref().as_ref().unwrap().0, trace, &model)
+                .expect("unable to generate proof");
 
         // Serialize proof using MessagePack and calculate size in KB
         let proof_bytes = to_vec_named(&proof)?;

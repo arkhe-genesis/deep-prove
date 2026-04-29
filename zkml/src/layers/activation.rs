@@ -8,7 +8,7 @@ use crate::{
     },
     layers::{
         Layer, LayerCtx, LayerProof,
-        provable::{QuantizeOp, QuantizeOutput},
+        provable::{QuantizeOp, QuantizeOutput, Splittable},
         requant::Requant,
     },
     lookup::{
@@ -23,19 +23,22 @@ use crate::{
     },
     model::Step,
     padding::PaddingMode,
+    poly_commit::verifier::VerifierCommitment,
     tensor::{Tensor, TensorTypeParam, WrappedModuleFn, WrappedTensor},
 };
 
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::util::transpose;
+use ark_ff::PrimeField;
+use dp_crypto::{
+    IntoMLE,
+    arkyper::{
+        CommitmentScheme,
+        transcript::{AppendToTranscript, Transcript},
+    },
+    structs::IOPProof,
+};
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, marker::PhantomData};
-use sumcheck::structs::IOPProof;
-
-use transcript::Transcript;
-use witness::RowMajorMatrix;
 
 pub mod lookup_data;
 use lookup_data::ActivationLookupData;
@@ -43,7 +46,7 @@ use lookup_data::ActivationLookupData;
 /// The short name used to identify an activation layer.
 pub const ACTIVATION_LAYER: &str = "ACTI";
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Activation<N> {
@@ -85,30 +88,36 @@ impl<N> ActivationLayer<N> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActivationCtx {
     pub op: Activation<Element>,
-    pub node_id: NodeId,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ActivationProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct ActivationProof<F: PrimeField, PCS: CommitmentScheme> {
     /// proof for the accumulation of the claim from m2v + claim from lookup for the same poly
     /// e.g. the "link" between a m2v and relu layer
-    pub(crate) io_accumulation: IOPProof<E>,
+    pub(crate) io_accumulation: IOPProof<F>,
     /// The evaluations output by the linking sumcheck
-    pub(crate) evaluations: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) evaluations: Vec<F>,
     /// the lookup proof for the relu
-    pub(crate) lookup: LogUpBatchProof<E>,
+    pub(crate) lookup: LogUpBatchProof<F>,
     /// The witness commitments from this function
-    pub(crate) commit: PCS::Commitment,
+    pub(crate) commitments: Vec<VerifierCommitment<PCS>>,
 }
 
-impl<E, PCS> ActivationProof<E, PCS>
+impl<F, PCS> ActivationProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
-        PCS::write_commitment(&self.commit, transcript).map_err(|e| anyhow!("{e:?}"))
+    pub(crate) fn write_commitment<T: Transcript>(&self, transcript: &mut T) -> Result<()> {
+        self.commitments
+            .iter()
+            .for_each(|commit| commit.append_to_transcript(transcript));
+        Ok(())
     }
 }
 
@@ -301,43 +310,27 @@ impl ActivationLayer<Element> {
             .collect()
     }
 
-    fn lookup_witness<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
+    fn lookup_witness<F: PrimeField, PCS: CommitmentScheme<Field = F>>(
         &self,
         id: NodeId,
-        ctx: &ProverContext<E, PCS>,
+        _ctx: &ProverContext<F, PCS>,
         activation_input: &Tensor<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    {
+    ) -> Result<LookupWitnessGen<'_, F>> {
         let lookup_data = self.get_lookup_data();
         let lookup_witness = lookup_data.get_lookup_witness(activation_input.clone())?;
 
         let element_counts = lookup_witness.get_counts(&lookup_data.table);
 
-        let input_evals = lookup_witness.input_mle_evals::<E>(lookup_data.table.num_columns());
-        let input_width = input_evals.len();
-        let output_evals = lookup_witness.output_mle_evals::<E>();
-        let output_width = output_evals.len();
+        let input_evals = lookup_witness.input_mle_evals::<F>(lookup_data.table.num_columns());
+        let output_evals = lookup_witness.output_mle_evals::<F>();
 
-        // Add the witness polynomials that we need to commit to
-        let transposed_input = transpose(input_evals);
-        let input_rmm = RowMajorMatrix::new_by_inner_matrix(
-            ceno_p3::matrix::dense::DenseMatrix::new(transposed_input.concat(), input_width),
-            witness::InstancePaddingStrategy::Default,
-        );
+        let mles = input_evals
+            .into_iter()
+            .chain(output_evals)
+            .map(|evals| evals.into_mle())
+            .collect();
 
-        let transposed_output = transpose(output_evals);
-        let output_rmm = RowMajorMatrix::new_by_inner_matrix(
-            ceno_p3::matrix::dense::DenseMatrix::new(transposed_output.concat(), output_width),
-            witness::InstancePaddingStrategy::Default,
-        );
-
-        let commit = ctx
-            .commitment_ctx
-            .batch_commit(vec![input_rmm, output_rmm])?;
-
-        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
+        let mut gen_w = LookupWitnessGen::<F>::default();
         let tables = vec![
             Table::new_shift_check(),
             lookup_data.table,
@@ -345,7 +338,7 @@ impl ActivationLayer<Element> {
             Table::new_signed_zero_check(),
         ];
 
-        gen_w.insert_layer_witness_data(id, commit, tables, element_counts);
+        gen_w.insert_layer_witness_data(id, mles, tables, element_counts);
 
         Ok(gen_w)
     }
@@ -500,11 +493,7 @@ impl Evaluate<Element> for Activation<Element> {
 }
 
 impl ProveInfo for Activation<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         // Set the model polys to be empty
         aux.model_polys = None;
         aux.max_poly_len = aux
@@ -515,35 +504,27 @@ impl ProveInfo for Activation<Element> {
             });
         let act = self.clone();
 
-        Ok((
-            LayerCtx::Activation(ActivationCtx {
-                op: act,
-                node_id: id,
-            }),
-            aux,
-        ))
+        Ok((LayerCtx::Activation(ActivationCtx { op: act }), aux))
     }
 }
 
 impl<N> PadOp for Activation<N> {}
 
-impl<E, PCS> ProvableOp<E, PCS> for Activation<Element>
+impl<F, PCS> ProvableOp<F, PCS> for Activation<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = ActivationCtx;
 
-    fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
+    fn prove<'a, 'b, 'c, 'd, T: Transcript>(
         &'a self,
         id: NodeId,
         _ctx: &'b Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<'c, 'd, E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut Prover<'c, 'd, F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         let inputs = &step_data.node_inputs;
         ensure!(
             !inputs.is_empty(),
@@ -555,9 +536,9 @@ where
     fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &ProverContext<E, PCS>,
+        ctx: &ProverContext<F, PCS>,
         step_data: &Step<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'_, F>> {
         ensure!(
             step_data.outputs().len() == 1,
             "Found more than 1 output tensor in inference step of activation layer"
@@ -606,23 +587,27 @@ impl OpInfo for ActivationCtx {
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for ActivationCtx
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-{
-    type Proof = ActivationProof<E, PCS>;
+impl Splittable for ActivationCtx {}
 
-    fn verify<T: Transcript<E>>(
+impl<F, PCS> VerifiableCtx<F, PCS> for ActivationCtx
+where
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
+{
+    type Proof = ActivationProof<F, PCS>;
+
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
-        self.verify_activation(verifier, last_claims[0], proof, shape_step)
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
+        self.verify_activation(verifier, last_claims[0], proof, node_id, shape_step)
     }
-    fn write_proof_to_transcript<T: Transcript<E>>(
+
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,
@@ -633,18 +618,16 @@ where
 
 impl Activation<Element> {
     #[timed::timed_instrument(name = "Prover::prove_activation_step")]
-    pub(crate) fn prove_step<'a, 'b, E, T: Transcript<E>, PCS>(
+    pub(crate) fn prove_step<'a, 'b, F, T: Transcript, PCS>(
         &self,
-        prover: &mut Prover<'a, 'b, E, T, PCS>,
-        last_claim: &Claim<E>,
+        prover: &mut Prover<'a, 'b, F, T, PCS>,
+        last_claim: &Claim<F>,
         step: &Step<Element>,
         node_id: NodeId,
-    ) -> anyhow::Result<Vec<Claim<E>>>
+    ) -> anyhow::Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        F: PrimeField,
+        PCS: CommitmentScheme<Field = F>,
     {
         let lookup_op = self.activation_type().get_lookup_data();
 
@@ -666,7 +649,7 @@ impl Activation<Element> {
             logup_proof,
             sumcheck_proof,
             evaluations,
-            commitment,
+            commitments,
             ..
         } = generic_proof;
 
@@ -674,7 +657,7 @@ impl Activation<Element> {
             io_accumulation: sumcheck_proof,
             evaluations,
             lookup: logup_proof,
-            commit: commitment,
+            commitments,
         };
 
         // Add the proof to the prover
@@ -685,29 +668,26 @@ impl Activation<Element> {
 }
 
 impl ActivationCtx {
-    pub(crate) fn verify_activation<
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
-    >(
+    pub(crate) fn verify_activation<F: PrimeField, T: Transcript, PCS: CommitmentScheme>(
         &self,
-        verifier: &mut Verifier<E, T, PCS>,
-        last_claim: &Claim<E>,
-        proof: &ActivationProof<E, PCS>,
+        verifier: &mut Verifier<F, T, PCS>,
+        last_claim: &Claim<F>,
+        proof: &ActivationProof<F, PCS>,
+        node_id: NodeId,
         shape_step: &ShapeStep,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         let ActivationProof {
             io_accumulation,
             evaluations,
             lookup,
-            commit,
+            commitments,
         } = proof;
 
-        let generic_lookup_proof = GenericLookupProof::<E, PCS> {
+        let generic_lookup_proof = GenericLookupProof::<F, PCS> {
             logup_proof: lookup.clone(),
             sumcheck_proof: io_accumulation.clone(),
             evaluations: evaluations.clone(),
-            commitment: commit.clone(),
+            commitments: commitments.clone(),
             weight_evaluation: None,
             shift_evaluations: None,
         };
@@ -719,7 +699,7 @@ impl ActivationCtx {
             &lookup_op.table,
             &generic_lookup_proof,
             verifier,
-            self.node_id,
+            node_id,
         )?;
 
         Ok(input_claims)

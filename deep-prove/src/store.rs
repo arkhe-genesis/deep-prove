@@ -2,11 +2,11 @@
 #![allow(clippy::manual_async_fn)]
 
 use anyhow::{Context, bail};
+use ark_bn254::Bn254;
+use dp_crypto::arkyper::HyperKZG;
 use exponential_backoff::Backoff;
-use ff_ext::GoldilocksExt2;
 use futures::StreamExt;
 use memmap2::Mmap;
-use mpcs::{Basefold, BasefoldRSParams};
 use object_store::{Attribute, GetOptions, GetRange, ObjectStore, PutPayload, path::Path};
 #[doc(inline)]
 pub use object_store::{
@@ -53,12 +53,12 @@ pub struct ModelKey {
     pub scaling_input_hash: Option<String>,
 }
 
-type F = GoldilocksExt2;
-type Pcs = Basefold<F, BasefoldRSParams>;
+type F = ark_bn254::Fr;
+type Pcs = HyperKZG<Bn254>;
 
 #[derive(Serialize, Deserialize)]
 pub struct Params {
-    pub prover: ProverContext<F, Pcs>,
+    pub prover: ProverContext<'static, F, Pcs>,
     pub verifier: VerifierContext<F, Pcs>,
 }
 

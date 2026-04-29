@@ -1,31 +1,11 @@
 use anyhow::ensure;
-use ff_ext::ExtensionField;
-use p3_field::{FieldAlgebra, TwoAdicField};
-use p3_goldilocks::Goldilocks;
+use ark_ff::PrimeField;
 use rayon::{
     iter::{IntoParallelRefMutIterator, ParallelIterator},
     prelude::ParallelSliceMut,
 };
 
-/// Returns an n-th root of unity by starting with a 32nd root of unity and squaring it (32-n) times.
-/// Each squaring operation halves the order of the root of unity:
-///   - For n=16: squares it 16 times (32-16) to get a 16th root of unity
-///   - For n=8:  squares it 24 times (32-8) to get an 8th root of unity
-///   - For n=4:  squares it 28 times (32-4) to get a 4th root of unity
-///
-/// The initial ROOT_OF_UNITY constant is verified to be a 32nd root of unity in the field implementation.
-pub fn get_root_of_unity<E: ExtensionField>(n: usize) -> E {
-    let mut rou = E::from_bases(&[
-        E::BaseField::two_adic_generator(Goldilocks::TWO_ADICITY),
-        E::BaseField::ZERO,
-    ]);
-
-    for _ in 0..(32 - n) {
-        rou = rou * rou;
-    }
-
-    rou
-}
+use crate::get_root_of_unity;
 
 /// Returns a permutation to convert a vector from normal order to bit reverse
 /// order.
@@ -55,7 +35,7 @@ fn bitreverse<T>(d: &mut [T]) {
 ///
 /// flag: false -> FFT
 /// flag: true -> iFFT
-pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) -> anyhow::Result<()> {
+pub fn fft<F: PrimeField + Send + Sync>(v: &mut Vec<F>, flag: bool) -> anyhow::Result<()> {
     ensure!(
         v.len().is_power_of_two(),
         "Input vector to fft must be a power of two",
@@ -69,12 +49,14 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) -> anyho
     bitreverse(v);
 
     // Compute the twiddle factors
-    let mut twiddle: Vec<E> = vec![E::ZERO; n];
-    twiddle[0] = E::ONE;
-    twiddle[1] = get_root_of_unity(logn as usize);
+    let mut twiddle: Vec<F> = vec![F::ZERO; n];
+    twiddle[0] = F::ONE;
+    twiddle[1] = get_root_of_unity(logn as usize)?;
 
     if flag {
-        twiddle[1] = twiddle[1].inverse();
+        twiddle[1] = twiddle[1]
+            .inverse()
+            .expect("Root of unity should not be zero");
     }
     for i in 2..n {
         twiddle[i] = twiddle[i - 1] * twiddle[1];
@@ -95,13 +77,9 @@ pub fn fft<E: ExtensionField + Send + Sync>(v: &mut Vec<E>, flag: bool) -> anyho
     }
 
     if flag {
-        let mut ilen = E::from_canonical_u64(n as u64);
-        ilen = ilen.inverse();
-        debug_assert_eq!(
-            ilen * E::from_canonical_u64(n as u64),
-            E::ONE,
-            "Error in inv"
-        );
+        let mut ilen = F::from(n as u64);
+        ilen = ilen.inverse().expect("Tried to invert zero");
+        debug_assert_eq!(ilen * F::from(n as u64), F::ONE, "Error in inv");
         v.par_iter_mut().for_each(|val| {
             *val *= ilen;
         });

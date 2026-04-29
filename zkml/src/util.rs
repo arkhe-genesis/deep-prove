@@ -1,9 +1,9 @@
 use std::{cmp::max, marker::PhantomData};
 
-use multilinear_extensions::virtual_poly::VPAuxInfo;
+use dp_crypto::virtual_poly::VPAuxInfo;
 
 /// List of list of MLEs num_vars (f1*f2 + f1*f3*f4 + ... )
-pub fn from_mle_list_dimensions<E>(product_list: &[Vec<usize>]) -> VPAuxInfo<E> {
+pub fn from_mle_list_dimensions<F>(product_list: &[Vec<usize>]) -> VPAuxInfo<F> {
     let mut max_num_vars = 0;
     let mut max_degree = 0;
 

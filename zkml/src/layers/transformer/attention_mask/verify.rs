@@ -2,23 +2,30 @@
 
 use anyhow::anyhow;
 
-use crate::commit::identity_eval;
+use crate::poly_commit::identity_eval;
+
+use dp_crypto::{
+    poly::eq::evals,
+    structs::IOPVerifierState,
+    util::ceil_log2,
+    virtual_poly::{VPAuxInfo, eq_eval},
+};
 
 use super::*;
 
 impl AttentionMask<Element> {
-    pub(crate) fn verify_internal<E, PCS, T>(
+    pub(crate) fn verify_internal<F, PCS, T>(
         &self,
-        proof: &AttentionMaskProof<E>,
-        last_claim: &Claim<E>,
-        mask_verifying_data: MaskVerifyingData<E>,
+        proof: &AttentionMaskProof<F>,
+        last_claim: &Claim<F>,
+        mask_verifying_data: MaskVerifyingData<F>,
         unpadded_seq_len: usize,
-        verifier: &mut Verifier<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>>
+        verifier: &mut Verifier<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-        T: Transcript<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme,
+        T: Transcript,
     {
         let AttentionMaskProof {
             sumcheck_proof,
@@ -48,20 +55,16 @@ impl AttentionMask<Element> {
             max_num_variables: num_vars,
             ..Default::default()
         };
-        let subclaim = IOPVerifierState::<E>::verify(
+        let subclaim = IOPVerifierState::<F>::verify(
             last_claim.evaluation(),
             sumcheck_proof,
             &aux_info,
             verifier.transcript,
         );
-        let sumcheck_point = subclaim
-            .point
-            .iter()
-            .map(|c| c.elements)
-            .collect::<Vec<E>>();
+        let sumcheck_point = &subclaim.point;
 
         let dim_vars = num_vars >> 1;
-        let eq_eval = eq_eval(&sumcheck_point, &eq_point);
+        let eq_eval = eq_eval(sumcheck_point, &eq_point);
 
         let (column_point, row_point) = sumcheck_point.split_at(dim_vars);
 
@@ -80,15 +83,15 @@ impl AttentionMask<Element> {
         let input_evals = &evaluations[additional_mask_poly as usize..];
 
         let (row_lt_eval, column_lt_eval) =
-            self.evaluate_row_column_lt_polys::<E>(row_point, column_point, unpadded_seq_len)?;
+            self.evaluate_row_column_lt_polys::<F>(row_point, column_point, unpadded_seq_len)?;
         let lt_eval = row_lt_eval * column_lt_eval;
-        let neg_inf_field: E = self.negative_infinity.to_field();
+        let neg_inf_field: F = self.negative_infinity.to_field();
         let calc_eval = eq_eval
             * lt_eval
             * batching_challenges.iter().zip(input_evals.iter()).fold(
-                E::ZERO,
+                F::ZERO,
                 |acc, (chal, eval)| {
-                    acc + *chal * (mask_eval * *eval + neg_inf_field * (E::ONE - mask_eval))
+                    acc + *chal * (mask_eval * *eval + neg_inf_field * (F::ONE - mask_eval))
                 },
             );
 
@@ -103,24 +106,24 @@ impl AttentionMask<Element> {
         let combined_eval = batching_challenges
             .iter()
             .zip(input_evals.iter())
-            .fold(E::ZERO, |acc, (c, e)| acc + (*c) * (*e));
+            .fold(F::ZERO, |acc, (c, e)| acc + (*c) * (*e));
         let full_point = sumcheck_point
             .iter()
             .chain(batching_point.iter())
             .copied()
             .collect::<Vec<_>>();
-        let input_claim = vec![Claim::<E>::new(full_point, combined_eval)];
+        let input_claim = vec![Claim::<F>::new(full_point, combined_eval)];
 
         Ok(input_claim)
     }
 
     /// Given the row and column points, evaluates the row and column less than polynomials
-    fn evaluate_row_column_lt_polys<E: ExtensionField>(
+    fn evaluate_row_column_lt_polys<F: PrimeField>(
         &self,
-        row_point: &[E],
-        column_point: &[E],
+        row_point: &[F],
+        column_point: &[F],
         unpadded_seq_len: usize,
-    ) -> Result<(E, E)> {
+    ) -> Result<(F, F)> {
         let bit_len = ceil_log2(unpadded_seq_len);
         ensure!(
             row_point.len() == bit_len,
@@ -133,25 +136,25 @@ impl AttentionMask<Element> {
             column_point.len(),
         );
         let seq_len_bits = to_bit_sequence_le(unpadded_seq_len - 1, bit_len)
-            .map(E::from_canonical_usize)
-            .collect::<Vec<E>>();
+            .map(|b| F::from(b as u64))
+            .collect::<Vec<F>>();
         let row_eval = eval_zeroifier_mle(row_point, &seq_len_bits);
         let column_eval = eval_zeroifier_mle(column_point, &seq_len_bits);
         Ok((row_eval, column_eval))
     }
 
-    fn verify_additional_mask_poly_eval<E, T, PCS>(
+    fn verify_additional_mask_poly_eval<F, T, PCS>(
         &self,
-        row_point: &[E],
-        column_point: &[E],
-        eval: E,
-        local_mask_proof: &IOPProof<E>,
-        verifier: &mut Verifier<E, T, PCS>,
+        row_point: &[F],
+        column_point: &[F],
+        eval: F,
+        local_mask_proof: &IOPProof<F>,
+        verifier: &mut Verifier<F, T, PCS>,
     ) -> anyhow::Result<()>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-        T: Transcript<E>,
+        F: PrimeField,
+        PCS: CommitmentScheme,
+        T: Transcript,
     {
         let AttentionSpan::Local(window) = self.span else {
             Err(anyhow!("Found sumcheck proof for full attention mask"))?
@@ -166,35 +169,31 @@ impl AttentionMask<Element> {
         let num_col_vars = column_point.len();
         // compute the evaluation for the padding polynomial, i.e., the polynomial P[i,j] = 1 iff j >= seq_len - window
         let pad_col_bits = to_bit_sequence_le(seq_len - window, num_col_vars)
-            .map(|b| E::from_canonical_usize(b))
+            .map(|b| F::from(b as u64))
             .collect_vec();
-        let padded_eval = E::ONE - eval_zeroifier_mle(column_point, &pad_col_bits);
+        let padded_eval = F::ONE - eval_zeroifier_mle(column_point, &pad_col_bits);
 
         let aux_info = VPAuxInfo {
             max_degree: 2,
             max_num_variables: num_col_vars,
             ..Default::default()
         };
-        let subclaim = IOPVerifierState::<E>::verify(
+        let subclaim = IOPVerifierState::<F>::verify(
             eval - padded_eval,
             local_mask_proof,
             &aux_info,
             verifier.transcript,
         );
 
-        let sumcheck_point = subclaim
-            .point
-            .iter()
-            .map(|c| c.elements)
-            .collect::<Vec<E>>();
+        let sumcheck_point = &subclaim.point;
 
         // evaluation for the upper diagonal MLE produced by the sumcheck. The evaluation is computed
         // using the formula for the lower trianfular MLE, but swapping the row point with the
         // column point (i.e., the ones given by sumcheck challenges)
-        let upper_eval = eval_zeroifier_mle(row_point, &sumcheck_point);
+        let upper_eval = eval_zeroifier_mle(row_point, sumcheck_point);
 
         // evaluation for the shift matrix MLE
-        let shift_eval = eval_shift_matrix(&sumcheck_point, column_point, window - 1);
+        let shift_eval = eval_shift_matrix(sumcheck_point, column_point, window - 1);
 
         let calc_eval = upper_eval * shift_eval;
         ensure!(
@@ -212,20 +211,20 @@ impl AttentionMask<Element> {
 /// provided as input. The shift matrix S is defined as S[i,j] = 1 iff i <= j + shift;
 /// given a generic square matrix `A`, right-multiplying `S` to `A` shifts the columns of `A` `shift` times to the left,
 /// leaving 0 columns in place of the shifted columns. The shift matrix is employed to construct the local attention mask  
-fn eval_shift_matrix<E: ExtensionField>(row_point: &[E], column_point: &[E], shift: usize) -> E {
-    let b1 = compute_betas_eval(row_point);
+fn eval_shift_matrix<F: PrimeField>(row_point: &[F], column_point: &[F], shift: usize) -> F {
+    let b1 = evals(row_point);
     let num_row_vars = row_point.len();
     let num_col_vars = column_point.len();
     assert_eq!(b1.len(), 1 << num_row_vars);
     (0..(1 << num_row_vars))
         .zip(b1)
-        .fold(E::ZERO, |sum, (row, beta)| {
+        .fold(F::ZERO, |sum, (row, beta)| {
             if row < shift {
                 sum
             } else {
                 let col = row - shift;
                 let col_le_bits = to_bit_sequence_le(col, num_col_vars)
-                    .map(|b| E::from_canonical_usize(b))
+                    .map(|b| F::from(b as u64))
                     .collect_vec();
                 let selector = beta * identity_eval(column_point, &col_le_bits);
                 sum + selector
@@ -235,18 +234,18 @@ fn eval_shift_matrix<E: ExtensionField>(row_point: &[E], column_point: &[E], shi
 #[derive(Debug, Clone)]
 /// Struct storing all information to verify a [`AttentionMaskProof`]. We prove and verify the mask applied to each individual 2D sub tensor in a batched fashion.
 /// This struct hold the information needed and is constructed from the shaps and the last claim.
-pub(crate) struct MaskVerifyingData<E: ExtensionField> {
+pub(crate) struct MaskVerifyingData<F: PrimeField> {
     /// These values are the evaluations of the eq-poly for the higher dims that aren't from padding
-    batching_challenges: Vec<E>,
+    batching_challenges: Vec<F>,
     /// This is the point used to make the batch challenges
-    batching_point: Vec<E>,
+    batching_point: Vec<F>,
     /// This is evaluations of the eq-poly for each of the rank-2 tensors that the mask is applied to
-    eq_point: Vec<E>,
+    eq_point: Vec<F>,
 }
 
-impl<E: ExtensionField> MaskVerifyingData<E> {
+impl<F: PrimeField> MaskVerifyingData<F> {
     /// Create a new [`MaskVerifyingData`]
-    pub fn new(batching_challenges: Vec<E>, batching_point: Vec<E>, eq_point: Vec<E>) -> Self {
+    pub fn new(batching_challenges: Vec<F>, batching_point: Vec<F>, eq_point: Vec<F>) -> Self {
         MaskVerifyingData {
             batching_challenges,
             batching_point,
@@ -255,7 +254,7 @@ impl<E: ExtensionField> MaskVerifyingData<E> {
     }
 
     pub fn new_from_claim_and_shape_data(
-        claim: &Claim<E>,
+        claim: &Claim<F>,
         input_shape: &Shape,
         unpadded_input_shape: &Shape,
     ) -> Result<Self> {
@@ -270,17 +269,17 @@ impl<E: ExtensionField> MaskVerifyingData<E> {
             .rev()
             .flat_map(|p| *p)
             .copied()
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
         let batching_challenges = dim_points[..rank - 2]
             .iter()
             .zip(unpadded_input_shape[..rank - 2].iter())
-            .fold(vec![E::ONE], |mut acc, (point_slice, dim)| {
-                let evals = compute_betas_eval(point_slice);
+            .fold(vec![F::ONE], |mut acc, (point_slice, dim)| {
+                let evals = evals(point_slice);
                 acc = acc
                     .into_iter()
-                    .flat_map(|c| evals.iter().take(*dim).map(|e| c * *e).collect::<Vec<E>>())
-                    .collect::<Vec<E>>();
+                    .flat_map(|c| evals.iter().take(*dim).map(|e| c * *e).collect::<Vec<F>>())
+                    .collect::<Vec<F>>();
                 acc
             });
 
@@ -289,7 +288,7 @@ impl<E: ExtensionField> MaskVerifyingData<E> {
             .rev()
             .flat_map(|p| *p)
             .copied()
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
         Ok(MaskVerifyingData::new(
             batching_challenges,

@@ -3,11 +3,11 @@
 use crate::{
     NextPowerOfTwo,
     lookup::table::{SHIFT_CHECK_TABLE_BIT_SIZE, TableSign},
-    to_base,
 };
 
 use super::*;
 
+use dp_crypto::{Expression, arkyper::transcript::Transcript, util::ceil_log2};
 use itertools::izip;
 use serde::{Deserialize, Serialize};
 
@@ -52,12 +52,12 @@ impl LookupVariant {
     }
 
     /// Builds the full sumcheck expression for the lookup operation by summing the expressions for each chunk.
-    pub fn build_full_sumcheck_expression<E: ExtensionField>(
+    pub fn build_full_sumcheck_expression<F: PrimeField>(
         &self,
         total_chunks: usize,
         final_dim_size: usize,
         chunking_info: &ChunkingInfo,
-    ) -> Expression<E> {
+    ) -> Expression<F> {
         // First we work out how many witness polynomials there will be total
         (0..total_chunks).fold(Expression::ZERO, |acc, chunk_number| {
             acc + self.sumcheck_expression_for_chunk(
@@ -71,11 +71,11 @@ impl LookupVariant {
 
     /// Internal method that builds the expressions needed for the output part of the lookup operation.
     /// This is the same for all variants.
-    pub(crate) fn build_lookup_output_expressions<E: ExtensionField>(
+    pub(crate) fn build_lookup_output_expressions<F: PrimeField>(
         &self,
         current_chunk: usize,
         chunking_info: &ChunkingInfo,
-    ) -> LookupExpressions<E> {
+    ) -> LookupExpressions<F> {
         let table = chunking_info.table();
         let number_zero_chunks = chunking_info.number_of_zeroing_chunks();
 
@@ -87,7 +87,7 @@ impl LookupVariant {
             initial_sum,
             witness_offset,
             sum_challenge_offset,
-        } = ValueExpression::<Expression<E>>::new(chunking_info, offset);
+        } = ValueExpression::<Expression<F>>::new(chunking_info, offset);
         // How we handle zeroing chunks changes depending on the whether the operation is signed or not.
         // If its signed then the most significant zeroing chunk has value +/- 1 if the most significant input chunk was non-zero,
         // if its not a signed operation then all zeroing chunks are 1 if and only if the input chunk was zero.
@@ -95,10 +95,10 @@ impl LookupVariant {
             let (mut prod, mut sum) = (0..number_zero_chunks.saturating_sub(1)).fold(
                 (Expression::ONE, initial_sum),
                 |(prod_acc, sum_acc), idx| {
-                    let chunk_expr = Expression::<E>::WitIn(witness_offset + idx as u16);
+                    let chunk_expr = Expression::<F>::WitIn(witness_offset + idx as u16);
                     // The sum challenge is always the first challenge
                     let sum_challenge =
-                        Expression::<E>::Challenge(0, sum_challenge_offset + idx, E::ONE, E::ZERO);
+                        Expression::<F>::Challenge(0, sum_challenge_offset + idx, F::ONE, F::ZERO);
                     (
                         prod_acc * chunk_expr.clone(),
                         sum_acc + chunk_expr * sum_challenge,
@@ -108,8 +108,8 @@ impl LookupVariant {
 
             // If prod == 1 then the output is the value expression, else its the corresponding clamping value
             // The clamping part is defined as clamping_max * (x * (x + 1)/2 + (1 - x^2)*(1-prod)) + clamping_min * (x * (x - 1)/2)
-            let two_field = E::TWO;
-            let (clamping_min, clamping_max): (E, E) = if chunking_info.number_of_value_chunks()
+            let two_field = F::from(2);
+            let (clamping_min, clamping_max): (F, F) = if chunking_info.number_of_value_chunks()
                 == 1
             {
                 (
@@ -125,22 +125,24 @@ impl LookupVariant {
 
             let (clamping_expression, squared_clamping_expression) = if number_zero_chunks != 0 {
                 let last_chunk_expr =
-                    Expression::<E>::WitIn(witness_offset - 1 + number_zero_chunks as u16);
+                    Expression::<F>::WitIn(witness_offset - 1 + number_zero_chunks as u16);
                 let lower_chunks_expr = prod.clone();
                 let one_minus_tc_squared =
-                    Expression::<E>::ONE - last_chunk_expr.clone() * last_chunk_expr.clone();
+                    Expression::<F>::ONE - last_chunk_expr.clone() * last_chunk_expr.clone();
                 prod *= one_minus_tc_squared.clone();
                 sum += last_chunk_expr.clone()
-                    * Expression::<E>::Challenge(
+                    * Expression::<F>::Challenge(
                         0,
                         sum_challenge_offset - 1 + number_zero_chunks,
-                        E::ONE,
-                        E::ZERO,
+                        F::ONE,
+                        F::ZERO,
                     );
 
-                let max_coeff = Expression::<E>::Constant(Either::Right(clamping_max));
-                let min_coeff = Expression::<E>::Constant(Either::Right(clamping_min));
-                let two_inv_expr = Expression::<E>::Constant(Either::Right(two_field.inverse()));
+                let max_coeff = Expression::<F>::Constant(clamping_max);
+                let min_coeff = Expression::<F>::Constant(clamping_min);
+                let two_inv_expr = Expression::<F>::Constant(
+                    two_field.inverse().expect("Cannot fail when inverting 2"),
+                );
 
                 let clamping_first_part = last_chunk_expr.clone()
                     * (last_chunk_expr.clone() + Expression::ONE)
@@ -175,12 +177,12 @@ impl LookupVariant {
             }
         } else {
             let (prod, sum) = (0..number_zero_chunks).fold(
-                (Expression::<E>::ONE, initial_sum),
+                (Expression::<F>::ONE, initial_sum),
                 |(prod_acc, sum_acc), idx| {
-                    let chunk_expr = Expression::<E>::WitIn(witness_offset + idx as u16);
+                    let chunk_expr = Expression::<F>::WitIn(witness_offset + idx as u16);
                     // The sum challenge is always the first challenge
                     let sum_challenge =
-                        Expression::<E>::Challenge(0, sum_challenge_offset + idx, E::ONE, E::ZERO);
+                        Expression::<F>::Challenge(0, sum_challenge_offset + idx, F::ONE, F::ZERO);
                     (
                         prod_acc * chunk_expr.clone(),
                         sum_acc + chunk_expr * sum_challenge,
@@ -190,14 +192,14 @@ impl LookupVariant {
 
             let clamping_expression = if number_zero_chunks != 0 {
                 // The clamping value is based on whether inputs are positive or negative.
-                let clamping_value: E = match table.operation().input_sign() {
+                let clamping_value: F = match table.operation().input_sign() {
                     TableSign::Positive => table.max_output_value().to_field(),
                     TableSign::Negative => table.min_output_value().to_field(),
                     TableSign::Mixed => {
                         unreachable!("Already checked that the table doesn't have mixed signs")
                     }
                 };
-                Expression::<E>::Constant(Either::Right(clamping_value))
+                Expression::<F>::Constant(clamping_value)
             } else {
                 // No zero chunks means no clamping needed
                 Expression::ONE
@@ -217,13 +219,13 @@ impl LookupVariant {
     }
 
     /// Builds the chunk Sumcheck expression for this variant.
-    pub fn sumcheck_expression_for_chunk<E: ExtensionField>(
+    pub fn sumcheck_expression_for_chunk<F: PrimeField>(
         &self,
         chunk_number: usize,
         total_chunks: usize,
         final_dim_size: usize,
         chunking_info: &ChunkingInfo,
-    ) -> Expression<E> {
+    ) -> Expression<F> {
         // The number of output related witnesses per chunk can be calculated from the chunking info
         let number_zero_chunks = chunking_info.number_of_zeroing_chunks();
         let output_witnesses_per_chunk =
@@ -234,10 +236,10 @@ impl LookupVariant {
             total_chunks * self.additional_witnesses_per_chunk() + total_output_witnesses;
 
         // We need to go case by case depending on the variant
-        let output_linking_eq = Expression::<E>::WitIn(total_witnesses as u16);
-        let lookup_linking_eq = Expression::<E>::WitIn((total_witnesses + 1) as u16);
+        let output_linking_eq = Expression::<F>::WitIn(total_witnesses as u16);
+        let lookup_linking_eq = Expression::<F>::WitIn((total_witnesses + 1) as u16);
         let chunk_challenge =
-            Expression::<E>::Challenge((1 + chunk_number) as u16, 1, E::ONE, E::ZERO);
+            Expression::<F>::Challenge((1 + chunk_number) as u16, 1, F::ONE, F::ZERO);
 
         let LookupExpressions {
             value,
@@ -262,7 +264,7 @@ impl LookupVariant {
                 let prod_expression = clamping_expression + prod_selector * value;
                 // The GLU witness is multiplied element wise with the prod_expression.
                 let glu_chunk_witness =
-                    Expression::<E>::WitIn((total_output_witnesses + chunk_number) as u16);
+                    Expression::<F>::WitIn((total_output_witnesses + chunk_number) as u16);
 
                 chunk_challenge
                     * (output_linking_eq * prod_expression * glu_chunk_witness
@@ -274,12 +276,12 @@ impl LookupVariant {
                 //     clamping_expression.clone() + prod_selector * (value - clamping_expression);
                 let prod_expression = clamping_expression + prod_selector * value;
 
-                let normalisation_eq = Expression::<E>::WitIn((total_witnesses + 2) as u16);
+                let normalisation_eq = Expression::<F>::WitIn((total_witnesses + 2) as u16);
 
                 let final_dim_log = ceil_log2(final_dim_size);
-                let pow_two: E = (1i64 << final_dim_log).to_field();
+                let pow_two: F = (1i64 << final_dim_log).to_field();
                 let sum_norm_challenge =
-                    Expression::<E>::Challenge((1 + total_chunks) as u16, 1, pow_two, E::ZERO);
+                    Expression::<F>::Challenge((1 + total_chunks) as u16, 1, pow_two, F::ZERO);
                 // In this case we want to link the normalisation check to the lookup output and that is done via the normalisation_eq poly.
                 chunk_challenge
                     * (output_linking_eq * prod_expression.clone()
@@ -292,10 +294,10 @@ impl LookupVariant {
                 normalised_sum_value,
                 has_weight,
             } => {
-                let normalisation_eq = Expression::<E>::WitIn((total_witnesses + 2) as u16);
+                let normalisation_eq = Expression::<F>::WitIn((total_witnesses + 2) as u16);
 
                 let final_dim_log = ceil_log2(final_dim_size);
-                let pow_two: E = (1i64 << final_dim_log).to_field();
+                let pow_two: F = (1i64 << final_dim_log).to_field();
 
                 // let prod_expression =
                 //     clamping_expression.clone() + prod_selector * (value - clamping_expression);
@@ -309,27 +311,27 @@ impl LookupVariant {
                     squared_clamping_expression + prod_selector * value.clone() * value;
 
                 let sumsq_norm_challenge =
-                    Expression::<E>::Challenge((1 + total_chunks) as u16, 1, pow_two, E::ZERO);
+                    Expression::<F>::Challenge((1 + total_chunks) as u16, 1, pow_two, F::ZERO);
 
                 let output_linking_eq = if *has_weight {
-                    output_linking_eq * Expression::<E>::WitIn((total_witnesses + 3) as u16)
+                    output_linking_eq * Expression::<F>::WitIn((total_witnesses + 3) as u16)
                 } else {
                     output_linking_eq
                 };
 
                 let input_chunk_expression =
-                    Expression::<E>::WitIn((total_output_witnesses + chunk_number) as u16);
-                let scaling_witness_expression = Expression::<E>::WitIn(
+                    Expression::<F>::WitIn((total_output_witnesses + chunk_number) as u16);
+                let scaling_witness_expression = Expression::<F>::WitIn(
                     (total_output_witnesses + total_chunks + chunk_number) as u16,
                 );
                 let input_challenge =
-                    Expression::<E>::Challenge((2 + total_chunks) as u16, 1, E::ONE, E::ZERO);
+                    Expression::<F>::Challenge((2 + total_chunks) as u16, 1, F::ONE, F::ZERO);
 
                 // Now we adat the output part again depending on whether we have sum normalisation or not
                 let mut output_part = output_linking_eq * prod_expression.clone();
                 if normalised_sum_value.is_some() {
                     let sum_norm_challenge =
-                        Expression::<E>::Challenge((1 + total_chunks) as u16, 2, pow_two, E::ZERO);
+                        Expression::<F>::Challenge((1 + total_chunks) as u16, 2, pow_two, F::ZERO);
                     output_part +=
                         sum_norm_challenge * (normalisation_eq.clone() * prod_expression);
                 };
@@ -358,39 +360,33 @@ impl LookupVariant {
     }
 
     /// Method that squeezes all the challenges required during sumcheck proving/verification for this variant.
-    pub fn squeeze_sumcheck_challenges<E: ExtensionField, T: Transcript<E>>(
+    pub fn squeeze_sumcheck_challenges<F: PrimeField, T: Transcript>(
         &self,
         transcript: &mut T,
-    ) -> Vec<E> {
+    ) -> Vec<F> {
         match self {
             LookupVariant::Standard | LookupVariant::GLU => vec![],
             LookupVariant::Softmax { .. } => {
-                vec![
-                    transcript
-                        .sample_and_append_challenge(b"normalisation")
-                        .elements,
-                ]
+                vec![transcript.append_and_sample(b"normalisation")]
             }
             LookupVariant::Normalisation { .. } => {
                 vec![
-                    transcript
-                        .sample_and_append_challenge(b"normalisation")
-                        .elements,
-                    transcript.sample_and_append_challenge(b"input").elements,
+                    transcript.append_and_sample(b"normalisation"),
+                    transcript.append_and_sample(b"input"),
                 ]
             }
         }
     }
     /// Produce the input claims that should be output by proving/verifying this operation.
-    pub fn produce_input_claims<E: ExtensionField, L: LookupOp>(
+    pub fn produce_input_claims<F: PrimeField, L: LookupOp>(
         &self,
         unpadded_input_shape: &Shape,
         lookup_op: &L,
-        last_claim_point: &[E],
-        logup_point: &[E],
-        sumcheck_point: &[E],
-        mut input_claim_evals: Vec<E>,
-    ) -> Result<Vec<Claim<E>>> {
+        last_claim_point: &[F],
+        logup_point: &[F],
+        sumcheck_point: &[F],
+        mut input_claim_evals: Vec<F>,
+    ) -> Result<Vec<Claim<F>>> {
         match self {
             LookupVariant::Standard | LookupVariant::GLU | LookupVariant::Softmax { .. } => {
                 // We only want to subtract the rounding constant from the unpadded portion of the input
@@ -405,14 +401,16 @@ impl LookupVariant {
                 let unbroadcast_shape = std::iter::repeat_n(1usize, dims_to_skip)
                     .chain(unpadded_input_shape[dims_to_skip..].iter().copied())
                     .collect::<Vec<usize>>();
-                let rounding_constant: E = lookup_op.rounding_constant().to_field();
+                let rounding_constant: F = lookup_op.rounding_constant().to_field();
                 let lt_eval = unpadded_input_shape
                     .broadcasting_evaluation(&dim_points, &unbroadcast_shape)?;
                 let rounding_to_sub = lt_eval * rounding_constant;
                 input_claim_evals[0] -= rounding_to_sub;
 
-                let fpm: E = lookup_op.fixed_point_multiplier().to_field();
-                let fpm_inv = fpm.inverse();
+                let fpm: F = lookup_op.fixed_point_multiplier().to_field();
+                let fpm_inv = fpm
+                    .inverse()
+                    .expect("Tried to invert 0 as fixed point multiplier");
                 input_claim_evals[0] *= fpm_inv;
 
                 let first_point = [logup_point, &last_claim_point[logup_point.len()..]].concat();
@@ -434,13 +432,13 @@ impl LookupVariant {
                 Ok(input_claim_evals
                     .iter()
                     .zip([first_point, second_point])
-                    .map(|(&eval, point)| Claim::<E>::new(point, eval))
-                    .collect::<Vec<Claim<E>>>())
+                    .map(|(&eval, point)| Claim::<F>::new(point, eval))
+                    .collect::<Vec<Claim<F>>>())
             }
             LookupVariant::Normalisation { .. } => {
                 let input_point =
                     [sumcheck_point, &last_claim_point[sumcheck_point.len()..]].concat();
-                Ok(vec![Claim::<E>::new(input_point, input_claim_evals[0])])
+                Ok(vec![Claim::<F>::new(input_point, input_claim_evals[0])])
             }
         }
     }
@@ -448,17 +446,17 @@ impl LookupVariant {
 
 #[derive(Debug, Clone)]
 /// Struct holding the expressions needed for the output part of the lookup operation.
-pub(crate) struct LookupExpressions<E: ExtensionField> {
+pub(crate) struct LookupExpressions<F: PrimeField> {
     /// The expression representing the output value of the lookup table.
-    pub value: Expression<E>,
+    pub value: Expression<F>,
     /// The selector used to pick the clamping value if clamping is required.
-    pub prod_selector: Expression<E>,
+    pub prod_selector: Expression<F>,
     /// The expression that returns the correct clamping value (min or max) based on the sign of the input.
-    pub clamping_expression: Expression<E>,
+    pub clamping_expression: Expression<F>,
     /// The expression that returns the square of the clamping value, this is only used in the normalisation variant with signed tables.
-    pub squared_clamping_expression: Expression<E>,
+    pub squared_clamping_expression: Expression<F>,
     /// The expression that is just a random linear combination of the lookup output related witnesses, this is used to link the lookup output to the sumcheck and also to enforce the zeroing of the zero chunks.
-    pub sum: Expression<E>,
+    pub sum: Expression<F>,
 }
 
 #[derive(Debug, Clone)]
@@ -474,19 +472,19 @@ pub(crate) struct ValueExpression<T> {
     pub sum_challenge_offset: usize,
 }
 
-impl<E: ExtensionField> ValueExpression<Expression<E>> {
+impl<F: PrimeField> ValueExpression<Expression<F>> {
     fn new(
         chunking_info: &ChunkingInfo,
         initial_witness_offset: u16,
-    ) -> ValueExpression<Expression<E>> {
+    ) -> ValueExpression<Expression<F>> {
         let number_value_chunks = chunking_info.number_of_value_chunks();
 
         // With one value chunk we can just return the result now
         if number_value_chunks == 1 {
             ValueExpression {
-                value: Expression::<E>::WitIn(initial_witness_offset),
-                initial_sum: Expression::<E>::WitIn(initial_witness_offset)
-                    * Expression::<E>::Challenge(0, 1, E::ONE, E::ZERO),
+                value: Expression::<F>::WitIn(initial_witness_offset),
+                initial_sum: Expression::<F>::WitIn(initial_witness_offset)
+                    * Expression::<F>::Challenge(0, 1, F::ONE, F::ZERO),
                 witness_offset: initial_witness_offset + 1,
                 sum_challenge_offset: 2,
             }
@@ -495,20 +493,20 @@ impl<E: ExtensionField> ValueExpression<Expression<E>> {
 
             let full_value_offset: Element =
                 1 << (number_value_chunks * table.table_bit_size() - 1);
-            let full_value_offset_field: E = full_value_offset.to_field();
+            let full_value_offset_field: F = full_value_offset.to_field();
             let (value, sum) = (0..number_value_chunks).fold(
                 (
-                    Expression::<E>::Constant(Either::Right(-full_value_offset_field)),
+                    Expression::<F>::Constant(-full_value_offset_field),
                     Expression::ZERO,
                 ),
                 |(value_acc, sum_acc), idx| {
-                    let chunk_expr = Expression::<E>::WitIn(initial_witness_offset + idx as u16);
+                    let chunk_expr = Expression::<F>::WitIn(initial_witness_offset + idx as u16);
                     let shift_amount =
-                        Expression::<E>::from(1u64 << (table.table_bit_size() * idx));
+                        Expression::<F>::from(1u64 << (table.table_bit_size() * idx));
                     let value_offset_expr =
-                        Expression::<E>::from(1u64 << (table.table_bit_size() - 1));
+                        Expression::<F>::from(1u64 << (table.table_bit_size() - 1));
                     let value_part = shift_amount * (chunk_expr.clone() + value_offset_expr);
-                    let sum_challenge = Expression::<E>::Challenge(0, idx + 1, E::ONE, E::ZERO);
+                    let sum_challenge = Expression::<F>::Challenge(0, idx + 1, F::ONE, F::ZERO);
                     (value_acc + value_part, sum_acc + chunk_expr * sum_challenge)
                 },
             );
@@ -523,13 +521,13 @@ impl<E: ExtensionField> ValueExpression<Expression<E>> {
     }
 }
 
-impl<E: ExtensionField> ValueExpression<E> {
+impl<F: PrimeField> ValueExpression<F> {
     /// Method to evaluate the value expression on a given witness assignment and set of challenges, this is used in the prover when we need to compute the value expression for the next chunk based on the witness values for the current chunk.
     pub(crate) fn evaluate(
-        values: &[E],
-        sum_challenge: E,
+        values: &[F],
+        sum_challenge: F,
         chunking_info: &ChunkingInfo,
-    ) -> ValueExpression<E> {
+    ) -> ValueExpression<F> {
         let number_value_chunks = chunking_info.number_of_value_chunks();
 
         // With one value chunk we can just return the result now
@@ -545,15 +543,13 @@ impl<E: ExtensionField> ValueExpression<E> {
 
             let full_value_offset: Element =
                 1 << (number_value_chunks * table.table_bit_size() - 1);
-            let full_value_offset_field: E = full_value_offset.to_field();
+            let full_value_offset_field: F = full_value_offset.to_field();
             let mut challenge_acc = sum_challenge;
             let (value, sum) = values.iter().enumerate().fold(
-                (-full_value_offset_field, E::ZERO),
+                (-full_value_offset_field, F::ZERO),
                 |(value_acc, sum_acc), (idx, &val)| {
-                    let shift_amount =
-                        E::from_canonical_u64(1u64 << (table.table_bit_size() * idx));
-                    let value_offset_expr =
-                        E::from_canonical_u64(1u64 << (table.table_bit_size() - 1));
+                    let shift_amount = F::from(1u64 << (table.table_bit_size() * idx));
+                    let value_offset_expr = F::from(1u64 << (table.table_bit_size() - 1));
                     let value_part = shift_amount * (val + value_offset_expr);
                     let sum_part = sum_acc + val * challenge_acc;
                     challenge_acc *= sum_challenge;

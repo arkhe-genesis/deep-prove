@@ -10,7 +10,7 @@ use crate::{
         activation::lookup_data::ActivationLookupData,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
-            VerifiableCtx,
+            Splittable, VerifiableCtx,
         },
         requant::{FIXED_POINT_SCALE, Requant},
     },
@@ -21,12 +21,13 @@ use crate::{
     tensor::{CommitmentId, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Context, Result, bail, ensure};
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::util::ceil_log2;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    util::ceil_log2,
+};
+use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, collections::HashMap, marker::PhantomData};
-use transcript::Transcript;
 
 /// The short name used to identify the Add layer.
 pub const ADD_LAYER: &str = "_ADD";
@@ -49,15 +50,20 @@ impl<N: TensorTypeParam> Default for Add<N> {
 /// NOTE: In LLM, we assume the same scaling info regardless of the sequence length.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddCtx {
-    node_id: NodeId,
     quant_info: AddQuantInfo,
     operand_key: Option<CommitmentId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddProof<E> {
-    left_eval: E,
-    right_eval: E,
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct AddProof<F> {
+    #[serde(with = "dp_crypto::serialization")]
+    left_eval: F,
+    #[serde(with = "dp_crypto::serialization")]
+    right_eval: F,
 }
 
 impl<N: TensorTypeParam> Add<N> {
@@ -70,20 +76,18 @@ impl<N: TensorTypeParam> Add<N> {
 }
 
 impl Add<Element> {
-    pub(crate) fn prove_step<A, E, T, PCS>(
+    pub(crate) fn prove_step<A, F, T, PCS>(
         &self,
         _node_id: NodeId,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         inputs: &[A],
-        _prover: &mut Prover<E, T, PCS>,
-    ) -> anyhow::Result<(Vec<Claim<E>>, AddProof<E>)>
+        _prover: &mut Prover<F, T, PCS>,
+    ) -> anyhow::Result<(Vec<Claim<F>>, AddProof<F>)>
     where
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        PCS: CommitmentScheme<Field = F>,
         A: AsRef<Tensor<Element>>,
-        E: ExtensionField,
-        T: Transcript<E>,
+        F: PrimeField,
+        T: Transcript,
     {
         ensure!(last_claims.len() == 1, "Add layer expects 1 claim");
         let last_claim = last_claims[0];
@@ -97,12 +101,12 @@ impl Add<Element> {
         // that x1(r) * M1 / 2^shift1 + x2(r) * M2 / 2^shift2 = y, so the prover outputs only x1(r) and x2(r)
         // and the verifier will "scale" the claims accordingly to check the equation.
         let left_input = inputs[0].as_ref();
-        let left_eval = left_input.to_field_mle().evaluate(&last_claim.point);
+        let left_eval = left_input.to_field_mle().evaluate(&last_claim.point)?;
         let mut output_claims = vec![Claim::new(last_claim.point.clone(), left_eval)];
         let right_eval = inputs[1]
             .as_ref()
             .to_field_mle()
-            .evaluate(&last_claim.point);
+            .evaluate(&last_claim.point)?;
         // this claims gets passed to the previous layer alongside the left one.
         output_claims.push(Claim::new(last_claim.point.clone(), right_eval));
 
@@ -424,18 +428,16 @@ impl QuantizeOp for Add<f32> {
 }
 
 impl ProveInfo for Add<Element> {
-    fn step_info<E: ExtensionField>(
+    fn step_info<F: PrimeField>(
         &self,
-        id: NodeId,
         aux: ContextAux,
-    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+    ) -> anyhow::Result<(LayerCtx<F>, ContextAux)> {
         let Some(ref quant_info) = self.quant_info else {
             bail!("Add layer is not quantized");
         };
         let ctx = AddCtx {
             quant_info: *quant_info,
             operand_key: None,
-            node_id: id,
         };
         Ok((LayerCtx::Add(ctx), aux))
     }
@@ -451,12 +453,10 @@ impl PadOp for Add<Element> {
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for Add<Element>
+impl<F, PCS> ProvableOp<F, PCS> for Add<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = AddCtx;
 
@@ -464,12 +464,12 @@ where
         &self,
         node_id: NodeId,
         _ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> anyhow::Result<Vec<Claim<E>>>
+        prover: &mut Prover<F, T, PCS>,
+    ) -> anyhow::Result<Vec<Claim<F>>>
     where
-        T: Transcript<E>,
+        T: Transcript,
     {
         let (output_claims, proof) = self.prove_step(
             node_id,
@@ -483,20 +483,23 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for AddCtx
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-{
-    type Proof = AddProof<E>;
+impl Splittable for AddCtx {}
 
-    fn verify<T: Transcript<E>>(
+impl<F, PCS> VerifiableCtx<F, PCS> for AddCtx
+where
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
+{
+    type Proof = AddProof<F>;
+
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         _shape_step: &ShapeStep,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         ensure!(last_claims.len() == 1, "Add layer expects 1 claim");
         let last_claim = last_claims[0];
         // just making sure downsizing due to API of E is ok
@@ -505,9 +508,9 @@ where
         // we have the output claim f(r) = y = x1(r) * x1_scale + x2(r) * x2_scale
         // and the proof gives us x1(r) and x2(r) so we just need to "scale" these and
         // verify the equation.
-        let left_scale: E = self.quant_info.left_scale().to_field();
+        let left_scale: F = self.quant_info.left_scale().to_field();
         let scaled_left = proof.left_eval * left_scale;
-        let right_scale: E = self.quant_info.right_scale().to_field();
+        let right_scale: F = self.quant_info.right_scale().to_field();
         let left_claim = Claim::new(last_claim.point.clone(), proof.left_eval);
         let scaled_right = proof.right_eval * right_scale;
         let right_claim = Claim::new(last_claim.point.clone(), proof.right_eval);
@@ -522,7 +525,7 @@ where
                 key.clone(),
                 Claim::new(last_claim.point.clone(), proof.right_eval),
             );
-            verifier.add_common_claims(self.node_id, claims);
+            verifier.add_common_claims(node_id, claims);
             // in this case we return only the left claim since the right one is verified by PCS
             Ok(vec![left_claim])
         } else {
@@ -531,7 +534,7 @@ where
         }
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         _proof: &Self::Proof,
         _transcript: &mut T,

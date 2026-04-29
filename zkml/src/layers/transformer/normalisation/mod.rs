@@ -21,15 +21,10 @@ use crate::{
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::{Arc, Mutex};
-use sumcheck::structs::IOPProof;
 use tenstore::StorageKey;
 use tracing::trace;
-use transcript::Transcript;
 
 pub mod layernorm;
 pub mod rmsnorm;

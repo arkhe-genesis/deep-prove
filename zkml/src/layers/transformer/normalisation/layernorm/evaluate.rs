@@ -208,7 +208,7 @@ mod tests {
 
     use super::*;
     use ark_std::rand::Rng;
-    use multilinear_extensions::util::ceil_log2;
+    use dp_crypto::util::ceil_log2;
     use proptest::prelude::*;
     use std::{
         fmt::{Debug, Display},
@@ -459,7 +459,7 @@ mod tests {
                 }).collect::<Vec<Element>>();
                 let sum = rescaled_row.iter().sum::<Element>();
                 let abs_sum = sum.unsigned_abs() as usize;
-                prop_assert!(abs_sum <= dim_size, "Mean not correctly normalised, got sum {sum} expected less than {}, rescaled row: {:?}", dim_size / 2, rescaled_row);
+                prop_assert!(abs_sum <= dim_size, "Mean not correctly normalised, got sum {sum} expected less than {}, rescaled row: {:?}", dim_size, rescaled_row);
             }
         }
 

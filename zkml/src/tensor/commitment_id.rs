@@ -9,6 +9,8 @@ use tenstore::StorageKey;
     Hash,
     Serialize,
     Deserialize,
+    PartialOrd,
+    Ord,
     derive_more::From,
     derive_more::Into,
     derive_more::Display,

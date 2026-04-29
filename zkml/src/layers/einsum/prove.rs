@@ -6,7 +6,6 @@ use super::*;
 
 use crate::{
     Claim, Shape, Tensor,
-    commit::compute_betas_eval,
     layers::einsum::axis::{FixedAxis, FixedPolys},
     quantization::ToField,
     tensor::CommitmentId,
@@ -14,28 +13,26 @@ use crate::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 
+use dp_crypto::{
+    poly::{dense::DensePolynomial, eq::evals},
+    structs::IOPProverState,
+    util::{ceil_log2, optimal_sumcheck_threads},
+    virtual_polys::VirtualPolynomialsBuilder,
+};
 use either::Either;
-use ff_ext::ExtensionField;
 use itertools::{Itertools, izip};
 
-use multilinear_extensions::{
-    mle::MultilinearExtension, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
-};
-
-use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
-use transcript::Transcript;
-
-pub(crate) struct EinSumProofInfo<E: ExtensionField> {
-    pub(crate) claims: Vec<Claim<E>>,
-    pub(crate) proof: EinSumProof<E>,
-    pub(crate) commitment_map: HashMap<CommitmentId, Claim<E>>,
+pub(crate) struct EinSumProofInfo<F: PrimeField> {
+    pub(crate) claims: Vec<Claim<F>>,
+    pub(crate) proof: EinSumProof<F>,
+    pub(crate) commitment_map: HashMap<CommitmentId, Claim<F>>,
 }
 
-impl<E: ExtensionField> EinSumProofInfo<E> {
+impl<F: PrimeField> EinSumProofInfo<F> {
     fn new(
-        claims: Vec<Claim<E>>,
-        proof: EinSumProof<E>,
-        commitment_map: HashMap<CommitmentId, Claim<E>>,
+        claims: Vec<Claim<F>>,
+        proof: EinSumProof<F>,
+        commitment_map: HashMap<CommitmentId, Claim<F>>,
     ) -> Self {
         Self {
             claims,
@@ -46,16 +43,16 @@ impl<E: ExtensionField> EinSumProofInfo<E> {
 }
 
 impl EinSum<Element> {
-    pub(crate) fn prove_internal<E, T>(
+    pub(crate) fn prove_internal<F, T>(
         &self,
-        ctx: &EinSumContext<E>,
-        last_claims: Vec<&Claim<E>>,
+        ctx: &EinSumContext<F>,
+        last_claims: Vec<&Claim<F>>,
         inputs: &[Tensor<Element>],
         transcript: &mut T,
-    ) -> Result<EinSumProofInfo<E>>
+    ) -> Result<EinSumProofInfo<F>>
     where
-        E: ExtensionField,
-        T: Transcript<E>,
+        F: PrimeField,
+        T: Transcript,
     {
         // Check that we have the correct number of `last_claims` and `inputs`
         let expected_num_inputs = self.mapping.input_count();
@@ -80,7 +77,7 @@ impl EinSum<Element> {
                     .map(|tensor| Ok(Tensor::try_from(tensor)?.pad_next_power_of_two().to_field()))
                     .transpose()
             })
-            .collect::<Result<Vec<Option<Tensor<E>>>>>()?;
+            .collect::<Result<Vec<Option<Tensor<F>>>>>()?;
 
         let mut full_inputs = Vec::with_capacity(field_constants.len() + 1);
         full_inputs.push(first_input);
@@ -142,7 +139,7 @@ impl EinSum<Element> {
             .iter()
             .zip(last_claims.iter())
             .map(|(shape, claim)| shape.split_point(claim.point()))
-            .collect::<Result<Vec<Vec<&[E]>>>>()?;
+            .collect::<Result<Vec<Vec<&[F]>>>>()?;
 
         let FixedPolys {
             lhs: fixed_lhs_polys,
@@ -158,9 +155,7 @@ impl EinSum<Element> {
         let contraction_size = axes_sizes[AxisType::Contracted];
         let stacking_size = axes_sizes[AxisType::Stacked];
 
-        let batching_challenge = transcript
-            .sample_and_append_challenge(b"batching_challenge")
-            .elements;
+        let batching_challenge = transcript.append_and_sample(b"batching_challenge");
 
         let num_vars = ceil_log2(contraction_size);
 
@@ -174,7 +169,7 @@ impl EinSum<Element> {
             .collect::<Vec<_>>();
 
         let expr_builder =
-            VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
+            VirtualPolynomialsBuilder::<F>::new_with_mles(num_threads, num_vars, either_mles);
 
         let stacking_coeffs_ref = stacking_coeffs
             .iter()
@@ -186,7 +181,7 @@ impl EinSum<Element> {
             &[batching_challenge],
         );
 
-        let (einsum_proof, state) = IOPProverState::<E>::prove(virtual_poly, transcript);
+        let (einsum_proof, state) = IOPProverState::<F>::prove(virtual_poly, transcript);
 
         // We will have twice as many evaluations as we have inputs, the first half relate only to the LHS poly, so we skip those and take the RHS claims when we make
         // any constant polynomial claims.
@@ -200,7 +195,7 @@ impl EinSum<Element> {
             .filter_map(|(output_id, (bias_opt, split_point))| {
                 if let Some(bias) = bias_opt.as_ref() {
                     let key = CommitmentId::from(bias.storage_key());
-                    let bias_field: Tensor<E> = Tensor::try_from(bias)
+                    let bias_field: Tensor<F> = Tensor::try_from(bias)
                         .unwrap()
                         .pad_next_power_of_two()
                         .to_field();
@@ -210,7 +205,7 @@ impl EinSum<Element> {
                         .bias_evaluation_point(output_id, bias_id, split_point)
                         .expect("Point should be valid");
                     bias_id += 1;
-                    let eval = bias_poly.evaluate(&bias_point);
+                    let eval = bias_poly.evaluate(&bias_point).unwrap();
                     Some((key, Claim::new(bias_point, eval)))
                 } else {
                     None
@@ -222,7 +217,7 @@ impl EinSum<Element> {
         let bias_evals = bias_claims
             .iter()
             .map(|(_, claim)| claim.evaluation())
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
         let half = einsum_evaluations.len() / 2;
         // Separate out the input claims and the constant (weight) claims
@@ -244,15 +239,15 @@ impl EinSum<Element> {
                 let eval = stacking_coeffs
                     .iter()
                     .zip(evals_chunk.iter())
-                    .fold(E::ZERO, |acc, (coeff, eval)| acc + *coeff * *eval);
+                    .fold(F::ZERO, |acc, (coeff, eval)| acc + *coeff * *eval);
 
                 if let Some(weight) = weight_opt.as_ref() {
                     Either::Right((
                         CommitmentId::from(weight.storage_key()),
-                        Claim::<E>::new(full_point, eval),
+                        Claim::<F>::new(full_point, eval),
                     ))
                 } else {
-                    Either::Left(Claim::<E>::new(full_point, eval))
+                    Either::Left(Claim::<F>::new(full_point, eval))
                 }
             },
         );
@@ -260,7 +255,7 @@ impl EinSum<Element> {
         let constant_poly_claims = rhs_constant_claims
             .into_iter()
             .chain(bias_claims)
-            .collect::<HashMap<CommitmentId, Claim<E>>>();
+            .collect::<HashMap<CommitmentId, Claim<F>>>();
 
         if let Some(agg_expr) = ctx.input_aggregation_expression.as_ref() {
             let input_mle = inputs[0].to_field_mle();
@@ -274,24 +269,23 @@ impl EinSum<Element> {
                         &einsum_sumcheck_point,
                         input_shapes[0].as_slice(),
                     );
-                    let evaluations = compute_betas_eval(&eq_point);
-                    MultilinearExtension::from_evaluations_ext_vec(num_vars, evaluations)
+                    let evaluations = evals(&eq_point);
+                    DensePolynomial::new(evaluations)
                 })
-                .collect::<Vec<MultilinearExtension<E>>>();
+                .collect::<Vec<_>>();
 
-            let input_batching_challenge = transcript
-                .sample_and_append_challenge(b"input_batching_challenge")
-                .elements;
+            let input_batching_challenge =
+                transcript.append_and_sample(b"input_batching_challenge");
             let num_threads = optimal_sumcheck_threads(num_vars);
             let either_mles = std::iter::once(&input_mle)
                 .chain(eq_polys.iter())
                 .map(Either::Left)
                 .collect::<Vec<_>>();
             let expr_builder =
-                VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
+                VirtualPolynomialsBuilder::<F>::new_with_mles(num_threads, num_vars, either_mles);
             let virtual_poly = expr_builder
                 .to_virtual_polys(std::slice::from_ref(agg_expr), &[input_batching_challenge]);
-            let (agg_proof, agg_state) = IOPProverState::<E>::prove(virtual_poly, transcript);
+            let (agg_proof, agg_state) = IOPProverState::<F>::prove(virtual_poly, transcript);
 
             let lhs_input_point = agg_state.collect_raw_challenges();
             let lhs_input_eval = agg_state.get_mle_flatten_final_evaluations()[0];
@@ -317,7 +311,7 @@ impl EinSum<Element> {
             let lhs_input_eval = stacking_coeffs[0]
                 .iter()
                 .zip(einsum_evaluations[..stacking_size].iter())
-                .fold(E::ZERO, |acc, (coeff, eval)| acc + *coeff * *eval);
+                .fold(F::ZERO, |acc, (coeff, eval)| acc + *coeff * *eval);
 
             let lhs_input_claim = Claim::new(lhs_input_point, lhs_input_eval);
 
@@ -340,11 +334,11 @@ impl EinSum<Element> {
 }
 
 /// Function used to reconstruct the full evaluation point of a tensor MLE from the fixed axes and the sumcheck point
-pub(crate) fn reconstruct_full_point<E: ExtensionField>(
-    fixed_axes: &[FixedAxis<&[E]>],
-    sumcheck_point: &[E],
+pub(crate) fn reconstruct_full_point<F: PrimeField>(
+    fixed_axes: &[FixedAxis<&[F]>],
+    sumcheck_point: &[F],
     input_shape: &[usize],
-) -> Vec<E> {
+) -> Vec<F> {
     let mut skip = 0usize;
     fixed_axes
         .iter()
@@ -363,5 +357,5 @@ pub(crate) fn reconstruct_full_point<E: ExtensionField>(
             }
         })
         .copied()
-        .collect::<Vec<E>>()
+        .collect::<Vec<F>>()
 }

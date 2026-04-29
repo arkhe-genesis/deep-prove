@@ -1,7 +1,5 @@
 use crate::{
-    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
-    commit::{compute_betas_eval, identity_eval},
-    eval_zeroifier_mle,
+    Claim, Element, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor, eval_zeroifier_mle,
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -19,6 +17,7 @@ use crate::{
     },
     model::Step,
     padding::PaddingMode,
+    poly_commit::identity_eval,
     quantization::{self, Quantize, ToField},
     tensor::{
         CommitmentId, TensorHandle, TensorSlice, TensorTypeParam, WrappedTensor,
@@ -28,42 +27,46 @@ use crate::{
     util::from_mle_list_dimensions,
 };
 use anyhow::{Ok, Result, ensure};
+use ark_ff::PrimeField;
 use burn::tensor::{Shape as BShape, Tensor as BTensor};
-use either::Either;
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    mle::IntoMLE, util::ceil_log2, virtual_polys::VirtualPolynomialsBuilder,
+use dp_crypto::{
+    IntoMLE,
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    poly::eq::evals,
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::{ceil_log2, optimal_sumcheck_threads},
+    virtual_polys::VirtualPolynomialsBuilder,
 };
+use either::Either;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::{Arc, Mutex};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
 use tenstore::{GenStore, StorageKey};
 use tracing::warn;
-use transcript::Transcript;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct RopeProof<E: ExtensionField> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct RopeProof<F: PrimeField> {
     // Evaluations of the sub-matrices required to compute the claim
     // about the cosine matrix.
-    sub_cosine_evals: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    sub_cosine_evals: Vec<F>,
     // Evaluations of the sub-matrices required to compute the claim
     // about the sine matrix.
-    sub_sine_evals: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    sub_sine_evals: Vec<F>,
     // Proof to link the output with the input
-    sumcheck_proof: IOPProof<E>,
+    sumcheck_proof: IOPProof<F>,
     // Evaluations of the polynomials involved in `sumcheck_proof`
-    sumcheck_evals: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    sumcheck_evals: Vec<F>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RopeCtx {
-    node_id: NodeId,
     pub(super) unpadded_shape: Shape,
     num_vars_positional_matrix: usize,
     cosine_key: CommitmentId,
@@ -232,11 +235,11 @@ impl RopeLayout {
         }
     }
 
-    fn permuted_eq_poly<E: ExtensionField>(&self, eq_evals: &[E], row_size: usize) -> Vec<E> {
+    fn permuted_eq_poly<F: PrimeField>(&self, eq_evals: &[F], row_size: usize) -> Vec<F> {
         match self {
             RopeLayout::Adjacent => eq_evals
                 .chunks(2)
-                .flat_map(|chunk| vec![chunk[1], E::ZERO - chunk[0]])
+                .flat_map(|chunk| vec![chunk[1], F::ZERO - chunk[0]])
                 .collect_vec(),
             RopeLayout::RotateHalf => {
                 let half_len = row_size / 2;
@@ -247,19 +250,19 @@ impl RopeLayout {
                         second_half
                             .iter()
                             .copied()
-                            .chain(first_half.iter().map(|e| E::ZERO - *e))
+                            .chain(first_half.iter().map(|e| F::ZERO - *e))
                     })
                     .collect_vec()
             }
         }
     }
 
-    fn evaluate_permuted_eq_poly<E: ExtensionField>(
+    fn evaluate_permuted_eq_poly<F: PrimeField>(
         &self,
-        eq_point: &[E],
-        sumcheck_point: &[E],
+        eq_point: &[F],
+        sumcheck_point: &[F],
         row_num_vars: usize,
-    ) -> E {
+    ) -> F {
         match self {
             RopeLayout::Adjacent => evaluate_permutation_eq_poly(eq_point, sumcheck_point),
             RopeLayout::RotateHalf => {
@@ -460,7 +463,7 @@ impl<N: TensorTypeParam> Rope<N> {
     /// claims for such matrices; this variable changes depending on the layout strategy. If Adjacent is used we drop the
     /// first variable, which corresponds to the lowest bit of the row index; if RotateHalf is used we drop the variable
     /// corresponding to the highest bit of the row index.
-    fn claim_for_committed_matrix<E: ExtensionField>(&self, claim: &mut Claim<E>) {
+    fn claim_for_committed_matrix<F: PrimeField>(&self, claim: &mut Claim<F>) {
         match self.layout {
             RopeLayout::Adjacent => claim.point.remove(0),
             RopeLayout::RotateHalf => {
@@ -470,20 +473,18 @@ impl<N: TensorTypeParam> Rope<N> {
         };
     }
 
-    pub(super) fn prove_step<E, T, PCS>(
+    pub(super) fn prove_step<F, T, PCS>(
         &self,
         node_id: NodeId,
-        output_claim: &Claim<E>,
+        output_claim: &Claim<F>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> anyhow::Result<Vec<Claim<E>>>
+        prover: &mut Prover<F, T, PCS>,
+    ) -> anyhow::Result<Vec<Claim<F>>>
     where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
-        N: ToField<E>,
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
+        N: ToField<F>,
+        F: PrimeField,
+        T: Transcript,
+        PCS: CommitmentScheme<Field = F>,
     {
         let input = step_data.padded_input_tensor_at(0)?;
         let input_shape = input.shape().clone();
@@ -541,18 +542,18 @@ impl<N: TensorTypeParam> Rope<N> {
             .rev()
             .flat_map(|v| *v)
             .cloned()
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
         let beta_vars = split_point
             .iter()
             .skip(input_shape.rank() - 2)
             .rev()
             .flat_map(|v| *v)
             .cloned()
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
 
         // compute evals of EQ poly for the output claim
-        let beta_vec = compute_betas_eval(&beta_vars);
-        let input_mle = input_mle.fix_high_variables(&fix_vars);
+        let beta_vec = evals(&beta_vars);
+        let input_mle = input_mle.fix_high_variables_parallel(&fix_vars);
         // compute `permuted_eq_poly`: by definition, given the evals of `eq_poly` (i.e., `beta_vec`),
         // it is constructed as `permuted_eq_vec[i] = beta_vec[i+1] if i is even, -beta_vec[i-1] if i is odd`
         let permuted_eq_evals = self.layout.permuted_eq_poly(&beta_vec, input_shape.dim(-1));
@@ -561,17 +562,17 @@ impl<N: TensorTypeParam> Rope<N> {
         let lt_poly = (0..input_shape.dim(-2))
             .flat_map(|i| {
                 if i < unpadded_input_shape.dim(-2) {
-                    vec![E::ONE; input_shape.dim(-1)]
+                    vec![F::ONE; input_shape.dim(-1)]
                 } else {
-                    vec![E::ZERO; input_shape.dim(-1)]
+                    vec![F::ZERO; input_shape.dim(-1)]
                 }
             })
-            .collect::<Vec<E>>()
+            .collect::<Vec<F>>()
             .into_mle();
 
         let num_vars = input_mle.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<F>::new(num_threads, num_vars);
         let input_expr = expr_builder.lift(Either::Left(&input_mle));
         let sub_cos_expr = expr_builder.lift(Either::Left(&sub_cos_mle));
         let sub_sin_expr = expr_builder.lift(Either::Left(&sub_sin_mle));
@@ -583,7 +584,7 @@ impl<N: TensorTypeParam> Rope<N> {
             &[input_expr * lt_expr * (eq_expr * sub_cos_expr + permuted_eq_expr * sub_sin_expr)],
             &[],
         );
-        let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let (sumcheck_proof, state) = IOPProverState::<F>::prove(virtual_poly, prover.transcript);
 
         let sumcheck_point = state.collect_raw_challenges();
         let sumcheck_evals = state.get_mle_flatten_final_evaluations()[..3].to_vec();
@@ -593,7 +594,7 @@ impl<N: TensorTypeParam> Rope<N> {
                 .iter()
                 .copied()
                 .chain(fix_vars)
-                .collect::<Vec<E>>(),
+                .collect::<Vec<F>>(),
             input_eval,
         );
 
@@ -836,11 +837,7 @@ impl PadOp for Rope<Element> {
 }
 
 impl Rope<Element> {
-    pub(super) fn step_info(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> anyhow::Result<(RopeCtx, ContextAux)> {
+    pub(super) fn step_info(&self, mut aux: ContextAux) -> anyhow::Result<(RopeCtx, ContextAux)> {
         // this closure retains only values in odd columns, relying on the fact that `self.cosine_matrix`
         // and `self.sine_matrix` have pairwise identical elements in each column. In this way, the size
         // of the polynomial being committed is halved
@@ -881,7 +878,6 @@ impl Rope<Element> {
         let num_vars = cosine_matrix.shape().num_vars().into_iter().sum();
         let ctx = RopeCtx {
             unpadded_shape: self.unpadded_shape.clone(),
-            node_id: id,
             num_vars_positional_matrix: num_vars,
             cosine_key: CommitmentId::from(self.cosine_matrix.storage_key()),
             sine_key: CommitmentId::from(self.sine_matrix.storage_key()),
@@ -893,17 +889,14 @@ impl Rope<Element> {
 }
 
 impl RopeCtx {
-    pub(super) fn verify<
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
-    >(
+    pub(super) fn verify<F: PrimeField, T: Transcript, PCS: CommitmentScheme<Field = F>>(
         &self,
-        proof: &RopeProof<E>,
-        last_claim: &Claim<E>,
-        verifier: &mut Verifier<E, T, PCS>,
+        proof: &RopeProof<F>,
+        last_claim: &Claim<F>,
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         let input_rank = shape_step.padded_input_shape[0].rank();
 
         let dim_vars = shape_step.padded_input_shape[0].num_vars();
@@ -933,17 +926,13 @@ impl RopeCtx {
             &aux_info,
             verifier.transcript,
         );
-        let sumcheck_point = subclaim
-            .point
-            .iter()
-            .map(|p| p.elements)
-            .collect::<Vec<_>>();
+        let sumcheck_point = &subclaim.point;
 
-        let beta_eval = identity_eval(&last_claim.point()[..input_num_vars], &sumcheck_point);
+        let beta_eval = identity_eval(&last_claim.point()[..input_num_vars], sumcheck_point);
         let row_num_vars = dim_vars[input_rank - 1];
         let permuted_eq_eval = self.layout.evaluate_permuted_eq_poly(
             &last_claim.point()[..input_num_vars],
-            &sumcheck_point,
+            sumcheck_point,
             row_num_vars,
         );
 
@@ -951,8 +940,8 @@ impl RopeCtx {
 
         let lt_point_len = shape_step.padded_input_shape[0].num_vars()[input_rank - 2];
         let lt_bits = to_bit_sequence_le(unpadded_seq_len - 1, lt_point_len)
-            .map(E::from_canonical_usize)
-            .collect::<Vec<E>>();
+            .map(|b| F::from(b as u64))
+            .collect::<Vec<F>>();
         let lt_eval = eval_zeroifier_mle(
             &sumcheck_point[sumcheck_point.len() - lt_point_len..],
             &lt_bits,
@@ -978,12 +967,12 @@ impl RopeCtx {
                 .iter()
                 .chain(last_claim.point()[input_num_vars..].iter())
                 .copied()
-                .collect::<Vec<E>>(),
+                .collect::<Vec<F>>(),
             input_eval,
         );
 
         let sub_cos_claim = Claim::new(sumcheck_point.clone(), cosine_eval);
-        let sub_sine_claim = Claim::new(sumcheck_point, sine_eval);
+        let sub_sine_claim = Claim::new(sumcheck_point.clone(), sine_eval);
 
         let mut cosine_matrix_claim = PositionalCtx::build_positional_matrix_claim(
             sub_cos_claim,
@@ -1006,7 +995,7 @@ impl RopeCtx {
         self.claim_for_committed_matrix(&mut sine_matrix_claim);
 
         verifier.add_common_claims(
-            self.node_id,
+            node_id,
             [
                 (self.cosine_key.clone(), cosine_matrix_claim),
                 (self.sine_key.clone(), sine_matrix_claim),
@@ -1018,7 +1007,7 @@ impl RopeCtx {
         Ok(vec![input_claim])
     }
 
-    fn claim_for_committed_matrix<E: ExtensionField>(&self, claim: &mut Claim<E>) {
+    fn claim_for_committed_matrix<F: PrimeField>(&self, claim: &mut Claim<F>) {
         match self.layout {
             RopeLayout::Adjacent => claim.point.remove(0),
             RopeLayout::RotateHalf => {
@@ -1037,7 +1026,7 @@ impl RopeCtx {
 // This method evalautes `permuted_eq_poly(input)` given an input point
 // with `n` coordinates and the claim point `r_c` employed to construct
 // `permuted_eq_poly`
-fn evaluate_permutation_eq_poly<E: ExtensionField>(claim_point: &[E], input: &[E]) -> E {
+fn evaluate_permutation_eq_poly<F: PrimeField>(claim_point: &[F], input: &[F]) -> F {
     // Given the coordinates `r_1, ..., r_n` of `claim_point` and the `n`
     // input variables `y_1,...,y_n`, we have:
     // - `permute_eq_poly[i]` = eq(i,r_2..)*r_1*(1-y_1) when i is even
@@ -1080,9 +1069,10 @@ mod tests {
         tensor::{TensorTypeParam, is_close_with_tolerance},
     };
 
-    use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::sync::{Arc, Mutex};
+
+    type F = ark_bn254::Fr;
 
     fn random_angles(num_angles: usize) -> Vec<f32> {
         let mut rng = rng_from_env_or_random();
@@ -1196,7 +1186,7 @@ mod tests {
 
         // run quantized model and get the output
         let trace = quantized_model.run(inputs.clone(), &mut store)?;
-        let io = trace.to_verifier_io::<GoldilocksExt2>()?;
+        let io = trace.to_verifier_io::<F>()?;
 
         // pad the model
         let padded_model = pad_model(quantized_model)?;
@@ -1207,7 +1197,7 @@ mod tests {
         // run the padded model
         let padded_trace = padded_model.run(padded_inputs, &mut Default::default())?;
 
-        let padded_io = padded_trace.to_verifier_io::<GoldilocksExt2>()?;
+        let padded_io = padded_trace.to_verifier_io::<F>()?;
 
         let output = &io.output[0];
         let padded_output = &padded_io.output[0];
@@ -1225,9 +1215,9 @@ mod tests {
                         && k < unpadded_out_shape[2]
                     {
                         // check that corresponding entries in `output` and `padded_output` are the same
-                        let out_data = output.data()
+                        let out_data = &output.data()
                             [i * unpadded_shape_strides[0] + j * unpadded_shape_strides[1] + k];
-                        let padded_out_data = padded_output.data()
+                        let padded_out_data = &padded_output.data()
                             [i * padded_shape_strides[0] + j * padded_shape_strides[1] + k];
                         assert_eq!(out_data, padded_out_data);
                     }

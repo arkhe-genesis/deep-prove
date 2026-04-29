@@ -3,10 +3,10 @@
 use super::*;
 
 /// Evaluates the row less than polynomial at the given row point for the given unpadded sequence length.
-pub(crate) fn evaluate_dim_lt_poly<E: ExtensionField>(
-    row_point: &[E],
+pub(crate) fn evaluate_dim_lt_poly<F: PrimeField>(
+    row_point: &[F],
     unpadded_seq_len: usize,
-) -> Result<E> {
+) -> Result<F> {
     let bit_len = ceil_log2(unpadded_seq_len);
     ensure!(
         row_point.len() == bit_len,
@@ -15,20 +15,20 @@ pub(crate) fn evaluate_dim_lt_poly<E: ExtensionField>(
     );
 
     let seq_len_bits = to_bit_sequence_le(unpadded_seq_len - 1, bit_len)
-        .map(E::from_canonical_usize)
-        .collect::<Vec<E>>();
+        .map(|bit| F::from(bit as u64))
+        .collect::<Vec<F>>();
     let row_eval = eval_zeroifier_mle(row_point, &seq_len_bits);
     Ok(row_eval)
 }
 
 impl LookupVariant {
     /// Method that given the normalisation lookup verifier evals for a chunk transforms them into evaluations that can be linked to the lookup output.
-    pub fn compute_norm_eval<E: ExtensionField>(
+    pub fn compute_norm_eval<F: PrimeField>(
         &self,
         unpadded_dim_size: usize,
-        point: &[E],
-        evals: &[E],
-    ) -> Result<Vec<E>> {
+        point: &[F],
+        evals: &[F],
+    ) -> Result<Vec<F>> {
         // We need the less than evaluation for the dimension so that we can zero out the contribution from the padded portion of the input
         let lt_eval = evaluate_dim_lt_poly(point, unpadded_dim_size)?;
 
@@ -42,8 +42,8 @@ impl LookupVariant {
                     "Expected single eval for softmax normalisation"
                 );
                 let offset: Element = (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * error_bound);
-                let offset_field: E = offset.to_field();
-                let norm_sum_const: E = (*normalised_sum_value + error_bound).to_field();
+                let offset_field: F = offset.to_field();
+                let norm_sum_const: F = (*normalised_sum_value + error_bound).to_field();
 
                 Ok(vec![offset_field + lt_eval * norm_sum_const - evals[0]])
             }
@@ -62,13 +62,13 @@ impl LookupVariant {
 
                 let sum_offset: Element =
                     (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * sum_error_bound);
-                let sum_offset_field: E = sum_offset.to_field();
+                let sum_offset_field: F = sum_offset.to_field();
 
                 let sumsq_offset: Element =
                     (1 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1 - (2 * magnitude_error_bound);
-                let sumsq_offset_field: E = sumsq_offset.to_field();
-                let norm_sum_const: E = (norm_sum + sum_error_bound).to_field();
-                let norm_magnitude_const: E =
+                let sumsq_offset_field: F = sumsq_offset.to_field();
+                let norm_sum_const: F = (norm_sum + sum_error_bound).to_field();
+                let norm_magnitude_const: F =
                     (*normalised_magnitude_value + magnitude_error_bound).to_field();
 
                 let out = evals
@@ -80,7 +80,7 @@ impl LookupVariant {
                     .map(|(&inner_eval, (offset, norm_sum))| {
                         offset + lt_eval * norm_sum - inner_eval
                     })
-                    .collect::<Vec<E>>();
+                    .collect::<Vec<F>>();
                 Ok(out)
             }
             LookupVariant::Standard | LookupVariant::GLU => Ok(vec![]),
@@ -88,15 +88,15 @@ impl LookupVariant {
     }
 
     /// Method to compute the initial claimed sum for the sumcheck in a lookup operation of this variant.
-    pub fn prepare_sumcheck_verification<E: ExtensionField>(
+    pub fn prepare_sumcheck_verification<F: PrimeField>(
         &self,
-        logup_claim: &LogUpBatchVerifierClaim<E>,
-        last_claim_eval: E,
-        shift_evals: &Option<Vec<E>>,
-        challenges: &[E],
+        logup_claim: &LogUpBatchVerifierClaim<F>,
+        last_claim_eval: F,
+        shift_evals: &Option<Vec<F>>,
+        challenges: &[F],
         chunking_info: &ChunkingInfo,
         unpadded_input_shape: &Shape,
-    ) -> Result<E> {
+    ) -> Result<F> {
         // First we need to know what size to chunk the logup evals into
         let table = chunking_info.table();
         let rank = unpadded_input_shape.rank();
@@ -120,7 +120,7 @@ impl LookupVariant {
             .output_claims()
             .iter()
             .map(|c| c.evaluation())
-            .collect::<Vec<E>>();
+            .collect::<Vec<F>>();
         // Split the evaluations into the IO evals and the normalisation evals, the normalisation evals are always at the end
         let (io_evals, norm_evals) = logup_evals.split_at(io_lookups_per_chunk * number_of_chunks);
         let logup_point = logup_claim.point();
@@ -153,23 +153,23 @@ impl LookupVariant {
                 let (all_value_evals, rest) = rest.split_at(table.num_columns() * chunking_info.number_of_value_chunks());
                 let (value_in_evals, value_out_evals) = match table.num_columns() {
                     1 =>  (all_value_evals.to_vec(), all_value_evals.to_vec()), // If we only have one column then all the value evals are input evals and output evals
-                    2 => all_value_evals.chunks(2).map(|pair| (pair[0], pair[1])).unzip::<E, E, Vec<E>, Vec<E>>(), // If we have two columns then we split them into input evals and output evals
+                    2 => all_value_evals.chunks(2).map(|pair| (pair[0], pair[1])).unzip::<F, F, Vec<F>, Vec<F>>(), // If we have two columns then we split them into input evals and output evals
                     _ => bail!("Unsupported number of table columns: {}", table.num_columns()),
                 };
 
-                let ValueExpression { value: _, initial_sum, witness_offset: _, sum_challenge_offset } = ValueExpression::<E>::evaluate(&value_out_evals, sum_challenge, chunking_info);
+                let ValueExpression { value: _, initial_sum, witness_offset: _, sum_challenge_offset } = ValueExpression::<F>::evaluate(&value_out_evals, sum_challenge, chunking_info);
                 let (zeroing_evals, _) = rest
                     .split_at(2 * chunking_info.number_of_zeroing_chunks());
                 let (zero_in_evals, zero_out_evals) = zeroing_evals
                     .chunks(2)
                     .map(|pair| (pair[0], pair[1]))
-                    .unzip::<E, E, Vec<E>, Vec<E>>();
+                    .unzip::<F, F, Vec<F>, Vec<F>>();
 
                 // Calculate the sum contribution from this chunk
                 let sum_contribution =  zero_out_evals
                         .iter()
                         .fold(
-                            (initial_sum, sum_challenge.exp_u64(sum_challenge_offset as u64)),
+                            (initial_sum, sum_challenge.pow([sum_challenge_offset as u64])),
                             |(acc, challenge), &zero_out_eval| {
                                 (acc + zero_out_eval * challenge, challenge * sum_challenge)
                             },
@@ -193,7 +193,7 @@ impl LookupVariant {
                         .step_by(number_of_chunks)
                         .take(norm_evals_per_chunk)
                         .copied()
-                        .collect::<Vec<E>>();
+                        .collect::<Vec<F>>();
 
                     initial_claim_contribution += self
                         .compute_norm_eval(
@@ -202,7 +202,7 @@ impl LookupVariant {
                             &chunk_norm_evals,
                         )?
                         .into_iter()
-                        .fold((E::ZERO, norm_challenge), |(acc, challenge), eval| {
+                        .fold((F::ZERO, norm_challenge), |(acc, challenge), eval| {
                             (acc + eval * challenge, challenge * norm_challenge)
                         })
                         .0;
@@ -221,7 +221,7 @@ impl LookupVariant {
                         &zero_in_evals,
                     );
                     // We need to subtract the rounding constant used
-                    let rounding_field: E = chunking_info.rounding_constant().to_field();
+                    let rounding_field: F = chunking_info.rounding_constant().to_field();
                     chunk_input_eval -= rounding_field;
 
                     if let Some(shift_evals) = shift_evals {

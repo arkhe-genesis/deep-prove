@@ -12,32 +12,33 @@ impl RequantCtx {
     /// It verifies both lookup argument proofs, calculates the initial claim for the sumcheck proof using the lookup argument claims
     /// and then verifies the sumcheck using this initial claim. It then takes the output claims provided by the prover, checks they relate to the sumcheck
     /// subclaim, adds them to the list of claims of commitment openings and then calculates the next claim.
-    pub(crate) fn verify_requant<E, T, PCS>(
+    pub(crate) fn verify_requant<F, T, PCS>(
         &self,
-        verifier: &mut Verifier<E, T, PCS>,
-        last_claim: &Claim<E>,
-        proof: &RequantProof<E, PCS>,
+        verifier: &mut Verifier<F, T, PCS>,
+        last_claim: &Claim<F>,
+        proof: &RequantProof<F, PCS>,
         shape_step: &ShapeStep,
-    ) -> anyhow::Result<Vec<Claim<E>>>
+        node_id: NodeId,
+    ) -> anyhow::Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E>,
+        F: PrimeField,
+        T: Transcript,
+        PCS: CommitmentScheme,
     {
         let RequantProof {
             io_accumulation,
             io_eval: evaluations,
             logup_proof: lookup,
-            commitment: commit,
+            commitments,
         } = proof;
 
         let lookup_op = &self.requant.activation_lookup_data;
 
-        let generic_lookup_proof = GenericLookupProof::<E, PCS> {
+        let generic_lookup_proof = GenericLookupProof::<F, PCS> {
             logup_proof: lookup.clone(),
             sumcheck_proof: io_accumulation.clone(),
             evaluations: evaluations.clone(),
-            commitment: commit.clone(),
+            commitments: commitments.clone(),
             weight_evaluation: None,
             shift_evaluations: None,
         };
@@ -49,7 +50,7 @@ impl RequantCtx {
             &lookup_op.table,
             &generic_lookup_proof,
             verifier,
-            self.node_id,
+            node_id,
         )?;
         Ok(input_claims)
     }

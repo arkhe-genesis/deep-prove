@@ -8,16 +8,16 @@
 
 use std::{borrow::Borrow, env, ops::Deref, str::FromStr};
 
+use anyhow::anyhow;
+use ark_ff::PrimeField;
 use ark_std::rand::{self, SeedableRng, rngs::StdRng};
-use ff_ext::{ExtensionField, FieldFrom};
+use dp_crypto::arkyper::transcript::{Transcript, blake3::Blake3Transcript};
 use itertools::Itertools;
-use multilinear_extensions::mle::PointAndEval;
 use quantization::ToField;
+use rayon::iter::ParallelIterator;
 use serde::{Deserialize, Serialize};
-use transcript::{BasicTranscript, Transcript};
 
 mod backend;
-mod commit;
 mod fft;
 pub mod graph;
 pub mod inputs;
@@ -29,10 +29,12 @@ pub mod model;
 pub mod number;
 pub mod padding;
 pub mod parser;
+pub mod poly_commit;
 pub mod quantization;
 pub mod shape;
 pub mod tensor;
 pub use crate::number::Number;
+use crate::quantization::ToElement;
 
 // Re-exports
 pub use iop::{
@@ -48,6 +50,44 @@ pub use tensor::Tensor;
 #[cfg(feature = "capture-layers-quant")]
 pub mod capture;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct SerializableField<F: PrimeField>(#[serde(with = "dp_crypto::serialization")] F);
+
+impl<F: PrimeField> Deref for SerializableField<F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<F: PrimeField> ToField<F> for SerializableField<F> {
+    fn to_field(&self) -> F {
+        self.0
+    }
+}
+
+impl<F: PrimeField> ToField<SerializableField<F>> for Element {
+    fn to_field(&self) -> SerializableField<F> {
+        SerializableField(self.to_field())
+    }
+}
+
+impl<F: PrimeField> ToElement for SerializableField<F> {
+    fn to_element(&self) -> Element {
+        self.0.to_element()
+    }
+}
+
+impl<F: PrimeField> From<F> for SerializableField<F> {
+    fn from(value: F) -> Self {
+        Self(value)
+    }
+}
 #[cfg(test)]
 mod testing;
 pub(crate) mod util;
@@ -62,27 +102,9 @@ pub fn version() -> String {
 /// 16 + log(c) = 64 => c = 2^48 columns in a dense layer
 pub type Element = i64;
 
-impl<E: ExtensionField> From<PointAndEval<E>> for Claim<E> {
-    fn from(value: PointAndEval<E>) -> Self {
-        Claim {
-            point: value.point.clone(),
-            eval: value.eval,
-        }
-    }
-}
-
-impl<E: ExtensionField> From<&PointAndEval<E>> for Claim<E> {
-    fn from(value: &PointAndEval<E>) -> Self {
-        Claim {
-            point: value.point.clone(),
-            eval: value.eval,
-        }
-    }
-}
-
 /// Returns the default transcript the prover and verifier must instantiate to validate a proof.
-pub fn default_transcript<E: ExtensionField>() -> BasicTranscript<E> {
-    BasicTranscript::new(b"m2vec")
+pub fn default_transcript() -> Blake3Transcript {
+    Blake3Transcript::new(b"m2vec")
 }
 
 /// Returns the bit sequence of num of bit_length length.
@@ -97,16 +119,21 @@ pub(crate) fn to_bit_sequence_le(
     (0..bit_length).map(move |i| (num >> i) & 1)
 }
 
+/// Returns a 2^n-th root of unity for PrimeField `F`
+pub fn get_root_of_unity<F: PrimeField>(n: usize) -> anyhow::Result<F> {
+    F::get_root_of_unity(1 << n as u64).ok_or(anyhow!("Cannot compute 2^{n}-th root of unity"))
+}
+
 /// Method to efficiency evaluate the MLE of the zeroifier matrix over a random
 /// point. The point is provided already split between coordinates referring to the
 /// columns and coordinates referring to the rows of the matrix.
 /// Currently, it works only for a square zeroifier matrix
-pub fn eval_zeroifier_mle<F: ExtensionField>(column_point: &[F], row_point: &[F]) -> F {
+pub fn eval_zeroifier_mle<F: PrimeField>(column_point: &[F], row_point: &[F]) -> F {
     column_point
         .iter()
         .zip(row_point)
         .fold(F::ONE, |acc, (&c, &r)| {
-            acc * (F::ONE - c - r + F::from_canonical_u64(2) * c * r) + (F::ONE - c) * r
+            acc * (F::ONE - c - r + F::from(2) * c * r) + (F::ONE - c) * r
         })
 }
 
@@ -114,7 +141,7 @@ pub fn eval_zeroifier_mle<F: ExtensionField>(column_point: &[F], row_point: &[F]
 /// point. The point is provided already split between coordinates referring to the
 /// columns and coordinates referring to the rows of the matrix.
 /// Currently, it works only for a square infinitizer matrix
-pub fn eval_infinitizer_mle<F: ExtensionField + FieldFrom<u64>>(
+pub fn eval_infinitizer_mle<F: PrimeField>(
     column_point: &[F],
     row_point: &[F],
     minus_infinity: Element,
@@ -122,24 +149,47 @@ pub fn eval_infinitizer_mle<F: ExtensionField + FieldFrom<u64>>(
     <Element as ToField<F>>::to_field(&minus_infinity)
         * (F::ONE - eval_zeroifier_mle(column_point, row_point))
 }
-
-pub trait VectorTranscript<E: ExtensionField> {
-    fn read_challenges(&mut self, n: usize) -> Vec<E>;
+#[allow(dead_code)]
+pub(crate) fn try_unzip<I, C, T, E>(iter: I) -> Result<C, E>
+where
+    I: IntoIterator<Item = Result<T, E>>,
+    C: Extend<T> + Default,
+{
+    iter.into_iter().try_fold(C::default(), |mut c, r| {
+        c.extend([r?]);
+        Ok(c)
+    })
+}
+#[allow(dead_code)]
+pub(crate) fn try_unzip_parallel<I, C, T, E>(iter: I) -> Result<C, E>
+where
+    I: ParallelIterator<Item = Result<T, E>>,
+    C: Extend<T> + Default + Send,
+    E: Send,
+    T: Send,
+{
+    // ToDo: remove need to collect into vector first
+    let v = iter.collect::<Vec<_>>();
+    try_unzip(v)
 }
 
-impl<T: Transcript<E>, E: ExtensionField> VectorTranscript<E> for T {
-    fn read_challenges(&mut self, n: usize) -> Vec<E> {
-        (0..n).map(|_| self.read_challenge().elements).collect_vec()
+pub trait VectorTranscript<F: PrimeField> {
+    fn read_challenges(&mut self, n: usize) -> Vec<F>;
+}
+
+impl<T: Transcript, F: PrimeField> VectorTranscript<F> for T {
+    fn read_challenges(&mut self, n: usize) -> Vec<F> {
+        (0..n).map(|_| self.challenge_scalar()).collect_vec()
     }
 }
 
-pub trait InitTranscript {
+pub trait InitTranscript: Clone {
     type InitData: Default + From<&'static [u8]>;
 
     fn new(init_data: Self::InitData) -> Self;
 }
 
-impl<E: ExtensionField> InitTranscript for BasicTranscript<E> {
+impl InitTranscript for Blake3Transcript {
     type InitData = &'static [u8];
 
     fn new(init_data: Self::InitData) -> Self {
@@ -147,17 +197,23 @@ impl<E: ExtensionField> InitTranscript for BasicTranscript<E> {
     }
 }
 
-/// Converts an iterator of elements to the base field.
-pub(crate) fn to_base<E, I>(iter: I) -> Vec<E::BaseField>
-where
-    I: IntoIterator,
-    I::Item: Borrow<Element>,
-    Element: ToField<E>,
-    E: ExtensionField,
-{
-    iter.into_iter()
-        .map(|v| v.borrow().to_field().as_bases()[0])
-        .collect()
+pub fn argmax<T: PartialOrd>(v: &[T]) -> Option<usize> {
+    if v.is_empty() {
+        return None;
+    }
+
+    let mut max_index = 0;
+    let mut max_value = &v[0];
+
+    for (i, value) in v.iter().enumerate().skip(1) {
+        // Only update if strictly greater, ensuring we take the first maximum in ties
+        if value > max_value {
+            max_index = i;
+            max_value = value;
+        }
+    }
+
+    Some(max_index)
 }
 
 /// Converts an iterator of elements to the extension field.
@@ -166,7 +222,6 @@ where
     I: IntoIterator,
     I::Item: Borrow<T>,
     T: ToField<E>,
-    E: ExtensionField,
 {
     iter.into_iter().map(|v| v.borrow().to_field()).collect()
 }
@@ -235,26 +290,23 @@ pub fn seed_from_env_or_rng() -> u64 {
 #[cfg(test)]
 mod test {
     use ark_std::rand::Rng;
-    use ceno_p3::field::FieldAlgebra;
-    use ff_ext::{FromUniformBytes, GoldilocksExt2};
+    use dp_crypto::{IntoMLE, arkyper::transcript::blake3::Blake3Transcript};
     use itertools::Itertools;
-    use multilinear_extensions::mle::IntoMLE;
     use tenstore::GenStore;
-    use transcript::BasicTranscript;
 
     use crate::{
         iop::{prover::Prover, verifier::verify},
         parser::onnx::FloatOnnxLoader,
         rng_from_env_or_random,
         tensor::Tensor,
-        testing::Pcs,
+        testing::{Pcs, random_field_vector},
         to_bit_sequence_le,
     };
 
-    type E = GoldilocksExt2;
-    type T = BasicTranscript<E>;
+    type F = ark_bn254::Fr;
+    type T = Blake3Transcript;
 
-    type P<'a, 'b> = Prover<'a, 'b, E, T, Pcs<E>>;
+    type P<'a, 'b> = Prover<'a, 'b, F, T, Pcs>;
 
     #[test]
     fn test_model_run() -> anyhow::Result<()> {
@@ -275,7 +327,7 @@ mod test {
 
         println!("[+] Loaded onnx file");
         let (prover_ctx, verifier_ctx) = model
-            .generate_contexts::<GoldilocksExt2, Pcs<GoldilocksExt2>>()
+            .generate_contexts::<F, Pcs>()
             .expect("Unable to generate contexts");
         println!("[+] Setup parameters");
 
@@ -292,9 +344,8 @@ mod test {
         let output = trace.outputs().first().unwrap();
         println!("[+] Run inference. Result: {output:?}");
 
-        let io = trace.to_verifier_io()?;
         println!("[+] Run prover");
-        let proof = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
+        let (proof, io) = P::prove(&prover_ctx, trace, &model).expect("unable to generate proof");
 
         verify::<_, T, _>(&verifier_ctx, proof, io).expect("invalid proof");
         println!("[+] Verify proof: valid");
@@ -306,15 +357,13 @@ mod test {
     #[test]
     fn test_vector_mle() {
         let n = 10_usize.next_power_of_two();
-        let v = (0..n)
-            .map(|_| <E as FromUniformBytes>::random(&mut rng_from_env_or_random()))
-            .collect_vec();
+        let v = random_field_vector::<F>(n);
         let mle = v.clone().into_mle();
         let random_index = rng_from_env_or_random().gen_range(0..v.len());
         let eval = to_bit_sequence_le(random_index, v.len().next_power_of_two().ilog2() as usize)
-            .map(|b| E::from_canonical_u64(b as u64))
+            .map(|b| F::from(b as u64))
             .collect_vec();
-        let output = mle.evaluate(&eval);
+        let output = mle.evaluate(&eval).unwrap();
 
         assert_eq!(output, v[random_index]);
     }

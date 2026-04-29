@@ -5,10 +5,9 @@ use super::{
 use crate::{
     Claim, Element, NextPowerOfTwo, Prover, ProverContext, Shape, Tensor,
     backend::Maxpool2dConfig,
-    commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
     iop::{ChallengeStorage, context::ShapeStep, verifier::Verifier},
-    layers::{ContextAux, LayerProof, convolution::check_cnn_input},
+    layers::{ContextAux, LayerProof, convolution::check_cnn_input, provable::Splittable},
     lookup::{
         context::LookupWitnessGen,
         logup_gkr::{
@@ -21,31 +20,32 @@ use crate::{
     model::Step,
     number::Number,
     padding::{PaddingMode, ShapeInfo, pooling},
+    poly_commit::{
+        identity_eval,
+        verifier::{VerifierClaim, VerifierCommitment},
+    },
     quantization::{ToElement, ToField},
     tensor::WrappedTensor,
-    to_base,
 };
 use anyhow::{Context, Result, ensure};
 
-use either::Either;
-use ff_ext::ExtensionField;
-use itertools::{Itertools, izip};
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{
-    Expression,
-    mle::MultilinearExtension,
-    util::{ceil_log2, transpose},
+use ark_ff::PrimeField;
+use dp_crypto::{
+    Expression, IntoMLE,
+    arkyper::{
+        CommitmentScheme,
+        transcript::{AppendToTranscript, Transcript},
+    },
+    poly::{dense::DensePolynomial, eq::evals},
+    structs::{IOPProof, IOPProverState, IOPVerifierState},
+    util::{ceil_log2, optimal_sumcheck_threads},
     virtual_polys::VirtualPolynomialsBuilder,
 };
+use either::Either;
+use itertools::{Itertools, izip};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
-use sumcheck::{
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    util::optimal_sumcheck_threads,
-};
-use transcript::Transcript;
-use witness::RowMajorMatrix;
 
 /// Short name used to identify the pooling layer.
 pub const POOLING_LAYER: &str = "POOL";
@@ -60,7 +60,6 @@ pub enum Pooling {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PoolingCtx {
     pub poolinfo: Maxpool2D,
-    pub node_id: NodeId,
 }
 
 impl PoolingCtx {
@@ -71,27 +70,34 @@ impl PoolingCtx {
 
 /// Contains proof material related to one step of the inference
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct PoolingProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct PoolingProof<F: PrimeField, PCS: CommitmentScheme> {
     /// the actual sumcheck proof proving that the product of correct terms is always zero
-    pub(crate) sumcheck: IOPProof<E>,
+    pub(crate) sumcheck: IOPProof<F>,
     /// The lookup proof showing that the diff is always in the correct range
-    pub(crate) lookup: LogUpBatchProof<E>,
+    pub(crate) lookup: LogUpBatchProof<F>,
     /// The output evaluations of the diff polys produced by the zerocheck
-    pub(crate) zerocheck_evals: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) zerocheck_evals: Vec<F>,
     /// This tells the verifier how far apart the variables get fixed on the input MLE
     pub(crate) variable_gap: usize,
     /// Commitments that are part of the commitment opening proof for this layer
-    pub(crate) commitment: PCS::Commitment,
+    pub(crate) commitments: Vec<VerifierCommitment<PCS>>,
 }
 
-impl<E, PCS> PoolingProof<E, PCS>
+impl<F, PCS> PoolingProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
-        PCS::write_commitment(&self.commitment, transcript).map_err(|e| anyhow::anyhow!("{e:?}"))
+    pub(crate) fn write_commitment<T: Transcript>(&self, transcript: &mut T) -> Result<()> {
+        self.commitments
+            .iter()
+            .for_each(|comm| comm.append_to_transcript(transcript));
+        Ok(())
     }
 }
 
@@ -195,11 +201,7 @@ impl Evaluate<f32> for Pooling {
 }
 
 impl ProveInfo for Pooling {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         let info = match self {
             Pooling::Maxpool2D(info) => {
                 aux.last_output_shape =
@@ -214,10 +216,7 @@ impl ProveInfo for Pooling {
                         acc.max(shapes.next_power_of_two().product())
                     });
 
-                LayerCtx::Pooling(PoolingCtx {
-                    poolinfo: *info,
-                    node_id: id,
-                })
+                LayerCtx::Pooling(PoolingCtx { poolinfo: *info })
             }
         };
         Ok((info, aux))
@@ -233,23 +232,21 @@ impl PadOp for Pooling {
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for Pooling
+impl<F, PCS> ProvableOp<F, PCS> for Pooling
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = PoolingCtx;
 
-    fn prove<T: Transcript<E>>(
+    fn prove<T: Transcript>(
         &self,
         id: NodeId,
         ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         let input_tensors = step_data.padded_input_tensors()?;
 
         Ok(vec![self.prove_pooling(
@@ -264,9 +261,9 @@ where
     fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &ProverContext<E, PCS>,
+        _ctx: &ProverContext<F, PCS>,
         step_data: &Step<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'static, F>> {
         let input_tensors = step_data.padded_input_tensors()?;
         let output_tensors = step_data.padded_output_tensors()?;
 
@@ -283,12 +280,12 @@ where
 
         let mut element_count = HashMap::<Element, u64>::new();
 
-        let mut column_evals = match self {
+        let column_evals = match self {
             Pooling::Maxpool2D(maxpool2d) => {
-                let field_vecs = maxpool2d.compute_polys::<E>(&input_tensors[0]).unwrap();
+                let field_vecs = maxpool2d.compute_polys::<F>(&input_tensors[0]).unwrap();
 
                 for value in field_vecs.iter().flat_map(|v| v.iter()) {
-                    let el = E::from(*value).to_element();
+                    let el = value.to_element();
                     *element_count.entry(el).or_default() += 1;
                 }
 
@@ -296,21 +293,18 @@ where
             }
         };
         // Commit to the witness polys
-        let output_poly = to_base::<E, _>(output_tensors[0].data());
-        column_evals.push(output_poly);
-        let width = column_evals.len();
-        let values = transpose(column_evals);
-        let rmm = RowMajorMatrix::<E::BaseField>::new_by_inner_matrix(
-            ceno_p3::matrix::dense::DenseMatrix::new(values.concat(), width),
-            witness::InstancePaddingStrategy::Default,
-        );
+        let output_poly = output_tensors[0].data();
 
-        let layer_commitment = ctx.commitment_ctx.batch_commit(vec![rmm])?;
+        let mles = column_evals
+            .into_iter()
+            .chain([output_poly.to_field()])
+            .map(|data| data.into_mle())
+            .collect();
 
-        let mut gen_w = LookupWitnessGen::<E, PCS>::default();
+        let mut gen_w = LookupWitnessGen::<F>::default();
         gen_w.insert_layer_witness_data(
             id,
-            layer_commitment,
+            mles,
             vec![Table::new_shift_check()],
             vec![element_count],
         );
@@ -347,29 +341,33 @@ impl OpInfo for PoolingCtx {
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for PoolingCtx
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-{
-    type Proof = PoolingProof<E, PCS>;
+impl Splittable for PoolingCtx {}
 
-    fn verify<T: Transcript<E>>(
+impl<F, PCS> VerifiableCtx<F, PCS> for PoolingCtx
+where
+    F: PrimeField,
+    PCS: CommitmentScheme,
+{
+    type Proof = PoolingProof<F, PCS>;
+
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
         Ok(vec![self.verify_pooling(
             verifier,
             last_claims[0],
             proof,
             shape_step,
+            node_id,
         )?])
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,
@@ -408,21 +406,19 @@ impl Pooling {
     }
 
     #[timed::timed_instrument(name = "Prover::prove_pooling_step")]
-    pub fn prove_pooling<E, T: Transcript<E>, PCS>(
+    pub fn prove_pooling<F, T: Transcript, PCS>(
         &self,
-        prover: &mut Prover<E, T, PCS>,
+        prover: &mut Prover<F, T, PCS>,
         // last random claim made
-        last_claim: &Claim<E>,
+        last_claim: &Claim<F>,
         // input to the dense layer
         input: &Tensor<Element>,
         info: &PoolingCtx,
         id: NodeId,
-    ) -> anyhow::Result<Claim<E>>
+    ) -> anyhow::Result<Claim<F>>
     where
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        F: PrimeField,
+        PCS: CommitmentScheme<Field = F>,
     {
         ensure!(
             input.shape().rank() == 3,
@@ -435,10 +431,12 @@ impl Pooling {
         // Should only be one prover_info for this step
         let layer_commitment = prover.lookup_witness(id)?;
 
-        let layer_polys = PCS::get_arc_mle_witness_from_commitment(layer_commitment);
-        let commitment = PCS::get_pure_commitment(layer_commitment);
+        let (layer_polys, commitments): (Vec<_>, Vec<_>) = layer_commitment
+            .iter()
+            .map(|comm| (comm.polynomial.clone(), VerifierCommitment::from(comm)))
+            .unzip();
 
-        let logup_inputs = self.create_logup_inputs::<E>(
+        let logup_inputs = self.create_logup_inputs::<F>(
             &layer_polys[..layer_polys.len() - 1],
             &prover.challenge_storage,
         )?;
@@ -451,23 +449,19 @@ impl Pooling {
             .map(|p| Either::Left(p.as_ref()))
             .collect::<Vec<Either<_, _>>>();
         let mut expr_builder =
-            VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
+            VirtualPolynomialsBuilder::<F>::new_with_mles(num_threads, num_vars, either_mles);
 
         // We reuse the logup point here for the zerocheck challenge
         let lookup_point = &logup_proof.output_claims()[0].point;
 
         // Compute the identity poly
-        let batch_challenge = prover
-            .transcript
-            .sample_and_append_challenge(b"batch_pooling")
-            .elements;
+        let batch_challenge = prover.transcript.append_and_sample(b"batch_pooling");
 
-        let beta_eval = compute_betas_eval(lookup_point);
-        let beta_poly = MultilinearExtension::from_evaluations_ext_vec(num_vars, beta_eval);
+        let beta_eval = evals(lookup_point);
+        let beta_poly = DensePolynomial::new(beta_eval);
 
-        let last_claim_beta_eval = compute_betas_eval(&last_claim.point);
-        let last_claim_beta =
-            MultilinearExtension::from_evaluations_ext_vec(num_vars, last_claim_beta_eval.clone());
+        let last_claim_beta_eval = evals(&last_claim.point);
+        let last_claim_beta = DensePolynomial::new(last_claim_beta_eval.clone());
 
         let beta_expr = expr_builder.lift(Either::Left(&beta_poly));
         let last_claim_expr = expr_builder.lift(Either::Left(&last_claim_beta));
@@ -476,15 +470,15 @@ impl Pooling {
             * Expression::WitIn(2)
             * Expression::WitIn(3)
             * beta_expr.clone();
-        let sum_expr = (0u16..4).fold(Expression::Constant(Either::Right(E::ZERO)), |acc, j| {
-            acc + Expression::Challenge(0, (j + 1) as usize, E::ONE, E::ZERO) * Expression::WitIn(j)
+        let sum_expr = (0u16..4).fold(Expression::Constant(F::ZERO), |acc, j| {
+            acc + Expression::Challenge(0, (j + 1) as usize, F::ONE, F::ZERO) * Expression::WitIn(j)
         });
         let diffs_expr = prod_expr + (beta_expr * sum_expr);
         let out_expr =
-            Expression::Challenge(0, 5, E::ONE, E::ZERO) * last_claim_expr * Expression::WitIn(4);
+            Expression::Challenge(0, 5, F::ONE, F::ZERO) * last_claim_expr * Expression::WitIn(4);
         let virtual_poly =
             expr_builder.to_virtual_polys(&[diffs_expr, out_expr], &[batch_challenge]);
-        let (proof, sumcheck_state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let (proof, sumcheck_state) = IOPProverState::<F>::prove(virtual_poly, prover.transcript);
 
         // Extract all claims about committed witness polys
         //
@@ -495,13 +489,14 @@ impl Pooling {
         let kernel_size = info.poolinfo.kernel_size * info.poolinfo.kernel_size;
 
         let output_eval = sumcheck_evals[kernel_size];
-        let commit_evals = (
-            zerocheck_point.to_vec(),
-            sumcheck_evals[..kernel_size + 1].to_vec(),
+
+        prover.add_witness_claim_per_poly(
+            id,
+            sumcheck_evals[..kernel_size + 1]
+                .iter()
+                .map(|eval| Claim::new(zerocheck_point.to_vec(), *eval))
+                .collect(),
         );
-        prover
-            .commit_prover
-            .add_witness_claim(id, vec![commit_evals]);
 
         // Now we must do the samething accumulating evals for the input poly as we fix variables on the input poly.
         // The point length is 2 longer because for now we only support MaxPool2D.
@@ -509,13 +504,10 @@ impl Pooling {
         let padded_input_shape = input.shape().next_power_of_two();
         let padded_input_row_length_log = ceil_log2(padded_input_shape[2]);
         // We can batch all of the claims for the input poly with 00, 10, 01, 11 fixed into one with random challenges
-        let [r1, r2] = [prover
-            .transcript
-            .sample_and_append_challenge(b"input_batching")
-            .elements; 2];
+        let [r1, r2] = [prover.transcript.append_and_sample(b"input_batching"); 2];
 
-        let one_minus_r1 = E::ONE - r1;
-        let one_minus_r2 = E::ONE - r2;
+        let one_minus_r1 = F::ONE - r1;
+        let one_minus_r2 = F::ONE - r2;
         // To the input claims we add evaluations at both the zerocheck point and lookup point
         // in the order 00, 01, 10, 11. These will be used in conjunction with r1 and r2 by the verifier to link the claims output by the sumcheck and lookup GKR
         // proofs with the claims fed to the same poly verifier.
@@ -534,7 +526,7 @@ impl Pooling {
                 .iter()
                 .take(kernel_size),
         )
-        .fold(E::ZERO, |zc_acc, (m, zc)| zc_acc + *m * (output_eval - *zc));
+        .fold(F::ZERO, |zc_acc, (m, zc)| zc_acc + *m * (output_eval - *zc));
 
         let point_1 = [
             &[r1],
@@ -560,17 +552,17 @@ impl Pooling {
                 lookup: logup_proof,
                 zerocheck_evals,
                 variable_gap: padded_input_row_length_log - 1,
-                commitment,
+                commitments,
             }),
         );
         Ok(next_claim)
     }
 
-    fn create_logup_inputs<E: ExtensionField>(
+    fn create_logup_inputs<F: PrimeField>(
         &self,
-        polys: &[Arc<MultilinearExtension<E>>],
-        challenge_storage: &ChallengeStorage<E>,
-    ) -> anyhow::Result<LogUpInput<E>> {
+        polys: &[Arc<DensePolynomial<F>>],
+        challenge_storage: &ChallengeStorage<F>,
+    ) -> anyhow::Result<LogUpInput<F>> {
         let table = Table::new_shift_check();
         let (constant_challenge, column_sep_challenge) = challenge_storage
             .get_challenges_by_name(&table.name())
@@ -578,10 +570,7 @@ impl Pooling {
                 "No challenges found for lookup table {} during MaxPool2D proving",
                 table.name()
             ))?;
-        let column_evals = polys
-            .iter()
-            .map(|p| p.get_base_field_vec().to_vec())
-            .collect::<Vec<Vec<E::BaseField>>>();
+        let column_evals = polys.iter().map(|p| p.evals()).collect::<Vec<Vec<F>>>();
 
         LogUpInput::new_lookup(
             column_evals,
@@ -597,15 +586,16 @@ impl PoolingCtx {
     pub fn output_shape(&self, input_shape: &Shape) -> Shape {
         maxpool2d_shape(input_shape)
     }
-    pub(crate) fn verify_pooling<E, T: Transcript<E>, PCS: PolynomialCommitmentScheme<E>>(
+    pub(crate) fn verify_pooling<F, T: Transcript, PCS: CommitmentScheme>(
         &self,
-        verifier: &mut Verifier<E, T, PCS>,
-        last_claim: &Claim<E>,
-        proof: &PoolingProof<E, PCS>,
+        verifier: &mut Verifier<F, T, PCS>,
+        last_claim: &Claim<F>,
+        proof: &PoolingProof<F, PCS>,
         shape_step: &ShapeStep,
-    ) -> anyhow::Result<Claim<E>>
+        node_id: NodeId,
+    ) -> anyhow::Result<Claim<F>>
     where
-        E: ExtensionField,
+        F: PrimeField,
     {
         // 1. Verify the lookup proof
         let full_vars = ceil_log2(shape_step.padded_output_shape[0].numel());
@@ -617,7 +607,7 @@ impl PoolingCtx {
                 "No challenges found for lookup table {} during MaxPool2D verifying",
                 table.name()
             ))?;
-        let logup_instance = LogUpVerifierInstance::<E>::new(
+        let logup_instance = LogUpVerifierInstance::<F>::new(
             constant_challenge,
             column_sep_challenge,
             table.num_columns(),
@@ -632,11 +622,11 @@ impl PoolingCtx {
         let (shift_num, shift_denom) = verifier
             .numerators_and_denominators
             .entry(table.name())
-            .or_insert((E::ZERO, E::ONE));
+            .or_insert((F::ZERO, F::ONE));
 
         for (num, denom) in numerators.into_iter().zip(denominators) {
             ensure!(
-                denom != E::ZERO,
+                denom != F::ZERO,
                 "Denominator in pooling lookup proof fractional output cannot be zero"
             );
             *shift_num = num * *shift_denom + *shift_num * denom;
@@ -655,18 +645,15 @@ impl PoolingCtx {
             self.output_shapes(&shape_step.padded_input_shape, PaddingMode::Padding)?;
         let num_vars = Pooling::num_vars_for_outputs(&output_shapes)?;
         let poly_aux = crate::util::from_mle_list_dimensions(&[vec![num_vars; 5]]);
-        let batching_challenge = verifier
-            .transcript
-            .sample_and_append_challenge(b"batch_pooling")
-            .elements;
+        let batching_challenge: F = verifier.transcript.append_and_sample(b"batch_pooling");
         let (initial_value_no_last_claim, final_batching_challenge) = poly_evals
             .iter()
-            .fold((E::ZERO, batching_challenge), |(acc, comb), &e| {
+            .fold((F::ZERO, batching_challenge), |(acc, comb), &e| {
                 (acc + e * comb, comb * batching_challenge)
             });
         let initial_value =
             initial_value_no_last_claim + final_batching_challenge * last_claim.eval;
-        let subclaim = IOPVerifierState::<E>::verify(
+        let subclaim = IOPVerifierState::<F>::verify(
             initial_value,
             &proof.sumcheck,
             &poly_aux,
@@ -674,16 +661,16 @@ impl PoolingCtx {
         );
 
         // Verify the sumcheck output claim and add commitment claims to the commit verifier
-        let zerocheck_point = subclaim.point.iter().map(|p| p.elements).collect_vec();
-        let beta_eval = identity_eval(batch_claim.point(), &zerocheck_point);
+        let zerocheck_point = &subclaim.point;
+        let beta_eval = identity_eval(batch_claim.point(), zerocheck_point);
 
-        let last_claim_beta_eval = identity_eval(&last_claim.point, &zerocheck_point);
+        let last_claim_beta_eval = identity_eval(&last_claim.point, zerocheck_point);
 
         let kernel_size = proof.zerocheck_evals.len() - 1;
 
         let (prod_claim, sum_claim, batch_chal) =
             proof.zerocheck_evals.iter().take(kernel_size).fold(
-                (beta_eval, E::ZERO, batching_challenge),
+                (beta_eval, F::ZERO, batching_challenge),
                 |(prod_acc, sum_acc, challenge_comb), &eval| {
                     (
                         prod_acc * eval,
@@ -695,7 +682,7 @@ impl PoolingCtx {
 
         let output_eval = proof.zerocheck_evals[kernel_size];
 
-        let expected_eval =
+        let expected_eval: F =
             prod_claim + sum_claim * beta_eval + output_eval * last_claim_beta_eval * batch_chal;
 
         ensure!(
@@ -705,20 +692,24 @@ impl PoolingCtx {
             subclaim.expected_evaluation
         );
 
-        let commit_claim = (zerocheck_point.clone(), proof.zerocheck_evals.clone());
+        let claims = proof
+            .zerocheck_evals
+            .iter()
+            .map(|eval| Claim::new(zerocheck_point.clone(), *eval));
         verifier.commit_verifier.add_witness_claim(
-            self.node_id,
-            proof.commitment.clone(),
-            vec![commit_claim],
+            node_id,
+            proof
+                .commitments
+                .iter()
+                .zip(claims)
+                .map(|(comm, claim)| VerifierClaim::from((comm.clone(), claim)))
+                .collect(),
         );
 
         // Challenegs used to batch input poly claims together and link them with zerocheck and lookup verification output
-        let [r1, r2] = [verifier
-            .transcript
-            .sample_and_append_challenge(b"input_batching")
-            .elements; 2];
-        let one_minus_r1 = E::ONE - r1;
-        let one_minus_r2 = E::ONE - r2;
+        let [r1, r2] = [verifier.transcript.append_and_sample(b"input_batching"); 2];
+        let one_minus_r1 = F::ONE - r1;
+        let one_minus_r2 = F::ONE - r2;
 
         let eval_multiplicands = [
             one_minus_r1 * one_minus_r2,
@@ -739,7 +730,7 @@ impl PoolingCtx {
             proof.zerocheck_evals.iter().take(kernel_size),
             eval_multiplicands.iter()
         )
-        .fold(E::ZERO, |zerocheck_acc, (&ze, &me)| {
+        .fold(F::ZERO, |zerocheck_acc, (&ze, &me)| {
             zerocheck_acc + (output_eval - ze) * me
         });
 
@@ -776,10 +767,7 @@ impl Maxpool2D {
     /// Computes MLE evaluations related to proving Maxpool function.
     /// The outputs of this function are the four polynomials corresponding to the input to the Maxpool, each with two variables fixed
     /// so that PROD (Output - poly_i) == 0 at every evaluation point.
-    pub fn compute_polys<E: ExtensionField>(
-        &self,
-        input: &Tensor<Element>,
-    ) -> Result<Vec<Vec<E::BaseField>>> {
+    pub fn compute_polys<F: PrimeField>(&self, input: &Tensor<Element>) -> Result<Vec<Vec<F>>> {
         let padded_input = input.pad_next_power_of_two();
 
         let padded_output = input
@@ -814,7 +802,7 @@ impl Maxpool2D {
             .collect::<Vec<Vec<Element>>>();
 
         #[allow(clippy::type_complexity)]
-        let (even_diff, odd_diff): (Vec<Vec<E::BaseField>>, Vec<Vec<E::BaseField>>) = new_even
+        let (even_diff, odd_diff): (Vec<Vec<F>>, Vec<Vec<F>>) = new_even
             .par_chunks(padded_input_shape[2] >> 1)
             .zip(new_odd.par_chunks(padded_input_shape[2] >> 1))
             .map(|(even_chunk, odd_chunk)| {
@@ -852,11 +840,11 @@ impl Maxpool2D {
                     padded_output.data()
                 )
                 .map(|(e, o, data)| {
-                    let e_field: E = (data - e).to_field();
-                    let o_field: E = (data - o).to_field();
-                    (e_field.as_bases()[0], o_field.as_bases()[0])
+                    let e_field: F = (data - e).to_field();
+                    let o_field: F = (data - o).to_field();
+                    (e_field, o_field)
                 })
-                .unzip::<_, _, Vec<E::BaseField>, Vec<E::BaseField>>()
+                .unzip::<_, _, Vec<F>, Vec<F>>()
             })
             .unzip();
 
@@ -885,21 +873,18 @@ pub fn safe_maxpool2d_shape(input_shape: &Shape) -> anyhow::Result<Shape> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{commit::compute_betas_eval, default_transcript, rng_from_env_or_random, to_base};
+    use crate::{default_transcript, rng_from_env_or_random, testing::random_field_vector};
 
     use super::*;
     use crate::util::from_mle_list_dimensions;
 
     use crate::tensor::TensorTypeParam;
+    use ark_ff::{AdditiveGroup, Field, UniformRand};
     use ark_std::rand::Rng;
-    use ceno_p3::field::FieldAlgebra;
-    use ff_ext::{FromUniformBytes, GoldilocksExt2};
     use itertools::Itertools;
-    use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
     use proptest::prelude::*;
-    use sumcheck::structs::{IOPProverState, IOPVerifierState};
 
-    type F = GoldilocksExt2;
+    type F = ark_bn254::Fr;
 
     #[test]
     fn test_max_pool_zerocheck() {
@@ -933,45 +918,38 @@ mod tests {
 
             let padded_input_shape = padded_input.shape();
 
-            let num_vars = padded_input.data().len().ilog2() as usize;
             let output_num_vars = padded_output.data().len().ilog2() as usize;
 
-            let mle = MultilinearExtension::<'_, F>::from_evaluations_vec(
-                num_vars,
-                to_base::<F, _>(padded_input.data()),
-            );
+            let mle = DensePolynomial::<'_, F>::new(padded_input.data().to_field());
 
             // This should give all possible combinations of fixing the lowest three bits in ascending order
 
             let fixed_mles = (0..padded_input_shape[3] << 1)
                 .map(|i| {
                     let point = (0..ceil_log2(padded_input_shape[3]) + 1)
-                        .map(|n| F::from_canonical_u64((i as u64 >> n) & 1))
+                        .map(|n| F::from((i as u64 >> n) & 1))
                         .collect::<Vec<F>>();
 
-                    mle.fix_variables(&point)
+                    mle.fix_low_variables(&point)
                 })
-                .collect::<Vec<MultilinearExtension<'_, F>>>();
+                .collect::<Vec<DensePolynomial<'_, F>>>();
             // f(0,x,0,..) = x * f(0,1,0,...) + (1 - x) * f(0,0,0,...)
             let even_mles = fixed_mles
                 .iter()
                 .cloned()
                 .step_by(2)
-                .collect::<Vec<MultilinearExtension<'_, F>>>();
+                .collect::<Vec<DensePolynomial<'_, F>>>();
             let odd_mles = fixed_mles
                 .iter()
                 .skip(1)
                 .cloned()
                 .step_by(2)
-                .collect::<Vec<MultilinearExtension<'_, F>>>();
+                .collect::<Vec<DensePolynomial<'_, F>>>();
 
             let even_merged = even_mles
                 .chunks(padded_input_shape[3] >> 1)
                 .map(|mle_chunk| {
-                    let mut mles_vec = mle_chunk
-                        .iter()
-                        .map(|m| m.get_ext_field_vec().to_vec())
-                        .collect::<Vec<Vec<F>>>();
+                    let mut mles_vec = mle_chunk.iter().map(|m| m.evals()).collect::<Vec<Vec<F>>>();
                     while mles_vec.len() > 1 {
                         let half = mles_vec.len() / 2;
 
@@ -984,20 +962,14 @@ mod tests {
                             .collect::<Vec<Vec<F>>>();
                     }
 
-                    MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
-                        output_num_vars,
-                        mles_vec[0].clone(),
-                    )
+                    DensePolynomial::<'_, F>::new(mles_vec[0].clone())
                 })
-                .collect::<Vec<MultilinearExtension<'_, F>>>();
+                .collect::<Vec<DensePolynomial<'_, F>>>();
 
             let odd_merged = odd_mles
                 .chunks(padded_input_shape[3] >> 1)
                 .map(|mle_chunk| {
-                    let mut mles_vec = mle_chunk
-                        .iter()
-                        .map(|m| m.get_ext_field_vec().to_vec())
-                        .collect::<Vec<Vec<F>>>();
+                    let mut mles_vec = mle_chunk.iter().map(|m| m.evals()).collect::<Vec<Vec<F>>>();
                     while mles_vec.len() > 1 {
                         let half = mles_vec.len() / 2;
 
@@ -1010,19 +982,13 @@ mod tests {
                             .collect::<Vec<Vec<F>>>();
                     }
 
-                    MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
-                        output_num_vars,
-                        mles_vec[0].clone(),
-                    )
+                    DensePolynomial::<'_, F>::new(mles_vec[0].clone())
                 })
-                .collect::<Vec<MultilinearExtension<'_, F>>>();
+                .collect::<Vec<DensePolynomial<'_, F>>>();
 
             let merged_input_mles = [even_merged, odd_merged].concat();
 
-            let output_mle = MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
-                output_num_vars,
-                padded_output.to_field().into_data(),
-            );
+            let output_mle = DensePolynomial::<'_, F>::new(padded_output.to_field().into_data());
 
             let num_threads = optimal_sumcheck_threads(output_num_vars);
             let mut expr_builder =
@@ -1030,17 +996,16 @@ mod tests {
             let diff_mles = merged_input_mles
                 .iter()
                 .map(|in_mle| {
-                    MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
-                        output_num_vars,
+                    DensePolynomial::<'_, F>::new(
                         in_mle
-                            .get_ext_field_vec()
+                            .evals_ref()
                             .iter()
-                            .zip(output_mle.get_ext_field_vec().iter())
+                            .zip(output_mle.evals_ref())
                             .map(|(input, output)| *output - *input)
                             .collect::<Vec<F>>(),
                     )
                 })
-                .collect::<Vec<MultilinearExtension<F>>>();
+                .collect::<Vec<DensePolynomial<F>>>();
 
             let diff_exprs = diff_mles
                 .iter()
@@ -1050,22 +1015,16 @@ mod tests {
             (0..1 << output_num_vars).for_each(|j| {
                 let values = diff_mles
                     .iter()
-                    .map(|mle| mle.get_ext_field_vec()[j])
+                    .map(|mle| mle.evals_ref()[j])
                     .collect::<Vec<F>>();
                 assert_eq!(values.into_iter().product::<F>(), F::ZERO)
             });
 
-            let random_point = (0..output_num_vars)
-                .map(|_| <F as FromUniformBytes>::random(&mut rng))
-                .collect::<Vec<F>>();
+            let random_point = random_field_vector(output_num_vars);
 
-            let beta_evals = compute_betas_eval(&random_point);
+            let beta_evals = evals(&random_point);
 
-            let beta_mle: MultilinearExtension<F> =
-                MultilinearExtension::<'_, F>::from_evaluations_ext_vec(
-                    output_num_vars,
-                    beta_evals,
-                );
+            let beta_mle: DensePolynomial<F> = DensePolynomial::<'_, F>::new(beta_evals);
 
             let beta_expr = expr_builder.lift(Either::Left(&beta_mle));
             let expr = diff_exprs.into_iter().fold(beta_expr, |acc, d| acc * d);
@@ -1073,21 +1032,17 @@ mod tests {
 
             let aux_info = from_mle_list_dimensions(&[vec![output_num_vars; 5]]);
 
-            let mut prover_transcript = default_transcript::<F>();
+            let mut prover_transcript = default_transcript();
 
             #[allow(deprecated)]
             let (proof, state) = IOPProverState::<F>::prove(virtual_poly, &mut prover_transcript);
 
-            let mut verifier_transcript = default_transcript::<F>();
+            let mut verifier_transcript = default_transcript();
 
             let subclaim =
                 IOPVerifierState::<F>::verify(F::ZERO, &proof, &aux_info, &mut verifier_transcript);
 
-            let point = subclaim
-                .point
-                .iter()
-                .map(|chal| chal.elements)
-                .collect::<Vec<F>>();
+            let point = &subclaim.point;
 
             let fixed_points = [
                 [F::ZERO, F::ZERO],
@@ -1105,13 +1060,13 @@ mod tests {
                 .concat()
             });
 
-            let output_eval = output_mle.evaluate(&point);
+            let output_eval = output_mle.evaluate(point).unwrap();
             let input_evals = fixed_points
                 .iter()
-                .map(|p| mle.evaluate(p))
+                .map(|p| mle.evaluate(p).unwrap())
                 .collect::<Vec<F>>();
 
-            let eq_eval = beta_mle.evaluate(&point);
+            let eq_eval = beta_mle.evaluate(point).unwrap();
 
             let calc_eval = input_evals
                 .iter()
@@ -1125,7 +1080,7 @@ mod tests {
             let final_mle_evals = state.get_mle_flatten_final_evaluations();
 
             // let (r1, r2) = (<F as Field>::random(&mut rng), <F as Field>::random(&mut rng));
-            let [r1, r2] = [<F as FromUniformBytes>::random(&mut rng); 2];
+            let [r1, r2] = [F::rand(&mut rng); 2];
             let one_minus_r1 = F::ONE - r1;
             let one_minus_r2 = F::ONE - r2;
 
@@ -1134,15 +1089,17 @@ mod tests {
                 + (output_eval - final_mle_evals[1]) * r1 * one_minus_r2
                 + (output_eval - final_mle_evals[3]) * r1 * r2;
 
-            let mle_eval = mle.evaluate(
-                &[
-                    &[r1],
-                    &point[..ceil_log2(padded_input_shape[3]) - 1],
-                    &[r2],
-                    &point[ceil_log2(padded_input_shape[3]) - 1..],
-                ]
-                .concat(),
-            );
+            let mle_eval = mle
+                .evaluate(
+                    &[
+                        &[r1],
+                        &point[..ceil_log2(padded_input_shape[3]) - 1],
+                        &[r2],
+                        &point[ceil_log2(padded_input_shape[3]) - 1..],
+                    ]
+                    .concat(),
+                )
+                .unwrap();
 
             assert_eq!(mle_eval, maybe_eval);
         }

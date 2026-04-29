@@ -133,7 +133,7 @@ impl Drop for MemoryFlameGraph {
 }
 
 #[cfg(feature = "mem-track")]
-mod track {
+pub mod track {
     use std::{
         alloc::System,
         env,
@@ -172,7 +172,7 @@ mod track {
     }
 
     /// Enables the flame graph and clean any data.
-    pub(crate) fn flame_graph_enable() {
+    pub fn flame_graph_enable() {
         let _graph = ALLOCATOR.inner().global_flame_graph();
         assert!(
             !ALLOCATOR.inner().is_enabled(),
@@ -189,7 +189,7 @@ mod track {
     /// # Panics
     ///
     /// If `flame_graph_enable` wasn't called.
-    pub(crate) fn flame_graph() {
+    pub fn flame_graph() {
         if let Ok(file_prefix) = env::var("FLAMEGRAPH") {
             assert!(
                 ALLOCATOR.inner().is_enabled(),
@@ -246,7 +246,7 @@ mod track {
 }
 
 #[cfg(not(feature = "mem-track"))]
-mod track {
+pub mod track {
     use crate::AllocatorMetrics;
 
     /// Collects memory metrics from the allocator.
@@ -256,11 +256,11 @@ mod track {
         None
     }
 
-    pub(crate) fn flame_graph_enable() {
+    pub fn flame_graph_enable() {
         // empty
     }
 
-    pub(crate) fn flame_graph() {
+    pub fn flame_graph() {
         // empty
     }
 }

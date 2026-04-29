@@ -1,6 +1,5 @@
 use crate::{
     Element, NextPowerOfTwo, Shape,
-    commit::mmcs_context::{CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext},
     graph::{Node, NodeId, NodeInput, NodeOutput, order_by_in_port},
     iop::chunking::{ChunkingStrategy, ModelChunk},
     layers::{
@@ -8,42 +7,46 @@ use crate::{
         provable::{OpInfo, ProveInfo},
     },
     lookup::{context::LookupContext, table::Table},
-    model::{Model, ModelCtx},
+    model::{Model, ModelCtx, trace::SplittedNodesInfo},
+    poly_commit::context::{CommitmentProverCtx, CommitmentVerifierCtx, GlobalCommitmentContext},
+    rng_from_env_or_random,
     tensor::CommitmentId,
-    to_base,
+    to_field,
 };
-use ff_ext::ExtensionField;
+use anyhow::ensure;
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    poly::dense::DensePolynomial,
+};
 use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::{mle::MultilinearExtension, util::ceil_log2};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, HashMap};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap},
+    iter::successors,
+};
 use tracing::{debug, info_span, trace};
-use transcript::Transcript;
 use utils::Metrics;
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct ProverContext<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct ProverContext<'a, F: PrimeField, PCS: CommitmentScheme> {
     /// Information about each steps of the model. That's the information that the verifier
     /// needs to know from the setup to avoid the prover being able to cheat.
     /// in REVERSED order already since proving goes from last layer to first layer.
-    pub model_ctx: ModelCtx<E>,
+    pub model_ctx: ModelCtx<F>,
     /// The commitment context used to generate both model commitments and witness commitments
-    pub commitment_ctx: CommitmentProverCtx<E, PCS>,
+    pub commitment_ctx: CommitmentProverCtx<'a, F, PCS>,
     /// Context holding all the different table types we use in lookups
     pub lookup: LookupContext,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> ProverContext<E, PCS>
-where
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-{
-    pub fn write_to_transcript<T: Transcript<E>>(&self, t: &mut T) -> anyhow::Result<()> {
-        self.commitment_ctx.write_to_transcript(t)?;
+impl<'a, F: PrimeField, PCS: CommitmentScheme<Field = F>> ProverContext<'a, F, PCS> {
+    pub fn write_to_transcript<T: Transcript>(&self, t: &mut T) -> anyhow::Result<()> {
+        self.commitment_ctx.write_to_transcript(t);
         Ok(())
     }
 
@@ -51,40 +54,52 @@ where
         &self,
         num_chunks: Option<usize>,
         strategy: S,
-    ) -> anyhow::Result<Vec<ModelChunk>> {
-        self.model_ctx.split_in_chunks(num_chunks, &strategy)
+    ) -> anyhow::Result<(Vec<ModelChunk>, SplittedNodesInfo)> {
+        self.model_ctx
+            .split_in_chunks(num_chunks, &strategy, self.next_node_iter())
+    }
+
+    pub(crate) fn next_node_iter(&self) -> impl Iterator<Item = NodeId> {
+        successors(
+            self.commitment_ctx
+                .table_node_id()
+                .checked_add(1)
+                .map(|n| n.into()),
+            |n: &NodeId| n.checked_add(1).map(|n| n.into()),
+        )
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct VerifierContext<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+#[serde(bound = "")]
+pub struct VerifierContext<F: PrimeField, PCS: CommitmentScheme> {
     /// Information about each steps of the model. That's the information that the verifier
     /// needs to know from the setup to avoid the prover being able to cheat.
     /// in REVERSED order already since proving goes from last layer to first layer.
-    pub model: ModelCtx<E>,
+    pub model: ModelCtx<F>,
     /// The commitment context used to generate both model commitments and witness commitments
-    pub commitment_ctx: CommitmentVerifierCtx<E, PCS>,
+    pub commitment_ctx: CommitmentVerifierCtx<PCS>,
     /// Context holding all the different table types we use in lookups
     pub lookup: LookupContext,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifierContext<E, PCS> {
-    pub fn write_to_transcript<T: Transcript<E>>(&self, t: &mut T) -> anyhow::Result<()> {
-        self.commitment_ctx.write_to_transcript(t)?;
+impl<F: PrimeField, PCS: CommitmentScheme> VerifierContext<F, PCS> {
+    pub fn write_to_transcript<T: Transcript>(&self, t: &mut T) -> anyhow::Result<()> {
+        self.commitment_ctx.write_to_transcript(t);
         Ok(())
     }
 }
 
 impl Model<Element> {
     /// Helper method employed to build the context data which is independent from the input shape.
-    fn build_global_context_data<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
+    fn build_global_context_data<F: PrimeField, PCS: CommitmentScheme<Field = F>>(
         &self,
         input_shapes: &[Shape],
-    ) -> anyhow::Result<(ModelCtx<E>, GlobalCommitmentContext<E, PCS>, LookupContext)>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-    {
+    ) -> anyhow::Result<(
+        ModelCtx<F>,
+        GlobalCommitmentContext<'static, F, PCS>,
+        LookupContext,
+    )> {
         let mut max_poly_len = 1;
 
         // An accumulator used to carry information over while converting the graph
@@ -95,7 +110,7 @@ impl Model<Element> {
         };
 
         // TODO: refactor that management of polys
-        let mut model_polys = HashMap::<CommitmentId, MultilinearExtension<E>>::new();
+        let mut model_polys = HashMap::<CommitmentId, DensePolynomial<F>>::new();
         let mut tables = BTreeMap::<Table, Vec<NodeId>>::new();
         // The shape register is filled along the traversal of the graph.
         let mut shapes: HashMap<NodeOutput, Shape> = HashMap::new();
@@ -114,7 +129,7 @@ impl Model<Element> {
                         }))
                         .collect();
                     let layer_ctx =
-                        compute_layer_ctx::<E>(&mut ctx_aux, &mut model_polys, id, layer)?;
+                        compute_layer_ctx::<F>(&mut ctx_aux, &mut model_polys, id, layer)?;
                     if let Some(layer_tables) = layer_ctx.lookup_tables() {
                         layer_tables
                             .into_iter()
@@ -168,23 +183,26 @@ impl Model<Element> {
 
         let metrics = Metrics::new();
         debug!("Context: commitment generating ...");
-        let commitment_ctx = GlobalCommitmentContext::<E, PCS>::new(
-            max_poly_len,
+        ensure!(
+            max_poly_len.is_power_of_two(),
+            "Polynomial length is now a power of 2"
+        );
+        let mut rng = rng_from_env_or_random();
+        let commitment_ctx = GlobalCommitmentContext::<F, PCS>::new(
+            max_poly_len.trailing_zeros() as usize, // we need to provide the number of variables
             model_polys,
             &lookup_ctx.tables.keys().collect_vec(),
             graph_ctx.next_node_id(),
+            &mut rng,
         )?;
         debug!("{} commitment generated.", metrics.to_span());
         Ok((ModelCtx::new(graph_ctx), commitment_ctx, lookup_ctx))
     }
 
     /// Generate the prover and verifier contexts for the input shape embedded in the model
-    pub fn generate_contexts<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>>(
+    pub fn generate_contexts<F: PrimeField, PCS: CommitmentScheme<Field = F>>(
         &self,
-    ) -> anyhow::Result<(ProverContext<E, PCS>, VerifierContext<E, PCS>)>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-    {
+    ) -> anyhow::Result<(ProverContext<'static, F, PCS>, VerifierContext<F, PCS>)> {
         // NOTE: here we pad the tensor because trace is unpadded - both the layer and this logic pad the tensor
         // - could be later optimized to only pad once if necessary
         let input_shapes: Vec<Shape> = self
@@ -216,16 +234,10 @@ impl Model<Element> {
     /// For models with variable input shapes (like LLMs) the maximum possible input shape should be passed here.
     /// Given the maximum possible input shape this method constructs prover and verifier contexts suitable for all
     /// acceptable inputs.
-    pub fn generate_contexts_for_input_shapes<
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E>,
-    >(
+    pub fn generate_contexts_for_input_shapes<F: PrimeField, PCS: CommitmentScheme<Field = F>>(
         &self,
         input_shapes: Vec<Shape>,
-    ) -> anyhow::Result<(ProverContext<E, PCS>, VerifierContext<E, PCS>)>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned,
-    {
+    ) -> anyhow::Result<(ProverContext<'_, F, PCS>, VerifierContext<F, PCS>)> {
         let span = info_span!(
             "zkml_generate_contexts_for_input_shapes",
             inputs = input_shapes.len()
@@ -296,24 +308,22 @@ pub struct ContextAux {
     pub max_poly_len: usize,
 }
 
-fn compute_layer_ctx<E: ExtensionField>(
+fn compute_layer_ctx<F: PrimeField>(
     ctx_aux: &mut ContextAux,
-    model_polys: &mut HashMap<CommitmentId, MultilinearExtension<E>>,
+    model_polys: &mut HashMap<CommitmentId, DensePolynomial<F>>,
     id: NodeId,
     layer: &Layer<Element>,
-) -> anyhow::Result<LayerCtx<E>> {
+) -> anyhow::Result<LayerCtx<F>> {
     trace!(
         "Context : {}-th layer {}info generation ...",
         id,
         layer.describe()
     );
-    let (info, mut new_aux) = layer.step_info(id, ctx_aux.clone())?;
+    let (info, mut new_aux) = layer.step_info(ctx_aux.clone())?;
     // Retrieve any model polynomials that need to be committed
     if let Some(aux_model_polys) = &mut new_aux.model_polys {
         for (poly_id, evals) in aux_model_polys.drain() {
-            let num_vars = ceil_log2(evals.len());
-            let mle =
-                MultilinearExtension::<E>::from_evaluations_vec(num_vars, to_base::<E, _>(evals));
+            let mle = DensePolynomial::new(to_field::<_, F, _>(evals));
             if let Some(expected_mle) = model_polys.get(&poly_id) {
                 // check that the same poly was stored for `poly_id`
                 debug_assert!(

@@ -8,21 +8,13 @@ use super::*;
 
 impl Softmax<Element> {
     #[allow(clippy::type_complexity)]
-    pub(crate) fn prove_internal<
-        E: ExtensionField,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        T: transcript::Transcript<E>,
-    >(
+    pub(crate) fn prove_internal<F: PrimeField, PCS: CommitmentScheme<Field = F>, T: Transcript>(
         &self,
         node_id: NodeId,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step: &Step<Element>,
-        prover: &mut crate::Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>>
-    where
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
-    {
+        prover: &mut crate::Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         let lookup_op = self
             .quant_info()
             .ok_or(anyhow!("Could not get Softmax proving data for proving"))?;
@@ -47,7 +39,7 @@ impl Softmax<Element> {
             logup_proof,
             sumcheck_proof,
             evaluations,
-            commitment,
+            commitments,
             shift_evaluations,
             ..
         } = generic_proof;
@@ -56,9 +48,9 @@ impl Softmax<Element> {
             "Could not get shift evaluations from lookup proof for Softmax"
         ))?;
 
-        let softmax_proof = SoftmaxProof::<E, PCS> {
+        let softmax_proof = SoftmaxProof::<F, PCS> {
             logup_proof,
-            commitment,
+            commitments,
             sumcheck_proof,
             evaluations,
             shift_evaluations,

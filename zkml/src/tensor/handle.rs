@@ -39,7 +39,7 @@ where
     unpadded_shape: Shape,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
 pub struct InnerTensor<T>
 where
@@ -76,6 +76,15 @@ where
 {
     WrappedTensor(InnerWrappedTensor<T>),
     Tensor(InnerTensor<T>),
+}
+
+impl<T> Default for TensorHandle<T>
+where
+    T: TensorTypeParam,
+{
+    fn default() -> Self {
+        TensorHandle::Tensor(InnerTensor::default())
+    }
 }
 
 impl<T> TensorHandle<T>
@@ -283,14 +292,22 @@ where
                 store,
                 shape,
                 unpadded_shape,
-                ..
+                wrapped_tensor,
             }) => {
                 Ok(TensorHandle::Tensor(InnerTensor {
                     storage_key,
                     store,
                     // XXX: downloading the wrapped tensor data here causes tests to
                     // fail, this needs to be investigated.
-                    tensor: Arc::new(RwLock::new(None)),
+                    tensor: if let Some(wrapped_tensor) = wrapped_tensor
+                        .read()
+                        .expect("Lock should not be poisoned")
+                        .as_ref()
+                    {
+                        Arc::new(RwLock::new(Some(wrapped_tensor.try_into()?)))
+                    } else {
+                        Arc::new(RwLock::new(None))
+                    },
                     shape,
                     unpadded_shape,
                 }))
@@ -328,6 +345,13 @@ where
         match self {
             TensorHandle::WrappedTensor(inner) => &inner.unpadded_shape,
             TensorHandle::Tensor(inner) => &inner.unpadded_shape,
+        }
+    }
+
+    pub(crate) fn padded_shape(&self) -> Shape {
+        match self {
+            TensorHandle::WrappedTensor(inner) => inner.shape.next_power_of_two(),
+            TensorHandle::Tensor(inner) => inner.shape.next_power_of_two(),
         }
     }
 

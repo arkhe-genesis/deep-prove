@@ -1,11 +1,20 @@
 //! Implementation of Layer Normalisation layer.
 
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{
+        CommitmentScheme,
+        transcript::{AppendToTranscript, Transcript},
+    },
+    structs::IOPProof,
+};
+
 use crate::{
     NextPowerOfTwo, ProverContext,
     iop::context::ContextAux,
     layers::{
         LayerCtx,
-        provable::{Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
+        provable::{Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, Splittable, VerifiableCtx},
         requant::{FIXED_POINT_SCALE, Requant},
         transformer::normalisation::layernorm::verify::LayerNormLookupVerifier,
     },
@@ -15,6 +24,7 @@ use crate::{
         table::SHIFT_CHECK_TABLE_BIT_SIZE,
     },
     padding::PaddingMode,
+    poly_commit::verifier::VerifierCommitment,
     quantization,
     tensor::{CommitmentId, TensorTypeParam},
 };
@@ -124,8 +134,6 @@ pub struct LayerNormCtx {
     mean_scaling: ScalingFactor,
     /// The [`ScalingFactor`] used for the normalising value in standard deviation (i.e. before applying gamma and beta)
     normalisation_scaling: ScalingFactor,
-    /// The node id
-    node_id: NodeId,
 }
 
 impl LayerNormCtx {
@@ -139,34 +147,44 @@ impl LayerNormCtx {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 /// Proof for correct execution of a quantised [`LayerNorm`] operation.
-pub struct LayerNormProof<E, PCS>
+pub struct LayerNormProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
     /// The LogUp proofs for LayerNorm, they are ordered `inv_sqrt_lookup`, `range_lookup`.
-    pub(crate) logup_proof: LogUpBatchProof<E>,
+    pub(crate) logup_proof: LogUpBatchProof<F>,
     /// The right shift used in the lookup operation
     pub(crate) right_shift: usize,
     /// Witness commitments for this layer
-    pub(crate) commitment: PCS::Commitment,
+    pub(crate) commitments: Vec<VerifierCommitment<PCS>>,
     /// The IO proof that links all claims to `last_claim` and the input
-    pub(crate) io_proof: IOPProof<E>,
+    pub(crate) io_proof: IOPProof<F>,
     /// The claimed evaluations of the commitments
-    pub(crate) io_evaluations: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) io_evaluations: Vec<F>,
     /// The evalautions of the mean commitments
-    pub(crate) mean_evals: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) mean_evals: Vec<F>,
     /// The gamma evaluation
-    pub(crate) gamma_eval: E,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) gamma_eval: F,
     /// The beta evaluation
-    pub(crate) beta_eval: E,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) beta_eval: F,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> LayerNormProof<E, PCS> {
-    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
-        PCS::write_commitment(&self.commitment, transcript).map_err(|e| anyhow!("{e:?}"))
+impl<F: PrimeField, PCS: CommitmentScheme> LayerNormProof<F, PCS> {
+    pub(crate) fn write_commitment<T: Transcript>(&self, transcript: &mut T) -> Result<()> {
+        self.commitments
+            .iter()
+            .for_each(|comm| comm.append_to_transcript(transcript));
+        Ok(())
     }
 }
 
@@ -310,11 +328,7 @@ impl LookupOp for LayerNormProvingData {
 }
 
 impl ProveInfo for LayerNorm<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         // Check that the quantisation scaling factors are present
         let (mean_scaling, normalisation_scaling) = self
             .get_quantisation_scaling_factors()
@@ -355,61 +369,61 @@ impl ProveInfo for LayerNorm<Element> {
                 beta_key: CommitmentId::from(self.beta.storage_key()),
                 mean_scaling: *mean_scaling,
                 normalisation_scaling: *normalisation_scaling,
-                node_id: id,
             }),
             aux,
         ))
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for LayerNorm<Element>
+impl<F, PCS> ProvableOp<F, PCS> for LayerNorm<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = LayerNormCtx;
 
-    fn prove<'a, 'b, 'c, 'd, T: transcript::Transcript<E>>(
+    fn prove<'a, 'b, 'c, 'd, T: Transcript>(
         &'a self,
         node_id: NodeId,
         _ctx: &'b Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<'c, 'd, E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut Prover<'c, 'd, F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         self.prove_internal(node_id, last_claims[0], step_data, prover)
     }
 
     fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &ProverContext<E, PCS>,
+        _ctx: &ProverContext<F, PCS>,
         step_data: &Step<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
-        self.lookup_witness(id, ctx, step_data)
+    ) -> Result<LookupWitnessGen<'_, F>> {
+        self.lookup_witness(id, step_data)
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for LayerNormCtx
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-{
-    type Proof = LayerNormProof<E, PCS>;
+impl Splittable for LayerNormCtx {}
 
-    fn verify<T: Transcript<E>>(
+impl<F, PCS> VerifiableCtx<F, PCS> for LayerNormCtx
+where
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
+{
+    type Proof = LayerNormProof<F, PCS>;
+
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<'_, E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<'_, F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
-        self.verify_internal(proof, self.node_id, verifier, last_claims[0], shape_step)
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
+        self.verify_internal(proof, node_id, verifier, last_claims[0], shape_step)
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,
@@ -579,6 +593,7 @@ mod tests {
     use tenstore::GenStore;
 
     use crate::{
+        init_test_logging,
         layers::{Layer, einsum::EinSum},
         model::{Model, test::prove_model},
         rng_from_env_or_random,
@@ -589,6 +604,7 @@ mod tests {
 
     #[test]
     fn test_layernorm_proving() {
+        init_test_logging("debug");
         for _ in 0..25 {
             let Input {
                 weight,

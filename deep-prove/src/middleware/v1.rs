@@ -1,15 +1,15 @@
-use mpcs::{Basefold, BasefoldRSParams};
 use serde::{Deserialize, Serialize};
 pub use zkml::inputs::Input;
 use zkml::{Element, Proof as ProofG, Tensor, quantization::ScalingStrategyKind};
 
 use super::{llm::LlmProvable, v2::Provable};
 
-pub type E = super::v2::E;
+pub type F = super::v2::F;
 pub type T = super::v2::T;
+pub type Pcs = super::v2::Pcs;
 
 /// A type of the proof for the `v1` of the protocol
-pub type Proof = ProofG<E, Basefold<E, BasefoldRSParams>>;
+pub type Proof = ProofG<F, Pcs>;
 
 /// The `v1` proving request
 #[derive(Serialize, Deserialize)]

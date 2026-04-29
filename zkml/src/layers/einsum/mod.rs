@@ -35,7 +35,7 @@ use crate::{
         LayerCtx, LayerProof, ShapeStep,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
-            VerifiableCtx,
+            Splittable, VerifiableCtx,
         },
         transformer::ConcatenationCache,
     },
@@ -45,16 +45,20 @@ use crate::{
     tensor::{CommitmentId, TensorHandle, TensorTypeParam, WrappedTensor},
 };
 use anyhow::{Result, anyhow, ensure};
+use ark_ff::PrimeField;
 use axis::{AxesMapping, AxisType, Dimension};
+use dp_crypto::{
+    Expression,
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    structs::IOPProof,
+};
 use evaluate::EvaluationInformation3D;
-use ff_ext::ExtensionField;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::Expression;
+use lazy_static::lazy_static;
+use parking_lot::RwLock;
 use prove::EinSumProofInfo;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::{Arc, Mutex};
-use sumcheck::structs::IOPProof;
-use transcript::Transcript;
+use tract_onnx::tract_hir::internal::num_integer::div_ceil;
 use verify::EinSumVerifierInfo;
 
 pub mod axis;
@@ -396,12 +400,8 @@ where
 }
 
 impl ProveInfo for EinSum<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
-        self.to_context(id, aux)
+    fn step_info<F: PrimeField>(&self, aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
+        self.to_context(aux)
             .map(|(ctx, aux)| (LayerCtx::EinSum(ctx), aux))
     }
 }
@@ -428,23 +428,21 @@ impl QuantizeOp for EinSum<f32> {
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for EinSum<Element>
+impl<F, PCS> ProvableOp<F, PCS> for EinSum<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
-    type Ctx = EinSumContext<E>;
+    type Ctx = EinSumContext<F>;
 
-    fn prove<T: transcript::Transcript<E>>(
+    fn prove<T: Transcript>(
         &self,
         node_id: NodeId,
         ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         let inputs = step_data.padded_input_tensors()?;
 
         let EinSumProofInfo {
@@ -454,7 +452,7 @@ where
         } = self.prove_internal(ctx, last_claims, &inputs, prover.transcript)?;
 
         // Add the proof to the proof list
-        prover.push_proof(node_id, LayerProof::<E, PCS>::EinSum(proof));
+        prover.push_proof(node_id, LayerProof::<F, PCS>::EinSum(proof));
         // Add the constant claims to the prover
         prover.add_common_claims(node_id, commitment_map);
 
@@ -463,7 +461,10 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 /// Context for an [`EinSum`] layer. The context consists of:
 /// - `node_id`: The unique identifier for the node.
 /// - `equation`: The equation describing the einsum operation.
@@ -472,18 +473,18 @@ where
 /// - `bias_unpadded_shapes`: The unpadded shapes of the bias tensors used in the operation, if any.
 /// - `einsum_sumcheck_expression`: The sumcheck expression for the einsum operation.
 /// - `input_aggregation_expression`: The sumcheck expression for the input aggregation operation, this checks that the same tensor was used as the LHS for all einsum operations. It is `None` if there are only two inputs to the einsum operation.
-pub struct EinSumContext<E: ExtensionField> {
-    pub node_id: NodeId,
+pub struct EinSumContext<F: PrimeField> {
     pub equation: String,
     pub mapping: AxesMapping,
     pub constant_keys: Vec<Option<CommitmentId>>,
     pub constant_unpadded_shapes: Vec<Option<Shape>>,
     pub bias_keys: Vec<Option<CommitmentId>>,
     pub bias_unpadded_shapes: Vec<Option<Shape>>,
-    pub input_aggregation_expression: Option<Expression<E>>,
+    pub input_aggregation_expression: Option<Expression<F>>,
+    is_splittable: bool,
 }
 
-impl<E: ExtensionField> OpInfo for EinSumContext<E> {
+impl<F: PrimeField> OpInfo for EinSumContext<F> {
     fn output_shapes(
         &self,
         input_shapes: &[Shape],
@@ -550,52 +551,75 @@ impl<E: ExtensionField> OpInfo for EinSumContext<E> {
     }
 }
 
+const DEFAULT_MIN_CHUNK_SIZE: usize = 128;
+
+lazy_static! {
+    pub(crate) static ref MIN_CHUNK_SIZE: RwLock<Option<usize>> = RwLock::new(None);
+}
+
+impl<F: PrimeField> Splittable for EinSumContext<F> {
+    fn ideal_num_chunks(&self, input_shapes: &[Shape]) -> Option<usize> {
+        if !self.is_splittable {
+            return None;
+        }
+        assert_eq!(input_shapes.len(), 1); // for now the layer is splittable only if the RHS are all constant tensors, so there must be only 1 input
+        let min_chunk_size = MIN_CHUNK_SIZE
+            .read_recursive()
+            .unwrap_or(DEFAULT_MIN_CHUNK_SIZE);
+        let seq_len = input_shapes[0].dim(0);
+        Some(div_ceil(seq_len, min_chunk_size))
+    }
+
+    fn is_splittable(&self) -> bool {
+        self.is_splittable
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 /// Proof for an [`EinSum`] layer. The proof consists of:
 /// - `bias_evals`: The evaluations of the bias polynomials at the random challenge points, this vec can be empty if there are no bias tensors.
 /// - `einsum_sumcheck`: The sumcheck proof for the einsum operation.
 /// - `einsum_evaluations`: The evaluations of the einsum polynomials at the random challenge point produced by the einsum sumcheck.
 /// - `input_aggregation_sumcheck`: The sumcheck proof for the input aggregation operation, this checks that the same tensor was used as the LHS for all einsum operations.
-pub struct EinSumProof<E: ExtensionField> {
+pub struct EinSumProof<F: PrimeField> {
     /// Claimed bias evaluations, one for each bias tensor, can be empty if there are no bias tensors.
-    bias_evals: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    bias_evals: Vec<F>,
     /// Sumcheck proof for the equation specified in the layer.
-    einsum_sumcheck: IOPProof<E>,
+    einsum_sumcheck: IOPProof<F>,
     /// Evaluations of the polynomials used in the einsum sumcheck, the first `n` of these correspond to the LHS polynomial evaluations, where `n` is the number of einsum operations (i.e. number of inputs - 1 including constant tensors).
-    einsum_evaluations: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    einsum_evaluations: Vec<F>,
     /// Sumcheck proof for the input aggregation, this checks that the same tensor was used as the LHS for all `n` einsum operations.
-    input_aggregation_sumcheck: Option<IOPProof<E>>,
+    input_aggregation_sumcheck: Option<IOPProof<F>>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS>
-    for EinSumContext<E>
-{
-    type Proof = EinSumProof<E>;
+impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for EinSumContext<F> {
+    type Proof = EinSumProof<F>;
 
-    fn verify<T: Transcript<E>>(
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
         // Run the internal method to verify the proof
         let EinSumVerifierInfo {
             claims,
             constants_map,
-        } = self.verify_internal(
-            proof,
-            last_claims,
-            &shape_step.unpadded_input_shape,
-            verifier.transcript,
-        )?;
+        } = self.verify_internal(proof, last_claims, shape_step, verifier.transcript)?;
         // Add the constant claims to the verifier
-        verifier.add_common_claims(self.node_id, constants_map);
+        verifier.add_common_claims(node_id, constants_map);
         Ok(claims)
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         _proof: &Self::Proof,
         _transcript: &mut T,
@@ -605,9 +629,10 @@ impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> VerifiableCtx<E, PCS
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
+    use dp_crypto::arkyper::transcript::blake3::Blake3Transcript;
     use tenstore::{GenStore, StorageKey};
-    use transcript::BasicTranscript;
 
     use crate::{
         Tensor,
@@ -620,7 +645,7 @@ mod tests {
         testing::Pcs,
     };
 
-    type T = BasicTranscript<F>;
+    type T = Blake3Transcript;
     use super::*;
     use crate::verify;
 
@@ -659,12 +684,12 @@ mod tests {
             .prepare_inputs(quantized_inputs.clone())
             .unwrap();
         let trace = padded_model.run(input_tensors, &mut store)?;
-        let io = trace.to_verifier_io().unwrap();
         let (prover_ctx, verifier_ctx) = padded_model
-            .generate_contexts::<F, Pcs<F>>()
+            .generate_contexts::<F, Pcs>()
             .expect("Unable to generate contexts");
 
-        let proof = P::prove(&prover_ctx, trace, &padded_model).expect("unable to generate proof");
+        let (proof, io) =
+            P::prove(&prover_ctx, trace, &padded_model).expect("unable to generate proof");
 
         verify::<_, T, _>(&verifier_ctx, proof, io)?;
         // prove_model(model, &mut GenStore::default()).unwrap();

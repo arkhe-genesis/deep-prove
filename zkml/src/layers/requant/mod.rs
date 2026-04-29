@@ -10,27 +10,28 @@ use crate::{
         context::{ContextAux, ShapeStep},
         verifier::Verifier,
     },
-    layers::{LayerProof, activation::lookup_data::ActivationLookupData},
+    layers::{LayerProof, activation::lookup_data::ActivationLookupData, provable::Splittable},
     lookup::{
         context::LookupWitnessGen, logup_gkr::structs::LogUpBatchProof, operation::LookupOp,
         table::Table,
     },
     model::Step,
     padding::PaddingMode,
+    poly_commit::verifier::VerifierCommitment,
     quantization,
     tensor::WrappedTensor,
 };
-use anyhow::{Result, anyhow, ensure};
-use ceno_p3::field::FieldAlgebra;
-use ff_ext::ExtensionField;
-
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::util::{ceil_log2, transpose};
-
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::structs::IOPProof;
-use transcript::Transcript;
-use witness::RowMajorMatrix;
+use anyhow::{Result, ensure};
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{
+        CommitmentScheme,
+        transcript::{AppendToTranscript, Transcript},
+    },
+    structs::IOPProof,
+    util::ceil_log2,
+};
+use serde::{Deserialize, Serialize};
 
 mod evaluate;
 mod lookup;
@@ -85,33 +86,39 @@ impl LookupOp for Requant {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequantCtx {
     pub requant: Requant,
-    pub node_id: NodeId,
     pub num_vars: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 /// Struct holding all the information needed to verify requantisation was performed correctly.
 /// This includes both lookup proofs and an additional sumcheck proof that we use so that all evaluations are at the same point.
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct RequantProof<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct RequantProof<F: PrimeField, PCS: CommitmentScheme> {
     /// proof for the accumulation of the claim from activation + claim from lookup for the same poly
     /// e.g. the "link" between an activation and requant layer
-    pub(crate) io_accumulation: IOPProof<E>,
+    pub(crate) io_accumulation: IOPProof<F>,
     /// The evalaution claims about witness polynomials from the io_accumulation sumcheck
-    pub(crate) io_eval: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) io_eval: Vec<F>,
     /// The logup batch proof for all the lookups
-    pub(crate) logup_proof: LogUpBatchProof<E>,
+    pub(crate) logup_proof: LogUpBatchProof<F>,
     /// COmmitments to lookup polynomials, they are in the order clamping commitments -> shifted commitments
-    pub(crate) commitment: PCS::Commitment,
+    pub(crate) commitments: Vec<VerifierCommitment<PCS>>,
 }
 
-impl<E, PCS> RequantProof<E, PCS>
+impl<F, PCS> RequantProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
-        PCS::write_commitment(&self.commitment, transcript).map_err(|e| anyhow!("{e:?}"))
+    pub(crate) fn write_commitment<T: Transcript>(&self, transcript: &mut T) -> Result<()> {
+        self.commitments
+            .iter()
+            .for_each(|comm| comm.append_to_transcript(transcript));
+        Ok(())
     }
 }
 
@@ -150,11 +157,7 @@ impl Evaluate<Element> for Requant {
 }
 
 impl ProveInfo for Requant {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         // `try_fold` would not allow returning of `Err` values
         // from here and would short-circuit
         // instead of looping over all values in the iterator
@@ -186,7 +189,6 @@ impl ProveInfo for Requant {
         Ok((
             LayerCtx::Requant(RequantCtx {
                 requant: *self,
-                node_id: id,
                 num_vars,
             }),
             aux,
@@ -196,32 +198,30 @@ impl ProveInfo for Requant {
 
 impl PadOp for Requant {}
 
-impl<E, PCS> ProvableOp<E, PCS> for Requant
+impl<F, PCS> ProvableOp<F, PCS> for Requant
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = RequantCtx;
 
-    fn prove<T: Transcript<E>>(
+    fn prove<T: Transcript>(
         &self,
         id: NodeId,
         _ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>> {
+        prover: &mut Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>> {
         self.prove_step(prover, last_claims[0], step_data, id)
     }
 
     fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &ProverContext<E, PCS>,
+        _ctx: &ProverContext<F, PCS>,
         step_data: &Step<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'_, F>> {
         ensure!(
             step_data.node_inputs.len() == 1,
             "Found more than 1 input in inference step of requant layer"
@@ -233,7 +233,7 @@ where
 
         let input = step_data.input_tensor_at(0)?;
 
-        self.lookup_witness(id, ctx, &input)
+        self.lookup_witness(id, &input)
     }
 }
 
@@ -263,24 +263,27 @@ impl OpInfo for RequantCtx {
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for RequantCtx
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-{
-    type Proof = RequantProof<E, PCS>;
+impl Splittable for RequantCtx {}
 
-    fn verify<T: Transcript<E>>(
+impl<F, PCS> VerifiableCtx<F, PCS> for RequantCtx
+where
+    F: PrimeField,
+    PCS: CommitmentScheme,
+{
+    type Proof = RequantProof<F, PCS>;
+
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<Claim<E>>> {
-        self.verify_requant(verifier, last_claims[0], proof, shape_step)
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
+        self.verify_requant(verifier, last_claims[0], proof, shape_step, node_id)
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,
@@ -363,13 +366,11 @@ impl Requant {
         self.activation_lookup_data.right_shift()
     }
 
-    pub fn write_to_transcript<E: ExtensionField, T: Transcript<E>>(&self, t: &mut T) {
-        t.append_field_element(&E::BaseField::from_canonical_u64(
-            self.activation_lookup_data.right_shift() as u64,
-        ));
-        t.append_field_element(&E::BaseField::from_canonical_u64(
+    pub fn write_to_transcript<F: PrimeField, T: Transcript>(&self, t: &mut T) {
+        t.append_scalars(&[F::from(self.activation_lookup_data.right_shift() as u64)]);
+        t.append_scalars(&[F::from(
             self.activation_lookup_data.fixed_point_multiplier() as u64,
-        ));
+        )]);
     }
 }
 

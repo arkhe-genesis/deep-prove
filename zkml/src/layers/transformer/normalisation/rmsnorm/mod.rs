@@ -1,4 +1,13 @@
 //! Module defining the [`RMSNorm`] layer.
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{
+        CommitmentScheme,
+        transcript::{AppendToTranscript, Transcript},
+    },
+    structs::IOPProof,
+};
+
 use super::*;
 
 use std::collections::HashMap;
@@ -8,7 +17,7 @@ use crate::{
     iop::context::ContextAux,
     layers::{
         LayerCtx,
-        provable::{Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, VerifiableCtx},
+        provable::{Evaluate, OpInfo, PadOp, ProvableOp, ProveInfo, Splittable, VerifiableCtx},
         requant::FIXED_POINT_SCALE,
         transformer::normalisation::rmsnorm::verify::RMSNormLookupVerifier,
     },
@@ -17,6 +26,7 @@ use crate::{
         table::{SHIFT_CHECK_TABLE_BIT_SIZE, Table},
     },
     padding::PaddingMode,
+    poly_commit::verifier::VerifierCommitment,
     quantization,
     tensor::{CommitmentId, TensorTypeParam},
 };
@@ -103,8 +113,6 @@ impl<N: TensorTypeParam> RMSNorm<N> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RMSNormCtx {
-    /// The [`NodeId`] for this operation
-    node_id: NodeId,
     /// The size of the dimension we normalise over (unpadded)
     normalisation_dim_size: usize,
     /// The [`CommitmentId`] for the `alpha` parameter
@@ -222,30 +230,38 @@ impl LookupOp for RMSNormProvingData {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
 /// Proof for correct execution of a quantised [`RMSNorm`] operation.
-pub struct RMSNormProof<E, PCS>
+pub struct RMSNormProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
     /// The LogUp proofs for RMSNorm, this is the error check on the normalised output.
-    pub(crate) logup_proof: LogUpBatchProof<E>,
+    pub(crate) logup_proof: LogUpBatchProof<F>,
     /// This is the size of the right shift for the RMSNorm operation
     pub(crate) right_shift: Element,
     /// Witness commitments for this layer
-    pub(crate) commitment: PCS::Commitment,
+    pub(crate) commitments: Vec<VerifierCommitment<PCS>>,
     /// The IO proof that links all claims to `last_claim` and the input
-    pub(crate) io_proof: IOPProof<E>,
+    pub(crate) io_proof: IOPProof<F>,
     /// The claimed evaluations of the commitments
-    pub(crate) io_evaluations: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) io_evaluations: Vec<F>,
     /// The (Optional) evaluation of alpha if it is used
-    pub(crate) alpha_evaluation: Option<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) alpha_evaluation: Option<F>,
 }
 
-impl<E: ExtensionField, PCS: PolynomialCommitmentScheme<E>> RMSNormProof<E, PCS> {
-    pub(crate) fn write_commitment<T: Transcript<E>>(&self, transcript: &mut T) -> Result<()> {
-        PCS::write_commitment(&self.commitment, transcript).map_err(|e| anyhow!("{e:?}"))
+impl<F: PrimeField, PCS: CommitmentScheme> RMSNormProof<F, PCS> {
+    pub(crate) fn write_commitment<T: Transcript>(&self, transcript: &mut T) -> Result<()> {
+        self.commitments
+            .iter()
+            .for_each(|comm| comm.append_to_transcript(transcript));
+        Ok(())
     }
 }
 
@@ -297,11 +313,7 @@ impl<N: TensorTypeParam> OpInfo for RMSNorm<N> {
 }
 
 impl ProveInfo for RMSNorm<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        mut aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, mut aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         // Check that the quantisation scaling factors are present
         let (input_scaling, normalisation_scaling) = self
             .get_quantisation_scaling_factors()
@@ -331,7 +343,6 @@ impl ProveInfo for RMSNorm<Element> {
         // return the LayerCtx and the updated ContextAux
         Ok((
             LayerCtx::RMSNorm(RMSNormCtx {
-                node_id: id,
                 normalisation_dim_size: self.normalisation_dim_size,
                 alpha_key,
                 input_scaling: *input_scaling,
@@ -342,54 +353,55 @@ impl ProveInfo for RMSNorm<Element> {
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for RMSNorm<Element>
+impl<F, PCS> ProvableOp<F, PCS> for RMSNorm<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = RMSNormCtx;
 
-    fn prove<'a, 'b, 'c, 'd, T: transcript::Transcript<E>>(
+    fn prove<'a, 'b, 'c, 'd, T: Transcript>(
         &'a self,
         node_id: NodeId,
         _ctx: &'b Self::Ctx,
-        last_claims: Vec<&crate::Claim<E>>,
+        last_claims: Vec<&crate::Claim<F>>,
         step_data: &crate::model::Step<Element>,
-        prover: &mut Prover<'c, 'd, E, T, PCS>,
-    ) -> Result<Vec<crate::Claim<E>>> {
+        prover: &mut Prover<'c, 'd, F, T, PCS>,
+    ) -> Result<Vec<crate::Claim<F>>> {
         self.prove_internal(node_id, last_claims[0], step_data, prover)
     }
 
     fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &crate::ProverContext<E, PCS>,
+        _ctx: &crate::ProverContext<F, PCS>,
         step_data: &crate::model::Step<Element>,
-    ) -> Result<crate::lookup::context::LookupWitnessGen<E, PCS>> {
-        self.lookup_witness(id, ctx, step_data)
+    ) -> Result<crate::lookup::context::LookupWitnessGen<'_, F>> {
+        self.lookup_witness(id, step_data)
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for RMSNormCtx
-where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
-{
-    type Proof = RMSNormProof<E, PCS>;
+impl Splittable for RMSNormCtx {}
 
-    fn verify<T: transcript::Transcript<E>>(
+impl<F, PCS> VerifiableCtx<F, PCS> for RMSNormCtx
+where
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
+{
+    type Proof = RMSNormProof<F, PCS>;
+
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         shape_step: &ShapeStep,
-    ) -> Result<Vec<crate::Claim<E>>> {
-        self.verify_internal(proof, self.node_id, verifier, last_claims[0], shape_step)
+        node_id: NodeId,
+    ) -> Result<Vec<crate::Claim<F>>> {
+        self.verify_internal(proof, node_id, verifier, last_claims[0], shape_step)
     }
 
-    fn write_proof_to_transcript<T: transcript::Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         proof: &Self::Proof,
         transcript: &mut T,

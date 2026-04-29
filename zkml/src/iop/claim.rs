@@ -1,4 +1,4 @@
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -6,50 +6,61 @@ use serde::{Deserialize, Serialize};
 /// This data can be used by the verifier to reconstruct a specific claim about
 /// the polynomial itself
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub(crate) struct PolynomialEvaluation<E> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub(crate) struct PolynomialEvaluation<F> {
     pub(crate) num_vars: usize,
-    pub(crate) eval: E,
+    #[serde(with = "dp_crypto::serialization")]
+    pub(crate) eval: F,
 }
 
 /// Claim type to accumulate in this protocol, for a certain polynomial, known in the context.
 /// f(point) = eval
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct Claim<E> {
-    pub point: Vec<E>,
-    pub eval: E,
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct Claim<F> {
+    #[serde(with = "dp_crypto::serialization")]
+    pub point: Vec<F>,
+    #[serde(with = "dp_crypto::serialization")]
+    pub eval: F,
 }
 
-impl<E> Claim<E> {
-    pub fn new(point: Vec<E>, eval: E) -> Self {
+impl<F> Claim<F> {
+    pub fn new(point: Vec<F>, eval: F) -> Self {
         Self { point, eval }
     }
     pub fn mle_num_vars(&self) -> usize {
         self.point.len()
     }
 
-    pub fn point(&self) -> &[E] {
+    pub fn point(&self) -> &[F] {
         &self.point
     }
 }
 
-impl<E: ExtensionField> Claim<E> {
+impl<F: PrimeField> Claim<F> {
     /// Pad the point to the new size given
     /// This is necessary for passing from output of padded lookups to next dense layer proving for example.
     /// NOTE: you can use it to pad or reduce size
-    pub fn pad(&self, new_num_vars: usize) -> Claim<E> {
+    pub fn pad(&self, new_num_vars: usize) -> Claim<F> {
         Self {
             eval: self.eval,
             point: self
                 .point
                 .iter()
-                .chain(std::iter::repeat(&E::ZERO))
+                .chain(std::iter::repeat(&F::ZERO))
                 .take(new_num_vars)
                 .cloned()
                 .collect_vec(),
         }
     }
 
-    pub fn evaluation(&self) -> E {
+    pub fn evaluation(&self) -> F {
         self.eval
     }
 }

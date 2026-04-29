@@ -10,7 +10,7 @@ use crate::{
     quantization::strategy::llm_tracker::{LLMInferenceTracker, LLMTrackerRunner},
 };
 
-use multilinear_extensions::util::ceil_log2;
+use dp_crypto::util::ceil_log2;
 use serde::{Deserialize, Serialize};
 
 pub const fn get_default_prompt() -> &'static str {
@@ -123,9 +123,7 @@ impl ScalingStrategy for LLMInferenceObserver {
             input_tensor,
         );
 
-        let runner = BaseRunner {
-            store: store.clone(),
-        };
+        let runner = BaseRunner::from(store.clone());
         let runner = LLMTrackerRunner {
             inner: runner,
             tracker: &mut tracker,

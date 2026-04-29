@@ -8,8 +8,8 @@ use crate::{
 
 use super::*;
 
+use dp_crypto::util::ceil_log2;
 use itertools::izip;
-use multilinear_extensions::util::ceil_log2;
 
 impl EinSum<f32> {
     pub(crate) fn quantise(

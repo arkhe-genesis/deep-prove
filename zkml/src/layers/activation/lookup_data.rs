@@ -1,6 +1,5 @@
 //! Generic lookup data required for activation layers.
-
-use multilinear_extensions::util::ceil_log2;
+use dp_crypto::util::ceil_log2;
 
 use super::*;
 

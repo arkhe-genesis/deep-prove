@@ -1,45 +1,49 @@
 //! Lookup proving methods.
 
-use multilinear_extensions::virtual_polys::VirtualPolynomialsBuilder;
-use sumcheck::{structs::IOPProverState, util::optimal_sumcheck_threads};
+use dp_crypto::{
+    arkyper::transcript::Transcript,
+    structs::{IOPProof, IOPProverState},
+    util::optimal_sumcheck_threads,
+    virtual_polys::VirtualPolynomialsBuilder,
+};
 
 use super::*;
 
 #[derive(Debug, Clone)]
-pub struct LookupSumcheckProof<E: ExtensionField> {
+pub struct LookupSumcheckProof<F: PrimeField> {
     /// The sumcheck proof linking the lookup and the main computation.
-    pub sumcheck_proof: IOPProof<E>,
+    pub sumcheck_proof: IOPProof<F>,
     /// The evaluations of the witness MLEs at the sumcheck point.
-    pub evaluations: Vec<E>,
+    pub evaluations: Vec<F>,
     /// The final point from the sumcheck protocol.
-    pub sumcheck_point: Vec<E>,
+    pub sumcheck_point: Vec<F>,
     /// The evaluation of the weight MLE at the sumcheck point, if applicable.
-    pub weight_eval: Option<E>,
+    pub weight_eval: Option<F>,
 }
 
 impl LookupInputConfig {
     /// This method proves the Sumcheck that links the lookup argument to the inputs/outputs of the layer. It takes in the MLEs of the witnesses used in the Sumcheck expression, the current claim, the point used in the lookup proof and optionally the MLE of the weights (if this is a normalisation variant). It returns the sumcheck proof and the evaluations of the witness MLEs at the sumcheck point.
-    pub fn prove_linking_sumcheck<E, T>(
+    pub fn prove_linking_sumcheck<F, T>(
         &self,
-        mles: &[MultilinearExtension<E>],
+        mles: &[DensePolynomial<F>],
         transcript: &mut T,
-        last_claim: &Claim<E>,
-        logup_point: &[E],
-        weight_mle: Option<MultilinearExtension<E>>,
-    ) -> Result<(LookupSumcheckProof<E>, Vec<E>)>
+        last_claim: &Claim<F>,
+        logup_point: &[F],
+        weight_mle: Option<DensePolynomial<F>>,
+    ) -> Result<(LookupSumcheckProof<F>, Vec<F>)>
     where
-        E: ExtensionField,
-        T: Transcript<E>,
+        F: PrimeField,
+        T: Transcript,
     {
         let variant = self.variant;
         let unpadded_input_shape = self.unpadded_input_shape();
         let (output_eq_point, mut batching_challenges) = unpadded_input_shape
-            .compute_eq_point_and_batching_challenges::<E>(last_claim.point())?;
+            .compute_eq_point_and_batching_challenges::<F>(last_claim.point())?;
 
         // Now we squeeze the required challenges from the transcript, we always need the sum challenge so we squeeze that explicitly first.
-        let sum_challenge = transcript.sample_and_append_challenge(b"sum").elements;
+        let sum_challenge = transcript.append_and_sample(b"sum");
         // We then get the other challenges required for batching from the variant, this is because different variants require different numbers of challenges depending on the number of checks they perform in the sumcheck and we want to avoid squeezing unnecessary challenges.
-        let other_challenges = variant.squeeze_sumcheck_challenges(transcript);
+        let other_challenges: Vec<F> = variant.squeeze_sumcheck_challenges(transcript);
         // Arrange the challenges in the expected order
         batching_challenges.insert(0, sum_challenge);
         batching_challenges.extend(other_challenges);
@@ -64,7 +68,7 @@ impl LookupInputConfig {
         // Build the virtual polynomials
         let num_vars = output_eq_point.len();
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let expression = self.build_full_sumcheck_expression::<E>();
+        let expression = self.build_full_sumcheck_expression::<F>();
 
         #[cfg(test)]
         {
@@ -78,11 +82,10 @@ impl LookupInputConfig {
         }
 
         let virtual_poly_builder =
-            VirtualPolynomialsBuilder::<E>::new_with_mles(num_threads, num_vars, either_mles);
+            VirtualPolynomialsBuilder::<F>::new_with_mles(num_threads, num_vars, either_mles);
         let virtual_poly = virtual_poly_builder
             .to_virtual_polys(std::slice::from_ref(&expression), &batching_challenges);
-
-        let (sumcheck_proof, state) = IOPProverState::<E>::prove(virtual_poly, transcript);
+        let (sumcheck_proof, state) = IOPProverState::<F>::prove(virtual_poly, transcript);
         let mut evaluations = state.get_mle_flatten_final_evaluations();
         let sumcheck_point = state.collect_raw_challenges();
 
@@ -114,21 +117,22 @@ impl LookupInputConfig {
 #[cfg(test)]
 mod test_utils {
 
+    use dp_crypto::utils::eval_by_expr_with_instance;
+
     use super::*;
     use crate::lookup::operation::variant::LookupExpressions;
-    use multilinear_extensions::utils::eval_by_expr_with_instance;
 
     impl LookupInputConfig {
-        pub(crate) fn debug_linking_sumcheck<E>(
+        pub(crate) fn debug_linking_sumcheck<F>(
             &self,
-            mles: &[MultilinearExtension<E>],
-            last_claim: &Claim<E>,
-            weight_mle: &Option<MultilinearExtension<E>>,
-            batching_challenges: &[E],
-            eq_polys: &[MultilinearExtension<E>],
+            mles: &[DensePolynomial<F>],
+            last_claim: &Claim<F>,
+            weight_mle: &Option<DensePolynomial<F>>,
+            batching_challenges: &[F],
+            eq_polys: &[DensePolynomial<F>],
         ) -> Result<()>
         where
-            E: ExtensionField,
+            F: PrimeField,
         {
             let unpadded_input_shape = self.unpadded_input_shape();
             let variant = self.variant;
@@ -141,10 +145,10 @@ mod test_utils {
             let total_witnesses =
                 total_chunks * variant.additional_witnesses_per_chunk() + total_output_witnesses;
 
-            let mut total_norm = E::ZERO;
-            let mut total_input = E::ZERO;
-            let mut total_output = E::ZERO;
-            let mut total_sum = E::ZERO;
+            let mut total_norm = F::ZERO;
+            let mut total_input = F::ZERO;
+            let mut total_output = F::ZERO;
+            let mut total_sum = F::ZERO;
 
             for current_chunk in 0..total_chunks {
                 let LookupExpressions {
@@ -153,14 +157,14 @@ mod test_utils {
                     clamping_expression,
                     squared_clamping_expression,
                     sum,
-                } = variant.build_lookup_output_expressions::<E>(current_chunk, chunking_info);
+                } = variant.build_lookup_output_expressions::<F>(current_chunk, chunking_info);
 
-                let output_linking_eq = Expression::<E>::WitIn(total_witnesses as u16);
-                let lookup_linking_eq = Expression::<E>::WitIn((total_witnesses + 1) as u16);
+                let output_linking_eq = Expression::<F>::WitIn(total_witnesses as u16);
+                let lookup_linking_eq = Expression::<F>::WitIn((total_witnesses + 1) as u16);
 
                 let final_dim_size = unpadded_input_shape.dim(-1);
                 let final_dim_log = ceil_log2(final_dim_size);
-                let pow_two: E = (1i64 << final_dim_log).to_field();
+                let pow_two: F = (1i64 << final_dim_log).to_field();
 
                 let prod_expression =
                     clamping_expression.clone() + prod_selector.clone() * value.clone();
@@ -168,33 +172,17 @@ mod test_utils {
 
                 let mut all_mle_evals = mles
                     .iter()
-                    .map(|either_mle| {
-                        either_mle
-                            .get_base_field_vec()
-                            .iter()
-                            .map(|&val| E::from_base(val))
-                            .collect::<Vec<E>>()
-                    })
-                    .chain(
-                        eq_polys
-                            .iter()
-                            .map(|eq_poly| eq_poly.get_ext_field_vec().to_vec()),
-                    )
-                    .collect::<Vec<Vec<E>>>();
+                    .map(|either_mle| either_mle.evals())
+                    .chain(eq_polys.iter().map(|eq_poly| eq_poly.evals()))
+                    .collect::<Vec<Vec<F>>>();
                 if let Some(weight) = weight_mle.as_ref() {
-                    all_mle_evals.push(
-                        weight
-                            .get_base_field_vec()
-                            .iter()
-                            .map(|&val| E::from_base(val))
-                            .collect::<Vec<E>>(),
-                    );
+                    all_mle_evals.push(weight.evals());
 
-                    output_part *= Expression::<E>::WitIn(all_mle_evals.len() as u16 - 1)
+                    output_part *= Expression::<F>::WitIn(all_mle_evals.len() as u16 - 1)
                 }
 
                 if matches!(variant, LookupVariant::GLU) {
-                    output_part *= Expression::<E>::WitIn(
+                    output_part *= Expression::<F>::WitIn(
                         total_output_witnesses as u16 + current_chunk as u16,
                     );
                 }
@@ -202,17 +190,17 @@ mod test_utils {
 
                 let sum_part = sum * lookup_linking_eq.clone();
 
-                let mut chunk_magnitude = E::ZERO;
-                let mut chunk_norm_sum = E::ZERO;
-                let mut chunk_input = E::ZERO;
-                let mut chunk_output = E::ZERO;
-                let mut chunk_sum_part = E::ZERO;
+                let mut chunk_magnitude = F::ZERO;
+                let mut chunk_norm_sum = F::ZERO;
+                let mut chunk_input = F::ZERO;
+                let mut chunk_output = F::ZERO;
+                let mut chunk_sum_part = F::ZERO;
 
                 for eval_idx in 0..total_len {
                     let evals_at_idx = all_mle_evals
                         .iter()
                         .map(|mle_evals| mle_evals[eval_idx])
-                        .collect::<Vec<E>>();
+                        .collect::<Vec<F>>();
 
                     let output_eval_result = eval_by_expr_with_instance(
                         &[],
@@ -221,9 +209,7 @@ mod test_utils {
                         &[],
                         batching_challenges,
                         &output_part,
-                    )
-                    .right()
-                    .unwrap();
+                    );
 
                     let sum_part_result = eval_by_expr_with_instance(
                         &[],
@@ -232,15 +218,13 @@ mod test_utils {
                         &[],
                         batching_challenges,
                         &sum_part,
-                    )
-                    .right()
-                    .unwrap();
+                    );
 
                     if matches!(
                         variant,
                         LookupVariant::Normalisation { .. } | LookupVariant::Softmax { .. }
                     ) {
-                        let normalisation_eq = Expression::<E>::WitIn((total_witnesses + 2) as u16);
+                        let normalisation_eq = Expression::<F>::WitIn((total_witnesses + 2) as u16);
 
                         let sum_part = normalisation_eq.clone() * prod_expression.clone();
 
@@ -252,9 +236,7 @@ mod test_utils {
                                 &[],
                                 batching_challenges,
                                 &sum_part,
-                            )
-                            .right()
-                            .unwrap();
+                            );
 
                         chunk_norm_sum += sum_eval_result;
 
@@ -276,14 +258,12 @@ mod test_utils {
                                     &[],
                                     batching_challenges,
                                     &magnitude_part,
-                                )
-                                .right()
-                                .unwrap();
+                                );
 
-                            let input_chunk_expression = Expression::<E>::WitIn(
+                            let input_chunk_expression = Expression::<F>::WitIn(
                                 (total_output_witnesses + current_chunk) as u16,
                             );
-                            let scaling_witness_expression = Expression::<E>::WitIn(
+                            let scaling_witness_expression = Expression::<F>::WitIn(
                                 (total_output_witnesses + total_chunks + current_chunk) as u16,
                             );
 
@@ -298,9 +278,7 @@ mod test_utils {
                                 &[],
                                 batching_challenges,
                                 &input_part,
-                            )
-                            .right()
-                            .unwrap();
+                            );
                             chunk_magnitude += magnitude_eval_result;
                             chunk_input += input_eval_result;
                         }

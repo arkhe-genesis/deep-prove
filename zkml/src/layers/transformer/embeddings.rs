@@ -1,21 +1,20 @@
-use std::iter::once;
+use std::{iter::once, ops::Deref};
 
 use anyhow::{Result, ensure};
-use either::Either;
-use ff_ext::ExtensionField;
-use itertools::Itertools;
-use mpcs::PolynomialCommitmentScheme;
-use multilinear_extensions::virtual_polys::VirtualPolynomialsBuilder;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sumcheck::{
+use ark_ff::PrimeField;
+use dp_crypto::{
+    arkyper::{CommitmentScheme, transcript::Transcript},
+    poly::eq::evals,
     structs::{IOPProof, IOPProverState, IOPVerifierState},
     util::optimal_sumcheck_threads,
+    virtual_polys::VirtualPolynomialsBuilder,
 };
-use transcript::Transcript;
+use either::Either;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     Claim, Element, NextPowerOfTwo, Prover, ScalingFactor, ScalingStrategy, Shape, Tensor,
-    commit::{compute_betas_eval, identity_eval},
     graph::NodeId,
     iop::{
         context::{ContextAux, ShapeStep},
@@ -25,13 +24,14 @@ use crate::{
         LayerCtx, LayerProof,
         provable::{
             Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
-            VerifiableCtx,
+            Splittable, VerifiableCtx,
         },
     },
     model::Step,
     padding::{PaddingMode, ShapeData, ShapeInfo},
     parser::{gguf, json},
-    quantization::{self, Quantize},
+    poly_commit::identity_eval,
+    quantization::{self, Quantize, ToElement, ToField},
     tensor::{CommitmentId, TensorHandle, TensorTypeParam, WrappedTensor},
     to_bit_sequence_le,
     util::from_mle_list_dimensions,
@@ -53,21 +53,24 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsCtx {
-    id: NodeId,
     vocab_size: usize,
     emb_size: usize,
     embedding_key: CommitmentId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub struct EmbeddingsProof<E: ExtensionField> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub struct EmbeddingsProof<F: PrimeField> {
     /// the actual sumcheck proof proving the matmul protocol
-    pub(crate) sumcheck: IOPProof<E>,
+    pub(crate) sumcheck: IOPProof<F>,
     /// The individual evaluations of the individual polynomial for the last random part of the
     /// sumcheck. One for each polynomial involved in the "virtual poly".
     /// Since we only support quadratic right now it's a flat list.
-    individual_claims: Vec<E>,
+    #[serde(with = "dp_crypto::serialization")]
+    individual_claims: Vec<F>,
 }
 
 impl<N> Embeddings<N>
@@ -88,10 +91,10 @@ where
     /// Split the point over which the 2d output tensor is evaluated into 2 sub-points:
     /// - The first sub-point refers to the row variables of the output tensor
     /// - The second sub-point refers to the column variables of the output tensor
-    fn split_output_point<E: ExtensionField>(
-        last_claim: &Claim<E>,
+    fn split_output_point<F: PrimeField>(
+        last_claim: &Claim<F>,
         emb_size: usize,
-    ) -> anyhow::Result<(&[E], &[E])> {
+    ) -> anyhow::Result<(&[F], &[F])> {
         let num_vars = emb_size.next_power_of_two().ilog2() as usize;
         // column variables are the least significant ones
         let column_point = &last_claim.point[..num_vars];
@@ -104,11 +107,11 @@ where
     /// Build points over which the evaluations produced by the sum-check in proving protocol are evaluated.
     /// - The first point being returned is the point for the claim about the one-hot encoded input
     /// - The second point being returned is the point for the claim about the emebdding matrix
-    fn build_points_for_claims<E: ExtensionField>(
-        last_claim: &Claim<E>,
+    fn build_points_for_claims<F: PrimeField>(
+        last_claim: &Claim<F>,
         emb_size: usize,
-        sumcheck_point: &[E],
-    ) -> anyhow::Result<(Vec<E>, Vec<E>)> {
+        sumcheck_point: &[F],
+    ) -> anyhow::Result<(Vec<F>, Vec<F>)> {
         let (row_point, column_point) = Self::split_output_point(last_claim, emb_size)?;
         let one_hot_claim_point = sumcheck_point
             .iter()
@@ -263,11 +266,10 @@ impl PadOp for Embeddings<Element> {
 }
 
 impl ProveInfo for Embeddings<Element> {
-    fn step_info<E: ExtensionField>(
+    fn step_info<F: PrimeField>(
         &self,
-        id: NodeId,
         mut aux: ContextAux,
-    ) -> anyhow::Result<(LayerCtx<E>, ContextAux)> {
+    ) -> anyhow::Result<(LayerCtx<F>, ContextAux)> {
         let tensor = self.mat.wrapped_tensor()?;
         let data = Vec::from(tensor.clone().pad_next_power_of_two());
 
@@ -276,7 +278,6 @@ impl ProveInfo for Embeddings<Element> {
 
         Ok((
             LayerCtx::Embeddings(EmbeddingsCtx {
-                id,
                 vocab_size: self.vocab_size,
                 emb_size: self.emb_size,
                 embedding_key: CommitmentId::from(self.mat.storage_key()),
@@ -310,6 +311,8 @@ impl OpInfo for EmbeddingsCtx {
         true
     }
 }
+
+impl Splittable for EmbeddingsCtx {}
 
 impl QuantizeOp for Embeddings<f32> {
     type QuantizedOp = Embeddings<Element>;
@@ -353,23 +356,21 @@ impl QuantizeOp for Embeddings<f32> {
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for Embeddings<Element>
+impl<F, PCS> ProvableOp<F, PCS> for Embeddings<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
     type Ctx = EmbeddingsCtx;
 
-    fn prove<T: Transcript<E>>(
+    fn prove<T: Transcript>(
         &self,
         node_id: NodeId,
         _ctx: &Self::Ctx,
-        last_claims: Vec<&Claim<E>>,
+        last_claims: Vec<&Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        prover: &mut Prover<F, T, PCS>,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         // we first construct the one hot encoding from the input indices and then we run
         // the matmul protocol.
         ensure!(
@@ -393,11 +394,11 @@ where
         // as `reduced_one_hot[x[i]] += \beta(i, row_point)`, for all items `x[i]` in the input tensor
 
         // we precompute all items `\beta(i, row_point)` for all `i` between `0` and `x.len()`
-        let beta_vec = compute_betas_eval(row_point);
+        let beta_vec = evals(row_point);
         let vocab_size = self.vocab_size.next_power_of_two();
         let emb_size = self.emb_size.next_power_of_two();
         // we now build the `reduced_one_hot` vector as `reduced_one_hot[x[i]] += beta_vec[i]`
-        let mut reduced_one_hot = vec![E::ZERO; vocab_size];
+        let mut reduced_one_hot = vec![F::ZERO; vocab_size];
 
         input
             .data()
@@ -428,7 +429,7 @@ where
 
         let mut embedding_mat_mle = embedding_matrix.to_2d_mle()?;
 
-        embedding_mat_mle.fix_variables_in_place_parallel(column_point);
+        embedding_mat_mle.fix_low_variables_in_place_parallel(column_point);
 
         // check that after fixing the variables in both matrices the number of free
         // variables is the same
@@ -436,11 +437,11 @@ where
 
         let num_vars = input_mle.num_vars();
         let num_threads = optimal_sumcheck_threads(num_vars);
-        let mut expr_builder = VirtualPolynomialsBuilder::<E>::new(num_threads, num_vars);
+        let mut expr_builder = VirtualPolynomialsBuilder::<F>::new(num_threads, num_vars);
         let input_expr = expr_builder.lift(Either::Left(&input_mle));
         let embedding_mat_expr = expr_builder.lift(Either::Left(&embedding_mat_mle));
         let virtual_poly = expr_builder.to_virtual_polys(&[input_expr * embedding_mat_expr], &[]);
-        let (proof, state) = IOPProverState::<E>::prove(virtual_poly, prover.transcript);
+        let (proof, state) = IOPProverState::<F>::prove(virtual_poly, prover.transcript);
 
         // sum-check will produce claims about `reduced_one_hot` vector and the `embedding_matrix`. We need
         // to commit build a claim for the one-hot encoded input tensor from the first claim, and produce an
@@ -475,27 +476,28 @@ where
     }
 }
 
-impl<E, PCS> VerifiableCtx<E, PCS> for EmbeddingsCtx
+impl<F, PCS> VerifiableCtx<F, PCS> for EmbeddingsCtx
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
-    type Proof = EmbeddingsProof<E>;
+    type Proof = EmbeddingsProof<F>;
 
-    fn verify<T: Transcript<E>>(
+    fn verify<T: Transcript>(
         &self,
         proof: &Self::Proof,
-        last_claims: &[&Claim<E>],
-        verifier: &mut Verifier<E, T, PCS>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
         _shape_step: &ShapeStep,
-    ) -> anyhow::Result<Vec<Claim<E>>> {
+        node_id: NodeId,
+    ) -> anyhow::Result<Vec<Claim<F>>> {
         ensure!(
             last_claims.len() == 1,
             "embeddings only support 1 last claim"
         );
         let last_claim = &last_claims[0];
         let num_vars = self.vocab_size.next_power_of_two().ilog2() as usize;
-        let subclaim = IOPVerifierState::<E>::verify(
+        let subclaim = IOPVerifierState::<F>::verify(
             last_claim.eval,
             &proof.sumcheck,
             &from_mle_list_dimensions(&[vec![num_vars, num_vars]]),
@@ -509,11 +511,7 @@ where
             Embeddings::<Element>::build_points_for_claims(
                 last_claim,
                 self.emb_size,
-                &subclaim
-                    .point
-                    .iter()
-                    .map(|p| p.elements)
-                    .collect::<Vec<_>>(),
+                &subclaim.point,
             )?;
         let one_hot_eval = proof.individual_claims[0];
         let embedding_mat_eval = proof.individual_claims[1];
@@ -523,7 +521,7 @@ where
         let embedding_mat_claim = Claim::new(emebdding_mat_point, embedding_mat_eval);
 
         verifier.add_common_claims(
-            self.id,
+            node_id,
             once((self.embedding_key.clone(), embedding_mat_claim)).collect(),
         );
 
@@ -550,10 +548,10 @@ where
         Ok(vec![one_hot_claim])
     }
 
-    fn verify_input_claim<A: AsRef<Tensor<E>>>(
+    fn verify_input_claim<D: Deref<Target = F> + ToField<F>, A: AsRef<Tensor<D>>>(
         &self,
         inputs: &[A],
-        claims: &[&Claim<E>],
+        claims: &[&Claim<F>],
     ) -> anyhow::Result<()> {
         // TODO verify efficiently the one hot encoding claim
         ensure!(inputs.len() == 1, "embeddings only support 1 input tensor");
@@ -569,13 +567,13 @@ where
             one_hot_claim.point.len()
         );
         let (r1, r2) = one_hot_claim.point.split_at(vocab_nv as usize);
-        let b1 = compute_betas_eval(r2);
+        let b1 = evals(r2);
         let sum = input.data().iter().take(unpadded_length).zip(b1).fold(
-            E::ZERO,
+            F::ZERO,
             |sum, (token, beta)| {
-                let token_value = token.to_canonical_u64_vec()[0] as usize;
+                let token_value = token.to_element() as usize;
                 let token_le_bits = to_bit_sequence_le(token_value, r1.len())
-                    .map(|b| E::from_canonical_usize(b))
+                    .map(|b| F::from(b as u64))
                     .collect_vec();
                 let selector = beta * identity_eval(r1, &token_le_bits);
                 sum + selector
@@ -588,7 +586,7 @@ where
         Ok(())
     }
 
-    fn write_proof_to_transcript<T: Transcript<E>>(
+    fn write_proof_to_transcript<T: Transcript>(
         &self,
         _proof: &Self::Proof,
         _transcript: &mut T,
@@ -622,9 +620,8 @@ impl Embeddings<f32> {
 
 #[cfg(test)]
 mod tests {
+    use ark_ff::{AdditiveGroup, Field};
     use ark_std::rand::Rng;
-    use ceno_p3::field::FieldAlgebra;
-    use ff_ext::GoldilocksExt2;
     use proptest::prelude::*;
     use std::{fmt::Debug, ops::Range};
     use tenstore::{GenStore, StorageKey};
@@ -641,6 +638,8 @@ mod tests {
     };
 
     use super::*;
+
+    type F = ark_bn254::Fr;
 
     fn generate_unique_random_indices(seq_len: usize, vocab_size: usize) -> Vec<usize> {
         let mut ctr = 0;
@@ -704,12 +703,12 @@ mod tests {
         Ok(())
     }
 
-    fn one_hot_encoding<E: ExtensionField>(indices: &[E], vocab_size: usize) -> Tensor<E> {
+    fn one_hot_encoding<F: PrimeField>(indices: &[F], vocab_size: usize) -> Tensor<F> {
         let mut data = Vec::new();
         for idx in indices {
-            let mut one_hot = vec![E::ZERO; vocab_size];
-            let idx: usize = idx.to_canonical_u64_vec()[0].try_into().unwrap();
-            one_hot[idx] = E::ONE;
+            let mut one_hot = vec![F::ZERO; vocab_size];
+            let idx: usize = idx.to_element().try_into().unwrap();
+            one_hot[idx] = F::ONE;
             data.extend_from_slice(&one_hot);
         }
         Tensor::new(vec![indices.len(), vocab_size].into(), data).unwrap()
@@ -719,7 +718,7 @@ mod tests {
     fn test_one_hot_encoding_inference() -> anyhow::Result<()> {
         let seq_len: usize = 5;
         let indices_elem: Vec<Element> = (0..seq_len).map(|i| i as Element).collect::<Vec<_>>();
-        let indices: Tensor<GoldilocksExt2> =
+        let indices: Tensor<F> =
             Tensor::<Element>::new(vec![5].into(), indices_elem.clone())?.to_field();
         let vocab_size = 6;
         let emb_size = 10;
@@ -729,36 +728,36 @@ mod tests {
         assert_eq!(
             one_hot.data(),
             &[
-                GoldilocksExt2::ONE,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ONE,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ONE,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ONE,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ZERO,
-                GoldilocksExt2::ONE,
-                GoldilocksExt2::ZERO,
+                F::ONE,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ONE,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ONE,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ONE,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ZERO,
+                F::ONE,
+                F::ZERO,
             ]
         );
 

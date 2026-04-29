@@ -23,8 +23,6 @@ use zkml::{
 #[cfg(test)]
 use zkml::model::SanityCheckRunner;
 
-type F = ff_ext::GoldilocksExt2;
-
 pub struct Snapshot<T>
 where
     T: TensorTypeParam,
@@ -78,9 +76,7 @@ impl GlobalContext {
                 tensor_to_handles(&inputs_f32, model_f32.graph(), &mut store_f32)?;
 
             let mut min_max_tracker_f32 = InferenceTracker::new(InferenceTrackingMode::MinMax);
-            let runner = BaseRunner {
-                store: store_f32.clone(),
-            };
+            let runner = BaseRunner::from(store_f32.clone());
             let runner = TrackerRunner {
                 inner: runner,
                 tracker: &mut min_max_tracker_f32,
@@ -120,9 +116,7 @@ impl GlobalContext {
                 tensor_to_handles(&inputs_elt, model_elt.graph(), &mut store_elt)?;
 
             let mut min_max_tracker_elt = InferenceTracker::new(InferenceTrackingMode::MinMax);
-            let runner = BaseRunner {
-                store: store_elt.clone(),
-            };
+            let runner = BaseRunner::from(store_elt.clone());
             let runner = TrackerRunner {
                 inner: runner,
                 tracker: &mut min_max_tracker_elt,
@@ -169,9 +163,7 @@ impl GlobalContext {
             let input_handles =
                 tensor_to_handles(&[input_tensor], driver_f32.model.graph(), &mut store_f32)?;
 
-            let runner = BaseRunner {
-                store: store_f32.clone(),
-            };
+            let runner = BaseRunner::from(store_f32.clone());
             let runner = TrackerRunner {
                 inner: runner,
                 tracker: &mut min_max_tracker_f32,
@@ -218,7 +210,7 @@ impl GlobalContext {
             let mut store_elt = GenStore::default();
             let (driver_elt, _metadata) = driver_f32.into_provable_llm(None)?;
             let input_tensor = driver_elt.tokens_to_tensor(&user_tokens)?;
-            let trace_elt = driver_elt.run_elements_with_tracker::<F>(
+            let trace_elt = driver_elt.run_elements_with_tracker(
                 input_tensor,
                 &mut store_elt,
                 &mut min_max_tracker_elt,

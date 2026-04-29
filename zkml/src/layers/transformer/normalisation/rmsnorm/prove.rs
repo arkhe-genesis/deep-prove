@@ -10,19 +10,17 @@ use std::collections::HashMap;
 use super::*;
 
 impl RMSNorm<Element> {
-    pub(crate) fn prove_internal<E, T, PCS>(
+    pub(crate) fn prove_internal<F, T, PCS>(
         &self,
         id: NodeId,
-        last_claim: &Claim<E>,
+        last_claim: &Claim<F>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>>
+        prover: &mut Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        F: PrimeField,
+        T: Transcript,
+        PCS: CommitmentScheme<Field = F>,
     {
         let lookup_op = step_data
             .node_outputs
@@ -62,7 +60,7 @@ impl RMSNorm<Element> {
             logup_proof,
             sumcheck_proof,
             evaluations,
-            commitment,
+            commitments,
             weight_evaluation,
             ..
         } = generic_proof;
@@ -70,7 +68,7 @@ impl RMSNorm<Element> {
         let proof = RMSNormProof {
             logup_proof,
             right_shift: lookup_op.right_shift() as Element,
-            commitment,
+            commitments,
             io_proof: sumcheck_proof,
             io_evaluations: evaluations,
             alpha_evaluation: weight_evaluation,
@@ -88,7 +86,7 @@ impl RMSNorm<Element> {
                 // Add the weight commitment claim to the prover
                 let alpha_key = CommitmentId::from(alpha_tensor.storage_key());
                 let claims_map =
-                    HashMap::from([(alpha_key, Claim::<E>::new(weight_eval_point, alpha_eval))]);
+                    HashMap::from([(alpha_key, Claim::<F>::new(weight_eval_point, alpha_eval))]);
                 prover.add_common_claims(id, claims_map);
             }
             (None, None, None) => {

@@ -1,11 +1,11 @@
 //! Module containing code for proving [`LayerNorm`] layers.
 
-use multilinear_extensions::mle::{IntoMLE, MultilinearExtension};
+use dp_crypto::IntoMLE;
 
 use crate::{
     layers::LayerProof,
     lookup::operation::generic_prove::{GenericLookupProof, LookupProverResult, prove_lookup_op},
-    to_base,
+    to_field,
 };
 
 use std::collections::HashMap;
@@ -13,19 +13,17 @@ use std::collections::HashMap;
 use super::*;
 
 impl LayerNorm<Element> {
-    pub(crate) fn prove_internal<E, T, PCS>(
+    pub(crate) fn prove_internal<F, T, PCS>(
         &self,
         id: NodeId,
-        last_claim: &Claim<E>,
+        last_claim: &Claim<F>,
         step_data: &Step<Element>,
-        prover: &mut Prover<E, T, PCS>,
-    ) -> Result<Vec<Claim<E>>>
+        prover: &mut Prover<F, T, PCS>,
+    ) -> Result<Vec<Claim<F>>>
     where
-        E: ExtensionField,
-        T: Transcript<E>,
-        PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-        PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-        PCS::ProverParam: Send + Sync,
+        F: PrimeField,
+        T: Transcript,
+        PCS: CommitmentScheme<Field = F>,
     {
         let lookup_op = step_data
             .node_outputs
@@ -59,15 +57,14 @@ impl LayerNorm<Element> {
         let bias_lt_eval =
             unpadded_input_shape.broadcasting_evaluation(&dim_points, &unbroadcast_shape)?;
         let wrapped_beta = self.beta.wrapped_tensor()?.clone().pad_next_power_of_two();
-        let beta_mle: MultilinearExtension<E> =
-            to_base::<E, _>(wrapped_beta.get_data().iter()).into_mle();
+        let beta_mle = to_field::<Element, F, _>(wrapped_beta.get_data().iter()).into_mle();
         let beta_point = dim_points
             .last()
             .ok_or(anyhow!(
                 "Could not get last dimension point for beta evaluation in LayerNorm proving"
             ))?
             .to_vec();
-        let beta_eval = beta_mle.evaluate(&beta_point);
+        let beta_eval = beta_mle.evaluate(&beta_point)?;
 
         let mut last_claim = last_claim.clone();
         last_claim.eval -= beta_eval * bias_lt_eval;
@@ -90,7 +87,7 @@ impl LayerNorm<Element> {
             logup_proof,
             sumcheck_proof,
             evaluations,
-            commitment,
+            commitments,
             weight_evaluation,
             shift_evaluations,
         } = generic_proof;
@@ -104,7 +101,7 @@ impl LayerNorm<Element> {
         let proof = LayerNormProof {
             logup_proof,
             right_shift: lookup_op.right_shift(),
-            commitment,
+            commitments,
             io_proof: sumcheck_proof,
             io_evaluations: evaluations,
             mean_evals,
@@ -123,11 +120,11 @@ impl LayerNorm<Element> {
         let claims_map = HashMap::from([
             (
                 CommitmentId::from(self.gamma.storage_key()),
-                Claim::<E>::new(gamma_point, gamma_eval),
+                Claim::<F>::new(gamma_point, gamma_eval),
             ),
             (
                 CommitmentId::from(self.beta.storage_key()),
-                Claim::<E>::new(beta_point, beta_eval),
+                Claim::<F>::new(beta_point, beta_eval),
             ),
         ]);
 

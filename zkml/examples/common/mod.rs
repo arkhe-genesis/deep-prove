@@ -1,11 +1,10 @@
 use crate::Tensor;
 use anyhow::ensure;
+use ark_bn254::Bn254;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams};
+use dp_crypto::arkyper::{HyperKZG, transcript::blake3::Blake3Transcript};
 use std::collections::HashMap;
 use tenstore::GenStore;
-use transcript::BasicTranscript;
 use zkml::{
     Element, IO, Proof, ProverContext,
     graph::{
@@ -20,11 +19,11 @@ use zkml::{
     },
 };
 
-pub type F = GoldilocksExt2;
+pub type F = ark_bn254::Fr;
 // the hasher type is chosen depending on the feature flag inside the mpcs crate
-pub type Pcs = Basefold<F, BasefoldRSParams>;
+pub type Pcs = HyperKZG<Bn254>;
 
-pub type T = BasicTranscript<F>;
+pub type T = Blake3Transcript;
 
 // Type of nodes of the graph to execute
 pub type Node<'a, 'b> = ExecGraphNode<'a, 'b, F, T, Pcs>;
@@ -41,13 +40,13 @@ pub type PartitionOutput<'a, 'b> = zkml::graph::partition::PartitionOutput<Node<
 
 pub type SerializableCtx = SerializableGraphCtx<F, Pcs>;
 
-pub trait GraphRuner {
+pub trait GraphRuner: 'static {
     type ChunkingStrategy: ChunkingStrategy;
     #[allow(clippy::type_complexity)]
     fn setup(
         &mut self,
-    ) -> anyhow::Result<(ProverContext<F, Pcs>, InferenceEngine, Vec<Tensor<Element>>)>;
-    fn chunk_strategy(&self) -> Self::ChunkingStrategy;
+    ) -> anyhow::Result<(ProverContext<'static, F, Pcs>, InferenceEngine, Vec<Tensor<Element>>)>;
+    fn chunk_strategy(&self, input_shapes: Vec<zkml::Shape>) -> Self::ChunkingStrategy;
     fn verify_proof(&self, proof: Proof<F, Pcs>, io: IO<F>) -> anyhow::Result<()>;
 }
 
@@ -136,7 +135,11 @@ pub fn main_loop<R: GraphRuner>(num_workers: usize, mut runner: R) -> anyhow::Re
     // the full context is not deserializable since it contains the store, so we need to build it
     // from the deserialized context by attaching the store
     let ctx = deserialized_ctx.to_full_ctx(store.clone());
-    let graph: Graph = build_execution_graph(&ctx, Some(num_workers), runner.chunk_strategy())?;
+    let graph: Graph = build_execution_graph(
+        &ctx, 
+        Some(num_workers), 
+        runner.chunk_strategy(inputs.iter().map(|inp| inp.unpadded_shape().clone()).collect())
+    )?;
 
     let inputs = graph_inputs(inputs, store.clone(), &graph)?;
 

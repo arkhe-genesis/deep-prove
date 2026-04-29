@@ -3,7 +3,6 @@
 use anyhow::ensure;
 
 use super::*;
-use transcript::Transcript;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 /// Enum representing the different types of lookup tables available.
@@ -154,28 +153,16 @@ impl TableType {
         Ok(output)
     }
 
-    pub fn generate_challenge<E: ExtensionField, T: Transcript<E>>(&self, transcript: &mut T) -> E {
+    pub fn generate_challenge<F: PrimeField, T: Transcript>(&self, transcript: &mut T) -> F {
         match self {
-            TableType::GeLU => transcript.sample_and_append_challenge(b"GeLU").elements,
-            TableType::SiLU => transcript.sample_and_append_challenge(b"SiLU").elements,
-            TableType::ReLU => transcript.sample_and_append_challenge(b"ReLU").elements,
-            TableType::Requantise => {
-                transcript
-                    .sample_and_append_challenge(b"Requantise")
-                    .elements
-            }
-            TableType::Exp => transcript.sample_and_append_challenge(b"Exp").elements,
-            TableType::ZeroCheck => transcript.sample_and_append_challenge(b"Zero").elements,
-            TableType::SignedZeroCheck => {
-                transcript
-                    .sample_and_append_challenge(b"SignedZero")
-                    .elements
-            }
-            TableType::ShiftCheck => {
-                transcript
-                    .sample_and_append_challenge(b"ShiftCheck")
-                    .elements
-            }
+            TableType::GeLU => transcript.append_and_sample(b"GeLU"),
+            TableType::SiLU => transcript.append_and_sample(b"SiLU"),
+            TableType::ReLU => transcript.append_and_sample(b"ReLU"),
+            TableType::Requantise => transcript.append_and_sample(b"Requantise"),
+            TableType::Exp => transcript.append_and_sample(b"Exp"),
+            TableType::ZeroCheck => transcript.append_and_sample(b"Zero"),
+            TableType::SignedZeroCheck => transcript.append_and_sample(b"SignedZero"),
+            TableType::ShiftCheck => transcript.append_and_sample(b"ShiftCheck"),
         }
     }
 }

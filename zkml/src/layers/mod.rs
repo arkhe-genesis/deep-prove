@@ -1,5 +1,5 @@
 use crate::{
-    Element, ProverContext, ScalingStrategy, Shape,
+    Element, InitTranscript, ProverContext, ScalingStrategy, Shape,
     graph::NodeId,
     iop::context::{ContextAux, ShapeStep},
     layers::{
@@ -9,9 +9,11 @@ use crate::{
         einsum::{EINSUM_LAYER, EinSum, EinSumContext, EinSumProof},
         flatten::FLATTEN_LAYER,
         pooling::{POOLING_LAYER, Pooling},
-        provable::ProvingHandle,
+        provable::{ProvingHandle, Splittable},
+        recombination::{RECOMBINATION_LAYER, RecombinationLayer, RecombinationProof},
         requant::{REQUANT_LAYER, Requant, RequantProof},
         reshape::{RESHAPE_LAYER, Reshape, ReshapeCtx},
+        split::{SPLIT_LAYER, SplitLayer, SplitLayerProof},
         transformer::{
             attention_mask::{
                 ATTENTION_MASK_LAYER, AttentionMask, AttentionMaskCtx, AttentionMaskProof,
@@ -39,10 +41,10 @@ use crate::{
 };
 use activation::ActivationCtx;
 use anyhow::{Result, bail, ensure};
+use ark_ff::PrimeField;
 use convolution::{ConvCtx, ConvProof};
-use ff_ext::ExtensionField;
+use dp_crypto::arkyper::{CommitmentScheme, transcript::Transcript};
 use flatten::Flatten;
-use mpcs::PolynomialCommitmentScheme;
 use pooling::{PoolingCtx, PoolingProof};
 use provable::{
     Evaluate, LayerOut, OpInfo, PadOp, ProvableOp, ProveInfo, QuantizeOp, QuantizeOutput,
@@ -51,7 +53,6 @@ use requant::RequantCtx;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 use tenstore::StoreError;
-use transcript::Transcript;
 
 pub mod activation;
 pub mod add;
@@ -61,8 +62,10 @@ pub mod flatten;
 pub mod hadamard;
 pub mod pooling;
 pub mod provable;
+pub mod recombination;
 pub mod requant;
 pub mod reshape;
+pub mod split;
 pub mod transformer;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +93,8 @@ where
     Positional(Positional<T>),
     AttentionMask(AttentionMask<T>),
     Logits(Logits),
+    Split(SplitLayer),
+    Recombination(RecombinationLayer),
 }
 
 impl<T> Layer<T>
@@ -113,6 +118,8 @@ where
             Layer::Logits(_) => LOGITS_LAYER,
             Layer::AttentionMask(_) => ATTENTION_MASK_LAYER,
             Layer::EinSum(_) => EINSUM_LAYER,
+            Layer::Split(_) => SPLIT_LAYER,
+            Layer::Recombination(_) => RECOMBINATION_LAYER,
         };
         assert_eq!(r.len(), 4, "layer short name must be 4 chars long: {r}");
         r
@@ -136,6 +143,8 @@ where
             Layer::Positional(_) => "positional",
             Layer::Logits(_) => "logits",
             Layer::AttentionMask(_) => "attention-mask",
+            Layer::Split(_) => "split",
+            Layer::Recombination(_) => "recombination",
         }
     }
 
@@ -158,13 +167,16 @@ where
 /// NOTE: The context automatically appends a requant step after each dense layer.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub enum LayerCtx<E: ExtensionField> {
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub enum LayerCtx<F: PrimeField> {
     Convolution(ConvCtx),
     Activation(ActivationCtx),
     Requant(RequantCtx),
     Pooling(PoolingCtx),
-    EinSum(EinSumContext<E>),
+    EinSum(EinSumContext<F>),
     LayerNorm(LayerNormCtx),
     RMSNorm(RMSNormCtx),
     Flatten,
@@ -175,32 +187,39 @@ pub enum LayerCtx<E: ExtensionField> {
     Positional(PositionalCtx),
     AttentionMask(AttentionMaskCtx),
     Logits(LogitsCtx),
+    Split(SplitLayer),
+    Recombination(RecombinationLayer),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
-pub enum LayerProof<E, PCS>
+#[serde(bound(
+    serialize = "F: ark_serialize::CanonicalSerialize",
+    deserialize = "F: ark_serialize::CanonicalDeserialize"
+))]
+pub enum LayerProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
-    Convolution(Box<ConvProof<E>>),
-    Activation(ActivationProof<E, PCS>),
-    Requant(RequantProof<E, PCS>),
-    Pooling(PoolingProof<E, PCS>),
-    EinSum(EinSumProof<E>),
-    Add(AddProof<E>),
-    LayerNorm(LayerNormProof<E, PCS>),
-    RMSNorm(RMSNormProof<E, PCS>),
-    Softmax(SoftmaxProof<E, PCS>),
-    Embeddings(EmbeddingsProof<E>),
-    Logits(LogitsProof<E, PCS>),
-    Positional(PositionalProof<E>),
-    AttentionMask(AttentionMaskProof<E>),
+    Convolution(Box<ConvProof<F>>),
+    Activation(ActivationProof<F, PCS>),
+    Requant(RequantProof<F, PCS>),
+    Pooling(PoolingProof<F, PCS>),
+    EinSum(EinSumProof<F>),
+    Add(AddProof<F>),
+    LayerNorm(LayerNormProof<F, PCS>),
+    RMSNorm(RMSNormProof<F, PCS>),
+    Softmax(SoftmaxProof<F, PCS>),
+    Embeddings(EmbeddingsProof<F>),
+    Logits(LogitsProof<F, PCS>),
+    Positional(PositionalProof<F>),
+    AttentionMask(AttentionMaskProof<F>),
+    SplitLayer(SplitLayerProof<F>),
+    Recombination(RecombinationProof<F>),
     Dummy, // To be used for non-provable layers
 }
 
-impl<E: ExtensionField> LayerCtx<E> {
+impl<F: PrimeField> LayerCtx<F> {
     pub fn variant_name(&self) -> String {
         match self {
             Self::EinSum(_) => "EinSum".to_string(),
@@ -218,6 +237,8 @@ impl<E: ExtensionField> LayerCtx<E> {
             Self::Pooling(_) => "Pooling".to_string(),
             Self::Flatten => "Reshape".to_string(),
             Self::AttentionMask(_) => "AttentionMask".to_string(),
+            Self::Split(_) => "Split".to_string(),
+            Self::Recombination(_) => "Recombination".to_string(),
         }
     }
 
@@ -242,6 +263,14 @@ impl<E: ExtensionField> LayerCtx<E> {
         unpadded_input: &[Shape],
         padded_input: &[Shape],
     ) -> Result<ShapeStep> {
+        if let LayerCtx::Split(split_layer) = self {
+            // check that the unpadded input shapes are equal to the split layer unpadded input shapes, which is needed
+            // to properly compute the padded output shapes of the layer
+            ensure!(
+                unpadded_input == split_layer.unpadded_input_shapes,
+                "Unpadded input shapes are not equal to split layer unpadded input shapes"
+            );
+        }
         let unpadded_output = self.output_shapes(unpadded_input, PaddingMode::NoPadding)?;
         let padded_output = self.output_shapes(padded_input, PaddingMode::Padding)?;
         Ok(ShapeStep::new(
@@ -272,6 +301,56 @@ impl<E: ExtensionField> LayerCtx<E> {
             LayerCtx::Positional(_) => None,
             LayerCtx::AttentionMask(_) => None,
             LayerCtx::Logits(logits_ctx) => Some(logits_ctx.lookup_tables()),
+            LayerCtx::Split(_) => None,
+            LayerCtx::Recombination(_) => None,
+        }
+    }
+}
+
+impl<F: PrimeField> Splittable for LayerCtx<F> {
+    fn ideal_num_chunks(&self, input_shapes: &[Shape]) -> Option<usize> {
+        match self {
+            LayerCtx::Convolution(conv_ctx) => conv_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Activation(activation_ctx) => activation_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Requant(requant_ctx) => requant_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Pooling(pooling_ctx) => pooling_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::EinSum(ein_sum_context) => ein_sum_context.ideal_num_chunks(input_shapes),
+            LayerCtx::LayerNorm(layer_norm_ctx) => layer_norm_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::RMSNorm(rmsnorm_ctx) => rmsnorm_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Flatten => None,
+            LayerCtx::Add(add_ctx) => add_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Softmax(softmax_ctx) => softmax_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Reshape(reshape_ctx) => reshape_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Embeddings(embeddings_ctx) => embeddings_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Positional(positional_ctx) => positional_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::AttentionMask(attention_mask_ctx) => {
+                attention_mask_ctx.ideal_num_chunks(input_shapes)
+            }
+            LayerCtx::Logits(logits_ctx) => logits_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::Split(_) => None,
+            LayerCtx::Recombination(_) => None,
+        }
+    }
+
+    fn is_splittable(&self) -> bool {
+        match self {
+            LayerCtx::Convolution(conv_ctx) => conv_ctx.is_splittable(),
+            LayerCtx::Activation(activation_ctx) => activation_ctx.is_splittable(),
+            LayerCtx::Requant(requant_ctx) => requant_ctx.is_splittable(),
+            LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_splittable(),
+            LayerCtx::EinSum(ein_sum_context) => ein_sum_context.is_splittable(),
+            LayerCtx::LayerNorm(layer_norm_ctx) => layer_norm_ctx.is_splittable(),
+            LayerCtx::RMSNorm(rmsnorm_ctx) => rmsnorm_ctx.is_splittable(),
+            LayerCtx::Flatten => false,
+            LayerCtx::Add(add_ctx) => add_ctx.is_splittable(),
+            LayerCtx::Softmax(softmax_ctx) => softmax_ctx.is_splittable(),
+            LayerCtx::Reshape(reshape_ctx) => reshape_ctx.is_splittable(),
+            LayerCtx::Embeddings(embeddings_ctx) => embeddings_ctx.is_splittable(),
+            LayerCtx::Positional(positional_ctx) => positional_ctx.is_splittable(),
+            LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.is_splittable(),
+            LayerCtx::Logits(logits_ctx) => logits_ctx.is_splittable(),
+            LayerCtx::Split(_) => false,
+            LayerCtx::Recombination(_) => false,
         }
     }
 }
@@ -379,6 +458,8 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
                 attention_mask.output_shapes(input_shapes, padding_mode)
             }
             Layer::EinSum(einsum) => einsum.output_shapes(input_shapes, padding_mode),
+            Layer::Split(split) => split.output_shapes(input_shapes, padding_mode),
+            Layer::Recombination(rec) => rec.output_shapes(input_shapes, padding_mode),
         }
     }
 
@@ -399,6 +480,8 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Flatten(reshape) => reshape.num_outputs(num_inputs),
             Layer::AttentionMask(attention_mask) => attention_mask.num_outputs(num_inputs),
             Layer::EinSum(einsum) => einsum.num_outputs(num_inputs),
+            Layer::Split(split) => split.num_outputs(num_inputs),
+            Layer::Recombination(rec) => rec.num_outputs(num_inputs),
         }
     }
 
@@ -419,6 +502,8 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Flatten(reshape) => reshape.describe(),
             Layer::AttentionMask(attention_mask) => attention_mask.describe(),
             Layer::EinSum(einsum) => einsum.describe(),
+            Layer::Split(split) => split.describe(),
+            Layer::Recombination(rec) => rec.describe(),
         }
     }
 
@@ -439,6 +524,8 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Flatten(reshape) => reshape.is_provable(),
             Layer::AttentionMask(attention_mask) => attention_mask.is_provable(),
             Layer::EinSum(einsum) => einsum.is_provable(),
+            Layer::Split(split) => split.is_provable(),
+            Layer::Recombination(rec) => rec.is_provable(),
         }
     }
 }
@@ -461,6 +548,8 @@ impl Evaluate<f32> for Layer<f32> {
             Layer::Flatten(reshape) => reshape.evaluate(inputs),
             Layer::AttentionMask(attention_mask) => attention_mask.evaluate(inputs),
             Layer::EinSum(einsum) => einsum.evaluate(inputs),
+            Layer::Split(split) => split.evaluate(inputs),
+            Layer::Recombination(rec) => rec.evaluate(inputs),
         }
     }
 }
@@ -483,6 +572,8 @@ impl Evaluate<Element> for Layer<Element> {
             Layer::Flatten(reshape) => reshape.evaluate(inputs),
             Layer::AttentionMask(attention_mask) => attention_mask.evaluate(inputs),
             Layer::EinSum(einsum) => einsum.evaluate(inputs),
+            Layer::Split(split) => split.evaluate(inputs),
+            Layer::Recombination(rec) => rec.evaluate(inputs),
         };
 
         #[cfg(feature = "capture-layers-quant")]
@@ -499,27 +590,25 @@ impl Evaluate<Element> for Layer<Element> {
 }
 
 impl ProveInfo for Layer<Element> {
-    fn step_info<E: ExtensionField>(
-        &self,
-        id: NodeId,
-        aux: ContextAux,
-    ) -> Result<(LayerCtx<E>, ContextAux)> {
+    fn step_info<F: PrimeField>(&self, aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         match self {
-            Layer::Add(add) => add.step_info(id, aux),
-            Layer::LayerNorm(layernorm) => layernorm.step_info(id, aux),
-            Layer::RMSNorm(rmsnorm) => rmsnorm.step_info(id, aux),
-            Layer::Softmax(softmax) => softmax.step_info(id, aux),
-            Layer::Logits(logits) => logits.step_info(id, aux),
-            Layer::Positional(positional) => positional.step_info(id, aux),
-            Layer::Embeddings(embeddings) => embeddings.step_info(id, aux),
-            Layer::Reshape(reshape) => reshape.step_info(id, aux),
-            Layer::Convolution(conv) => conv.step_info(id, aux),
-            Layer::Activation(activation) => activation.step_info(id, aux),
-            Layer::Requant(requant) => requant.step_info(id, aux),
-            Layer::Pooling(pooling) => pooling.step_info(id, aux),
-            Layer::Flatten(reshape) => reshape.step_info(id, aux),
-            Layer::AttentionMask(attention_mask) => attention_mask.step_info(id, aux),
-            Layer::EinSum(einsum) => einsum.step_info(id, aux),
+            Layer::Add(add) => add.step_info(aux),
+            Layer::LayerNorm(layernorm) => layernorm.step_info(aux),
+            Layer::RMSNorm(rmsnorm) => rmsnorm.step_info(aux),
+            Layer::Softmax(softmax) => softmax.step_info(aux),
+            Layer::Logits(logits) => logits.step_info(aux),
+            Layer::Positional(positional) => positional.step_info(aux),
+            Layer::Embeddings(embeddings) => embeddings.step_info(aux),
+            Layer::Reshape(reshape) => reshape.step_info(aux),
+            Layer::Convolution(conv) => conv.step_info(aux),
+            Layer::Activation(activation) => activation.step_info(aux),
+            Layer::Requant(requant) => requant.step_info(aux),
+            Layer::Pooling(pooling) => pooling.step_info(aux),
+            Layer::Flatten(reshape) => reshape.step_info(aux),
+            Layer::AttentionMask(attention_mask) => attention_mask.step_info(aux),
+            Layer::EinSum(einsum) => einsum.step_info(aux),
+            Layer::Split(split) => split.step_info(aux),
+            Layer::Recombination(rec) => rec.step_info(aux),
         }
     }
 }
@@ -547,27 +636,27 @@ impl PadOp for Layer<Element> {
                 Layer::AttentionMask(attention_mask.pad_node(si)?)
             }
             Layer::EinSum(einsum) => Layer::EinSum(einsum.pad_node(si)?),
+            Layer::Split(split) => Layer::Split(split.pad_node(si)?),
+            Layer::Recombination(rec) => Layer::Recombination(rec.pad_node(si)?),
         })
     }
 }
 
-impl<E, PCS> ProvableOp<E, PCS> for Layer<Element>
+impl<F, PCS> ProvableOp<F, PCS> for Layer<Element>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E> + Send + Sync,
-    PCS::CommitmentWithWitness: Serialize + DeserializeOwned + Send + Sync,
-    PCS::ProverParam: Send + Sync,
+    F: PrimeField,
+    PCS: CommitmentScheme<Field = F>,
 {
-    type Ctx = LayerCtx<E>;
+    type Ctx = LayerCtx<F>;
 
-    fn prove<'a, 'b, 'c, 'd, T: Transcript<E>>(
+    fn prove<'a, 'b, 'c, 'd, T: Transcript + InitTranscript>(
         &'a self,
         node_id: NodeId,
         ctx: &'b Self::Ctx,
-        last_claims: Vec<&crate::Claim<E>>,
+        last_claims: Vec<&crate::Claim<F>>,
         step_data: &Step<Element>,
-        prover: &mut crate::Prover<'c, 'd, E, T, PCS>,
-    ) -> Result<Vec<crate::Claim<E>>> {
+        prover: &mut crate::Prover<'c, 'd, F, T, PCS>,
+    ) -> Result<Vec<crate::Claim<F>>> {
         match (self, ctx) {
             (Layer::Convolution(convolution), LayerCtx::Convolution(info)) => {
                 convolution.prove(node_id, info, last_claims, step_data, prover)
@@ -611,7 +700,12 @@ where
             (Layer::EinSum(einsum), LayerCtx::EinSum(info)) => {
                 einsum.prove(node_id, info, last_claims, step_data, prover)
             }
-
+            (Layer::Split(split), LayerCtx::Split(info)) => {
+                split.prove(node_id, info, last_claims, step_data, prover)
+            }
+            (Layer::Recombination(rec), LayerCtx::Recombination(info)) => {
+                rec.prove(node_id, info, last_claims, step_data, prover)
+            }
             _ => bail!(
                 "Incompatible layer {} and ctx {} found for node id {}",
                 self.describe(),
@@ -624,9 +718,9 @@ where
     fn gen_lookup_witness(
         &self,
         id: NodeId,
-        ctx: &ProverContext<E, PCS>,
+        ctx: &ProverContext<F, PCS>,
         step_data: &Step<Element>,
-    ) -> Result<LookupWitnessGen<E, PCS>> {
+    ) -> Result<LookupWitnessGen<'_, F>> {
         match self {
             Layer::Convolution(convolution) => convolution.gen_lookup_witness(id, ctx, step_data),
             Layer::Add(add) => add.gen_lookup_witness(id, ctx, step_data),
@@ -651,6 +745,8 @@ where
                 attention_mask.gen_lookup_witness(id, ctx, step_data)
             }
             Layer::EinSum(einsum) => einsum.gen_lookup_witness(id, ctx, step_data),
+            Layer::Split(split) => split.gen_lookup_witness(id, ctx, step_data),
+            Layer::Recombination(rec) => rec.gen_lookup_witness(id, ctx, step_data),
         }
     }
 }
@@ -840,14 +936,18 @@ impl QuantizeOp for Layer<f32> {
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
             }
+            Layer::Split(split) => QuantizeOutput::new(Layer::Split(split), input_scaling.to_vec()),
+            Layer::Recombination(rec) => {
+                QuantizeOutput::new(Layer::Recombination(rec), input_scaling.to_vec())
+            }
         })
     }
 }
 
-impl<E, PCS> LayerProof<E, PCS>
+impl<F, PCS> LayerProof<F, PCS>
 where
-    E: ExtensionField,
-    PCS: PolynomialCommitmentScheme<E>,
+    F: PrimeField,
+    PCS: CommitmentScheme,
 {
     pub fn variant_name(&self) -> String {
         match self {
@@ -865,6 +965,8 @@ where
             Self::Dummy => "Dummy".to_string(),
             Self::AttentionMask(_) => "AttentionMask".to_string(),
             Self::EinSum(_) => "EinSum".to_string(),
+            Self::SplitLayer(_) => "Split".to_string(),
+            Self::Recombination(_) => "Recombination".to_string(),
         }
     }
 }

@@ -159,9 +159,7 @@ impl ScalingStrategy for InferenceObserver {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let runner = BaseRunner {
-                store: store.clone(),
-            };
+            let runner = BaseRunner::from(store.clone());
             let runner = TrackerRunner {
                 inner: runner,
                 tracker: &mut tracker,

@@ -1,16 +1,12 @@
 use crate::{Element, quantization, rng_from_env_or_random, seed_from_env_or_rng};
+use ark_bn254::Bn254;
+use ark_ff::PrimeField;
 use ark_std::rand::{Rng, SeedableRng, rngs::StdRng};
-use ff_ext::{ExtensionField, FromUniformBytes};
+use dp_crypto::arkyper::HyperKZG;
 use itertools::Itertools;
-use mpcs::{Basefold, BasefoldRSParams};
 
 // The hasher type is chosen depending on the feature flag
-pub(crate) type Pcs<E> = Basefold<E, BasefoldRSParams>;
-
-pub fn _random_vector<E: ExtensionField>(n: usize) -> Vec<E> {
-    let mut rng = rng_from_env_or_random();
-    (0..n).map(|_| E::random(&mut rng)).collect_vec()
-}
+pub(crate) type Pcs = HyperKZG<Bn254>;
 
 pub fn random_vector(n: usize) -> Vec<Element> {
     let mut rng = rng_from_env_or_random();
@@ -19,16 +15,9 @@ pub fn random_vector(n: usize) -> Vec<Element> {
         .collect_vec()
 }
 
-pub fn random_field_vector<E: FromUniformBytes>(n: usize) -> Vec<E> {
+pub fn random_field_vector<F: PrimeField>(n: usize) -> Vec<F> {
     let mut rng = rng_from_env_or_random();
-    (0..n).map(|_| E::random(&mut rng)).collect_vec()
-}
-
-pub fn random_bool_vector<E: ExtensionField>(n: usize) -> Vec<E> {
-    let mut rng = rng_from_env_or_random();
-    (0..n)
-        .map(|_| E::from_canonical_u64(rng.gen_bool(0.5) as u64))
-        .collect_vec()
+    (0..n).map(|_| F::rand(&mut rng)).collect_vec()
 }
 
 #[allow(unused)]

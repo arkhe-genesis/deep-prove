@@ -1,6 +1,6 @@
+use ark_bn254::Bn254;
 use criterion::{Criterion, criterion_group, criterion_main};
-use ff_ext::GoldilocksExt2;
-use mpcs::{Basefold, BasefoldRSParams};
+use dp_crypto::arkyper::{HyperKZG, transcript::blake3::Blake3Transcript};
 use tenstore::GenStore;
 use zkml::{
     Element, Prover, ProverContext, Tensor,
@@ -17,17 +17,17 @@ use zkml::{
     verify,
 };
 
-type F = GoldilocksExt2;
-type Pcs<E> = Basefold<E, BasefoldRSParams>;
+type F = ark_bn254::Fr;
+type Pcs = HyperKZG<Bn254>;
 
-type Transcript = transcript::basic::BasicTranscript<F>;
+type Transcript = Blake3Transcript;
 
 const MLP_IRIS: &[u8] = include_bytes!("../assets/scripts/MLP/mlp-iris-01.onnx");
 const MLP_IRIS_INPUT: &[u8] = include_bytes!("../assets/scripts/MLP/input.json.zst");
 const CNN_CIFAR: &[u8] = include_bytes!("../assets/scripts/CNN/cnn-cifar-01.onnx");
 const CNN_CIFAR_INPUT: &[u8] = include_bytes!("../assets/scripts/CNN/input.json.zst");
 
-type P<'a, 'b> = Prover<'a, 'b, F, Transcript, Pcs<F>>;
+type P<'a, 'b> = Prover<'a, 'b, F, Transcript, Pcs>;
 
 fn parse_model_and_inputs<T: std::io::Read>(
     model_data: &[u8],
@@ -66,13 +66,12 @@ fn random_input<T: Clone>(inputs: &[T]) -> T {
 fn prove_model(
     model: &Model<Element>,
     inputs: Vec<Tensor<i64>>,
-    prover_ctx: &ProverContext<F, Pcs<F>>,
-    verifier_ctx: &VerifierContext<F, Pcs<F>>,
+    prover_ctx: &ProverContext<F, Pcs>,
+    verifier_ctx: &VerifierContext<F, Pcs>,
 ) {
     let trace = model.run(inputs, &mut GenStore::default()).unwrap();
-    let io = trace.to_verifier_io().unwrap();
 
-    let proof = P::prove(prover_ctx, trace, model).expect("unable to generate proof");
+    let (proof, io) = P::prove(prover_ctx, trace, model).expect("unable to generate proof");
 
     verify::<_, Transcript, _>(verifier_ctx, proof, io).expect("invalid proof");
 }
@@ -87,7 +86,7 @@ fn prove(c: &mut Criterion) {
     let inputs = zstd::Decoder::new(MLP_IRIS_INPUT).expect("failed to parse zstd");
     let (model, metadata, inputs) = parse_model_and_inputs(MLP_IRIS, inputs);
     let (prover_ctx, verifier_ctx) = model
-        .generate_contexts::<F, Pcs<F>>()
+        .generate_contexts::<F, Pcs>()
         .expect("unable to generate context");
 
     let inputs = inputs_to_elements(&model, &metadata, inputs);
@@ -102,7 +101,7 @@ fn prove(c: &mut Criterion) {
     let inputs = zstd::Decoder::new(CNN_CIFAR_INPUT).expect("failed to parse zstd");
     let (model, _metadata, inputs) = parse_model_and_inputs(CNN_CIFAR, inputs);
     let (prover_ctx, verifier_ctx) = model
-        .generate_contexts::<F, Pcs<F>>()
+        .generate_contexts::<F, Pcs>()
         .expect("unable to generate context");
 
     let inputs = inputs_to_elements(&model, &metadata, inputs);

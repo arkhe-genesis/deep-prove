@@ -1,8 +1,10 @@
 use super::*;
-use crate::tensor::KeyedTensor;
-use ff_ext::GoldilocksExt2;
+use crate::{get_root_of_unity, tensor::KeyedTensor};
+use ark_ff::{FftField, Field};
 use proptest::prelude::*;
 use std::{fmt::Debug, ops::Range};
+
+type F = ark_bn254::Fr;
 
 fn split_garbage(
     fft_output: &Tensor<Element>,
@@ -28,6 +30,14 @@ fn split_garbage(
         }
     }
     (valid, garbage)
+}
+
+#[test]
+fn test_root_of_unity() {
+    for i in 2..=F::TWO_ADICITY {
+        let c = get_root_of_unity::<F>(i as usize).unwrap();
+        assert_eq!(c.pow([1 << i as u64]), F::ONE, "Failed for {i}");
+    }
 }
 
 /// Checks `conv2d_tensor` and `fft_tensor` have the same result.
@@ -115,7 +125,7 @@ fn test_conv() {
 
                     filter.prepare_for_fft(&padded_input_shape).unwrap();
 
-                    let (result, _) = filter.fft_conv::<GoldilocksExt2>(&input, &bias).unwrap();
+                    let (result, _) = filter.fft_conv::<F>(&input, &bias).unwrap();
                     check_tensor_consistency(&expected, &result);
                 }
             }
@@ -182,7 +192,7 @@ fn test_conv_unpadded_to_padded() {
         .unwrap()
         .prepared_for_fft(&input_shape)
         .unwrap();
-    let (fft_output, conv_data) = fft_conv.fft::<GoldilocksExt2>(&padded_input).unwrap();
+    let (fft_output, conv_data) = fft_conv.fft::<F>(&padded_input).unwrap();
     let (valid, _garbage) = split_garbage(&fft_output, output.shape());
     assert_eq!(
         valid,

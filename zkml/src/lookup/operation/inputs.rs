@@ -1,11 +1,11 @@
 //! Module containing code for transforming the chunked input MLEs into lookup operation inputs.
 
-use crate::{lookup::operation::variant::LookupVariant, to_base};
+use crate::{lookup::operation::variant::LookupVariant, to_field};
 
 use super::*;
 
+use dp_crypto::{Expression, IntoMLE, poly::dense::DensePolynomial, util::ceil_log2};
 use itertools::izip;
-use p3_field::FieldAlgebra;
 
 pub mod proving;
 pub mod verifying;
@@ -51,12 +51,12 @@ impl LookupInputConfig {
         &self.unpadded_input_shape
     }
 
-    pub fn create_logup_inputs<E: ExtensionField>(
+    pub fn create_logup_inputs<F: PrimeField>(
         &self,
-        mles: &[Arc<MultilinearExtension<E>>],
+        mles: &[Arc<DensePolynomial<F>>],
         output: Option<&Tensor<Element>>,
-        challenge_storage: &ChallengeStorage<E>,
-    ) -> Result<Vec<LogUpInput<E>>> {
+        challenge_storage: &ChallengeStorage<F>,
+    ) -> Result<Vec<LogUpInput<F>>> {
         let chunking_info = &self.chunking_info;
         let number_of_chunks = self.number_of_chunks();
         // Calculate how many input mles we expect per chunk
@@ -90,15 +90,15 @@ impl LookupInputConfig {
             .chunks(total_inputs_per_chunk)
             .zip(all_output_mles.chunks(output_chunk_size))
             .try_fold(
-                Vec::<LogUpInput<E>>::new(),
+                Vec::<LogUpInput<F>>::new(),
                 |mut acc, (input_chunk_mles, output_chunk_mles)| {
                     // Split the input mles into shifted, value, and zeroing mles
                     let (shifted_input_mles, rest) =
                         input_chunk_mles.split_at(chunking_info.number_of_shifted_chunks());
                     let shifted_column_evals = shifted_input_mles
                         .iter()
-                        .map(|mle| mle.get_base_field_vec().to_vec())
-                        .collect::<Vec<Vec<E::BaseField>>>();
+                        .map(|mle| mle.evals())
+                        .collect::<Vec<Vec<F>>>();
 
                     // The structure of the remaining MLEs depends on the number of columns in the value table
                     let (value_column_evals, zeroing_column_evals) = match chunking_info
@@ -111,18 +111,15 @@ impl LookupInputConfig {
                                 .take(number_zero_chunks)
                                 .zip(output_chunk_mles.iter().skip(number_of_value_chunks))
                                 .flat_map(|(input_mle, output_mle)| {
-                                    [
-                                        input_mle.get_base_field_vec().to_vec(),
-                                        output_mle.get_base_field_vec().to_vec(),
-                                    ]
+                                    [input_mle.evals(), output_mle.evals()]
                                 })
-                                .collect::<Vec<Vec<E::BaseField>>>();
+                                .collect::<Vec<Vec<F>>>();
                             // The value evals are then just given by the output part
                             let value_columns = output_chunk_mles
                                 .iter()
                                 .take(number_of_value_chunks)
-                                .map(|mle| mle.get_base_field_vec().to_vec())
-                                .collect::<Vec<Vec<E::BaseField>>>();
+                                .map(|mle| mle.evals())
+                                .collect::<Vec<Vec<F>>>();
                             (value_columns, zeroing_column_evals)
                         }
                         2 => {
@@ -134,23 +131,17 @@ impl LookupInputConfig {
                                 .take(number_zero_chunks)
                                 .zip(output_chunk_mles.iter().skip(number_of_value_chunks))
                                 .flat_map(|(input_mle, output_mle)| {
-                                    [
-                                        input_mle.get_base_field_vec().to_vec(),
-                                        output_mle.get_base_field_vec().to_vec(),
-                                    ]
+                                    [input_mle.evals(), output_mle.evals()]
                                 })
-                                .collect::<Vec<Vec<E::BaseField>>>();
+                                .collect::<Vec<Vec<F>>>();
 
                             let value_columns = value_input_mles
                                 .iter()
                                 .zip(output_chunk_mles.iter().take(number_of_value_chunks))
                                 .flat_map(|(input_mle, output_mle)| {
-                                    [
-                                        input_mle.get_base_field_vec().to_vec(),
-                                        output_mle.get_base_field_vec().to_vec(),
-                                    ]
+                                    [input_mle.evals(), output_mle.evals()]
                                 })
-                                .collect::<Vec<Vec<E::BaseField>>>();
+                                .collect::<Vec<Vec<F>>>();
 
                             (value_columns, zeroing_column_evals)
                         }
@@ -158,16 +149,16 @@ impl LookupInputConfig {
                     };
 
                     // Create the LogUpInput structures for the shifted inputs and value inputs
-                    let shift_logup_input = LogUpInput::<E>::new_lookup(
+                    let shift_logup_input = LogUpInput::<F>::new_lookup(
                         shifted_column_evals,
                         constant_challenge,
-                        E::ONE,
+                        F::ONE,
                         shift_check_table.num_columns(),
                     )
                     .map_err(|e| {
                         anyhow!("Failed to create LogUpInput for Shifted Inputs: {e:?}")
                     })?;
-                    let value_logup_input = LogUpInput::<E>::new_lookup(
+                    let value_logup_input = LogUpInput::<F>::new_lookup(
                         value_column_evals,
                         value_constant_challenge,
                         value_column_sep,
@@ -186,7 +177,7 @@ impl LookupInputConfig {
                                 signed_zero_opt.ok_or(anyhow!(
                                     "Could not find challenges for SignedZeroCheckTable"
                                 ))?;
-                            let signed_zero_logup_input = LogUpInput::<E>::new_lookup(
+                            let signed_zero_logup_input = LogUpInput::<F>::new_lookup(
                                 zeroing_column_evals,
                                 signed_zero_constant_challenge,
                                 signed_zero_column_sep,
@@ -203,7 +194,7 @@ impl LookupInputConfig {
                                 zeroing_column_evals.split_at(2 * (n - 1));
                             let (zero_constant_challenge, zero_column_sep) = zero_opt
                                 .ok_or(anyhow!("Could not find challenges for ZeroCheckTable"))?;
-                            let zero_check_logup_input = LogUpInput::<E>::new_lookup(
+                            let zero_check_logup_input = LogUpInput::<F>::new_lookup(
                                 zero_check_columns.to_vec(),
                                 zero_constant_challenge,
                                 zero_column_sep,
@@ -219,7 +210,7 @@ impl LookupInputConfig {
                                     "Could not find challenges for SignedZeroCheckTable"
                                 ))?;
 
-                            let signed_zero_logup_input = LogUpInput::<E>::new_lookup(
+                            let signed_zero_logup_input = LogUpInput::<F>::new_lookup(
                                 signed_columns.to_vec(),
                                 signed_zero_constant_challenge,
                                 signed_zero_column_sep,
@@ -234,7 +225,7 @@ impl LookupInputConfig {
                             // In this case we have only zero check tables to handle
                             let (zero_constant_challenge, zero_column_sep) = zero_opt
                                 .ok_or(anyhow!("Could not find challenges for ZeroCheckTable"))?;
-                            let zero_check_logup_input = LogUpInput::<E>::new_lookup(
+                            let zero_check_logup_input = LogUpInput::<F>::new_lookup(
                                 zeroing_column_evals,
                                 zero_constant_challenge,
                                 zero_column_sep,
@@ -266,10 +257,10 @@ impl LookupInputConfig {
         Ok(logup_inputs)
     }
 
-    pub fn create_logup_verifier_instances<E: ExtensionField>(
+    pub fn create_logup_verifier_instances<F: PrimeField>(
         &self,
-        challenge_storage: &ChallengeStorage<E>,
-    ) -> Result<Vec<LogUpVerifierInstance<E>>> {
+        challenge_storage: &ChallengeStorage<F>,
+    ) -> Result<Vec<LogUpVerifierInstance<F>>> {
         // Build the verifier instances for the LogUp proof
         let table = self.chunking_info().table();
         let unpadded_input_shape = self.unpadded_input_shape();
@@ -314,7 +305,7 @@ impl LookupInputConfig {
         for _ in 0..num_chunks {
             // Add the shifted instances
             (0..num_shifted_chunks).for_each(|_| {
-                instances.push(LogUpVerifierInstance::<E>::new(
+                instances.push(LogUpVerifierInstance::<F>::new(
                     shift_constant_challenge,
                     shift_column_sep,
                     shift_check_table.num_columns(),
@@ -324,7 +315,7 @@ impl LookupInputConfig {
             });
             // Add the value instances
             (0..num_value_chunks).for_each(|_| {
-                instances.push(LogUpVerifierInstance::<E>::new(
+                instances.push(LogUpVerifierInstance::<F>::new(
                     value_constant_challenge,
                     value_column_sep,
                     num_value_columns,
@@ -339,7 +330,7 @@ impl LookupInputConfig {
                         .ok_or(anyhow!(
                             "Could not find challenges for SignedZeroCheckTable"
                         ))?;
-                    instances.push(LogUpVerifierInstance::<E>::new(
+                    instances.push(LogUpVerifierInstance::<F>::new(
                         signed_zero_constant_challenge,
                         signed_zero_column_sep,
                         signed_zero_check_table.num_columns(),
@@ -352,7 +343,7 @@ impl LookupInputConfig {
                     let (zero_constant_challenge, zero_column_sep) =
                         zero_opt.ok_or(anyhow!("Could not find challenges for ZeroCheckTable"))?;
                     (0..(n - 1)).for_each(|_| {
-                        instances.push(LogUpVerifierInstance::<E>::new(
+                        instances.push(LogUpVerifierInstance::<F>::new(
                             zero_constant_challenge,
                             zero_column_sep,
                             zero_check_table.num_columns(),
@@ -366,7 +357,7 @@ impl LookupInputConfig {
                         .ok_or(anyhow!(
                             "Could not find challenges for SignedZeroCheckTable"
                         ))?;
-                    instances.push(LogUpVerifierInstance::<E>::new(
+                    instances.push(LogUpVerifierInstance::<F>::new(
                         signed_zero_constant_challenge,
                         signed_zero_column_sep,
                         signed_zero_check_table.num_columns(),
@@ -379,7 +370,7 @@ impl LookupInputConfig {
                     let (zero_constant_challenge, zero_column_sep) =
                         zero_opt.ok_or(anyhow!("Could not find challenges for ZeroCheckTable"))?;
                     (0..n).for_each(|_| {
-                        instances.push(LogUpVerifierInstance::<E>::new(
+                        instances.push(LogUpVerifierInstance::<F>::new(
                             zero_constant_challenge,
                             zero_column_sep,
                             zero_check_table.num_columns(),
@@ -394,7 +385,7 @@ impl LookupInputConfig {
             let chunk_normalisation_instances = self
                 .compute_normalisation_lookup_verifier_instances(
                     shift_constant_challenge,
-                    E::ONE,
+                    F::ONE,
                     norm_vars,
                 );
             norm_instances.extend(chunk_normalisation_instances);
@@ -409,10 +400,10 @@ impl LookupInputConfig {
     /// Creates any extra MLEs required for the lookup operation.
     /// For [`LookupVariant::GLU`] this will create the MLEs corresponding to the second input to the GLU.
     /// For [`LookupVariant::Normalisation`] this will create the MLEs corresponding to the normalisation values.
-    pub fn create_extra_sumcheck_mles<E: ExtensionField>(
+    pub fn create_extra_sumcheck_mles<F: PrimeField>(
         &self,
         input_tensor: &Tensor<Element>,
-    ) -> Result<Vec<MultilinearExtension<'_, E>>> {
+    ) -> Result<Vec<DensePolynomial<'_, F>>> {
         match self.variant {
             LookupVariant::Standard | LookupVariant::Softmax { .. } => Ok(vec![]),
             LookupVariant::GLU | LookupVariant::Normalisation { .. } => {
@@ -436,21 +427,21 @@ impl LookupInputConfig {
                         let evaluations = chunk
                             .chunks(last_dim)
                             .flat_map(|row| {
-                                to_base::<E, _>(row)
+                                to_field::<Element, F, _>(row)
                                     .into_iter()
-                                    .chain(std::iter::repeat_n(E::BaseField::ZERO, row_diff))
+                                    .chain(std::iter::repeat_n(F::ZERO, row_diff))
                             })
-                            .chain(std::iter::repeat_n(E::BaseField::ZERO, column_diff))
-                            .collect::<Vec<E::BaseField>>();
+                            .chain(std::iter::repeat_n(F::ZERO, column_diff))
+                            .collect::<Vec<F>>();
                         evaluations.into_mle()
                     })
-                    .collect::<Vec<MultilinearExtension<E>>>();
+                    .collect::<Vec<DensePolynomial<F>>>();
                 Ok(mles)
             }
         }
     }
 
-    pub fn build_full_sumcheck_expression<E: ExtensionField>(&self) -> Expression<E> {
+    pub fn build_full_sumcheck_expression<F: PrimeField>(&self) -> Expression<F> {
         let chunking_info = self.chunking_info();
         let final_dim_size = self.unpadded_input_shape().dim(-1);
         // First we work out how many witness polynomials there will be total
@@ -461,13 +452,13 @@ impl LookupInputConfig {
         )
     }
 
-    pub(crate) fn construct_lookup_evaluations<E: ExtensionField>(
+    pub(crate) fn construct_lookup_evaluations<F: PrimeField>(
         &self,
-        logup_evals: &[E],
-        sumcheck_evals: &[E],
-        batching_challenges: &[E],
-        shift_evals: &Option<Vec<E>>,
-    ) -> Result<LookupEvaluations<E>> {
+        logup_evals: &[F],
+        sumcheck_evals: &[F],
+        batching_challenges: &[F],
+        shift_evals: &Option<Vec<F>>,
+    ) -> Result<LookupEvaluations<F>> {
         let number_of_chunks = self.number_of_chunks();
         let chunking_info = self.chunking_info();
 
@@ -481,8 +472,8 @@ impl LookupInputConfig {
 
         // If the Lookup is part of a GLU operation then there are two input claims for the layer.
         let input_claim_evals = match self.variant {
-            LookupVariant::GLU => vec![E::ZERO, E::ZERO],
-            _ => vec![E::ZERO],
+            LookupVariant::GLU => vec![F::ZERO, F::ZERO],
+            _ => vec![F::ZERO],
         };
 
         // Initialise the lookup evaluations struct
@@ -518,24 +509,24 @@ impl LookupInputConfig {
     }
 }
 
-pub(crate) struct LookupEvaluations<E: ExtensionField> {
-    pub input_commitment_evals: Vec<E>,
-    pub output_commitment_evals: Vec<E>,
-    pub normalisation_commitment_evals: Vec<E>,
-    pub input_claim_evals: Vec<E>,
+pub(crate) struct LookupEvaluations<F: PrimeField> {
+    pub input_commitment_evals: Vec<F>,
+    pub output_commitment_evals: Vec<F>,
+    pub normalisation_commitment_evals: Vec<F>,
+    pub input_claim_evals: Vec<F>,
 }
 
-impl<E: ExtensionField> LookupEvaluations<E> {
+impl<F: PrimeField> LookupEvaluations<F> {
     #[allow(clippy::too_many_arguments)]
     fn update_for_chunk(
         &mut self,
         variant: LookupVariant,
         chunk_idx: usize,
         chunking_info: &ChunkingInfo,
-        logup_chunk: &[E],
-        batch_chal: E,
-        shift_evals: Option<&Vec<E>>,
-        additional_evals: &[E],
+        logup_chunk: &[F],
+        batch_chal: F,
+        shift_evals: Option<&Vec<F>>,
+        additional_evals: &[F],
         number_of_chunks: usize,
     ) -> Result<()> {
         // Process input evaluations
@@ -550,14 +541,14 @@ impl<E: ExtensionField> LookupEvaluations<E> {
             2 => all_value_evals
                 .chunks(2)
                 .map(|pair| (pair[0], pair[1]))
-                .unzip::<E, E, Vec<E>, Vec<E>>(), /* If we have two columns then we split them into input evals and output evals */
+                .unzip::<F, F, Vec<F>, Vec<F>>(), /* If we have two columns then we split them into input evals and output evals */
             _ => bail!(
                 "Unsupported number of table columns: {}",
                 table.num_columns()
             ),
         };
 
-        let zero_in_evals = zero_evals.iter().step_by(2).copied().collect::<Vec<E>>();
+        let zero_in_evals = zero_evals.iter().step_by(2).copied().collect::<Vec<F>>();
 
         // Append the input commitment evaluations
         self.input_commitment_evals

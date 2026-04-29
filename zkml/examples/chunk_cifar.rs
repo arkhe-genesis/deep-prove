@@ -1,7 +1,7 @@
 #![recursion_limit = "1024"]
 #![allow(clippy::print_stdout)]
 use zkml::{
-    self, Element, IO, Proof, ProverContext, Tensor,
+    self, Element, IO, Proof, ProverContext, Shape, Tensor,
     inputs::Input,
     iop::{chunking::DefaultChunkingStrategy, context::VerifierContext},
     model::{Model, exec_graph::InferenceEngine},
@@ -42,7 +42,11 @@ impl GraphRuner for CifarRunner {
     type ChunkingStrategy = DefaultChunkingStrategy;
     fn setup(
         &mut self,
-    ) -> anyhow::Result<(ProverContext<F, Pcs>, InferenceEngine, Vec<Tensor<Element>>)> {
+    ) -> anyhow::Result<(
+        ProverContext<'static, F, Pcs>,
+        InferenceEngine,
+        Vec<Tensor<Element>>,
+    )> {
         let (model, inputs) = build_model(
             include_bytes!("../assets/scripts/CNN/cnn-cifar-01.onnx"),
             zstd::Decoder::new(&include_bytes!("../assets/scripts/CNN/input.json.zst")[..])
@@ -54,8 +58,8 @@ impl GraphRuner for CifarRunner {
         Ok((pk, InferenceEngine::Generic(model), input_tensors))
     }
 
-    fn chunk_strategy(&self) -> Self::ChunkingStrategy {
-        DefaultChunkingStrategy::default()
+    fn chunk_strategy(&self, unpadded_input_shapes: Vec<Shape>) -> Self::ChunkingStrategy {
+        DefaultChunkingStrategy::new(unpadded_input_shapes)
     }
 
     fn verify_proof(&self, proof: Proof<F, Pcs>, io: IO<F>) -> anyhow::Result<()> {

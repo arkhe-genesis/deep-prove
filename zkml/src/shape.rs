@@ -1,11 +1,8 @@
-use crate::{
-    NextPowerOfTwo, commit::compute_betas_eval, eval_zeroifier_mle, quantization,
-    to_bit_sequence_le,
-};
+use crate::{NextPowerOfTwo, eval_zeroifier_mle, quantization, to_bit_sequence_le};
 use anyhow::{Result, ensure};
-use ff_ext::ExtensionField;
+use ark_ff::PrimeField;
+use dp_crypto::{poly::eq::evals, util::ceil_log2};
 use itertools::izip;
-use multilinear_extensions::util::ceil_log2;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::PartialEq,
@@ -44,6 +41,7 @@ pub(crate) fn filter_size(shape: &Shape) -> usize {
     derive_more::Deref,
     derive_more::DerefMut,
     derive_more::Display,
+    Default,
     Serialize,
     Deserialize,
     PartialEq,
@@ -474,7 +472,7 @@ impl Shape {
 
     /// Given a [Point][mpcs::Point] that corresponds to the [MLE][multilinear_extension::MultilinearExtension] of a [Tensor] with this [`Shape`],
     /// this method splits the point into its component parts corresponding to each dimension of the [Tensor].
-    pub fn split_point<'a, E: ExtensionField>(&self, point: &'a [E]) -> Result<Vec<&'a [E]>> {
+    pub fn split_point<'a, F>(&self, point: &'a [F]) -> Result<Vec<&'a [F]>> {
         // First we check that the point has the same number of elements as the shape's dimensions
         ensure!(
             point.len() == self.num_vars().iter().sum::<usize>(),
@@ -492,7 +490,7 @@ impl Shape {
                 *end = start;
                 Some(slice)
             })
-            .collect::<Vec<&[E]>>();
+            .collect::<Vec<&[F]>>();
 
         Ok(slices)
     }
@@ -515,11 +513,11 @@ impl Shape {
     /// Computes the "broadcasting evaluation" for a given shape and point.
     /// For example if the full shape is [x, y, z] and we have a claim for a tensor with shape [1, y, z]
     /// then this function computes the evaluation of `lt(x, r_x)` where `r_x` is the point for the first dimension.
-    pub fn broadcasting_evaluation<E: ExtensionField>(
+    pub fn broadcasting_evaluation<F: PrimeField>(
         &self,
-        dim_points: &[&[E]],
+        dim_points: &[&[F]],
         unbroadcast_shape_slice: &[usize],
-    ) -> Result<E> {
+    ) -> Result<F> {
         ensure!(
             unbroadcast_shape_slice.len() == self.rank(),
             "Unbroadcast shape slice length {} does not match shape rank {}",
@@ -537,7 +535,7 @@ impl Shape {
         // Now we compute the broadcasting evaluation, if a dimension is unbroadcasted (size 1)
         // we compute the lt evaluation for that dimension and multiply them all together.
         // If the dimension is not unbroadcasted we ensure that the dimension sizes agree and then skip.
-        let mut eval = E::ONE;
+        let mut eval = F::ONE;
 
         for (&full_dim, &unbroadcast_dim, &point) in izip!(
             self.iter(),
@@ -547,8 +545,8 @@ impl Shape {
             if unbroadcast_dim == 1 {
                 // Dimension is unbroadcasted, compute lt evaluation
                 let dim_size_bits = to_bit_sequence_le(full_dim - 1, point.len())
-                    .map(E::from_canonical_usize)
-                    .collect::<Vec<E>>();
+                    .map(|bit| F::from(bit as u64))
+                    .collect::<Vec<F>>();
                 eval *= eval_zeroifier_mle(point, &dim_size_bits);
             } else {
                 // Dimension is not unbroadcasted, ensure sizes agree
@@ -564,10 +562,10 @@ impl Shape {
     }
 
     /// Given a point and an UNPADDED [`Shape`], computes the evaluation point for the 2D sub tensors and the batching challenges for said sub tensors.
-    pub fn compute_eq_point_and_batching_challenges<E: ExtensionField>(
+    pub fn compute_eq_point_and_batching_challenges<F: PrimeField>(
         &self,
-        point: &[E],
-    ) -> Result<(Vec<E>, Vec<E>)> {
+        point: &[F],
+    ) -> Result<(Vec<F>, Vec<F>)> {
         let padded_shape = self.next_power_of_two();
         let total_vars = ceil_log2(padded_shape.numel());
 
@@ -587,11 +585,11 @@ impl Shape {
             .zip(self.iter())
             .enumerate()
             .try_fold(
-                (Vec::<E>::new(), vec![E::ONE]),
+                (Vec::<F>::new(), vec![F::ONE]),
                 |(mut eq_points, mut batching_challenges), (i, (dim_point, &dim_size))| {
                     if i < dims_to_skip {
                         // Compute eq_poly evaluations for batching challenges
-                        let evals = compute_betas_eval(dim_point);
+                        let evals = evals(dim_point);
                         batching_challenges = batching_challenges
                             .into_iter()
                             .flat_map(|c| {
@@ -599,9 +597,9 @@ impl Shape {
                                     .iter()
                                     .take(dim_size)
                                     .map(|e| c * *e)
-                                    .collect::<Vec<E>>()
+                                    .collect::<Vec<F>>()
                             })
-                            .collect::<Vec<E>>();
+                            .collect::<Vec<F>>();
                         Ok((eq_points, batching_challenges))
                     } else {
                         eq_points = [dim_point, eq_points.as_slice()].concat();
@@ -693,7 +691,7 @@ mod test {
     use itertools::izip;
     use std::panic::catch_unwind;
 
-    use ff_ext::GoldilocksExt2 as F;
+    type F = ark_bn254::Fr;
 
     impl Shape {
         /// Converts a coordinate into an index.
