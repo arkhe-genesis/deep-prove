@@ -1,37 +1,52 @@
-# 🚀 DeepProve: Zero-Knowledge Machine Learning (zkml) Inference
+# DeepProve
 
-Welcome to **DeepProve**, a cutting-edge framework designed to prove neural network inference using zero-knowledge cryptographic techniques. Whether you're working with Multi-Layer Perceptrons (MLPs) or Convolutional Neural Networks (CNNs), DeepProve offers a fast and efficient way to verify computations without revealing the underlying data.
-zkml is the name of the subcrate implementing the proving logic.
+Zero-knowledge proof system for neural network inference, with first-class support for end-to-end LLM proving.
 
-## 🤔 What Does DeepProve Do?
+**WARNING: This codebase is not audited and not production ready. Use at your own risk.**
 
-DeepProve leverages advanced cryptographic methods like sumchecks and logup GKR to achieve sublinear proving times. This means you can prove the correctness of your model's inference faster than ever before!
+## 👉 Looking to run DeepProve? Start with [`zkml/README.md`](zkml/README.md)
 
-### 📊 Benchmark Highlights
+That's where the installation steps, model setup, GPU build, and the full end-to-end `bench-llm` tutorial live. The rest of this page is a high-level summary of what DeepProve is and what to expect.
 
-CNN 264k: This runs a CNN on the cifar 10 dataset for a total of 264k parameters. DeepProve is proving 158x faster at this size!
-Dense 4M: This runs a multiple dense layers for a total of 4 million parameters. DeepProve is proving 54x faster at this size!
+## Overview
 
-| Model Type | ZKML Proving Time (ms) | ZKML Verification Time (ms) | EZKL Proving Time (ms) | EZKL Verification Time (ms) |
-|------------|------------------------|-----------------------------|------------------------|-----------------------------|
-| CNN 264k   | 1242                   | 599                         | 196567.01              | 312505                      |
-| Dense 4M   | 2335                   | 520                         | 126831.3               | 1112                        |
+DeepProve is the first end-to-end zero-knowledge proof system for full LLM inference. It generates cryptographic proofs of neural network forward passes using sumchecks and logup GKR, achieving sublinear proving time in model size — orders of magnitude faster than circuit-based approaches.
 
+Confirmed working models: **GPT-2**, **Gemma 3**, **Llama 2** — all transformer layers proven end-to-end, from token embeddings through to next-token argmax. MLP and CNN inference is also supported.
 
+This repository is a Rust workspace. The [`zkml`](zkml/) crate is the core proving library; the remaining crates provide the client stack, storage layer, and developer tooling.
 
-## 📜 Licensing
+## Headline Numbers
 
-- **zkml folder**: Licensed under the [Lagrange License](https://github.com/Lagrange-Labs/deep-prove/blob/master/zkml/LICENSE), unless otherwise specified.
-- **Rest of the Code**: Licensed under Apache 2.0 + MIT, as per the original repository.
+Single-machine inference proving on a 24-core / 504 GB CPU server:
 
-## 🌟 Use Cases
+| Model   | Sequence   | Prove time | Verify | Proof size | Throughput                    |
+|---------|-----------:|-----------:|-------:|-----------:|------------------------------:|
+| GPT-2   | 512 tokens |    7.6 min |  1.3 s |   10.7 MiB | 1.12 tokens/s (67 tokens/min) |
+| Gemma 3 | 512 tokens |     19 min |  4.3 s |     27 MiB | 0.45 tokens/s (27 tokens/min) |
 
-Proving inference of AI models has a wide range of applications, especially in scenarios where privacy and trust are paramount. For instance, in healthcare, sensitive patient data can be used to make predictions without exposing the data itself. In finance, models can be verified for compliance without revealing proprietary algorithms. Additionally, in decentralized applications, zero-knowledge proofs can ensure the integrity of AI computations on the blockchain, fostering trust and transparency. These use cases highlight the transformative potential of ZKML in various industries.
+- **10–30× faster** than the previous published state of the art (e.g. zkGPT reports ≈ 0.05 tokens/s on similar hardware).
+- **Accuracy preserved**: ≥99.6% cosine similarity to the floating-point baseline at 12-bit quantization (GPT-2).
+- **Scales out**: horizontal proof distribution and GPU acceleration are supported today; clusters of GPU workers are on the roadmap.
 
-## 🙏 Acknowledgements
+For the full methodology and a deeper benchmark sweep across sequence lengths and models, see the DeepProve paper (link to be added) and [`zkml/README.md`](zkml/README.md).
 
-This project builds upon the work from scroll-tech/ceno, reusing the sumcheck and GKR implementation from their codebase. Check out their work at [scroll-tech/ceno](https://github.com/scroll-tech/ceno).
+## Repository Structure
 
-For more technical details and usage instructions, dive into the [ZKML README](zkml/README.md).
+| Crate | Description |
+|-------|-------------|
+| [`zkml`](zkml/) | Core proving library — model quantization, layer implementations (MLP, CNN, transformer), and ZK proof generation/verification |
+| [`deep-prove`](deep-prove/) | Client stack — `deep-prove-worker` runs a proof generation server; `deep-prove-cli` submits proving jobs locally or to a remote proving network |
+| [`tenstore`](tenstore/) | Storage facade for persisting and retrieving tensor data; supports local and remote (S3-compatible) backends |
+| [`tenvis`](tenvis/) | Interactive CLI tool for inspecting and debugging proof data stored in tenstore |
+| [`telemetry`](telemetry/) | Shared OpenTelemetry tracing and logging setup used across all crates |
+| [`utils`](utils/) | Shared utility helpers: CSV recording, memory tracking, statistical summaries |
 
-Happy proving! 🎉
+## Licensing
+
+- **`zkml/` folder**: Licensed under the [Lagrange License](zkml/LICENSE).
+- **All other code**: Licensed under Apache 2.0 + MIT, as per the original repository.
+
+## Acknowledgements
+
+This project builds upon the work from [scroll-tech/ceno](https://github.com/scroll-tech/ceno), reusing the sumcheck and GKR implementation from that codebase.

@@ -1,205 +1,336 @@
 # ZKML Inference Proving
 
-**WARNING**: **This codebase is not audited and not production ready and is provided as is. Use at your own risk.**
+**WARNING**: This codebase is not audited and not production ready and is provided as is. Use at your own risk.
 
-**Welcome back to Deep Prove framework!** This document will guide you through the inner workings of ZKML, how to install it, and how to make the most of its capabilities.
+## Overview
 
-## 🌐 Overview
+DeepProve is a framework for proving inference of neural networks using cryptographic techniques based on sumchecks and logup GKR. Proving time is sublinear in the size of the model, providing order-of-magnitude speedups compared to other inference proving frameworks.
 
-DeepProve is a framework for proving inference of neural networks using cryptographic techniques based on sumchecks, and logup GKR mostly. Thanks to these techniques, the proving time is actually sublinear in the size of the model and is able to provide an order of magnitude speedups compared to other inference frameworks.
+**First-class LLM support**: DeepProve proves end-to-end inference for transformer-based LLMs including **GPT-2**, **Gemma 3**, and **Llama 2**, covering all transformer layer types from embeddings through to next-token argmax. MLP and CNN inference is also supported.
 
-The framework currently supports proving inference for both Multi-Layer Perceptron (MLP) models and Convolutional Neural Networks (CNN). Namely, it supports dense layers, relu, maxpool and convolutions.
-The framework requantizes the output after each layer into a fixed zero-centered range; by default we are using [-128;127] quantization range. 
+The framework quantizes weights and activations into a fixed zero-centered range. The default range is `[-2^11, 2^11-1]` (12-bit symmetric quantization); the bit width can be set via the `ZKML_BIT_LEN` environment variable (typical values: 8, 10, 12, 16).
 
-Stay tuned for a blog post explaining the technical details of the framework !
+## How DeepProve Works
 
-## Status & Roadmap
+DeepProve is built on a few simple ideas. If you skim only one section of this document, this is the one.
 
-This is a research driven project and the codebase is improving on a fast pace. Here is the current status of the project:
+### 1. Certify, don't re-execute
 
-**Features**:
+A naïve ZK system would re-run each token's forward pass inside a circuit. For a sequence of length `t` and a per-token circuit of size `|C|`, that gives `O(t² · |C|)` prover work — unworkable on real-world LLMs.
 
-- [x] Prove inference of Dense layers
-- [x] Prove inference of ReLU
-- [x] Prove inference of MaxPool
-- [x] Prove inference of Convolution
-- [ ] Add support for more layers types (BatchNorm, Dropout, etc)
+DeepProve instead concatenates the input tokens and the claimed output tokens into a single sequence, and runs the model on that sequence **once**. Because of the causal attention mask and the deterministic argmax at the output, the model's prediction at position `t` certifies the token at position `t+1`. We prove a single forward pass; the structure of attention does the rest.
 
-**Accuracy**:
-- [x] Layer-wise requantization (a single scaling factor per layer)
-- [ ] Allowing BIT_LEN to grow without losing performance (lookup related)
-- [ ] Add supports for row-wise quantization for each layer to provide better accuracy
+### 2. Pre-process the model once
 
-**Performance**:
-- [ ] Better lookup usage with more small tables
-- [ ] Implement simpler GKR for logup - no need to have a full generic GKR
-- [ ] Improved parallelism for logup, gkr, sumchecks
-- [ ] GPU support
+A model file in SafeTensors, GGUF, or ONNX format is parsed into an operator graph, quantized into integer-only arithmetic (post-training static quantization, calibrated on a representative dataset), and committed to with a polynomial commitment scheme. The result is a reusable proving context (`*.pk` / `*.vk`) that amortizes across every subsequent inference proof.
 
-## Benchmark
+### 3. Prove layer-by-layer, then chain
 
-For high level benchmark comparison, check out the main [README](https://github.com/Lagrange-Labs/deep-prove) !
+For every layer in the graph we run a specialised protocol:
 
-To run your own benchmark, this repo provides bench.py that can run deep prove framework against a generated onnx file and an input file. 
-Check out the folder `assets/scripts/` to see the PyTorch scripts generating the CNN and MLP model used in the benchmark !
+- **Linear ops** (MatMul, Conv, RMSNorm, LayerNorm) — efficient sum-check protocols
+- **Non-linear ops** (Softmax, GeLU, requantization) — LogUp-GKR lookup arguments
 
+Per-layer claims chain back-to-front in a GKR-style composition, producing a single end-to-end proof.
 
-## ⚙️ How It Works
+The polynomial commitment scheme used in the public binaries is **HyperKZG**, built on top of [arkworks](https://arkworks.rs/) and therefore generic over any pairing-friendly curve. The CPU build defaults to BN254; the GPU build (`--features cuda`) is currently BN254-only.
 
-ZKML is built on cryptographic techniques that allow for efficient proof generation and verification of neural network inferences. It supports various layers like dense, ReLU, maxpool, and convolution, with a focus on speed and accuracy.
+## Documentation
 
-## 🛠️ Installation
+Deeper technical write-ups — proof protocols for each layer (embeddings, QKV, multi-head attention, positional encoding, LayerNorm, RMSNorm, argmax), softmax, EinSum, ReLU, MaxPool, range checks, lookup tables, and commitment schemes — live in [`docs/`](docs/) and are built with [mdBook](https://github.com/rust-lang/mdBook) + [mdbook-katex](https://github.com/lzanini/mdbook-katex):
 
-To get started with ZKML, ensure you have the following prerequisites:
+```bash
+cargo install mdbook
+cargo install mdbook-katex
+mdbook build docs --open
+```
 
-- **Python 3.10 or higher**
-- **Rust and Cargo** (latest stable)
-- **EZKL** (optional, for comparisons)
+## Supported Models & Layers
 
-### Installing Rust and Cargo
+### Transformer (LLM)
+
+The recommended path is **SafeTensors via Hugging Face**: pass `--hf <model-id>` and `bench-llm` will fetch and cache the weights automatically on first run. GGUF (`--gguf <path|url>`) and ONNX models are also supported.
+
+| Model | Recommended loader | Notes |
+|-------|--------------------|-------|
+| **GPT-2** | `--hf openai-community/gpt2` | SafeTensors auto-downloaded from HF. GGUF also supported (`--gguf gpt2.Q2_K.gguf`) |
+| **Gemma 3** | `--hf google/gemma-3-1b-it` | SafeTensors only |
+| **Llama 2** | `--hf meta-llama/Llama-2-7b-hf` | SafeTensors only. `--accuracy` mode currently falls back to default quantization for Llama 2 |
+
+Supported transformer layers:
+
+- **Embeddings** — provable token vocabulary lookup
+- **Positional encoding** — Absolute and Rotary (RoPE)
+- **Attention mask** — causal masking for auto-regressive generation
+- **EinSum / Multi-head attention** — batched matrix multiplication for QK^T and OV projections
+- **Softmax** — with provable range checks
+- **LayerNorm / RMSNorm** — vector normalization with proofs
+- **Argmax / Logits** — next-token prediction output layer
+
+### Traditional (MLP / CNN)
+
+- **Dense** — fully connected layers
+- **Conv2D** — convolutions with FFT-based optimization
+- **Activations** — ReLU, GELU
+- **Pooling** — MaxPool
+- **Reshape / Flatten / Add** — tensor manipulation and residual connections
+
+## Installation
+
+### Prerequisites
+
+- **Rust + Cargo** (latest stable)
+- **Python 3.10+** — only required if you plan to run the MLP/CNN benchmark harness `bench.py`
+- **CUDA 12.x toolkit + NVIDIA driver** — only required for the GPU build
+
+### Build (CPU)
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
+cargo build --release -p zkml --bin bench-llm
 ```
 
-Visit the [official Rust installation page](https://www.rust-lang.org/tools/install) for platform-specific instructions.
+### Build (GPU)
 
-### Installing EZKL
+DeepProve ships two GPU feature flags:
 
-If you plan to run EZKL comparisons, refer to the [EZKL documentation](https://github.com/zkonduit/ezkl#installation).
-
-### Python Dependencies
-
-```bash
-pip install -r assets/scripts/requirements.txt
-```
-**NOTE**: If you prefer to use a separated environment, you can do first:
-```bash
-python -m venv venv
-source venv/bin/activate
-```
-
-ZKML allows you to customize Python scripts located in `zkml/assets/scripts/` to suit your needs. Once set up, you can run the `bench.py` script to test different configurations and measure performance.
-
-### Example Command
+| Feature | Platform | Effect |
+|---------|----------|--------|
+| `cuda` | Linux + NVIDIA | Replaces the CPU PCS with `HyperKZGGpu` and runs inference on burn's CUDA backend — **fastest path** |
+| `wgpu` | Linux / macOS / Windows | Cross-platform GPU inference; PCS still runs on CPU |
 
 ```bash
-cargo build --release
+# Linux + NVIDIA: full GPU acceleration (inference + PCS)
+cargo build --release --features cuda -p zkml --bin bench-llm
+
+# Cross-platform GPU inference only
+cargo build --release --features wgpu -p zkml --bin bench-llm
 ```
 
-## Running Benchmarks
+The default (no `--features` flag) is a CPU-only build using the `ndarray` backend.
 
-The main benchmark script is `bench.py`, which supports various configurations and options.
+## Quickstart: Prove GPT-2 Inference End-to-End
 
-### Basic Usage
+This walkthrough builds the binary, fetches GPT-2 from Hugging Face, and produces an end-to-end inference proof.
+
+### 1. Build
 
 ```bash
-python bench.py [options]
+cargo build --release -p zkml --bin bench-llm
 ```
 
-### Example Commands
+### 2. Get a GPT-2 model
 
-Simple benchmark with default settings:
+The recommended path is `--hf openai-community/gpt2`: `bench-llm` will fetch the SafeTensors weights and tokenizer from Hugging Face on first run and cache them locally for subsequent runs — no manual download required. SafeTensors is the most widely-used checkpoint format for transformer models, which is why we lead with it.
+
+GGUF (`--gguf <path|url>`) and ONNX checkpoints are also supported; the GGUF path is convenient if you already have a pre-quantized file (e.g. `gpt2.Q2_K.gguf`).
+
+### 3. Prove a single sequence
+
 ```bash
-python bench.py
+cargo run --release --bin bench-llm -- \
+  --model gpt2 --hf openai-community/gpt2 --sequence 64
 ```
 
-Benchmark specific MLP model configurations with multiple runs:
+This builds the proving context, runs inference on a 64-token random prompt, generates a proof, and verifies it. Two CSV files are produced (see *Reading the output* below).
+
+### 4. Sweep multiple sequence lengths
+
 ```bash
+cargo run --release --bin bench-llm -- \
+  --model gpt2 --hf openai-community/gpt2 --sequence 64,128,256,512
+```
+
+Each sequence length appends one row to the bench CSV.
+
+### 5. Run on GPU
+
+Linux + NVIDIA:
+
+```bash
+cargo run --release --features cuda --bin bench-llm -- \
+  --model gpt2 --hf openai-community/gpt2 --sequence 64
+```
+
+The `cuda` feature switches the PCS to `HyperKZGGpu` and runs inference on the GPU backend.
+
+### 6. Cache the proving context
+
+The proving context (`pk` / `vk`) is the most expensive one-off step. Save it to disk once and reuse it across runs:
+
+```bash
+# First run: generate and save
+cargo run --release --bin bench-llm -- \
+  --model gpt2 --hf openai-community/gpt2 --sequence 64 \
+  --save_params setup
+
+# Subsequent runs: skip context generation
+cargo run --release --bin bench-llm -- \
+  --model gpt2 --hf openai-community/gpt2 --sequence 64 \
+  --load_params setup
+```
+
+This writes/reads `setup.pk` and `setup.vk` in the current directory.
+
+### 7. Higher-accuracy mode
+
+```bash
+cargo run --release --bin bench-llm -- \
+  --model gpt2 --hf openai-community/gpt2 --sequence 64 --accuracy
+```
+
+`--accuracy` enables outlier smoothing and per-tensor activation tracking, improving cosine similarity / perplexity at the cost of additional proving time. Available for GPT-2 and Gemma 3.
+
+### 8. Profile distributed proving locally
+
+```bash
+cargo run --release --bin bench-llm -- \
+  --model gpt2 --hf openai-community/gpt2 --sequence 64 \
+  --distributed --num_chunks 4
+```
+
+`--distributed` simulates the chunked distributed protocol on a single host (useful for measuring memory split across N workers without provisioning a cluster). Output goes to `bench_distributed.csv`.
+
+### 9. Read the output CSV
+
+`bench-llm` produces two CSV files in the current directory:
+
+| File | Source | Contents |
+|------|--------|----------|
+| `bench-llm.csv` | `timed_core` | One row per timed function call across the run — useful for per-method profiling |
+| `bench.csv` (or `bench_distributed.csv` with `--distributed`) | `measure` | One row per benchmark trial with aggregated metrics |
+
+Columns in the per-run CSV (`bench.csv`):
+
+| Column | Meaning |
+|--------|---------|
+| `model_name` | `gpt2` / `gemma3` / `llama2` |
+| `num_threads` | Rayon thread count for this run |
+| `quantization_time` | One-off cost of converting the model to integer arithmetic (ms) |
+| `context_generation_time` | One-off cost of generating PK/VK (ms; `0` when `--load_params` is used) |
+| `max_context` | Maximum context window for this trial (tokens) |
+| `min_user_len` | Prompt length (tokens) |
+| `inference_time` | Quantized inference wall-time (ms) |
+| `prove_full` | Total proving wall-time (ms) |
+| `proof_size` | Serialized proof size (bytes) |
+| `prove_full_memory_peak` | Peak RSS during proving (MiB) |
+| `token/sec` | Derived as `max_context / prove_full` |
+
+### 10. Try Gemma 3 / Llama 2
+
+```bash
+# Gemma 3
+cargo run --release --bin bench-llm -- \
+  --model gemma3 --hf google/gemma-3-1b-it --sequence 128
+
+# Llama 2
+cargo run --release --bin bench-llm -- \
+  --model llama2 --hf meta-llama/Llama-2-7b-hf --sequence 128
+```
+
+Hugging Face access requires `huggingface-cli login` for gated models (e.g. Llama 2).
+
+### 11. Run the standalone code example
+
+For a self-contained reference run with prompt `"The sky is"`:
+
+```bash
+cargo run --release --example chunk_llm
+```
+
+Run `bench-llm --help` for the full list of flags and options.
+
+## Expected Performance
+
+Reference numbers on a 24-core / 504 GB CPU machine (AMD EPYC 9254, 2.9 GHz), HyperKZG PCS, default quantization:
+
+| Model   | Sequence | Prove time | Verify | Proof size | Throughput (tokens/s) | Throughput (tokens/min) |
+|---------|---------:|-----------:|-------:|-----------:|----------------------:|------------------------:|
+| GPT-2   |       64 |    2.35 min |  1.25 s |   7.95 MiB |                  0.45 |                      27 |
+| GPT-2   |      128 |    3.02 min |  1.14 s |   8.82 MiB |                  0.71 |                      42 |
+| GPT-2   |      256 |    4.60 min |  1.24 s |   9.77 MiB |                  0.93 |                      56 |
+| GPT-2   |      512 |    7.64 min |  1.33 s |  10.71 MiB |                  1.12 |                      67 |
+| Gemma 3 |       64 |    8.49 min |  3.69 s |  16.34 MiB |                  0.13 |                       8 |
+| Gemma 3 |      128 |   10.27 min |  3.88 s |  18.02 MiB |                  0.21 |                      12 |
+| Gemma 3 |      256 |   12.65 min |  4.09 s |  19.76 MiB |                  0.34 |                      20 |
+| Gemma 3 |      512 |   18.95 min |  4.32 s |  21.73 MiB |                  0.45 |                      27 |
+
+The CSV output column is `token/sec`; the per-minute number is provided here for convenience.
+
+Llama 2 benchmarks land in the same regime as Gemma 3; rerun locally for current numbers. GPU builds (`--features cuda`) accelerate both inference and PCS opening; the relative speedup depends on hardware.
+
+For full benchmark methodology and a comparison against published prior work, see the main [README](../README.md) and the DeepProve paper.
+
+## CNN/MLP Inference
+
+```bash
+python bench.py --model-type cnn
 python bench.py --configs 5,100:7,50 --repeats 5
 ```
 
-Benchmark a CNN model:
-```bash
-python bench.py --model-type cnn
+Results are written to `zkml_*.csv` with columns: setup time, inference time, proving time, verification time, accuracy, proof size (KB).
+
+## Repository Layout
+
+```
+zkml/
+├── src/
+│   ├── lib.rs               # Public API
+│   ├── bin/bench/
+│   │   ├── llm.rs           # bench-llm binary (LLM benchmarking)
+│   │   └── cnn.rs           # bench binary (CNN/MLP benchmarking)
+│   ├── layers/              # Layer implementations (CNN + transformer)
+│   ├── model/               # Model runners and LLM driver
+│   ├── parser/              # ONNX, GGUF, SafeTensors parsers
+│   ├── tensor/              # Tensor operations
+│   ├── graph/               # Computational graph representation
+│   ├── iop/                 # Interactive oracle proofs and chunking
+│   ├── lookup/              # Lookup table implementations
+│   ├── quantization/        # Quantization strategies
+│   └── commit/              # Commitment schemes
+├── examples/
+│   ├── chunk_llm.rs         # LLM inference + chunked proving (GPT-2)
+│   └── chunk_cifar.rs       # CNN inference proving (CIFAR)
+├── docs/                    # mdBook technical documentation
+├── assets/scripts/          # Python scripts for model generation
+└── bench.py                 # Python benchmark harness (MLP/CNN)
 ```
 
-Comparative benchmarking with EZKL:
-```bash
-python bench.py --configs 4,128 --run-ezkl --verbose
-```
+## Status & Roadmap
 
-Resource-constrained benchmarking with fewer samples:
-```bash
-python bench.py --num-threads 8 --configs 5,64 --samples 10
-```
+**Models & layers:**
 
-## Breakdown of deeo prove performance
+- [x] LLM inference proving (GPT-2, Gemma 3, Llama 2)
+- [x] Full transformer layer coverage (embeddings, attention, LayerNorm, RMSNorm, softmax, argmax)
+- [x] MLP, CNN (Dense, Conv2D, ReLU/GELU, MaxPool)
+- [x] Chunked / distributed proving
+- [x] Unpadded inference
+- [ ] Additional model families
+- [ ] More layer types (BatchNorm, Dropout, etc.)
 
-Add a env var before running the script where you will get a CSV file where each line is one invocation of a function. Aggregating these lines on a spreadsheet engine will give you a good idea where the bottlenecks are:
-```bash
-TIMED_OUTPUT=prover_perf.csv python bench.py ...
-```
+**Accuracy.** DeepProve preserves model behaviour to a high degree even after full integer quantization. Out of the box every layer uses a single scaling factor, which is fast and works well for most architectures. For GPT-2 and Gemma 3 you can opt into a higher-fidelity mode with `--accuracy`: this enables outlier smoothing and per-tensor activation tracking, pushing cosine similarity above 99.6% versus the floating-point baseline at 12-bit quantization (GPT-2) — well worth a try if you care about output quality. We are working on extending outlier smoothing to Llama 2 and adding row-wise per-layer quantization to squeeze out more accuracy on long-context models.
 
-## 🎈 Try It Out
+**Performance:**
 
-Feel free to tweak the Python scripts and run `bench.py` to explore the full potential of ZKML. 
-This is a research-driven project and the codebase is improving at a fast pace. Here is the current status of the project:
-- `zkml_d{dense}_w{width}.csv`: ZKML benchmark results for MLP models
-- `zkml_cnn.csv`: ZKML benchmark results for CNN models
-- `ezkl_d{dense}_w{width}.csv`: EZKL benchmark results (if enabled) for MLP models
-- `ezkl_cnn.csv`: EZKL benchmark results (if enabled) for CNN models
+- [x] HyperKZG PCS (CPU + GPU)
+- [x] GPU acceleration via `--features cuda` (Linux + NVIDIA) or `--features wgpu` (cross-platform inference)
+- [ ] GPU proving cluster
+- [ ] Smaller, more frequent lookup tables
+- [ ] Improved parallelism for logup, GKR, sumchecks
 
-Each CSV file contains these performance metrics for each run:
-- Setup time (ms)
-- Inference time (ms) 
-- Proving time (ms)
-- EZKL full proving time (ms) - Total time for witness generation + proving in EZKL
-- Verification time (ms)
-- Accuracy (boolean, 1=correct, 0=incorrect)
-- Proof size (KB)
+## Troubleshooting
 
-The script also generates a summary table showing averages across all runs for each configuration.
+- **Out of memory** — large LLMs at long context windows require substantial RAM. Reduce `--sequence` / `--max-context` or use a host with more memory.
+- **Hugging Face downloads fail** — gated models (e.g. Llama 2) require `huggingface-cli login` first; otherwise check network access.
+- **GGUF format mismatch** — ensure the GGUF file matches the expected model architecture (`--model gpt2` ↔ a GPT-2 GGUF).
+- **CUDA build fails** — verify the CUDA toolkit (≥ 12.x) and NVIDIA driver are installed; the `cuda` feature is Linux-only.
+- **macOS thread limiting** — CPU affinity is not supported on macOS; the binary proceeds without restrictions and prints a warning.
 
-Stay curious and keep experimenting! 🌟
-
-### Documentation
-
-We use [mdBook](https://github.com/rust-lang/mdBook) together with a [katex extension](https://github.com/lzanini/mdbook-katex) to produce technical documentation related to DeepProve, if you already have Cargo and Rust installed you can simply run
-```bash
-cargo install mdbook
-```
-followed  by 
-```bash
-cargo install mdbook-katex
-```
-to install it, for more info on installing mdBook check out their guide [here](https://rust-lang.github.io/mdBook/guide/installation.html).
-
-To build and open the docs, from the `zkml` directory run: 
-```bash 
-mdbook build docs --open
-```
-This will open a copy of the docs in your default web browser.
-
-
-## Caveats on EZKL comparison
-
-**Unfair comparison**: The ezkl binary does not allow to configure the exact amount of logrows used for proving.
-Therefore, it uses the fastest possible way to prove but incurring a MUCH larger time to verify.
-In production scenario, the proving time should be way higher with a much smaller verification time.
-
-The TLDR is that it is hard to get a fair apple-to-apple comparison between ZKML and EZKL.
-
-**Invalid Verification**: 
-* When not using the calibration step, EZKL verification actually fails, and proving time is much higher.
-* Calibration makes verification succeed but force to trim the KZG params at proving time, which takes a lot of time.
-So both time, proving + trimming and proving alone are included in the benchmark since both are offering different trade-offs that don't seem to be customizable from the CLI.
-
-**GPU Code**: By default on MacOS with Apple Silicon, the ezkl binary is compiled with GPU support. We currently do not  
-support GPU code. Installing the CPU version from the source code is the only way to go. 
-
-## 🛠️ Troubleshooting
-
-- **CPU Affinity Issues**: Thread limiting via CPU affinity is not supported on macOS. The script will proceed without restrictions and display a warning.
-- **EZKL Not Found**: When using `--run-ezkl`, ensure EZKL is properly installed and in your PATH.
-- **Memory Limitations**: Large models may require substantial memory. Consider reducing model size or using a machine with more RAM if you encounter memory errors.
-- **Performance Variability**: For the most consistent results, close other resource-intensive applications when running benchmarks and consider using the `--num-threads` option.
-
-## 📄 LICENSE
+## License
 
 This project is licensed under the [LICENSE](LICENSE) file.
 
-## 🙏 Acknowledgements
+## Acknowledgements
 
-This project is built on top of the work from scroll-tech/ceno - it re-uses the sumcheck and GKR implementation from the codebase at https://github.com/scroll-tech/ceno
+This project is built on top of the work from [scroll-tech/ceno](https://github.com/scroll-tech/ceno) — it re-uses the sumcheck and GKR implementation from that codebase.
