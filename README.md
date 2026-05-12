@@ -2,8 +2,6 @@
 
 Zero-knowledge proof system for neural network inference, with first-class support for end-to-end LLM proving.
 
-**WARNING: This codebase is not audited and not production ready. Use at your own risk.**
-
 ## 👉 Looking to run DeepProve? Start with [`zkml/README.md`](zkml/README.md)
 
 That's where the installation steps, model setup, GPU build, and the full end-to-end `bench-llm` tutorial live. The rest of this page is a high-level summary of what DeepProve is and what to expect.
