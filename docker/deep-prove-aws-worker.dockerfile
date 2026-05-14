@@ -25,4 +25,4 @@ COPY --from=builder /usr/local/cargo/bin/deep-prove-worker /usr/local/bin
 EXPOSE 8080
 ENV RUST_BACKTRACE=full
 USER lagrange
-CMD ["/usr/local/bin/deep-prove-worker", "local-api"]
+CMD ["/usr/local/bin/deep-prove-worker", "--tensor-store", "temporary", "local-api"]
