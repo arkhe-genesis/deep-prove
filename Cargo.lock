@@ -3240,7 +3240,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "deep-prove"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "alloy",
  "alloy-signer",
@@ -8264,7 +8264,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -8301,7 +8301,7 @@ dependencies = [
 
 [[package]]
 name = "tenstore"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8328,7 +8328,7 @@ dependencies = [
 
 [[package]]
 name = "tenvis"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -9395,7 +9395,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "utils"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -10609,7 +10609,7 @@ dependencies = [
 
 [[package]]
 name = "zkml"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "ahash",
  "anyhow",
