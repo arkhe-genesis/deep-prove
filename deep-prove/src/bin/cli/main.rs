@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use bincode::serde::decode_from_slice;
 use clap::{Parser, Subcommand, ValueEnum};
 use deep_prove::middleware::{
@@ -62,8 +63,8 @@ enum Executor {
 
     /// Verify that a proof is correct.
     Verify {
-        /// The file containing the serialized proof to verify.
-        #[arg(long, short)]
+        /// The file containing the proof to verify.
+        #[arg()]
         proof: PathBuf,
     },
 }
@@ -175,9 +176,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Copy, Clone, ValueEnum)]
 pub enum ProofFormat {
-    Json,
-    Bin,
-    Msgpack,
+    Bincode,
+    Postcard,
 }
 
 fn verify_proof(proof: PathBuf) -> anyhow::Result<()> {
@@ -190,42 +190,35 @@ fn verify_proof(proof: PathBuf) -> anyhow::Result<()> {
         .map(|s| s.to_ascii_lowercase())
         .as_deref()
     {
-        Some("json") => ProofFormat::Json,
-        Some("msgpack" | "mp") => ProofFormat::Msgpack,
-        Some("bin") => ProofFormat::Bin,
+        Some("postcard" | "pc") => ProofFormat::Postcard,
+        Some("bin") => ProofFormat::Bincode,
         Some(other) => bail!(
-            "unknown proof file extension '.{other}'. Supported extensions: .msgpack, .mp, .json, .bin"
+            "unknown proof file extension '.{other}'. Supported extensions: .postcard, .pc, .bin"
         ),
         None => {
-            bail!("proof file has no extension. Supported extensions: .msgpack, .mp, .json, .bin")
+            bail!("proof file has no extension. Supported extensions: .postcard, .pc, .bin")
         }
     };
 
     let result = match format {
-        ProofFormat::Json => {
-            let outputs: Vec<Output> =
-                serde_json::from_slice(&bytes).context("deserializing ONNX proof (JSON)")?;
-            info!("verifying ONNX proof (JSON) with {} outputs", outputs.len());
-            outputs.into_iter().try_fold((), |_, o| o.proof.verify())
-        }
-        ProofFormat::Msgpack => {
-            if let Ok(outputs) = rmp_serde::from_slice::<Vec<Output>>(&bytes) {
+        ProofFormat::Postcard => {
+            let bytes = BASE64_STANDARD
+                .decode(&bytes)
+                .context("decoding base64-encoded proof")?;
+            if let Ok(output) = postcard::from_bytes::<Output>(&bytes) {
+                info!("verifying ONNX proof (postcard)",);
+                output.proof.verify()
+            } else if let Ok(outputs) = postcard::from_bytes::<Vec<LlmOutput>>(&bytes) {
                 info!(
-                    "verifying ONNX proof (msgpack) with {} outputs",
-                    outputs.len()
-                );
-                outputs.into_iter().try_fold((), |_, o| o.proof.verify())
-            } else if let Ok(outputs) = rmp_serde::from_slice::<Vec<LlmOutput>>(&bytes) {
-                info!(
-                    "verifying LLM proof (msgpack) with {} outputs",
+                    "verifying LLM proof (postcard) with {} outputs",
                     outputs.len()
                 );
                 outputs.into_iter().try_fold((), |_, o| o.proof.verify())
             } else {
-                bail!("failed to deserialize proof as either ONNX or LLM format (msgpack)")
+                bail!("failed to deserialize proof as either ONNX or LLM format")
             }
         }
-        ProofFormat::Bin => {
+        ProofFormat::Bincode => {
             let (llm, _) =
                 decode_from_slice::<LlmOneShotOutput, _>(&bytes, bincode::config::standard())
                     .context("deserializing LLM proof (bincode)")?;

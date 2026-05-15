@@ -51,7 +51,7 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
 
     let ctx: SerializableGraphCtx<F, Pcs> = {
         let _guard = info_span!("deserialize_ctx", bytes = ctx_bytes.len()).entered();
-        rmp_serde::from_slice(ctx_bytes).context("failed to deserialize SerializableGraphCtx")?
+        postcard::from_bytes(ctx_bytes).context("failed to deserialize SerializableGraphCtx")?
     };
 
     // explicitly check consistency to avoid failures later which are harder to debug.
@@ -77,7 +77,7 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
 
     let mut partitions: Vec<ChunkPartition> = {
         let _guard = info_span!("deserialize_partitions").entered();
-        rmp_serde::from_slice(
+        postcard::from_bytes(
             &BASE64_STANDARD
                 .decode(&chunk.partition)
                 .context("failed to decode partition from Base64")?,
@@ -126,7 +126,7 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
             })?;
 
             let all_outputs: Vec<SerializablePartitionOutput<F, Pcs>> =
-                rmp_serde::from_slice(&decoded_bytes).with_context(|| {
+                postcard::from_bytes(&decoded_bytes).with_context(|| {
                     format!("failed to deserialize outputs from chunk {}", dep_chunk_id)
                 })?;
 
@@ -209,7 +209,7 @@ fn run_chunk_partition(chunk: v2::ChunkPayload, tenstore: GenStore) -> anyhow::R
             output,
         ));
     }
-    rmp_serde::to_vec(&intermediate_outputs).context("failed to serialize chunk outputs")
+    postcard::to_allocvec(&intermediate_outputs).context("failed to serialize chunk outputs")
 }
 
 /// Resolve context into [`v2::ChunkContext`] by fetching from S3 and mmap it.
@@ -269,7 +269,7 @@ pub(super) async fn process_job(
 
                     for (i, proof_b64) in agg_job.chunk_proofs.iter().enumerate() {
                         let outputs: Vec<SerializablePartitionOutput<F, Pcs>> =
-                            rmp_serde::from_slice(
+                            postcard::from_bytes(
                                 &BASE64_STANDARD.decode(proof_b64).with_context(|| {
                                     format!("failed to decode chunk proof {}", i)
                                 })?,
@@ -340,8 +340,8 @@ pub(super) async fn process_job(
                             }
 
                             if !chunk_proofs.is_empty() {
-                                let serialized =
-                                    rmp_serde::to_vec(&chunk_proofs).with_context(|| {
+                                let serialized = postcard::to_allocvec(&chunk_proofs)
+                                    .with_context(|| {
                                         format!("failed to serialize chunk {} outputs", chunk_id)
                                     })?;
                                 dependency_outputs.insert(
@@ -377,7 +377,7 @@ pub(super) async fn process_job(
                 let _guard = info_span!("serialize_aggregated_proof").entered();
 
                 let outputs: Vec<SerializablePartitionOutput<F, Pcs>> =
-                    rmp_serde::from_slice(&result)
+                    postcard::from_bytes(&result)
                         .context("failed to deserialize chunk 0 aggregation outputs")?;
 
                 let proof = outputs
@@ -400,7 +400,7 @@ pub(super) async fn process_job(
                         .map(|&t| Token::from(t as u64))
                         .collect();
 
-                    let verifier_ctx: LLMVerifierContext<F, Pcs> = rmp_serde::from_slice(
+                    let verifier_ctx: LLMVerifierContext<F, Pcs> = postcard::from_bytes(
                         &BASE64_STANDARD
                             .decode(&agg.serialized_verifier_ctx)
                             .context("failed to decode LLM verifier context")?,
@@ -416,9 +416,10 @@ pub(super) async fn process_job(
                             user_tokens,
                         },
                     }];
-                    rmp_serde::to_vec(&outputs).context("failed to serialize aggregated LLM proof")
+                    postcard::to_allocvec(&outputs)
+                        .context("failed to serialize aggregated LLM proof")
                 } else {
-                    let verifier_ctx: VerifierContext<F, Pcs> = rmp_serde::from_slice(
+                    let verifier_ctx: VerifierContext<F, Pcs> = postcard::from_bytes(
                         &BASE64_STANDARD
                             .decode(&agg.serialized_verifier_ctx)
                             .context("failed to decode verifier context")?,
@@ -433,7 +434,7 @@ pub(super) async fn process_job(
                             ctx: verifier_ctx,
                         },
                     }];
-                    rmp_serde::to_vec(&outputs).context("failed to serialize aggregated proof")
+                    postcard::to_allocvec(&outputs).context("failed to serialize aggregated proof")
                 }
             }
             .instrument(span)

@@ -144,14 +144,14 @@ impl Store for S3Store {
                     .context("access FS cache")?
             {
                 let bytes = tokio::fs::read(path).await?;
-                let value = serde_json::from_slice::<Params>(&bytes)
-                    .context("decoding params value from FS cache")?;
+                let value =
+                    postcard::from_bytes(&bytes).context("decoding params value from FS cache")?;
                 return Ok(Some(value));
             }
             match store.get(&key).await {
                 Ok(result) => {
                     let bytes = result.bytes().await?;
-                    let value = serde_json::from_slice::<Params>(&bytes)
+                    let value = postcard::from_bytes::<Params>(&bytes)
                         .context("decoding params value from S3")?;
 
                     // Cache to FS
@@ -181,7 +181,7 @@ impl Store for S3Store {
     ) -> impl Future<Output = anyhow::Result<()>> + Send {
         async move {
             let value_bytes: Vec<u8> =
-                serde_json::to_vec(&params).context("serializing params to store")?;
+                postcard::to_allocvec(&params).context("serializing params to store")?;
             let key = params_key(key);
             let S3Store { store, fs_cache } = self;
 
@@ -247,7 +247,7 @@ impl Store for S3Store {
                     .context("access FS cache")?
             {
                 let bytes = tokio::fs::read(path).await?;
-                let value = serde_json::from_slice::<ScaledModel>(&bytes)
+                let value = postcard::from_bytes::<ScaledModel>(&bytes)
                     .context("decoding scaled model value from FS cache")?;
                 return Ok(value);
             }
@@ -255,7 +255,7 @@ impl Store for S3Store {
             match store.get(&key).await {
                 Ok(result) => {
                     let bytes = result.bytes().await?;
-                    let value = serde_json::from_slice::<ScaledModel>(&bytes)
+                    let value = postcard::from_bytes::<ScaledModel>(&bytes)
                         .context("decoding scaled model value from S3")?;
 
                     // Cache to FS
@@ -272,8 +272,8 @@ impl Store for S3Store {
                 }
                 Err(object_store::Error::NotFound { .. }) => {
                     let value = init().await?;
-                    let value_bytes: Vec<u8> =
-                        serde_json::to_vec(&value).context("serializing scaled model to store")?;
+                    let value_bytes: Vec<u8> = postcard::to_allocvec(&value)
+                        .context("serializing scaled model to store")?;
 
                     // Write to FS cache first
                     if let Some(path) = cache_path {
@@ -757,9 +757,7 @@ impl Store for MemStore {
             let guard = self.pps.lock().unwrap();
             guard
                 .get(&key)
-                .map_or(Ok(None), |bytes| {
-                    serde_json::from_slice::<Params>(bytes).map(Some)
-                })
+                .map_or(Ok(None), |bytes| postcard::from_bytes(bytes).map(Some))
                 .map_err(anyhow::Error::from)
         }
     }
@@ -772,7 +770,7 @@ impl Store for MemStore {
         async move {
             let key = params_key(key);
             let mut guard = self.pps.lock().unwrap();
-            let bytes = serde_json::to_vec(&params).context("serializing params to store")?;
+            let bytes = postcard::to_allocvec(&params).context("serializing params to store")?;
             guard.insert(key, bytes);
             Ok(())
         }

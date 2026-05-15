@@ -18,6 +18,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use base64::{Engine, prelude::BASE64_STANDARD};
 use deep_prove::{middleware::v1::DeepProveRequest as DeepProveRequestV1, store::MemStore};
 use tenstore::GenStore;
 use tokio::sync::Mutex;
@@ -93,13 +94,19 @@ pub async fn serve(args: RunMode, tenstore: GenStore) -> anyhow::Result<()> {
                     )
                     .await;
                     match result {
-                        Ok(output) => {
+                        Ok(proofs) => {
                             info!("proof generated in {}s", now.elapsed().as_secs());
-                            app_state.lock().await.proofs_queue.extend(
-                                output
-                                    .into_iter()
-                                    .map(|output| serde_json::to_string(&output).unwrap()),
-                            );
+                            app_state
+                                .lock()
+                                .await
+                                .proofs_queue
+                                .extend(proofs.into_iter().map(|proof| {
+                                    BASE64_STANDARD.encode(
+                                        postcard::to_allocvec(&proof)
+                                            .context("serializing proof")
+                                            .unwrap(),
+                                    )
+                                }));
                         }
                         Err(err) => error!("failed to generate proof: {err:?}"),
                     }

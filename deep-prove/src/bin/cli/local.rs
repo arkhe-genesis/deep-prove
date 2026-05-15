@@ -57,15 +57,15 @@ pub async fn connect(executor: Executor) -> anyhow::Result<()> {
 
             match resp.status() {
                 StatusCode::OK => {
-                    // create a file to write the proofs to
+                    // create a file to write the proof to
                     let mut file = tempfile::Builder::new()
                         .prefix(filename.as_deref().unwrap_or(DEFAULT_PREFIX))
-                        .suffix(".json")
+                        .suffix(".postcard")
                         .rand_bytes(10)
                         .disable_cleanup(true)
                         .tempfile_in(std::env::current_dir().unwrap_or("./".into()))?;
 
-                    // save the list of proofs
+                    // save the returned proof
                     let body = resp
                         .body_mut()
                         .with_config()
