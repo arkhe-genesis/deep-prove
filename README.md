@@ -42,8 +42,7 @@ For the full methodology and a deeper benchmark sweep across sequence lengths an
 
 ## Licensing
 
-- **`zkml/` folder**: Licensed under the [Lagrange License](zkml/LICENSE).
-- **All other code**: Licensed under Apache 2.0 + MIT, as per the original repository.
+Licensed under the [Lagrange License](LICENSE).
 
 ## Acknowledgements
 
