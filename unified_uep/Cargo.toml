@@ -1,0 +1,12 @@
+[package]
+name = "unified_uep"
+categories.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+safety-core = { version = "2.0.1", path = "../safety-core" }
