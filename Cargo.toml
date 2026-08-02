@@ -8,7 +8,7 @@ members = [
   "utils",
   "tenstore",
   "tenvis",
-  "telemetry",
+  "telemetry", "safety-core", "floquet_ptc", "unified_uep", "tools/cargo-hg-check",
 ]
 resolver = "2"
 
