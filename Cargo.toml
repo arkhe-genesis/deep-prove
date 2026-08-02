@@ -1,5 +1,8 @@
 [workspace]
 members = [
+  "arkhe-buzz-bridge",
+  "arkhe-soc-tlm",
+  "arkhe-soc-traits",
   "zkml",
   "deep-prove",
   "utils",
