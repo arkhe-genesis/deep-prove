@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  litho-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/specs:/data/specs:ro
+      - ./data/reports:/data/reports
+      - ./equipment_db.json:/app/equipment_db.json:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  litho-batch:
+    build: .
+    command: >
+      python litho_batch.py
+      --input-dir /data/specs
+      --output-dir /data/reports
+      --watch
+      --interval 60
+      --format json,markdown
+      --workers 2
+    volumes:
+      - ./data/specs:/data/specs:ro
+      - ./data/reports:/data/reports
+      - ./equipment_db.json:/app/equipment_db.json:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      - litho-api
+
+  # Opcional: PostgreSQL para persistência de métricas
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: litho
+  #     POSTGRES_PASSWORD: litho
+  #     POSTGRES_DB: litho_metrics
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+
+# volumes:
+#   pgdata:
